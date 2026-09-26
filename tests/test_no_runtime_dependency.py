@@ -1,0 +1,113 @@
+"""The fork package must stay importable without the portable runtime.
+
+Acceptance criterion for this slice: ``input_manager.py`` has no Gradio/browser dependency. More
+broadly, the whole ``beatsync_fork`` package must import on a bare CPython — no gradio, numpy, cv2,
+librosa or cupy, and none of the upstream modules that pull them in (``logger`` imports librosa at
+module level and mutates ``PATH``/``CUDA_PATH`` as an import side effect; importing ``paths`` creates
+directories on disk).
+
+Checked in a subprocess so the assertion sees a clean module table rather than whatever the rest of
+the suite has already imported.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+FORBIDDEN = (
+    # Heavy third-party runtime.
+    "gradio",
+    "numpy",
+    "cv2",
+    "librosa",
+    "cupy",
+    "numba",
+    "PIL",
+    # Upstream modules with import-time side effects.
+    "logger",
+    "paths",
+    "gpu_cpu_utils",
+    "ffmpeg_processing",
+    "video_analysis",
+    "video_processor",
+    "ui_content",
+    "auto_mode",
+)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SRC = os.path.join(_REPO_ROOT, "src")
+
+_PROBE = """
+import sys
+import beatsync_fork
+import beatsync_fork.input_manager
+import beatsync_fork.input_report
+forbidden = {forbidden!r}
+leaked = sorted(name for name in forbidden if name in sys.modules)
+print("LEAKED:" + ",".join(leaked))
+"""
+
+
+def _run_probe() -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _SRC
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return subprocess.run(
+        [sys.executable, "-c", _PROBE.format(forbidden=FORBIDDEN)],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+        env=env,
+        timeout=120,
+        check=False,
+    )
+
+
+def test_fork_package_imports_without_the_portable_runtime():
+    result = _run_probe()
+    assert result.returncode == 0, f"import failed:\n{result.stderr}"
+
+
+def test_fork_package_pulls_in_no_runtime_dependency():
+    result = _run_probe()
+    assert result.returncode == 0, f"import failed:\n{result.stderr}"
+
+    line = next(
+        (item for item in result.stdout.splitlines() if item.startswith("LEAKED:")),
+        None,
+    )
+    assert line is not None, f"probe produced no verdict:\n{result.stdout}\n{result.stderr}"
+
+    leaked = [name for name in line[len("LEAKED:"):].split(",") if name]
+    assert leaked == [], f"beatsync_fork imported forbidden modules: {leaked}"
+
+
+def test_input_manager_source_imports_only_stdlib():
+    """Static check, so the guarantee holds even where a dependency happens not to be installed."""
+    import ast
+
+    allowed = {
+        "__future__",
+        "hashlib",
+        "os",
+        "stat",
+        "time",
+        "collections",
+        "dataclasses",
+        "enum",
+        "typing",
+    }
+    source_path = os.path.join(_SRC, "beatsync_fork", "input_manager.py")
+    with open(source_path, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=source_path)
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            imported.add(node.module.split(".")[0])
+
+    assert imported <= allowed, f"unexpected imports: {sorted(imported - allowed)}"
