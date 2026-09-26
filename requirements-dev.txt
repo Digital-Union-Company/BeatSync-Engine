@@ -1,0 +1,12 @@
+# Development / test dependencies only.
+#
+# Intentionally NOT in requirements.txt and NOT installed by scripts/install.ps1: the portable
+# runtime that ships to users does not need a test runner. Install separately when working on the
+# fork:
+#
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest
+#
+# The fork test suite is stdlib-only, so any recent CPython works — it does not need the portable
+# 3.13 runtime, CUDA, FFmpeg or the Qwen models.
+pytest>=8.0

@@ -36,11 +36,23 @@ set PY=bin\python-3.13.14-embed-amd64\python.exe
 pipeline — it runs the same `analyze_beats_auto` → `create_music_video` path as the UI, but prints
 everything instead of routing through the UI's quiet console.
 
-**There is no test suite, linter, or formatter config.** Verification is end-to-end: run the CLI on a
-short audio file plus one source video and check the console stage timings and the output file. The
-installer's own smoke checks (`scripts/install.ps1`, bottom) are the closest thing to a health check —
-they import gradio/librosa/cv2/cupy/numba, run a CuPy kernel, assert PyTorch is *absent*, verify the
-llama.cpp binaries and GGUF files, and run `pip check`.
+### Tests
+
+```bat
+python -m pip install -r requirements-dev.txt    :: pytest only; NOT installed into bin/ by install.ps1
+python -m pytest                                 :: whole suite
+python -m pytest tests/test_input_manager_large.py -v
+```
+
+The suite covers `src/beatsync_fork/` only, and runs on **any** recent CPython — no portable runtime,
+no CUDA, no FFmpeg, no models — because fork modules are stdlib-only by rule (see below).
+
+The upstream pipeline modules have no tests and cannot even be imported without the portable runtime;
+verification there is still end-to-end (run the CLI on a short audio file plus one source video and
+check the console stage timings and the output file). There is no linter or formatter config. The
+installer's own smoke checks (`scripts/install.ps1`, bottom) are the closest thing to a runtime health
+check — they import gradio/librosa/cv2/cupy/numba, run a CuPy kernel, assert PyTorch is *absent*,
+verify the llama.cpp binaries and GGUF files, and run `pip check`.
 
 ## Architecture
 
@@ -162,10 +174,67 @@ Windows-only by construction: `.exe` paths, `CREATE_NO_WINDOW`, `chcp 65001`, Po
 embedded-Python `._pth` patched to include `..\..\src`. `gui.py` also patches asyncio's Proactor
 transport to swallow benign `WinError 10054` pipe resets — that filter is intentional, not dead code.
 
-The repo has **no `.gitignore`**, and runtime folders are created inside the repo root. A stale
-`src/auto_mode/__pycache__/*.pyc` is currently tracked; don't add more build artifacts.
+Runtime folders are created inside the repo root, so `.gitignore` covers `bin/`, `input/`, `output/`
+and Python caches. Ignoring is not deleting: `output/` and `input/video_analysis_cache/` are still
+retained on disk by the housekeeping policy below.
 
-Licensed AGPL-3.0.
+Licensed AGPL-3.0. This repository is a **modified fork** — see `CHANGELOG-FORK.md` for the
+modification record required by AGPL-3.0 §5(a), and the README licence section for the §13
+(network-use) consequence of ever exposing the Gradio UI beyond localhost.
+
+## Fork-specific code (`src/beatsync_fork/`)
+
+All Digital Union additions live in this package. Upstream never creates this directory, so features
+land here with almost no merge-conflict surface; upstream modules are touched only at small call sites
+marked `# [FORK]`. Grep for `[FORK]` to enumerate the entire divergence surface.
+
+**Hard rule:** nothing in `beatsync_fork` may import the upstream runtime (`logger`, `paths`, `gradio`,
+`cupy`, `cv2`, `librosa`, `numpy`). `logger` imports librosa at module scope and mutates
+`PATH`/`CUDA_PATH`, and importing `paths` creates directories as a side effect — depending on either
+would make the fork package untestable on a bare interpreter. `tests/test_no_runtime_dependency.py`
+enforces this both dynamically (subprocess module-table check) and statically (AST import inspection).
+
+| Module | Purpose |
+|---|---|
+| `__init__.py` | fork identity: `FORK_NAME`, `FORK_VERSION`, `UPSTREAM_BASELINE_COMMIT`, `fork_identity()` |
+| `input_manager.py` | `scan_folder()` — deterministic local-folder source discovery with exact accounting |
+| `input_report.py` | `InputReport` — renders and serialises the counts from an `InputSet` |
+
+### Input manager status
+
+```
+INPUT MANAGER CORE EXISTS
+GUI INTEGRATION = NOT YET IMPLEMENTED
+```
+
+`scan_folder()` is currently reachable only from tests and from Python. **`gui.py` is untouched** and
+still uses upstream's `gr.File` multi-upload path, so the failure this module was written to prevent —
+a partially-uploaded selection rendering silently from a truncated source set (observed: 329 of ~701
+files reaching Stage 5) — is **not yet fixed in the app**. Wiring the folder-mode UI, the READY state
+and the confirm-before-render gate is the next slice.
+
+What the core does: enumerates `.mp4`/`.mkv` under a folder (optionally recursive); rejects entries
+with a recorded reason (`unsupported_extension`, `empty_file`, `not_a_file`, `unreadable`); collapses a
+file reachable by two paths into a single entry with a recorded collision; orders results
+case-insensitively with a total-order tie-break so two scans agree exactly; and reports duplicate
+*candidates* using a cheap fingerprint (size + SHA-256 of the first and last 1 MiB, whole file when
+≤ 2 MiB). Files whose size is unique within the set are never opened at all. It copies nothing,
+transcodes nothing, and deletes nothing — duplicates are reported, never removed.
+
+**Traversal is all-or-nothing, and must stay that way:** a complete walk returns an `InputSet`; any
+directory that cannot be listed raises `InputScanError`. `os.walk` silently skips `scandir` failures
+unless an `onerror` callback is passed, so never drop the one in `_walk_error_raiser()` and never
+"soften" it into a partial result — a quietly smaller library that still reports READY is the exact
+bug this module exists to prevent. Unreadable *files* are different: they stay `unreadable`
+rejections, because a named rejection is not a silent loss.
+
+**No entry may be dropped by a probe in `_iter_candidate_paths()`.** It decides only "directory or
+not"; everything else goes to the classifier, which owns extension, `stat`, regular-file, empty-file
+and `UNREADABLE` handling. Never reintroduce `os.path.isfile()` / `os.path.isdir()` as the filter:
+they *suppress* stat errors and return `False`, so an unreadable entry vanishes from `ready`,
+`rejected` **and** `discovered_count` — invisible even to the counting invariant. (Note for tests:
+since Python 3.13 on Windows `os.path.isfile` is `nt._path_isfile`, a C builtin that never calls
+`os.stat`, so patching `os.stat` alone cannot simulate an unreadable path.)
 
 ---
 

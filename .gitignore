@@ -1,0 +1,24 @@
+# Source-control hygiene only.
+#
+# An entry here means "Git does not track this path". It does NOT mean the path
+# is disposable. The retention rules in CLAUDE.md (PCBUS-HK-v1) still apply:
+# output/ holds the user's rendered videos and input/video_analysis_cache/ is a
+# deliberately preserved cache. Never delete either as housekeeping.
+
+# Portable runtime installed by scripts/install.ps1 (multi-GB, never tracked).
+/bin/
+
+# App-managed runtime I/O created by src/paths.py at import time.
+# Includes audio/, video/, processing/, gradio_uploads/ and video_analysis_cache/.
+/input/
+
+# Rendered output.
+/output/
+
+# Python bytecode and caches.
+__pycache__/
+*.pyc
+*.pyo
+
+# Test tooling.
+/.pytest_cache/

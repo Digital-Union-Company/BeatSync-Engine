@@ -19,6 +19,19 @@ BeatSync Engine analyzes music rhythm, energy, sections, and source-video moment
 
 ---
 
+## 🔱 About this fork
+
+This repository is **Digital Union's fork** of [Merserk/BeatSync-Engine](https://github.com/Merserk/BeatSync-Engine), maintained at [Digital-Union-Company/BeatSync-Engine](https://github.com/Digital-Union-Company/BeatSync-Engine).
+
+*   **Upstream baseline:** `06679c1` (upstream `main`)
+*   **Fork modifications began:** 2026-09-26
+*   **Modification log:** [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)
+*   **Fork identity/version:** `FORK_VERSION` in `src/beatsync_fork/__init__.py`
+
+Upstream Auto Mode creative behaviour is preserved as the default: install this fork, leave the settings alone, and you get upstream's editing behaviour. Fork-specific code is kept in `src/beatsync_fork/` so that upstream synchronisation stays straightforward.
+
+---
+
 ## 🎥 Demo Video
 
 [![Watch the BeatSync Engine demo video](https://img.youtube.com/vi/Iv00-5GkoOM/maxresdefault.jpg)](https://www.youtube.com/watch?v=Iv00-5GkoOM)
@@ -319,6 +332,18 @@ Best for:
 *   maximum timeline stability.
 
 > ProRes files are larger. The app can create an H.264 preview for the Gradio video player while keeping the `.mov` output.
+
+---
+
+## 📄 License
+
+BeatSync Engine is licensed under the **GNU Affero General Public License v3.0** — see [`LICENSE`](LICENSE).
+
+This repository is a **modified version** of the upstream project. Modifications are recorded in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md), as required by AGPL-3.0 §5(a).
+
+The app is local-first: it binds to `127.0.0.1` and does not share a public link. If you modify it **and** make the interface reachable by other users over a network, AGPL-3.0 §13 requires you to offer those users the Corresponding Source of your modified version.
+
+The portable runtime is downloaded at install time rather than redistributed here. FFmpeg, llama.cpp and the Qwen3-VL GGUF models remain under their own licenses.
 
 ---
 
