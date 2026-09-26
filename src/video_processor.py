@@ -48,6 +48,9 @@ from ffmpeg_processing import (
 )
 from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
 
+# [FORK] Digital-Union: structured progress events (stdlib-only fork module).
+from beatsync_fork import progress as fork_progress
+
 # Import mode modules
 from auto_mode import analyze_beats_auto
 
@@ -55,6 +58,16 @@ warnings.filterwarnings('ignore', message='.*bytes wanted but 0 bytes read.*')
 
 BeatTimes : TypeAlias = np.ndarray
 VideoList : TypeAlias = List[str]
+
+
+def _short_error(exc: object, max_chars: int = 240) -> str:
+    """[FORK] Digital-Union: one concise line for the UI.
+
+    Deliberately truncated: the status textbox must not receive megabytes of FFmpeg stderr. The full
+    text still reaches the console through the existing prints.
+    """
+    text = " ".join(str(exc).split())
+    return text if len(text) <= max_chars else text[: max_chars - 1] + "\u2026"
 
 
 def _fmt_seconds(seconds: float) -> str:
@@ -323,7 +336,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       max_workers: int = None,
                       beat_info: dict = None,
                       lossless_mode: bool = False, use_gpu: bool = False, 
-                      gpu_encoder: str = 'h264_nvenc', fps: float = None) -> str:
+                      gpu_encoder: str = 'h264_nvenc', fps: float = None,
+                      event_callback=None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
     
@@ -443,6 +457,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         "timeline_frames": int(sum(segment_frames)),
     })
 
+    # [FORK] Digital-Union: total is the frame-locked segment count -- the authoritative denominator.
+    fork_progress.emit(event_callback, fork_progress.start(
+        6, f"Rendering {total_clips} frame-locked cuts",
+        current=0, total=total_clips, unit="clips",
+        encoder=render_info.get("encoder"), output_fps=float(fps),
+    ))
     print(f"🎬 Creating video with {total_clips} frame-locked cuts")
     print(f"⏱️  Cut timeline: {len(selected_beats)} boundaries, {sum(segment_frames)} frames")
     if dropped_boundaries:
@@ -482,11 +502,18 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         # Convert all input videos to ProRes (video only, no audio)
         prores_files = []
         prores_map = {}
+        # [FORK] Digital-Union: ProRes has two expensive serial loops; report both honestly.
+        convert_counter = fork_progress.StageCounter(6, len(video_files), min_interval=0.5)
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, f"ProRes conversion started ({len(video_files)} source(s))",
+            phase="prores_convert"))
         for idx, video_file in enumerate(video_files, 1):
             print(f"Converting {idx}/{len(video_files)}...")
             prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps)
             prores_files.append(prores_file)
             prores_map[os.path.abspath(video_file)] = prores_file
+            fork_progress.emit(event_callback, convert_counter.advance(
+                1, "converted to ProRes", phase="prores_convert", unit="sources"))
         
         print(f"✓ All videos converted to ProRes 422 Proxy (video only)")
         
@@ -503,6 +530,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         segment_files = []
         segments_dir = os.path.join(session_temp_dir, 'segments')
         os.makedirs(segments_dir, exist_ok=True)
+        extract_counter = fork_progress.StageCounter(6, total_clips, min_interval=0.5)
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, f"ProRes segment extraction started ({total_clips} segments)",
+            phase="prores_extract"))
         
         for i, exact_duration in enumerate(segment_durations):
             # Duration comes from the absolute frame-locked timeline.
@@ -524,6 +555,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 start_time=segment_start
             )
             segment_files.append(segment_file)
+            fork_progress.emit(event_callback, extract_counter.advance(
+                1, "segments extracted", phase="prores_extract", unit="clips"))
 
             if (i + 1) % 10 == 0:
                 print(f"   ✓ Extracted {i + 1}/{total_clips} segments (frame-perfect)")
@@ -535,15 +568,24 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         print(f"🔗 LOSSLESS CONCATENATION + MUSIC")
         print(f"{'='*60}")
         
-        concatenate_videos_ffmpeg(
-            video_files=segment_files,
-            output_file=output_file,
-            audio_file=audio_file,
-            start_time=start_time,
-            end_time=end_time,
-            use_nvenc=False,  # ProRes uses stream copy
-            temp_dir=session_temp_dir
-        )
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, "Final assembly started", phase="assembly"))
+        try:
+            concatenate_videos_ffmpeg(
+                video_files=segment_files,
+                output_file=output_file,
+                audio_file=audio_file,
+                start_time=start_time,
+                end_time=end_time,
+                use_nvenc=False,  # ProRes uses stream copy
+                temp_dir=session_temp_dir
+            )
+        except Exception as exc:
+            fork_progress.emit(event_callback, fork_progress.error(
+                6, f"Final assembly failed: {_short_error(exc)}", phase="assembly"))
+            raise
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, "Final assembly finished", phase="assembly"))
         
         print(f"\n{'='*60}")
         print(f"✅ LOSSLESS VIDEO CREATION COMPLETE!")
@@ -584,7 +626,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             pass
         
         print(f"✓ Cleanup complete")
-        
+
+        fork_progress.emit(event_callback, fork_progress.end(
+            6, f"{len(segment_files)} ProRes segments assembled",
+            current=total_clips, total=total_clips,
+            elapsed_seconds=time.perf_counter() - video_creation_started,
+            encoder="PRORES_PROXY", unit="clips",
+        ))
         return output_file
     
     # STANDARD MODE - Direct parallel processing (NO BATCHES)
@@ -617,6 +665,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []
         clip_stage_started = time.perf_counter()
+        # [FORK] Digital-Union: `current` advances only for clips that were actually created.
+        # StageCounter throttles to ~2 updates/sec and always emits the final one.
+        clip_counter = fork_progress.StageCounter(
+            6, len(clip_args), min_interval=0.5, started=clip_stage_started
+        )
+        clip_failures: List[str] = []
         
         # Process all clips in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -641,12 +695,29 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                     
                     if error:
                         print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
+                        clip_failures.append(f"clip {i + 1}: {_short_error(error)}")
+                        # Surface the first few concretely, then only the running count, so a
+                        # systematic failure (every NVENC clip, say) is visible without flooding.
+                        if len(clip_failures) <= 3:
+                            fork_progress.emit(event_callback, fork_progress.warning(
+                                6, f"Clip {i + 1} failed: {_short_error(error)}",
+                                failed_clips=len(clip_failures),
+                            ))
+                        elif len(clip_failures) % 25 == 0:
+                            fork_progress.emit(event_callback, fork_progress.warning(
+                                6, f"{len(clip_failures)} clips have failed so far",
+                                failed_clips=len(clip_failures),
+                            ))
                         continue
                     
                     if clip_path is not None:
                         clip_files[idx] = clip_path
                         
                         completed += 1
+                        fork_progress.emit(event_callback, clip_counter.advance(
+                            1, "clips rendered", unit="clips",
+                            failed_clips=len(clip_failures),
+                        ))
                         if completed % 10 == 0 or completed == len(clip_args):
                             progress = (completed / len(clip_args)) * 100
                             elapsed = time.perf_counter() - clip_stage_started
@@ -658,15 +729,32 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                     
                 except Exception as e:
                     print(f"⚠️  Warning: Error processing clip: {str(e)}")
+                    clip_failures.append(_short_error(e))
+                    fork_progress.emit(event_callback, fork_progress.warning(
+                        6, f"Clip worker error: {_short_error(e)}",
+                        failed_clips=len(clip_failures),
+                    ))
                     continue
         
         clip_stage_seconds = time.perf_counter() - clip_stage_started
         _summarize_clip_timings(clip_timings, clip_stage_seconds)
+        # The final state is always published, even if throttling suppressed the last advance.
+        fork_progress.emit(event_callback, clip_counter.snapshot(
+            "clip extraction complete", unit="clips", failed_clips=len(clip_failures)))
 
         # Do not silently drop failed clips. Dropping one segment compresses the
         # output timeline and makes every later cut drift against the audio.
         failed_count = sum(1 for f in clip_files if f is None)
         if failed_count:
+            # The refusal itself is unchanged: an incomplete timeline is never concatenated. It is
+            # now merely visible in the UI instead of only on a discarded stdout.
+            fork_progress.emit(event_callback, fork_progress.error(
+                6,
+                f"{failed_count} of {total_clips} clip(s) failed; refusing to concatenate an "
+                f"incomplete timeline.",
+                failed_clips=int(failed_count), total_clips=int(total_clips),
+                first_failures=clip_failures[:3],
+            ))
             raise RuntimeError(
                 f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
             )
@@ -680,17 +768,26 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         
         # Concatenate all clips and add audio
         assembly_started = time.perf_counter()
-        concatenate_videos_ffmpeg(
-            video_files=clip_files,
-            output_file=output_file,
-            audio_file=audio_file,
-            start_time=start_time,
-            end_time=end_time,
-            use_nvenc=use_nvenc,
-            gpu_encoder=gpu_encoder,
-            fps=fps,
-            temp_dir=session_temp_dir
-        )
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, "Final assembly started", phase="assembly"))
+        try:
+            concatenate_videos_ffmpeg(
+                video_files=clip_files,
+                output_file=output_file,
+                audio_file=audio_file,
+                start_time=start_time,
+                end_time=end_time,
+                use_nvenc=use_nvenc,
+                gpu_encoder=gpu_encoder,
+                fps=fps,
+                temp_dir=session_temp_dir
+            )
+        except Exception as exc:
+            fork_progress.emit(event_callback, fork_progress.error(
+                6, f"Final assembly failed: {_short_error(exc)}", phase="assembly"))
+            raise
+        fork_progress.emit(event_callback, fork_progress.state(
+            6, "Final assembly finished", phase="assembly"))
         assembly_seconds = time.perf_counter() - assembly_started
         render_info["final_assembly_seconds"] = float(assembly_seconds)
         print(f"   ⏱ Final assembly total: {_fmt_seconds(assembly_seconds)}")
@@ -724,6 +821,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         print(f"   Total video creation time: {_fmt_seconds(time.perf_counter() - video_creation_started)}")
         print(f"{'='*60}\n")
         
+        fork_progress.emit(event_callback, fork_progress.end(
+            6, f"{total_clips} clips rendered and assembled",
+            current=total_clips, total=total_clips,
+            elapsed_seconds=time.perf_counter() - video_creation_started,
+            encoder=render_info.get("encoder"), output_fps=float(fps), unit="clips",
+        ))
         return output_file
  
  

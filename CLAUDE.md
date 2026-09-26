@@ -129,16 +129,71 @@ signature (model/mmproj/server/mtmd stat + `llama-mtmd-cli --version`). **Bump `
 otherwise stale candidates silently survive. Swapping the GGUF model or llama.cpp build invalidates
 automatically.
 
-### Console vs. UI output
+### Console vs. UI output — structured progress
 
-In GUI runs, `gui.process_video` redirects stdout/stderr into `QuietConsole` (discarded) and the worker
-thread streams status through two callbacks:
+In GUI runs `gui.process_video` still redirects stdout/stderr into `QuietConsole` (discarded), so **a
+plain `print()` inside the pipeline is invisible in the UI.** Emit a structured event instead.
 
-- `progress_callback(str)` → the Gradio status box, and starts a stage in `StageConsoleLogger`
-- `console_callback(stage, msg)` → the CMD window, capped at **5 lines per stage**
+```
+pipeline  --ProgressEvent-->  queue.Queue  -->  Gradio generator  -->  status textbox
+```
 
-So a plain `print()` added inside the pipeline is invisible in the UI. Emit through `_notify_console`
-(auto_mode) or the `_stage5_summary`/`_stage6_summary` helpers in `gui.py` instead.
+`src/beatsync_fork/progress.py` defines the immutable `ProgressEvent(stage, kind, message, current,
+total, elapsed_seconds, rate, data)`; `progress_view.ProgressView` folds events into the panel text.
+Both are stdlib-only, so the whole progress path is testable without Gradio.
+
+**Stage identity is `event.stage`, an integer.** The old path recovered it with
+`re.search(r"Stage (\d+) is processing", message)` — that regex is gone from `gui.py` and must not come
+back; a test asserts its absence.
+
+Rules that are load-bearing:
+
+- **`emit()` never raises.** It swallows callback exceptions and ignores a `None` event, which is what
+  makes `emit(cb, counter.advance())` safe — `StageCounter.advance()` returns `None` when throttled.
+  A broken status widget must not lose hours of analysis. `KeyboardInterrupt` still propagates.
+- **`StageCounter` is monotonic, bounded and throttled** (~2 updates/sec, final update always sent).
+  Stage 5 retries a failed video serially and Stage 6 collects clips out of order via `as_completed`;
+  neither may make the displayed count go backwards or exceed the total.
+- **Monotonicity is per `(stage, phase)`, never per stage.** A stage number is not a counter: Stage 6's
+  ProRes path counts *sources* while converting and *clips* while extracting, with different
+  denominators, then runs an uncounted assembly phase; Stage 5 counts sources then runs Qwen. The phase
+  comes from `data["phase"]` (`prores_convert`, `prores_extract`, `assembly`, `qwen`); events without
+  one belong to the stage's main counter. Merging them produced `758 / 100 (758%)` and an extraction
+  that looked 62% done before it started. Nothing may carry across a phase boundary — count, total,
+  unit, rate or elapsed.
+- **An uncounted active phase shows no percentage.** Assembly and Qwen must not inherit the previous
+  counter; `ProgressView` shows their state plus a history line (`· 1216 clips completed`) instead.
+- **`ProgressEvent.data` is read-only *recursively*.** `frozen=True` alone allowed
+  `event.data["x"] = ...`, and a shallow `MappingProxyType` still allowed
+  `event.data["section_types"].append(...)` — which matters because Stage 3 and the Stage 6 refusal
+  really do emit nested lists. `_freeze`/`_thaw` handle mappings and sequences only; scalars, `str`
+  and `bytes` pass through. `as_dict()` thaws recursively, so the payload shares no mutable container
+  with the event; it is built field by field because `dataclasses.asdict` deep-copies and cannot
+  handle a mappingproxy.
+- **A rate must describe what it measures.** `StageCounter` tracks its rate basis separately from the
+  completion count: `advance(..., counts_toward_rate=False)` counts a Stage 5 cache hit without
+  billing it as throughput, and `begin_rate_window()` re-bases the clock after the cache scan. Without
+  that, 420 instant cache hits made the panel claim ~840 sources/s. Pass `rate_unit` when the rate
+  measures something narrower than the count (Stage 5 counts `sources`, its rate is
+  `analyzed sources`). Stage 6 opens no window, so its clip rate is unchanged. **Never add an ETA.**
+- **A stale straggler is ignored for everything, not just the count.** `ProgressView` drops
+  out-of-order events for `rate`, `elapsed` and `message` as well, and never overwrites a known
+  measurement with `None` — otherwise one late Stage 6 event erased `4.8 clips/s`.
+- **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
+  the generator does all widget updates. A test asserts the callback's only method call is `put`.
+- **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of
+  sitting at 0 while doing nothing.
+- **No invented ETAs.** Stages 1-4 are seconds long; Stage 5's per-video cost varies with clip
+  duration. Rendering publishes a *measured* rate, which is not a prediction.
+
+The legacy `progress_callback` / `console_callback` remain for CLI and headless callers;
+`event_callback` is optional everywhere. `StageConsoleLogger.apply_event()` drives the CMD log from the
+same events, so console and GUI cannot disagree.
+
+**Qwen live progress is not implemented (Phase 2B).** `video_analysis.py` launches the worker with
+`subprocess.run(capture_output=True)`, so its `tagged N/T` lines are unavailable until the worker
+exits. Only honest high-level states are emitted. Do not fabricate an N/T counter here, and do not
+switch to `Popen` as a side effect of unrelated work.
 
 ### Rendering modes
 
@@ -201,6 +256,8 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `input_report.py` | `InputReport` — renders and serialises the counts from an `InputSet` |
 | `input_confirmation.py` | `SourceSnapshot` identity + `evaluate_gate()` — what "confirmed" means |
 | `input_session.py` | the source-input state machine and `resolve_for_render()` — the actual gate |
+| `progress.py` | `ProgressEvent` + `StageCounter` + `emit()` — structured pipeline progress |
+| `progress_view.py` | `ProgressView` — folds events into the status panel text |
 
 ### Video source modes and the confirmation gate
 

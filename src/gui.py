@@ -110,6 +110,11 @@ from video_processor import create_music_video
 
 from auto_mode import analyze_beats_auto
 
+# [FORK] Digital-Union: structured pipeline progress. Event model and rendering live in
+# src/beatsync_fork/ (stdlib-only, Gradio-free); this module only moves events to widgets.
+from beatsync_fork.progress import EventKind, ProgressEvent
+from beatsync_fork.progress_view import ProgressView
+
 # [FORK] Digital-Union: source-input confirmation gate. All decision logic lives in
 # src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires it to widgets.
 from beatsync_fork.input_confirmation import SourceMode
@@ -219,6 +224,24 @@ class StageConsoleLogger:
     def _clean(self, text: str) -> str:
         text = str(text).encode("ascii", "ignore").decode("ascii")
         return re.sub(r"\s+", " ", text).strip()
+
+    # [FORK] Digital-Union: drive the CMD log from structured events too, so the console and the
+    # GUI agree and neither depends on parsing prose.
+    def apply_event(self, event: ProgressEvent) -> None:
+        if event.kind is EventKind.START:
+            self.start_stage(event.stage)
+            if event.message:
+                self.line(event.message)
+        elif event.kind is EventKind.END:
+            if event.message:
+                self.stage_line(event.stage, event.message)
+            if self.stage_number == event.stage:
+                self.end_stage()
+        elif event.kind in (EventKind.METRIC, EventKind.STATE):
+            if event.message:
+                self.stage_line(event.stage, event.message)
+        elif event.kind in (EventKind.WARNING, EventKind.ERROR):
+            self.stage_line(event.stage, f"! {event.message}")
 
 
 def _fmt_stage_seconds(seconds: float | int | None) -> str:
@@ -369,7 +392,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
-                       console_logger: StageConsoleLogger | None = None) -> StatusResult:
+                       console_logger: StageConsoleLogger | None = None,
+                       event_callback: Callable[[ProgressEvent], None] | None = None) -> StatusResult:
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -450,6 +474,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             video_files=local_video_paths,
             progress_callback=progress_callback,
             console_callback=lambda stage, message: console_logger.stage_line(stage, message) if console_logger else None,
+            event_callback=event_callback,
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
@@ -462,7 +487,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             local_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
-            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps
+            use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
+            event_callback=event_callback
         )
 
         # Move to output folder
@@ -526,17 +552,31 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, session_state: dict) -> Iterator[StatusResult]:
-    status_queue: queue.Queue[str | None] = queue.Queue()
+    """Run the pipeline in a worker thread, streaming structured progress to the UI.
+
+    [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
+    sentences, and stage identity comes from ``event.stage`` rather than a regex over prose. The
+    architecture is otherwise the one that was already here — worker thread + ``queue.Queue`` +
+    generator — because Gradio components must only be touched from the generator, never from the
+    worker thread.
+
+    Legacy string statuses are still accepted on the same queue as a compatibility fallback, so a
+    caller that only supplies ``progress_callback`` keeps working.
+    """
+    status_queue: queue.Queue[object | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
-    initial_status = _stage_status(1)
     console_logger = StageConsoleLogger(sys.__stdout__)
     quiet_console = QuietConsole()
+    view = ProgressView()
 
     def progress_callback(message: str) -> None:
-        status_queue.put(message)
-        match = re.search(r"Stage (\d+) is processing", message)
-        if match:
-            console_logger.start_stage(int(match.group(1)))
+        # Compatibility path only: structured events are the primary source of stage identity.
+        status_queue.put(str(message))
+
+    def event_callback(event: ProgressEvent) -> None:
+        # Called from the worker thread and from Stage 5/6 worker threads. Putting on a Queue is the
+        # only cross-thread action taken here; no Gradio component is touched.
+        status_queue.put(event)
 
     def worker() -> None:
         try:
@@ -550,29 +590,39 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
+                    event_callback=event_callback,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
-            result = None, f"❌ Error: {e}", session_state
+            result = None, f"\u274c Error: {e}", session_state
         finally:
             console_logger.finish()
         result_queue.put(result)
         status_queue.put(None)
 
     thread = threading.Thread(target=worker, daemon=True)
-    console_logger.start_stage(1)
     thread.start()
 
-    last_status = initial_status
-    yield None, initial_status, session_state
+    last_status = "Starting\u2026"
+    yield None, last_status, session_state
 
     while True:
-        message = status_queue.get()
-        if message is None:
+        item = status_queue.get()
+        if item is None:
             break
-        if message != last_status:
-            last_status = message
-            yield None, message, session_state
+        if isinstance(item, ProgressEvent):
+            view.apply(item)
+            console_logger.apply_event(item)
+            rendered = view.render()
+        else:
+            # Legacy string status: shown only when no structured event has arrived yet, so the old
+            # "Stage N is processing" sentences cannot overwrite richer structured output.
+            if view.active_stage() is not None:
+                continue
+            rendered = str(item)
+        if rendered != last_status:
+            last_status = rendered
+            yield None, rendered, session_state
 
     thread.join()
     yield result_queue.get()

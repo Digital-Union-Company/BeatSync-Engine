@@ -46,6 +46,8 @@ import beatsync_fork.input_confirmation
 import beatsync_fork.input_manager
 import beatsync_fork.input_report
 import beatsync_fork.input_session
+import beatsync_fork.progress
+import beatsync_fork.progress_view
 forbidden = {forbidden!r}
 leaked = sorted(name for name in forbidden if name in sys.modules)
 print("LEAKED:" + ",".join(leaked))
@@ -99,11 +101,13 @@ def test_fork_modules_import_only_stdlib():
         "collections",
         "dataclasses",
         "enum",
+        "types",
         "typing",
     }
     # beatsync_fork itself is allowed: fork modules may build on each other, just not on the runtime.
     allowed = allowed | {"beatsync_fork"}
-    for module in ("input_manager", "input_report", "input_confirmation", "input_session"):
+    for module in ("input_manager", "input_report", "input_confirmation", "input_session",
+                   "progress", "progress_view"):
         source_path = os.path.join(_SRC, "beatsync_fork", f"{module}.py")
         with open(source_path, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read(), filename=source_path)

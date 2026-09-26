@@ -20,6 +20,105 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-26 (Phase 2A review remediation, round 3)
+
+- **`ProgressEvent.data` is now immutable *recursively*** (`src/beatsync_fork/progress.py`). R2's
+  `MappingProxyType` was shallow, and the pipeline genuinely emits nested mutable values —
+  `section_types=[...]` from Stage 3, `first_failures=[...]` from the Stage 6 refusal — so
+  `event.data["section_types"].append("evil")` still succeeded, and `as_dict()`'s shallow copy handed
+  the *same* nested objects to every consumer. Small stdlib-only `_freeze`/`_thaw` pair: mappings
+  become `MappingProxyType` over recursively frozen copies, lists and tuples become tuples, scalars
+  (including `str`/`bytes`) are untouched. `as_dict()` recursively thaws back to plain
+  `dict`/`list`, so the payload shares no mutable container with the event and stays JSON
+  serialisable. Only the container types the pipeline actually emits are handled; no serialization
+  framework was added.
+- **Stage 5 no longer bills cache hits as analysis throughput** (`progress.py`,
+  `src/video_analysis.py`). `StageCounter.rate` was `current / elapsed`, and the source counter
+  advances for cache hits too, so 420 instant cache hits plus one slow real analysis reported
+  **839.9 sources/s** in the reproduction. The rate basis is now tracked separately from the
+  completion count: `advance(..., counts_toward_rate=False)` records a cache hit without billing it,
+  and `begin_rate_window()` re-bases the clock once the cache scan finishes. The count still reads
+  `421 / 758` with cache hits visible; the rate now reads `0.1 analyzed sources/s`, labelled via a
+  `rate_unit` so a bare `sources/s` cannot be misread next to a count that includes cache hits.
+  **Stage 6 clip throughput is unchanged** — it opens no rate window, so its basis is the whole
+  counter exactly as before. No ETA was added.
+- **A stale straggling progress event no longer wipes a good measurement** (`progress_view.py`).
+  Monotonicity protected `current` but `rate`/`elapsed`/`message` were overwritten unconditionally, so
+  an out-of-order Stage 6 event carrying no rate silently degraded
+  `612 / 1216 · 4.8 clips/s · elapsed 2m 07s` to `612 / 1216`. An event ignored for the count is now
+  ignored for those fields too, and a known measurement is never replaced by `None`. Found by the
+  portable UI smoke, not by the unit tests.
+- **28 new tests** (`tests/test_progress_truth.py`), 16 of which were confirmed failing against
+  `95150de` first, including AST/source assertions that `video_analysis.py` really opts cache hits out
+  of the rate, really re-bases the window, and really labels the rate unit.
+
+### Fixed — 2026-09-26 (Phase 2A review remediation)
+
+- **Progress counters are now subphase-aware** (`src/beatsync_fork/progress_view.py`,
+  `src/video_analysis.py`). Monotonicity was enforced per *stage*, but Stage 6's ProRes path contains
+  two counted subphases with different units and denominators — conversion counts sources, extraction
+  counts clips — so the conversion count leaked into extraction. Reproduced before the fix:
+  758 sources followed by 100 segments rendered **`758 / 100 (758.0%)`**; with 1216 segments,
+  extraction appeared to begin **62.3% complete**. The monotonicity key is now `(stage, phase)`, taken
+  from the `data["phase"]` marker the pipeline already emitted. Nothing carries across a phase
+  boundary — not the count, total, unit, rate or elapsed time — while monotonicity *within* each phase
+  is unchanged, so a straggling `4 / 10` after `7 / 10` still shows `7 / 10`.
+- **No fake percentage for uncounted phases.** `Final assembly started` previously still displayed
+  `1216 / 1216 (100.0%)` as though the assembly itself were complete; the Qwen phase likewise wore the
+  deterministic pass's `758 / 758 (100.0%)`. An uncounted active phase now shows its own state plus a
+  history line (`· 1216 clips completed`) instead of inheriting a counter. The Qwen state events carry
+  `phase="qwen"` so the view can tell the two apart. **Qwen live N/T progress remains NOT implemented
+  (Phase 2B); no `Popen` was introduced.**
+- **`ProgressEvent.data` is genuinely read-only.** `frozen=True` only prevented field rebinding, so
+  `event.data["x"] = ...` succeeded and an event handed to several consumers could be edited under the
+  others. `data` is now a `MappingProxyType` over a private copy; `as_dict()` is built field by field
+  because `dataclasses.asdict` deep-copies and cannot handle a mappingproxy. Stdlib only, no
+  serialization framework.
+- **23 new tests** (`tests/test_progress_phases.py` plus immutability regressions), including AST
+  assertions that `video_processor.py` really emits `prores_convert` / `prores_extract` / `assembly`
+  and `video_analysis.py` really emits `qwen`, so the suite cannot drift into testing an invented
+  event shape.
+
+### Added — 2026-09-26 (Phase 2A — structured progress / observability)
+
+- **Structured progress core** (`src/beatsync_fork/progress.py`, `progress_view.py`): an immutable
+  `ProgressEvent(stage, kind, message, current, total, elapsed_seconds, rate, data)` with a `Stage`
+  enum, `EventKind` (start/progress/metric/state/warning/error/end), JSON-friendly `as_dict()`, and a
+  `StageCounter` that is monotonic, bounded and throttled (~2 updates/sec, always emitting the final
+  one). `emit()` swallows any callback exception — and a `None` event — so observability can never
+  fail a render; `KeyboardInterrupt` still propagates. Stdlib-only, so the whole core is testable on a
+  bare interpreter. `ProgressView` accumulates events into the status panel.
+- **The GUI no longer parses prose for stage identity.** `gui.py` previously recovered the current
+  stage with `re.search(r"Stage (\d+) is processing", message)`; that regex is gone. Stage identity is
+  now the integer `event.stage`. The existing architecture is preserved — worker thread → `queue.Queue`
+  → generator → widgets — and the `event_callback` only ever enqueues, so no Gradio component is
+  touched from a worker thread (asserted by a test).
+- **Stages 1-4** emit start/end boundaries with useful metrics (beats + tempo, features profiled,
+  section count, cuts/beats/ratio/interval/preset). No ETAs: these stages take seconds, so a projection
+  would be noise.
+- **Stage 5 deterministic analysis** reports real source progress — `total` is the actual source count,
+  **cache hits count as completed work** (a fully cached run shows completion rather than sitting at
+  zero), and a video that fails in parallel and is retried serially advances the counter exactly once.
+  Worker count and cache-hit count are reported as metrics.
+- **Stage 6 rendering** reports `current / total` clips against the frame-locked segment count, with
+  measured rate and elapsed. `current` advances only for clips actually created, individual failures
+  surface as concise warnings (first three in detail, then a running count), and the
+  incomplete-timeline refusal — unchanged in behaviour — is now visible in the UI instead of only on a
+  discarded stdout.
+- **ProRes** reports both of its serial loops: sources converted and segments extracted.
+- **Final assembly** emits start/finish states and a concise error on failure. No fake percentage for a
+  single FFmpeg call.
+- **Backward compatible.** `progress_callback` and `console_callback` are untouched and
+  `event_callback` is optional, so CLI/headless callers keep working. Legacy string statuses are still
+  accepted on the same queue, but only shown before any structured event arrives, so they cannot
+  overwrite richer output.
+- **Qwen live progress is NOT implemented.** `video_analysis.py` still launches the worker with
+  `subprocess.run(capture_output=True)`, so the worker's own `Qwen llama.cpp tagged N/T` lines remain
+  invisible to the parent until it exits. Only honest high-level states are emitted
+  (started / tags N/T / finished / failed). Live streaming is **Phase 2B**; no `Popen` was introduced.
+- **100 new tests** (`test_progress_core.py`, `test_progress_sequence.py`, `test_gui_progress_seam.py`)
+  plus the fork no-runtime-dependency guard extended to both new modules.
+
 ### Fixed — 2026-09-26 (Phase 1B review remediation)
 
 - **The render gate now validates the LIVE source controls, not only the stored session state**

@@ -18,6 +18,7 @@ Existing project imports remain compatible:
 
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 
@@ -94,6 +95,9 @@ from typing import Callable, Dict, List, Tuple
 import librosa
 import numpy as np
 from gpu_cpu_utils import GPU_AVAILABLE, clear_gpu_memory
+
+# [FORK] Digital-Union: structured progress events (stdlib-only fork module).
+from beatsync_fork import progress as fork_progress
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -244,6 +248,15 @@ def _notify_console(console_callback: Callable[[int, str], None] | None,
         pass
 
 
+def _emit(event_callback, event) -> None:
+    """[FORK] Digital-Union: deliver one structured ProgressEvent, never failing the pipeline.
+
+    Additive: `progress_callback` and `console_callback` above are untouched, so headless/CLI callers
+    that pass neither, or only those, keep working exactly as before.
+    """
+    fork_progress.emit(event_callback, event)
+
+
 def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        end_time: float = None, use_gpu: bool = False,
                        video_files: List[str] = None,
@@ -251,7 +264,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        enable_qwen_semantics: bool = True,
                        qwen_model_path: str = None,
                        progress_callback: Callable[[str], None] | None = None,
-                       console_callback: Callable[[int, str], None] | None = None) -> Tuple[np.ndarray, Dict]:
+                       console_callback: Callable[[int, str], None] | None = None,
+                       event_callback: Callable[[object], None] | None = None) -> Tuple[np.ndarray, Dict]:
     """
     Build a cleaner Auto Mode cut plan.
 
@@ -283,14 +297,23 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         y_harmonic, y_percussive = y, y
 
     _notify_progress(progress_callback, 1)
+    _emit(event_callback, fork_progress.start(1, "Detecting beat grid"))
+    _stage_started = time.perf_counter()
     print("   🥁 Step 1: Detecting stable beat grid...")
     beat_times, tempo, beat_frames, onset_env = detect_master_beat_grid(y_percussive, sr, cfg)
     if len(beat_times) < 2:
         raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
     print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
     _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
+    _emit(event_callback, fork_progress.end(
+        1, f"{len(beat_times)} beats at {tempo:.1f} BPM",
+        elapsed_seconds=time.perf_counter() - _stage_started,
+        beats=int(len(beat_times)), tempo=float(tempo),
+    ))
 
     _notify_progress(progress_callback, 2)
+    _emit(event_callback, fork_progress.start(2, "Reading energy and rhythm features"))
+    _stage_started = time.perf_counter()
     print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
     features = analyze_wave_features(y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu)
     wave = np.asarray(features.get("wave", []), dtype=float)
@@ -304,8 +327,15 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         _notify_console(console_callback, 2, f"Strong rhythm impacts: {strong_impacts}/{len(impact)} beats")
     if rhythm.size:
         _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
+    _emit(event_callback, fork_progress.end(
+        2, f"{len(beat_times)} beats profiled",
+        elapsed_seconds=time.perf_counter() - _stage_started,
+        average_wave=float(np.mean(wave)) if wave.size else None,
+    ))
 
     _notify_progress(progress_callback, 3)
+    _emit(event_callback, fork_progress.start(3, "Detecting musical sections"))
+    _stage_started = time.perf_counter()
     print("   🎼 Step 3: Detecting broad musical sections...")
     sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg)
     print(f"      ✓ {len(sections)} sections")
@@ -320,8 +350,16 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
             3,
             f"Longest section: {longest.get('type', 'section')} ({float(longest.get('duration', 0.0)):.1f}s)",
         )
+    _emit(event_callback, fork_progress.end(
+        3, f"{len(sections)} sections",
+        elapsed_seconds=time.perf_counter() - _stage_started,
+        sections=int(len(sections)),
+        section_types=[str(sec.get("type", "section")) for sec in sections],
+    ))
 
     _notify_progress(progress_callback, 4)
+    _emit(event_callback, fork_progress.start(4, "Selecting rhythmic cuts"))
+    _stage_started = time.perf_counter()
     print("   🧠 Step 4: Selecting deliberate rhythmic cuts...")
     selected_beats, selection_info = select_wave_cuts(
         beat_times=beat_times,
@@ -361,6 +399,16 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     )
     print(f"   ✓ Smart preset: {audio_visual_profile['smart_preset']}")
     _notify_console(console_callback, 4, f"Preset: {audio_visual_profile['smart_preset']}")
+    _emit(event_callback, fork_progress.end(
+        4,
+        f"{len(selected_beats)} cuts from {len(beat_times)} beats ({cut_ratio:.1f}%)",
+        current=int(len(selected_beats)), total=int(len(beat_times)),
+        elapsed_seconds=time.perf_counter() - _stage_started,
+        cuts=int(len(selected_beats)), beats=int(len(beat_times)),
+        cut_ratio_percent=float(cut_ratio),
+        average_interval_seconds=float(avg_interval) if avg_interval else None,
+        smart_preset=str(audio_visual_profile["smart_preset"]),
+    ))
 
     video_analysis = None
     should_analyze_video = bool(
@@ -385,10 +433,15 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                 use_gpu=use_gpu,
                 enable_ai=qwen_enabled,
                 qwen_model_path=model_path,
+                event_callback=event_callback,
             )
         except Exception as e:
             print(f"   ⚠️  Video analysis failed; renderer will use fallback sampling: {e}")
             _notify_console(console_callback, 5, f"Video analysis failed; fallback sampling: {e}")
+            _emit(event_callback, fork_progress.warning(
+                5, f"Video analysis failed; renderer will use fallback sampling: {e}"
+            ))
+            _emit(event_callback, fork_progress.end(5, "Video analysis unavailable"))
 
     energy_profile = {
         "beat_energy": features["energy"],
