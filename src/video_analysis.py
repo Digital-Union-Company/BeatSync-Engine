@@ -425,6 +425,7 @@ def analyze_video_sources(
             5,
             f"Qwen semantic tagging started ({len(deferred_jobs)} video(s)) — "
             f"no live per-frame progress until Phase 2B",
+            phase="qwen",
             qwen_videos=len(deferred_jobs),
             qwen_live_progress_available=False,
         ))
@@ -469,7 +470,8 @@ def analyze_video_sources(
                 qwen_seconds=float(qwen_elapsed),
             ))
         fork_progress.emit(event_callback, fork_progress.state(
-            5, "Qwen semantic tagging finished", qwen_seconds=float(qwen_elapsed)))
+            5, "Qwen semantic tagging finished", phase="qwen",
+            qwen_seconds=float(qwen_elapsed)))
 
     for job in jobs:
         video_data = results_by_index.get(job["index"])

@@ -28,7 +28,8 @@ Design constraints
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from enum import Enum
 from typing import Any, Callable, Mapping
 
@@ -95,6 +96,17 @@ class ProgressEvent:
     rate: float | None = None
     data: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Make ``data`` genuinely read-only.
+
+        ``frozen=True`` only stops field *rebinding*; without this, ``event.data["x"] = ...`` was
+        possible, so an event handed to several consumers could be edited under the others. A
+        ``MappingProxyType`` over a private copy closes that. Note this is also why
+        :meth:`as_dict` cannot use ``dataclasses.asdict`` — that deep-copies, and a mappingproxy is
+        not copyable.
+        """
+        object.__setattr__(self, "data", MappingProxyType(dict(self.data)))
+
     @property
     def stage_title(self) -> str:
         return STAGE_TITLES.get(self.stage, f"Stage {self.stage}")
@@ -110,13 +122,23 @@ class ProgressEvent:
         return self.current is not None and self.total is not None
 
     def as_dict(self) -> dict[str, Any]:
-        """JSON-friendly form. ``kind`` becomes its string value; ``data`` is copied."""
-        payload = asdict(self)
-        payload["kind"] = self.kind.value
-        payload["data"] = dict(self.data)
-        payload["schema"] = PROGRESS_SCHEMA
-        payload["stage_title"] = self.stage_title
-        return payload
+        """JSON-friendly form. ``kind`` becomes its string value; ``data`` is copied.
+
+        Built field by field rather than with ``dataclasses.asdict``, which deep-copies and cannot
+        handle the read-only ``data`` mapping.
+        """
+        return {
+            "stage": self.stage,
+            "kind": self.kind.value,
+            "message": self.message,
+            "current": self.current,
+            "total": self.total,
+            "elapsed_seconds": self.elapsed_seconds,
+            "rate": self.rate,
+            "data": dict(self.data),
+            "schema": PROGRESS_SCHEMA,
+            "stage_title": self.stage_title,
+        }
 
     def with_elapsed(self, elapsed_seconds: float) -> "ProgressEvent":
         return replace(self, elapsed_seconds=float(elapsed_seconds))

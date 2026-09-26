@@ -101,6 +101,7 @@ def test_fork_modules_import_only_stdlib():
         "collections",
         "dataclasses",
         "enum",
+        "types",
         "typing",
     }
     # beatsync_fork itself is allowed: fork modules may build on each other, just not on the runtime.

@@ -154,6 +154,18 @@ Rules that are load-bearing:
 - **`StageCounter` is monotonic, bounded and throttled** (~2 updates/sec, final update always sent).
   Stage 5 retries a failed video serially and Stage 6 collects clips out of order via `as_completed`;
   neither may make the displayed count go backwards or exceed the total.
+- **Monotonicity is per `(stage, phase)`, never per stage.** A stage number is not a counter: Stage 6's
+  ProRes path counts *sources* while converting and *clips* while extracting, with different
+  denominators, then runs an uncounted assembly phase; Stage 5 counts sources then runs Qwen. The phase
+  comes from `data["phase"]` (`prores_convert`, `prores_extract`, `assembly`, `qwen`); events without
+  one belong to the stage's main counter. Merging them produced `758 / 100 (758%)` and an extraction
+  that looked 62% done before it started. Nothing may carry across a phase boundary — count, total,
+  unit, rate or elapsed.
+- **An uncounted active phase shows no percentage.** Assembly and Qwen must not inherit the previous
+  counter; `ProgressView` shows their state plus a history line (`· 1216 clips completed`) instead.
+- **`ProgressEvent.data` is a read-only `MappingProxyType`.** `frozen=True` alone allowed
+  `event.data["x"] = ...`. That is also why `as_dict()` is built field by field rather than with
+  `dataclasses.asdict`, which deep-copies and cannot handle a mappingproxy.
 - **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
   the generator does all widget updates. A test asserts the callback's only method call is `put`.
 - **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of

@@ -80,6 +80,40 @@ def test_as_dict_is_json_serialisable():
     assert decoded["stage_title"] == "Video Analysis"
 
 
+def test_event_data_is_read_only():
+    """`frozen=True` only stops field rebinding; the data mapping must be read-only too.
+
+    Regression: `event.data["injected"] = "yes"` used to succeed, so an event handed to several
+    consumers (queue reader, console logger, a later run manifest) could be edited under the others.
+    """
+    event = progress(5, 1, 2, "x", cache_hits=7)
+    with pytest.raises(TypeError):
+        event.data["injected"] = "yes"          # type: ignore[index]
+    with pytest.raises(TypeError):
+        del event.data["cache_hits"]           # type: ignore[attr-defined]
+    assert dict(event.data) == {"cache_hits": 7}, "data must still be readable"
+
+
+def test_event_data_is_isolated_from_the_caller_dict():
+    """Mutating the dict passed in must not change the event afterwards."""
+    payload = {"cache_hits": 1}
+    event = metric(5, "m", **payload)
+    payload["cache_hits"] = 999
+    assert event.data["cache_hits"] == 1
+
+
+def test_frozen_event_still_supports_dataclasses_replace():
+    """with_elapsed uses dataclasses.replace; the read-only mapping must not break it."""
+    from dataclasses import replace as dc_replace
+
+    event = progress(6, 1, 2, "x", unit="clips")
+    updated = dc_replace(event, current=2)
+    assert updated.current == 2
+    assert dict(updated.data) == {"unit": "clips"}
+    with pytest.raises(TypeError):
+        updated.data["unit"] = "sources"       # type: ignore[index]
+
+
 def test_as_dict_copies_data_so_mutation_cannot_leak():
     event = metric(1, "m", beats=10)
     payload = event.as_dict()

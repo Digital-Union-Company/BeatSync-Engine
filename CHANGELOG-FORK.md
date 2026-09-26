@@ -20,6 +20,33 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-26 (Phase 2A review remediation)
+
+- **Progress counters are now subphase-aware** (`src/beatsync_fork/progress_view.py`,
+  `src/video_analysis.py`). Monotonicity was enforced per *stage*, but Stage 6's ProRes path contains
+  two counted subphases with different units and denominators — conversion counts sources, extraction
+  counts clips — so the conversion count leaked into extraction. Reproduced before the fix:
+  758 sources followed by 100 segments rendered **`758 / 100 (758.0%)`**; with 1216 segments,
+  extraction appeared to begin **62.3% complete**. The monotonicity key is now `(stage, phase)`, taken
+  from the `data["phase"]` marker the pipeline already emitted. Nothing carries across a phase
+  boundary — not the count, total, unit, rate or elapsed time — while monotonicity *within* each phase
+  is unchanged, so a straggling `4 / 10` after `7 / 10` still shows `7 / 10`.
+- **No fake percentage for uncounted phases.** `Final assembly started` previously still displayed
+  `1216 / 1216 (100.0%)` as though the assembly itself were complete; the Qwen phase likewise wore the
+  deterministic pass's `758 / 758 (100.0%)`. An uncounted active phase now shows its own state plus a
+  history line (`· 1216 clips completed`) instead of inheriting a counter. The Qwen state events carry
+  `phase="qwen"` so the view can tell the two apart. **Qwen live N/T progress remains NOT implemented
+  (Phase 2B); no `Popen` was introduced.**
+- **`ProgressEvent.data` is genuinely read-only.** `frozen=True` only prevented field rebinding, so
+  `event.data["x"] = ...` succeeded and an event handed to several consumers could be edited under the
+  others. `data` is now a `MappingProxyType` over a private copy; `as_dict()` is built field by field
+  because `dataclasses.asdict` deep-copies and cannot handle a mappingproxy. Stdlib only, no
+  serialization framework.
+- **23 new tests** (`tests/test_progress_phases.py` plus immutability regressions), including AST
+  assertions that `video_processor.py` really emits `prores_convert` / `prores_extract` / `assembly`
+  and `video_analysis.py` really emits `qwen`, so the suite cannot drift into testing an invented
+  event shape.
+
 ### Added — 2026-09-26 (Phase 2A — structured progress / observability)
 
 - **Structured progress core** (`src/beatsync_fork/progress.py`, `progress_view.py`): an immutable
