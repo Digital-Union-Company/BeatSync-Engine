@@ -363,6 +363,11 @@ def _iter_candidate_paths(root: str, recursive: bool) -> Iterator[str]:
     partial. Note that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an
     entry as a file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE``
     rejection, so it is still reported rather than lost.
+
+    Both modes follow the same rule for *entries*: this function decides only "directory or not", and
+    anything that is not a directory is passed to the classifier, which owns extension, ``stat``,
+    regular-file, empty-file and ``UNREADABLE`` handling. No entry may be dropped here, because an
+    entry dropped here is invisible in every count the report publishes.
     """
     if recursive:
         walk = os.walk(root, onerror=_walk_error_raiser(root), followlinks=False)
@@ -372,15 +377,31 @@ def _iter_candidate_paths(root: str, recursive: bool) -> Iterator[str]:
                 yield os.path.join(dirpath, name)
         return
 
+    entries: list[os.DirEntry] = []
     try:
-        with os.scandir(root) as entries:
-            names = sorted(entry.name for entry in entries)
+        with os.scandir(root) as scanner:
+            for entry in scanner:
+                entries.append(entry)
     except OSError as exc:
         raise InputScanError(f"Cannot list folder: {root} ({exc})") from exc
-    for name in names:
-        candidate = os.path.join(root, name)
-        if os.path.isfile(candidate):
-            yield candidate
+
+    for entry in sorted(entries, key=lambda item: item.name):
+        # Exclude directories only. Everything else — including an entry whose metadata cannot be
+        # read — is handed to the classifier, which accounts for it explicitly (UNREADABLE /
+        # NOT_A_FILE / EMPTY_FILE) instead of dropping it.
+        #
+        # This must not be written as `if os.path.isfile(entry.path)`: os.path.isfile() *suppresses*
+        # stat/access errors and returns False, so a locked or vanished top-level source file
+        # disappeared before the classifier saw it — absent from ready, absent from rejected, and
+        # missing from discovered_count, so even the counting invariant could not detect the loss.
+        try:
+            is_directory = entry.is_dir()
+        except OSError:
+            # Same policy as os.walk, which treats an entry it cannot classify as a non-directory:
+            # account for it downstream rather than silently skip it.
+            is_directory = False
+        if not is_directory:
+            yield entry.path
 
 
 def scan_folder(

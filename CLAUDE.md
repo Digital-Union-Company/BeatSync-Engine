@@ -228,6 +228,14 @@ unless an `onerror` callback is passed, so never drop the one in `_walk_error_ra
 bug this module exists to prevent. Unreadable *files* are different: they stay `unreadable`
 rejections, because a named rejection is not a silent loss.
 
+**No entry may be dropped by a probe in `_iter_candidate_paths()`.** It decides only "directory or
+not"; everything else goes to the classifier, which owns extension, `stat`, regular-file, empty-file
+and `UNREADABLE` handling. Never reintroduce `os.path.isfile()` / `os.path.isdir()` as the filter:
+they *suppress* stat errors and return `False`, so an unreadable entry vanishes from `ready`,
+`rejected` **and** `discovered_count` — invisible even to the counting invariant. (Note for tests:
+since Python 3.13 on Windows `os.path.isfile` is `nt._path_isfile`, a C builtin that never calls
+`os.stat`, so patching `os.stat` alone cannot simulate an unreadable path.)
+
 ---
 
 # Repository Workflow Policy: DU-REPO-WORKFLOW-v1

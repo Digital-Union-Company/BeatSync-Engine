@@ -50,6 +50,18 @@ behaviour is preserved as the default.
   `followlinks=False` and all ordering, classification and accounting semantics are unchanged.
   Individual files that cannot be stat'ed remain `unreadable` rejections rather than scan failures,
   because a named rejection is not a silent loss.
+- **Non-recursive scans no longer drop an entry whose metadata probe fails**
+  (`src/beatsync_fork/input_manager.py`). The non-recursive iterator selected entries with
+  `os.path.isfile()`, which *suppresses* stat/access errors and returns `False`. A locked, offline or
+  vanished top-level source file therefore disappeared before the classifier saw it — absent from
+  `ready`, absent from `rejected`, and missing from `discovered_count`, so even the
+  `discovered == ready + rejected + path_collisions` invariant could not detect the loss. Reproduced:
+  a three-file folder with one unreadable `.mp4` reported `discovered=2, ready=2, rejected=0` and
+  INPUT READY. The iterator now decides only "directory or not" from the `scandir` entry and passes
+  everything else to the classifier, which accounts for it as `unreadable`. This also removes a
+  redundant `stat` per entry. Ordinary directories are still excluded; recursive behaviour,
+  ordering, duplicate and collision semantics are unchanged. Side effect: a broken symlink at the top
+  level is now reported as an `unreadable` rejection instead of vanishing.
 
 ### Removed — 2026-09-26
 
