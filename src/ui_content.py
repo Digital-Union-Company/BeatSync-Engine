@@ -339,6 +339,33 @@ INFO_PARALLEL_WORKERS = "Clips processed simultaneously. More workers with GPU."
 LABEL_OUTPUT_FILENAME = "📝 Output Filename"
 INFO_OUTPUT_FILENAME = "Timestamp added automatically (.mkv or .mov)"
 
+# ============================================================================
+# [FORK] Digital-Union: video-source mode + confirmation gate labels
+# See src/beatsync_fork/input_session.py for the behaviour these labels describe.
+# ============================================================================
+
+LABEL_SOURCE_MODE = "🎬 Video Source"
+CHOICE_SOURCE_LOCAL_FOLDER = "Local folder — recommended for large libraries"
+CHOICE_SOURCE_BROWSER_FILES = "Browser files"
+INFO_SOURCE_MODE = (
+    "Local folder reads your files in place — nothing is copied, and the counts are exact. "
+    "Browser files uploads copies into the app's temp folder."
+)
+
+LABEL_SOURCE_FOLDER = "📂 Source Folder"
+PLACEHOLDER_SOURCE_FOLDER = r"J:\New folder\Cuts"
+INFO_SOURCE_FOLDER = "Local path to the folder holding your .mp4 / .mkv source videos."
+
+LABEL_SOURCE_RECURSIVE = "Include subfolders"
+LABEL_SCAN_FOLDER = "🔍 Scan Folder"
+LABEL_SOURCE_REPORT = "📋 Source Status"
+LABEL_CONFIRM_SOURCES = "✅ Confirm source files"
+
+INFO_CONFIRMATION_GATE = (
+    "Create Music Video stays disabled until you confirm the source list. "
+    "Confirmation covers the actual files, not just the count, and is re-checked before rendering."
+)
+
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
     """GPU status info."""
     if gpu_available and nvenc_available:

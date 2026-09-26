@@ -42,8 +42,10 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 _PROBE = """
 import sys
 import beatsync_fork
+import beatsync_fork.input_confirmation
 import beatsync_fork.input_manager
 import beatsync_fork.input_report
+import beatsync_fork.input_session
 forbidden = {forbidden!r}
 leaked = sorted(name for name in forbidden if name in sys.modules)
 print("LEAKED:" + ",".join(leaked))
@@ -84,7 +86,7 @@ def test_fork_package_pulls_in_no_runtime_dependency():
     assert leaked == [], f"beatsync_fork imported forbidden modules: {leaked}"
 
 
-def test_input_manager_source_imports_only_stdlib():
+def test_fork_modules_import_only_stdlib():
     """Static check, so the guarantee holds even where a dependency happens not to be installed."""
     import ast
 
@@ -99,15 +101,18 @@ def test_input_manager_source_imports_only_stdlib():
         "enum",
         "typing",
     }
-    source_path = os.path.join(_SRC, "beatsync_fork", "input_manager.py")
-    with open(source_path, "r", encoding="utf-8") as handle:
-        tree = ast.parse(handle.read(), filename=source_path)
+    # beatsync_fork itself is allowed: fork modules may build on each other, just not on the runtime.
+    allowed = allowed | {"beatsync_fork"}
+    for module in ("input_manager", "input_report", "input_confirmation", "input_session"):
+        source_path = os.path.join(_SRC, "beatsync_fork", f"{module}.py")
+        with open(source_path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=source_path)
 
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            imported.add(node.module.split(".")[0])
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                imported.add(node.module.split(".")[0])
 
-    assert imported <= allowed, f"unexpected imports: {sorted(imported - allowed)}"
+        assert imported <= allowed, f"{module}: unexpected imports {sorted(imported - allowed)}"

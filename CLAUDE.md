@@ -199,19 +199,46 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `__init__.py` | fork identity: `FORK_NAME`, `FORK_VERSION`, `UPSTREAM_BASELINE_COMMIT`, `fork_identity()` |
 | `input_manager.py` | `scan_folder()` — deterministic local-folder source discovery with exact accounting |
 | `input_report.py` | `InputReport` — renders and serialises the counts from an `InputSet` |
+| `input_confirmation.py` | `SourceSnapshot` identity + `evaluate_gate()` — what "confirmed" means |
+| `input_session.py` | the source-input state machine and `resolve_for_render()` — the actual gate |
 
-### Input manager status
+### Video source modes and the confirmation gate
 
 ```
 INPUT MANAGER CORE EXISTS
-GUI INTEGRATION = NOT YET IMPLEMENTED
+GUI INTEGRATION = IMPLEMENTED (local folder + browser, confirmation gate)
 ```
 
-`scan_folder()` is currently reachable only from tests and from Python. **`gui.py` is untouched** and
-still uses upstream's `gr.File` multi-upload path, so the failure this module was written to prevent —
-a partially-uploaded selection rendering silently from a truncated source set (observed: 329 of ~701
-files reaching Stage 5) — is **not yet fixed in the app**. Wiring the folder-mode UI, the READY state
-and the confirm-before-render gate is the next slice.
+`gui.py` has a **Video Source** block with two modes:
+
+- **Local folder** (default, recommended for large libraries) — `scan_folder()` enumerates the folder
+  server-side, so `Discovered / Supported / Rejected / Ready / Duplicates / Total size` are exact by
+  construction. Files are used **in place**: nothing is copied, and the paths handed to the pipeline
+  are the user's original files.
+- **Browser files** — upstream's `gr.File` multi-upload, unchanged. Gradio still copies these into
+  `input/gradio_uploads/`.
+
+**Browser mode reports only `Backend ready: N`** — the count the server has actually received. The
+number of files the user picked in the browser dialog is frontend state that is never transmitted, so
+a "selected" or "pending" figure would be fabricated. `tests/test_input_gate.py` asserts no such
+number is ever printed. Do not add JS to scrape it; the fix does not depend on knowing it.
+
+**Create Music Video is disabled until the source set is explicitly confirmed**, and confirmation is
+over a `SourceSnapshot` — an ordered identity of path + size + mtime_ns per file, plus mode, scan root
+and the recursive flag — not a count. Two different lists of the same length are different
+confirmations. Identity deliberately does **not** hash file contents; the head+tail fingerprint in
+`input_manager` is for duplicate candidacy and must not become a per-render cost.
+
+Any source change clears the confirmation (mode switch, folder path, recursive toggle, re-scan, browser
+list change). Non-source settings — FPS, encoder, output filename, audio — must **not**: they are not
+wired to these transitions, and a test asserts the confirmation survives them.
+
+**`process_video_guarded()` in `gui.py` is the real gate.** Button state is only a projection of
+backend state; the handler re-derives the source identity from the filesystem on every click and
+refuses before any Stage 1 work if it no longer matches. Folder mode re-scans with
+`detect_duplicates=False` (duplicate grouping is reporting, not identity); browser mode re-stats the
+confirmed paths. On success it hands the existing `process_video()` the same `List[str]` it always
+consumed, so Auto Mode and the renderer remain unaware that input modes exist.
 
 What the core does: enumerates `.mp4`/`.mkv` under a folder (optionally recursive); rejects entries
 with a recorded reason (`unsupported_extension`, `empty_file`, `not_a_file`, `unreadable`); collapses a

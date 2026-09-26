@@ -30,6 +30,17 @@ This repository is **Digital Union's fork** of [Merserk/BeatSync-Engine](https:/
 
 Upstream Auto Mode creative behaviour is preserved as the default: install this fork, leave the settings alone, and you get upstream's editing behaviour. Fork-specific code is kept in `src/beatsync_fork/` so that upstream synchronisation stays straightforward.
 
+### Video source: local folder + confirmation
+
+This fork adds a **Video Source** section with two modes:
+
+*   **Local folder** (default, recommended for large libraries) — type a folder path, optionally include subfolders, and press **Scan Folder**. The app enumerates the folder itself and reports exact counts (discovered / supported / rejected / ready / duplicates / total size). **Your video files are read in place — nothing is copied.**
+*   **Browser files** — the original multi-file picker. Gradio still uploads copies into `input/gradio_uploads/`. This mode reports **Backend ready: N**, the number of files the app has actually received; the number you picked in the file dialog is browser-side information that is never sent to the app, so it cannot be shown. Wait until `Backend ready` matches what you expect before confirming.
+
+**🎬 Create Music Video stays disabled until you press Confirm.** Confirmation covers the actual file set — not just how many — and is re-checked immediately before rendering. If anything changed in the meantime (files added, removed, renamed or modified), the render is refused with `SOURCE INPUT CHANGED` instead of quietly starting from a different set of clips.
+
+This exists because a real run rendered from only 329 of ~701 selected files, with no warning: the browser had not finished uploading them all.
+
 ---
 
 ## 🎥 Demo Video

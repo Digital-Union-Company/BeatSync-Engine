@@ -20,6 +20,39 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-26 (Phase 1B — GUI source modes + confirmation gate)
+
+- **Local folder video-source mode** (`src/gui.py`, `src/ui_content.py`), the new default and the
+  recommended mode for large libraries. It calls the existing `beatsync_fork.input_manager` — no
+  duplicate enumeration logic in the UI — and shows exact
+  `Discovered / Supported / Rejected / Ready / Duplicates / Total size`. Source files are referenced
+  **in place**: no Gradio upload, no copies. Browser-files mode remains available and unchanged.
+- **Authoritative confirmation gate.** `Create Music Video` now starts disabled and is enabled only by
+  an explicit `Confirm N files` action.
+- **`src/beatsync_fork/input_confirmation.py`**: `SourceSnapshot` — an ordered identity over
+  (normalised path, size, mtime_ns) per file plus mode, scan root and recursive flag, digested with
+  SHA-256. Confirmation is over the **set**, not the count, so two different lists of equal length are
+  never interchangeable. File contents are not hashed: the head+tail fingerprint in `input_manager` is
+  for duplicate candidacy and must not become a per-render cost. Also provides `describe_change()` for
+  actionable abort messages and `evaluate_gate()`.
+- **`src/beatsync_fork/input_session.py`**: the source state machine (`set_mode`, `set_folder_path`,
+  `set_recursive`, `scan_folder_action`, `set_browser_files`, `confirm_action`) and
+  `resolve_for_render()`. Pure, Gradio-free and stdlib-only, so the gate is fully testable without a
+  web server.
+- **Render-time re-verification.** `process_video_guarded()` in `gui.py` re-derives source identity
+  from the filesystem on every click and refuses before Stage 1 if it no longer matches the
+  confirmation. UI disablement alone is treated as a courtesy, not a guarantee.
+- **Invalidation rules**: mode switch, folder path change, recursive toggle, re-scan, and any browser
+  file-list change all clear the confirmation. FPS, encoder, output filename and audio deliberately do
+  not — they are not source identity, and a test asserts the confirmation survives them.
+- **Honest browser semantics.** Browser mode reports only `Backend ready: N`. The browser-side
+  selected/pending count is never transmitted to Python, so it is never displayed; a test asserts no
+  such number is printed.
+- **64 new tests** (`tests/test_input_confirmation.py`, `tests/test_input_gate.py`) covering snapshot
+  identity (added / removed / replaced-same-count / renamed / size / mtime / order / root / recursive /
+  mode), empty-set refusal, and the full gate matrix. The fork no-runtime-dependency guard now covers
+  the two new modules as well.
+
 ### Added — 2026-09-26
 
 - **Repository workflow policy** (`CLAUDE.md`): `DU-REPO-WORKFLOW-v1` task-closeout rules.
