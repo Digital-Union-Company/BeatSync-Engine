@@ -110,6 +110,21 @@ from video_processor import create_music_video
 
 from auto_mode import analyze_beats_auto
 
+# [FORK] Digital-Union: source-input confirmation gate. All decision logic lives in
+# src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires it to widgets.
+from beatsync_fork.input_confirmation import SourceMode
+from beatsync_fork.input_session import (
+    confirm_action,
+    initial_state as initial_source_state,
+    live_declaration,
+    resolve_for_render,
+    scan_folder_action,
+    set_browser_files,
+    set_folder_path,
+    set_mode,
+    set_recursive,
+)
+
 # Import UI content
 from ui_content import *
 
@@ -563,6 +578,105 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
     yield result_queue.get()
 
 
+# [FORK] Digital-Union: source-confirmation UI glue.
+#
+# These handlers are deliberately thin. Every decision — what invalidates a confirmation, what may be
+# confirmed, whether a render may start — is made by beatsync_fork.input_session, which has no Gradio
+# dependency and is covered by tests/test_input_gate.py. Nothing here is authoritative: the Gradio
+# State object holds the backend truth, and process_video_guarded() re-checks it against the
+# filesystem before any Stage 1 work begins.
+
+SOURCE_MODE_VALUES = {
+    SourceMode.LOCAL_FOLDER.value: SourceMode.LOCAL_FOLDER,
+    SourceMode.BROWSER_FILES.value: SourceMode.BROWSER_FILES,
+}
+
+
+def _source_ui_updates(state) -> Tuple:
+    """Project the backend source state onto the four source widgets plus the Create button."""
+    return (
+        state.report_text,
+        gr.update(value=state.confirm_button_label(), interactive=state.can_confirm()),
+        state.confirmation_status_text(),
+        gr.update(interactive=state.is_confirmed()),
+        state,
+    )
+
+
+def _on_source_mode_change(mode_value: str, state) -> Tuple:
+    mode = SOURCE_MODE_VALUES.get(str(mode_value), SourceMode.LOCAL_FOLDER)
+    new_state = set_mode(state, mode)
+    is_folder = mode is SourceMode.LOCAL_FOLDER
+    return (gr.update(visible=is_folder), gr.update(visible=not is_folder)) + _source_ui_updates(
+        new_state
+    )
+
+
+def _on_folder_path_change(folder_path: str, state) -> Tuple:
+    return _source_ui_updates(set_folder_path(state, folder_path))
+
+
+def _on_recursive_change(recursive: bool, state) -> Tuple:
+    return _source_ui_updates(set_recursive(state, recursive))
+
+
+def _on_scan_click(folder_path: str, recursive: bool, state) -> Tuple:
+    # Re-apply the live widget values first: a Textbox `change` event may not have fired yet if the
+    # user typed a path and clicked Scan immediately, and the scan must use what is on screen.
+    state = set_recursive(set_folder_path(state, folder_path), recursive)
+    return _source_ui_updates(scan_folder_action(state))
+
+
+def _on_browser_files_change(file_paths, state) -> Tuple:
+    return _source_ui_updates(set_browser_files(state, file_paths))
+
+
+def _on_confirm_click(state) -> Tuple:
+    return _source_ui_updates(confirm_action(state))
+
+
+def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
+                          source_recursive: bool, video_input: VideoFilesInput,
+                          output_filename: str, processing_mode: str,
+                          custom_fps: float, session_state: dict,
+                          source_state) -> Iterator[StatusResult]:
+    """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
+
+    This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
+    or a direct API call can all reach this handler.
+
+    Crucially it takes the **live** source-control values submitted with this request, not just the
+    stored session state. Gradio delivers widget changes as separate queued events, so at click time
+    the state can lag behind the widgets — a file can finish uploading, or the folder textbox can
+    change, before its `change` handler has run. Trusting the state alone would approve a render for a
+    source set the user is no longer declaring. The event handlers above remain for immediate UX
+    feedback; this is the authority.
+
+    On success the freshly verified paths are handed to the existing `process_video` generator as the
+    same `List[str]` it already consumed, so Auto Mode and the renderer are entirely unaware of input
+    modes.
+    """
+    # Parameter names deliberately mirror the widget names in process_btn.click(inputs=...):
+    # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
+    # the two lists line up name-for-name.
+    decision = resolve_for_render(
+        source_state,
+        live_declaration(source_mode, source_folder, source_recursive, video_input),
+    )
+    if not decision.allowed:
+        yield None, f"❌ {decision.message}", session_state
+        return
+
+    yield from process_video(
+        audio_file=audio_file,
+        video_files=list(decision.paths),
+        output_filename=output_filename,
+        processing_mode=processing_mode,
+        custom_fps=custom_fps,
+        session_state=session_state,
+    )
+
+
 def cleanup_on_startup():
     """
     Clean temporary runtime files on script start while preserving user inputs
@@ -613,15 +727,62 @@ def create_ui() -> gr.Blocks:
     app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
     with app:
         session_state = gr.State({})
+        # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
+        # session state so source identity is never entangled with render bookkeeping.
+        source_state = gr.State(initial_source_state())
 
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
-        
+
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
-                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
+
+                # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
+                with gr.Group():
+                    gr.Markdown('### 🎬 Video Source')
+                    source_mode = gr.Radio(
+                        choices=[
+                            (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
+                            (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
+                        ],
+                        value=SourceMode.LOCAL_FOLDER.value,
+                        label=LABEL_SOURCE_MODE,
+                        info=INFO_SOURCE_MODE,
+                        elem_id='source-mode-radio',
+                    )
+
+                    with gr.Group(visible=True) as folder_group:
+                        source_folder = gr.Textbox(
+                            label=LABEL_SOURCE_FOLDER,
+                            placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                            info=INFO_SOURCE_FOLDER,
+                            elem_id='source-folder-input',
+                        )
+                        source_recursive = gr.Checkbox(
+                            value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
+                        )
+                        scan_btn = gr.Button(LABEL_SCAN_FOLDER, elem_id='scan-folder-button')
+
+                    with gr.Group(visible=False) as browser_group:
+                        video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
+
+                    source_report = gr.Textbox(
+                        label=LABEL_SOURCE_REPORT,
+                        value=initial_source_state().report_text,
+                        interactive=False,
+                        lines=9,
+                        max_lines=14,
+                        elem_id='source-report-box',
+                    )
+                    confirm_btn = gr.Button(
+                        LABEL_CONFIRM_SOURCES, interactive=False, elem_id='confirm-sources-button'
+                    )
+                    confirm_status = gr.Markdown(
+                        initial_source_state().confirmation_status_text(),
+                        elem_id='confirm-status',
+                    )
 
                 with gr.Group():
                     gr.Markdown('### ⚙️ Video Settings')
@@ -638,19 +799,66 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown('### 📁 Output Settings')
                     output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
 
-                process_btn = gr.Button('🎬 Create Music Video', variant='primary', size='lg')
+                # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
+                process_btn = gr.Button(
+                    '🎬 Create Music Video', variant='primary', size='lg', interactive=False
+                )
+                gr.Markdown(INFO_CONFIRMATION_GATE)
 
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
                 
+        # [FORK] Digital-Union: source-mode / scan / confirm wiring.
+        #
+        # Every one of these events routes through beatsync_fork.input_session, so any source change
+        # clears the confirmation and disables Create Music Video. Note which inputs are absent:
+        # FPS, encoder, output filename and audio are never wired here, so changing them cannot
+        # invalidate a source confirmation — they are not source-video identity.
+        source_outputs = [source_report, confirm_btn, confirm_status, process_btn, source_state]
+
+        source_mode.change(
+            fn=_on_source_mode_change,
+            inputs=[source_mode, source_state],
+            outputs=[folder_group, browser_group] + source_outputs,
+        )
+        source_folder.change(
+            fn=_on_folder_path_change,
+            inputs=[source_folder, source_state],
+            outputs=source_outputs,
+        )
+        source_recursive.change(
+            fn=_on_recursive_change,
+            inputs=[source_recursive, source_state],
+            outputs=source_outputs,
+        )
+        scan_btn.click(
+            fn=_on_scan_click,
+            inputs=[source_folder, source_recursive, source_state],
+            outputs=source_outputs,
+        )
+        # `change` covers files arriving, being added to, and being cleared from the browser input.
+        video_input.change(
+            fn=_on_browser_files_change,
+            inputs=[video_input, source_state],
+            outputs=source_outputs,
+        )
+        confirm_btn.click(
+            fn=_on_confirm_click,
+            inputs=[source_state],
+            outputs=source_outputs,
+        )
+
+        # [FORK] Digital-Union: the live source controls are inputs to the render request, so the
+        # gate validates what the widgets currently declare rather than possibly-stale gr.State.
         process_btn.click(
-            fn=process_video,
+            fn=process_video_guarded,
             inputs=[
-                audio_input, video_input,
+                audio_input,
+                source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps,
-                session_state
+                session_state, source_state
             ],
             outputs=[video_output, status_output, session_state],
             show_progress='hidden'
