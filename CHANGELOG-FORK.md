@@ -38,6 +38,19 @@ behaviour is preserved as the default.
 
 - **`README.md`**: added a fork notice and a licence section. Upstream content is otherwise unmodified.
 
+### Fixed — 2026-09-26
+
+- **Input scan no longer silently skips an unscannable directory** (`src/beatsync_fork/input_manager.py`).
+  `os.walk` ignores `scandir` failures unless an `onerror` callback is supplied, so an unreadable,
+  vanished or disconnected nested directory was skipped in silence while `scan_folder()` still
+  returned an `InputSet` that could report INPUT READY — the same silent-truncation failure the module
+  exists to prevent, sourced from the filesystem instead of the browser. Traversal is now
+  all-or-nothing: a complete walk returns an `InputSet`, and any directory that cannot be listed
+  raises `InputScanError` naming the failing path and preserving the original `OSError` as `__cause__`.
+  `followlinks=False` and all ordering, classification and accounting semantics are unchanged.
+  Individual files that cannot be stat'ed remain `unreadable` rejections rather than scan failures,
+  because a named rejection is not a silent loss.
+
 ### Removed — 2026-09-26
 
 - Untracked the stale compiled artefact `src/auto_mode/__pycache__/stage5_qwen_scene_worker.cpython-313.pyc`

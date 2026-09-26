@@ -221,6 +221,13 @@ case-insensitively with a total-order tie-break so two scans agree exactly; and 
 ≤ 2 MiB). Files whose size is unique within the set are never opened at all. It copies nothing,
 transcodes nothing, and deletes nothing — duplicates are reported, never removed.
 
+**Traversal is all-or-nothing, and must stay that way:** a complete walk returns an `InputSet`; any
+directory that cannot be listed raises `InputScanError`. `os.walk` silently skips `scandir` failures
+unless an `onerror` callback is passed, so never drop the one in `_walk_error_raiser()` and never
+"soften" it into a partial result — a quietly smaller library that still reports READY is the exact
+bug this module exists to prevent. Unreadable *files* are different: they stay `unreadable`
+rejections, because a named rejection is not a silent loss.
+
 ---
 
 # Repository Workflow Policy: DU-REPO-WORKFLOW-v1

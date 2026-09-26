@@ -13,6 +13,15 @@ This module is the backend-authoritative alternative: it enumerates a local fold
 count it reports is exact by construction rather than inferred from browser state. It performs
 **discovery and accounting only**.
 
+A scan is authoritative only if traversal completed, so the contract is deliberately all-or-nothing::
+
+    complete traversal   -> InputSet
+    incomplete traversal -> InputScanError
+
+A returned :class:`InputSet` therefore means every directory in the tree was read. Individual files
+that cannot be stat'ed are a different matter: those are recorded as ``UNREADABLE`` rejections and
+remain visible in the report, because a named rejection is not a silent loss.
+
 Deliberate non-goals
 --------------------
 No media copying, no FFmpeg, no OpenCV, no Qwen, no rendering, no full-file hashing, and no Gradio
@@ -32,7 +41,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 SUPPORTED_VIDEO_EXTENSIONS: frozenset[str] = frozenset({".mp4", ".mkv"})
 """Extensions recognised as source video, matched case-insensitively.
@@ -323,13 +332,41 @@ def find_duplicate_groups(
 # ---------------------------------------------------------------------------
 
 
+def _walk_error_raiser(root: str) -> Callable[[OSError], None]:
+    """Build the ``onerror`` callback that turns a partial walk into a hard failure.
+
+    ``os.walk`` **ignores** ``scandir`` failures unless ``onerror`` is supplied. Without this, an
+    unreadable, vanished or disconnected subdirectory is skipped in silence and the scan still returns
+    an ``InputSet`` that can report INPUT READY — the same silent-truncation failure this module exists
+    to prevent, just sourced from the filesystem instead of the browser. A scan is authoritative only
+    if traversal completed, so an incomplete traversal raises.
+
+    ``os.walk`` passes the callback only the error, not the path it was walking, so the error's own
+    ``filename`` is used when present and the scan root is the fallback context.
+    """
+
+    def raise_scan_error(error: OSError) -> None:
+        location = getattr(error, "filename", None) or root
+        raise InputScanError(
+            f"Cannot scan folder tree: traversal failed at {location} ({error})"
+        ) from error
+
+    return raise_scan_error
+
+
 def _iter_candidate_paths(root: str, recursive: bool) -> Iterator[str]:
     """Yield every file entry under ``root`` in a deterministic order.
 
     Directory symlinks are not followed, so a self-referential link cannot make the walk unbounded.
+
+    Raises ``InputScanError`` if any directory cannot be listed: the walk is all-or-nothing, never
+    partial. Note that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an
+    entry as a file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE``
+    rejection, so it is still reported rather than lost.
     """
     if recursive:
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        walk = os.walk(root, onerror=_walk_error_raiser(root), followlinks=False)
+        for dirpath, dirnames, filenames in walk:
             dirnames.sort()
             for name in sorted(filenames):
                 yield os.path.join(dirpath, name)
@@ -364,10 +401,14 @@ def scan_folder(
         chunk_bytes: Head/tail size for fingerprinting.
 
     Returns:
-        An :class:`InputSet`. Nothing is copied, moved, modified or deleted.
+        An :class:`InputSet` covering a **complete** traversal. Nothing is copied, moved, modified or
+        deleted.
 
     Raises:
-        InputScanError: ``root`` is empty, missing, not a directory, or unlistable.
+        InputScanError: ``root`` is empty, missing, not a directory or unlistable, **or** any
+            directory in the tree could not be listed. Traversal is all-or-nothing: a returned
+            :class:`InputSet` always means every directory was read successfully, so an incomplete
+            scan can never masquerade as a smaller library.
     """
     started = time.perf_counter()
 
