@@ -233,12 +233,29 @@ Any source change clears the confirmation (mode switch, folder path, recursive t
 list change). Non-source settings — FPS, encoder, output filename, audio — must **not**: they are not
 wired to these transitions, and a test asserts the confirmation survives them.
 
-**`process_video_guarded()` in `gui.py` is the real gate.** Button state is only a projection of
-backend state; the handler re-derives the source identity from the filesystem on every click and
-refuses before any Stage 1 work if it no longer matches. Folder mode re-scans with
-`detect_duplicates=False` (duplicate grouping is reporting, not identity); browser mode re-stats the
-confirmed paths. On success it hands the existing `process_video()` the same `List[str]` it always
+**`process_video_guarded()` in `gui.py` is the real gate**, and it validates the **live** source
+controls — `source_mode`, `source_folder`, `source_recursive`, `video_input` are render-request inputs,
+not just `gr.State`. That is load-bearing, not defensive padding: Gradio delivers widget changes as
+separate queued events, so at click time the state can lag behind the widgets (a late upload, a retyped
+folder). Trusting the state alone allowed a render for a source set the user was no longer declaring.
+**Never reduce this handler's inputs back to `source_state` alone.** Its parameter names mirror the
+widget names because Gradio passes them positionally; `tests/test_gui_guard_seam.py` asserts the two
+lists line up, so a silent reordering fails the suite.
+
+`check_declaration()` compares declared intent first (mode / folder / recursive), so a folder the user
+has navigated away from is never scanned. Then folder mode re-scans with `detect_duplicates=False`
+(duplicate grouping is reporting, not identity) and browser mode snapshots the **live** `gr.File` list —
+re-stat'ing `confirmed.paths` instead would only re-verify files already approved and would never notice
+a late upload. On success the handler hands the existing `process_video()` the same `List[str]` it always
 consumed, so Auto Mode and the renderer remain unaware that input modes exist.
+
+**Folder identity covers the supported *scope*, not just the ready subset.** `SourceSnapshot.excluded`
+records supported-extension files the scan could not use (`empty_file`, `unreadable`, `not_a_file`) as
+`(path, reason)` pairs inside the digest. A live library gains `.mp4` files that are momentarily 0 bytes
+— the real `Cuts` folder gains roughly one per minute — and a ready-only identity reported "no change"
+while a new source entry had appeared. Record only the stable reason code, never OS error text, or the
+digest stops being reproducible. Unsupported files (`.mp3`, `.txt`) are deliberately outside identity so
+they cannot cause false invalidation. The render list stays ready-only.
 
 What the core does: enumerates `.mp4`/`.mkv` under a folder (optionally recursive); rejects entries
 with a recorded reason (`unsupported_extension`, `empty_file`, `not_a_file`, `unreadable`); collapses a

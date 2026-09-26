@@ -116,6 +116,7 @@ from beatsync_fork.input_confirmation import SourceMode
 from beatsync_fork.input_session import (
     confirm_action,
     initial_state as initial_source_state,
+    live_declaration,
     resolve_for_render,
     scan_folder_action,
     set_browser_files,
@@ -634,20 +635,34 @@ def _on_confirm_click(state) -> Tuple:
     return _source_ui_updates(confirm_action(state))
 
 
-def process_video_guarded(audio_file: str, output_filename: str, processing_mode: str,
+def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
+                          source_recursive: bool, video_input: VideoFilesInput,
+                          output_filename: str, processing_mode: str,
                           custom_fps: float, session_state: dict,
                           source_state) -> Iterator[StatusResult]:
-    """Re-verify the confirmed source set, then delegate to the untouched render pipeline.
+    """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
-    or a direct API call can all reach this handler, so the source identity is re-derived from the
-    filesystem here and compared against what the user actually confirmed. No Stage 1 work starts
-    unless that comparison passes.
+    or a direct API call can all reach this handler.
 
-    On success the confirmed paths are handed to the existing `process_video` generator as the same
-    `List[str]` it already consumed, so Auto Mode and the renderer are entirely unaware of input modes.
+    Crucially it takes the **live** source-control values submitted with this request, not just the
+    stored session state. Gradio delivers widget changes as separate queued events, so at click time
+    the state can lag behind the widgets — a file can finish uploading, or the folder textbox can
+    change, before its `change` handler has run. Trusting the state alone would approve a render for a
+    source set the user is no longer declaring. The event handlers above remain for immediate UX
+    feedback; this is the authority.
+
+    On success the freshly verified paths are handed to the existing `process_video` generator as the
+    same `List[str]` it already consumed, so Auto Mode and the renderer are entirely unaware of input
+    modes.
     """
-    decision = resolve_for_render(source_state)
+    # Parameter names deliberately mirror the widget names in process_btn.click(inputs=...):
+    # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
+    # the two lists line up name-for-name.
+    decision = resolve_for_render(
+        source_state,
+        live_declaration(source_mode, source_folder, source_recursive, video_input),
+    )
     if not decision.allowed:
         yield None, f"❌ {decision.message}", session_state
         return
@@ -835,10 +850,13 @@ def create_ui() -> gr.Blocks:
             outputs=source_outputs,
         )
 
+        # [FORK] Digital-Union: the live source controls are inputs to the render request, so the
+        # gate validates what the widgets currently declare rather than possibly-stale gr.State.
         process_btn.click(
             fn=process_video_guarded,
             inputs=[
                 audio_input,
+                source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps,
                 session_state, source_state
             ],

@@ -17,15 +17,17 @@ from beatsync_fork.input_confirmation import (
     ConfirmationError,
     GateDecision,
     GateReason,
+    LiveSourceDeclaration,
     SourceMode,
     SourceSnapshot,
     SourceSnapshotError,
+    check_declaration,
     confirm_snapshot,
     evaluate_gate,
     snapshot_from_media_files,
     snapshot_from_paths,
 )
-from beatsync_fork.input_manager import InputScanError, InputSet, scan_folder
+from beatsync_fork.input_manager import InputScanError, InputSet, RejectReason, scan_folder
 from beatsync_fork.input_report import InputReport
 
 DEFAULT_MODE = SourceMode.LOCAL_FOLDER
@@ -105,6 +107,65 @@ def initial_state() -> SourceSessionState:
     return SourceSessionState(report_text="Choose a source folder and press Scan Folder.")
 
 
+def snapshot_from_input_set(input_set: InputSet) -> SourceSnapshot:
+    """Build a folder snapshot covering the whole **supported** scope, not just the ready subset.
+
+    Identity has to include supported files the scan could not use. On a live library - the real
+    ``Cuts`` folder was observed gaining about one MP4 per minute - a newly created ``.mp4`` is often
+    0 bytes or briefly unreadable for its first moments. Such a file is rejected, so the ready list is
+    unchanged, and a ready-only snapshot would report "no change" while a new source entry had in fact
+    appeared. The render list stays the ready files only; this just makes the gate honest about scope.
+
+    Unsupported extensions are excluded on purpose: a new ``.mp3`` or ``.txt`` is not a video source
+    and must not invalidate a confirmation.
+    """
+    supported_rejections = [
+        item for item in input_set.rejected if item.reason is not RejectReason.UNSUPPORTED_EXTENSION
+    ]
+    return snapshot_from_media_files(
+        input_set.files,
+        scan_root=input_set.root,
+        recursive=input_set.recursive,
+        excluded=supported_rejections,
+    )
+
+
+def declaration_from_state(state: SourceSessionState) -> LiveSourceDeclaration:
+    """The declaration implied by the stored state, for callers that have no live widget values."""
+    return LiveSourceDeclaration(
+        mode=state.mode,
+        folder_path=state.folder_path,
+        recursive=state.recursive,
+        browser_paths=() if state.current is None else state.current.paths,
+    )
+
+
+def live_declaration(mode_value, folder_path, recursive, browser_files) -> LiveSourceDeclaration:
+    """Build a declaration from raw Gradio widget values.
+
+    Tolerant of the shapes Gradio hands back (``None``, a single path, a list) so the UI layer stays a
+    one-line call site.
+    """
+    try:
+        mode = SourceMode(str(mode_value))
+    except ValueError:
+        mode = DEFAULT_MODE
+
+    if browser_files is None:
+        paths: tuple[str, ...] = ()
+    elif isinstance(browser_files, (str, bytes)):
+        paths = (str(browser_files),)
+    else:
+        paths = tuple(str(item) for item in browser_files if item)
+
+    return LiveSourceDeclaration(
+        mode=mode,
+        folder_path="" if folder_path is None else str(folder_path),
+        recursive=bool(recursive),
+        browser_paths=paths,
+    )
+
+
 def _invalidated(state: SourceSessionState, report_text: str, **changes) -> SourceSessionState:
     """Apply changes and drop both the current selection and any confirmation."""
     return replace(state, current=None, confirmed=None, report_text=report_text, **changes)
@@ -159,9 +220,7 @@ def scan_folder_action(state: SourceSessionState) -> SourceSessionState:
         return _invalidated(state, f"❌ SCAN FAILED\n{exc}")
 
     report = InputReport.from_input_set(input_set).render_text()
-    snapshot = snapshot_from_media_files(
-        input_set.files, scan_root=input_set.root, recursive=input_set.recursive
-    )
+    snapshot = snapshot_from_input_set(input_set)
     if snapshot.is_empty():
         return _invalidated(state, report + "\n\nNothing to confirm.")
     return replace(state, current=snapshot, confirmed=None, report_text=report)
@@ -212,49 +271,68 @@ def confirm_action(state: SourceSessionState) -> SourceSessionState:
 # ---------------------------------------------------------------------------
 
 
-def current_snapshot_for_render(state: SourceSessionState) -> SourceSnapshot | None:
-    """Re-derive the source identity from the filesystem, right now.
+def current_snapshot_for_render(
+    state: SourceSessionState, live: LiveSourceDeclaration | None = None
+) -> SourceSnapshot | None:
+    """Re-derive the source identity from the filesystem, right now, from the **live** declaration.
 
-    Folder mode re-scans the configured root with ``detect_duplicates=False``: duplicate grouping is
-    a reporting feature and is not part of source identity, so paying for its reads on every render
-    would be waste. Browser mode re-stats the confirmed backend paths.
+    ``live`` carries the widget values submitted with the render request. When omitted it is derived
+    from the stored state, which is only safe for callers that have no widgets (tests, scripts) - the
+    UI must always pass the real thing, because stored state can lag behind queued Gradio events.
 
-    Returns ``None`` when the sources can no longer be read at all, which the gate reports rather
-    than treating as "no change".
+    Folder mode re-scans the live folder with ``detect_duplicates=False``: duplicate grouping is a
+    reporting feature, not identity, so its reads would be pure waste on every render. Browser mode
+    snapshots the **live** ``gr.File`` list; using the confirmed paths instead would re-verify only the
+    files already approved and would never notice a late upload.
+
+    Returns ``None`` when the sources cannot be read at all, which the gate reports rather than
+    treating as "no change".
     """
-    if state.mode is SourceMode.LOCAL_FOLDER:
-        if not state.folder_path.strip():
+    declaration = live if live is not None else declaration_from_state(state)
+
+    if declaration.mode is SourceMode.LOCAL_FOLDER:
+        folder = declaration.folder_path
+        if not folder.strip():
             return None
         try:
-            fresh = scan_folder(
-                state.folder_path, recursive=state.recursive, detect_duplicates=False
-            )
+            fresh = scan_folder(folder, recursive=declaration.recursive, detect_duplicates=False)
         except (InputScanError, OSError):
             return None
-        return snapshot_from_media_files(
-            fresh.files, scan_root=fresh.root, recursive=fresh.recursive
-        )
+        return snapshot_from_input_set(fresh)
 
-    # Browser mode: the authoritative list is what was confirmed; re-stat exactly those paths so a
-    # deleted or swapped temp file is caught.
-    reference = state.confirmed or state.current
-    if reference is None:
-        return None
+    if not declaration.browser_paths:
+        return SourceSnapshot(mode=SourceMode.BROWSER_FILES, entries=())
     try:
-        return snapshot_from_paths(reference.paths, SourceMode.BROWSER_FILES)
+        return snapshot_from_paths(declaration.browser_paths, SourceMode.BROWSER_FILES)
     except SourceSnapshotError:
         return None
 
 
-def resolve_for_render(state: SourceSessionState) -> GateDecision:
+def resolve_for_render(
+    state: SourceSessionState, live: LiveSourceDeclaration | None = None
+) -> GateDecision:
     """The gate. No Stage 1 work may begin unless this returns ``allowed``.
 
-    UI disablement is not sufficient on its own — a stale browser tab, a queued event or a direct API
-    call can all reach the render handler — so this re-verifies from the filesystem every time.
+    Two independent checks, cheapest first:
+
+    1. :func:`~beatsync_fork.input_confirmation.check_declaration` compares the *declared intent*
+       (mode, folder, recursive) against the confirmation, so a changed folder is caught before any
+       filesystem work and a folder the user has navigated away from is never scanned.
+    2. The identity comparison, against a snapshot re-derived from the live declaration.
+
+    UI disablement is not sufficient on its own: a stale tab, a queued event or a direct API call can
+    all reach the render handler.
     """
     if state.confirmed is None or state.confirmed.is_empty():
         return evaluate_gate(state.confirmed, None)
-    return evaluate_gate(state.confirmed, current_snapshot_for_render(state))
+
+    declaration = live if live is not None else declaration_from_state(state)
+
+    declaration_denial = check_declaration(state.confirmed, declaration)
+    if declaration_denial is not None:
+        return declaration_denial
+
+    return evaluate_gate(state.confirmed, current_snapshot_for_render(state, declaration))
 
 
 def _format_bytes(size: int) -> str:
@@ -273,15 +351,19 @@ __all__ = [
     "DEFAULT_RECURSIVE",
     "GateDecision",
     "GateReason",
+    "LiveSourceDeclaration",
     "SourceMode",
     "SourceSessionState",
     "confirm_action",
     "current_snapshot_for_render",
+    "declaration_from_state",
     "initial_state",
+    "live_declaration",
     "resolve_for_render",
     "scan_folder_action",
     "set_browser_files",
     "set_folder_path",
     "set_mode",
     "set_recursive",
+    "snapshot_from_input_set",
 ]
