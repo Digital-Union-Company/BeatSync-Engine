@@ -20,6 +20,74 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-26 (Phase 2B: live Qwen worker progress)
+
+Closes the last observability hole in the pipeline: the parent → Python-worker subprocess boundary.
+Observability only — no creative, inference, scoring, cache-identity or render behaviour changed.
+
+- **New fork module `src/beatsync_fork/qwen_progress.py`** (stdlib-only, like the rest of the package).
+  Three pieces: a namespaced one-line JSON wire protocol (`encode`/`decode`/`is_protocol_line`), a
+  `QwenProgressTranslator` that folds payloads into Stage 5 `phase="qwen"` events, and
+  `stream_worker_process()` / `run_qwen_worker()`, the `Popen`-based runner.
+- **The worker emits machine-readable progress** (`src/auto_mode/stage5_qwen_scene_worker.py`).
+  `BEATSYNC_QWEN_PROGRESS\t{…}` lines for `worker_state` (`loading_model`, `backend_ready`,
+  `prefetch`), `job_start`, `job_progress` and `job_end`, **additive** to the existing human-readable
+  lines, which are byte-for-byte unchanged. Emission goes through a guarded `_emit_progress()` that
+  swallows every failure — including a missing fork package — because a status line must never cost a
+  run that has already spent GPU minutes. The only other change to this file is an optional
+  `job_context` parameter on `_run_semantics_for_video()` carrying
+  `job_index`/`job_total`/`job_id`/`source_name` so emitted lines can be attributed. Prompt, schema,
+  vocabularies, device/slot/context selection, frame prefetch, inference waves and the
+  `LlamaServerClient`/`LlamaMtmdClient`/`QwenLlamaClient` classes are all AST-identical to the base
+  commit.
+- **The parent streams instead of capturing** (`src/video_analysis.py`).
+  `_run_qwen_worker_batch()` and `_run_qwen_worker()` now call `fork_qwen.run_qwen_worker()` with the
+  same argv, environment, UTF-8-with-replacement decoding, timeout and `{}`-on-failure contract they
+  had with `subprocess.run(capture_output=True)`. `event_callback` is threaded through
+  `analyze_video_sources` → `_analyze_single_video` / `_complete_deferred_qwen` /
+  `_complete_deferred_qwen_batch` → `_annotate_candidates_with_qwen` → both worker launches, so live
+  progress works in **both** execution modes rather than silently only in batched runs.
+- **stdout and stderr are drained concurrently** on two threads while the main thread owns
+  `wait(timeout=…)`. Required, not decorative: a failing llama.cpp run emits megabytes of Vulkan
+  diagnostics, and draining stderr only after `wait()` deadlocks once the pipe buffer fills. stderr is
+  retained as a bounded tail (2400 chars batch / 1800 single — the limits the old code already
+  printed), so RAM stays flat however loudly the worker fails.
+- **Reported truthfully.** Per-job progress is an *uncounted* `STATE` event: the only provable
+  denominator is the current job's `len(frame_items)`, so the panel shows
+  `Qwen job 17 / 300 · 64 / 120 candidates (53.3%) · 2.1 candidates/s · batch 8` and never invents a
+  cross-job total. The rate is the worker's own measured `idx / elapsed`, labelled **`candidates/s`**.
+  Staying uncounted also keeps `· 758 sources completed` visible and avoids fighting `ProgressView`'s
+  per-`(stage, phase)` monotonicity, which would otherwise reject job 18's restart at `1 / 130` as a
+  stale straggler.
+- **The response JSON is still the only semantic authority.** Nothing is reconstructed from stdout; a
+  test asserts the streaming path returns exactly what the old capture path returned for identical
+  response JSON, and that results are identical with and without a progress callback. Request/response
+  files remain retained per the project's PCBUS-HK-v1 override (the `finally:` blocks are still bare
+  `pass`).
+- **Scope of `Popen`.** `stage5_qwen_scene_worker.py` already used `subprocess.Popen` for its internal
+  `llama-server` lifecycle long before Phase 2B, handing it dedicated log-file handles rather than the
+  worker's pipes; that code is untouched and a test pins it to exactly one `Popen` inside
+  `LlamaServerClient._start`. The short `llama-mtmd-cli --version` probe remains a plain
+  `subprocess.run`. A repo-wide "no `Popen`" invariant would be both false and about the wrong
+  boundary.
+- **Measured, not assumed.** Red evidence first: under `capture_output=True` a worker emitting its
+  first progress line at ~0s delivered **0 callbacks before exit**, first observed at 0.857s — the exit
+  timestamp. After the change, the real worker with the real Qwen3VL-2B GGUF on Vulkan reported
+  `loading model` at +0.17s and `backend ready` at +8.98s of a 10.38s run. Timeout process-tree
+  boundary was measured both ways: the direct Python worker is killed and an already-started
+  `llama-server` is **orphaned**, identically to the pre-Phase-2B path, because both kill only the
+  direct child. That gap is pre-existing and was deliberately not "fixed" with `taskkill /T`.
+
+Two defects found by the new tests and fixed before commit: a job's first `job_progress` was being
+swallowed by the throttle window (the update that replaces "starting" with a real count), and closing a
+pipe from the waiting thread blocked on the reader's buffer lock, turning a 2s timeout into a 120s
+return whenever a grandchild held the write end — reader threads now own their own close and are joined
+against one shared deadline.
+
+`ANALYSIS_VERSION` is unchanged (`auto_av_analysis_v8_llama_vulkan_batched`): a progress-only change must
+not invalidate a 758-video analysis cache. `tests/test_no_runtime_dependency.py` now discovers fork
+modules from disk instead of a hardcoded list, so a future module cannot escape the stdlib-only guard.
+
 ### Fixed — 2026-09-26 (Phase 2A review remediation, round 3)
 
 - **`ProgressEvent.data` is now immutable *recursively*** (`src/beatsync_fork/progress.py`). R2's

@@ -37,6 +37,32 @@ DEFAULT_LLAMA_DIR = BIN_DIR / "llama-bin-win-vulkan-x64"
 DEFAULT_MODEL = BIN_DIR / "models" / "Qwen3VL-2B-Instruct-Q8_0.gguf"
 DEFAULT_MMPROJ = BIN_DIR / "models" / "mmproj-Qwen3VL-2B-Instruct-F16.gguf"
 
+# [FORK] Digital-Union (Phase 2B): machine-readable progress on stdout, additive to the human lines
+# below. Appended (not inserted) so nothing in src/ can shadow a stdlib or site-packages module for
+# this worker; `beatsync_fork` is unique, so appending is enough. The import is guarded because a
+# missing fork package must degrade to "no live progress", never break semantic tagging.
+if str(ROOT_DIR / "src") not in sys.path:
+    sys.path.append(str(ROOT_DIR / "src"))
+try:
+    from beatsync_fork.qwen_progress import encode as _encode_qwen_progress
+except Exception:  # pragma: no cover - exercised only on a broken/partial checkout
+    _encode_qwen_progress = None
+
+
+def _emit_progress(kind: str, **fields) -> None:
+    """Write one namespaced protocol line. Observability only — never affects inference.
+
+    Swallows everything: this runs next to llama.cpp calls that have already cost real GPU time, and
+    a status line is never worth losing them over.
+    """
+    if _encode_qwen_progress is None:
+        return
+    try:
+        print(_encode_qwen_progress(kind, **fields), flush=True)
+    except Exception:
+        pass
+
+
 NUMERIC_KEYS = [
     "action_intensity",
     "beauty_score",
@@ -1001,11 +1027,22 @@ def _run_semantics_for_video(
     fps: float,
     candidates: List[Dict],
     prompt: str,
+    job_context: Dict | None = None,
 ) -> tuple[Dict[str, Dict], Dict]:
+    # [FORK] job_context carries only identifying fields (job_index/job_total/job_id/source_name) so
+    # the emitted progress lines can be attributed. It influences no inference decision.
+    job_context = dict(job_context or {})
     decode_threads = _configure_opencv_ffmpeg_threads()
     print(f"Qwen OpenCV decode threads: {decode_threads}", flush=True)
     frame_width = _qwen_frame_width()
     print(f"Qwen frame max width: {frame_width}", flush=True)
+    # Frame prefetch is silent for seconds on a long source; say so rather than looking stuck.
+    _emit_progress(
+        "worker_state",
+        state="prefetch",
+        message=f"decoding {len(candidates)} candidate frames",
+        **job_context,
+    )
     cap = cv2.VideoCapture(video_file)
     semantics: Dict[str, Dict] = {}
     timings = {
@@ -1033,6 +1070,16 @@ def _run_semantics_for_video(
                 f"({rate:.2f}/s, batch {client.batch_size})",
                 flush=True,
             )
+            # Same authoritative numbers as the line above: len(frame_items) is the live denominator
+            # (what prefetch actually decoded), and `rate` is measured inference throughput.
+            _emit_progress(
+                "job_progress",
+                current=idx,
+                total=len(frame_items),
+                candidates_per_second=round(float(rate), 3),
+                batch_size=int(client.batch_size or 1),
+                **job_context,
+            )
         elapsed = max(0.001, time.perf_counter() - inference_started)
         timings["inference_seconds"] = elapsed
         timings["tag_count"] = len(semantics)
@@ -1040,6 +1087,14 @@ def _run_semantics_for_video(
             f"Qwen llama.cpp semantic inference total: {len(semantics)}/{len(frame_items)} tags "
             f"in {elapsed:.1f}s ({len(frame_items) / elapsed:.2f} candidates/s)",
             flush=True,
+        )
+        _emit_progress(
+            "job_end",
+            frame_count=len(frame_items),
+            tag_count=len(semantics),
+            inference_seconds=round(float(elapsed), 3),
+            prefetch_seconds=round(float(timings["prefetch_seconds"]), 3),
+            **job_context,
         )
     finally:
         cap.release()
@@ -1056,7 +1111,16 @@ def main() -> None:
     audio_profile = request.get("audio_profile") or {}
     prompt = _build_prompt(audio_profile)
 
+    # Model load is the longest silent stretch of a Qwen run, so announce both ends of it.
+    _emit_progress("worker_state", state="loading_model", message="loading Qwen model (llama.cpp)")
     client = QwenLlamaClient(model_path, args.response)
+    _emit_progress(
+        "worker_state",
+        state="backend_ready",
+        message="Qwen backend ready",
+        batch_size=int(client.batch_size or 1),
+        device=str(getattr(client, "device_label", "") or ""),
+    )
     jobs = request.get("jobs")
     if not jobs:
         jobs = [{
@@ -1082,12 +1146,24 @@ def main() -> None:
                 f"({len(candidates)} candidates)",
                 flush=True,
             )
+            job_context = {
+                "job_index": job_index,
+                "job_total": len(jobs),
+                "job_id": job_id,
+                "source_name": os.path.basename(video_file),
+            }
+            _emit_progress(
+                "job_start",
+                requested_candidate_count=len(candidates),
+                **job_context,
+            )
             semantics, timings = _run_semantics_for_video(
                 client=client,
                 video_file=video_file,
                 fps=fps,
                 candidates=candidates,
                 prompt=prompt,
+                job_context=job_context,
             )
             semantics_by_job[job_id] = semantics
             timings_by_job[job_id] = timings

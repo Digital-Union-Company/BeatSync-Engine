@@ -32,6 +32,8 @@ from logger import ROOT_DIR, setup_environment
 
 # [FORK] Digital-Union: structured progress events (stdlib-only fork module).
 from beatsync_fork import progress as fork_progress
+# [FORK] Digital-Union (Phase 2B): streaming Qwen worker runner + stdout progress protocol.
+from beatsync_fork import qwen_progress as fork_qwen
 
 
 setup_environment()
@@ -364,6 +366,7 @@ def analyze_video_sources(
                         True,
                         job["index"],
                         len(existing),
+                        event_callback,
                     ): job
                     for job in jobs
                 }
@@ -391,6 +394,7 @@ def analyze_video_sources(
                             True,
                             job["index"],
                             len(existing),
+                            event_callback,
                         )
                     # One advance per video, after either the parallel result or the serial retry,
                     # so a retried video is never double-counted.
@@ -409,6 +413,7 @@ def analyze_video_sources(
                     False,
                     job["index"],
                     len(existing),
+                    event_callback,
                 )
                 fork_progress.emit(event_callback, source_counter.advance(
                     1, "analyzed", cache_hits=cache_hits, unit="sources",
@@ -423,18 +428,16 @@ def analyze_video_sources(
     ]
     batch_qwen = os.environ.get("BEATSYNC_QWEN_BATCH_VIDEOS", "1") != "0"
     if deferred_jobs:
-        # [FORK] Digital-Union: high-level states only. The worker already prints
-        # "Qwen llama.cpp tagged N/T", but analyze_video_sources launches it with
-        # subprocess.run(capture_output=True), so the parent cannot see those lines until the worker
-        # exits. Fabricating an N/T counter here would be inventing progress we do not have.
-        # Live streaming of the worker's stdout is Phase 2B.
+        # [FORK] Digital-Union (Phase 2B): the worker's stdout is now streamed, so the per-job
+        # "N / T candidates" states that follow are the worker's own live numbers. This opening state
+        # deliberately claims no global candidate denominator: only the worker knows how many frames
+        # prefetch actually decoded for the job it is currently on.
         fork_progress.emit(event_callback, fork_progress.state(
             5,
-            f"Qwen semantic tagging started ({len(deferred_jobs)} video(s)) — "
-            f"no live per-frame progress until Phase 2B",
+            f"Qwen semantic tagging started ({len(deferred_jobs)} video(s))",
             phase="qwen",
             qwen_videos=len(deferred_jobs),
-            qwen_live_progress_available=False,
+            qwen_live_progress_available=True,
         ))
     qwen_started = time.perf_counter()
     if len(deferred_jobs) > 1 and batch_qwen:
@@ -444,6 +447,7 @@ def analyze_video_sources(
             qwen_model_path=qwen_model_path,
             audio_profile=audio_profile or {},
             total_video_count=len(existing),
+            event_callback=event_callback,
         )
     else:
         for job in deferred_jobs:
@@ -457,6 +461,7 @@ def analyze_video_sources(
                 qwen_model_path=qwen_model_path,
                 audio_profile=audio_profile or {},
                 label=f"{idx}/{len(existing)}",
+                event_callback=event_callback,
             )
 
     if deferred_jobs:
@@ -571,6 +576,7 @@ def _analyze_single_video(
     defer_ai: bool = False,
     index: int | None = None,
     total: int | None = None,
+    event_callback=None,
 ) -> Dict:
     started = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -652,6 +658,7 @@ def _analyze_single_video(
                 qwen_model_path=qwen_model_path,
                 use_gpu=use_gpu,
                 audio_profile=audio_profile,
+                event_callback=event_callback,
             )
             qwen_seconds = time.perf_counter() - step_started
             timings.update(qwen_info or {})
@@ -701,6 +708,7 @@ def _complete_deferred_qwen(
     qwen_model_path: str,
     audio_profile: Dict,
     label: str = "",
+    event_callback=None,
 ) -> Dict:
     candidates = video_data.get("candidates") or []
     if not candidates:
@@ -720,6 +728,7 @@ def _complete_deferred_qwen(
             qwen_model_path=qwen_model_path,
             use_gpu=use_gpu,
             audio_profile=audio_profile,
+            event_callback=event_callback,
         )
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
@@ -756,6 +765,7 @@ def _complete_deferred_qwen_batch(
     qwen_model_path: str,
     audio_profile: Dict,
     total_video_count: int,
+    event_callback=None,
 ) -> None:
     max_windows = _qwen_max_windows()
     if max_windows == 0:
@@ -808,6 +818,7 @@ def _complete_deferred_qwen_batch(
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
         audio_profile=audio_profile,
+        event_callback=event_callback,
     )
     batch_seconds = time.perf_counter() - batch_started
     semantics_by_job = response.get("semantics_by_job") or {}
@@ -872,11 +883,27 @@ def _complete_deferred_qwen_batch(
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
 
 
+def _qwen_worker_stdout_printer(indent: str = "      "):
+    """Print a human worker line as it arrives, with the indent the old post-mortem dump used."""
+    def printer(line: str) -> None:
+        print(f"{indent}{line}")
+    return printer
+
+
+def _short_qwen_error(text: str, limit: int = 200) -> str:
+    """One short line for the status panel. The full bounded tail still goes to the console."""
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[-limit:]
+
+
 def _run_qwen_worker_batch(
     jobs: Sequence[Dict],
     qwen_model_path: str,
     use_gpu: bool,
     audio_profile: Dict,
+    event_callback=None,
 ) -> Dict:
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
     token = _hash_text(f"batch|{time.time()}|{len(jobs)}", 12)
@@ -896,31 +923,47 @@ def _run_qwen_worker_batch(
     total_candidates = sum(len(job.get("candidates") or []) for job in jobs)
     timeout = max(1800, int(total_candidates * 75))
     try:
-        result = subprocess.run(
+        # [FORK] Digital-Union (Phase 2B): streamed instead of captured. Identical argv, env, UTF-8
+        # decoding, timeout and return-code contract; the difference is that the worker's progress
+        # lines now reach the UI while it runs instead of after it exits. The worker's own
+        # llama-server Popen is unrelated and untouched.
+        result = fork_qwen.run_qwen_worker(
             [sys.executable, worker_path, "--request", request_path, "--response", response_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+            response_path,
             env=env,
+            timeout=timeout,
+            event_callback=event_callback,
+            on_human_line=_qwen_worker_stdout_printer(),
+            stderr_char_limit=2400,
         )
-        if result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                print(f"      {line}")
-        if result.returncode != 0:
-            error_tail = (result.stderr or "").strip()[-2400:]
+        if result.outcome.timed_out:
+            raise subprocess.TimeoutExpired(worker_path, timeout)
+        if result.outcome.launch_error:
+            raise RuntimeError(result.outcome.launch_error)
+        if result.outcome.returncode != 0:
+            error_tail = result.outcome.stderr_tail
             print(f"      Qwen batch worker failed: {error_tail}")
+            fork_progress.emit(event_callback, fork_progress.warning(
+                5,
+                f"Qwen batch worker failed (exit {result.outcome.returncode}): "
+                f"{_short_qwen_error(error_tail)}",
+                phase="qwen", qwen_returncode=result.outcome.returncode,
+            ))
             return {}
-        with open(response_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if result.response_error:
+            raise RuntimeError(result.response_error)
+        return result.response
     except subprocess.TimeoutExpired:
         print("      Qwen batch worker timed out; deterministic visual tags remain active.")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, "Qwen batch worker timed out; deterministic visual tags remain active.",
+            phase="qwen", qwen_timed_out=True,
+        ))
         return {}
     except Exception as e:
         print(f"      Qwen batch worker error: {e}")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, f"Qwen batch worker error: {_short_qwen_error(str(e))}", phase="qwen"))
         return {}
     finally:
         # Keep Qwen worker request/response files in video_analysis_cache for
@@ -1407,6 +1450,7 @@ def _annotate_candidates_with_qwen(
     qwen_model_path: str,
     use_gpu: bool,
     audio_profile: Dict,
+    event_callback=None,
 ) -> None:
     max_windows = int(os.environ.get("BEATSYNC_QWEN_MAX_WINDOWS", "120"))
     max_windows = max(0, max_windows)
@@ -1426,6 +1470,7 @@ def _annotate_candidates_with_qwen(
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
         audio_profile=audio_profile,
+        event_callback=event_callback,
     )
     semantics = response.get("semantics") if isinstance(response, dict) else {}
     if not semantics:
@@ -1463,6 +1508,7 @@ def _run_qwen_worker(
     qwen_model_path: str,
     use_gpu: bool,
     audio_profile: Dict,
+    event_callback=None,
 ) -> Dict:
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
     token = _hash_text(f"{video_file}|{time.time()}", 12)
@@ -1490,31 +1536,45 @@ def _run_qwen_worker(
     env = _qwen_worker_environment()
     timeout = max(1800, int(len(candidates) * 75))
     try:
-        result = subprocess.run(
+        # [FORK] Digital-Union (Phase 2B): same streaming boundary as the batch path, so live Qwen
+        # progress is not silently exclusive to batched runs.
+        result = fork_qwen.run_qwen_worker(
             [sys.executable, worker_path, "--request", request_path, "--response", response_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+            response_path,
             env=env,
+            timeout=timeout,
+            event_callback=event_callback,
+            on_human_line=_qwen_worker_stdout_printer(),
+            stderr_char_limit=1800,
         )
-        if result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                print(f"      {line}")
-        if result.returncode != 0:
-            error_tail = (result.stderr or "").strip()[-1800:]
+        if result.outcome.timed_out:
+            raise subprocess.TimeoutExpired(worker_path, timeout)
+        if result.outcome.launch_error:
+            raise RuntimeError(result.outcome.launch_error)
+        if result.outcome.returncode != 0:
+            error_tail = result.outcome.stderr_tail
             print(f"      Qwen worker failed: {error_tail}")
+            fork_progress.emit(event_callback, fork_progress.warning(
+                5,
+                f"Qwen worker failed (exit {result.outcome.returncode}): "
+                f"{_short_qwen_error(error_tail)}",
+                phase="qwen", qwen_returncode=result.outcome.returncode,
+            ))
             return {}
-        with open(response_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if result.response_error:
+            raise RuntimeError(result.response_error)
+        return result.response
     except subprocess.TimeoutExpired:
         print("      Qwen worker timed out; deterministic visual tags remain active.")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, "Qwen worker timed out; deterministic visual tags remain active.",
+            phase="qwen", qwen_timed_out=True,
+        ))
         return {}
     except Exception as e:
         print(f"      Qwen worker error: {e}")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, f"Qwen worker error: {_short_qwen_error(str(e))}", phase="qwen"))
         return {}
     finally:
         # Keep Qwen worker request/response files in video_analysis_cache for

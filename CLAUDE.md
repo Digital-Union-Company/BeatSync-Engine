@@ -47,6 +47,18 @@ python -m pytest tests/test_input_manager_large.py -v
 The suite covers `src/beatsync_fork/` only, and runs on **any** recent CPython — no portable runtime,
 no CUDA, no FFmpeg, no models — because fork modules are stdlib-only by rule (see below).
 
+`tests/test_qwen_stream.py` is the one suite that spawns **real child processes**: it writes a tiny fake
+Qwen worker into `tmp_path` and runs it with `sys.executable`. That is deliberate — the defect Phase 2B
+fixed is a property of the process boundary, and a mocked `Popen` would "stream" happily under the old
+`capture_output=True` code too. It still needs nothing but CPython, and it is a few seconds slower than
+the rest of the suite because several cases wait on real child timing.
+
+Two suites verify code that **cannot be imported** on a bare interpreter (`video_analysis.py` needs the
+whole runtime; the Qwen worker needs cv2/PIL) by inspecting it with `ast` instead:
+`tests/test_qwen_worker_protocol.py` and `tests/test_gui_guard_seam.py`. Prefer AST assertions over grep
+there — they match call sites by function and keyword, so e.g. the `llama-mtmd-cli --version` probe is
+distinguished from the streaming launches by its argv rather than by a line number.
+
 The upstream pipeline modules have no tests and cannot even be imported without the portable runtime;
 verification there is still end-to-end (run the CLI on a short audio file plus one source video and
 check the console stage timings and the output file). There is no linter or formatter config. The
@@ -116,6 +128,42 @@ default (`BEATSYNC_QWEN_BATCH_VIDEOS`) for the same reason.
 
 The request/response JSON files are **intentionally left behind** for debugging — the `finally:` blocks
 that would delete them are deliberately empty. Do not "clean that up".
+
+**The parent streams the worker's stdout** (Phase 2B). `_run_qwen_worker_batch()` and
+`_run_qwen_worker()` go through `beatsync_fork.qwen_progress.run_qwen_worker()`, which uses `Popen` and
+drains stdout and stderr on **two separate threads** while the main thread owns `wait(timeout=…)`.
+Draining both concurrently is mandatory, not tidiness: a failing llama.cpp run emits megabytes of Vulkan
+diagnostics, and reading stdout to EOF first deadlocks the moment the stderr pipe buffer fills. stderr is
+kept as a bounded tail (2400 chars batch / 1800 single — the same limits the old code printed), so a
+loudly-failing worker cannot grow the parent's RAM.
+
+Three boundaries here are load-bearing:
+
+- **Only the two long-running Python-worker launches were converted.** The short
+  `llama-mtmd-cli --version` probe in `_llama_version_token()` is still a plain `subprocess.run` — it
+  feeds the cache signature and has nothing to stream.
+- **The worker's own `subprocess.Popen` is a different thing.** `LlamaServerClient._start` has managed
+  the `llama-server` child since long before Phase 2B, handing it dedicated log-file handles
+  (`*_llama_server_ctx*_stdout.log`), not the worker's pipes. Never state a repo-wide "no `Popen`"
+  invariant — it is false and it describes the wrong boundary. A test asserts the worker still contains
+  exactly one `Popen` and that it is still `_start`'s.
+- **A reader thread owns closing its own pipe.** Closing a pipe from the waiting thread blocks on the
+  buffer's internal lock while its reader sits in `readline()`; with a grandchild holding the write end
+  that turned a 2s timeout into a 120s return (measured). `stream_worker_process` therefore joins both
+  readers against **one shared deadline** and closes only pipes whose reader has already finished.
+
+Timeout and failure semantics are unchanged from `subprocess.run`: bounded wait, then `terminate()` →
+short grace → `kill()`; a non-zero exit prints the bounded stderr tail and returns `{}`; deterministic
+visual tags stay active either way. Measured process-tree boundary on a timeout: the direct Python worker
+is killed, and an already-started `llama-server` is **orphaned** — identically to the pre-Phase-2B path,
+because both kill only the direct child and neither runs the worker's `finally: client.close()`. That gap
+is pre-existing; do not "fix" it with `taskkill /T` or a process-group redesign as a side effect of
+unrelated work.
+
+**The response JSON remains the only semantic authority.** Nothing is reconstructed from stdout and no
+tag is ever parsed out of a progress line, so the same request returns the same semantics whether a
+progress callback exists or not. A test compares the streaming result against the old capture path for
+identical response JSON.
 
 Qwen is advisory, not authoritative: `_merge_semantic()` keeps deterministic motion/quality metrics
 dominant (e.g. action = 0.72·deterministic + 0.28·semantic·motion_gate) so a pretty static frame can't be
@@ -190,10 +238,37 @@ The legacy `progress_callback` / `console_callback` remain for CLI and headless 
 `event_callback` is optional everywhere. `StageConsoleLogger.apply_event()` drives the CMD log from the
 same events, so console and GUI cannot disagree.
 
-**Qwen live progress is not implemented (Phase 2B).** `video_analysis.py` launches the worker with
-`subprocess.run(capture_output=True)`, so its `tagged N/T` lines are unavailable until the worker
-exits. Only honest high-level states are emitted. Do not fabricate an N/T counter here, and do not
-switch to `Popen` as a side effect of unrelated work.
+**Qwen live progress is streamed (Phase 2B).** The worker emits a namespaced one-line JSON protocol on
+stdout — `BEATSYNC_QWEN_PROGRESS\t{"v":"beatsync.qwen-progress/1","kind":…}` — **in addition to** its
+existing human-readable lines, which are untouched because they are what a CLI user reads.
+`beatsync_fork/qwen_progress.py` owns the wire format (`encode`/`decode`), the translator, and the
+streaming runner; `stage5_qwen_scene_worker.py` calls a guarded `_emit_progress()` that swallows
+everything, so a status line can never cost a Qwen run that has already spent GPU minutes.
+
+Kinds: `worker_state` (`loading_model`, `backend_ready`, `prefetch` — the model load is the longest
+silent stretch of a run, ~8s even for the 2B model), `job_start`, `job_progress`, `job_end`. Rules:
+
+- **Do not regex worker prose.** Phase 2A deleted prose parsing from the GUI; re-adding it at the
+  subprocess boundary would repeat the mistake one layer down. The machine channel is explicit and
+  versioned, and unknown `kind`s, malformed JSON, and non-object payloads are counted and ignored — never
+  raised. Ordinary stdout stays ordinary and goes to the console sink.
+- **`job_progress` carries the worker's own numbers**: `current` is the inference loop index, `total` is
+  `len(frame_items)` — what frame prefetch *actually* decoded — and `candidates_per_second` is the
+  worker's measured `idx / elapsed`. Never recompute the rate from source counts, cache counts or total
+  Stage 5 elapsed time, and label it **`candidates/s`**, never `sources/s`.
+- **No global candidate denominator is invented.** The parent knows requested candidate counts, not the
+  live per-job denominator, so the panel shows `Qwen job 17 / 300 · 64 / 120 candidates (53.3%)` and
+  never a cross-job `1840 / 3620`. `job_end` accumulates `candidates_done` from worker-reported tag
+  counts only.
+- **Per-job progress is an uncounted `STATE` event under `phase="qwen"`**, deliberately. A counted phase
+  would fight `ProgressView`'s per-`(stage, phase)` monotonicity — job 18 restarting at `1 / 130` after
+  job 17 finished at `120 / 120` looks exactly like the stale straggler that rule rejects, freezing the
+  panel on the old job — and it would also hide the `· 758 sources completed` history line, which
+  `ProgressView` shows precisely when the active phase has no counter. The numbers live in the message
+  *and* in `event.data`.
+- Both execution modes stream: the shared batch worker and the single/legacy path. A test asserts both
+  call sites go through the streaming runner and that `event_callback` reaches every orchestrator seam,
+  so live progress cannot silently become batch-only.
 
 ### Rendering modes
 
@@ -258,6 +333,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `input_session.py` | the source-input state machine and `resolve_for_render()` — the actual gate |
 | `progress.py` | `ProgressEvent` + `StageCounter` + `emit()` — structured pipeline progress |
 | `progress_view.py` | `ProgressView` — folds events into the status panel text |
+| `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 
 ### Video source modes and the confirmation gate
 

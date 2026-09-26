@@ -40,18 +40,27 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO_ROOT, "src")
 
 _PROBE = """
+import importlib
 import sys
 import beatsync_fork
-import beatsync_fork.input_confirmation
-import beatsync_fork.input_manager
-import beatsync_fork.input_report
-import beatsync_fork.input_session
-import beatsync_fork.progress
-import beatsync_fork.progress_view
+for name in {modules!r}:
+    importlib.import_module("beatsync_fork." + name)
 forbidden = {forbidden!r}
 leaked = sorted(name for name in forbidden if name in sys.modules)
 print("LEAKED:" + ",".join(leaked))
 """
+
+
+def _fork_modules() -> list[str]:
+    """Every module in the package, discovered — so a new fork module cannot escape this guard."""
+    package = os.path.join(_SRC, "beatsync_fork")
+    names = sorted(
+        os.path.splitext(entry)[0]
+        for entry in os.listdir(package)
+        if entry.endswith(".py") and entry != "__init__.py"
+    )
+    assert names, "no fork modules discovered"
+    return names
 
 
 def _run_probe() -> subprocess.CompletedProcess:
@@ -59,7 +68,7 @@ def _run_probe() -> subprocess.CompletedProcess:
     env["PYTHONPATH"] = _SRC
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(
-        [sys.executable, "-c", _PROBE.format(forbidden=FORBIDDEN)],
+        [sys.executable, "-c", _PROBE.format(forbidden=FORBIDDEN, modules=_fork_modules())],
         capture_output=True,
         text=True,
         cwd=_REPO_ROOT,
@@ -95,8 +104,11 @@ def test_fork_modules_import_only_stdlib():
     allowed = {
         "__future__",
         "hashlib",
+        "json",
         "os",
         "stat",
+        "subprocess",
+        "threading",
         "time",
         "collections",
         "dataclasses",
@@ -106,8 +118,7 @@ def test_fork_modules_import_only_stdlib():
     }
     # beatsync_fork itself is allowed: fork modules may build on each other, just not on the runtime.
     allowed = allowed | {"beatsync_fork"}
-    for module in ("input_manager", "input_report", "input_confirmation", "input_session",
-                   "progress", "progress_view"):
+    for module in _fork_modules():
         source_path = os.path.join(_SRC, "beatsync_fork", f"{module}.py")
         with open(source_path, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read(), filename=source_path)
