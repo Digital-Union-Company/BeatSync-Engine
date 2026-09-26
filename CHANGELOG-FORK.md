@@ -20,6 +20,38 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-26 (Phase 2A review remediation, round 3)
+
+- **`ProgressEvent.data` is now immutable *recursively*** (`src/beatsync_fork/progress.py`). R2's
+  `MappingProxyType` was shallow, and the pipeline genuinely emits nested mutable values —
+  `section_types=[...]` from Stage 3, `first_failures=[...]` from the Stage 6 refusal — so
+  `event.data["section_types"].append("evil")` still succeeded, and `as_dict()`'s shallow copy handed
+  the *same* nested objects to every consumer. Small stdlib-only `_freeze`/`_thaw` pair: mappings
+  become `MappingProxyType` over recursively frozen copies, lists and tuples become tuples, scalars
+  (including `str`/`bytes`) are untouched. `as_dict()` recursively thaws back to plain
+  `dict`/`list`, so the payload shares no mutable container with the event and stays JSON
+  serialisable. Only the container types the pipeline actually emits are handled; no serialization
+  framework was added.
+- **Stage 5 no longer bills cache hits as analysis throughput** (`progress.py`,
+  `src/video_analysis.py`). `StageCounter.rate` was `current / elapsed`, and the source counter
+  advances for cache hits too, so 420 instant cache hits plus one slow real analysis reported
+  **839.9 sources/s** in the reproduction. The rate basis is now tracked separately from the
+  completion count: `advance(..., counts_toward_rate=False)` records a cache hit without billing it,
+  and `begin_rate_window()` re-bases the clock once the cache scan finishes. The count still reads
+  `421 / 758` with cache hits visible; the rate now reads `0.1 analyzed sources/s`, labelled via a
+  `rate_unit` so a bare `sources/s` cannot be misread next to a count that includes cache hits.
+  **Stage 6 clip throughput is unchanged** — it opens no rate window, so its basis is the whole
+  counter exactly as before. No ETA was added.
+- **A stale straggling progress event no longer wipes a good measurement** (`progress_view.py`).
+  Monotonicity protected `current` but `rate`/`elapsed`/`message` were overwritten unconditionally, so
+  an out-of-order Stage 6 event carrying no rate silently degraded
+  `612 / 1216 · 4.8 clips/s · elapsed 2m 07s` to `612 / 1216`. An event ignored for the count is now
+  ignored for those fields too, and a known measurement is never replaced by `None`. Found by the
+  portable UI smoke, not by the unit tests.
+- **28 new tests** (`tests/test_progress_truth.py`), 16 of which were confirmed failing against
+  `95150de` first, including AST/source assertions that `video_analysis.py` really opts cache hits out
+  of the rate, really re-bases the window, and really labels the rate unit.
+
 ### Fixed — 2026-09-26 (Phase 2A review remediation)
 
 - **Progress counters are now subphase-aware** (`src/beatsync_fork/progress_view.py`,

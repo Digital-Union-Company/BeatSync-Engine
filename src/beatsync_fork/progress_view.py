@@ -50,6 +50,10 @@ class _PhaseView:
 
     key: str | None
     unit: str = "items"
+    rate_unit: str = ""
+    """What the rate measures, when that differs from what is being counted. Stage 5 counts
+    ``sources`` but its rate describes ``analyzed sources`` only, and saying so removes the ambiguity
+    of a bare ``sources/s`` next to a count that also includes cache hits."""
     current: int | None = None
     total: int | None = None
     elapsed_seconds: float | None = None
@@ -74,7 +78,7 @@ class _PhaseView:
             parts.append(text)
         if self.last_message:
             parts.append(self.last_message)
-        rate = format_rate(self.rate, self.unit)
+        rate = format_rate(self.rate, self.rate_unit or self.unit)
         if rate:
             parts.append(rate)
         elapsed = format_duration(self.elapsed_seconds)
@@ -175,6 +179,9 @@ class ProgressView:
         unit = event.data.get("unit")
         if isinstance(unit, str) and unit:
             phase.unit = unit
+        rate_unit = event.data.get("rate_unit")
+        if isinstance(rate_unit, str) and rate_unit:
+            phase.rate_unit = rate_unit
 
         if event.kind is EventKind.START:
             stage.started = True
@@ -189,16 +196,26 @@ class ProgressView:
             stage.started = True
             # Monotonic *within this phase only*. A late lower event from another worker thread must
             # not rewind the display, and a previous phase's larger count must not leak in here.
+            is_newest = True
             if event.current is not None:
-                phase.current = (
-                    event.current if phase.current is None else max(phase.current, event.current)
-                )
+                if phase.current is None or event.current >= phase.current:
+                    phase.current = event.current
+                else:
+                    is_newest = False
             if event.total is not None:
                 phase.total = event.total
-            phase.elapsed_seconds = event.elapsed_seconds
-            phase.rate = event.rate
-            if event.message:
-                phase.last_message = event.message
+            # A stale straggler is ignored for the *count*, so it must be ignored for rate, elapsed
+            # and message too. Accepting those was inconsistent: a late event carrying no rate wiped
+            # a good measurement, so `612 / 1216 · 4.8 clips/s` degraded to `612 / 1216` the moment
+            # any out-of-order event arrived. A known measurement is likewise never overwritten with
+            # None, which would make the figure flicker.
+            if is_newest:
+                if event.elapsed_seconds is not None:
+                    phase.elapsed_seconds = event.elapsed_seconds
+                if event.rate is not None:
+                    phase.rate = event.rate
+                if event.message:
+                    phase.last_message = event.message
 
         elif event.kind is EventKind.STATE:
             stage.started = True

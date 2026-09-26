@@ -326,8 +326,11 @@ def analyze_video_sources(
             cache_hits += 1
             print(f"   Reusing cached visual analysis {idx}/{len(existing)}: {_safe_name(video_file)}")
             results_by_index[idx] = cached
+            # Counted as a completed source (it is), but excluded from the throughput measurement:
+            # cache hits arrive instantly and would otherwise inflate the reported sources/s.
             event = source_counter.advance(
-                1, "cached", cache_hits=cache_hits, unit="sources")
+                1, "cached", counts_toward_rate=False,
+                cache_hits=cache_hits, unit="sources")
             fork_progress.emit(event_callback, event)
         else:
             jobs.append({"index": idx, "video_file": video_file, "cache_file": cache_file})
@@ -341,6 +344,8 @@ def analyze_video_sources(
     # Always publish the post-cache count, even when nothing needs analyzing.
     fork_progress.emit(event_callback, source_counter.snapshot(
         "cache scan complete", cache_hits=cache_hits, unit="sources"))
+    # Re-base the rate clock: from here on, throughput describes the analysis pass only.
+    source_counter.begin_rate_window()
     if jobs:
         if workers > 1:
             print(
@@ -390,7 +395,8 @@ def analyze_video_sources(
                     # One advance per video, after either the parallel result or the serial retry,
                     # so a retried video is never double-counted.
                     fork_progress.emit(event_callback, source_counter.advance(
-                        1, "analyzed", cache_hits=cache_hits, unit="sources"))
+                        1, "analyzed", cache_hits=cache_hits, unit="sources",
+                        rate_unit="analyzed sources"))
         else:
             print("   CPU visual analysis workers: 1 (serial)")
             for job in jobs:
@@ -405,7 +411,8 @@ def analyze_video_sources(
                     len(existing),
                 )
                 fork_progress.emit(event_callback, source_counter.advance(
-                    1, "analyzed", cache_hits=cache_hits, unit="sources"))
+                    1, "analyzed", cache_hits=cache_hits, unit="sources",
+                    rate_unit="analyzed sources"))
 
     # When the deterministic CPU-heavy pass ran in parallel, run Qwen after it in
     # original video order. A single multi-video Qwen worker is used by default so

@@ -38,6 +38,35 @@ PROGRESS_SCHEMA = "beatsync.progress/1"
 run manifest can tell versions apart."""
 
 
+def _freeze(value: Any) -> Any:
+    """Recursively convert a payload value into a read-only equivalent.
+
+    Only the container types the pipeline actually emits are handled — mappings and sequences. Stage 3
+    emits ``section_types=[...]`` and the Stage 6 refusal emits ``first_failures=[...]``, so a shallow
+    ``MappingProxyType`` left those lists writable and an event handed to several consumers could be
+    edited under the others. Scalars are returned untouched; strings and bytes are scalars here, not
+    sequences.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Inverse of :func:`_freeze`: rebuild plain, JSON-friendly, freely mutable containers.
+
+    Frozen sequences come back as ``list`` because JSON has no tuple, and because a caller that
+    mutates the result must not be able to reach the event's own state.
+    """
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
 class Stage(int, Enum):
     """The pipeline stages a user sees. ``INPUT`` covers pre-Stage-1 source work."""
 
@@ -97,15 +126,15 @@ class ProgressEvent:
     data: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Make ``data`` genuinely read-only.
+        """Make ``data`` read-only **all the way down**.
 
-        ``frozen=True`` only stops field *rebinding*; without this, ``event.data["x"] = ...`` was
-        possible, so an event handed to several consumers could be edited under the others. A
-        ``MappingProxyType`` over a private copy closes that. Note this is also why
-        :meth:`as_dict` cannot use ``dataclasses.asdict`` — that deep-copies, and a mappingproxy is
-        not copyable.
+        ``frozen=True`` only stops field *rebinding*, and a shallow ``MappingProxyType`` still left
+        nested lists and dicts writable — which matters because the pipeline emits them
+        (``section_types``, ``first_failures``). :func:`_freeze` recurses. This is also why
+        :meth:`as_dict` cannot use ``dataclasses.asdict``: that deep-copies, and a mappingproxy is not
+        copyable.
         """
-        object.__setattr__(self, "data", MappingProxyType(dict(self.data)))
+        object.__setattr__(self, "data", _freeze(dict(self.data)))
 
     @property
     def stage_title(self) -> str:
@@ -122,10 +151,11 @@ class ProgressEvent:
         return self.current is not None and self.total is not None
 
     def as_dict(self) -> dict[str, Any]:
-        """JSON-friendly form. ``kind`` becomes its string value; ``data`` is copied.
+        """JSON-friendly form. ``kind`` becomes its string value; ``data`` is recursively thawed.
 
         Built field by field rather than with ``dataclasses.asdict``, which deep-copies and cannot
-        handle the read-only ``data`` mapping.
+        handle the read-only ``data`` mapping. The returned payload shares **no** mutable container
+        with the event, so a consumer may edit it freely.
         """
         return {
             "stage": self.stage,
@@ -135,7 +165,7 @@ class ProgressEvent:
             "total": self.total,
             "elapsed_seconds": self.elapsed_seconds,
             "rate": self.rate,
-            "data": dict(self.data),
+            "data": _thaw(self.data),
             "schema": PROGRESS_SCHEMA,
             "stage_title": self.stage_title,
         }
@@ -273,7 +303,8 @@ class StageCounter:
       the panel cannot come to rest on a stale number.
     """
 
-    __slots__ = ("stage", "total", "_current", "_started", "_last_emit", "min_interval")
+    __slots__ = ("stage", "total", "_current", "_started", "_last_emit", "min_interval",
+                 "_rate_current", "_rate_started")
 
     def __init__(self, stage: int, total: int, min_interval: float = 0.5,
                  started: float | None = None, initial: int = 0) -> None:
@@ -284,6 +315,12 @@ class StageCounter:
         self._started = time.perf_counter() if started is None else float(started)
         # Seed so the first advance always emits.
         self._last_emit = float("-inf")
+        # The rate basis is tracked separately from the completion count, because not every
+        # completion represents measured work: Stage 5 counts cache hits (correctly, as completed
+        # sources) but they arrive instantly and must not be billed as analysis throughput.
+        # By default the basis is the whole counter, which is what the render path wants.
+        self._rate_current = 0
+        self._rate_started = self._started
 
     @property
     def current(self) -> int:
@@ -295,23 +332,46 @@ class StageCounter:
 
     @property
     def rate(self) -> float | None:
-        elapsed = self.elapsed
-        if elapsed <= 0.0 or self._current <= 0:
+        """Measured throughput over the rate window, or ``None`` when nothing has been measured.
+
+        Deliberately not ``current / elapsed``: see :meth:`begin_rate_window` and
+        ``counts_toward_rate``.
+        """
+        if self._rate_current <= 0:
             return None
-        return self._current / elapsed
+        elapsed = max(0.0, time.perf_counter() - self._rate_started)
+        if elapsed <= 0.0:
+            return None
+        return self._rate_current / elapsed
+
+    def begin_rate_window(self) -> None:
+        """Re-base the rate clock to now, without touching the completion count.
+
+        Stage 5 calls this once the cache scan is done, so the reported throughput describes the
+        analysis pass rather than being diluted by hundreds of instant cache hits.
+        """
+        self._rate_started = time.perf_counter()
+        self._rate_current = 0
 
     def set_current(self, value: int) -> None:
         """Move the counter forward only. Regressions are ignored, not applied."""
         self._current = max(self._current, max(0, min(int(value), self.total)))
 
     def advance(self, step: int = 1, message: str = "", force: bool = False,
-                **data: Any) -> ProgressEvent | None:
+                counts_toward_rate: bool = True, **data: Any) -> ProgressEvent | None:
         """Add ``step`` completions; return an event if one should be shown now.
 
         Returns ``None`` when throttled. The caller emits only what it gets back, so a throttled
         advance still updates the internal count.
+
+        ``counts_toward_rate=False`` records the completion but excludes it from the throughput
+        measurement — used for Stage 5 cache hits, which are genuinely complete but represent no
+        elapsed analysis work.
         """
-        self.set_current(self._current + max(0, int(step)))
+        step = max(0, int(step))
+        self.set_current(self._current + step)
+        if counts_toward_rate:
+            self._rate_current += step
         now = time.perf_counter()
         is_final = self._current >= self.total
         if not (force or is_final or (now - self._last_emit) >= self.min_interval):

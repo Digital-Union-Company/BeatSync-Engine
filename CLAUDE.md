@@ -163,9 +163,22 @@ Rules that are load-bearing:
   unit, rate or elapsed.
 - **An uncounted active phase shows no percentage.** Assembly and Qwen must not inherit the previous
   counter; `ProgressView` shows their state plus a history line (`· 1216 clips completed`) instead.
-- **`ProgressEvent.data` is a read-only `MappingProxyType`.** `frozen=True` alone allowed
-  `event.data["x"] = ...`. That is also why `as_dict()` is built field by field rather than with
-  `dataclasses.asdict`, which deep-copies and cannot handle a mappingproxy.
+- **`ProgressEvent.data` is read-only *recursively*.** `frozen=True` alone allowed
+  `event.data["x"] = ...`, and a shallow `MappingProxyType` still allowed
+  `event.data["section_types"].append(...)` — which matters because Stage 3 and the Stage 6 refusal
+  really do emit nested lists. `_freeze`/`_thaw` handle mappings and sequences only; scalars, `str`
+  and `bytes` pass through. `as_dict()` thaws recursively, so the payload shares no mutable container
+  with the event; it is built field by field because `dataclasses.asdict` deep-copies and cannot
+  handle a mappingproxy.
+- **A rate must describe what it measures.** `StageCounter` tracks its rate basis separately from the
+  completion count: `advance(..., counts_toward_rate=False)` counts a Stage 5 cache hit without
+  billing it as throughput, and `begin_rate_window()` re-bases the clock after the cache scan. Without
+  that, 420 instant cache hits made the panel claim ~840 sources/s. Pass `rate_unit` when the rate
+  measures something narrower than the count (Stage 5 counts `sources`, its rate is
+  `analyzed sources`). Stage 6 opens no window, so its clip rate is unchanged. **Never add an ETA.**
+- **A stale straggler is ignored for everything, not just the count.** `ProgressView` drops
+  out-of-order events for `rate`, `elapsed` and `message` as well, and never overwrites a known
+  measurement with `None` — otherwise one late Stage 6 event erased `4.8 clips/s`.
 - **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
   the generator does all widget updates. A test asserts the callback's only method call is `put`.
 - **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of
