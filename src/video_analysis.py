@@ -30,6 +30,9 @@ from ffmpeg_processing import (
 )
 from logger import ROOT_DIR, setup_environment
 
+# [FORK] Digital-Union: structured progress events (stdlib-only fork module).
+from beatsync_fork import progress as fork_progress
+
 
 setup_environment()
 
@@ -275,6 +278,7 @@ def analyze_video_sources(
     use_gpu: bool = False,
     enable_ai: bool = True,
     qwen_model_path: str | None = None,
+    event_callback=None,
 ) -> Dict:
     """Analyze all source videos and return candidate moments for Auto Mode."""
     total_started = time.perf_counter()
@@ -282,6 +286,9 @@ def analyze_video_sources(
     qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
     existing = [os.path.abspath(p) for p in video_files if p and os.path.exists(p)]
     if not existing:
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, "No source videos available for analysis."))
+        fork_progress.emit(event_callback, fork_progress.end(5, "No source videos"))
         return {
             "analysis_version": ANALYSIS_VERSION,
             "videos": [],
@@ -297,6 +304,15 @@ def analyze_video_sources(
     print(f"   Source videos: {len(existing)}")
     print(f"   Qwen semantic tags: {'enabled' if ai_available else 'disabled/fallback'}")
 
+    # [FORK] Digital-Union: structured progress. `total` is the real source count, and cache hits
+    # count as already-completed deterministic analysis, so the counter reflects work actually done
+    # rather than restarting from zero on a cached run.
+    fork_progress.emit(event_callback, fork_progress.start(
+        5, f"Analyzing {len(existing)} source video(s)",
+        current=0, total=len(existing), unit="sources",
+    ))
+    source_counter = fork_progress.StageCounter(5, len(existing), min_interval=0.5)
+
     results_by_index: Dict[int, Dict] = {}
     cache_paths: Dict[int, str] = {}
     jobs: List[Dict] = []
@@ -310,10 +326,21 @@ def analyze_video_sources(
             cache_hits += 1
             print(f"   Reusing cached visual analysis {idx}/{len(existing)}: {_safe_name(video_file)}")
             results_by_index[idx] = cached
+            event = source_counter.advance(
+                1, "cached", cache_hits=cache_hits, unit="sources")
+            fork_progress.emit(event_callback, event)
         else:
             jobs.append({"index": idx, "video_file": video_file, "cache_file": cache_file})
 
     workers = _video_analysis_workers(len(jobs))
+    fork_progress.emit(event_callback, fork_progress.metric(
+        5,
+        f"{cache_hits} cached, {len(jobs)} to analyze, {workers} worker(s)",
+        cache_hits=cache_hits, to_analyze=len(jobs), workers=int(workers),
+    ))
+    # Always publish the post-cache count, even when nothing needs analyzing.
+    fork_progress.emit(event_callback, source_counter.snapshot(
+        "cache scan complete", cache_hits=cache_hits, unit="sources"))
     if jobs:
         if workers > 1:
             print(
@@ -345,6 +372,11 @@ def analyze_video_sources(
                             f"{_safe_name(job['video_file'])}: {exc}"
                         )
                         print("   ↪ Retrying that video safely in serial mode...")
+                        fork_progress.emit(event_callback, fork_progress.warning(
+                            5,
+                            f"{_safe_name(job['video_file'])} failed in parallel mode; retrying "
+                            f"serially ({exc})",
+                        ))
                         results_by_index[job["index"]] = _analyze_single_video(
                             job["video_file"],
                             use_gpu,
@@ -355,6 +387,10 @@ def analyze_video_sources(
                             job["index"],
                             len(existing),
                         )
+                    # One advance per video, after either the parallel result or the serial retry,
+                    # so a retried video is never double-counted.
+                    fork_progress.emit(event_callback, source_counter.advance(
+                        1, "analyzed", cache_hits=cache_hits, unit="sources"))
         else:
             print("   CPU visual analysis workers: 1 (serial)")
             for job in jobs:
@@ -368,6 +404,8 @@ def analyze_video_sources(
                     job["index"],
                     len(existing),
                 )
+                fork_progress.emit(event_callback, source_counter.advance(
+                    1, "analyzed", cache_hits=cache_hits, unit="sources"))
 
     # When the deterministic CPU-heavy pass ran in parallel, run Qwen after it in
     # original video order. A single multi-video Qwen worker is used by default so
@@ -377,6 +415,20 @@ def analyze_video_sources(
         if results_by_index.get(job["index"], {}).get("ai_deferred") and ai_available
     ]
     batch_qwen = os.environ.get("BEATSYNC_QWEN_BATCH_VIDEOS", "1") != "0"
+    if deferred_jobs:
+        # [FORK] Digital-Union: high-level states only. The worker already prints
+        # "Qwen llama.cpp tagged N/T", but analyze_video_sources launches it with
+        # subprocess.run(capture_output=True), so the parent cannot see those lines until the worker
+        # exits. Fabricating an N/T counter here would be inventing progress we do not have.
+        # Live streaming of the worker's stdout is Phase 2B.
+        fork_progress.emit(event_callback, fork_progress.state(
+            5,
+            f"Qwen semantic tagging started ({len(deferred_jobs)} video(s)) — "
+            f"no live per-frame progress until Phase 2B",
+            qwen_videos=len(deferred_jobs),
+            qwen_live_progress_available=False,
+        ))
+    qwen_started = time.perf_counter()
     if len(deferred_jobs) > 1 and batch_qwen:
         _complete_deferred_qwen_batch(
             video_items=[(job, results_by_index[job["index"]]) for job in deferred_jobs],
@@ -398,6 +450,26 @@ def analyze_video_sources(
                 audio_profile=audio_profile or {},
                 label=f"{idx}/{len(existing)}",
             )
+
+    if deferred_jobs:
+        tagged = sum(int((results_by_index.get(j["index"], {}).get("timings") or {}).get("qwen_tag_count", 0))
+                     for j in deferred_jobs)
+        frames = sum(int((results_by_index.get(j["index"], {}).get("timings") or {}).get("qwen_frame_count", 0))
+                     for j in deferred_jobs)
+        qwen_elapsed = time.perf_counter() - qwen_started
+        if tagged:
+            fork_progress.emit(event_callback, fork_progress.metric(
+                5, f"Qwen tags {tagged}/{frames} in {_fmt_seconds(qwen_elapsed)}",
+                qwen_tag_count=tagged, qwen_frame_count=frames,
+                qwen_seconds=float(qwen_elapsed),
+            ))
+        else:
+            fork_progress.emit(event_callback, fork_progress.warning(
+                5, "Qwen produced no semantic tags; deterministic visual tags retained.",
+                qwen_seconds=float(qwen_elapsed),
+            ))
+        fork_progress.emit(event_callback, fork_progress.state(
+            5, "Qwen semantic tagging finished", qwen_seconds=float(qwen_elapsed)))
 
     for job in jobs:
         video_data = results_by_index.get(job["index"])
@@ -448,6 +520,18 @@ def analyze_video_sources(
         f"   Visual library ready: {summary} "
         f"[total {_fmt_seconds(total_elapsed)}, cache hits {cache_hits}/{len(existing)}]"
     )
+    if not all_candidates:
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, "No usable candidate moments found; renderer will use fallback sampling."))
+    fork_progress.emit(event_callback, fork_progress.end(
+        5, summary,
+        current=len(existing), total=len(existing),
+        elapsed_seconds=float(total_elapsed),
+        sources=len(existing), cache_hits=int(cache_hits), workers=int(workers),
+        candidates=len(all_candidates), ai_enabled=bool(ai_available),
+        qwen_tag_count=int(qwen_tag_count), qwen_frame_count=int(qwen_frame_count),
+        unit="sources",
+    ))
     return {
         "analysis_version": ANALYSIS_VERSION,
         "videos": videos,

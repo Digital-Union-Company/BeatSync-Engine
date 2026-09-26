@@ -20,6 +20,46 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-26 (Phase 2A — structured progress / observability)
+
+- **Structured progress core** (`src/beatsync_fork/progress.py`, `progress_view.py`): an immutable
+  `ProgressEvent(stage, kind, message, current, total, elapsed_seconds, rate, data)` with a `Stage`
+  enum, `EventKind` (start/progress/metric/state/warning/error/end), JSON-friendly `as_dict()`, and a
+  `StageCounter` that is monotonic, bounded and throttled (~2 updates/sec, always emitting the final
+  one). `emit()` swallows any callback exception — and a `None` event — so observability can never
+  fail a render; `KeyboardInterrupt` still propagates. Stdlib-only, so the whole core is testable on a
+  bare interpreter. `ProgressView` accumulates events into the status panel.
+- **The GUI no longer parses prose for stage identity.** `gui.py` previously recovered the current
+  stage with `re.search(r"Stage (\d+) is processing", message)`; that regex is gone. Stage identity is
+  now the integer `event.stage`. The existing architecture is preserved — worker thread → `queue.Queue`
+  → generator → widgets — and the `event_callback` only ever enqueues, so no Gradio component is
+  touched from a worker thread (asserted by a test).
+- **Stages 1-4** emit start/end boundaries with useful metrics (beats + tempo, features profiled,
+  section count, cuts/beats/ratio/interval/preset). No ETAs: these stages take seconds, so a projection
+  would be noise.
+- **Stage 5 deterministic analysis** reports real source progress — `total` is the actual source count,
+  **cache hits count as completed work** (a fully cached run shows completion rather than sitting at
+  zero), and a video that fails in parallel and is retried serially advances the counter exactly once.
+  Worker count and cache-hit count are reported as metrics.
+- **Stage 6 rendering** reports `current / total` clips against the frame-locked segment count, with
+  measured rate and elapsed. `current` advances only for clips actually created, individual failures
+  surface as concise warnings (first three in detail, then a running count), and the
+  incomplete-timeline refusal — unchanged in behaviour — is now visible in the UI instead of only on a
+  discarded stdout.
+- **ProRes** reports both of its serial loops: sources converted and segments extracted.
+- **Final assembly** emits start/finish states and a concise error on failure. No fake percentage for a
+  single FFmpeg call.
+- **Backward compatible.** `progress_callback` and `console_callback` are untouched and
+  `event_callback` is optional, so CLI/headless callers keep working. Legacy string statuses are still
+  accepted on the same queue, but only shown before any structured event arrives, so they cannot
+  overwrite richer output.
+- **Qwen live progress is NOT implemented.** `video_analysis.py` still launches the worker with
+  `subprocess.run(capture_output=True)`, so the worker's own `Qwen llama.cpp tagged N/T` lines remain
+  invisible to the parent until it exits. Only honest high-level states are emitted
+  (started / tags N/T / finished / failed). Live streaming is **Phase 2B**; no `Popen` was introduced.
+- **100 new tests** (`test_progress_core.py`, `test_progress_sequence.py`, `test_gui_progress_seam.py`)
+  plus the fork no-runtime-dependency guard extended to both new modules.
+
 ### Fixed — 2026-09-26 (Phase 1B review remediation)
 
 - **The render gate now validates the LIVE source controls, not only the stored session state**

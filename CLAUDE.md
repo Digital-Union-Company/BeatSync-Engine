@@ -129,16 +129,46 @@ signature (model/mmproj/server/mtmd stat + `llama-mtmd-cli --version`). **Bump `
 otherwise stale candidates silently survive. Swapping the GGUF model or llama.cpp build invalidates
 automatically.
 
-### Console vs. UI output
+### Console vs. UI output — structured progress
 
-In GUI runs, `gui.process_video` redirects stdout/stderr into `QuietConsole` (discarded) and the worker
-thread streams status through two callbacks:
+In GUI runs `gui.process_video` still redirects stdout/stderr into `QuietConsole` (discarded), so **a
+plain `print()` inside the pipeline is invisible in the UI.** Emit a structured event instead.
 
-- `progress_callback(str)` → the Gradio status box, and starts a stage in `StageConsoleLogger`
-- `console_callback(stage, msg)` → the CMD window, capped at **5 lines per stage**
+```
+pipeline  --ProgressEvent-->  queue.Queue  -->  Gradio generator  -->  status textbox
+```
 
-So a plain `print()` added inside the pipeline is invisible in the UI. Emit through `_notify_console`
-(auto_mode) or the `_stage5_summary`/`_stage6_summary` helpers in `gui.py` instead.
+`src/beatsync_fork/progress.py` defines the immutable `ProgressEvent(stage, kind, message, current,
+total, elapsed_seconds, rate, data)`; `progress_view.ProgressView` folds events into the panel text.
+Both are stdlib-only, so the whole progress path is testable without Gradio.
+
+**Stage identity is `event.stage`, an integer.** The old path recovered it with
+`re.search(r"Stage (\d+) is processing", message)` — that regex is gone from `gui.py` and must not come
+back; a test asserts its absence.
+
+Rules that are load-bearing:
+
+- **`emit()` never raises.** It swallows callback exceptions and ignores a `None` event, which is what
+  makes `emit(cb, counter.advance())` safe — `StageCounter.advance()` returns `None` when throttled.
+  A broken status widget must not lose hours of analysis. `KeyboardInterrupt` still propagates.
+- **`StageCounter` is monotonic, bounded and throttled** (~2 updates/sec, final update always sent).
+  Stage 5 retries a failed video serially and Stage 6 collects clips out of order via `as_completed`;
+  neither may make the displayed count go backwards or exceed the total.
+- **Never touch a Gradio component from a worker thread.** `event_callback` only calls `queue.put`;
+  the generator does all widget updates. A test asserts the callback's only method call is `put`.
+- **Stage 5 seeds the counter with cache hits**, so a fully cached run shows completion instead of
+  sitting at 0 while doing nothing.
+- **No invented ETAs.** Stages 1-4 are seconds long; Stage 5's per-video cost varies with clip
+  duration. Rendering publishes a *measured* rate, which is not a prediction.
+
+The legacy `progress_callback` / `console_callback` remain for CLI and headless callers;
+`event_callback` is optional everywhere. `StageConsoleLogger.apply_event()` drives the CMD log from the
+same events, so console and GUI cannot disagree.
+
+**Qwen live progress is not implemented (Phase 2B).** `video_analysis.py` launches the worker with
+`subprocess.run(capture_output=True)`, so its `tagged N/T` lines are unavailable until the worker
+exits. Only honest high-level states are emitted. Do not fabricate an N/T counter here, and do not
+switch to `Popen` as a side effect of unrelated work.
 
 ### Rendering modes
 
@@ -201,6 +231,8 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `input_report.py` | `InputReport` — renders and serialises the counts from an `InputSet` |
 | `input_confirmation.py` | `SourceSnapshot` identity + `evaluate_gate()` — what "confirmed" means |
 | `input_session.py` | the source-input state machine and `resolve_for_render()` — the actual gate |
+| `progress.py` | `ProgressEvent` + `StageCounter` + `emit()` — structured pipeline progress |
+| `progress_view.py` | `ProgressView` — folds events into the status panel text |
 
 ### Video source modes and the confirmation gate
 
