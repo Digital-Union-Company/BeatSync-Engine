@@ -32,8 +32,11 @@ travel with the failure. Diagnostics only: no encoder, command, timing or render
 
 - **New fork module `src/beatsync_fork/ffmpeg_diagnostics.py`** (stdlib-only). `summarize_ffmpeg_failure`
   ranks stderr lines and returns one bounded line; `describe_output_problem` and `describe_exception`
-  cover the cases where there is no stderr worth quoting. Vendor-neutral by construction — a test
-  asserts the marker tuples never mention NVENC/CUDA/drivers — so the next failure family benefits too.
+  cover the cases where there is no stderr worth quoting. Vendor-neutral by construction: the marker
+  tuples contain no NVIDIA/NVENC/CUDA-specific tokens and no incident-specific values such as `13.1` or
+  `610.00`, and a test asserts exactly that token set. Generic diagnostic terms stay intentionally
+  allowed — `_SPECIFIC_MARKERS` does include `"driver"`, which matches any vendor — so the next failure
+  family benefits too.
 - **`extract_clip_segment_ffmpeg()` keeps its `-> bool` signature** and becomes a thin delegate to the
   new `extract_clip_segment_ffmpeg_detailed() -> Tuple[bool, str]`. The call graph shows exactly one
   in-repo caller, but the boolean function is a module-level API in an upstream file, so it was left

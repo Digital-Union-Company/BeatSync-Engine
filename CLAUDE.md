@@ -141,9 +141,11 @@ without FFmpeg or a GPU. Load-bearing details:
   diagnostic line wins" was the first implementation and it was wrong: in the real capture the recovered
   nvdec warning sits *four lines before* the fatal `Driver does not support the required nvenc API
   version. Required: 13.1 Found: 13.0`, and got reported instead of it.
-- **Generic, not vendor-special-cased.** Nothing in the ranking data mentions NVENC, CUDA or drivers; a
-  test asserts that of the marker tuples directly. The real pre-driver stderr is committed as the
-  regression fixture.
+- **Generic, not vendor-special-cased.** The ranking data carries no NVIDIA/NVENC/CUDA-specific tokens
+  and no incident-specific version literals (`13.1`, `610.00`); a test asserts that vendor-token set
+  against the marker tuples directly. Generic diagnostic words *are* allowed and `_SPECIFIC_MARKERS`
+  does contain `"driver"` — that matches any vendor's driver complaint and is deliberately not treated
+  as a vendor special case. The real pre-driver stderr is committed as the regression fixture.
 - **Bounded at 240 chars**, one line, control characters stripped and heap addresses collapsed
   (`[h264_nvenc @ 000001c3…]` → `[h264_nvenc]`) so the same failure produces the same string twice. A
   1 MB stderr still yields a ~60-char reason. The unabridged stderr still goes to the console exactly
