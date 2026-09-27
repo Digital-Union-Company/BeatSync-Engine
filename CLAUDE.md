@@ -132,11 +132,16 @@ without FFmpeg or a GPU. Load-bearing details:
 
 - **Only consulted when `returncode != 0`.** `rc=0` plus a non-empty output is success, full stop — a
   test pins the call inside the `returncode != 0` branch. The rule was written because, while the NVENC
-  path still requested `-hwaccel cuda`, *every successful* clip on driver 617.14 printed a scary nvdec
+  path still requested `-hwaccel cuda`, successful clips on driver 617.14 kept printing a scary nvdec
   fallback warning (`cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE`, `more than 32 (33) decode
-  surfaces`), and summarising unconditionally would have attached a "reason" to all 150 clips of a
-  perfectly good render. Phase 3C removed that request, so current renders no longer emit it — but the
-  rule stands on its own: a warning a tool recovered from is not a failure, whatever produced it.
+  surfaces`), so summarising unconditionally would have attached a "reason" to most of a perfectly good
+  render. Phase 3C later quantified what Phase 3B had only observed: CUDA decode initialisation failed
+  on **48 of 60** measured old-path clips, which then fell back to software decode, while one sampled
+  source family engaged real NVDEC and emitted no such warning. It was never *every* successful clip —
+  it was most of the sampled ones. Phase 3C also removed the request, so current renders no longer emit
+  it at all. The rule stands on its own either way: a warning a tool recovered from is not a failure,
+  whatever produced it. (Some frozen Phase 3B test docstrings still carry the older "every successful
+  clip" phrasing; the measured figure above is the authority.)
 - **The selector anchors on FFmpeg's *consequence* lines, not on line order.** FFmpeg prints the root
   cause immediately before the wrapper it triggers (`Error while opening encoder` → `Task finished with
   error code` → `Conversion failed!`), so the specific lines nearest that boundary win. "Earliest

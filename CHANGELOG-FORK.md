@@ -88,11 +88,14 @@ travel with the failure. Diagnostics only: no encoder, command, timing or render
   `progress.py` and no `ProgressView` change was required; `gui.py` is untouched.
 - **A successful clip stays successful.** The summariser is only reached inside the
   `returncode != 0` branch, asserted by a seam test. This mattered concretely *at the time of Phase 3B*,
-  when the NVENC path still requested `-hwaccel cuda`: on driver 617.14 every successful NVENC clip
-  emitted `cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE` / `more than 32 (33) decode surfaces` while
-  FFmpeg fell back to software decode, and the validated 150-clip render would otherwise have acquired
-  150 spurious "reasons". (Phase 3C later removed that request, so current renders no longer emit it —
-  the rule itself is unchanged and still load-bearing.)
+  when the NVENC path still requested `-hwaccel cuda`: successful NVENC clips on driver 617.14 were
+  emitting `cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE` / `more than 32 (33) decode surfaces` while
+  FFmpeg fell back to software decode, so the validated 150-clip render would otherwise have acquired a
+  large crop of spurious "reasons". Phase 3B observed the behaviour without quantifying it; Phase 3C
+  later measured it at **48 of 60** old-path clips failing CUDA decode initialisation, with one sampled
+  source family engaging real NVDEC and emitting no such warning — so it was most successful clips, not
+  all of them. (Phase 3C also removed the request, so current renders no longer emit it — the rule
+  itself is unchanged and still load-bearing.)
 - **Bounded**: 240 characters, one line, control characters stripped, heap addresses collapsed so the
   same failure yields a reproducible string. A 1 MB stderr produced a 61-character reason in test. The
   full text still reaches the console through the pre-existing print.
