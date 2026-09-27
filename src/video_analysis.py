@@ -1652,7 +1652,10 @@ def _annotate_candidates_with_qwen(
     use_gpu: bool,
     audio_profile: Dict,
     event_callback=None,
-) -> None:
+) -> Dict[str, Any]:
+    # [FORK] Digital-Union (D1 R3): annotation corrected from `-> None`. Every normal branch returns
+    # a timings dict, and since D1 it also carries the load-bearing private `_QWEN_COMPLETED_KEY`
+    # that the caller pops to decide `ai_enabled`. Annotation only - no behaviour or shape change.
     max_windows = int(os.environ.get("BEATSYNC_QWEN_MAX_WINDOWS", "120"))
     max_windows = max(0, max_windows)
     if max_windows == 0:

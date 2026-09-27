@@ -30,12 +30,28 @@ against the pre-D1 code with three uncached sources: interrupting during the det
 `os._exit` mid-run left 0. On the real 702-source library (median 4.4 s, mean 6.5 s per source) a full
 cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously throw away.
 
-- **Per-source checkpointing.** A source is now persisted the moment it is genuinely complete: after
-  each serial `_analyze_single_video`, after each parallel result, after `_complete_deferred_qwen`,
-  and after **each per-job merge** in `_complete_deferred_qwen_batch` — so a later job's failure, or
-  an abort part way through a long shared Qwen batch, no longer costs work that already finished. The
-  terminal loop remains only as a backstop and now goes through the same guard, so it can no longer
+- **Per-source checkpointing.** Every point at which a source could have become complete now *checks
+  checkpoint eligibility* through the one completion rule, and writes only if the rule accepts:
+  after each serial `_analyze_single_video`, after each parallel deterministic result, after
+  `_complete_deferred_qwen`, and after **each per-job merge** in `_complete_deferred_qwen_batch`. The
+  terminal loop remains only as a backstop and goes through the same guard, so it can no longer
   promote an incomplete record into an accepted cache entry.
+
+  What that actually persists, per shape:
+
+  - a **non-AI** parallel or serial result is complete on arrival and is written immediately;
+  - an **AI-deferred** parallel result carries `ai_deferred=True`, so the rule *refuses* it at that
+    point — it becomes durable only once its Qwen result genuinely completes;
+  - a **candidate-less** result that finished its deterministic scoring pass is the explicit
+    no-Qwen-work exception and is written (see the R2 note below for why the scoring evidence is
+    required);
+  - in the **shared Qwen batch**, each per-job merge is checkpointed independently *once the worker's
+    final response has returned*, so a failing or missing sibling — and a parent interruption during
+    the post-response merge loop — no longer discards jobs already written.
+
+  The boundary this does **not** cross: while the shared worker is still in flight, its per-job
+  results exist only inside that process and nothing about them is durable yet. Streamed worker
+  progress is presentation only and carries no semantic result authority. See *Honest limits* below.
 - **One completion rule.** New `_cache_entry_is_complete()` answers "is this payload reusable for this
   request?" in one place. It rejects non-dict payloads, wrong `analysis_version`, missing/non-string
   `video_file`, non-list `candidates`, and anything with `ai_deferred` truthy; under `require_ai` it
@@ -52,9 +68,12 @@ cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously
   `ai_enabled=True` with 0 tags and was reused as AI-complete forever. Completion is now a per-job
   membership test, one missing job no longer fails its siblings, and the existing total-batch-failure
   behaviour is preserved.
-- **Candidate-less sources are no longer re-analysed forever.** With no candidates there is no Qwen
-  work, so the source is complete — expressed through the completion rule, with `ai_enabled` left
-  honestly `False` rather than faked to satisfy the loader.
+- **Candidate-less sources are no longer re-analysed forever** — but only when the deterministic
+  scoring pass genuinely completed, proven by the existing scoring evidence in `timings`. There is
+  then no Qwen work to do, so the source is reusable, expressed through the completion rule with
+  `ai_enabled` left honestly `False` rather than faked to satisfy the loader. An empty candidate list
+  on its own is **not** proof of success: an OpenCV-open failure produces the same shape, and R2
+  below records that the first pass wrongly accepted it.
 - **Hardened writer.** `_save_cache` now publishes through a unique same-directory temp file
   (`tempfile.mkstemp`), `flush` + `os.fsync`, then `os.replace`, with best-effort cleanup in
   `finally`. The old shared `path + ".tmp"` was demonstrably unsafe across processes: under

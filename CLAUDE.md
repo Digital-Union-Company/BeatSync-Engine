@@ -228,16 +228,30 @@ Before D1 the only save site was a terminal loop at the end of `analyze_video_so
 interruption *anywhere* earlier discarded every newly analysed source — measured: 3 sources and all
 their Qwen tags completed, **0** durable cache entries. The rules that replaced it:
 
-- **A source is checkpointed the moment it is genuinely complete**, not when Stage 5 finishes:
-  after each serial `_analyze_single_video` (inline AI), after each parallel result, after
-  `_complete_deferred_qwen`, and after **each per-job merge** inside
-  `_complete_deferred_qwen_batch`. The terminal loop survives only as a backstop.
+- **Every completion point checks checkpoint eligibility**, rather than Stage 5 saving once at the
+  end. `_checkpoint_cache` is called after each serial `_analyze_single_video` (inline AI), after
+  each parallel deterministic result, after `_complete_deferred_qwen`, and after **each per-job
+  merge** inside `_complete_deferred_qwen_batch`; the terminal loop survives only as a backstop. A
+  *call* is not a write — the completion rule decides, so what each shape actually persists is:
+
+  | shape | at that point | durable? |
+  |---|---|---|
+  | non-AI parallel or serial | complete on arrival | **yes, immediately** |
+  | AI-deferred parallel result | `ai_deferred=True` | **no** — only after its Qwen result completes |
+  | candidate-less with scoring evidence | no Qwen work exists | **yes** (the explicit exception) |
+  | shared Qwen batch, per job | after the worker's final response returns | **yes, per job** |
+
+  So a failing or missing sibling job, and a parent interruption during the post-response merge loop,
+  cannot discard jobs already written. **While the shared worker is still in flight its per-job
+  results are not durable at all** — they exist only inside that process until its final response is
+  written, and the streamed progress channel carries no semantic result authority. Closing that gap
+  would need a two-phase deterministic-only record, which D1 deliberately does not introduce.
 - **`_cache_entry_is_complete()` is the single completion rule.** Never re-answer "is this reusable?"
   anywhere else — the scattered version is exactly how a failed Qwen run became a permanent
   AI-complete hit. It rejects a non-dict payload, a wrong `analysis_version`, a missing/non-string
   `video_file`, non-list `candidates`, and **anything with `ai_deferred` truthy**; under
-  `require_ai` it additionally demands `ai_enabled` *unless there are no candidates*, because then
-  there was never any Qwen work to do.
+  `require_ai` it additionally demands `ai_enabled` unless there are no candidates *and* the
+  deterministic scoring pass is shown to have run (see the candidate-less rule below).
 - **`_checkpoint_cache()` is the only thing that may start a write.** It consults the rule first, so
   checkpointing early can never publish a deferred or failed-AI record. `analyze_video_sources`
   must not call `_save_cache` directly; a test asserts that.
