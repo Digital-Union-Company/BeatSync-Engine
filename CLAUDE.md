@@ -401,11 +401,12 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   This exists because a read-only audit of the real 2196-entry cache found **4** records claiming
   `ai_enabled=True` with `qwen_frame_count=10`, `qwen_tag_count=9` and 9 `ai_analyzed` candidates —
   exactly the false-complete shape D1 exists to prevent — which the pre-R6 loader accepted because it
-  only checked `bool(data["ai_enabled"])`. Measured effect: 2192 of 2196 accepted, those 4 rejected and
-  naturally recomputed on next encounter. Two further records (398 candidates/114 tagged, 525/119) are
-  internally coherent but historically unverifiable; they stay reusable and belong to the D2
-  completion-contract decision. **No runtime cache file was ever edited** — the audit and the
-  verification are read-only, and rejection simply becomes an ordinary cache miss.
+  only checked `bool(data["ai_enabled"])`. Measured effect *in the D1-era cache*: 2192 of 2196 accepted,
+  those 4 rejected and naturally recomputed on next encounter. Two further records (398 candidates/114
+  tagged, 525/119) were internally coherent but historically unverifiable, and remained reusable under
+  the D1 loader pending the D2 decision — which the D2 generation transition has since settled by
+  orphaning them. **No runtime cache file was ever edited** — the audit and the verification are
+  read-only, and rejection simply becomes an ordinary cache miss.
 - **A candidate-less source is complete only if the deterministic pass actually ran.** Two very
   different outcomes both end with `candidates == []`: a source whose windows yielded no usable
   moments, and a source OpenCV could not open (`"Warning: OpenCV could not open …; candidate
@@ -431,12 +432,19 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
 - **`PROCESS_CRASH_ATOMICITY` is provided** (a reader sees the old entry or the new one, never a
   partial final file — verified at all four boundaries). **`POWER_LOSS_DURABILITY` is not claimed**:
   the temp is fsynced, the containing directory is not. Do not upgrade that claim without testing it.
-- D1 deliberately **did not** change `_video_signature`, `_path_signature_token`,
-  `_qwen_backend_signature_token`, `_cache_path` or `ANALYSIS_VERSION`, so all pre-existing entries
-  stay **addressable** — and 2192 of the 2196 real records stay **reusable**, with 4 intentionally
-  rejected as self-contradictory (see the stored-consistency rule below). Source/backend
-  identity hardening — `int(st_mtime)` collides for any in-place rewrite inside the same second — is
-  **deferred to D2** because it re-keys the whole cache.
+- **Historical, at the D1 merge boundary:** D1 deliberately did **not** change `_video_signature`,
+  `_path_signature_token`, `_qwen_backend_signature_token`, `_cache_path` or `ANALYSIS_VERSION`.
+  `_video_signature` still used `int(stat.st_mtime)` at that point, so all pre-existing entries
+  remained addressable, and 2192 of the 2196 real records remained reusable once the selective legacy
+  guard landed, with 4 intentionally rejected as self-contradictory (see the stored-consistency rule
+  above). Source/backend identity hardening was intentionally deferred *from* D1, because closing
+  `int(st_mtime)`'s same-second collision re-keys the whole cache.
+
+  **Current state:** the D2 identity contract above supersedes all of that. Identity now uses
+  `st_mtime_ns` plus a bounded content fingerprint under `CACHE_CONTRACT_VERSION = "stage5_cache_v2"`,
+  so pre-D2 records are naturally orphaned and are never reachable by a D2 lookup — including the two
+  records whose completeness D1 could not prove, which that transition retires without a judgement
+  call. The D1 figures above describe the D1-era loader and cache, not current behaviour.
 - **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in
   `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...`; the runtime cache is read-only for study work.
 

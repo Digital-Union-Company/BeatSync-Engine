@@ -284,11 +284,12 @@ It deliberately does **not** call `_qwen_job_completed`: that needs `requested_i
 payloads never stored (nor the `BEATSYNC_QWEN_MAX_WINDOWS` value in force), so replaying the live rule
 against an old record would mean inventing evidence. For the same reason it does not require
 `frame_count == len(candidates)` — a smaller value is the normal result of `_select_ai_candidates`
-limiting the submitted set, so the two unverifiable records stay reusable and are left to the D2
-completion-contract decision.
+limiting the submitted set, so the two unverifiable records remained reusable under the D1 loader and
+were left to the D2 completion-contract decision. *The D2 transition above has since settled that by
+orphaning them.*
 
-Measured against the real cache, read-only: **2192 accepted, 4 rejected**, the rejected set exactly the
-four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
+Measured against the real cache at the D1 merge boundary, read-only: **2192 accepted, 4 rejected**, the
+rejected set exactly the four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
 an ordinary cache miss, and the source is recomputed and republished through the already-hardened
 writer. No migration command is provided and none is needed. `require_ai=False` deterministic reuse is
 unaffected (those candidates are real work), and the candidate-less path still answers to
@@ -306,20 +307,23 @@ validation, terminal backstop). A successful uninterrupted run is payload-equiva
 execution shapes — parallel/deferred and serial/inline — with the only difference being the removal
 of the leaked `_qwen_completed` key from the serial shape's stored timings.
 
-**Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
-still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
-the real cache: all entries stay **addressable**, and 2192 of 2196 stay **reusable** (see R6 — 4 are
-intentionally rejected as self-contradictory). A successful
-uninterrupted run returns a payload identical to the pre-D1 result (candidates, per-video records and
-summary compared field by field).
+**Cache compatibility — at the D1 merge boundary.** There was no cache-key, signature or
+`ANALYSIS_VERSION` change: `_video_signature` still used `int(stat.st_mtime)`, so existing entries
+remained addressable. Verified read-only against the real cache at that point: all entries addressable,
+and 2192 of 2196 reusable (see R6 — 4 intentionally rejected as self-contradictory). A successful
+uninterrupted run returned a payload identical to the pre-D1 result (candidates, per-video records and
+summary compared field by field). *The later D2 generation transition documented above supersedes this
+contract and naturally orphans every pre-D2 entry, so these figures describe the D1-era cache, not
+current lookup behaviour.*
 
-**Honest limits.** D1 introduces no two-phase deterministic-partial cache contract, so if the process
-dies while a shared Qwen worker is still running *before its response returns*, that batch's
-deterministic work still has to be recomputed. **D1 does not fix source-identity collisions**:
-`int(st_mtime)` still gives the same signature to a file rewritten in place with the same size inside
-the same second, and an exact-mtime restore collides regardless of precision. Source and backend
-identity hardening is **deferred to D2**, because moving to `st_mtime_ns` re-keys the entire cache and
-would force a cold rebuild.
+**Honest limits — as of D1.** D1 introduced no two-phase deterministic-partial cache contract, so if
+the process died while a shared Qwen worker was still running *before its response returned*, that
+batch's deterministic work had to be recomputed — still true today, since D2 changed identity, not that
+contract. **D1 did not fix source-identity collisions**: `int(st_mtime)` gave the same signature to a
+file rewritten in place with the same size inside the same second, and an exact-mtime restore collided
+regardless of precision. Source and backend identity hardening was deferred to D2, because moving to
+`st_mtime_ns` re-keys the entire cache and forces a cold rebuild; **the D2 section above now closes that
+work** and accepts exactly one such rebuild.
 
 ### Changed — 2026-09-27 (Phase 3C: NVENC clips decode in software)
 
