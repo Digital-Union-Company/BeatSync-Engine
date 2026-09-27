@@ -214,6 +214,80 @@ Qwen is advisory, not authoritative: `_merge_semantic()` keeps deterministic mot
 dominant (e.g. action = 0.72·deterministic + 0.28·semantic·motion_gate) so a pretty static frame can't be
 hallucinated into an action shot. Keep that weighting shape when adding semantic fields.
 
+### A persistently rejected candidate gets one targeted recovery (R1)
+
+A candidate whose semantics `_normalize_semantic` rejects used to make its **whole source permanently
+uncacheable**, because `_qwen_job_completed` requires `returned_ids == requested_ids`, so one missing
+tag means no checkpoint and the source is re-analysed on every run forever. Two sources in the real
+845-file library were in exactly that state (measured: 10 requested, 10 decoded, 9 tagged), costing a
+~51 s Stage 5 tax on every warm run.
+
+Measured root cause — **truncation**, not a field-level rejection. The primary request budgets
+`_max_new_tokens()` (default 128) and leaves `description` an unbounded string. llama-server returns
+`finish_reason="length"` with non-empty but truncated text; `_parse_json_object`'s `\{.*\}` finds no
+closing brace, `json.loads` fails, and `_normalize_semantic` rejects at its not-a-dict guard. All 8
+numeric keys, both enums and a long description were present in the raw text — only the closing brace
+was missing. Because decoding is greedy (`temperature 0`, `top_k 1`) every existing retry tier
+re-issues the identical request and gets byte-identical output, which is why it never resolves.
+
+**Raising the token budget alone is not a fix, and that is measured rather than assumed.** One of the
+two cases is a degenerate repetition loop (`lips moving, lips open, lips closed, …`) that simply
+consumes a larger budget too: still truncated at 160, 192 **and 256** tokens, growing 350 → 470 → 614
+→ 880 characters. The grammar bound is the half that stops the loop; the extra budget is only needed so
+the bounded JSON can close (131 and 129 tokens observed). The bound alone also fails — it leaves the
+other case one token short. Smallest variant recovering both 3/3 deterministically:
+**160 tokens + `description.maxLength = 96`**. Larger bounds (112, 128) also pass but retain *more* of
+the repetition, which is the argument for 96.
+
+Load-bearing details:
+
+- **The primary path is untouched.** `_max_new_tokens()` still governs the ordinary request, still
+  keyed into the D2 signature through `BEATSYNC_QWEN_MAX_NEW_TOKENS`; `SEMANTIC_SCHEMA` still carries
+  `description = {"type": "string"}` with no bound; the prompt and greedy sampling are unchanged.
+  `_recovery_semantic_schema()` deep-copies rather than mutating the global. Proven cross-branch:
+  primary output is **byte-identical** to merged main on all four measured candidates (342/347/350/306
+  chars) against one shared llama-server instance.
+- **Recovery is deliberately LAST.** Every existing primary tier runs first — initial attempt, server
+  retry, reduced-slot restart (which `return`s recursively, so only the innermost wave reaches
+  recovery), serial/CLI fallback. Only then does an unresolved candidate get **exactly one** recovery
+  generation. No recursion, no second attempt.
+- **Eligibility is recomputed from `semantics`, not from `failed`.** The serial fallback tier resolves
+  candidates without rewriting `failed`, so trusting `failed` would re-ask for semantics that already
+  arrived.
+- **Semantic rejection only, never transport failure.** `_is_semantic_rejection(semantic, text)`
+  requires a falsy semantic *and* non-empty text. An HTTP error, dead server, CLI timeout, non-zero
+  exit or empty generation produces no truncated output to rescue, and re-asking would paper over a
+  broken backend — those paths report `False` as the 4th tuple element. The classification is internal
+  to the inference wave and **never reaches a cached payload**.
+- **`max_tokens`/`semantic_schema` overrides default to `None` on all three `generate()` primitives**
+  (`LlamaServerClient`, `LlamaMtmdClient`, `QwenLlamaClient`), so every existing caller is unchanged.
+  The CLI client's ctx-fallback self-retry forwards them too — without that, a recovery hitting a ctx
+  error would silently retry as an ordinary 128-token unbounded request and truncate again while
+  appearing to have run.
+- **The constants are hard-coded, not environment variables.** A `BEATSYNC_QWEN_RECOVERY_*` knob would
+  be result-affecting Qwen configuration absent from `_qwen_config_token()` — exactly the defect D2
+  fixed for `MAX_WINDOWS`. They are contract-governed instead, like the prompt and the schema.
+- **No cache re-key and no contract bump for this first introduction**, and the argument is structural:
+  a source current main caches had every requested candidate tagged on the primary path, so recovery
+  never runs and the persisted semantics are identical; a source that missed a candidate fails
+  `_qwen_job_completed`, so current main wrote **no complete record at all** — recovery can only turn
+  an absence into a record, never contradict a stored one. The 843 existing D2 records stay reusable.
+  A *future* change to these constants does not inherit that argument, because fallback-generated
+  records will exist by then: default policy is to bump `CACHE_CONTRACT_VERSION` unless
+  persisted-output compatibility is explicitly proven.
+- **The completion contract is unchanged.** `_qwen_job_completed`, `_stored_ai_cache_is_consistent`,
+  `ai_enabled`/`ai_deferred` semantics and checkpoint eligibility are all untouched. Recovery merely
+  supplies one more candidate semantic; the existing machinery still decides whether the source may be
+  checkpointed. A failed recovery leaves the candidate absent and the job incomplete, exactly as before.
+- **Recovery does not cure repetition.** The recovered degenerate description is still partially
+  repetitive — it is merely valid JSON, schema-valid, normalization-valid and bounded to ≤ 96 chars.
+  The win is that one runaway description no longer makes an entire source permanently uncacheable.
+  Prose quality is out of scope.
+
+Measured cost: ~0.61–0.72 s per recovery call (mean ~0.65 s), so 2 calls ≈ 1.3 s for the known library.
+Prediction only until a production run confirms it: once both sources recover and checkpoint, a
+subsequent identical warm run should show 845/845 cache hits and launch no Qwen worker at all.
+
 ### Analysis cache
 
 `input/video_analysis_cache/*.json` is keyed by `ANALYSIS_VERSION` + video path/size/mtime + a backend

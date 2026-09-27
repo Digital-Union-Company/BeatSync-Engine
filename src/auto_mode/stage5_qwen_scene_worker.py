@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import copy
 import io
 import json
 import os
@@ -89,6 +90,60 @@ SEMANTIC_SCHEMA["properties"].update({
     "recommended_use": {"type": "string", "enum": sorted(ALLOWED_USES)},
     "description": {"type": "string"},
 })
+
+# [FORK] Digital-Union (R1): targeted semantic recovery for a *persistently* rejected candidate.
+#
+# Measured root cause: the primary request budgets `_max_new_tokens()` (default 128) and leaves
+# `description` an unbounded string, so a long or degenerate description consumes the budget before
+# the JSON closes. llama-server then returns `finish_reason="length"` with non-empty but truncated
+# text, `_parse_json_object` finds no closing brace, and `_normalize_semantic` rejects at its
+# not-a-dict guard. Because decoding is greedy (temperature 0 / top_k 1) every primary retry tier
+# reproduces the identical output, so the candidate never resolves and its whole source stays
+# permanently uncacheable.
+#
+# Raising the budget alone is NOT a fix, and this was measured rather than assumed: a degenerate
+# repetition loop simply consumes the larger budget too (observed truncated at 128, 160, 192 and
+# 256 tokens, growing 350 -> 470 -> 614 -> 880 characters and never closing). The grammar bound is
+# the half that stops the loop; the extra budget is only needed so the bounded JSON can close.
+# Smallest variant that recovered both measured failures 3/3 deterministically: 160 tokens plus
+# `description.maxLength = 96`. Both are needed; neither alone suffices.
+#
+# These are hard-coded implementation constants on purpose: a user-tunable recovery knob would be
+# result-affecting Qwen configuration absent from the D2 cache signature, which is exactly the
+# defect `_qwen_config_token()` exists to prevent. They are instead contract-governed, like the
+# prompt and the schema.
+#
+# Cache compatibility of this *first* introduction (no re-key, no contract bump):
+#   * primary succeeds for every requested candidate -> recovery never runs -> the returned and
+#     persisted semantics are byte-identical, so every existing D2 record stays valid;
+#   * primary misses any candidate -> `_qwen_job_completed` requires `returned_ids == requested_ids`,
+#     so current main writes NO complete source-cache record at all -> recovery can only turn an
+#     absence into a record, never contradict a stored one.
+# A future change to these constants does NOT inherit that argument, because fallback-generated
+# records will exist by then. Default policy for such a change is to bump CACHE_CONTRACT_VERSION
+# unless persisted-output compatibility is explicitly proven.
+#
+# Honest limit: recovery does not cure repetition. The measured recovered description for the
+# degenerate case is still partially repetitive; it is merely valid JSON, schema-valid,
+# normalization-valid and bounded. The point is that one runaway description no longer makes an
+# entire source permanently uncacheable. Prose quality is out of scope.
+_SEMANTIC_RECOVERY_MAX_TOKENS = 160
+_SEMANTIC_RECOVERY_DESCRIPTION_MAX_LENGTH = 96
+
+
+def _recovery_semantic_schema() -> Dict:
+    """[FORK] Digital-Union (R1): `SEMANTIC_SCHEMA` with a bounded description, copied not mutated.
+
+    Identical to the primary schema in every other respect - numeric keys and their 0..1 limits,
+    `required`, `additionalProperties`, and both enums. The primary object must keep serving the
+    ordinary path unchanged, so this deep-copies rather than editing in place.
+    """
+    schema = copy.deepcopy(SEMANTIC_SCHEMA)
+    schema["properties"]["description"] = {
+        "type": "string",
+        "maxLength": _SEMANTIC_RECOVERY_DESCRIPTION_MAX_LENGTH,
+    }
+    return schema
 
 
 def _parse_args() -> argparse.Namespace:
@@ -649,7 +704,15 @@ class LlamaServerClient:
         self._stdout_handle.close()
         self._stderr_handle.close()
 
-    def generate(self, image: Image.Image, prompt: str) -> str:
+    def generate(
+        self,
+        image: Image.Image,
+        prompt: str,
+        max_tokens: int | None = None,
+        semantic_schema: Dict | None = None,
+    ) -> str:
+        # [FORK] Digital-Union (R1): the two overrides exist only for targeted semantic recovery.
+        # `None` means "ordinary request", so every existing caller keeps today's exact behaviour.
         if not self.process or self.process.poll() is not None:
             raise RuntimeError("llama-server is not running")
         timeout = float(_env_int("BEATSYNC_QWEN_LLAMA_HTTP_TIMEOUT", 240, lo=30, hi=1800))
@@ -666,14 +729,14 @@ class LlamaServerClient:
             "top_k": 1,
             "top_p": 1,
             "min_p": 0,
-            "max_tokens": _max_new_tokens(),
+            "max_tokens": _max_new_tokens() if max_tokens is None else int(max_tokens),
             "stream": False,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "beatsync_semantic_tag",
                     "strict": True,
-                    "schema": SEMANTIC_SCHEMA,
+                    "schema": SEMANTIC_SCHEMA if semantic_schema is None else semantic_schema,
                 },
             },
         }
@@ -710,7 +773,15 @@ class LlamaMtmdClient:
         self.frame_dir = prefix.with_name(prefix.name + "_llama_frames")
         self.frame_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, image: Image.Image, prompt: str, item_id: str) -> str:
+    def generate(
+        self,
+        image: Image.Image,
+        prompt: str,
+        item_id: str,
+        max_tokens: int | None = None,
+        semantic_schema: Dict | None = None,
+    ) -> str:
+        # [FORK] Digital-Union (R1): same optional overrides as the server path, same `None` default.
         image_path = self.frame_dir / f"{_safe_file_token(item_id)}.png"
         image.save(image_path, format="PNG")
         args = [
@@ -719,7 +790,7 @@ class LlamaMtmdClient:
             "--mmproj", str(self.paths.mmproj),
             "--image", str(image_path),
             "-p", prompt,
-            "-n", str(_max_new_tokens()),
+            "-n", str(_max_new_tokens() if max_tokens is None else int(max_tokens)),
             "--ctx-size", str(self.ctx_size),
             "--batch-size", "2048",
             "--ubatch-size", "512",
@@ -730,7 +801,10 @@ class LlamaMtmdClient:
             "--top-k", "1",
             "--top-p", "1",
             "--min-p", "0",
-            "--json-schema", json.dumps(SEMANTIC_SCHEMA, separators=(",", ":")),
+            "--json-schema", json.dumps(
+                SEMANTIC_SCHEMA if semantic_schema is None else semantic_schema,
+                separators=(",", ":"),
+            ),
             "--no-warmup",
             "--log-verbosity", "1",
             "--no-log-prefix",
@@ -777,7 +851,10 @@ class LlamaMtmdClient:
                     f"Retrying llama-mtmd-cli with ctx {fallback_ctx} after exit code {result.returncode}.",
                 )
                 self.ctx_size = fallback_ctx
-                return self.generate(image, prompt, item_id)
+                # [FORK] Digital-Union (R1): forward the overrides. Without them a recovery request
+                # that hit a ctx error would silently retry as an ordinary 128-token unbounded
+                # request and truncate again, defeating recovery while appearing to have run.
+                return self.generate(image, prompt, item_id, max_tokens, semantic_schema)
             _append_log(self.stderr_path, f"{item_id} exit", f"Exit code {result.returncode}")
             return ""
         return result.stdout or ""
@@ -877,10 +954,21 @@ class QwenLlamaClient:
             self._prepare_cli(self.ctx_size)
             return False
 
-    def generate(self, image: Image.Image, prompt: str, item_id: str) -> str:
+    def generate(
+        self,
+        image: Image.Image,
+        prompt: str,
+        item_id: str,
+        max_tokens: int | None = None,
+        semantic_schema: Dict | None = None,
+    ) -> str:
+        # [FORK] Digital-Union (R1): forwards the recovery overrides to whichever backend serves the
+        # request, so recovery works identically on the server and CLI paths. The existing
+        # context/VRAM fallback and CLI switch below are transport resilience for this single
+        # generation - they are not additional recovery attempts.
         if self.server:
             try:
-                return self.server.generate(image, prompt)
+                return self.server.generate(image, prompt, max_tokens, semantic_schema)
             except Exception as exc:
                 fallback_ctx = _ctx_sizes()[-1]
                 if self.ctx_size != fallback_ctx and _is_context_or_memory_error(str(exc)):
@@ -901,7 +989,7 @@ class QwenLlamaClient:
                         self.ctx_size = fallback_ctx
                         self.load_seconds += self.server.load_seconds
                         self.batch_size = self.server.slots
-                        return self.server.generate(image, prompt)
+                        return self.server.generate(image, prompt, max_tokens, semantic_schema)
                     except Exception as retry_exc:
                         print(f"Qwen llama-server ctx {fallback_ctx} retry failed: {retry_exc}", flush=True)
                 print(f"Qwen llama-server request failed; switching to CLI fallback: {exc}", flush=True)
@@ -911,7 +999,7 @@ class QwenLlamaClient:
                 self._prepare_cli(self.ctx_size)
         if not self.cli:
             self._prepare_cli(self.ctx_size)
-        return self.cli.generate(image, prompt, item_id)
+        return self.cli.generate(image, prompt, item_id, max_tokens, semantic_schema)
 
     def close(self) -> None:
         if self.server:
@@ -923,20 +1011,35 @@ def _candidate_id(item: Dict, fallback_index: int = 0) -> str:
     return str(item["candidate"].get("id") or fallback_index)
 
 
+def _is_semantic_rejection(semantic: Dict, text: str) -> bool:
+    """[FORK] Digital-Union (R1): did generation *succeed* but normalization reject the result?
+
+    This is the only failure shape targeted semantic recovery may act on. It must stay distinct from
+    a transport failure: an HTTP error, a dead server, a CLI timeout or a non-zero exit produce no
+    usable text, so re-asking with a larger budget and a bounded description would be answering the
+    wrong question - and would paper over a broken backend. Empty text is likewise excluded; there
+    is no truncated output to rescue.
+    """
+    return not semantic and bool((text or "").strip())
+
+
 def _generate_with_server(
     client: QwenLlamaClient,
     item: Dict,
     prompt: str,
     fallback_index: int = 0,
-) -> Tuple[str, Dict, str]:
+) -> Tuple[str, Dict, str, bool]:
+    # [FORK] Digital-Union (R1): the 4th element is the narrow rejection classification. It stays
+    # internal to the inference wave and never reaches a cached payload.
     item_id = _candidate_id(item, fallback_index)
     if not client.server:
-        return item_id, {}, "llama-server is not running"
+        return item_id, {}, "llama-server is not running", False
     try:
         text = client.server.generate(item["image"], prompt)
     except Exception as exc:
-        return item_id, {}, str(exc)
-    return item_id, _semantic_from_text(text), ""
+        return item_id, {}, str(exc), False
+    semantic = _semantic_from_text(text)
+    return item_id, semantic, "", _is_semantic_rejection(semantic, text)
 
 
 def _generate_serial(
@@ -944,13 +1047,42 @@ def _generate_serial(
     item: Dict,
     prompt: str,
     fallback_index: int = 0,
-) -> Tuple[str, Dict, str]:
+) -> Tuple[str, Dict, str, bool]:
     item_id = _candidate_id(item, fallback_index)
     try:
         text = client.generate(item["image"], prompt, item_id)
     except Exception as exc:
-        return item_id, {}, str(exc)
-    return item_id, _semantic_from_text(text), ""
+        return item_id, {}, str(exc), False
+    semantic = _semantic_from_text(text)
+    return item_id, semantic, "", _is_semantic_rejection(semantic, text)
+
+
+def _recover_semantic(
+    client: QwenLlamaClient,
+    item: Dict,
+    prompt: str,
+    fallback_index: int = 0,
+) -> Dict:
+    """[FORK] Digital-Union (R1): ONE targeted recovery generation for a persistent rejection.
+
+    Same image, same prompt, same greedy decoding, same model. The only differences are the measured
+    recovery budget and the bounded-description schema. Returns `{}` if it still fails, which leaves
+    the candidate absent exactly as before - the completion contract, not this function, decides
+    whether the source may be checkpointed.
+    """
+    item_id = _candidate_id(item, fallback_index)
+    try:
+        text = client.generate(
+            item["image"],
+            prompt,
+            item_id,
+            max_tokens=_SEMANTIC_RECOVERY_MAX_TOKENS,
+            semantic_schema=_recovery_semantic_schema(),
+        )
+    except Exception as exc:
+        print(f"Qwen targeted semantic recovery failed for {item_id}: {exc}", flush=True)
+        return {}
+    return _semantic_from_text(text)
 
 
 def _run_inference_wave(
@@ -964,6 +1096,10 @@ def _run_inference_wave(
 
     semantics: Dict[str, Dict] = {}
     failed: List[Tuple[int, Dict, str]] = []
+    # [FORK] Digital-Union (R1): the last primary verdict per candidate. Overwritten by every primary
+    # attempt, so after all existing tiers it describes the *final* failure, which is what decides
+    # recovery eligibility.
+    rejected: Dict[str, bool] = {}
     server = client.server
     concurrency = max(1, int(client.batch_size or 1))
 
@@ -976,16 +1112,20 @@ def _run_inference_wave(
             for future in concurrent.futures.as_completed(future_to_item):
                 offset, item = future_to_item[future]
                 try:
-                    item_id, semantic, error = future.result()
+                    item_id, semantic, error, rejection = future.result()
                 except Exception as exc:
-                    item_id, semantic, error = _candidate_id(item, base_index + offset), {}, str(exc)
+                    item_id, semantic, error, rejection = (
+                        _candidate_id(item, base_index + offset), {}, str(exc), False)
+                rejected[item_id] = rejection
                 if semantic:
                     semantics[item_id] = semantic
                 else:
                     failed.append((offset, item, error))
     else:
         for offset, item in enumerate(wave_items, 1):
-            item_id, semantic, error = _generate_serial(client, item, prompt, base_index + offset)
+            item_id, semantic, error, rejection = _generate_serial(
+                client, item, prompt, base_index + offset)
+            rejected[item_id] = rejection
             if semantic:
                 semantics[item_id] = semantic
             else:
@@ -994,7 +1134,9 @@ def _run_inference_wave(
     if failed and client.server:
         retry_failed: List[Tuple[int, Dict, str]] = []
         for offset, item, _error in failed:
-            item_id, semantic, error = _generate_with_server(client, item, prompt, base_index + offset)
+            item_id, semantic, error, rejection = _generate_with_server(
+                client, item, prompt, base_index + offset)
+            rejected[item_id] = rejection
             if semantic:
                 semantics[item_id] = semantic
             else:
@@ -1013,9 +1155,37 @@ def _run_inference_wave(
 
     if failed and not client.server:
         for offset, item, _error in failed:
-            item_id, semantic, _error = _generate_serial(client, item, prompt, base_index + offset)
+            item_id, semantic, _error, rejection = _generate_serial(
+                client, item, prompt, base_index + offset)
+            rejected[item_id] = rejection
             if semantic:
                 semantics[item_id] = semantic
+
+    # [FORK] Digital-Union (R1): targeted semantic recovery, deliberately LAST.
+    #
+    # Every existing primary tier above runs first and is untouched: the initial attempt, the
+    # server retry, the reduced-slot restart (which returns recursively, so only the innermost wave
+    # reaches this point) and the serial/CLI fallback. Recovery is a last resort for a candidate
+    # that greedy decoding will otherwise never resolve, not a substitute for that machinery.
+    #
+    # Eligibility is recomputed from `semantics` rather than from `failed`, because the serial
+    # fallback above can resolve a candidate without rewriting `failed` - trusting `failed` would
+    # re-ask for semantics that already arrived.
+    for offset, item in enumerate(wave_items, 1):
+        item_id = _candidate_id(item, base_index + offset)
+        if item_id in semantics:
+            continue
+        if not rejected.get(item_id):
+            continue  # transport failure or empty generation: not a semantic rejection
+        semantic = _recover_semantic(client, item, prompt, base_index + offset)
+        if semantic:
+            print(
+                f"Qwen targeted semantic recovery succeeded for {item_id} "
+                f"({_SEMANTIC_RECOVERY_MAX_TOKENS} tokens, description "
+                f"maxLength {_SEMANTIC_RECOVERY_DESCRIPTION_MAX_LENGTH})",
+                flush=True,
+            )
+            semantics[item_id] = semantic
 
     return semantics
 
