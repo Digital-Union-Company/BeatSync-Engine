@@ -101,9 +101,12 @@ def test_detailed_function_returns_success_and_reason(ffmpeg_tree):
 def test_stderr_is_summarised_only_when_the_return_code_is_non_zero(ffmpeg_tree):
     """The decisive success-path guarantee.
 
-    On driver 617.14 every successful clip emits a scary-looking nvdec fallback warning on stderr. If
-    the summariser were consulted unconditionally, all 150 valid clips of the validated render would
-    have acquired a "reason" - and anything keying off a non-empty reason would call them failures.
+    While the pre-Phase-3C NVENC path requested ``-hwaccel cuda``, successful clips on driver 617.14
+    could emit a scary-looking recovered nvdec fallback warning on stderr. Phase 3C later quantified
+    it at 48 of 60 sampled old-path clips failing CUDA decode initialisation and falling back to
+    software decode; one sampled source family engaged real NVDEC and emitted no such warning. If the
+    summariser were consulted unconditionally, the bulk of a perfectly valid render would have
+    acquired a "reason" - and anything keying off a non-empty reason would call those clips failures.
     """
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
 
@@ -226,7 +229,13 @@ def test_the_complete_timeline_refusal_is_intact(processor_tree):
     assert "_short_error(error)" in source
 
 
-def test_the_ffmpeg_command_and_encoder_settings_are_untouched(ffmpeg_tree):
+def test_the_frame_arithmetic_filters_and_encoder_selection_are_untouched(ffmpeg_tree):
+    """Everything about the command except the input decode request is frozen.
+
+    Phase 3C deliberately changed exactly one fact here — the NVENC branch no longer asks for
+    CUDA input decoding — so this test no longer claims the *whole* command is untouched. The
+    decode request itself is asserted separately, below.
+    """
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
     source = ast.unparse(fn)
 
@@ -238,14 +247,46 @@ def test_the_ffmpeg_command_and_encoder_settings_are_untouched(ffmpeg_tree):
     assert "'setpts=PTS-STARTPTS'" in source
     assert "f'scale={width}:{height}'" in source
     assert "f'fps={fps}'" in source
-    # hwaccel and encoder selection
-    assert "['-hwaccel', 'cuda']" in source
-    assert "['-hwaccel', 'auto']" in source
+    # encoder selection
     assert "get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True)" in source
     assert "get_cpu_h264_quality_args(include_pix_fmt=True)" in source
     # frame-accurate output flags
     assert "'-vframes'" in source and "'-fps_mode', 'cfr'" in source
     assert "_run_media_command(cmd, timeout=120)" in source
+
+
+def test_nvenc_extraction_does_not_request_cuda_input_decoding(ffmpeg_tree):
+    """[FORK] Phase 3C: the NVENC path decodes in software on purpose.
+
+    Measured on RTX 3080 / driver 617.14: ``-hwaccel cuda`` failed to initialise on most sampled
+    sources (33 > 32 nvdec decode surfaces) and FFmpeg fell back to software decode anyway, and on
+    the one source where real NVDEC *did* engage it was ~20% slower — the CPU filter chain
+    (trim/setpts/scale/fps) has to pull the frames back to system memory. A/B outputs were
+    byte-identical on 20/20 clips, so the request bought nothing but a scary warning.
+
+    This asserts the *request* is gone, not that hardware decoding is impossible.
+    """
+    fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
+    source = ast.unparse(fn)
+
+    assert "'-hwaccel', 'cuda'" not in source, (
+        "the NVENC path must not request CUDA input decoding (Phase 3C)"
+    )
+    assert "'cuda'" not in source, "no CUDA decode request of any spelling belongs here"
+    # and no replacement knob was smuggled in with it
+    for forbidden in ("'-hwaccel_output_format'", "'-extra_hw_frames'",
+                      "hwdownload", "scale_cuda"):
+        assert forbidden not in source, forbidden
+
+
+def test_the_cpu_path_still_requests_hwaccel_auto(ffmpeg_tree):
+    """The CPU-encode branch was not part of the Phase 3C decision and must be untouched."""
+    fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
+    source = ast.unparse(fn)
+
+    assert "['-hwaccel', 'auto']" in source
+    # guarded by use_nvenc, so an NVENC render cannot pick it up
+    assert "use_nvenc" in source
 
 
 def test_nvenc_and_cpu_quality_args_are_byte_for_byte_unchanged(ffmpeg_tree):

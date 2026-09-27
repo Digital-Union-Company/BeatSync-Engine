@@ -284,10 +284,15 @@ def test_exception_without_a_message_still_names_its_type():
 
 
 def test_the_non_fatal_hwaccel_warning_is_never_consulted_on_success():
-    """rc=0 means success. This stderr exists on every successful clip on driver 617.14.
+    """rc=0 means success. This stderr is a real recovered-success capture from the pre-Phase-3C
+    NVENC path, which requested ``-hwaccel cuda``.
 
-    The summariser would happily describe it as a failure — which is exactly why the caller must only
-    invoke it when ``returncode != 0``. Asserted at the seam in ``test_stage6_diagnostic_seam.py``.
+    Phase 3C later measured how often that happened: CUDA decode initialisation failed on 48 of 60
+    sampled old-path clips, which then fell back to software decode, while other sampled clips
+    engaged real NVDEC and emitted no such warning. So this is a common recovered case, not a
+    universal one — and that is enough, because the summariser would happily describe it as a
+    failure. Hence the caller must only invoke it when ``returncode != 0``; asserted at the seam in
+    ``test_stage6_diagnostic_seam.py``.
     """
     would_have_said = fd.summarize_ffmpeg_failure(NON_FATAL_STDERR)
 

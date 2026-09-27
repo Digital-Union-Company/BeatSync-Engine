@@ -351,9 +351,14 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
         cmd = [FFMPEG_PATH]
         
         # Hardware acceleration
-        if use_nvenc:
-            cmd.extend(['-hwaccel', 'cuda'])
-        else:
+        # [FORK] Digital-Union (Phase 3C): the NVENC branch asks for no input hwaccel at all.
+        # Measured on RTX 3080 / driver 617.14: '-hwaccel cuda' failed to initialise on most
+        # sampled sources (33 > 32 nvdec decode surfaces) and FFmpeg fell back to software decode
+        # anyway; where real NVDEC did engage it was ~20% slower, because this CPU filter chain
+        # (trim/setpts/scale/fps) has to pull the frames back to system memory. A/B outputs were
+        # byte-identical on 20/20 clips. Encoding is still h264_nvenc — only the decode request
+        # is gone. The CPU-encode branch was not part of that measurement and is unchanged.
+        if not use_nvenc:
             cmd.extend(['-hwaccel', 'auto'])
         
         # ✅ FRAME-ACCURATE INPUT SEEKING
