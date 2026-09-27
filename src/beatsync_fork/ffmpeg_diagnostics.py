@@ -15,11 +15,14 @@ line FFmpeg emitted, so the existing Phase 2A structured warning path can carry 
 
 Two design rules worth keeping:
 
-* **Generic, not NVIDIA-special-cased.** Nothing here knows about drivers or NVENC. It ranks lines by
-  how diagnostic they look, and anchors on the generic consequence FFmpeg prints after a real failure
-  (``Error while opening encoder`` → ``Task finished with error code`` → ``Conversion failed!``) to
-  locate the root cause just before it. Special-casing the driver text would have fixed exactly one
-  incident and taught us nothing about the next.
+* **Generic, not vendor-special-cased.** The ranking data carries no NVIDIA/NVENC/CUDA-specific
+  tokens and no incident-specific version literals such as ``13.1`` or ``610.00``. Generic diagnostic
+  concepts *are* intentionally allowed — ``_SPECIFIC_MARKERS`` does contain ``"driver"``, because that
+  matches any vendor's driver complaint. It ranks lines by how diagnostic they look, and anchors on
+  the generic consequence FFmpeg prints after a real failure (``Error while opening encoder`` →
+  ``Task finished with error code`` → ``Conversion failed!``) to locate the root cause just before it.
+  Special-casing the nvenc API-version text itself would have fixed exactly one incident and taught us
+  nothing about the next.
 * **Bounded, single line.** A failing llama.cpp/Vulkan run can emit megabytes. The status panel is a
   status line, not a log sink — the full text still reaches the console exactly as before.
 
