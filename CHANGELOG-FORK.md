@@ -97,12 +97,10 @@ commit before being fixed:
   private `_qwen_completed` flag reach `timings` — and therefore the cached payload — through
   `timings.update(qwen_info)`. The inline path now pops the flag before the update and derives
   `ai_enabled` from it, exactly like the deferred paths.
-- **A finished worker with zero semantic tags was called a failure.** The worker publishes
-  `timings_by_job["single"]` once a job completes even when `semantics == {}`, whereas every
-  `_run_qwen_worker` failure path returns `{}`. The first pass keyed on emptiness of `semantics`, so
-  both cases reported not-completed and a legitimately tag-less source repeated its whole Qwen pass
-  on every run. Completion is now membership of the job's entry in the response envelope — the same
-  rule the batch path already used — and tag count is never the predicate.
+- **Zero semantic tags were conflated with a worker-process failure.** The first pass keyed on
+  emptiness of `semantics`, so a worker that finished and a worker that never produced a response
+  both reported not-completed. R2 replaced that with membership of the job's entry in the response
+  envelope — which R4 below shows was still wrong, in the opposite direction.
 - **An OpenCV-open failure was accepted as a candidate-less success.** `"Warning: OpenCV could not
   open …; candidate analysis skipped."` returns `candidates == []`, which the D1 completion rule
   treated as "nothing for Qwen to do, therefore complete" — so one transient decode failure would
@@ -111,6 +109,37 @@ commit before being fixed:
   rule now requires `timings["candidate_scoring_seconds"]`, which is written only inside the
   `cap.isOpened()` branch; a genuine no-usable-moments result keeps it and stays reusable, the
   failure does not and is retried.
+
+**R4 — per-job Qwen completion required actual per-frame results.** R2/R3 defined completion as
+membership of the job's entry in the worker response (`timings_by_job["single"]`, or `job_id` in
+`semantics_by_job`) and documented "valid completed response + zero tags = SUCCESS". Read against the
+worker, that is too weak: `_run_semantics_for_video` always returns a timings dict and `main` always
+records it under the job id, so the envelope only proves **the job loop returned**. Inside the loop,
+`_normalize_semantic` yields `{}` for any candidate whose semantic content is invalid,
+`_run_inference_wave` classifies `{}` as failed and retries it (server retry → reduced-slot restart →
+serial fallback), and a candidate still failing is simply **absent** from the returned semantics.
+
+Measured against the R3 commit, all of these were wrongly reported as complete and cached as
+AI-complete: `frame_count=3 tag_count=0 semantics={}`; `frame_count=0 tag_count=0`;
+`frame_count=4 tag_count=3` (partial); and the batch equivalents, which were also checkpointed.
+
+New shared rule `_qwen_job_completed()` — used by **both** the single and batch paths so the
+arithmetic exists once — requires the expected per-job envelope, a dict `timing`, `frame_count > 0`,
+and `tag_count == frame_count`, plus basic count coherence (`tag_count` may not exceed the semantic
+records actually returned). Tags that did arrive are still merged; only the verdict changes, so an
+incomplete job is retried next run instead of inheriting a silent gap. A successful sibling in a
+partially-failed batch remains independently complete and checkpointed, and total-batch-failure
+behaviour is unchanged.
+
+Two accompanying corrections: **tag count is not forbidden from completion truth** — it is meaningful
+only together with the envelope and the real `frame_count`, and the earlier blanket claim to the
+contrary is removed. And the claim that *every* `_run_qwen_worker` failure returns `{}` is narrowed:
+that holds for process-level failures (launch error, non-zero exit, timeout, unreadable response),
+but candidate-level inference failures are swallowed and retried **inside** the worker, so a
+successful worker process can still return an incomplete per-job semantic result. Worker counts are
+now read through `_coerce_count`, closing a latent `ValueError` crash on a malformed payload (present
+in the batch path before R4). The candidate-less no-Qwen-work case is untouched and remains separate:
+no job is submitted, so the per-frame rule does not apply to it.
 
 `BEATSYNC_QWEN_MAX_WINDOWS=0` now reports not-completed rather than AI-complete, deliberately:
 `QWEN_MAX_WINDOWS` is not part of cache identity, so a knowingly Qwen-less record must not be stored

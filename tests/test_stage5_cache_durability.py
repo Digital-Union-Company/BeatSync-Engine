@@ -287,26 +287,83 @@ def test_the_pop_happens_before_timings_are_updated(tree):
             f"{name}: pop at line {min(pops)} must precede timings.update() at {min(updates)}")
 
 
-def test_single_job_completion_uses_the_worker_response_envelope(tree):
-    """R2: zero semantic tags from a finished worker is a success, not a failure."""
+def test_single_job_completion_delegates_to_the_shared_per_job_rule(tree):
+    """R4: the response envelope *locates* the job; `_qwen_job_completed` decides completion.
+
+    R2 asserted that completion must be envelope membership alone, and that tag count must never
+    appear in the verdict. Both were wrong against the worker contract: the worker records a job's
+    timings whenever its loop returns, even when every candidate's semantic failed. Tag count *is*
+    part of completion truth — together with the envelope and the real frame count, never alone.
+    Behavioural coverage lives in ``test_stage5_cache_completion.py``.
+    """
     facade = _func(tree, "_annotate_candidates_with_qwen")
     body = ast.unparse(facade)
 
-    assert "_QWEN_SINGLE_JOB_ID" in body, "completion must key off the worker's per-job envelope"
+    assert "_QWEN_SINGLE_JOB_ID" in body, "the per-job envelope must still be located by job id"
     membership = [
         node for node in ast.walk(facade)
         if isinstance(node, ast.Compare) and any(isinstance(op, ast.In) for op in node.ops)
         and "job_timings" in ast.unparse(node.comparators[0])
     ]
-    assert membership, "completion must be a membership test on timings_by_job"
+    assert membership, "the envelope lookup must remain a membership test on timings_by_job"
 
     completed_assigns = [node for node in ast.walk(facade) if isinstance(node, ast.Assign)
                          and ast.unparse(node.targets[0]) == "completed"]
     assert completed_assigns, "an explicit `completed` verdict is required"
     verdict = ast.unparse(completed_assigns[0].value)
-    assert "semantics" not in verdict, (
-        f"tag presence must not decide completion; found {verdict}")
-    assert "tag_count" not in verdict, verdict
+    assert "_qwen_job_completed(" in verdict, (
+        f"completion must delegate to the shared rule, not re-derive it; found {verdict}")
+    assert "envelope_present" in verdict, verdict
+
+
+def test_both_qwen_paths_share_one_completion_rule(tree):
+    """The arithmetic must exist once, so single and batch cannot drift apart."""
+    rule = _func(tree, "_qwen_job_completed")
+    body = ast.unparse(rule)
+
+    assert "frame_count" in body and "tag_count" in body
+    assert "envelope_present" in ast.unparse(rule.args), "the envelope is an input to the rule"
+
+    for caller in ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch"):
+        calls = _calls(_func(tree, caller), "_qwen_job_completed")
+        assert calls, f"{caller} must use the shared rule"
+
+    # frame_count > 0 and tag_count == frame_count are both load-bearing
+    assert any(isinstance(node, ast.Compare) and "frame_count" in ast.unparse(node)
+               and any(isinstance(op, (ast.LtE, ast.Lt)) for op in node.ops)
+               for node in ast.walk(rule)), "a zero frame count must not count as completion"
+    assert any(isinstance(node, ast.Compare) and any(isinstance(op, ast.NotEq) for op in node.ops)
+               and "tag_count" in ast.unparse(node) and "frame_count" in ast.unparse(node)
+               for node in ast.walk(rule)), "every decoded frame must have produced a semantic"
+
+
+def test_batch_completion_also_delegates_to_the_shared_rule(tree):
+    """R4: membership in `semantics_by_job` locates the job; it does not prove completion."""
+    batch = _func(tree, "_complete_deferred_qwen_batch")
+    body = ast.unparse(batch)
+
+    assert "envelope_present" in body, "membership is now only the envelope lookup"
+    assigns = [node for node in ast.walk(batch)
+               if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "job_completed"]
+    assert assigns, "an explicit per-job verdict is required"
+    verdict = ast.unparse(assigns[0].value)
+    assert "_qwen_job_completed(" in verdict, verdict
+
+
+def test_worker_counts_are_read_defensively(tree):
+    """A malformed subprocess payload must not crash the analysis with ValueError."""
+    _func(tree, "_coerce_count")
+    for name in ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch"):
+        func = _func(tree, name)
+        assert _calls(func, "_coerce_count"), f"{name} must coerce worker counts safely"
+        bare_int_on_counts = [
+            node for node in ast.walk(func)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "int"
+            and ("frame_count" in ast.unparse(node) or "tag_count" in ast.unparse(node))
+        ]
+        assert not bare_int_on_counts, (
+            f"{name} still calls int() directly on a worker count: "
+            f"{[ast.unparse(n) for n in bare_int_on_counts]}")
 
 
 def test_the_deterministic_scoring_evidence_discriminator_exists(tree):

@@ -28,8 +28,9 @@ _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
 
 # The exact set of cache primitives D1 owns. All stdlib-only by construction.
-_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_deterministic_analysis_completed",
-          "_cache_entry_is_complete", "_load_cache", "_save_cache", "_checkpoint_cache")
+_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_qwen_job_completed",
+          "_deterministic_analysis_completed", "_cache_entry_is_complete",
+          "_load_cache", "_save_cache", "_checkpoint_cache")
 _CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY", "_QWEN_SINGLE_JOB_ID",
            "_DETERMINISTIC_SCORING_KEY")
 
@@ -135,14 +136,23 @@ def _load_pipeline(worker_response, *, capture_opens=True, window_count=3, max_w
     return namespace
 
 
-def _worker_ok(tag_count=3, semantics=None):
-    """A structurally successful legacy-single worker response."""
+def _semantic_records(count, prefix="clip.mp4"):
+    return {f"{prefix}-{i}": {"action": 0.9, "emotion": "calm"} for i in range(count)}
+
+
+def _worker_ok(frame_count=3, tag_count=None, semantics=None, job="single"):
+    """A legacy-single worker response.
+
+    Defaults to a *fully* successful job: every decoded frame item produced a semantic, which is what
+    the worker's own `tag_count = len(semantics)` / `frame_count = len(frame_items)` pair means.
+    """
+    tag_count = frame_count if tag_count is None else tag_count
     return {
         "model_load_seconds": 8.0, "model_id": "qwen3vl-2b", "batch_size": 1,
         "peak_vram_gb": 3.0, "total_seconds": 12.0,
-        "timings_by_job": {"single": {"tag_count": tag_count, "frame_count": 3,
-                                      "inference_seconds": 5.0}},
-        "semantics": {"clip.mp4-0": {"action": 0.9}} if semantics is None else semantics,
+        "timings_by_job": {job: {"tag_count": tag_count, "frame_count": frame_count,
+                                 "inference_seconds": 5.0, "prefetch_seconds": 0.1}},
+        "semantics": _semantic_records(tag_count) if semantics is None else semantics,
     }
 
 
@@ -431,11 +441,16 @@ def test_checkpoint_without_a_cache_file_is_a_no_op(cache, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_a_finished_worker_with_zero_semantic_tags_counts_as_completed():
-    """The worker publishes ``timings_by_job["single"]`` once the job finishes, whatever the tag
-    count. A zero-tag *success* must not be mistaken for a failure, or every run repeats the whole
-    Qwen pass for a source that genuinely has nothing to say."""
-    ns = _load_pipeline(_worker_ok(tag_count=0, semantics={}))
+def test_every_decoded_frame_must_have_produced_a_semantic(cache):
+    """T1: a fully successful submitted job — `tag_count == frame_count > 0`.
+
+    R4 replaced an earlier assumption that a bare response envelope proved success. Read against the
+    worker: `_run_semantics_for_video` always returns timings and `main` always records them, so the
+    envelope only proves the job loop returned. Inside it, `_normalize_semantic` returns ``{}`` for
+    invalid semantic content, `_run_inference_wave` treats ``{}`` as failed and retries, and a
+    candidate still failing is absent from the returned semantics.
+    """
+    ns = _load_pipeline(_worker_ok(frame_count=3))
     candidates = [{"id": f"clip.mp4-{i}"} for i in range(3)]
 
     info = ns["_annotate_candidates_with_qwen"](
@@ -443,8 +458,94 @@ def test_a_finished_worker_with_zero_semantic_tags_counts_as_completed():
         qwen_model_path="m", use_gpu=False, audio_profile={})
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
-    assert info["qwen_tag_count"] == 0
+    assert info["qwen_tag_count"] == 3 and info["qwen_frame_count"] == 3
+    assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1", "clip.mp4-2"]
+
+
+def test_all_semantic_inference_failed_is_not_completed():
+    """T2: the job loop returned, but every candidate's semantic failed after retries."""
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=0, semantics={}))
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
     assert ns["_calls"]["merged"] == [], "nothing to merge, and nothing was invented"
+
+
+def test_partial_semantic_failure_is_not_completed():
+    """T3: some decoded frames produced no valid semantic, so the AI work is incomplete."""
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=2,
+                                   semantics=_semantic_records(2)))
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1"], (
+        "the tags that did arrive are still merged; only the completion verdict changes")
+
+
+def test_no_decoded_frames_is_not_completed():
+    """T4: prefetch decoded nothing, so no AI frame work happened at all."""
+    ns = _load_pipeline(_worker_ok(frame_count=0, tag_count=0, semantics={}))
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+
+
+def test_a_response_claiming_more_tags_than_it_returned_is_not_completed():
+    """Basic count coherence: tag_count may not exceed the semantic records actually present."""
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=3,
+                                   semantics=_semantic_records(1)))
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+
+
+@pytest.mark.parametrize("timing, why", [
+    ({"frame_count": 3}, "tag_count missing -> treated as 0"),
+    ({"tag_count": 3}, "frame_count missing -> no frame work proven"),
+    ({"frame_count": "three", "tag_count": "three"}, "non-numeric counts"),
+    ({"frame_count": -1, "tag_count": -1}, "negative counts"),
+    ("not-a-dict", "malformed timing"),
+])
+def test_malformed_or_incomplete_timing_is_not_completed(timing, why):
+    response = {
+        "model_load_seconds": 8.0, "model_id": "q", "batch_size": 1, "peak_vram_gb": 3.0,
+        "timings_by_job": {"single": timing},
+        "semantics": _semantic_records(3),
+    }
+    ns = _load_pipeline(response)
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False, why
+
+
+def test_the_shared_completion_rule_is_used_by_both_paths(cache):
+    """The arithmetic exists once; exercise it directly at its boundaries."""
+    rule = cache["_qwen_job_completed"]
+
+    assert rule({"frame_count": 3, "tag_count": 3}, True) is True
+    assert rule({"frame_count": 3, "tag_count": 0}, True) is False
+    assert rule({"frame_count": 3, "tag_count": 2}, True) is False
+    assert rule({"frame_count": 0, "tag_count": 0}, True) is False
+    assert rule({"frame_count": 3, "tag_count": 3}, False) is False, "no envelope, no completion"
+    assert rule(None, True) is False
+    assert rule({"frame_count": 3, "tag_count": 4}, True) is False, "more tags than frames"
+    assert rule({"frame_count": 3, "tag_count": 3}, True, 3) is True
+    assert rule({"frame_count": 3, "tag_count": 3}, True, 1) is False, "incoherent record count"
 
 
 def test_an_empty_worker_response_is_not_completed():
@@ -473,8 +574,8 @@ def test_completion_requires_this_jobs_envelope(response, why):
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False, why
 
 
-def test_tags_are_still_merged_when_the_worker_completes():
-    ns = _load_pipeline(_worker_ok(tag_count=1))
+def test_semantic_values_are_actually_merged_onto_the_candidates():
+    ns = _load_pipeline(_worker_ok(frame_count=3))
     candidates = [{"id": f"clip.mp4-{i}"} for i in range(3)]
 
     info = ns["_annotate_candidates_with_qwen"](
@@ -482,8 +583,8 @@ def test_tags_are_still_merged_when_the_worker_completes():
         qwen_model_path="m", use_gpu=False, audio_profile={})
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
-    assert ns["_calls"]["merged"] == ["clip.mp4-0"]
-    assert candidates[0]["semantic_action"] == 0.9
+    assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1", "clip.mp4-2"]
+    assert all(c["semantic_action"] == 0.9 for c in candidates)
 
 
 def test_max_windows_zero_reports_not_completed_and_never_calls_the_worker():
@@ -508,6 +609,162 @@ def test_no_selected_candidates_is_a_completed_no_op():
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
     assert info["qwen_tag_count"] == 0
     assert ns["_calls"]["worker_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R4: batch per-job completion truth (T6, T7, T8)
+# ---------------------------------------------------------------------------
+
+_BATCH_FUNCS = ("_qwen_max_windows", "_complete_deferred_qwen_batch")
+
+
+def _load_batch(worker_response):
+    """Exec the real `_complete_deferred_qwen_batch` with the worker subprocess stubbed."""
+    found, consts = _extract(_FUNCS + ("_fmt_seconds",) + _BATCH_FUNCS)
+    calls: Dict[str, Any] = {"merged": []}
+    namespace: Dict[str, Any] = {
+        "os": os, "json": json, "tempfile": tempfile, "math": math, "time": time,
+        "Any": Any, "Dict": Dict, "List": list, "Sequence": list,
+        "__builtins__": __builtins__,
+        "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],
+        "_merge_semantic": lambda candidate, semantic: (
+            calls["merged"].append(candidate["id"]),
+            candidate.update({"semantic_action": semantic.get("action", 0.0)}))[1],
+        "_run_qwen_worker_batch": lambda **kwargs: worker_response,
+    }
+    namespace.update(consts)
+    _exec_into(namespace, found, _FUNCS + ("_fmt_seconds",) + _BATCH_FUNCS)
+    os.environ.pop("BEATSYNC_QWEN_MAX_WINDOWS", None)
+    namespace["_calls"] = calls
+    return namespace
+
+
+def _deferred_record(av, name, n=3, path=None):
+    return {
+        "analysis_version": av, "video_file": path or rf"C:\src\{name}", "source_name": name,
+        "duration": 30.0, "fps": 25.0, "width": 1280, "height": 720, "scene_changes": [1.0],
+        "candidate_count": n,
+        "candidates": [{"id": f"{name}-{i}", "start": i, "end": i + 2, "action_score": 0.5,
+                        "editorial_score": 0.5 - i * 0.01} for i in range(n)],
+        "analysis_seconds": 12.0,
+        "timings": {"total_seconds": 12.0, "candidate_scoring_seconds": 0.4},
+        "ai_enabled": False, "ai_deferred": True,
+    }
+
+
+def _batch_response(jobs):
+    """jobs: {job_id: (frame_count, tag_count, semantic_record_count, source_name)}"""
+    semantics, timings = {}, {}
+    for job_id, (frames, tags, records, name) in jobs.items():
+        semantics[job_id] = _semantic_records(records, name)
+        timings[job_id] = {"frame_count": frames, "tag_count": tags,
+                           "inference_seconds": 5.0, "prefetch_seconds": 0.1}
+    return {"model_load_seconds": 8.0, "model_id": "q", "batch_size": len(jobs),
+            "peak_vram_gb": 3.0, "semantics_by_job": semantics, "timings_by_job": timings}
+
+
+def test_a_fully_successful_batch_job_is_complete_and_checkpointed(cache, tmp_path):
+    """T6."""
+    ns = _load_batch(_batch_response({"1": (3, 3, 3, "ok.mp4")}))
+    record = _deferred_record(cache["ANALYSIS_VERSION"], "ok.mp4")
+    path = str(tmp_path / "ok.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": path}, record)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+
+    assert record["ai_enabled"] is True
+    assert record["ai_deferred"] is False
+    assert os.path.exists(path)
+    assert cache["_load_cache"](path, require_ai=True,
+                               expected_video_file=record["video_file"]) is not None
+
+
+@pytest.mark.parametrize("frames, tags, records, why", [
+    (3, 0, 0, "every candidate's semantic failed after retries"),
+    (3, 2, 2, "partial semantic failure"),
+    (0, 0, 0, "prefetch decoded nothing"),
+])
+def test_an_incomplete_batch_job_is_neither_complete_nor_checkpointed(cache, tmp_path, frames,
+                                                                     tags, records, why):
+    """T7."""
+    ns = _load_batch(_batch_response({"1": (frames, tags, records, "bad.mp4")}))
+    record = _deferred_record(cache["ANALYSIS_VERSION"], "bad.mp4")
+    path = str(tmp_path / "bad.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": path}, record)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+
+    assert record["ai_enabled"] is False, why
+    assert record["ai_deferred"] is False, "the deferral is resolved either way"
+    assert not os.path.exists(path), why
+    assert record["candidates"], "deterministic candidates are always kept"
+
+
+def test_a_successful_sibling_survives_a_failing_one(cache, tmp_path):
+    """T8: one job's failure must not cost a sibling that genuinely completed."""
+    ns = _load_batch(_batch_response({
+        "1": (3, 3, 3, "good.mp4"),      # fully successful
+        "2": (3, 1, 1, "half.mp4"),      # partial -> incomplete
+    }))
+    good = _deferred_record(cache["ANALYSIS_VERSION"], "good.mp4")
+    half = _deferred_record(cache["ANALYSIS_VERSION"], "half.mp4")
+    good_path, half_path = str(tmp_path / "good.json"), str(tmp_path / "half.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": good_path}, good),
+                     ({"index": 2, "cache_file": half_path}, half)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+
+    assert good["ai_enabled"] is True and os.path.exists(good_path)
+    assert half["ai_enabled"] is False and not os.path.exists(half_path)
+
+
+def test_a_requested_job_absent_from_the_response_is_not_complete(cache, tmp_path):
+    ns = _load_batch(_batch_response({"1": (3, 3, 3, "present.mp4")}))
+    present = _deferred_record(cache["ANALYSIS_VERSION"], "present.mp4")
+    missing = _deferred_record(cache["ANALYSIS_VERSION"], "missing.mp4")
+    p1, p2 = str(tmp_path / "p1.json"), str(tmp_path / "p2.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": p1}, present),
+                     ({"index": 2, "cache_file": p2}, missing)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+
+    assert present["ai_enabled"] is True and os.path.exists(p1)
+    assert missing["ai_enabled"] is False and not os.path.exists(p2)
+
+
+def test_total_batch_failure_still_marks_every_job_incomplete(cache, tmp_path):
+    ns = _load_batch({})
+    records = [_deferred_record(cache["ANALYSIS_VERSION"], f"t{i}.mp4") for i in range(2)]
+    paths = [str(tmp_path / f"t{i}.json") for i in range(2)]
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": i + 1, "cache_file": paths[i]}, records[i]) for i in range(2)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+
+    for record, path in zip(records, paths):
+        assert record["ai_enabled"] is False
+        assert not os.path.exists(path)
+
+
+def test_a_candidate_less_batch_job_is_still_the_no_qwen_work_case(cache, tmp_path):
+    """No Qwen job is submitted, so the per-frame rule does not apply to it."""
+    ns = _load_batch(_batch_response({"1": (3, 3, 3, "x.mp4")}))
+    record = _deferred_record(cache["ANALYSIS_VERSION"], "empty.mp4", n=0)
+    path = str(tmp_path / "empty.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": path}, record)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+
+    assert record["ai_enabled"] is False, "honest: no AI work was done"
+    assert record["ai_deferred"] is False
+    assert os.path.exists(path), "but it is complete and reusable via the completion rule"
+    assert cache["_load_cache"](path, require_ai=True,
+                               expected_video_file=record["video_file"]) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +828,7 @@ def test_inline_max_windows_zero_must_not_report_ai_enabled():
 
 def test_the_private_completion_key_never_reaches_timings_or_the_cache(tmp_path):
     """T4: the bookkeeping flag must not leak into the stored payload through timings.update()."""
-    ns = _load_pipeline(_worker_ok(tag_count=2))
+    ns = _load_pipeline(_worker_ok(frame_count=3))
     record = _inline(ns)
     key = ns["_QWEN_COMPLETED_KEY"]
 

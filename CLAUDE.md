@@ -261,14 +261,34 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   caller **pops before `timings.update(...)`** so it never reaches a cached payload. Never restate
   the request as the result: `ai_enabled = enable_ai and not defer_ai` was exactly the R2 defect —
   the inline path reported AI-complete for a Qwen run that had failed, timed out or been skipped.
-- **Completion comes from the worker's response envelope, never from tag count.** The worker writes
-  `timings_by_job[<job id>]` once a job has finished, while every `_run_qwen_worker` failure path
-  (launch error, non-zero exit, timeout, unreadable response) returns `{}`. So membership in that
-  map is the evidence: single-job runs check `"single"`, the batch path checks each `job_id`. A
-  *finished* worker that produced zero usable tags is a **success with nothing to merge** —
-  treating it as failure made the next run repeat the whole Qwen pass for nothing. A globally
-  non-empty batch response is still not proof that *this* job completed, and one missing job must
-  not fail its siblings.
+- **A submitted Qwen job completed only if every decoded frame produced a semantic.**
+  `_qwen_job_completed(timing, envelope_present, semantic_record_count)` is the one rule, shared by
+  the single and batch paths. It requires: the expected per-job envelope exists, `timing` is a dict,
+  `frame_count > 0`, and `tag_count == frame_count` (plus `tag_count` not exceeding the semantic
+  records actually returned).
+
+  **Envelope membership alone is not completion** — that was an earlier mistake here. Read against
+  the worker: `_run_semantics_for_video` always returns a timings dict and `main` always records it
+  under the job id, so the envelope only proves *the job loop returned*. Inside that loop
+  `_normalize_semantic` returns `{}` for any candidate whose semantic content is invalid (missing
+  numeric key, disallowed emotion/use, empty description), `_run_inference_wave` classifies `{}` as
+  **failed** and retries it (server retry → reduced-slot restart → serial fallback), and a candidate
+  still failing afterwards is simply **absent** from the returned semantics. The worker publishes
+  `frame_count = len(frame_items)` (what prefetch decoded) and `tag_count = len(semantics)`.
+
+  **Tag count alone is not completion either** — it is meaningful only against the envelope and the
+  real `frame_count`. So `frame_count == 0` means no AI frame work happened; `tag_count < frame_count`
+  means one or more decoded frames never produced a valid semantic. Tags that *did* arrive are still
+  merged; only the completion verdict changes, so the next run retries rather than inheriting a
+  silent gap. A globally non-empty batch response is still no proof that *this* job ran, and one
+  failing job never fails its siblings.
+
+  Note the boundary: `frame_count` is what prefetch **decoded**, which can be fewer than the
+  candidates submitted if a frame could not be read. This rule proves every *decoded* frame was
+  tagged, not that every requested candidate was.
+
+  Worker counts are read through `_coerce_count`, because the response is parsed JSON from a
+  subprocess: a non-numeric count used to raise `ValueError` out of the whole analysis.
 - **A candidate-less source is complete only if the deterministic pass actually ran.** Two very
   different outcomes both end with `candidates == []`: a source whose windows yielded no usable
   moments, and a source OpenCV could not open (`"Warning: OpenCV could not open …; candidate
