@@ -20,6 +20,68 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-27 (Stage 5 cache durability D1: checkpointing + AI completion truth)
+
+**The measured reason.** Until now `analyze_video_sources` wrote the cache in a single terminal loop
+at the very end of Stage 5, so an interruption before that loop discarded *everything* new. Measured
+against the pre-D1 code with three uncached sources: interrupting during the deterministic pass left
+**2 completed analyses and 0 durable cache entries**; interrupting after every deterministic analysis
+*and* every Qwen tag had finished still left **3 completed sources and 0 durable entries**. A hard
+`os._exit` mid-run left 0. On the real 702-source library (median 4.4 s, mean 6.5 s per source) a full
+cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously throw away.
+
+- **Per-source checkpointing.** A source is now persisted the moment it is genuinely complete: after
+  each serial `_analyze_single_video`, after each parallel result, after `_complete_deferred_qwen`,
+  and after **each per-job merge** in `_complete_deferred_qwen_batch` — so a later job's failure, or
+  an abort part way through a long shared Qwen batch, no longer costs work that already finished. The
+  terminal loop remains only as a backstop and now goes through the same guard, so it can no longer
+  promote an incomplete record into an accepted cache entry.
+- **One completion rule.** New `_cache_entry_is_complete()` answers "is this payload reusable for this
+  request?" in one place. It rejects non-dict payloads, wrong `analysis_version`, missing/non-string
+  `video_file`, non-list `candidates`, and anything with `ai_deferred` truthy; under `require_ai` it
+  also demands genuine AI completion. `_checkpoint_cache()` consults it before any write, which is
+  what makes early saving safe.
+- **`ai_enabled` stopped lying.** Previously `_complete_deferred_qwen` swallowed a Qwen exception and
+  then set `ai_enabled=True` unconditionally, so a failed run was cached as AI-complete and Qwen
+  never retried for that source. Completion now comes from an explicit signal the Qwen facade
+  reports on every return path — *not* from "no exception was raised", and *not* from tag count,
+  because a dead worker and a worker that legitimately returns zero tags both produce
+  `qwen_tag_count == 0`. Deterministic candidates and visual tags are untouched on failure.
+- **Batch failure is judged per job.** A globally non-empty `semantics_by_job` was being treated as
+  proof that every requested job completed; a job simply absent from the response became
+  `ai_enabled=True` with 0 tags and was reused as AI-complete forever. Completion is now a per-job
+  membership test, one missing job no longer fails its siblings, and the existing total-batch-failure
+  behaviour is preserved.
+- **Candidate-less sources are no longer re-analysed forever.** With no candidates there is no Qwen
+  work, so the source is complete — expressed through the completion rule, with `ai_enabled` left
+  honestly `False` rather than faked to satisfy the loader.
+- **Hardened writer.** `_save_cache` now publishes through a unique same-directory temp file
+  (`tempfile.mkstemp`), `flush` + `os.fsync`, then `os.replace`, with best-effort cleanup in
+  `finally`. The old shared `path + ".tmp"` was demonstrably unsafe across processes: under
+  deterministic barriers one writer's `os.replace` published the *other* writer's payload while
+  reporting success, and the loser failed with `FileNotFoundError` into a warning the GUI discards.
+  After the fix, 160 concurrent writes from two processes produced 0 exceptions, no shared temp
+  names, no mixed payloads and no orphan temps. `PROCESS_CRASH_ATOMICITY` is preserved (verified at
+  all four boundaries); **power-loss durability is still not guaranteed** — the temp is fsynced, the
+  containing directory is not.
+- **Minimal load validation.** The loader now refuses version-correct but malformed or *foreign*
+  payloads, and can be told which source it expected. Unexpected extra fields remain allowed for
+  forward compatibility.
+
+**Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
+still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
+200 sampled real cache entries — all 200 still accepted under both `require_ai` modes. A successful
+uninterrupted run returns a payload identical to the pre-D1 result (candidates, per-video records and
+summary compared field by field).
+
+**Honest limits.** D1 introduces no two-phase deterministic-partial cache contract, so if the process
+dies while a shared Qwen worker is still running *before its response returns*, that batch's
+deterministic work still has to be recomputed. **D1 does not fix source-identity collisions**:
+`int(st_mtime)` still gives the same signature to a file rewritten in place with the same size inside
+the same second, and an exact-mtime restore collides regardless of precision. Source and backend
+identity hardening is **deferred to D2**, because moving to `st_mtime_ns` re-keys the entire cache and
+would force a cold rebuild.
+
 ### Changed — 2026-09-27 (Phase 3C: NVENC clips decode in software)
 
 The NVENC extraction path no longer asks FFmpeg for CUDA input decoding. **`h264_nvenc` still does the

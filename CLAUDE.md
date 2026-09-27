@@ -222,6 +222,61 @@ signature (model/mmproj/server/mtmd stat + `llama-mtmd-cli --version`). **Bump `
 otherwise stale candidates silently survive. Swapping the GGUF model or llama.cpp build invalidates
 automatically.
 
+#### Durability invariants (D1)
+
+Before D1 the only save site was a terminal loop at the end of `analyze_video_sources`, so an
+interruption *anywhere* earlier discarded every newly analysed source — measured: 3 sources and all
+their Qwen tags completed, **0** durable cache entries. The rules that replaced it:
+
+- **A source is checkpointed the moment it is genuinely complete**, not when Stage 5 finishes:
+  after each serial `_analyze_single_video` (inline AI), after each parallel result, after
+  `_complete_deferred_qwen`, and after **each per-job merge** inside
+  `_complete_deferred_qwen_batch`. The terminal loop survives only as a backstop.
+- **`_cache_entry_is_complete()` is the single completion rule.** Never re-answer "is this reusable?"
+  anywhere else — the scattered version is exactly how a failed Qwen run became a permanent
+  AI-complete hit. It rejects a non-dict payload, a wrong `analysis_version`, a missing/non-string
+  `video_file`, non-list `candidates`, and **anything with `ai_deferred` truthy**; under
+  `require_ai` it additionally demands `ai_enabled` *unless there are no candidates*, because then
+  there was never any Qwen work to do.
+- **`_checkpoint_cache()` is the only thing that may start a write.** It consults the rule first, so
+  checkpointing early can never publish a deferred or failed-AI record. `analyze_video_sources`
+  must not call `_save_cache` directly; a test asserts that.
+- **`ai_enabled` is a fact, not a convenience.** Set it `True` only when Qwen genuinely completed.
+  The facade reports completion through the private `_QWEN_COMPLETED_KEY`, popped before the
+  timings are stored, because *tag count cannot be the predicate* — a worker that died and a worker
+  that legitimately returned zero tags both yield `qwen_tag_count == 0`. In the batch path
+  completion is decided **per job** by membership in `semantics_by_job`: a globally non-empty
+  response is not proof that *this* job completed, and one missing job must not fail its siblings.
+- **A candidate-less source is complete, and `ai_enabled` stays `False`.** It is reusable via the
+  completion rule rather than by falsifying the flag. Before D1 such a source was re-analysed on
+  every run forever.
+- **The writer publishes through a unique same-directory temp**
+  (`tempfile.mkstemp(prefix=<name>., suffix=.tmp, dir=<cache dir>)`), `flush` + `os.fsync`, then
+  `os.replace`, with best-effort temp cleanup in `finally`. The old shared `path + ".tmp"` let two
+  processes collide: measured, one writer's `os.replace` published the *other* writer's payload
+  while reporting success, and the loser failed with `FileNotFoundError` into a warning
+  `QuietConsole` discards. Never reintroduce a temp name derived from the final path.
+- **`PROCESS_CRASH_ATOMICITY` is provided** (a reader sees the old entry or the new one, never a
+  partial final file — verified at all four boundaries). **`POWER_LOSS_DURABILITY` is not claimed**:
+  the temp is fsynced, the containing directory is not. Do not upgrade that claim without testing it.
+- D1 deliberately **did not** change `_video_signature`, `_path_signature_token`,
+  `_qwen_backend_signature_token`, `_cache_path` or `ANALYSIS_VERSION`, so all pre-existing entries
+  stay addressable and reusable (verified read-only against 200 real entries). Source/backend
+  identity hardening — `int(st_mtime)` collides for any in-place rewrite inside the same second — is
+  **deferred to D2** because it re-keys the whole cache.
+- **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in
+  `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...`; the runtime cache is read-only for study work.
+
+#### The portable-Python `._pth` provenance hazard
+
+`bin\python-3.13.14-embed-amd64\python._pth` is patched to include the runtime checkout's `src`, and
+**that entry wins over `PYTHONPATH`**. A probe that simply does `import video_analysis` under the
+portable interpreter can therefore load a *different checkout's* module and, because
+`VIDEO_ANALYSIS_CACHE_DIR` is derived from `logger.ROOT_DIR`, point straight at the **real runtime
+cache**. This has actually happened during a study. Any script that imports pipeline modules for
+inspection must first strip that path entry, then assert `video_analysis.__file__` is the intended
+file and that the redirected cache directory is not the runtime one — and refuse to run otherwise.
+
 ### Console vs. UI output — structured progress
 
 In GUI runs `gui.process_video` still redirects stdout/stderr into `QuietConsole` (discarded), so **a
