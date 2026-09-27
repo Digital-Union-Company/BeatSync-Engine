@@ -113,8 +113,8 @@ Measured recovery cost ~0.61–0.72 s per call (mean ~0.65 s), so ~1.3 s for the
 Prediction only, pending a production run: once both recover and checkpoint, a subsequent identical warm
 run should show 845/845 cache hits and launch no Qwen worker.
 
-Changed: `src/auto_mode/stage5_qwen_scene_worker.py`, `tests/test_qwen_semantic_recovery.py` (21 tests),
-`CLAUDE.md`, `CHANGELOG-FORK.md`. Suite 614 passed / 2 skipped (593 + 21 new; same two pre-existing
+Changed: `src/auto_mode/stage5_qwen_scene_worker.py`, `tests/test_qwen_semantic_recovery.py` (24 tests),
+`CLAUDE.md`, `CHANGELOG-FORK.md`. Suite 617 passed / 2 skipped (593 + 24 new; same two pre-existing
 `WinError 1314` symlink skips).
 
 ### Changed — 2026-09-27 (Stage 5 cache identity D2: one deliberate generation transition)

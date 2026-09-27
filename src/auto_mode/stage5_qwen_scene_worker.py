@@ -1163,10 +1163,12 @@ def _run_inference_wave(
 
     # [FORK] Digital-Union (R1): targeted semantic recovery, deliberately LAST.
     #
-    # Every existing primary tier above runs first and is untouched: the initial attempt, the
-    # server retry, the reduced-slot restart (which returns recursively, so only the innermost wave
-    # reaches this point) and the serial/CLI fallback. Recovery is a last resort for a candidate
-    # that greedy decoding will otherwise never resolve, not a substitute for that machinery.
+    # Every *applicable* pre-existing primary tier above stays ahead of recovery and is untouched.
+    # They are conditional, not a fixed sequence every candidate walks: the initial attempt always
+    # runs; the server retry and the reduced-slot restart (which returns recursively, so only the
+    # innermost wave reaches this point) fire only on their own conditions; the serial/CLI fallback
+    # depends on backend state. Recovery forces none of them to run - it is a last resort for a
+    # candidate that greedy decoding will otherwise never resolve, not a substitute for that machinery.
     #
     # Eligibility is recomputed from `semantics` rather than from `failed`, because the serial
     # fallback above can resolve a candidate without rewriting `failed` - trusting `failed` would
