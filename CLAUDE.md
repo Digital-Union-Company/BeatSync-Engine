@@ -140,8 +140,7 @@ without FFmpeg or a GPU. Load-bearing details:
   source family engaged real NVDEC and emitted no such warning. It was never *every* successful clip —
   it was most of the sampled ones. Phase 3C also removed the request, so current renders no longer emit
   it at all. The rule stands on its own either way: a warning a tool recovered from is not a failure,
-  whatever produced it. (Some frozen Phase 3B test docstrings still carry the older "every successful
-  clip" phrasing; the measured figure above is the authority.)
+  whatever produced it.
 - **The selector anchors on FFmpeg's *consequence* lines, not on line order.** FFmpeg prints the root
   cause immediately before the wrapper it triggers (`Error while opening encoder` → `Task finished with
   error code` → `Conversion failed!`), so the specific lines nearest that boundary win. "Earliest

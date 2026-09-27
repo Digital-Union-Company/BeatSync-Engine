@@ -101,9 +101,12 @@ def test_detailed_function_returns_success_and_reason(ffmpeg_tree):
 def test_stderr_is_summarised_only_when_the_return_code_is_non_zero(ffmpeg_tree):
     """The decisive success-path guarantee.
 
-    On driver 617.14 every successful clip emits a scary-looking nvdec fallback warning on stderr. If
-    the summariser were consulted unconditionally, all 150 valid clips of the validated render would
-    have acquired a "reason" - and anything keying off a non-empty reason would call them failures.
+    While the pre-Phase-3C NVENC path requested ``-hwaccel cuda``, successful clips on driver 617.14
+    could emit a scary-looking recovered nvdec fallback warning on stderr. Phase 3C later quantified
+    it at 48 of 60 sampled old-path clips failing CUDA decode initialisation and falling back to
+    software decode; one sampled source family engaged real NVDEC and emitted no such warning. If the
+    summariser were consulted unconditionally, the bulk of a perfectly valid render would have
+    acquired a "reason" - and anything keying off a non-empty reason would call those clips failures.
     """
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
 
