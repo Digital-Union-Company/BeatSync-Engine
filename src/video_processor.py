@@ -41,6 +41,7 @@ from ffmpeg_processing import (
     get_video_resolution,
     convert_to_prores_proxy,
     extract_clip_segment_ffmpeg,
+    extract_clip_segment_ffmpeg_detailed,
     extract_prores_segment_random,
     concatenate_videos_ffmpeg,
     seconds_to_frame_count,
@@ -317,11 +318,17 @@ def create_clip_parallel(args):
             'gpu_encoder': gpu_encoder,
         }
 
-        success = extract_clip_segment_ffmpeg(**extract_kwargs)
-        
+        # [FORK] Digital-Union (Phase 3B): same extraction, but a failure now carries the bounded
+        # reason FFmpeg already printed. Without this the whole chain collapsed to one generic string
+        # and a real NVENC driver/API mismatch was indistinguishable from a missing file.
+        success, reason = extract_clip_segment_ffmpeg_detailed(**extract_kwargs)
+
         elapsed = time.perf_counter() - clip_started
         if not success:
-            return (i, None, target_size, None, "FFmpeg extraction failed", elapsed)
+            # The original wording is kept as a prefix so existing log/string expectations still
+            # match; the useful part is appended rather than replacing it.
+            detail = f"FFmpeg extraction failed: {reason}" if reason else "FFmpeg extraction failed"
+            return (i, None, target_size, None, detail, elapsed)
         
         return (i, temp_clip_path, target_size, temp_clip_path, None, elapsed)
         
