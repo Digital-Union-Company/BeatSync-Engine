@@ -32,8 +32,22 @@ _FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_coun
           "_reported_count", "_stored_ai_cache_is_consistent", "_qwen_job_completed",
           "_deterministic_analysis_completed", "_cache_entry_is_complete",
           "_load_cache", "_save_cache", "_checkpoint_cache")
-_CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY", "_QWEN_SINGLE_JOB_ID",
-           "_DETERMINISTIC_SCORING_KEY")
+_CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
+           "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
+
+
+def _cache_contract_version() -> str:
+    """Read CACHE_CONTRACT_VERSION straight out of production, so fixtures cannot drift from it."""
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "CACHE_CONTRACT_VERSION":
+                    return ast.literal_eval(node.value)
+    raise AssertionError("CACHE_CONTRACT_VERSION missing from video_analysis.py")
+
+
+_CACHE_CONTRACT = _cache_contract_version()
 
 # Functions that need a few pipeline collaborators stubbed. Their own bodies are still the real
 # production bodies, so the Qwen-completion and candidate-analysis logic under test is genuine.
@@ -171,6 +185,8 @@ def _entry(av, *, video_file, candidates=None, ai_enabled=True, ai_deferred=Fals
     stored record build it explicitly with `_stored(...)`."""
     entry = {
         "analysis_version": av,
+        # D2: every record a run writes carries the cache contract, so fixtures must too
+        "cache_contract": _CACHE_CONTRACT,
         "video_file": video_file,
         "source_name": os.path.basename(video_file),
         "duration": 30.0, "fps": 25.0, "width": 1280, "height": 720,
@@ -268,15 +284,18 @@ def test_unexpected_extra_fields_stay_allowed(cache):
     assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True
 
 
-def test_a_representative_pre_d1_entry_is_still_accepted(cache):
-    """Existing cache entries must remain reusable: D1 changes no key and no required field.
-
-    Shaped after the *real* runtime records, which a read-only audit of all 2196 confirmed carry
+def test_a_representative_record_of_this_generation_is_accepted(cache):
+    """Shaped after the *real* runtime records, which a read-only audit of all 2196 confirmed carry
     matching `qwen_frame_count`/`qwen_tag_count` and an `ai_analyzed` marker on each tagged candidate
-    (``_merge_semantic`` sets it). R6's stored-consistency check therefore accepts them.
+    (``_merge_semantic`` sets it), plus the D2 `cache_contract`.
+
+    D2 note: pre-D2 records carry no contract marker and are rejected — see
+    ``test_legacy_1_a_d1_record_is_never_treated_as_d2_complete`` in
+    ``test_stage5_cache_identity.py``. They are also unreachable, because the D2 signature re-keys.
     """
     legacy = {
         "analysis_version": cache["ANALYSIS_VERSION"],
+        "cache_contract": _CACHE_CONTRACT,
         "video_file": r"C:\lib\clip.mp4", "source_name": "clip.mp4",
         "duration": 41.0, "fps": 25.0, "width": 1280, "height": 720,
         "scene_changes": [2.0], "candidate_count": 2,
@@ -700,7 +719,7 @@ def _stored(av, *, candidate_count, frame_count, tag_count, analysed,
     if tag_count is not None:
         timings["qwen_tag_count"] = tag_count
     return {
-        "analysis_version": av, "video_file": video_file,
+        "analysis_version": av, "cache_contract": _CACHE_CONTRACT, "video_file": video_file,
         "source_name": os.path.basename(video_file), "duration": 30.0, "fps": 25.0,
         "width": 1280, "height": 720, "scene_changes": [1.0],
         "candidate_count": len(candidates), "candidates": candidates,
@@ -946,7 +965,8 @@ def _load_batch(worker_response):
 
 def _deferred_record(av, name, n=3, path=None):
     return {
-        "analysis_version": av, "video_file": path or rf"C:\src\{name}", "source_name": name,
+        "analysis_version": av, "cache_contract": _CACHE_CONTRACT,
+        "video_file": path or rf"C:\src\{name}", "source_name": name,
         "duration": 30.0, "fps": 25.0, "width": 1280, "height": 720, "scene_changes": [1.0],
         "candidate_count": n,
         "candidates": [{"id": f"{name}-{i}", "start": i, "end": i + 2, "action_score": 0.5,

@@ -528,21 +528,26 @@ def test_a_cache_write_failure_cannot_abort_the_render(tree):
 # ---------------------------------------------------------------------------
 
 
-def test_the_cache_key_is_unchanged_because_identity_hardening_is_d2(tree):
+def test_the_cache_key_carries_the_d2_identity(tree):
+    """D1 deliberately left identity alone; D2 hardened it. Detailed coverage lives in
+    ``test_stage5_cache_identity.py`` — this pins that the durability work still sees the D2 key."""
     signature = ast.unparse(_func(tree, "_video_signature"))
 
-    assert "int(stat.st_mtime)" in signature, "D1 must not re-key the existing cache"
-    assert "st_mtime_ns" not in signature, "source-identity hardening is deferred to D2"
+    assert "st_mtime_ns" in signature, "integer-second truncation was fixed in D2"
+    assert "int(stat.st_mtime)" not in signature
     assert "ANALYSIS_VERSION" in signature
+    assert "CACHE_CONTRACT_VERSION" in signature
 
 
-def test_the_path_and_backend_signature_tokens_are_unchanged(tree):
-    token = ast.unparse(_func(tree, "_path_signature_token"))
-    assert "int(stat.st_mtime)" in token and "st_mtime_ns" not in token
+def test_the_backend_signature_is_content_backed_and_fails_closed(tree):
+    backend = _func(tree, "_qwen_backend_signature_token")
+    rendered = ast.unparse(backend)
+    assert "_llama_version_token" in rendered, "the version string remains as extra evidence"
+    assert _calls(backend, "_backend_component_token"), "components must be content-fingerprinted"
 
-    backend = ast.unparse(_func(tree, "_qwen_backend_signature_token"))
-    assert "_llama_version_token" in backend
-    assert "ai_missing" in backend
+    code = "\n".join(ast.unparse(node) for node in backend.body
+                     if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+    assert "ai_missing" not in code, "a stable token for an unprovable backend is what D2 removed"
 
 
 def test_analysis_version_is_unchanged(module_source):
@@ -550,6 +555,11 @@ def test_analysis_version_is_unchanged(module_source):
 
 
 def test_the_cache_path_layout_is_unchanged(tree):
-    body = ast.unparse(_func(tree, "_cache_path"))
+    """D2 changed the signature *inputs*, not the filename shape."""
+    path = _func(tree, "_cache_path")
+    body = ast.unparse(path)
     assert "_hash_text(name, 8)" in body
-    assert "_video_signature(video_file, enable_ai, qwen_model_path)" in body
+    assert _calls(path, "_video_signature"), "the filename still embeds the signature"
+    # D2: the path may now decline to exist at all, which is the fail-closed seam
+    assert any(isinstance(node, ast.Return) and ast.unparse(node.value) == "None"
+               for node in ast.walk(path)), "an unprovable identity must yield no cache path"

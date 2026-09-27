@@ -59,6 +59,28 @@ _QWEN_COMPLETED_KEY = "_qwen_completed"
 # *finished* worker distinguishable from a worker that never produced a response at all.
 _QWEN_SINGLE_JOB_ID = "single"
 
+# [FORK] Digital-Union (D2): the ONE constant owning cache identity *and* the persisted completion
+# contract. It is both the first component of every cache signature and the value stored as
+# ``cache_contract`` in every record, so a key and its payload can never disagree about which
+# generation they belong to.
+#
+# **Bump this whenever a change alters what a cached result means**, even if the candidate schema is
+# untouched and `ANALYSIS_VERSION` therefore stays put: the identity algorithm, the Qwen prompt, the
+# semantic normalisation/output contract, or any result-affecting Qwen configuration not already
+# represented in the signature. Do NOT hash the worker source into the key - a progress or
+# performance-only worker edit must not invalidate semantic cache.
+CACHE_CONTRACT_VERSION = "stage5_cache_v2"
+
+# Bounded content fingerprint geometry. 1 MiB chunks; files at or below three chunks are read whole.
+_FINGERPRINT_CHUNK = 1 << 20
+_FINGERPRINT_WHOLE_FILE_LIMIT = 3 * _FINGERPRINT_CHUNK
+_FINGERPRINT_DIGEST_SIZE = 16
+
+# Canonical Qwen-config identity for a deterministic-only (no_ai) run: there is no Qwen
+# configuration to represent, and keying one in would make unrelated env changes re-key a
+# deterministic cache.
+_NO_AI_CONFIG_TOKEN = "cfg_no_ai"
+
 # [FORK] Digital-Union (D1 R2): `timings["candidate_scoring_seconds"]` is written immediately after
 # `_measure_windows` inside the `cap.isOpened()` branch of `_analyze_single_video`, and nowhere else.
 # Its presence therefore proves the deterministic candidate pass really ran, which is how a genuine
@@ -140,6 +162,80 @@ def _path_signature_token(path: str) -> str:
         return f"{os.path.basename(path)}:missing"
 
 
+def _bounded_fingerprint(path: str, size: int) -> str | None:
+    """[FORK] Digital-Union (D2): deterministic bounded content fingerprint, or None if unreadable.
+
+    BLAKE2b, 16-byte digest. The file size is hashed first, then content samples:
+
+    * ``size <= 3 MiB`` - the whole file, read once;
+    * ``size > 3 MiB``  - exactly three non-overlapping 1 MiB windows:
+        - ``[0, 1 MiB)``
+        - ``[mid, mid + 1 MiB)`` where
+          ``mid = max(1 MiB, min(size // 2 - 512 KiB, size - 2 MiB))``
+        - ``[size - 1 MiB, size)``
+      The clamp guarantees the middle window never overlaps the head or the tail, so no byte is
+      hashed twice and the bytes read are exactly ``min(size, 3 MiB)``.
+
+    BLAKE2b rather than SHA-256 because it measured faster and this is **accidental** stale-cache
+    prevention, not an adversarial problem: 128 bits is ample to stop a same-size/same-timestamp
+    rewrite from being mistaken for the original. No cryptographic claim is made.
+
+    Returns ``None`` on any read failure - the caller must then treat the source as having no strong
+    identity at all rather than inventing a weak placeholder.
+    """
+    chunk = _FINGERPRINT_CHUNK
+    digest = hashlib.blake2b(digest_size=_FINGERPRINT_DIGEST_SIZE)
+    digest.update(str(size).encode("ascii"))
+    try:
+        with open(path, "rb") as handle:
+            if size <= _FINGERPRINT_WHOLE_FILE_LIMIT:
+                digest.update(handle.read())
+            else:
+                digest.update(handle.read(chunk))
+                middle = max(chunk, min(size // 2 - chunk // 2, size - 2 * chunk))
+                handle.seek(middle)
+                digest.update(handle.read(chunk))
+                handle.seek(-chunk, os.SEEK_END)
+                digest.update(handle.read(chunk))
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _full_fingerprint(path: str) -> str | None:
+    """[FORK] Digital-Union (D2): whole-file BLAKE2b, for files small enough that sampling is silly.
+
+    Used for ``llama-server.exe`` and ``llama-mtmd-cli.exe`` - measured at 9,216 and 82,944 bytes,
+    hashed in ~13 ms combined - so those two components get exact identity for free.
+    """
+    digest = hashlib.blake2b(digest_size=_FINGERPRINT_DIGEST_SIZE)
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(_FINGERPRINT_CHUNK), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _backend_component_token(path: str, *, full_hash: bool) -> str | None:
+    """[FORK] Digital-Union (D2): strong identity for one backend file, or None if unreadable.
+
+    Absolute path, not basename: the D1 study proved a basename-keyed token is identical for
+    same-name/same-size/same-second files in different directories, so pointing
+    ``BEATSYNC_QWEN_LLAMA_MODEL`` at another copy did not re-key the cache.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    fingerprint = (_full_fingerprint(path) if full_hash
+                   else _bounded_fingerprint(path, stat.st_size))
+    if fingerprint is None:
+        return None
+    return f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}:{fingerprint}"
+
+
 def _llama_version_token(llama_dir: str) -> str:
     llama_dir = os.path.abspath(llama_dir)
     cached = _LLAMA_VERSION_TOKENS.get(llama_dir)
@@ -173,44 +269,135 @@ def _llama_version_token(llama_dir: str) -> str:
     return token
 
 
-def _qwen_backend_signature_token(qwen_model_path: str | None) -> str:
+def _qwen_backend_signature_token(qwen_model_path: str | None) -> str | None:
+    """[FORK] Digital-Union (D2): strong backend identity, or None when it cannot be proven.
+
+    **Compute this ONCE per `analyze_video_sources` invocation and thread the result** - see the
+    ``backend_token`` parameter on `_video_signature`/`_cache_path`. It used to be called from
+    `_video_signature`, i.e. once per source; with content fingerprints that is 702 calls, measured at
+    **61.7 minutes** if the two GGUFs are full-hashed. Memoised to one call it is ~20 ms.
+
+    There is deliberately no module-level cache of the result, so a second invocation in the same
+    process re-reads the backend and can observe a swapped model or llama build.
+
+    Returns ``None`` if any component is missing or unreadable. There is no weak "ai_missing"-style
+    placeholder any more: a stable token for an unprovable backend is exactly what lets a stale entry
+    be reused, so the caller must fall back to *no cache* instead.
+    """
     paths = _resolve_qwen_backend_paths(qwen_model_path)
-    required = ["server", "mtmd", "model", "mmproj"]
-    if not all(os.path.exists(paths[key]) for key in required):
-        return "ai_missing"
-    raw = "|".join([
-        "llama_vulkan",
-        _path_signature_token(paths["model"]),
-        _path_signature_token(paths["mmproj"]),
-        _path_signature_token(paths["server"]),
-        _path_signature_token(paths["mtmd"]),
-        _llama_version_token(paths["llama_dir"]),
-    ])
+    components = [
+        ("model", False),      # ~1.83 GB  -> bounded fingerprint
+        ("mmproj", False),     # ~0.82 GB  -> bounded fingerprint
+        ("server", True),      # ~9 KB     -> full hash
+        ("mtmd", True),        # ~83 KB    -> full hash
+    ]
+    tokens = []
+    for key, full_hash in components:
+        token = _backend_component_token(paths[key], full_hash=full_hash)
+        if token is None:
+            return None
+        tokens.append(token)
+    # The llama --version string stays as additional evidence, but is no longer load-bearing on its
+    # own: if it cannot be probed it degrades to a stat token while the file fingerprints above remain
+    # strong, so a version-probe failure is non-fatal by design.
+    raw = "|".join(["llama_vulkan", *tokens, _llama_version_token(paths["llama_dir"])])
     return "ai_" + _hash_text(raw, length=20)
 
 
-def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | None) -> str:
-    stat = os.stat(video_file)
-    model_token = "no_ai"
+def _qwen_config_token() -> str:
+    """[FORK] Digital-Union (D2): identity for the Qwen settings that change what gets persisted.
+
+    Keyed on **effective** values, mirroring the runtime's own parsing and clamping, so behaviourally
+    identical configurations produce identical identity: an unset variable and its explicit default
+    agree, and a malformed value agrees with the default the worker actually falls back to.
+
+    * ``BEATSYNC_QWEN_MAX_WINDOWS``   - default 120, malformed -> 120, then ``max(0, value)``.
+      D1 proved this changes *how many* candidates receive semantics while being absent from identity,
+      so a 60-window cache was silently reused by a run asking for 120.
+    * ``BEATSYNC_QWEN_FRAME_WIDTH``   - default 512, clamped 224..768 (the worker's own `_env_int`).
+      Changes the image the VLM sees, so it changes the semantics.
+    * ``BEATSYNC_QWEN_MAX_NEW_TOKENS`` - default 128, clamped 32..256. Can truncate the semantic JSON.
+
+    Runtime/performance knobs are deliberately excluded - slots, device, timeouts, batching - because
+    they do not alter the persisted semantic contract. Resolved model/mmproj/llama paths are covered
+    by the backend token, and ``BEATSYNC_DISABLE_QWEN`` is represented indirectly: it produces
+    ``enable_ai=False`` and therefore the separate no-AI identity.
+    """
+    return "cfg_" + _hash_text("|".join([
+        f"max_windows={_qwen_max_windows()}",
+        f"frame_width={_env_int('BEATSYNC_QWEN_FRAME_WIDTH', 512, lo=224, hi=768)}",
+        f"max_new_tokens={_env_int('BEATSYNC_QWEN_MAX_NEW_TOKENS', 128, lo=32, hi=256)}",
+    ]), length=16)
+
+
+def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | None,
+                     backend_token: str | None = None,
+                     config_token: str | None = None) -> str | None:
+    """[FORK] Digital-Union (D2): the cache signature, or None when identity cannot be proven.
+
+    Inputs: `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION`, the absolute source path, ``st_size``,
+    ``st_mtime_ns``, the bounded source fingerprint, the backend token (or ``no_ai``) and the Qwen
+    config token. ``st_mtime_ns`` alone would not be enough: it closes the integer-second truncation
+    but an exact-mtime restore still collides, which the fingerprint is what actually catches.
+
+    The absolute path stays in identity on purpose. Identity is *location + content*, so a moved file
+    re-keys, preserving the pre-D2 contract. Content-only identity would deduplicate copies - a real
+    gain, but a semantic change, so D2 does not make it.
+
+    Pass ``backend_token``/``config_token`` to reuse one invocation's values instead of recomputing
+    per source.
+    """
+    try:
+        stat = os.stat(video_file)
+    except OSError:
+        return None
+    fingerprint = _bounded_fingerprint(video_file, stat.st_size)
+    if fingerprint is None:
+        return None
+
     if enable_ai:
-        model_token = _qwen_backend_signature_token(qwen_model_path)
+        if backend_token is None:
+            backend_token = _qwen_backend_signature_token(qwen_model_path)
+        if backend_token is None:
+            return None
+        if config_token is None:
+            config_token = _qwen_config_token()
+    else:
+        backend_token = "no_ai"
+        config_token = _NO_AI_CONFIG_TOKEN
+
+    # `model_token` keeps the pre-D2 local name deliberately: a Phase 2B test asserts the key mixes
+    # it and carries no progress-related field, and that guarantee is still exactly what we want.
+    model_token = backend_token
     raw = "|".join([
+        CACHE_CONTRACT_VERSION,
         ANALYSIS_VERSION,
         os.path.abspath(video_file),
         str(stat.st_size),
-        str(int(stat.st_mtime)),
+        str(stat.st_mtime_ns),
+        fingerprint,
         model_token,
+        config_token,
     ])
     return _hash_text(raw, length=24)
 
 
-def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None) -> str:
+def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
+                backend_token: str | None = None,
+                config_token: str | None = None) -> str | None:
+    """[FORK] Digital-Union (D2): the cache filename, or None when identity cannot be proven.
+
+    A ``None`` return is the fail-closed path: the caller performs no lookup and no write for that
+    source, so nothing is ever stored under an unprovable identity. `_checkpoint_cache` already
+    treats a ``None`` cache file as a no-op, which is the seam this uses.
+    """
+    signature = _video_signature(video_file, enable_ai, qwen_model_path,
+                                 backend_token=backend_token, config_token=config_token)
+    if signature is None:
+        return None
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
     name = os.path.splitext(_safe_name(video_file))[0]
-    return os.path.join(
-        VIDEO_ANALYSIS_CACHE_DIR,
-        f"{_hash_text(name, 8)}_{_video_signature(video_file, enable_ai, qwen_model_path)}.json",
-    )
+    return os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"{_hash_text(name, 8)}_{signature}.json")
 
 
 def _same_source(cached_video_file: Any, expected_video_file: str) -> bool:
@@ -423,6 +610,12 @@ def _cache_entry_is_complete(data: Any, require_ai: bool) -> bool:
         return False
     if data.get("analysis_version") != ANALYSIS_VERSION:
         return False
+    # [FORK] Digital-Union (D2): the persisted contract must match this generation. Pre-D2 records
+    # carry no marker and are rejected here - which is belt-and-braces, because the D2 signature also
+    # re-keys every entry, so a pre-D2 file is never even looked up. There is deliberately no
+    # D1-to-D2 compatibility branch: legacy records are orphaned and rebuilt once.
+    if data.get("cache_contract") != CACHE_CONTRACT_VERSION:
+        return False
     if not isinstance(data.get("video_file"), str) or not data.get("video_file"):
         return False
     candidates = data.get("candidates")
@@ -615,10 +808,28 @@ def analyze_video_sources(
     jobs: List[Dict] = []
     cache_hits = 0
 
+    # [FORK] Digital-Union (D2): compute the backend and Qwen-config identity ONCE for this whole
+    # invocation, then thread them into every source signature. `_qwen_backend_signature_token` reads
+    # and fingerprints the model/mmproj/exes; per source that is 702 calls, measured at 61.7 minutes
+    # if the GGUFs are full-hashed. Invocation-scoped rather than module-cached, so a later call in the
+    # same process still sees a swapped model or llama build.
+    invocation_backend_token = _qwen_backend_signature_token(qwen_model_path) if ai_available else None
+    invocation_config_token = _qwen_config_token() if ai_available else None
+    if ai_available and invocation_backend_token is None:
+        # Strong backend identity could not be proven. Analysis proceeds, but nothing may be looked up
+        # or stored under an unprovable AI identity, so every source below gets cache_file=None.
+        print("   Warning: Qwen backend identity could not be verified; "
+              "this run will not read or write AI analysis cache.")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, "Qwen backend identity unverifiable; AI analysis cache disabled for this run."))
+
     for idx, video_file in enumerate(existing, 1):
-        cache_file = _cache_path(video_file, ai_available, qwen_model_path)
+        cache_file = _cache_path(video_file, ai_available, qwen_model_path,
+                                 backend_token=invocation_backend_token,
+                                 config_token=invocation_config_token)
         cache_paths[idx] = cache_file
-        cached = _load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
+        cached = (_load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
+                  if cache_file else None)
         if cached:
             cache_hits += 1
             print(f"   Reusing cached visual analysis {idx}/{len(existing)}: {_safe_name(video_file)}")
@@ -1008,6 +1219,11 @@ def _analyze_single_video(
 
     return {
         "analysis_version": ANALYSIS_VERSION,
+        # [FORK] Digital-Union (D2): stamped here, at the one place source records are built, so every
+        # record - AI, deterministic/no_ai and candidate-less alike - carries the contract before the
+        # completion rule ever inspects it. `_save_cache` stays a pure transport primitive and never
+        # injects semantic truth into a payload.
+        "cache_contract": CACHE_CONTRACT_VERSION,
         "video_file": os.path.abspath(video_file),
         "source_name": name,
         "duration": duration,
