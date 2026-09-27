@@ -241,15 +241,36 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
 - **`_checkpoint_cache()` is the only thing that may start a write.** It consults the rule first, so
   checkpointing early can never publish a deferred or failed-AI record. `analyze_video_sources`
   must not call `_save_cache` directly; a test asserts that.
-- **`ai_enabled` is a fact, not a convenience.** Set it `True` only when Qwen genuinely completed.
-  The facade reports completion through the private `_QWEN_COMPLETED_KEY`, popped before the
-  timings are stored, because *tag count cannot be the predicate* — a worker that died and a worker
-  that legitimately returned zero tags both yield `qwen_tag_count == 0`. In the batch path
-  completion is decided **per job** by membership in `semantics_by_job`: a globally non-empty
-  response is not proof that *this* job completed, and one missing job must not fail its siblings.
-- **A candidate-less source is complete, and `ai_enabled` stays `False`.** It is reusable via the
-  completion rule rather than by falsifying the flag. Before D1 such a source was re-analysed on
-  every run forever.
+- **`ai_enabled` is a fact, not a convenience.** Set it `True` only when Qwen genuinely completed —
+  and that applies to **every** path: the deferred single, the deferred batch, *and* the serial
+  inline one. The facade reports completion through the private `_QWEN_COMPLETED_KEY`, which each
+  caller **pops before `timings.update(...)`** so it never reaches a cached payload. Never restate
+  the request as the result: `ai_enabled = enable_ai and not defer_ai` was exactly the R2 defect —
+  the inline path reported AI-complete for a Qwen run that had failed, timed out or been skipped.
+- **Completion comes from the worker's response envelope, never from tag count.** The worker writes
+  `timings_by_job[<job id>]` once a job has finished, while every `_run_qwen_worker` failure path
+  (launch error, non-zero exit, timeout, unreadable response) returns `{}`. So membership in that
+  map is the evidence: single-job runs check `"single"`, the batch path checks each `job_id`. A
+  *finished* worker that produced zero usable tags is a **success with nothing to merge** —
+  treating it as failure made the next run repeat the whole Qwen pass for nothing. A globally
+  non-empty batch response is still not proof that *this* job completed, and one missing job must
+  not fail its siblings.
+- **A candidate-less source is complete only if the deterministic pass actually ran.** Two very
+  different outcomes both end with `candidates == []`: a source whose windows yielded no usable
+  moments, and a source OpenCV could not open (`"Warning: OpenCV could not open …; candidate
+  analysis skipped."`). `_deterministic_analysis_completed()` tells them apart using existing
+  durable evidence — `timings["candidate_scoring_seconds"]`, written once immediately after
+  `_measure_windows` inside the `cap.isOpened()` branch and nowhere else. The genuine case is
+  reusable (with `ai_enabled` left honestly `False`, not falsified); the open failure is not cached
+  at all, so the source is retried. An empty candidate list **alone** is not evidence of success —
+  D1 accepted it and would have retired a readable source permanently on one transient decode
+  failure. This check applies under both `require_ai` modes.
+- **`BEATSYNC_QWEN_MAX_WINDOWS=0` means no Qwen work was completed**, so `ai_enabled` is `False` and
+  no AI-keyed checkpoint is written. That is deliberate: `QWEN_MAX_WINDOWS` is *not* part of cache
+  identity, so caching a knowingly Qwen-less record under the AI model key would poison it for a
+  later run that does want tags. The supported way to cache deterministic-only results is
+  `BEATSYNC_DISABLE_QWEN=1`, which `auto_mode/__init__.py` turns into `enable_ai=False` and which
+  therefore produces the separate `no_ai` cache identity.
 - **The writer publishes through a unique same-directory temp**
   (`tempfile.mkstemp(prefix=<name>., suffix=.tmp, dir=<cache dir>)`), `flush` + `os.fsync`, then
   `os.replace`, with best-effort temp cleanup in `finally`. The old shared `path + ".tmp"` let two

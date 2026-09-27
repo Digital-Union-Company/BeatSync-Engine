@@ -68,6 +68,43 @@ cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously
   payloads, and can be told which source it expected. Unexpected extra fields remain allowed for
   forward compatibility.
 
+**R2 — three completion gaps the first pass left open.** Each was reproduced against the first D1
+commit before being fixed:
+
+- **The serial inline path ignored the completion signal entirely.** `_analyze_single_video` still
+  returned `ai_enabled = enable_ai and not defer_ai`, so a `workers == 1` run reported AI-complete
+  whatever Qwen did. Measured on the pre-R2 code: worker returning `{}` → `ai_enabled=True`; worker
+  raising → `ai_enabled=True`; `BEATSYNC_QWEN_MAX_WINDOWS=0` → `ai_enabled=True`. It also let the
+  private `_qwen_completed` flag reach `timings` — and therefore the cached payload — through
+  `timings.update(qwen_info)`. The inline path now pops the flag before the update and derives
+  `ai_enabled` from it, exactly like the deferred paths.
+- **A finished worker with zero semantic tags was called a failure.** The worker publishes
+  `timings_by_job["single"]` once a job completes even when `semantics == {}`, whereas every
+  `_run_qwen_worker` failure path returns `{}`. The first pass keyed on emptiness of `semantics`, so
+  both cases reported not-completed and a legitimately tag-less source repeated its whole Qwen pass
+  on every run. Completion is now membership of the job's entry in the response envelope — the same
+  rule the batch path already used — and tag count is never the predicate.
+- **An OpenCV-open failure was accepted as a candidate-less success.** `"Warning: OpenCV could not
+  open …; candidate analysis skipped."` returns `candidates == []`, which the D1 completion rule
+  treated as "nothing for Qwen to do, therefore complete" — so one transient decode failure would
+  have cached an empty result and retired a readable source permanently. Measured on the pre-R2
+  code: the open-failure record was accepted under both `require_ai` modes **and** checkpointed. The
+  rule now requires `timings["candidate_scoring_seconds"]`, which is written only inside the
+  `cap.isOpened()` branch; a genuine no-usable-moments result keeps it and stays reusable, the
+  failure does not and is retried.
+
+`BEATSYNC_QWEN_MAX_WINDOWS=0` now reports not-completed rather than AI-complete, deliberately:
+`QWEN_MAX_WINDOWS` is not part of cache identity, so a knowingly Qwen-less record must not be stored
+under the AI model key. `BEATSYNC_DISABLE_QWEN=1` remains the supported deterministic-only path — it
+is turned into `enable_ai=False` in `auto_mode/__init__.py` (verified), producing the separate
+`no_ai` cache identity.
+
+R2 changed no cache key, signature or `ANALYSIS_VERSION`, and preserved every first-pass fix
+(per-source checkpointing, unique fsynced temps, atomic replace, batch per-job completion, loader
+validation, terminal backstop). A successful uninterrupted run is payload-equivalent in **both**
+execution shapes — parallel/deferred and serial/inline — with the only difference being the removal
+of the leaked `_qwen_completed` key from the serial shape's stored timings.
+
 **Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
 still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
 200 sampled real cache entries — all 200 still accepted under both `require_ai` modes. A successful

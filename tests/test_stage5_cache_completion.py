@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import tempfile
+import time
 from typing import Any, Dict
 
 import pytest
@@ -26,38 +28,122 @@ _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
 
 # The exact set of cache primitives D1 owns. All stdlib-only by construction.
-_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_cache_entry_is_complete",
-          "_load_cache", "_save_cache", "_checkpoint_cache")
-_CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY")
+_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_deterministic_analysis_completed",
+          "_cache_entry_is_complete", "_load_cache", "_save_cache", "_checkpoint_cache")
+_CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY", "_QWEN_SINGLE_JOB_ID",
+           "_DETERMINISTIC_SCORING_KEY")
+
+# Functions that need a few pipeline collaborators stubbed. Their own bodies are still the real
+# production bodies, so the Qwen-completion and candidate-analysis logic under test is genuine.
+_PIPELINE_FUNCS = ("_fmt_seconds", "_annotate_candidates_with_qwen", "_analyze_single_video")
 
 
-def _load_primitives():
-    """Exec the production definitions verbatim in an isolated stdlib-only namespace."""
+def _extract(names):
+    """Return {name: verbatim source} for the requested top-level functions, plus the constants."""
     source = open(_VIDEO_ANALYSIS, encoding="utf-8").read()
     tree = ast.parse(source)
-
-    namespace: Dict[str, Any] = {
-        "os": os, "json": json, "tempfile": tempfile,
-        "Any": Any, "Dict": Dict, "__builtins__": __builtins__,
-    }
-    found = {}
+    found, consts = {}, {}
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in _FUNCS:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
             found[node.name] = ast.get_source_segment(source, node)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in _CONSTS:
-                    namespace[target.id] = ast.literal_eval(node.value)
+                    consts[target.id] = ast.literal_eval(node.value)
+    missing = [name for name in names if name not in found]
+    assert not missing, f"missing from video_analysis.py: {missing}"
+    return found, consts
 
-    missing = [name for name in _FUNCS if name not in found]
-    assert not missing, f"cache primitives missing from video_analysis.py: {missing}"
-    for name in _CONSTS:
-        assert name in namespace, f"{name} missing from video_analysis.py"
 
-    for name in _FUNCS:
+def _exec_into(namespace, found, order):
+    for name in order:
         exec(compile("from __future__ import annotations\n" + found[name], f"<{name}>", "exec"),
              namespace)
     return namespace
+
+
+def _load_primitives():
+    """Exec the production cache definitions verbatim in an isolated stdlib-only namespace."""
+    found, consts = _extract(_FUNCS)
+    namespace: Dict[str, Any] = {
+        "os": os, "json": json, "tempfile": tempfile,
+        "Any": Any, "Dict": Dict, "__builtins__": __builtins__,
+    }
+    namespace.update(consts)
+    for name in _CONSTS:
+        assert name in namespace, f"{name} missing from video_analysis.py"
+    return _exec_into(namespace, found, _FUNCS)
+
+
+def _load_pipeline(worker_response, *, capture_opens=True, window_count=3, max_windows=None):
+    """Exec the real `_analyze_single_video` / Qwen facade with their collaborators stubbed.
+
+    Only the *collaborators* are fake (media metadata, OpenCV capture, window metrics, and the Qwen
+    worker subprocess). The completion logic, the timings bookkeeping and the returned record shape
+    are the production ones, so these tests exercise real behaviour rather than source text.
+    """
+    found, consts = _extract(_FUNCS + _PIPELINE_FUNCS)
+    calls: Dict[str, Any] = {"merged": [], "worker_requests": 0}
+
+    class _Capture:
+        def isOpened(self):
+            return capture_opens
+
+        def release(self):
+            calls["released"] = True
+
+    def _run_qwen_worker(**kwargs):
+        calls["worker_requests"] += 1
+        return worker_response() if callable(worker_response) else worker_response
+
+    namespace: Dict[str, Any] = {
+        "os": os, "json": json, "tempfile": tempfile, "math": math, "time": time,
+        "Any": Any, "Dict": Dict, "List": list, "Sequence": list,
+        "__builtins__": __builtins__,
+        # media + analysis collaborators
+        "get_video_duration": lambda path: 30.0,
+        "get_video_fps": lambda path: 25.0,
+        "get_video_resolution": lambda path: (1280, 720),
+        "detect_video_scene_changes": lambda *a, **k: [1.0, 5.0, 9.0],
+        "_use_gpu_scene_detection": lambda use_gpu: False,
+        "_use_gpu_candidate_metrics": lambda use_gpu: False,
+        "_build_boundaries": lambda scene_changes, duration: [0.0, 10.0, 20.0, 30.0],
+        "_make_candidate_windows": lambda boundaries, duration: [
+            {"start": i * 2.0, "end": i * 2.0 + 2.0} for i in range(window_count)],
+        "_open_video_capture": lambda path: _Capture(),
+        "_measure_windows": lambda cap, fps, windows, use_gpu=False: [
+            {"quality": 0.6} for _ in windows],
+        "_build_candidate": lambda video_file, name, duration, i, window, metrics: {
+            "id": f"{name}-{i}", "start": window["start"], "end": window["end"],
+            "action_score": 0.5, "beauty_score": 0.4, "quality_score": 0.6,
+            "editorial_score": 0.9 - i * 0.1, "tags": ["deterministic"]},
+        # Qwen collaborators
+        "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],
+        "_run_qwen_worker": _run_qwen_worker,
+        "_merge_semantic": lambda candidate, semantic: (
+            calls["merged"].append(candidate["id"]),
+            candidate.update({"semantic_action": semantic.get("action", 0.0)}))[1],
+        "fork_progress": None,
+    }
+    namespace.update(consts)
+    _exec_into(namespace, found, _FUNCS + _PIPELINE_FUNCS)
+    if max_windows is None:
+        os.environ.pop("BEATSYNC_QWEN_MAX_WINDOWS", None)
+    else:
+        os.environ["BEATSYNC_QWEN_MAX_WINDOWS"] = str(max_windows)
+    namespace["_calls"] = calls
+    return namespace
+
+
+def _worker_ok(tag_count=3, semantics=None):
+    """A structurally successful legacy-single worker response."""
+    return {
+        "model_load_seconds": 8.0, "model_id": "qwen3vl-2b", "batch_size": 1,
+        "peak_vram_gb": 3.0, "total_seconds": 12.0,
+        "timings_by_job": {"single": {"tag_count": tag_count, "frame_count": 3,
+                                      "inference_seconds": 5.0}},
+        "semantics": {"clip.mp4-0": {"action": 0.9}} if semantics is None else semantics,
+    }
 
 
 @pytest.fixture(scope="module")
@@ -109,9 +195,13 @@ def test_candidate_less_result_is_complete_without_faking_ai_enabled(cache):
     The pre-D1 behaviour re-analysed such a source on every single run, because the only way to be
     accepted under ``require_ai`` was ``ai_enabled=True`` - which would have been a lie. The
     completion rule carries that knowledge instead.
+
+    R2: "no candidates" only means success when the deterministic pass actually ran, so the entry
+    must carry the scoring evidence - see the OpenCV-open-failure tests below.
     """
     entry = _entry(cache["ANALYSIS_VERSION"], video_file=r"C:\src\empty.mp4",
                    candidates=[], ai_enabled=False)
+    entry["timings"][cache["_DETERMINISTIC_SCORING_KEY"]] = 0.4
 
     assert entry["ai_enabled"] is False, "the flag must stay honest"
     assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True
@@ -334,6 +424,259 @@ def test_checkpoint_without_a_cache_file_is_a_no_op(cache, tmp_path):
     entry = _entry(cache["ANALYSIS_VERSION"], video_file=str(tmp_path / "a.mp4"))
     assert cache["_checkpoint_cache"](None, entry, require_ai=True) is False
     assert cache["_checkpoint_cache"]("", entry, require_ai=True) is False
+
+
+# ---------------------------------------------------------------------------
+# R2: zero-tag truth from the worker response envelope (T5, T6)
+# ---------------------------------------------------------------------------
+
+
+def test_a_finished_worker_with_zero_semantic_tags_counts_as_completed():
+    """The worker publishes ``timings_by_job["single"]`` once the job finishes, whatever the tag
+    count. A zero-tag *success* must not be mistaken for a failure, or every run repeats the whole
+    Qwen pass for a source that genuinely has nothing to say."""
+    ns = _load_pipeline(_worker_ok(tag_count=0, semantics={}))
+    candidates = [{"id": f"clip.mp4-{i}"} for i in range(3)]
+
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0, candidates=candidates,
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is True
+    assert info["qwen_tag_count"] == 0
+    assert ns["_calls"]["merged"] == [], "nothing to merge, and nothing was invented"
+
+
+def test_an_empty_worker_response_is_not_completed():
+    """Every `_run_qwen_worker` failure path returns ``{}`` - launch error, non-zero exit, timeout
+    or an unreadable response."""
+    ns = _load_pipeline({})
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+
+
+@pytest.mark.parametrize("response, why", [
+    ({"timings_by_job": {}}, "envelope present but this job never finished"),
+    ({"timings_by_job": {"other": {}}}, "a different job id finished"),
+    ({"semantics": {"clip.mp4-0": {"action": 0.9}}}, "tags but no completion envelope"),
+    ({"timings_by_job": None}, "malformed envelope"),
+    (None, "no response object at all"),
+])
+def test_completion_requires_this_jobs_envelope(response, why):
+    ns = _load_pipeline(response)
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False, why
+
+
+def test_tags_are_still_merged_when_the_worker_completes():
+    ns = _load_pipeline(_worker_ok(tag_count=1))
+    candidates = [{"id": f"clip.mp4-{i}"} for i in range(3)]
+
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0, candidates=candidates,
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is True
+    assert ns["_calls"]["merged"] == ["clip.mp4-0"]
+    assert candidates[0]["semantic_action"] == 0.9
+
+
+def test_max_windows_zero_reports_not_completed_and_never_calls_the_worker():
+    ns = _load_pipeline(_worker_ok(), max_windows=0)
+    try:
+        info = ns["_annotate_candidates_with_qwen"](
+            video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
+            qwen_model_path="m", use_gpu=False, audio_profile={})
+    finally:
+        os.environ.pop("BEATSYNC_QWEN_MAX_WINDOWS", None)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert ns["_calls"]["worker_requests"] == 0
+
+
+def test_no_selected_candidates_is_a_completed_no_op():
+    ns = _load_pipeline(_worker_ok())
+    info = ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is True
+    assert info["qwen_tag_count"] == 0
+    assert ns["_calls"]["worker_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R2: inline (serial) AI completion truth (T1, T2, T3, T4)
+# ---------------------------------------------------------------------------
+
+
+def _inline(ns, **kwargs):
+    defaults = dict(video_file=r"C:\src\clip.mp4", use_gpu=False, enable_ai=True,
+                    qwen_model_path="m", audio_profile={}, defer_ai=False)
+    defaults.update(kwargs)
+    return ns["_analyze_single_video"](**defaults)
+
+
+def test_inline_qwen_success_reports_ai_enabled():
+    ns = _load_pipeline(_worker_ok(tag_count=3))
+    record = _inline(ns)
+
+    assert record["ai_enabled"] is True
+    assert record["ai_deferred"] is False
+    assert record["candidates"], "deterministic candidates must survive"
+
+
+@pytest.mark.parametrize("response, why", [
+    ({}, "worker failed / returned nothing"),
+    ({"timings_by_job": {}}, "no completion envelope for this job"),
+    ({"semantics": {"clip.mp4-0": {"action": 0.9}}}, "tags without a completion envelope"),
+])
+def test_inline_qwen_failure_must_not_report_ai_enabled(response, why):
+    """The R2 defect: the serial path ignored the completion signal entirely and reported
+    ``ai_enabled = enable_ai and not defer_ai``, so a failed Qwen run was cached as AI-complete."""
+    ns = _load_pipeline(response)
+    record = _inline(ns)
+
+    assert record["ai_enabled"] is False, why
+    assert record["candidates"], "deterministic work is still kept on Qwen failure"
+
+
+def test_inline_qwen_raising_must_not_report_ai_enabled():
+    def boom():
+        raise RuntimeError("llama.cpp worker died")
+
+    ns = _load_pipeline(boom)
+    record = _inline(ns)
+
+    assert record["ai_enabled"] is False
+    assert record["candidates"]
+
+
+def test_inline_max_windows_zero_must_not_report_ai_enabled():
+    ns = _load_pipeline(_worker_ok(), max_windows=0)
+    try:
+        record = _inline(ns)
+    finally:
+        os.environ.pop("BEATSYNC_QWEN_MAX_WINDOWS", None)
+
+    assert record["ai_enabled"] is False, (
+        "QWEN_MAX_WINDOWS is not part of cache identity, so a deliberately Qwen-less result must not "
+        "be stored under an AI-keyed entry")
+
+
+def test_the_private_completion_key_never_reaches_timings_or_the_cache(tmp_path):
+    """T4: the bookkeeping flag must not leak into the stored payload through timings.update()."""
+    ns = _load_pipeline(_worker_ok(tag_count=2))
+    record = _inline(ns)
+    key = ns["_QWEN_COMPLETED_KEY"]
+
+    assert key not in record["timings"], record["timings"]
+    assert key not in record
+
+    path = str(tmp_path / "entry.json")
+    ns["_save_cache"](path, record)
+    stored = json.loads(open(path, encoding="utf-8").read())
+    assert key not in stored.get("timings", {})
+    assert key not in stored
+    assert key not in open(path, encoding="utf-8").read()
+
+
+def test_deferred_inline_request_stays_deferred():
+    ns = _load_pipeline(_worker_ok())
+    record = _inline(ns, defer_ai=True)
+
+    assert record["ai_deferred"] is True
+    assert record["ai_enabled"] is False
+    assert ns["_calls"]["worker_requests"] == 0, "deferred means Qwen has not run yet"
+
+
+def test_non_ai_analysis_is_unchanged():
+    ns = _load_pipeline(_worker_ok())
+    record = _inline(ns, enable_ai=False)
+
+    assert record["ai_enabled"] is False
+    assert record["ai_deferred"] is False
+    assert ns["_calls"]["worker_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R2: legitimate empty candidates vs failed deterministic analysis (T7, T8, T9)
+# ---------------------------------------------------------------------------
+
+
+def test_a_genuine_candidate_less_analysis_records_scoring_evidence(cache):
+    """Windows were measured but none were usable: a real, finished analysis."""
+    ns = _load_pipeline(_worker_ok(), window_count=0)
+    record = _inline(ns, enable_ai=False)
+
+    assert record["candidates"] == []
+    assert cache["_DETERMINISTIC_SCORING_KEY"] in record["timings"]
+    assert cache["_cache_entry_is_complete"](record, require_ai=True) is True
+    assert cache["_cache_entry_is_complete"](record, require_ai=False) is True
+
+
+def test_an_opencv_open_failure_is_not_a_candidate_less_success(cache):
+    """The R2 defect: both outcomes end with ``candidates == []``, and the D1 rule accepted both,
+    so one transient decode failure retired a readable source permanently."""
+    ns = _load_pipeline(_worker_ok(), capture_opens=False)
+    record = _inline(ns, enable_ai=False)
+
+    assert record["candidates"] == []
+    assert cache["_DETERMINISTIC_SCORING_KEY"] not in record["timings"], (
+        "the scoring step never ran, so it must leave no evidence behind")
+    assert cache["_cache_entry_is_complete"](record, require_ai=True) is False
+    assert cache["_cache_entry_is_complete"](record, require_ai=False) is False
+
+
+def test_a_failed_deterministic_source_is_not_checkpointed_and_is_retried(cache, tmp_path):
+    """T8 + T9: nothing is written, so the next run re-analyses the source."""
+    ns = _load_pipeline(_worker_ok(), capture_opens=False)
+    record = _inline(ns, enable_ai=False)
+    path = str(tmp_path / "entry.json")
+
+    assert cache["_checkpoint_cache"](path, record, require_ai=False) is False
+    assert not os.path.exists(path)
+    # next run: the cache lookup finds nothing, so the source is analysed again
+    assert cache["_load_cache"](path, require_ai=False,
+                               expected_video_file=r"C:\src\clip.mp4") is None
+
+
+def test_a_genuine_candidate_less_source_is_checkpointed_and_reused(cache, tmp_path):
+    ns = _load_pipeline(_worker_ok(), window_count=0)
+    record = _inline(ns, enable_ai=False)
+    path = str(tmp_path / "entry.json")
+
+    assert cache["_checkpoint_cache"](path, record, require_ai=True) is True
+    reused = cache["_load_cache"](path, require_ai=True,
+                                  expected_video_file=record["video_file"])
+    assert reused is not None
+    assert reused["candidates"] == []
+
+
+def test_deterministic_completion_evidence_is_read_defensively(cache):
+    for payload in (None, [], "text", {}, {"timings": None}, {"timings": []},
+                    {"timings": {"other": 1}}):
+        assert cache["_deterministic_analysis_completed"](payload) is False
+    assert cache["_deterministic_analysis_completed"](
+        {"timings": {cache["_DETERMINISTIC_SCORING_KEY"]: 0.0}}) is True
+
+
+def test_an_empty_candidate_list_alone_is_not_evidence_of_success(cache):
+    """Guards the rule itself: the old `if not candidates: return True` shortcut is gone."""
+    entry = _entry(cache["ANALYSIS_VERSION"], video_file=r"C:\src\a.mp4",
+                   candidates=[], ai_enabled=False)
+    entry["timings"] = {"total_seconds": 1.0}       # no scoring evidence
+
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+    assert cache["_cache_entry_is_complete"](entry, require_ai=False) is False
+
+    entry["timings"][cache["_DETERMINISTIC_SCORING_KEY"]] = 0.5
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True
 
 
 def test_checkpointed_sources_survive_while_a_later_source_is_abandoned(cache, tmp_path):

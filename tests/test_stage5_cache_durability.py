@@ -245,6 +245,104 @@ def test_total_batch_failure_behaviour_is_preserved(tree):
     assert "will retry on the next run" in body
 
 
+def test_inline_analysis_consumes_the_same_completion_signal(tree):
+    """R2: the serial/inline path must not restate the request as a result.
+
+    Behavioural coverage lives in ``test_stage5_cache_completion.py``; this pins the wiring so the
+    signal cannot be quietly unhooked again.
+    """
+    analyse = _func(tree, "_analyze_single_video")
+    body = ast.unparse(analyse)
+
+    assert "_QWEN_COMPLETED_KEY" in body, "the inline path must consult the completion signal"
+    assert ".pop(_QWEN_COMPLETED_KEY" in body, (
+        "pop before timings.update(), or the private flag lands in the cached payload")
+
+    returns = [node for node in ast.walk(analyse) if isinstance(node, ast.Return) and node.value]
+    assert returns, "the analysis must return a record"
+    rendered = ast.unparse(returns[-1])
+    assert "inline_qwen_completed" in rendered, (
+        "ai_enabled must depend on real completion, not only on enable_ai/defer_ai")
+    assert "'ai_enabled': bool(enable_ai and not defer_ai)" not in rendered, (
+        "the pre-R2 formula restated the request instead of the outcome")
+
+
+def test_the_pop_happens_before_timings_are_updated(tree):
+    """Order matters: updating first would copy the private flag into the stored timings.
+
+    Compared by source line number of the individual ``Call`` nodes. Comparing the position of
+    walked nodes does not work: ``ast.walk`` also yields the enclosing function, whose text contains
+    both calls, so everything collapses to index 0.
+    """
+    for name in ("_analyze_single_video", "_complete_deferred_qwen"):
+        func = _func(tree, name)
+        pops = [node.lineno for node in ast.walk(func) if isinstance(node, ast.Call)
+                and ".pop" in ast.unparse(node.func)
+                and "_QWEN_COMPLETED_KEY" in ast.unparse(node)]
+        updates = [node.lineno for node in _calls(func, "update")
+                   if ast.unparse(node.func).startswith("timings.")]
+        assert pops, f"{name}: expected a pop of the private completion key"
+        assert updates, f"{name}: expected a timings.update()"
+        assert min(pops) < min(updates), (
+            f"{name}: pop at line {min(pops)} must precede timings.update() at {min(updates)}")
+
+
+def test_single_job_completion_uses_the_worker_response_envelope(tree):
+    """R2: zero semantic tags from a finished worker is a success, not a failure."""
+    facade = _func(tree, "_annotate_candidates_with_qwen")
+    body = ast.unparse(facade)
+
+    assert "_QWEN_SINGLE_JOB_ID" in body, "completion must key off the worker's per-job envelope"
+    membership = [
+        node for node in ast.walk(facade)
+        if isinstance(node, ast.Compare) and any(isinstance(op, ast.In) for op in node.ops)
+        and "job_timings" in ast.unparse(node.comparators[0])
+    ]
+    assert membership, "completion must be a membership test on timings_by_job"
+
+    completed_assigns = [node for node in ast.walk(facade) if isinstance(node, ast.Assign)
+                         and ast.unparse(node.targets[0]) == "completed"]
+    assert completed_assigns, "an explicit `completed` verdict is required"
+    verdict = ast.unparse(completed_assigns[0].value)
+    assert "semantics" not in verdict, (
+        f"tag presence must not decide completion; found {verdict}")
+    assert "tag_count" not in verdict, verdict
+
+
+def test_the_deterministic_scoring_evidence_discriminator_exists(tree):
+    """R2: an empty candidate list alone must not count as a completed analysis."""
+    _func(tree, "_deterministic_analysis_completed")
+    rule = _func(tree, "_cache_entry_is_complete")
+    assert _calls(rule, "_deterministic_analysis_completed"), (
+        "the completion rule must distinguish a real candidate-less result from an open failure")
+
+    evidence = ast.unparse(_func(tree, "_deterministic_analysis_completed"))
+    assert "_DETERMINISTIC_SCORING_KEY" in evidence
+
+    # and the discriminator must be written only inside the capture-opened branch
+    analyse = _func(tree, "_analyze_single_video")
+    writes = [node for node in ast.walk(analyse) if isinstance(node, ast.Assign)
+              and "candidate_scoring_seconds" in ast.unparse(node.targets[0])]
+    assert len(writes) == 1, (
+        f"scoring evidence must be written exactly once; found {len(writes)}")
+    guarded = [node for node in ast.walk(analyse)
+               if isinstance(node, ast.If) and "isOpened" in ast.unparse(node.test)
+               and any("candidate_scoring_seconds" in ast.unparse(inner)
+                       for inner in ast.walk(node) if isinstance(inner, ast.Assign))]
+    assert guarded, "the evidence must be produced only when the capture actually opened"
+
+
+def test_the_empty_candidate_shortcut_is_gone(tree):
+    """The D1 rule returned True for any empty candidate list; that accepted decode failures."""
+    rule = _func(tree, "_cache_entry_is_complete")
+    for node in ast.walk(rule):
+        if isinstance(node, ast.If) and "not candidates" in ast.unparse(node.test):
+            rendered = ast.unparse(node)
+            assert "_deterministic_analysis_completed" in rendered, rendered
+            assert rendered.count("return True") == 0, (
+                f"an empty candidate list must not be an unconditional success: {rendered}")
+
+
 def test_the_candidate_less_source_is_finished_without_faking_ai_enabled(tree):
     """MINOR 11: it must be checkpointed and reusable, but ai_enabled must stay honest."""
     deferred = ast.unparse(_func(tree, "_complete_deferred_qwen"))
