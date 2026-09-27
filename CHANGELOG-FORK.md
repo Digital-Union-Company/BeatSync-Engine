@@ -20,6 +20,101 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-09-27 (Stage 5 cache identity D2: one deliberate generation transition)
+
+D1 made the cache *durable* and its completion state *honest*. What it deliberately left alone was
+whether a cache key identifies the right inputs at all. Measured on current main before changing
+anything:
+
+- **Source identity collided.** `abspath + size + int(st_mtime)` gave the *same* signature to a file
+  whose content was replaced inside the same second, and to one whose exact original mtime was
+  restored — so a stale analysis was reused for different media, the worst error class in this cache.
+- **Backend identity collided** for all four components. The token used the file *basename* plus size
+  plus `int(mtime)`, so a same-name/same-size/same-second swap was invisible and an override pointing
+  at another copy of a model did not re-key.
+- **`BEATSYNC_QWEN_MAX_WINDOWS` was absent from identity.** Runs with 120, 60, 0 and unset all shared
+  one cache file, so a 60-window result was silently reused by a run asking for 120. The same applied
+  to `BEATSYNC_QWEN_FRAME_WIDTH` and `BEATSYNC_QWEN_MAX_NEW_TOKENS`, both of which change the persisted
+  semantics.
+- **There was no persisted completion contract**, so nothing distinguished a record written under one
+  set of rules from another.
+
+D2 fixes all of it in **one** generation transition rather than several.
+
+`CACHE_CONTRACT_VERSION = "stage5_cache_v2"` is a single constant used both as the first signature
+component and as the stored `cache_contract` field, so a key and its payload cannot disagree about
+their generation. `ANALYSIS_VERSION` is untouched — its job is candidate scoring, window building and
+the candidate schema, none of which changed.
+
+Source identity is now `CACHE_CONTRACT_VERSION | ANALYSIS_VERSION | abspath | st_size | st_mtime_ns |
+bounded content fingerprint | backend token | Qwen config token`. `st_mtime_ns` alone would not have
+been enough: it closes the integer-second truncation but an exact-mtime restore still collides, so the
+fingerprint is the part that actually catches it. The fingerprint is BLAKE2b/16 over the size plus
+either the whole file (≤ 3 MiB) or three non-overlapping 1 MiB windows (head, a clamped middle, tail),
+measured at **5.1 ms/source → ~3.6 s and ~2.1 GB for 700 sources**. No cryptographic claim is made —
+bounded fingerprints are for practical accidental stale-cache prevention.
+
+Backend identity now covers each component by absolute path, size, `st_mtime_ns` and content: a full
+hash for the two tiny executables (9 KB, 83 KB) and the bounded fingerprint for the two GGUFs
+(1.83 GB, 0.82 GB). The `llama --version` string remains as extra evidence rather than the only strong
+signal, so a failed probe stays non-fatal.
+
+**One measurement shaped the whole design.** `_qwen_backend_signature_token` was reached from
+`_video_signature`, i.e. **once per source — 702 times**, and was not memoised. Adding content
+fingerprints there without changing that would have cost **61.7 minutes** per run. The orchestrator now
+computes the backend and config tokens once per `analyze_video_sources` invocation and threads them into
+every signature: ~9–20 ms total. It is invocation-scoped rather than module-cached, so a second call in
+the same process still sees a swapped model, and a test asserts exactly four component fingerprints for
+N sources.
+
+Qwen identity uses *effective* values mirroring the runtime's own clamps, so an unset variable and its
+explicit default agree, and a malformed value agrees with the default the worker really falls back to.
+It keys `MAX_WINDOWS`, `FRAME_WIDTH`, `MAX_NEW_TOKENS` and — added in R2 below —
+`audio_profile["smart_preset"]`. Runtime-only knobs (slots, device, timeouts, batching) are deliberately
+excluded, and the whole `audio_profile` is deliberately not hashed.
+
+**R2 — two gaps the first pass left.** Both were reproduced through the real `analyze_video_sources`
+before being fixed:
+
+- **Prompt context was missing from identity.** The worker's `_build_prompt` reads
+  `audio_profile.get("smart_preset", "rhythmic_gmv_amv")` and interpolates it straight into the Qwen
+  prompt, and `analyze_video_sources` forwards the audio profile into the worker request — so two runs
+  differing only in preset produce different semantics. Measured on the first D2 commit: presets
+  `rhythmic_hype_gmv_amv` and `cinematic_soft_amv` produced the *same* cache file. The effective style
+  hint is now part of the Qwen identity token (missing key still equals the explicit default, and a
+  `no_ai` key is unaffected), with a seam test that reads the worker's own call so a worker-side change
+  to the key or default fails the suite. The worker is untouched.
+- **A failed backend identity recomputed per source, and could recover mid-run.** The orchestrator
+  passed the failed `None` token onward, but `_video_signature` reads `None` as "not supplied, compute
+  it now" — so the same value meant two different things at that boundary. Measured: 6 sources produced
+  **7** backend-token calls (1 + N), and a token that failed once then succeeded re-enabled caching
+  inside that run, writing 6 records contrary to the documented run-level fail-closed contract. An
+  explicit `ai_cache_disabled` state now short-circuits before `_cache_path` is called at all: 1 call,
+  0 writes, no mid-run recovery, and analysis still returns all 6 sources. The success path already
+  behaved correctly and still does — 1 call per invocation, 2 across two invocations.
+
+`CACHE_CONTRACT_VERSION` is deliberately **not** bumped for R2: the first D2 commit is unshipped and no
+D2 cache generation exists yet, so this is remediation inside the same unshipped generation rather than
+a new one.
+
+**Unprovable identity now means no cache rather than a weak key.** A stat or fingerprint failure, source
+or backend, makes the signature and cache path `None`: no lookup, no write, and the render continues.
+The old `ai_missing` placeholder is gone, because a *stable* token for an unprovable input is precisely
+what allows a stale entry to be reused.
+
+The contract marker is stamped in `_analyze_single_video`, where records are built, so AI,
+deterministic/`no_ai` and candidate-less records all carry it; `_save_cache` remains a pure transport
+primitive.
+
+**Cost and legacy.** Exactly one cold rebuild is accepted by design — ~0.86–1.27 h for the current
+702-source library — after which warm runs pay only the ~3.6 s identity scan plus ~20 ms of backend
+work. There is **no migration, no cleanup and no D1→D2 compatibility loader**: new inputs mean new
+filenames, so the 2196 pre-D2 records are simply never looked up. They remain on disk as harmless
+historical artifacts (~55 MB, alongside a similar new generation), and `input/video_analysis_cache/` is
+preserved by policy. The two D1 records whose completeness could never be proven become unreachable and
+rebuild naturally, so that open question closes without a judgement call. A cold D2 run was verified to
+return a payload and stored records identical to base main, cache-only metadata aside.
+
 ### Fixed — 2026-09-27 (Stage 5 cache durability D1: checkpointing + AI completion truth)
 
 **The measured reason.** Until now `analyze_video_sources` wrote the cache in a single terminal loop
@@ -189,11 +284,12 @@ It deliberately does **not** call `_qwen_job_completed`: that needs `requested_i
 payloads never stored (nor the `BEATSYNC_QWEN_MAX_WINDOWS` value in force), so replaying the live rule
 against an old record would mean inventing evidence. For the same reason it does not require
 `frame_count == len(candidates)` — a smaller value is the normal result of `_select_ai_candidates`
-limiting the submitted set, so the two unverifiable records stay reusable and are left to the D2
-completion-contract decision.
+limiting the submitted set, so the two unverifiable records remained reusable under the D1 loader and
+were left to the D2 completion-contract decision. *The D2 transition above has since settled that by
+orphaning them.*
 
-Measured against the real cache, read-only: **2192 accepted, 4 rejected**, the rejected set exactly the
-four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
+Measured against the real cache at the D1 merge boundary, read-only: **2192 accepted, 4 rejected**, the
+rejected set exactly the four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
 an ordinary cache miss, and the source is recomputed and republished through the already-hardened
 writer. No migration command is provided and none is needed. `require_ai=False` deterministic reuse is
 unaffected (those candidates are real work), and the candidate-less path still answers to
@@ -211,20 +307,23 @@ validation, terminal backstop). A successful uninterrupted run is payload-equiva
 execution shapes — parallel/deferred and serial/inline — with the only difference being the removal
 of the leaked `_qwen_completed` key from the serial shape's stored timings.
 
-**Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
-still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
-the real cache: all entries stay **addressable**, and 2192 of 2196 stay **reusable** (see R6 — 4 are
-intentionally rejected as self-contradictory). A successful
-uninterrupted run returns a payload identical to the pre-D1 result (candidates, per-video records and
-summary compared field by field).
+**Cache compatibility — at the D1 merge boundary.** There was no cache-key, signature or
+`ANALYSIS_VERSION` change: `_video_signature` still used `int(stat.st_mtime)`, so existing entries
+remained addressable. Verified read-only against the real cache at that point: all entries addressable,
+and 2192 of 2196 reusable (see R6 — 4 intentionally rejected as self-contradictory). A successful
+uninterrupted run returned a payload identical to the pre-D1 result (candidates, per-video records and
+summary compared field by field). *The later D2 generation transition documented above supersedes this
+contract and naturally orphans every pre-D2 entry, so these figures describe the D1-era cache, not
+current lookup behaviour.*
 
-**Honest limits.** D1 introduces no two-phase deterministic-partial cache contract, so if the process
-dies while a shared Qwen worker is still running *before its response returns*, that batch's
-deterministic work still has to be recomputed. **D1 does not fix source-identity collisions**:
-`int(st_mtime)` still gives the same signature to a file rewritten in place with the same size inside
-the same second, and an exact-mtime restore collides regardless of precision. Source and backend
-identity hardening is **deferred to D2**, because moving to `st_mtime_ns` re-keys the entire cache and
-would force a cold rebuild.
+**Honest limits — as of D1.** D1 introduced no two-phase deterministic-partial cache contract, so if
+the process died while a shared Qwen worker was still running *before its response returned*, that
+batch's deterministic work had to be recomputed — still true today, since D2 changed identity, not that
+contract. **D1 did not fix source-identity collisions**: `int(st_mtime)` gave the same signature to a
+file rewritten in place with the same size inside the same second, and an exact-mtime restore collided
+regardless of precision. Source and backend identity hardening was deferred to D2, because moving to
+`st_mtime_ns` re-keys the entire cache and forces a cold rebuild; **the D2 section above now closes that
+work** and accepts exactly one such rebuild.
 
 ### Changed — 2026-09-27 (Phase 3C: NVENC clips decode in software)
 
