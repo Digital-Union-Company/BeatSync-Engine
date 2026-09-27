@@ -67,9 +67,35 @@ every signature: ~9–20 ms total. It is invocation-scoped rather than module-ca
 the same process still sees a swapped model, and a test asserts exactly four component fingerprints for
 N sources.
 
-Qwen config identity uses *effective* values mirroring the runtime's own clamps, so an unset variable and
-its explicit default agree, and a malformed value agrees with the default the worker really falls back
-to. Runtime-only knobs — slots, device, timeouts, batching — are deliberately excluded.
+Qwen identity uses *effective* values mirroring the runtime's own clamps, so an unset variable and its
+explicit default agree, and a malformed value agrees with the default the worker really falls back to.
+It keys `MAX_WINDOWS`, `FRAME_WIDTH`, `MAX_NEW_TOKENS` and — added in R2 below —
+`audio_profile["smart_preset"]`. Runtime-only knobs (slots, device, timeouts, batching) are deliberately
+excluded, and the whole `audio_profile` is deliberately not hashed.
+
+**R2 — two gaps the first pass left.** Both were reproduced through the real `analyze_video_sources`
+before being fixed:
+
+- **Prompt context was missing from identity.** The worker's `_build_prompt` reads
+  `audio_profile.get("smart_preset", "rhythmic_gmv_amv")` and interpolates it straight into the Qwen
+  prompt, and `analyze_video_sources` forwards the audio profile into the worker request — so two runs
+  differing only in preset produce different semantics. Measured on the first D2 commit: presets
+  `rhythmic_hype_gmv_amv` and `cinematic_soft_amv` produced the *same* cache file. The effective style
+  hint is now part of the Qwen identity token (missing key still equals the explicit default, and a
+  `no_ai` key is unaffected), with a seam test that reads the worker's own call so a worker-side change
+  to the key or default fails the suite. The worker is untouched.
+- **A failed backend identity recomputed per source, and could recover mid-run.** The orchestrator
+  passed the failed `None` token onward, but `_video_signature` reads `None` as "not supplied, compute
+  it now" — so the same value meant two different things at that boundary. Measured: 6 sources produced
+  **7** backend-token calls (1 + N), and a token that failed once then succeeded re-enabled caching
+  inside that run, writing 6 records contrary to the documented run-level fail-closed contract. An
+  explicit `ai_cache_disabled` state now short-circuits before `_cache_path` is called at all: 1 call,
+  0 writes, no mid-run recovery, and analysis still returns all 6 sources. The success path already
+  behaved correctly and still does — 1 call per invocation, 2 across two invocations.
+
+`CACHE_CONTRACT_VERSION` is deliberately **not** bumped for R2: the first D2 commit is unshipped and no
+D2 cache generation exists yet, so this is remediation inside the same unshipped generation rather than
+a new one.
 
 **Unprovable identity now means no cache rather than a weak key.** A stat or fingerprint failure, source
 or backend, makes the signature and cache path `None`: no lookup, no write, and the render continues.

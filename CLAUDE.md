@@ -258,21 +258,41 @@ full BLAKE2b for `llama-server.exe` and `llama-mtmd-cli.exe` (9 KB and 83 KB —
 pointing at another copy did not re-key. The `llama --version` string stays as extra evidence but is no
 longer load-bearing alone, so a failed version probe remains non-fatal.
 
-**The backend token MUST be computed once per `analyze_video_sources` invocation and threaded into
-every source signature** (`backend_token=` / `config_token=` on `_video_signature`/`_cache_path`). It
-used to be reached *from* `_video_signature`, i.e. once per source; with content fingerprints that is
-702 reads of a ~2.65 GB backend, measured at **61.7 minutes**. Threaded it is ~9–20 ms once. It is
-invocation-scoped, not module-cached, so a later call in the same process still observes a swapped
-model or llama build. A test asserts exactly four component fingerprints for N sources.
+**The backend token is computed once per `analyze_video_sources` invocation — on success *and* on
+failure — and threaded into every source signature** (`backend_token=` / `config_token=` /
+`audio_profile=` on `_video_signature`/`_cache_path`). It used to be reached *from* `_video_signature`,
+i.e. once per source; with content fingerprints that is 702 reads of a ~2.65 GB backend, measured at
+**61.7 minutes**. Threaded it is ~9–20 ms once. It is invocation-scoped, not module-cached, so a later
+call in the same process still observes a swapped model or llama build.
 
-**Qwen config identity** keys the settings that change what gets persisted, on *effective* values
-mirroring the runtime's own parsing and clamps, so behaviourally identical configurations key
-identically (unset == explicit default; a malformed value == the default the worker actually uses):
-`BEATSYNC_QWEN_MAX_WINDOWS` (default 120, then `max(0, …)` — D1 proved this changes how many candidates
-get semantics while being absent from identity), `BEATSYNC_QWEN_FRAME_WIDTH` (512, clamp 224–768) and
-`BEATSYNC_QWEN_MAX_NEW_TOKENS` (128, clamp 32–256). Runtime-only knobs are deliberately **excluded** —
-slots, device, timeouts, batching, ctx, prefetch. A `no_ai` run gets a canonical no-AI config token, so
-Qwen settings never perturb a deterministic key.
+**If the invocation-level backend identity fails, AI caching is off for that entire run.** The
+orchestrator holds an explicit `ai_cache_disabled` state and then does not call `_cache_path` at all —
+because down in `_video_signature` a `None` `backend_token` means *"not supplied, compute it now"*, so
+handing the failed `None` onward made every source retry the fingerprinting (measured **1 + N** calls)
+and let a transient later success re-enable caching *mid-run*. Never overload `None` as both "not
+supplied" and "supplied but failed" at that boundary, and **do not** claim a per-source retry can
+restore caching: it must not. Analysis, Qwen and rendering continue normally; only the cache is off.
+
+**Qwen identity keys four things**, on *effective* values mirroring the runtime's own parsing and
+clamps, so behaviourally identical configurations key identically (unset == explicit default; a
+malformed value == the default the worker actually uses):
+
+- `BEATSYNC_QWEN_MAX_WINDOWS` — default 120, then `max(0, …)`. D1 proved this changes how many
+  candidates get semantics while being absent from identity.
+- `BEATSYNC_QWEN_FRAME_WIDTH` — 512, clamp 224–768. Changes the image the VLM sees.
+- `BEATSYNC_QWEN_MAX_NEW_TOKENS` — 128, clamp 32–256. Can truncate the semantic JSON.
+- `audio_profile["smart_preset"]` — **prompt context**. `analyze_video_sources` forwards the audio
+  profile into the worker request, and the worker's `_build_prompt` interpolates this value directly
+  into the Qwen prompt (`"The music edit style is {style_hint}."`), defaulting to `rhythmic_gmv_amv`.
+  `_qwen_prompt_style_hint` mirrors that default in one place; a seam test reads the worker's own
+  `audio_profile.get("smart_preset", …)` call and asserts the parent agrees, so a worker-side change
+  to the key or default fails the suite.
+
+The **whole `audio_profile` is deliberately not hashed** — almost all of it drives beat and render
+decisions, not the prompt; only fields proven to reach the persisted result belong in identity.
+Runtime-only knobs stay **excluded**: slots, device, timeouts, batching, ctx, prefetch. A `no_ai` run
+gets a canonical no-AI config token, so neither Qwen settings nor `smart_preset` perturb a
+deterministic key.
 
 **Unprovable identity means no cache, never a weak key.** If a stat or fingerprint fails —
 source *or* backend — `_video_signature` and `_cache_path` return `None`: that source gets no lookup and

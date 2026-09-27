@@ -26,7 +26,7 @@ _FUNCS = (
     "_safe_name", "_hash_text", "_env_int", "_qwen_max_windows", "_path_signature_token",
     "_bounded_fingerprint", "_full_fingerprint", "_backend_component_token",
     "_llama_version_token", "_resolve_qwen_backend_paths", "_qwen_backend_signature_token",
-    "_qwen_config_token", "_video_signature", "_cache_path",
+    "_qwen_prompt_style_hint", "_qwen_config_token", "_video_signature", "_cache_path",
     "_is_count", "_stored_ai_cache_is_consistent", "_deterministic_analysis_completed",
     "_cache_entry_is_complete",
 )
@@ -443,6 +443,167 @@ def test_config_5_a_no_ai_run_has_its_own_identity(va, tmp_path):
         finally:
             for name in env:
                 os.environ.pop(name, None)
+
+
+# ---------------------------------------------------------------------------
+# PROMPT-ID-1..4 — prompt context is part of identity (D2 R2)
+# ---------------------------------------------------------------------------
+
+
+_WORKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "src", "auto_mode", "stage5_qwen_scene_worker.py")
+
+
+def test_prompt_id_4_the_worker_prompt_really_consumes_smart_preset():
+    """Structural seam against the byte-identical worker: this is *why* smart_preset is in identity.
+
+    If `_build_prompt` ever stops interpolating the preset, or starts using a different default, this
+    fails and the mirrored default in `_qwen_prompt_style_hint` must be revisited.
+    """
+    tree = ast.parse(open(_WORKER, encoding="utf-8").read())
+    build = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_build_prompt")
+    body = ast.unparse(build)
+
+    assert "audio_profile.get('smart_preset', 'rhythmic_gmv_amv')" in body, body
+    assert "style_hint" in body
+    # the hint is interpolated into the returned prompt, not merely computed
+    returns = [ast.unparse(n) for n in ast.walk(build) if isinstance(n, ast.Return)]
+    assert any("style_hint" in text for text in returns), returns
+
+
+def test_the_parent_mirrors_the_workers_default_exactly(va):
+    """Same key, same default string — read from the worker, asserted against the parent."""
+    tree = ast.parse(open(_WORKER, encoding="utf-8").read())
+    build = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_build_prompt")
+    call = next(n for n in ast.walk(build) if isinstance(n, ast.Call)
+                and ast.unparse(n).startswith("audio_profile.get("))
+    key, default = (ast.literal_eval(call.args[0]), ast.literal_eval(call.args[1]))
+
+    assert va["_qwen_prompt_style_hint"]({}) == default
+    assert va["_qwen_prompt_style_hint"]({key: "something_else"}) == "something_else"
+    assert va["_qwen_prompt_style_hint"](None) == default
+    assert va["_qwen_prompt_style_hint"]("not-a-dict") == default
+
+
+def test_prompt_id_1_a_different_smart_preset_changes_the_ai_key(va, tmp_path):
+    """`analyze_video_sources` forwards the audio profile into the worker request, and the worker
+    interpolates `smart_preset` straight into the Qwen prompt — so two runs differing only in preset
+    produce different semantics. Before R2 they shared one cache key."""
+    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
+    token = va["_qwen_backend_signature_token"](None)
+
+    def key(profile):
+        return va["_cache_path"](clip, True, None, backend_token=token,
+                                 config_token=va["_qwen_config_token"](profile))
+
+    hype = key({"smart_preset": "rhythmic_hype_gmv_amv"})
+    soft = key({"smart_preset": "cinematic_soft_amv"})
+    assert hype != soft
+    # and unrelated audio-profile fields must NOT perturb identity
+    assert key({"smart_preset": "cinematic_soft_amv", "tempo": 174.0, "beat_count": 812}) == soft
+
+
+def test_prompt_id_2_a_missing_smart_preset_equals_the_explicit_default(va, tmp_path):
+    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
+    token = va["_qwen_backend_signature_token"](None)
+
+    def key(profile):
+        return va["_cache_path"](clip, True, None, backend_token=token,
+                                 config_token=va["_qwen_config_token"](profile))
+
+    default = key({})
+    assert key({"smart_preset": "rhythmic_gmv_amv"}) == default
+    assert key(None) == default
+    assert key({"tempo": 128.0}) == default, "an audio profile without a preset is still the default"
+
+
+def test_prompt_id_3_a_no_ai_key_ignores_smart_preset(va, tmp_path):
+    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
+    baseline = va["_cache_path"](clip, False, None)
+
+    for preset in ("rhythmic_hype_gmv_amv", "cinematic_soft_amv", "rhythmic_gmv_amv"):
+        assert va["_cache_path"](clip, False, None,
+                                 audio_profile={"smart_preset": preset}) == baseline
+
+
+def test_the_whole_audio_profile_is_not_hashed():
+    """Only fields proven to reach the persisted result belong in identity."""
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    token = ast.unparse(next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                             and n.name == "_qwen_config_token"))
+    assert "smart_preset" in token or "_qwen_prompt_style_hint" in token
+    for reckless in ("json.dumps(audio_profile", "str(audio_profile)", "sorted(audio_profile"):
+        assert reckless not in token, f"must not hash the whole profile: {reckless}"
+
+
+# ---------------------------------------------------------------------------
+# BACKEND memoisation / failure state at the orchestration seam (D2 R2)
+# ---------------------------------------------------------------------------
+
+
+def _orchestrator():
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                and n.name == "analyze_video_sources")
+
+
+def _calls_named(node, callee):
+    found = []
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Call):
+            func = inner.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name == callee:
+                found.append(inner)
+    return found
+
+
+def test_the_backend_token_is_computed_once_in_the_orchestrator(va):
+    """Structural, because `analyze_video_sources` needs cv2/numpy/librosa and cannot be imported on a
+    bare interpreter (see CLAUDE.md). The behavioural proof runs against the real orchestrator in the
+    D2 scratch harness: 1 call for N=6 sources on success, 2 across two invocations, and 1 — not
+    1 + N — when the token fails.
+    """
+    orchestrator = _orchestrator()
+    calls = _calls_named(orchestrator, "_qwen_backend_signature_token")
+    assert len(calls) == 1, (
+        f"exactly one invocation-level computation; found {len(calls)}")
+
+    assigned = [n for n in ast.walk(orchestrator) if isinstance(n, ast.Assign)
+                and "invocation_backend_token" in ast.unparse(n.targets[0])]
+    assert assigned, "the result must be held for the whole invocation"
+    # and threaded, not recomputed per source
+    for call in _calls_named(orchestrator, "_cache_path"):
+        rendered = ast.unparse(call)
+        assert "backend_token=" in rendered and "config_token=" in rendered, rendered
+
+
+def test_a_failed_backend_token_disables_ai_caching_for_the_whole_invocation(va):
+    """R2's defect: the failed `None` was passed on to `_cache_path`, where `None` means "not supplied,
+    compute it now" — so every source retried the fingerprinting (measured 1 + N calls) and a transient
+    later success re-enabled caching mid-run. An explicit state replaces the overloaded `None`."""
+    orchestrator = _orchestrator()
+    body = ast.unparse(orchestrator)
+    assert "ai_cache_disabled" in body, "an explicit disabled state is required"
+
+    # the cache path must be guarded by that state, not merely handed a None token
+    guarded = [n for n in ast.walk(orchestrator)
+               if isinstance(n, ast.IfExp) and "ai_cache_disabled" in ast.unparse(n.test)
+               and "_cache_path" in ast.unparse(n)]
+    assert guarded, "when AI caching is disabled, _cache_path must not be called at all"
+    assert ast.unparse(guarded[0].body) == "None", ast.unparse(guarded[0])
+
+
+def test_the_orchestrator_threads_the_audio_profile_into_identity(va):
+    orchestrator = _orchestrator()
+    config_calls = _calls_named(orchestrator, "_qwen_config_token")
+    assert config_calls, "the config token must be computed once per invocation"
+    for call in config_calls:
+        assert "audio_profile" in ast.unparse(call), ast.unparse(call)
+    for call in _calls_named(orchestrator, "_cache_path"):
+        assert "audio_profile" in ast.unparse(call), ast.unparse(call)
 
 
 def test_runtime_only_knobs_are_absent_from_the_config_token():

@@ -304,8 +304,20 @@ def _qwen_backend_signature_token(qwen_model_path: str | None) -> str | None:
     return "ai_" + _hash_text(raw, length=20)
 
 
-def _qwen_config_token() -> str:
-    """[FORK] Digital-Union (D2): identity for the Qwen settings that change what gets persisted.
+def _qwen_prompt_style_hint(audio_profile: Dict | None) -> str:
+    """[FORK] Digital-Union (D2 R2): the style hint the worker will actually put in the prompt.
+
+    Mirrors ``stage5_qwen_scene_worker._build_prompt`` exactly:
+    ``audio_profile.get("smart_preset", "rhythmic_gmv_amv")``. Kept as its own function so the
+    mirrored default lives in one place next to the reason it exists.
+    """
+    if not isinstance(audio_profile, dict):
+        return "rhythmic_gmv_amv"
+    return str(audio_profile.get("smart_preset", "rhythmic_gmv_amv"))
+
+
+def _qwen_config_token(audio_profile: Dict | None = None) -> str:
+    """[FORK] Digital-Union (D2): identity for the Qwen inputs that change what gets persisted.
 
     Keyed on **effective** values, mirroring the runtime's own parsing and clamping, so behaviourally
     identical configurations produce identical identity: an unset variable and its explicit default
@@ -317,22 +329,30 @@ def _qwen_config_token() -> str:
     * ``BEATSYNC_QWEN_FRAME_WIDTH``   - default 512, clamped 224..768 (the worker's own `_env_int`).
       Changes the image the VLM sees, so it changes the semantics.
     * ``BEATSYNC_QWEN_MAX_NEW_TOKENS`` - default 128, clamped 32..256. Can truncate the semantic JSON.
+    * ``audio_profile["smart_preset"]`` (D2 R2) - **prompt context**. `analyze_video_sources` forwards
+      the audio profile into the worker request, and the worker's `_build_prompt` interpolates this
+      value straight into the Qwen prompt ("The music edit style is {style_hint}."). Two runs differing
+      only in preset therefore get different semantics, yet shared one cache key before R2.
 
-    Runtime/performance knobs are deliberately excluded - slots, device, timeouts, batching - because
-    they do not alter the persisted semantic contract. Resolved model/mmproj/llama paths are covered
-    by the backend token, and ``BEATSYNC_DISABLE_QWEN`` is represented indirectly: it produces
-    ``enable_ai=False`` and therefore the separate no-AI identity.
+    Only fields *proven* to reach the persisted result are included - the whole ``audio_profile`` is
+    deliberately **not** hashed, since almost all of it drives beat/render decisions rather than the
+    prompt. Runtime/performance knobs are excluded too: slots, device, timeouts, batching. Resolved
+    model/mmproj/llama paths are covered by the backend token, and ``BEATSYNC_DISABLE_QWEN`` is
+    represented indirectly - it produces ``enable_ai=False`` and therefore the separate no-AI identity,
+    which carries no Qwen configuration at all.
     """
     return "cfg_" + _hash_text("|".join([
         f"max_windows={_qwen_max_windows()}",
         f"frame_width={_env_int('BEATSYNC_QWEN_FRAME_WIDTH', 512, lo=224, hi=768)}",
         f"max_new_tokens={_env_int('BEATSYNC_QWEN_MAX_NEW_TOKENS', 128, lo=32, hi=256)}",
+        f"smart_preset={_qwen_prompt_style_hint(audio_profile)}",
     ]), length=16)
 
 
 def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | None,
                      backend_token: str | None = None,
-                     config_token: str | None = None) -> str | None:
+                     config_token: str | None = None,
+                     audio_profile: Dict | None = None) -> str | None:
     """[FORK] Digital-Union (D2): the cache signature, or None when identity cannot be proven.
 
     Inputs: `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION`, the absolute source path, ``st_size``,
@@ -361,7 +381,7 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
         if backend_token is None:
             return None
         if config_token is None:
-            config_token = _qwen_config_token()
+            config_token = _qwen_config_token(audio_profile)
     else:
         backend_token = "no_ai"
         config_token = _NO_AI_CONFIG_TOKEN
@@ -384,7 +404,8 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
 
 def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
                 backend_token: str | None = None,
-                config_token: str | None = None) -> str | None:
+                config_token: str | None = None,
+                audio_profile: Dict | None = None) -> str | None:
     """[FORK] Digital-Union (D2): the cache filename, or None when identity cannot be proven.
 
     A ``None`` return is the fail-closed path: the caller performs no lookup and no write for that
@@ -392,7 +413,8 @@ def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
     treats a ``None`` cache file as a no-op, which is the seam this uses.
     """
     signature = _video_signature(video_file, enable_ai, qwen_model_path,
-                                 backend_token=backend_token, config_token=config_token)
+                                 backend_token=backend_token, config_token=config_token,
+                                 audio_profile=audio_profile)
     if signature is None:
         return None
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
@@ -814,19 +836,26 @@ def analyze_video_sources(
     # if the GGUFs are full-hashed. Invocation-scoped rather than module-cached, so a later call in the
     # same process still sees a swapped model or llama build.
     invocation_backend_token = _qwen_backend_signature_token(qwen_model_path) if ai_available else None
-    invocation_config_token = _qwen_config_token() if ai_available else None
-    if ai_available and invocation_backend_token is None:
-        # Strong backend identity could not be proven. Analysis proceeds, but nothing may be looked up
-        # or stored under an unprovable AI identity, so every source below gets cache_file=None.
+    invocation_config_token = _qwen_config_token(audio_profile) if ai_available else None
+    # [FORK] Digital-Union (D2 R2): an explicit state, because `None` alone is ambiguous. Down in
+    # `_video_signature` a `None` backend_token means "not supplied, compute it now", so passing the
+    # failed `None` straight through made every source retry the fingerprinting - measured at 1 + N
+    # calls - and let a transient later success re-enable caching *inside* a run whose identity had
+    # already failed. Once the invocation-level computation fails, AI caching is off for the whole
+    # invocation and `_cache_path` is not called at all.
+    ai_cache_disabled = ai_available and invocation_backend_token is None
+    if ai_cache_disabled:
         print("   Warning: Qwen backend identity could not be verified; "
               "this run will not read or write AI analysis cache.")
         fork_progress.emit(event_callback, fork_progress.warning(
             5, "Qwen backend identity unverifiable; AI analysis cache disabled for this run."))
 
     for idx, video_file in enumerate(existing, 1):
-        cache_file = _cache_path(video_file, ai_available, qwen_model_path,
-                                 backend_token=invocation_backend_token,
-                                 config_token=invocation_config_token)
+        cache_file = None if ai_cache_disabled else _cache_path(
+            video_file, ai_available, qwen_model_path,
+            backend_token=invocation_backend_token,
+            config_token=invocation_config_token,
+            audio_profile=audio_profile)
         cache_paths[idx] = cache_file
         cached = (_load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
                   if cache_file else None)
