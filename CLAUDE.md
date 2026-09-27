@@ -226,9 +226,13 @@ Measured root cause — **truncation**, not a field-level rejection. The primary
 `_max_new_tokens()` (default 128) and leaves `description` an unbounded string. llama-server returns
 `finish_reason="length"` with non-empty but truncated text; `_parse_json_object`'s `\{.*\}` finds no
 closing brace, `json.loads` fails, and `_normalize_semantic` rejects at its not-a-dict guard. All 8
-numeric keys, both enums and a long description were present in the raw text — only the closing brace
-was missing. Because decoding is greedy (`temperature 0`, `top_k 1`) every existing retry tier
-re-issues the identical request and gets byte-identical output, which is why it never resolves.
+numeric keys, both enums and substantial description content were already present in the raw text;
+what was missing was **JSON termination** — generation stopped mid-description, so neither the
+description string's closing quote nor the object's closing brace was emitted (the captured output
+has an odd quote count). The description value is therefore *not* syntactically complete, which is
+why no amount of lenient brace-matching would rescue it. Because decoding is greedy
+(`temperature 0`, `top_k 1`) every retry re-issues the identical request and gets byte-identical
+output, which is why it never resolves.
 
 **Raising the token budget alone is not a fix, and that is measured rather than assumed.** One of the
 two cases is a degenerate repetition loop (`lips moving, lips open, lips closed, …`) that simply
@@ -247,10 +251,15 @@ Load-bearing details:
   `_recovery_semantic_schema()` deep-copies rather than mutating the global. Proven cross-branch:
   primary output is **byte-identical** to merged main on all four measured candidates (342/347/350/306
   chars) against one shared llama-server instance.
-- **Recovery is deliberately LAST.** Every existing primary tier runs first — initial attempt, server
-  retry, reduced-slot restart (which `return`s recursively, so only the innermost wave reaches
-  recovery), serial/CLI fallback. Only then does an unresolved candidate get **exactly one** recovery
-  generation. No recursion, no second attempt.
+- **Recovery is deliberately LAST in the control flow**, and every *applicable* pre-existing primary
+  retry/fallback path stays ahead of it. The tiers are conditional, not a fixed sequence every
+  candidate walks: the initial attempt always runs; the server retry applies to failed candidates
+  while a server is still available; the reduced-slot restart fires only on its existing condition
+  (`valid_ratio < 0.70`, server active, `batch_size > 1`) and `return`s recursively, so only the
+  innermost wave reaches recovery; the serial/CLI fallback applies per the existing backend state.
+  Recovery does **not** force any of those tiers to run — it simply sits after whichever ones did.
+  Only then does a still-unresolved candidate get **exactly one** recovery generation. No recursion,
+  no second attempt.
 - **Eligibility is recomputed from `semantics`, not from `failed`.** The serial fallback tier resolves
   candidates without rewriting `failed`, so trusting `failed` would re-ask for semantics that already
   arrived.

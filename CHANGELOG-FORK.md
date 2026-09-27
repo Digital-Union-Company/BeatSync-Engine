@@ -32,11 +32,14 @@ requested, 10 decoded, **9** tagged — costing a ~51 s Stage 5 tax on every war
 `_max_new_tokens()` (default 128) and leaves `description` an unbounded schema string. llama-server
 returns `finish_reason="length"` with `completion_tokens` exactly at the budget and non-empty but
 truncated text; `_parse_json_object`'s `\{.*\}` finds no closing brace, `json.loads` fails, and
-`_normalize_semantic` rejects at its not-a-dict guard. The raw text contained all 8 numeric keys, a
-valid `emotion` and `recommended_use`, and a long description — only the closing brace was missing.
-Greedy decoding (`temperature 0`, `top_k 1`) makes it byte-for-byte reproducible, so every existing
-retry tier re-issues the identical request: the candidate can never resolve. Verified by reproducing the
-request out of process and capturing the raw output that production discards.
+`_normalize_semantic` rejects at its not-a-dict guard. The raw text already contained all 8 numeric
+keys, a valid `emotion` and `recommended_use`, and substantial description content; what was missing
+was **JSON termination** — generation stopped mid-description, leaving both the description string's
+closing quote and the object's closing brace unemitted (the captured output has an odd quote count).
+The description value is therefore not syntactically complete, so this is not a case lenient
+brace-matching could have rescued. Greedy decoding (`temperature 0`, `top_k 1`) makes it byte-for-byte
+reproducible, so each retry re-issues the identical request: the candidate can never resolve. Verified
+by reproducing the request out of process and capturing the raw output that production discards.
 
 **A bigger token budget alone is not the fix — measured, not assumed.** One of the two cases is a
 degenerate repetition loop (`lips moving, lips open, lips closed, …`) that consumes whatever budget it
@@ -56,11 +59,15 @@ leaving the other case one token short of closing. Full matrix, 3/3 repetitions 
 Smallest variant recovering both: **160 tokens + `description.maxLength = 96`**. Bounds of 112 and 128
 also pass but retain more of the repetition, which is why 96 was chosen.
 
-**The change.** After *all* existing primary retry tiers are exhausted — initial attempt, server retry,
-reduced-slot restart, serial/CLI fallback — an unresolved candidate gets **exactly one** targeted
-recovery generation with those two measured parameters. Same image, same prompt, same model, same greedy
-sampling. If it succeeds the semantic is added normally; if it fails, behaviour is unchanged: candidate
-absent, job incomplete, no checkpoint.
+**The change.** Recovery is last in the control flow, with every *applicable* pre-existing primary
+retry/fallback path ahead of it. Those tiers are conditional rather than a fixed sequence every
+candidate walks: the initial attempt always runs, the server retry applies while a server is still
+available, the reduced-slot restart fires only on its existing `valid_ratio < 0.70` condition (and
+returns recursively, so only the innermost wave reaches recovery), and the serial/CLI fallback applies
+per the existing backend state. Recovery forces none of them to run. A candidate still unresolved after
+whichever tiers applied gets **exactly one** targeted recovery generation with those two measured
+parameters. Same image, same prompt, same model, same greedy sampling. If it succeeds the semantic is
+added normally; if it fails, behaviour is unchanged: candidate absent, job incomplete, no checkpoint.
 
 **Deliberately narrow:**
 
