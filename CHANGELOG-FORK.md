@@ -20,6 +20,212 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-27 (Stage 5 cache durability D1: checkpointing + AI completion truth)
+
+**The measured reason.** Until now `analyze_video_sources` wrote the cache in a single terminal loop
+at the very end of Stage 5, so an interruption before that loop discarded *everything* new. Measured
+against the pre-D1 code with three uncached sources: interrupting during the deterministic pass left
+**2 completed analyses and 0 durable cache entries**; interrupting after every deterministic analysis
+*and* every Qwen tag had finished still left **3 completed sources and 0 durable entries**. A hard
+`os._exit` mid-run left 0. On the real 702-source library (median 4.4 s, mean 6.5 s per source) a full
+cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously throw away.
+
+- **Per-source checkpointing.** Every point at which a source could have become complete now *checks
+  checkpoint eligibility* through the one completion rule, and writes only if the rule accepts:
+  after each serial `_analyze_single_video`, after each parallel deterministic result, after
+  `_complete_deferred_qwen`, and after **each per-job merge** in `_complete_deferred_qwen_batch`. The
+  terminal loop remains only as a backstop and goes through the same guard, so it can no longer
+  promote an incomplete record into an accepted cache entry.
+
+  What that actually persists, per shape:
+
+  - a **non-AI** parallel or serial result is complete on arrival and is written immediately;
+  - an **AI-deferred** parallel result carries `ai_deferred=True`, so the rule *refuses* it at that
+    point — it becomes durable only once its Qwen result genuinely completes;
+  - a **candidate-less** result that finished its deterministic scoring pass is the explicit
+    no-Qwen-work exception and is written (see the R2 note below for why the scoring evidence is
+    required);
+  - in the **shared Qwen batch**, each per-job merge is checkpointed independently *once the worker's
+    final response has returned*, so a failing or missing sibling — and a parent interruption during
+    the post-response merge loop — no longer discards jobs already written.
+
+  The boundary this does **not** cross: while the shared worker is still in flight, its per-job
+  results exist only inside that process and nothing about them is durable yet. Streamed worker
+  progress is presentation only and carries no semantic result authority. See *Honest limits* below.
+- **One completion rule.** New `_cache_entry_is_complete()` answers "is this payload reusable for this
+  request?" in one place. It rejects non-dict payloads, wrong `analysis_version`, missing/non-string
+  `video_file`, non-list `candidates`, and anything with `ai_deferred` truthy; under `require_ai` it
+  also demands genuine AI completion. `_checkpoint_cache()` consults it before any write, which is
+  what makes early saving safe.
+- **`ai_enabled` stopped lying.** Previously `_complete_deferred_qwen` swallowed a Qwen exception and
+  then set `ai_enabled=True` unconditionally, so a failed run was cached as AI-complete and Qwen
+  never retried for that source. Completion now comes from an explicit signal the Qwen facade
+  reports on every return path — *not* from "no exception was raised". (What that signal is allowed to
+  mean was itself tightened twice afterwards; see R4 and R5 below.) Deterministic candidates and
+  visual tags are untouched on failure.
+- **Batch failure is judged per job.** A globally non-empty `semantics_by_job` was being treated as
+  proof that every requested job completed; a job simply absent from the response became
+  `ai_enabled=True` with 0 tags and was reused as AI-complete forever. Completion is now a per-job
+  membership test, one missing job no longer fails its siblings, and the existing total-batch-failure
+  behaviour is preserved.
+- **Candidate-less sources are no longer re-analysed forever** — but only when the deterministic
+  scoring pass genuinely completed, proven by the existing scoring evidence in `timings`. There is
+  then no Qwen work to do, so the source is reusable, expressed through the completion rule with
+  `ai_enabled` left honestly `False` rather than faked to satisfy the loader. An empty candidate list
+  on its own is **not** proof of success: an OpenCV-open failure produces the same shape, and R2
+  below records that the first pass wrongly accepted it.
+- **Hardened writer.** `_save_cache` now publishes through a unique same-directory temp file
+  (`tempfile.mkstemp`), `flush` + `os.fsync`, then `os.replace`, with best-effort cleanup in
+  `finally`. The old shared `path + ".tmp"` was demonstrably unsafe across processes: under
+  deterministic barriers one writer's `os.replace` published the *other* writer's payload while
+  reporting success, and the loser failed with `FileNotFoundError` into a warning the GUI discards.
+  After the fix, 160 concurrent writes from two processes produced 0 exceptions, no shared temp
+  names, no mixed payloads and no orphan temps. `PROCESS_CRASH_ATOMICITY` is preserved (verified at
+  all four boundaries); **power-loss durability is still not guaranteed** — the temp is fsynced, the
+  containing directory is not.
+- **Minimal load validation.** The loader now refuses version-correct but malformed or *foreign*
+  payloads, and can be told which source it expected. Unexpected extra fields remain allowed for
+  forward compatibility.
+
+**R2 — three completion gaps the first pass left open.** Each was reproduced against the first D1
+commit before being fixed:
+
+- **The serial inline path ignored the completion signal entirely.** `_analyze_single_video` still
+  returned `ai_enabled = enable_ai and not defer_ai`, so a `workers == 1` run reported AI-complete
+  whatever Qwen did. Measured on the pre-R2 code: worker returning `{}` → `ai_enabled=True`; worker
+  raising → `ai_enabled=True`; `BEATSYNC_QWEN_MAX_WINDOWS=0` → `ai_enabled=True`. It also let the
+  private `_qwen_completed` flag reach `timings` — and therefore the cached payload — through
+  `timings.update(qwen_info)`. The inline path now pops the flag before the update and derives
+  `ai_enabled` from it, exactly like the deferred paths.
+- **Zero semantic tags were conflated with a worker-process failure.** The first pass keyed on
+  emptiness of `semantics`, so a worker that finished and a worker that never produced a response
+  both reported not-completed. R2 replaced that with membership of the job's entry in the response
+  envelope — which R4 below shows was still wrong, in the opposite direction.
+- **An OpenCV-open failure was accepted as a candidate-less success.** `"Warning: OpenCV could not
+  open …; candidate analysis skipped."` returns `candidates == []`, which the D1 completion rule
+  treated as "nothing for Qwen to do, therefore complete" — so one transient decode failure would
+  have cached an empty result and retired a readable source permanently. Measured on the pre-R2
+  code: the open-failure record was accepted under both `require_ai` modes **and** checkpointed. The
+  rule now requires `timings["candidate_scoring_seconds"]`, which is written only inside the
+  `cap.isOpened()` branch; a genuine no-usable-moments result keeps it and stays reusable, the
+  failure does not and is retried.
+
+**R4 — per-job Qwen completion required actual per-frame results.** R2/R3 defined completion as
+membership of the job's entry in the worker response (`timings_by_job["single"]`, or `job_id` in
+`semantics_by_job`) and documented "valid completed response + zero tags = SUCCESS". Read against the
+worker, that is too weak: `_run_semantics_for_video` always returns a timings dict and `main` always
+records it under the job id, so the envelope only proves **the job loop returned**. Inside the loop,
+`_normalize_semantic` yields `{}` for any candidate whose semantic content is invalid,
+`_run_inference_wave` classifies `{}` as failed and retries it (server retry → reduced-slot restart →
+serial fallback), and a candidate still failing is simply **absent** from the returned semantics.
+
+Measured against the R3 commit, all of these were wrongly reported as complete and cached as
+AI-complete: `frame_count=3 tag_count=0 semantics={}`; `frame_count=0 tag_count=0`;
+`frame_count=4 tag_count=3` (partial); and the batch equivalents, which were also checkpointed.
+
+New shared rule `_qwen_job_completed()` — used by **both** the single and batch paths so the
+arithmetic exists once — requires the expected per-job envelope, a dict `timing`, `frame_count > 0`,
+and `tag_count == frame_count`, plus basic count coherence (`tag_count` may not exceed the semantic
+records actually returned). Tags that did arrive are still merged; only the verdict changes, so an
+incomplete job is retried next run instead of inheriting a silent gap. A successful sibling in a
+partially-failed batch remains independently complete and checkpointed, and total-batch-failure
+behaviour is unchanged.
+
+Two accompanying corrections: **tag count is not forbidden from completion truth** — it is meaningful
+only together with the envelope and the real `frame_count`, and the earlier blanket claim to the
+contrary is removed. And the claim that *every* `_run_qwen_worker` failure returns `{}` is narrowed:
+that holds for process-level failures (launch error, non-zero exit, timeout, unreadable response),
+but candidate-level inference failures are swallowed and retried **inside** the worker, so a
+successful worker process can still return an incomplete per-job semantic result. Worker counts are
+now read through `_coerce_count`, closing a latent `ValueError` crash on a malformed payload (present
+in the batch path before R4). The candidate-less no-Qwen-work case is untouched and remains separate:
+no job is submitted, so the per-frame rule does not apply to it.
+
+**R5 — completion must cover the *requested* candidate set, not just the decoded one.** R4 required
+`frame_count > 0` and `tag_count == frame_count`, which proves every *decoded* frame was tagged. But
+`_prefetch_candidate_frames` returns only the frames it could actually read
+(`ready = [p for p in plans if p["image"] is not None]`), so `frame_count` can be smaller than the
+candidate set the parent submitted — the worker even logs `{len(ready)}/{len(candidates)}`. Measured
+against the R4 commit: a job requesting 3 candidates that decoded and tagged only 2 was reported
+complete and cached as AI-complete, leaving a requested candidate with no semantics at all.
+
+Completion now requires the requested set to be covered end to end — `frame_count` must equal the
+number of candidates `_select_ai_candidates` submitted, `tag_count` must equal `frame_count`, and the
+**returned semantic ids must equal the requested ids exactly**. R4 passed only
+`len(semantic_by_id)`, so a response whose counts looked perfect but whose ids were foreign counted as
+completion; measured on R4, three foreign ids satisfied it. An extra id now also fails, because the
+worker keys semantics by our own candidate ids and anything else means the response does not match the
+request.
+
+Two robustness corrections alongside it. A worker-reported `frame_count = 0` was being rewritten into
+the requested candidate count in the stored timings by `timing.get(key) or default`; `_reported_count`
+now decides on **presence**, so a genuine zero survives and the fallback applies only when the field is
+absent. And `bool` subclasses `int`, so R4's `isinstance(..., int)` check accepted
+`frame_count: true` and then compared it equal to 1; `_is_count` rejects bools.
+
+The candidate-less no-Qwen-work case is untouched and deliberately does **not** go through these
+requested-count rules: no job is submitted, so there is nothing to cover.
+
+**R6 — legacy AI records must be self-consistent too.** R5 hardened how *new* records are created, but
+`require_ai` reuse of an *existing* candidateful record still ultimately trusted
+`bool(data["ai_enabled"])` — a flag written by the very code this branch has repeatedly proven could
+set it wrongly. A read-only audit of the real 2196-entry runtime cache measured the consequence:
+
+| | |
+|---|---|
+| source-cache entries | 2196 (plus 28 qwen debug/repro artifacts, excluded) |
+| provably R5-complete | 2190 (`candidate_count == frame_count == tag_count == ai_analyzed`) |
+| **definitely inconsistent** | **4** — `ai_enabled=True` with `qwen_frame_count=10`, `qwen_tag_count=9`, 9 `ai_analyzed` |
+| unverifiable but internally coherent | 2 (398 candidates/114 tagged, 525/119) |
+
+The 4 are exactly the false-complete shape D1 exists to prevent, and the pre-R6 loader accepted all
+2196. New `_stored_ai_cache_is_consistent()` now runs whenever `require_ai` reuse depends on
+`ai_enabled`, rejecting only contradictions provable from **already-persisted** fields: real integer
+counts (not bools), `frame_count > 0`, `tag_count == frame_count`,
+`frame_count <= len(candidates)`, usable candidate ids, and `ai_analyzed` ids that are unique, a subset
+of the candidate ids, and number exactly `tag_count`.
+
+It deliberately does **not** call `_qwen_job_completed`: that needs `requested_ids`, which legacy
+payloads never stored (nor the `BEATSYNC_QWEN_MAX_WINDOWS` value in force), so replaying the live rule
+against an old record would mean inventing evidence. For the same reason it does not require
+`frame_count == len(candidates)` — a smaller value is the normal result of `_select_ai_candidates`
+limiting the submitted set, so the two unverifiable records stay reusable and are left to the D2
+completion-contract decision.
+
+Measured against the real cache, read-only: **2192 accepted, 4 rejected**, the rejected set exactly the
+four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
+an ordinary cache miss, and the source is recomputed and republished through the already-hardened
+writer. No migration command is provided and none is needed. `require_ai=False` deterministic reuse is
+unaffected (those candidates are real work), and the candidate-less path still answers to
+`_deterministic_analysis_completed`.
+
+`BEATSYNC_QWEN_MAX_WINDOWS=0` now reports not-completed rather than AI-complete, deliberately:
+`QWEN_MAX_WINDOWS` is not part of cache identity, so a knowingly Qwen-less record must not be stored
+under the AI model key. `BEATSYNC_DISABLE_QWEN=1` remains the supported deterministic-only path — it
+is turned into `enable_ai=False` in `auto_mode/__init__.py` (verified), producing the separate
+`no_ai` cache identity.
+
+R2 changed no cache key, signature or `ANALYSIS_VERSION`, and preserved every first-pass fix
+(per-source checkpointing, unique fsynced temps, atomic replace, batch per-job completion, loader
+validation, terminal backstop). A successful uninterrupted run is payload-equivalent in **both**
+execution shapes — parallel/deferred and serial/inline — with the only difference being the removal
+of the leaked `_qwen_completed` key from the serial shape's stored timings.
+
+**Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
+still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
+the real cache: all entries stay **addressable**, and 2192 of 2196 stay **reusable** (see R6 — 4 are
+intentionally rejected as self-contradictory). A successful
+uninterrupted run returns a payload identical to the pre-D1 result (candidates, per-video records and
+summary compared field by field).
+
+**Honest limits.** D1 introduces no two-phase deterministic-partial cache contract, so if the process
+dies while a shared Qwen worker is still running *before its response returns*, that batch's
+deterministic work still has to be recomputed. **D1 does not fix source-identity collisions**:
+`int(st_mtime)` still gives the same signature to a file rewritten in place with the same size inside
+the same second, and an exact-mtime restore collides regardless of precision. Source and backend
+identity hardening is **deferred to D2**, because moving to `st_mtime_ns` re-keys the entire cache and
+would force a cold rebuild.
+
 ### Changed — 2026-09-27 (Phase 3C: NVENC clips decode in software)
 
 The NVENC extraction path no longer asks FFmpeg for CUDA input decoding. **`h264_nvenc` still does the

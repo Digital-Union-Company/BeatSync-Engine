@@ -14,6 +14,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Sequence
@@ -45,6 +46,25 @@ DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL
 DEFAULT_LLAMA_CPP_DIR = os.path.join(ROOT_DIR, "bin", "llama-bin-win-vulkan-x64")
 VIDEO_ANALYSIS_CACHE_DIR = os.path.join(ROOT_DIR, "input", "video_analysis_cache")
 _LLAMA_VERSION_TOKENS: Dict[str, str] = {}
+
+# [FORK] Digital-Union (D1): private completion signal from the Qwen facade to its caller. Every
+# caller pops it before `timings.update(...)`, so it never reaches a cache payload - the cached
+# record carries the *consequence* (ai_enabled) rather than this bookkeeping flag.
+_QWEN_COMPLETED_KEY = "_qwen_completed"
+
+# [FORK] Digital-Union (D1 R2): the worker always publishes a per-job timings entry once a job has
+# finished (`timings_by_job["single"]` for the legacy single-job request), while every
+# `_run_qwen_worker` failure path returns `{}`. Membership is therefore the completion evidence -
+# the same rule the batch path uses - and it is what makes an empty `semantics` dict from a
+# *finished* worker distinguishable from a worker that never produced a response at all.
+_QWEN_SINGLE_JOB_ID = "single"
+
+# [FORK] Digital-Union (D1 R2): `timings["candidate_scoring_seconds"]` is written immediately after
+# `_measure_windows` inside the `cap.isOpened()` branch of `_analyze_single_video`, and nowhere else.
+# Its presence therefore proves the deterministic candidate pass really ran, which is how a genuine
+# "no usable moments" result is told apart from an OpenCV-open failure - both of which end up with
+# an empty candidate list.
+_DETERMINISTIC_SCORING_KEY = "candidate_scoring_seconds"
 
 
 def _clamp(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -193,28 +213,303 @@ def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None) -
     )
 
 
-def _load_cache(path: str, require_ai: bool = False) -> Dict | None:
+def _same_source(cached_video_file: Any, expected_video_file: str) -> bool:
+    """[FORK] Digital-Union (D1): does a cache payload describe the source we asked about?"""
+    if not isinstance(cached_video_file, str) or not cached_video_file:
+        return False
+    try:
+        a = os.path.normcase(os.path.abspath(cached_video_file))
+        b = os.path.normcase(os.path.abspath(expected_video_file))
+    except Exception:
+        return False
+    return a == b
+
+
+def _coerce_count(value: Any, default: int = 0) -> int:
+    """[FORK] Digital-Union (D1 R4): read a count out of a worker response without trusting it.
+
+    The worker writes plain ints, but the response is parsed JSON from a subprocess, so a malformed
+    or truncated-then-repaired payload can carry anything. `int(timing.get(...) or default)` raised
+    ``ValueError`` on a non-numeric value and would have taken the whole analysis down with it -
+    latent in the batch path before R4, and newly reachable in the single path once genuine counts
+    started being reported for incomplete jobs too.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _is_count(value: Any) -> bool:
+    """[FORK] Digital-Union (D1 R5): a real integer count, not a bool.
+
+    ``bool`` subclasses ``int``, so ``isinstance(True, int)`` is ``True`` and a response carrying
+    ``frame_count: true`` would otherwise have passed the R4 type check and then compared equal to 1.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _reported_count(timing: Any, key: str, default: int) -> int:
+    """[FORK] Digital-Union (D1 R5): report the worker's own count, including a genuine zero.
+
+    ``timing.get(key) or default`` silently rewrote a real ``frame_count = 0`` into the requested
+    candidate count, so the stored timings claimed frames that were never decoded. Presence decides:
+    a present value is used (coerced to 0 if unreadable, because "present but malformed" is not
+    evidence of anything), and the caller's default applies only when the field is genuinely absent.
+    """
+    if isinstance(timing, dict) and key in timing:
+        return _coerce_count(timing.get(key), 0)
+    return int(default)
+
+
+def _qwen_job_completed(timing: Any, envelope_present: bool,
+                        requested_ids: Any, returned_ids: Any) -> bool:
+    """[FORK] Digital-Union (D1 R5): did the AI work for one *submitted* Qwen job actually complete?
+
+    Shared by the single and batch paths so the arithmetic exists once.
+
+    Three earlier definitions of this were too weak, in order:
+
+    1. *emptiness of ``semantics``* - conflated a finished worker with a dead one (fixed in R2);
+    2. *response-envelope membership alone* - ``_run_semantics_for_video`` always returns a timings
+       dict and ``main`` always records it under the job id, so the envelope only proves **the job
+       loop returned**. Inside that loop ``_normalize_semantic`` yields ``{}`` for any candidate whose
+       semantic content is invalid, ``_run_inference_wave`` classifies ``{}`` as failed and retries it
+       (server retry, reduced-slot restart, serial fallback), and a candidate still failing is simply
+       **absent** from the returned semantics (fixed in R4);
+    3. *``tag_count == frame_count``* - proves every *decoded* frame was tagged, but
+       ``_prefetch_candidate_frames`` returns only the frames it could actually read
+       (``ready = [p for p in plans if p["image"] is not None]``), so ``frame_count`` may be **smaller
+       than the requested candidate set**. A job that asked for 10 candidates, decoded 8 and tagged 8
+       therefore looked complete while 2 candidates silently had no semantics at all (this, R5).
+
+    Completion now requires the requested set to be covered end to end:
+
+    * the expected per-job envelope exists and ``timing`` is a dict;
+    * ``frame_count`` and ``tag_count`` are real integer counts (not bools);
+    * the requested candidate set is non-empty;
+    * ``frame_count == len(requested_ids)`` - every requested candidate was decoded;
+    * ``tag_count == frame_count`` - every decoded frame produced a valid semantic;
+    * ``returned_ids == requested_ids`` - and those semantics are for *our* candidates. A foreign id
+      is not evidence that one of ours completed, and an extra id means the response does not match
+      the request; the worker keys semantics by our own candidate ids, so an exact match is the
+      contract.
+
+    Neither the envelope nor a count is sufficient alone. ``requested_ids`` is the set selected by
+    ``_select_ai_candidates`` - the candidates actually submitted - not every deterministic candidate.
+
+    A source with no candidates never submits a job at all: that is the separate no-Qwen-work case
+    handled by ``_cache_entry_is_complete``/``_deterministic_analysis_completed``, not here.
+    """
+    if not envelope_present or not isinstance(timing, dict):
+        return False
+    if not _is_count(timing.get("frame_count")) or not _is_count(timing.get("tag_count")):
+        return False
+    try:
+        expected = {str(item) for item in requested_ids}
+        returned = {str(item) for item in returned_ids}
+    except TypeError:
+        return False
+    if not expected:
+        return False
+    frame_count = int(timing["frame_count"])
+    tag_count = int(timing["tag_count"])
+    if frame_count != len(expected) or tag_count != frame_count:
+        return False
+    return returned == expected
+
+
+def _stored_ai_cache_is_consistent(data: Any) -> bool:
+    """[FORK] Digital-Union (D1 R6): is a *persisted* AI-complete record self-consistent?
+
+    This is deliberately **not** the R5 live-worker rule. `_qwen_job_completed` needs
+    ``requested_ids``, and legacy payloads never stored them (nor the ``BEATSYNC_QWEN_MAX_WINDOWS``
+    value in force), so R5 cannot be replayed against an old record. Calling it from the loader would
+    mean inventing evidence.
+
+    Instead this asks only what the stored fields can actually prove: *does this record contradict
+    itself?* A read-only audit of the real 2196-entry runtime cache found 4 records claiming
+    ``ai_enabled=True`` with ``qwen_frame_count=10`` but ``qwen_tag_count=9`` and 9 candidates marked
+    ``ai_analyzed`` — precisely the false-complete shape D1 exists to prevent, and the pre-R6 loader
+    accepted all four because it only checked ``bool(data["ai_enabled"])``.
+
+    Required, all from fields already persisted:
+
+    * ``candidates`` is a non-empty list of dicts with usable string ids;
+    * ``timings`` is a dict carrying real integer ``qwen_frame_count``/``qwen_tag_count`` (not bools);
+    * ``frame_count > 0`` and ``tag_count == frame_count``;
+    * ``frame_count <= len(candidates)`` — it cannot have decoded more than existed;
+    * the ``ai_analyzed`` ids are unique, are a subset of the candidate ids, and number exactly
+      ``tag_count``.
+
+    Deliberately **not** required: ``frame_count == len(candidates)``. A smaller value is the normal
+    result of ``_select_ai_candidates`` limiting the submitted set, and the audit's two
+    398-candidate/114-tagged and 525-candidate/119-tagged records are internally coherent. They may
+    well be decoded subsets of a 120-candidate request, but nothing stored proves it, so they stay
+    reusable and belong to the D2 completion-contract decision.
+    """
+    if not isinstance(data, dict):
+        return False
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    timings = data.get("timings")
+    if not isinstance(timings, dict):
+        return False
+    frame_count = timings.get("qwen_frame_count")
+    tag_count = timings.get("qwen_tag_count")
+    if not _is_count(frame_count) or not _is_count(tag_count):
+        return False
+    if frame_count <= 0 or tag_count < 0 or tag_count != frame_count:
+        return False
+    if frame_count > len(candidates):
+        return False
+
+    candidate_ids: List[str] = []
+    analysed_ids: List[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        candidate_id = candidate.get("id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            return False
+        candidate_ids.append(candidate_id)
+        if candidate.get("ai_analyzed") is True:
+            analysed_ids.append(candidate_id)
+
+    if len(set(analysed_ids)) != len(analysed_ids):
+        return False
+    if not set(analysed_ids) <= set(candidate_ids):
+        return False
+    return len(analysed_ids) == tag_count
+
+
+def _deterministic_analysis_completed(data: Any) -> bool:
+    """[FORK] Digital-Union (D1 R2): did the deterministic candidate pass actually run?
+
+    Needed because two very different outcomes both end with ``candidates == []``: a source whose
+    windows simply yielded no usable moments (a real, finished analysis) and a source OpenCV could
+    not open at all (``"Warning: OpenCV could not open ...; candidate analysis skipped."``). Only the
+    first may be cached; treating the second as complete would retire a readable source permanently
+    on one transient decode failure.
+
+    The discriminator is existing durable evidence, not a new schema field:
+    ``timings["candidate_scoring_seconds"]`` is written once, immediately after ``_measure_windows``
+    inside the ``cap.isOpened()`` branch, and is absent from every other path.
+    """
+    if not isinstance(data, dict):
+        return False
+    timings = data.get("timings")
+    return isinstance(timings, dict) and _DETERMINISTIC_SCORING_KEY in timings
+
+
+def _cache_entry_is_complete(data: Any, require_ai: bool) -> bool:
+    """[FORK] Digital-Union (D1): the ONE rule for "is this payload complete enough to reuse?".
+
+    Deliberately centralised: the pre-D1 code scattered the question across `_load_cache`'s
+    ``ai_enabled`` check and several ``ai_enabled = True`` assignments, which is how a failed Qwen
+    run could be written as AI-complete and then reused forever.
+
+    * ``require_ai=False`` - a deterministic-complete result is reusable.
+    * ``require_ai=True`` with candidates - reusable only if AI work genuinely completed.
+    * no candidates - reusable only if the deterministic pass actually ran (see
+      ``_deterministic_analysis_completed``). There is then nothing for Qwen to annotate, so such a
+      source is reusable under ``require_ai`` too, expressed here rather than by falsifying
+      ``ai_enabled``. An *empty candidate list alone* is not evidence of success: an OpenCV-open
+      failure produces exactly the same shape, and caching that would retire the source forever.
+    * ``ai_deferred`` truthy - never reusable, whatever else the payload says.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("analysis_version") != ANALYSIS_VERSION:
+        return False
+    if not isinstance(data.get("video_file"), str) or not data.get("video_file"):
+        return False
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    if data.get("ai_deferred"):
+        return False
+    if not candidates:
+        # [FORK] Digital-Union (D1 R2): checked for both require_ai modes - a failed deterministic
+        # pass must be retried whether or not the run wants semantic tags.
+        return _deterministic_analysis_completed(data)
+    if not require_ai:
+        return True
+    if not data.get("ai_enabled"):
+        return False
+    # [FORK] Digital-Union (D1 R6): `ai_enabled` was written by code this branch has repeatedly proven
+    # could set it wrongly, so an AI-complete claim must also survive a stored-consistency check.
+    return _stored_ai_cache_is_consistent(data)
+
+
+def _load_cache(path: str, require_ai: bool = False,
+                expected_video_file: str | None = None) -> Dict | None:
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("analysis_version") == ANALYSIS_VERSION:
-                if require_ai and not data.get("ai_enabled"):
-                    return None
-                return data
+            # [FORK] Digital-Union (D1): one completion rule, plus a source-identity check when the
+            # caller knows which source it asked for. Unexpected extra fields stay allowed.
+            if not _cache_entry_is_complete(data, require_ai):
+                return None
+            if expected_video_file is not None and not _same_source(
+                    data.get("video_file"), expected_video_file):
+                return None
+            return data
     except Exception as e:
         print(f"   Warning: could not read video analysis cache: {e}")
     return None
 
 
 def _save_cache(path: str, data: Dict) -> None:
+    """[FORK] Digital-Union (D1): atomic publish through a UNIQUE same-directory temp file.
+
+    The pre-D1 writer used a single shared ``path + ".tmp"``. Two processes writing the same cache
+    key could then have one truncate the other's temp file, so the first writer's ``os.replace``
+    published the *other* payload while reporting success, and the second failed with
+    ``FileNotFoundError`` into a warning the GUI's QuietConsole discards.
+
+    ``os.replace`` still gives process-crash atomicity: a reader sees the old entry or the new one,
+    never a partial final file. Power-loss durability is NOT claimed - the temp file is fsynced, but
+    the containing directory is not.
+    """
+    tmp_path = ""
     try:
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        tmp_path = ""
     except Exception as e:
         print(f"   Warning: could not write video analysis cache: {e}")
+    finally:
+        # best effort: never leave our own unique temp behind, and never fail the render for it
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _checkpoint_cache(cache_file: str | None, video_data: Dict, require_ai: bool) -> bool:
+    """[FORK] Digital-Union (D1): persist a source the moment it is genuinely complete.
+
+    Before D1 the only save site was the terminal loop at the end of `analyze_video_sources`, so any
+    interruption - including one after every deterministic analysis and every Qwen tag had finished -
+    left zero durable new entries. This is the guard that makes an early save safe: it writes only
+    what the central completion rule already accepts, so checkpointing can never publish a deferred
+    or failed-AI record as a reusable one.
+    """
+    if not cache_file or not _cache_entry_is_complete(video_data, require_ai):
+        return False
+    _save_cache(cache_file, video_data)
+    return True
 
 
 def _fmt_seconds(seconds: float) -> str:
@@ -323,7 +618,7 @@ def analyze_video_sources(
     for idx, video_file in enumerate(existing, 1):
         cache_file = _cache_path(video_file, ai_available, qwen_model_path)
         cache_paths[idx] = cache_file
-        cached = _load_cache(cache_file, require_ai=ai_available)
+        cached = _load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
         if cached:
             cache_hits += 1
             print(f"   Reusing cached visual analysis {idx}/{len(existing)}: {_safe_name(video_file)}")
@@ -374,6 +669,11 @@ def analyze_video_sources(
                     job = futures[future]
                     try:
                         results_by_index[job["index"]] = future.result()
+                        # [FORK] Digital-Union (D1): checkpoint as soon as this source is complete.
+                        # In parallel mode the record is still ai_deferred, so the central rule
+                        # declines it here and the Qwen stage checkpoints it instead.
+                        _checkpoint_cache(job["cache_file"], results_by_index[job["index"]],
+                                          require_ai=ai_available)
                     except Exception as exc:
                         print(
                             f"   ⚠️  Parallel analysis failed for "
@@ -396,6 +696,8 @@ def analyze_video_sources(
                             len(existing),
                             event_callback,
                         )
+                        _checkpoint_cache(job["cache_file"], results_by_index[job["index"]],
+                                          require_ai=ai_available)
                     # One advance per video, after either the parallel result or the serial retry,
                     # so a retried video is never double-counted.
                     fork_progress.emit(event_callback, source_counter.advance(
@@ -415,6 +717,10 @@ def analyze_video_sources(
                     len(existing),
                     event_callback,
                 )
+                # [FORK] Digital-Union (D1): serial mode runs Qwen inline (defer_ai=False), so this
+                # source is genuinely finished here - make it durable before starting the next one.
+                _checkpoint_cache(job["cache_file"], results_by_index[job["index"]],
+                                  require_ai=ai_available)
                 fork_progress.emit(event_callback, source_counter.advance(
                     1, "analyzed", cache_hits=cache_hits, unit="sources",
                     rate_unit="analyzed sources"))
@@ -462,6 +768,7 @@ def analyze_video_sources(
                 audio_profile=audio_profile or {},
                 label=f"{idx}/{len(existing)}",
                 event_callback=event_callback,
+                cache_file=job["cache_file"],
             )
 
     if deferred_jobs:
@@ -485,10 +792,14 @@ def analyze_video_sources(
             5, "Qwen semantic tagging finished", phase="qwen",
             qwen_seconds=float(qwen_elapsed)))
 
+    # [FORK] Digital-Union (D1): defensive backstop only - every completed source has already been
+    # checkpointed above. It goes through the same completion rule, so it can never promote an
+    # incomplete or failed-AI record into an accepted cache entry (the pre-D1 loop saved
+    # unconditionally, which is how a failed Qwen run became a permanent AI-complete hit).
     for job in jobs:
         video_data = results_by_index.get(job["index"])
         if video_data:
-            _save_cache(job["cache_file"], video_data)
+            _checkpoint_cache(job["cache_file"], video_data, require_ai=ai_available)
 
     videos: List[Dict] = [results_by_index[i] for i in range(1, len(existing) + 1) if i in results_by_index]
     all_candidates: List[Dict] = []
@@ -648,6 +959,11 @@ def _analyze_single_video(
         print(f"      Warning: OpenCV could not open {name}; candidate analysis skipped.")
 
     qwen_seconds = 0.0
+    # [FORK] Digital-Union (D1 R2): the inline (serial, defer_ai=False) path must consume the same
+    # explicit completion signal the deferred path uses. Before R2 it ignored the signal entirely and
+    # reported `ai_enabled = enable_ai and not defer_ai`, so a failed, timed-out or
+    # deliberately-skipped Qwen run was still cached as AI-complete and never retried.
+    inline_qwen_completed = False
     if enable_ai and candidates and not defer_ai:
         try:
             step_started = time.perf_counter()
@@ -661,11 +977,17 @@ def _analyze_single_video(
                 event_callback=event_callback,
             )
             qwen_seconds = time.perf_counter() - step_started
+            # Pop before the update: the private flag must never reach timings or the cache payload.
+            inline_qwen_completed = bool((qwen_info or {}).pop(_QWEN_COMPLETED_KEY, False))
             timings.update(qwen_info or {})
             timings["qwen_seconds"] = qwen_seconds
             print(f"      ⏱ Qwen semantic analysis total: {_fmt_seconds(qwen_seconds)}")
+            if not inline_qwen_completed:
+                print(f"      Qwen did not complete for {name}; deterministic visual tags retained "
+                      f"and AI analysis will retry on the next run.")
         except Exception as e:
             print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
+            inline_qwen_completed = False
     elif enable_ai and candidates and defer_ai:
         timings["qwen_seconds"] = 0.0
         print("      Qwen semantic analysis: deferred until parallel CPU pass completes")
@@ -697,7 +1019,9 @@ def _analyze_single_video(
         "candidates": candidates,
         "analysis_seconds": elapsed,
         "timings": timings,
-        "ai_enabled": bool(enable_ai and not defer_ai),
+        # [FORK] Digital-Union (D1 R2): a fact about this run, not a restatement of the request.
+        # Inline AI claims completion only when the Qwen facade reported it.
+        "ai_enabled": bool(enable_ai and not defer_ai and inline_qwen_completed),
         "ai_deferred": bool(enable_ai and defer_ai),
     }
 
@@ -709,17 +1033,23 @@ def _complete_deferred_qwen(
     audio_profile: Dict,
     label: str = "",
     event_callback=None,
+    cache_file: str | None = None,
 ) -> Dict:
     candidates = video_data.get("candidates") or []
     if not candidates:
         video_data["ai_deferred"] = False
         video_data["ai_enabled"] = False
+        # [FORK] Digital-Union (D1): nothing for Qwen to annotate, so this source IS finished.
+        # `ai_enabled` stays honestly False; `_cache_entry_is_complete` is what makes it reusable,
+        # and checkpointing it here is what stops it being re-analysed on every future run.
+        _checkpoint_cache(cache_file, video_data, require_ai=True)
         return
 
     name = _safe_name(video_data.get("video_file", video_data.get("source_name", "video")))
     print(f"   Running deferred Qwen semantic analysis {label}: {name}")
     started = time.perf_counter()
     qwen_info = {}
+    qwen_completed = False
     try:
         qwen_info = _annotate_candidates_with_qwen(
             video_file=video_data["video_file"],
@@ -730,8 +1060,13 @@ def _complete_deferred_qwen(
             audio_profile=audio_profile,
             event_callback=event_callback,
         )
+        # [FORK] Digital-Union (D1): completion comes from the facade's explicit signal, never from
+        # "no exception was raised". The facade applies `_qwen_job_completed`, so a worker process
+        # that merely *finished* is not the same as one whose submitted candidates were all tagged.
+        qwen_completed = bool((qwen_info or {}).pop(_QWEN_COMPLETED_KEY, False))
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
+        qwen_completed = False
 
     qwen_seconds = time.perf_counter() - started
     candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
@@ -741,12 +1076,21 @@ def _complete_deferred_qwen(
     timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
     video_data["analysis_seconds"] = timings["total_seconds"]
     video_data["ai_deferred"] = False
-    video_data["ai_enabled"] = True
+    # [FORK] Digital-Union (D1): only genuine completion may claim AI-complete. On failure the
+    # deterministic candidates and visual tags are kept exactly as they are, but the record is not
+    # reusable under require_ai, so the next run retries Qwen instead of inheriting a silent gap.
+    video_data["ai_enabled"] = qwen_completed
     video_data["candidate_count"] = len(candidates)
+    if not qwen_completed:
+        print(f"      Qwen did not complete for {name}; deterministic visual tags retained and "
+              f"AI analysis will retry on the next run.")
     print(
         f"      ⏱ Deferred Qwen total: {_fmt_seconds(qwen_seconds)}; "
         f"video total now {_fmt_seconds(video_data['analysis_seconds'])}"
     )
+    # Checkpoint immediately: this source is finished, and waiting for the rest of Stage 5 is
+    # exactly what used to lose it.
+    _checkpoint_cache(cache_file, video_data, require_ai=True)
 
 
 
@@ -775,6 +1119,9 @@ def _complete_deferred_qwen_batch(
         print("   Qwen semantic analysis skipped (BEATSYNC_QWEN_MAX_WINDOWS=0).")
         return {"qwen_frame_count": 0, "qwen_tag_count": 0}
 
+    # [FORK] Digital-Union (D1): remember each job's cache file so a completed job can be
+    # checkpointed the moment its own merge finishes, instead of waiting for its siblings.
+    job_to_cache: Dict[str, str] = {}
     request_jobs: List[Dict] = []
     job_to_video: Dict[str, Dict] = {}
     selected_by_job: Dict[str, List[Dict]] = {}
@@ -791,9 +1138,12 @@ def _complete_deferred_qwen_batch(
         if not ai_candidates:
             video_data["ai_deferred"] = False
             video_data["ai_enabled"] = False
+            # [FORK] Digital-Union (D1): nothing for Qwen to annotate -> finished, and durable now.
+            _checkpoint_cache(job.get("cache_file"), video_data, require_ai=True)
             continue
         selected_by_job[job_id] = ai_candidates
         job_to_video[job_id] = video_data
+        job_to_cache[job_id] = job.get("cache_file") or ""
         request_jobs.append({
             "job_id": job_id,
             "video_file": video_data["video_file"],
@@ -838,6 +1188,15 @@ def _complete_deferred_qwen_batch(
 
     for job_id, video_data in job_to_video.items():
         ai_candidates = selected_by_job.get(job_id, [])
+        # [FORK] Digital-Union (D1 R4): per-job evidence in two parts. Membership in
+        # `semantics_by_job` locates this job's result - a globally non-empty response is no proof
+        # that *this* job ran, and before D1 an absent job became ai_enabled=True with 0 tags and was
+        # reused as AI-complete forever. But membership alone is still not completion: the worker
+        # records a job's timings whenever its loop returns, even when every candidate's semantic
+        # failed. `_qwen_job_completed` applies the shared rule. One failing job never fails its
+        # siblings.
+        envelope_present = str(job_id) in (semantics_by_job if isinstance(semantics_by_job, dict)
+                                           else {})
         semantics = semantics_by_job.get(str(job_id), {})
         semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
         merged_count = 0
@@ -849,6 +1208,12 @@ def _complete_deferred_qwen_batch(
         candidates = video_data.get("candidates") or []
         candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
         timing = timings_by_job.get(str(job_id), {}) if isinstance(timings_by_job, dict) else {}
+        if not isinstance(timing, dict):
+            timing = {}
+        # [FORK] Digital-Union (D1 R5): same rule, using this job's own submitted candidate set.
+        job_completed = _qwen_job_completed(
+            timing, envelope_present,
+            {str(candidate.get("id")) for candidate in ai_candidates}, set(semantic_by_id))
         qwen_seconds = (
             float(timing.get("prefetch_seconds") or 0.0)
             + float(timing.get("inference_seconds") or 0.0)
@@ -859,16 +1224,25 @@ def _complete_deferred_qwen_batch(
         timings["qwen_model_load_seconds_amortized"] = amortized_model
         timings["qwen_prefetch_seconds"] = float(timing.get("prefetch_seconds") or 0.0)
         timings["qwen_inference_seconds"] = float(timing.get("inference_seconds") or 0.0)
-        timings["qwen_frame_count"] = int(timing.get("frame_count") or len(ai_candidates))
-        timings["qwen_tag_count"] = int(timing.get("tag_count") or merged_count)
+        timings["qwen_frame_count"] = _reported_count(timing, "frame_count", len(ai_candidates))
+        timings["qwen_tag_count"] = _reported_count(timing, "tag_count", merged_count)
         timings["qwen_model_id"] = qwen_model_id
         timings["qwen_concurrency"] = qwen_concurrency
         timings["qwen_peak_vram_gb"] = qwen_peak_vram_gb
         timings["total_seconds"] = float(timings.get("total_seconds", video_data.get("analysis_seconds", 0.0))) + qwen_seconds
         video_data["analysis_seconds"] = timings["total_seconds"]
         video_data["ai_deferred"] = False
-        video_data["ai_enabled"] = True
+        video_data["ai_enabled"] = job_completed
         video_data["candidate_count"] = len(candidates)
+        if not job_completed:
+            print(
+                f"      Qwen semantic pass incomplete for "
+                f"{_safe_name(video_data.get('video_file', 'video'))} "
+                f"({_reported_count(timing, 'tag_count', merged_count)} of "
+                f"{_reported_count(timing, 'frame_count', 0)} decoded frames tagged for "
+                f"{len(ai_candidates)} requested candidate(s)); deterministic visual tags retained "
+                f"and AI analysis will retry on the next run."
+            )
         print(
             f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)} "
             f"for {_safe_name(video_data.get('video_file', 'video'))}"
@@ -879,6 +1253,11 @@ def _complete_deferred_qwen_batch(
             f"inference {_fmt_seconds(timings['qwen_inference_seconds'])}, "
             f"model share {_fmt_seconds(amortized_model)})"
         )
+        # [FORK] Digital-Union (D1, wording corrected in R5): checkpoint this job now, so a later
+        # job's failure - or a parent interruption during this post-response merge loop - cannot cost
+        # a job that is already finished. Work still inside an in-flight worker is NOT covered: the
+        # batch response only exists once the worker's whole job loop has returned.
+        _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
 
@@ -1451,16 +1830,22 @@ def _annotate_candidates_with_qwen(
     use_gpu: bool,
     audio_profile: Dict,
     event_callback=None,
-) -> None:
+) -> Dict[str, Any]:
+    # [FORK] Digital-Union (D1 R3): annotation corrected from `-> None`. Every normal branch returns
+    # a timings dict, and since D1 it also carries the load-bearing private `_QWEN_COMPLETED_KEY`
+    # that the caller pops to decide `ai_enabled`. Annotation only - no behaviour or shape change.
     max_windows = int(os.environ.get("BEATSYNC_QWEN_MAX_WINDOWS", "120"))
     max_windows = max(0, max_windows)
     if max_windows == 0:
         print("   Qwen semantic analysis skipped (BEATSYNC_QWEN_MAX_WINDOWS=0).")
-        return
+        # [FORK] Digital-Union (D1): skipped-by-configuration is not completed AI work. The batch
+        # path already treats BEATSYNC_QWEN_MAX_WINDOWS=0 this way; this makes the two agree.
+        return {_QWEN_COMPLETED_KEY: False}
 
     ai_candidates = _select_ai_candidates(candidates, max_windows)
     if not ai_candidates:
-        return {"qwen_frame_count": 0, "qwen_tag_count": 0}
+        # Nothing to annotate (no candidates) - genuinely finished, not a failure.
+        return {"qwen_frame_count": 0, "qwen_tag_count": 0, _QWEN_COMPLETED_KEY: True}
 
     print(f"   Qwen semantic analysis: {len(ai_candidates)} candidate moments")
     response = _run_qwen_worker(
@@ -1472,29 +1857,46 @@ def _annotate_candidates_with_qwen(
         audio_profile=audio_profile,
         event_callback=event_callback,
     )
+    # [FORK] Digital-Union (D1 R4): the response envelope locates this job's timings; whether the
+    # job's AI work actually *completed* is then decided by `_qwen_job_completed`, which requires
+    # every decoded frame item to have produced a valid semantic. Envelope membership alone only
+    # proves the worker's job loop returned - see that helper for the worker-contract reasoning.
+    job_timings = response.get("timings_by_job") if isinstance(response, dict) else None
+    envelope_present = isinstance(job_timings, dict) and _QWEN_SINGLE_JOB_ID in job_timings
+    timing = job_timings.get(_QWEN_SINGLE_JOB_ID) if envelope_present else {}
+    if not isinstance(timing, dict):
+        timing = {}
     semantics = response.get("semantics") if isinstance(response, dict) else {}
-    if not semantics:
-        print("      Qwen returned no semantic tags; deterministic visual tags remain active.")
-        return {
-            "qwen_frame_count": len(ai_candidates),
-            "qwen_tag_count": 0,
-            "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
-            "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
-            "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
-        }
+    semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
+    # [FORK] Digital-Union (D1 R5): the requested set is what `_select_ai_candidates` submitted.
+    requested_ids = {str(candidate.get("id")) for candidate in ai_candidates}
+    completed = _qwen_job_completed(timing, envelope_present, requested_ids, set(semantic_by_id))
 
-    semantic_by_id = {str(k): v for k, v in semantics.items()}
     merged_count = 0
     for candidate in ai_candidates:
         semantic = semantic_by_id.get(str(candidate.get("id")))
         if semantic:
             _merge_semantic(candidate, semantic)
             merged_count += 1
-    print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
-    timing = response.get("timings_by_job", {}).get("single", {}) if isinstance(response, dict) else {}
+
+    if not envelope_present:
+        print("      Qwen returned no usable response; deterministic visual tags remain active.")
+    elif not completed:
+        print(
+            f"      Qwen tagged {_reported_count(timing, 'tag_count', merged_count)} of "
+            f"{_reported_count(timing, 'frame_count', 0)} decoded frames for "
+            f"{len(requested_ids)} requested candidate(s); the semantic pass did not complete, so "
+            f"deterministic visual tags remain active and AI analysis will retry."
+        )
+    else:
+        print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
+
     return {
-        "qwen_frame_count": int(timing.get("frame_count") or len(ai_candidates)),
-        "qwen_tag_count": int(timing.get("tag_count") or merged_count),
+        _QWEN_COMPLETED_KEY: completed,
+        # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback
+        # applies only when the field is genuinely absent.
+        "qwen_frame_count": _reported_count(timing, "frame_count", len(ai_candidates)),
+        "qwen_tag_count": _reported_count(timing, "tag_count", merged_count),
         "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
         "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
         "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
