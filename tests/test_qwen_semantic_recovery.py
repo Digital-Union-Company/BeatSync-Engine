@@ -80,6 +80,36 @@ def _calls(node: ast.AST, func_name: str) -> list[ast.Call]:
     return found
 
 
+def _forwarded_values(call: ast.Call) -> set[str]:
+    """Local names passed through as argument *values*.
+
+    Deliberately reads the values, not the keyword names: `max_tokens=None` names the keyword while
+    dropping the override, which is precisely the regression these tests exist to catch.
+    """
+    names = {a.id for a in call.args if isinstance(a, ast.Name)}
+    names |= {kw.value.id for kw in call.keywords if isinstance(kw.value, ast.Name)}
+    return names
+
+
+def _generate_calls(node: ast.AST, dotted: str) -> list[ast.Call]:
+    """Calls whose unparsed callee is exactly `dotted` (e.g. "self.generate")."""
+    found = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+            if ast.unparse(sub.func) == dotted:
+                found.append(sub)
+    return found
+
+
+def _enclosing_ifs(root: ast.AST, target: ast.AST) -> list[ast.If]:
+    """Every `if` statement that contains `target`, outermost first."""
+    chain = []
+    for node in ast.walk(root):
+        if isinstance(node, ast.If) and any(sub is target for sub in ast.walk(node)):
+            chain.append(node)
+    return sorted(chain, key=lambda n: n.lineno)
+
+
 def _code(node: ast.AST) -> str:
     """Executable statements only - never the docstring.
 
@@ -229,6 +259,89 @@ def test_recovery_5_recovery_constants_are_hard_coded_not_env(worker_tree):
     assert "environ" not in recover and "_env_int" not in recover
     schema_fn = _code(_func(worker_tree, "_recovery_semantic_schema"))
     assert "environ" not in schema_fn and "_env_int" not in schema_fn
+
+
+# ------------------------------------------- override forwarding: every backend path (R2)
+def test_cli_ctx_fallback_retry_forwards_both_overrides(worker_tree):
+    """The CLI client's context-error self-retry must carry the recovery overrides with it.
+
+    This is load-bearing rather than tidiness. Recovery starts at 160 tokens with the bounded schema;
+    if a context error then triggers `LlamaMtmdClient.generate`'s recursive retry and the overrides
+    are dropped, the retry silently becomes an ordinary 128-token unbounded request and truncates
+    again - so recovery would report failure while appearing to have executed, and the source would
+    stay permanently uncacheable for a reason no log explains.
+    """
+    fn = _method(worker_tree, "LlamaMtmdClient", "generate")
+    recursive = _generate_calls(fn, "self.generate")
+    assert len(recursive) == 1, (
+        "expected exactly one recursive self.generate (the ctx fallback); "
+        f"found {[ast.unparse(c) for c in recursive]}")
+    call = recursive[0]
+
+    forwarded = _forwarded_values(call)
+    for name in ("image", "prompt", "item_id", "max_tokens", "semantic_schema"):
+        assert name in forwarded, (
+            f"ctx-fallback retry drops {name!r}: {ast.unparse(call)}")
+
+    # It must sit under the non-zero-exit -> context/memory-error fallback, not somewhere unrelated.
+    chain = _enclosing_ifs(fn, call)
+    assert chain, "the recursive retry is no longer guarded by any condition"
+    tests = [ast.unparse(node.test) for node in chain]
+    assert any("returncode" in t for t in tests), (
+        f"recursive retry is not under the non-zero-exit branch: {tests}")
+    assert any("_is_context_or_memory_error" in t for t in tests), (
+        f"recursive retry is not under the context/memory-error branch: {tests}")
+
+    # and it really is a retry: the fallback ctx is adopted before re-entering
+    guard = [node for node in chain if "_is_context_or_memory_error" in ast.unparse(node.test)][-1]
+    body = "\n".join(ast.unparse(stmt) for stmt in guard.body)
+    assert "self.ctx_size = fallback_ctx" in body
+
+
+def test_qwen_client_forwards_overrides_on_every_backend_path(worker_tree):
+    """No backend route may silently drop either override: server, ctx-retry server, or CLI."""
+    fn = _method(worker_tree, "QwenLlamaClient", "generate")
+
+    server_calls = _generate_calls(fn, "self.server.generate")
+    assert len(server_calls) == 2, (
+        "expected the ordinary server call and the fallback-context server retry; "
+        f"found {[ast.unparse(c) for c in server_calls]}")
+    for call in server_calls:
+        forwarded = _forwarded_values(call)
+        assert {"image", "prompt", "max_tokens", "semantic_schema"} <= forwarded, (
+            f"server path drops an override: {ast.unparse(call)}")
+
+    cli_calls = _generate_calls(fn, "self.cli.generate")
+    assert len(cli_calls) == 1, f"expected one CLI handoff; found {len(cli_calls)}"
+    forwarded = _forwarded_values(cli_calls[0])
+    assert {"image", "prompt", "item_id", "max_tokens", "semantic_schema"} <= forwarded, (
+        f"CLI handoff drops an override: {ast.unparse(cli_calls[0])}")
+
+    # one of the two server calls is the ctx retry, and it must be inside the exception path
+    handlers = [h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler)]
+    assert handlers, "the server exception handling disappeared"
+    in_handler = [c for c in server_calls
+                  if any(sub is c for h in handlers for sub in ast.walk(h))]
+    assert len(in_handler) == 1, (
+        "expected exactly one server retry inside the exception handler")
+    retry_chain = [ast.unparse(n.test) for n in _enclosing_ifs(fn, in_handler[0])]
+    assert any("_is_context_or_memory_error" in t for t in retry_chain), (
+        f"the server ctx retry is not guarded by the context/memory check: {retry_chain}")
+
+
+def test_recovery_reaches_the_backend_through_the_forwarding_client(worker_tree):
+    """`_recover_semantic` must go through QwenLlamaClient.generate, which forwards to any backend.
+
+    Calling `client.server.generate` directly would work only while a server happens to be up and
+    would skip the CLI path entirely.
+    """
+    recover = _func(worker_tree, "_recover_semantic")
+    direct = _generate_calls(recover, "client.server.generate")
+    assert not direct, "recovery must not bypass the forwarding client"
+    via_client = _generate_calls(recover, "client.generate")
+    assert len(via_client) == 1, "recovery must issue exactly one client.generate"
+    kwargs = {kw.arg for kw in via_client[0].keywords if kw.arg}
+    assert {"max_tokens", "semantic_schema"} <= kwargs
 
 
 # ---------------------------------------------------------------- RECOVERY-6 / 7 / 8

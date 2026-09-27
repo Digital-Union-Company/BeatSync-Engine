@@ -290,11 +290,18 @@ subsequent identical warm run should show 845/845 cache hits and launch no Qwen 
 
 ### Analysis cache
 
-`input/video_analysis_cache/*.json` is keyed by `ANALYSIS_VERSION` + video path/size/mtime + a backend
-signature (model/mmproj/server/mtmd stat + `llama-mtmd-cli --version`). **Bump `ANALYSIS_VERSION` in
-`video_analysis.py` whenever candidate scoring, window building, or the candidate schema changes** —
-otherwise stale candidates silently survive. Swapping the GGUF model or llama.cpp build invalidates
-automatically.
+`input/video_analysis_cache/*.json` is keyed by `CACHE_CONTRACT_VERSION` + `ANALYSIS_VERSION` + source
+identity (absolute path, size, `st_mtime_ns`, bounded content fingerprint) + a backend token (or
+`no_ai`) + an effective Qwen config token covering `MAX_WINDOWS`, `FRAME_WIDTH`, `MAX_NEW_TOKENS` and
+`smart_preset`. **The exact contract — including the fingerprint windows, backend identity,
+fail-closed behaviour and the persisted `cache_contract` marker — is the D2 section immediately
+below; read that rather than this summary before changing anything.** Swapping the GGUF model or
+llama.cpp build still invalidates automatically.
+
+`ANALYSIS_VERSION` keeps its own narrower job and does **not** own cache-generation semantics: **bump
+it in `video_analysis.py` whenever candidate scoring, window building, or the candidate schema
+changes**, otherwise stale candidates silently survive. Cache identity and the contract generation
+belong to `CACHE_CONTRACT_VERSION`.
 
 #### Cache identity and the contract generation (D2)
 
