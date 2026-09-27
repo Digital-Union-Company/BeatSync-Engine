@@ -166,6 +166,39 @@ absent. And `bool` subclasses `int`, so R4's `isinstance(..., int)` check accept
 The candidate-less no-Qwen-work case is untouched and deliberately does **not** go through these
 requested-count rules: no job is submitted, so there is nothing to cover.
 
+**R6 — legacy AI records must be self-consistent too.** R5 hardened how *new* records are created, but
+`require_ai` reuse of an *existing* candidateful record still ultimately trusted
+`bool(data["ai_enabled"])` — a flag written by the very code this branch has repeatedly proven could
+set it wrongly. A read-only audit of the real 2196-entry runtime cache measured the consequence:
+
+| | |
+|---|---|
+| source-cache entries | 2196 (plus 28 qwen debug/repro artifacts, excluded) |
+| provably R5-complete | 2190 (`candidate_count == frame_count == tag_count == ai_analyzed`) |
+| **definitely inconsistent** | **4** — `ai_enabled=True` with `qwen_frame_count=10`, `qwen_tag_count=9`, 9 `ai_analyzed` |
+| unverifiable but internally coherent | 2 (398 candidates/114 tagged, 525/119) |
+
+The 4 are exactly the false-complete shape D1 exists to prevent, and the pre-R6 loader accepted all
+2196. New `_stored_ai_cache_is_consistent()` now runs whenever `require_ai` reuse depends on
+`ai_enabled`, rejecting only contradictions provable from **already-persisted** fields: real integer
+counts (not bools), `frame_count > 0`, `tag_count == frame_count`,
+`frame_count <= len(candidates)`, usable candidate ids, and `ai_analyzed` ids that are unique, a subset
+of the candidate ids, and number exactly `tag_count`.
+
+It deliberately does **not** call `_qwen_job_completed`: that needs `requested_ids`, which legacy
+payloads never stored (nor the `BEATSYNC_QWEN_MAX_WINDOWS` value in force), so replaying the live rule
+against an old record would mean inventing evidence. For the same reason it does not require
+`frame_count == len(candidates)` — a smaller value is the normal result of `_select_ai_candidates`
+limiting the submitted set, so the two unverifiable records stay reusable and are left to the D2
+completion-contract decision.
+
+Measured against the real cache, read-only: **2192 accepted, 4 rejected**, the rejected set exactly the
+four audited files. **No runtime cache file was created, edited, renamed or deleted** — a rejection is
+an ordinary cache miss, and the source is recomputed and republished through the already-hardened
+writer. No migration command is provided and none is needed. `require_ai=False` deterministic reuse is
+unaffected (those candidates are real work), and the candidate-less path still answers to
+`_deterministic_analysis_completed`.
+
 `BEATSYNC_QWEN_MAX_WINDOWS=0` now reports not-completed rather than AI-complete, deliberately:
 `QWEN_MAX_WINDOWS` is not part of cache identity, so a knowingly Qwen-less record must not be stored
 under the AI model key. `BEATSYNC_DISABLE_QWEN=1` remains the supported deterministic-only path — it
@@ -180,7 +213,8 @@ of the leaked `_qwen_completed` key from the serial shape's stored timings.
 
 **Cache compatibility.** No cache-key, signature or `ANALYSIS_VERSION` change: `_video_signature`
 still uses `int(stat.st_mtime)` and every existing entry stays addressable. Verified read-only against
-200 sampled real cache entries — all 200 still accepted under both `require_ai` modes. A successful
+the real cache: all entries stay **addressable**, and 2192 of 2196 stay **reusable** (see R6 — 4 are
+intentionally rejected as self-contradictory). A successful
 uninterrupted run returns a payload identical to the pre-D1 result (candidates, per-video records and
 summary compared field by field).
 

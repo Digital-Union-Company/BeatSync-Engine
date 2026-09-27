@@ -319,6 +319,71 @@ def _qwen_job_completed(timing: Any, envelope_present: bool,
     return returned == expected
 
 
+def _stored_ai_cache_is_consistent(data: Any) -> bool:
+    """[FORK] Digital-Union (D1 R6): is a *persisted* AI-complete record self-consistent?
+
+    This is deliberately **not** the R5 live-worker rule. `_qwen_job_completed` needs
+    ``requested_ids``, and legacy payloads never stored them (nor the ``BEATSYNC_QWEN_MAX_WINDOWS``
+    value in force), so R5 cannot be replayed against an old record. Calling it from the loader would
+    mean inventing evidence.
+
+    Instead this asks only what the stored fields can actually prove: *does this record contradict
+    itself?* A read-only audit of the real 2196-entry runtime cache found 4 records claiming
+    ``ai_enabled=True`` with ``qwen_frame_count=10`` but ``qwen_tag_count=9`` and 9 candidates marked
+    ``ai_analyzed`` — precisely the false-complete shape D1 exists to prevent, and the pre-R6 loader
+    accepted all four because it only checked ``bool(data["ai_enabled"])``.
+
+    Required, all from fields already persisted:
+
+    * ``candidates`` is a non-empty list of dicts with usable string ids;
+    * ``timings`` is a dict carrying real integer ``qwen_frame_count``/``qwen_tag_count`` (not bools);
+    * ``frame_count > 0`` and ``tag_count == frame_count``;
+    * ``frame_count <= len(candidates)`` — it cannot have decoded more than existed;
+    * the ``ai_analyzed`` ids are unique, are a subset of the candidate ids, and number exactly
+      ``tag_count``.
+
+    Deliberately **not** required: ``frame_count == len(candidates)``. A smaller value is the normal
+    result of ``_select_ai_candidates`` limiting the submitted set, and the audit's two
+    398-candidate/114-tagged and 525-candidate/119-tagged records are internally coherent. They may
+    well be decoded subsets of a 120-candidate request, but nothing stored proves it, so they stay
+    reusable and belong to the D2 completion-contract decision.
+    """
+    if not isinstance(data, dict):
+        return False
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    timings = data.get("timings")
+    if not isinstance(timings, dict):
+        return False
+    frame_count = timings.get("qwen_frame_count")
+    tag_count = timings.get("qwen_tag_count")
+    if not _is_count(frame_count) or not _is_count(tag_count):
+        return False
+    if frame_count <= 0 or tag_count < 0 or tag_count != frame_count:
+        return False
+    if frame_count > len(candidates):
+        return False
+
+    candidate_ids: List[str] = []
+    analysed_ids: List[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        candidate_id = candidate.get("id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            return False
+        candidate_ids.append(candidate_id)
+        if candidate.get("ai_analyzed") is True:
+            analysed_ids.append(candidate_id)
+
+    if len(set(analysed_ids)) != len(analysed_ids):
+        return False
+    if not set(analysed_ids) <= set(candidate_ids):
+        return False
+    return len(analysed_ids) == tag_count
+
+
 def _deterministic_analysis_completed(data: Any) -> bool:
     """[FORK] Digital-Union (D1 R2): did the deterministic candidate pass actually run?
 
@@ -371,7 +436,11 @@ def _cache_entry_is_complete(data: Any, require_ai: bool) -> bool:
         return _deterministic_analysis_completed(data)
     if not require_ai:
         return True
-    return bool(data.get("ai_enabled"))
+    if not data.get("ai_enabled"):
+        return False
+    # [FORK] Digital-Union (D1 R6): `ai_enabled` was written by code this branch has repeatedly proven
+    # could set it wrongly, so an AI-complete claim must also survive a stored-consistency check.
+    return _stored_ai_cache_is_consistent(data)
 
 
 def _load_cache(path: str, require_ai: bool = False,

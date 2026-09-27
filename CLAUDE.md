@@ -296,6 +296,28 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   rejects `bool` (which subclasses `int`, so `frame_count: true` would otherwise have compared equal
   to 1), and `_reported_count` uses **presence** rather than truthiness — `timing.get(k) or default`
   silently rewrote a genuine `frame_count = 0` into the requested candidate count in stored timings.
+- **A *stored* AI record must also be self-consistent, not just flagged.**
+  `_stored_ai_cache_is_consistent()` runs whenever `require_ai` reuse depends on `ai_enabled`, and it
+  is deliberately **not** the live rule: `_qwen_job_completed` needs `requested_ids`, which legacy
+  payloads never stored (nor the `BEATSYNC_QWEN_MAX_WINDOWS` value in force), so replaying it against
+  an old record would mean inventing evidence. **Never call `_qwen_job_completed` from the loader.**
+
+  It asks only whether the persisted fields contradict each other: `timings` is a dict with real
+  integer `qwen_frame_count`/`qwen_tag_count` (not bools), `frame_count > 0`,
+  `tag_count == frame_count`, `frame_count <= len(candidates)`, candidate ids are usable strings, and
+  the `ai_analyzed` ids are unique, a subset of the candidate ids, and number exactly `tag_count`.
+
+  It deliberately does **not** require `frame_count == len(candidates)` — a smaller value is the
+  normal result of `_select_ai_candidates` limiting the submitted set.
+
+  This exists because a read-only audit of the real 2196-entry cache found **4** records claiming
+  `ai_enabled=True` with `qwen_frame_count=10`, `qwen_tag_count=9` and 9 `ai_analyzed` candidates —
+  exactly the false-complete shape D1 exists to prevent — which the pre-R6 loader accepted because it
+  only checked `bool(data["ai_enabled"])`. Measured effect: 2192 of 2196 accepted, those 4 rejected and
+  naturally recomputed on next encounter. Two further records (398 candidates/114 tagged, 525/119) are
+  internally coherent but historically unverifiable; they stay reusable and belong to the D2
+  completion-contract decision. **No runtime cache file was ever edited** — the audit and the
+  verification are read-only, and rejection simply becomes an ordinary cache miss.
 - **A candidate-less source is complete only if the deterministic pass actually ran.** Two very
   different outcomes both end with `candidates == []`: a source whose windows yielded no usable
   moments, and a source OpenCV could not open (`"Warning: OpenCV could not open …; candidate
@@ -323,7 +345,8 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   the temp is fsynced, the containing directory is not. Do not upgrade that claim without testing it.
 - D1 deliberately **did not** change `_video_signature`, `_path_signature_token`,
   `_qwen_backend_signature_token`, `_cache_path` or `ANALYSIS_VERSION`, so all pre-existing entries
-  stay addressable and reusable (verified read-only against 200 real entries). Source/backend
+  stay **addressable** — and 2192 of the 2196 real records stay **reusable**, with 4 intentionally
+  rejected as self-contradictory (see the stored-consistency rule below). Source/backend
   identity hardening — `int(st_mtime)` collides for any in-place rewrite inside the same second — is
   **deferred to D2** because it re-keys the whole cache.
 - **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in

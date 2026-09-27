@@ -29,8 +29,9 @@ _VIDEO_ANALYSIS = os.path.join(
 
 # The exact set of cache primitives D1 owns. All stdlib-only by construction.
 _FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_count",
-          "_reported_count", "_qwen_job_completed", "_deterministic_analysis_completed",
-          "_cache_entry_is_complete", "_load_cache", "_save_cache", "_checkpoint_cache")
+          "_reported_count", "_stored_ai_cache_is_consistent", "_qwen_job_completed",
+          "_deterministic_analysis_completed", "_cache_entry_is_complete",
+          "_load_cache", "_save_cache", "_checkpoint_cache")
 _CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY", "_QWEN_SINGLE_JOB_ID",
            "_DETERMINISTIC_SCORING_KEY")
 
@@ -121,9 +122,11 @@ def _load_pipeline(worker_response, *, capture_opens=True, window_count=3, max_w
         # Qwen collaborators
         "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],
         "_run_qwen_worker": _run_qwen_worker,
+        # faithful to the real `_merge_semantic`, which also sets `ai_analyzed = True`
         "_merge_semantic": lambda candidate, semantic: (
             calls["merged"].append(candidate["id"]),
-            candidate.update({"semantic_action": semantic.get("action", 0.0)}))[1],
+            candidate.update({"semantic_action": semantic.get("action", 0.0),
+                              "ai_analyzed": True}))[1],
         "fork_progress": None,
     }
     namespace.update(consts)
@@ -162,6 +165,10 @@ def cache():
 
 
 def _entry(av, *, video_file, candidates=None, ai_enabled=True, ai_deferred=False, **extra):
+    """A cache payload. When it claims `ai_enabled=True` it is made *internally consistent* by
+    default (R6): the Qwen counts and the per-candidate `ai_analyzed` markers agree, which is what a
+    genuine AI-complete record written by the pipeline looks like. Tests that want an inconsistent
+    stored record build it explicitly with `_stored(...)`."""
     entry = {
         "analysis_version": av,
         "video_file": video_file,
@@ -175,6 +182,13 @@ def _entry(av, *, video_file, candidates=None, ai_enabled=True, ai_deferred=Fals
         "ai_enabled": ai_enabled,
         "ai_deferred": ai_deferred,
     }
+    if ai_enabled and isinstance(entry["candidates"], list):
+        usable = [c for c in entry["candidates"] if isinstance(c, dict) and isinstance(c.get("id"), str)]
+        for candidate in usable:
+            candidate["ai_analyzed"] = True
+        if usable:
+            entry["timings"]["qwen_frame_count"] = len(usable)
+            entry["timings"]["qwen_tag_count"] = len(usable)
     entry["candidate_count"] = len(entry["candidates"])
     entry.update(extra)
     return entry
@@ -255,15 +269,22 @@ def test_unexpected_extra_fields_stay_allowed(cache):
 
 
 def test_a_representative_pre_d1_entry_is_still_accepted(cache):
-    """Existing cache entries must remain reusable: D1 changes no key and no required field."""
+    """Existing cache entries must remain reusable: D1 changes no key and no required field.
+
+    Shaped after the *real* runtime records, which a read-only audit of all 2196 confirmed carry
+    matching `qwen_frame_count`/`qwen_tag_count` and an `ai_analyzed` marker on each tagged candidate
+    (``_merge_semantic`` sets it). R6's stored-consistency check therefore accepts them.
+    """
     legacy = {
         "analysis_version": cache["ANALYSIS_VERSION"],
         "video_file": r"C:\lib\clip.mp4", "source_name": "clip.mp4",
         "duration": 41.0, "fps": 25.0, "width": 1280, "height": 720,
         "scene_changes": [2.0], "candidate_count": 2,
-        "candidates": [{"id": "a", "action_score": 0.4}, {"id": "b", "action_score": 0.6}],
+        "candidates": [{"id": "a", "action_score": 0.4, "ai_analyzed": True},
+                       {"id": "b", "action_score": 0.6, "ai_analyzed": True}],
         "analysis_seconds": 4.4,
-        "timings": {"total_seconds": 4.4, "qwen_tag_count": 2, "qwen_seconds": 2.3},
+        "timings": {"total_seconds": 4.4, "qwen_frame_count": 2, "qwen_tag_count": 2,
+                    "qwen_seconds": 2.3},
         "ai_enabled": True, "ai_deferred": False,
     }
     assert cache["_cache_entry_is_complete"](legacy, require_ai=True) is True
@@ -647,6 +668,169 @@ def test_no_selected_candidates_is_a_completed_no_op():
 
 
 # ---------------------------------------------------------------------------
+# R6: stored-record consistency for legacy AI cache entries
+# ---------------------------------------------------------------------------
+
+
+def _stored(av, *, candidate_count, frame_count, tag_count, analysed,
+            analysed_ids=None, duplicate_analysed=False, video_file=r"C:\lib\clip.mp4"):
+    """A persisted AI-complete record, shaped like the real cache entries."""
+    candidates = []
+    for i in range(candidate_count):
+        candidate = {"id": f"clip.mp4-{i}", "start": i * 2.0, "end": i * 2.0 + 2.0,
+                     "action_score": 0.5, "editorial_score": 0.9 - i * 0.01}
+        candidates.append(candidate)
+    ids = analysed_ids if analysed_ids is not None else [f"clip.mp4-{i}" for i in range(analysed)]
+    if duplicate_analysed and ids:
+        ids = list(ids[:-1]) + [ids[0]]
+    by_id = {c["id"]: c for c in candidates}
+    for cid in ids:
+        target = by_id.get(cid)
+        if target is None:                      # a foreign analysed id: attach a stray candidate
+            candidates.append({"id": cid, "ai_analyzed": True, "action_score": 0.5})
+        else:
+            target["ai_analyzed"] = True
+    if duplicate_analysed:
+        # two candidate entries carrying the same analysed id
+        candidates.append({"id": ids[0], "ai_analyzed": True, "action_score": 0.5})
+    timings = {"total_seconds": 12.0, "candidate_scoring_seconds": 0.5,
+               "qwen_model_id": "Qwen3VL-2B-Instruct-Q8_0 (llama.cpp Vulkan)"}
+    if frame_count is not None:
+        timings["qwen_frame_count"] = frame_count
+    if tag_count is not None:
+        timings["qwen_tag_count"] = tag_count
+    return {
+        "analysis_version": av, "video_file": video_file,
+        "source_name": os.path.basename(video_file), "duration": 30.0, "fps": 25.0,
+        "width": 1280, "height": 720, "scene_changes": [1.0],
+        "candidate_count": len(candidates), "candidates": candidates,
+        "analysis_seconds": 12.0, "timings": timings,
+        "ai_enabled": True, "ai_deferred": False,
+    }
+
+
+def test_L1_a_stored_record_with_fewer_tags_than_decoded_frames_is_rejected(cache):
+    """The exact shape of the 4 bad records found in the real runtime cache:
+    frame_count=10, tag_count=9, 9 candidates marked ai_analyzed, ai_enabled=True.
+    The pre-R6 loader accepted all four."""
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10,
+                    tag_count=9, analysed=9)
+
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+    # still reusable for a deterministic-only run: its candidates are real work
+    assert cache["_cache_entry_is_complete"](entry, require_ai=False) is True
+
+
+def test_L2_a_stored_record_whose_ai_analyzed_count_disagrees_with_tag_count_is_rejected(cache):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10,
+                    tag_count=10, analysed=9)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+def test_L3_duplicate_ai_analyzed_ids_are_rejected(cache):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10,
+                    tag_count=10, analysed=10, duplicate_analysed=True)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+def test_L4_an_ai_analyzed_id_outside_the_candidate_set_is_rejected(cache):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10, tag_count=10,
+                    analysed=0, analysed_ids=[f"clip.mp4-{i}" for i in range(9)] + ["foreign-1"])
+    # the stray analysed id is appended as its own candidate, so the subset check is what must fire
+    entry["candidates"] = [c for c in entry["candidates"] if c["id"] != "foreign-1"] + \
+                          [{"id": "foreign-1", "ai_analyzed": True}]
+    entry["candidates"] = [c for c in entry["candidates"] if c["id"] != "foreign-1"]
+    entry["timings"]["qwen_tag_count"] = 10
+    entry["timings"]["qwen_frame_count"] = 10
+    # 9 analysed inside the set, tag_count claims 10 -> contradiction either way
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+def test_L5_a_stored_zero_frame_count_is_rejected(cache):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=0,
+                    tag_count=0, analysed=0)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+@pytest.mark.parametrize("frame_count, tag_count", [(True, True), (True, 1), (1, True)])
+def test_L6_bool_counts_in_a_stored_record_are_rejected(cache, frame_count, tag_count):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=1, frame_count=frame_count,
+                    tag_count=tag_count, analysed=1)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+@pytest.mark.parametrize("drop", ["qwen_frame_count", "qwen_tag_count"])
+def test_a_stored_record_missing_a_qwen_count_is_rejected(cache, drop):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=3, frame_count=3,
+                    tag_count=3, analysed=3)
+    del entry["timings"][drop]
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+def test_a_stored_frame_count_above_the_candidate_count_is_rejected(cache):
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=3, frame_count=5,
+                    tag_count=5, analysed=3)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is False
+
+
+def test_L7_a_fully_consistent_legacy_record_is_accepted(cache):
+    """The 2190 records the audit found provably complete."""
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10,
+                    tag_count=10, analysed=10)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True
+
+
+def test_L8_an_internally_consistent_subset_record_is_accepted(cache):
+    """Load-bearing: R6 must NOT pretend it can reconstruct the missing legacy requested set.
+
+    These are the two real records with 398/525 candidates and 114/119 decoded+tagged. They may well
+    be decoded subsets of a 120-candidate request, but ``requested_ids`` and the historical
+    ``BEATSYNC_QWEN_MAX_WINDOWS`` were never stored, so R6 cannot prove it. Rejecting them would be
+    inventing evidence; they are left for D2.
+    """
+    for candidate_count, covered in ((398, 114), (525, 119)):
+        entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=candidate_count,
+                        frame_count=covered, tag_count=covered, analysed=covered)
+        assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True, candidate_count
+
+
+def test_the_stored_rule_is_not_applied_when_ai_is_not_required(cache):
+    """A deterministic-only run must still reuse these records: the candidates are real work."""
+    entry = _stored(cache["ANALYSIS_VERSION"], candidate_count=10, frame_count=10,
+                    tag_count=9, analysed=9)
+    assert cache["_cache_entry_is_complete"](entry, require_ai=False) is True
+
+
+def test_the_stored_rule_does_not_touch_the_candidate_less_path(cache):
+    """No candidates means no Qwen counts to check; the deterministic evidence still governs."""
+    entry = _entry(cache["ANALYSIS_VERSION"], video_file=r"C:\lib\empty.mp4",
+                   candidates=[], ai_enabled=False)
+    entry["timings"][cache["_DETERMINISTIC_SCORING_KEY"]] = 0.4
+    assert cache["_cache_entry_is_complete"](entry, require_ai=True) is True
+
+    without_evidence = _entry(cache["ANALYSIS_VERSION"], video_file=r"C:\lib\broken.mp4",
+                              candidates=[], ai_enabled=False)
+    assert cache["_cache_entry_is_complete"](without_evidence, require_ai=True) is False
+
+
+def test_the_stored_consistency_rule_reads_defensively(cache):
+    rule = cache["_stored_ai_cache_is_consistent"]
+
+    assert rule({"candidates": [], "timings": {}}) is False
+    assert rule({"candidates": "nope", "timings": {}}) is False
+    assert rule({"candidates": [{"id": "a"}], "timings": None}) is False
+    assert rule({"candidates": [{"id": "a"}], "timings": {"qwen_frame_count": 1,
+                                                          "qwen_tag_count": 1}}) is False, \
+        "one candidate, one tag claimed, but nothing is marked ai_analyzed"
+    ok = {"candidates": [{"id": "a", "ai_analyzed": True}],
+          "timings": {"qwen_frame_count": 1, "qwen_tag_count": 1}}
+    assert rule(ok) is True
+    assert rule({"candidates": [{"id": None, "ai_analyzed": True}, {"id": None}],
+                 "timings": {"qwen_frame_count": 1, "qwen_tag_count": 1}}) is False, \
+        "unusable candidate ids cannot be compared"
+
+
+# ---------------------------------------------------------------------------
 # R5: the requested Qwen candidate set must be covered end to end
 # ---------------------------------------------------------------------------
 
@@ -746,9 +930,11 @@ def _load_batch(worker_response):
         "Any": Any, "Dict": Dict, "List": list, "Sequence": list,
         "__builtins__": __builtins__,
         "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],
+        # faithful to the real `_merge_semantic`, which also sets `ai_analyzed = True`
         "_merge_semantic": lambda candidate, semantic: (
             calls["merged"].append(candidate["id"]),
-            candidate.update({"semantic_action": semantic.get("action", 0.0)}))[1],
+            candidate.update({"semantic_action": semantic.get("action", 0.0),
+                              "ai_analyzed": True}))[1],
         "_run_qwen_worker_batch": lambda **kwargs: worker_response,
     }
     namespace.update(consts)

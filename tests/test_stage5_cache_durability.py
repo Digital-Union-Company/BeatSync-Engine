@@ -194,8 +194,12 @@ def test_single_qwen_completion_comes_from_an_explicit_signal(tree, module_sourc
 
 
 def test_the_qwen_facade_reports_completion_on_every_return_path(tree):
-    """Skipped-by-config and an empty worker response are failures; zero tags with a real response
-    and 'nothing to annotate' are successes."""
+    """Every return path must carry a verdict.
+
+    Skipped-by-config and an empty worker response are incomplete. A *submitted* job must satisfy the
+    full requested-set contract in `_qwen_job_completed` — zero tags from a worker that merely
+    finished is **not** success. The no-candidate path is the separate completed no-op.
+    """
     facade = _func(tree, "_annotate_candidates_with_qwen")
     returns = [node for node in ast.walk(facade) if isinstance(node, ast.Return) and node.value]
     assert returns, "the facade must return completion information"
@@ -398,6 +402,49 @@ def test_a_reported_zero_count_is_never_replaced_by_a_fallback(tree):
         ]
         assert not truthy_fallbacks, (
             f"{name} still uses an `or`-fallback on a worker count: {truthy_fallbacks}")
+
+
+def test_the_loader_applies_a_stored_consistency_check_to_ai_records(tree):
+    """R6: `ai_enabled` alone is not enough to reuse a persisted AI record.
+
+    A read-only audit found 4 real cache records claiming `ai_enabled=True` with
+    `qwen_frame_count=10` but `qwen_tag_count=9`; the pre-R6 loader accepted all four.
+    """
+    rule = _func(tree, "_cache_entry_is_complete")
+    assert _calls(rule, "_stored_ai_cache_is_consistent"), (
+        "the completion rule must check stored consistency, not just the ai_enabled flag")
+
+    # and the check must come after ai_enabled, i.e. it strengthens rather than replaces it
+    statements = [ast.unparse(node) for node in rule.body
+                  if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
+    joined = "\n".join(statements)
+    assert joined.index("ai_enabled") < joined.index("_stored_ai_cache_is_consistent"), joined
+
+    # the loader must NOT try to replay the live rule against a stored record
+    assert not _calls(rule, "_qwen_job_completed"), (
+        "legacy records do not store requested_ids; replaying the live rule would invent evidence")
+    assert not _calls(_func(tree, "_load_cache"), "_qwen_job_completed")
+
+
+def test_the_stored_consistency_rule_checks_only_persisted_evidence(tree):
+    """It must not require `frame_count == len(candidates)`: MAX_WINDOWS may have limited the set."""
+    checker = _func(tree, "_stored_ai_cache_is_consistent")
+    # executable statements only: the docstring legitimately *discusses* requested_ids to explain why
+    # the live rule cannot be replayed here.
+    code = "\n".join(ast.unparse(node) for node in checker.body
+                     if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+
+    assert "qwen_frame_count" in code and "qwen_tag_count" in code
+    assert "ai_analyzed" in code, "the per-candidate marker is part of the stored evidence"
+    assert _calls(checker, "_is_count"), "bools must be rejected as counts"
+
+    # frame_count is bounded ABOVE by the candidate count, never required to equal it
+    comparisons = [ast.unparse(node) for node in ast.walk(checker)
+                   if isinstance(node, ast.Compare) and "frame_count" in ast.unparse(node)]
+    assert any(">" in c or "<" in c for c in comparisons), comparisons
+    assert not any("frame_count == len(candidates)" in c for c in comparisons), (
+        f"a decoded subset is legitimate under MAX_WINDOWS; found {comparisons}")
+    assert "requested_ids" not in code, "legacy payloads never stored the requested set"
 
 
 def test_the_deterministic_scoring_evidence_discriminator_exists(tree):
