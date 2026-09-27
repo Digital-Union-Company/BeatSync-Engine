@@ -118,6 +118,39 @@ never with floating-point `-t` alone.
 Corollary, in `create_music_video`: if any clip fails to extract, it **raises** rather than concatenating
 a short timeline. Dropping one segment silently desynchronizes every later cut. Don't "fix" this by skipping.
 
+### A failed clip carries the reason FFmpeg gave (Phase 3B)
+
+`extract_clip_segment_ffmpeg()` still returns a plain `bool` — that signature is a compatibility surface
+and must stay. The implementation moved to `extract_clip_segment_ffmpeg_detailed()`, which returns
+`(success, reason)`; the boolean function is a thin delegate. `create_clip_parallel` calls the detailed
+variant and reports `f"FFmpeg extraction failed: {reason}"`, so the existing Stage 6 chain
+(`clip_failures` → warning event → `first_failures` on the refusal → `ProgressView`) carries a real cause.
+No new transport, no stdout scraping, and `gui.py` needed no change.
+
+`beatsync_fork/ffmpeg_diagnostics.py` owns the summarising and is stdlib-only, so the ranking is testable
+without FFmpeg or a GPU. Load-bearing details:
+
+- **Only consulted when `returncode != 0`.** On driver 617.14 *every successful* NVENC clip prints a
+  scary nvdec fallback warning (`cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE`, `more than 32 (33)
+  decode surfaces`). Summarising unconditionally would attach a "reason" to all 150 clips of a perfectly
+  good render. `rc=0` plus a non-empty output is success, full stop — a test pins the call inside the
+  `returncode != 0` branch.
+- **The selector anchors on FFmpeg's *consequence* lines, not on line order.** FFmpeg prints the root
+  cause immediately before the wrapper it triggers (`Error while opening encoder` → `Task finished with
+  error code` → `Conversion failed!`), so the specific lines nearest that boundary win. "Earliest
+  diagnostic line wins" was the first implementation and it was wrong: in the real capture the recovered
+  nvdec warning sits *four lines before* the fatal `Driver does not support the required nvenc API
+  version. Required: 13.1 Found: 13.0`, and got reported instead of it.
+- **Generic, not vendor-special-cased.** Nothing in the ranking data mentions NVENC, CUDA or drivers; a
+  test asserts that of the marker tuples directly. The real pre-driver stderr is committed as the
+  regression fixture.
+- **Bounded at 240 chars**, one line, control characters stripped and heap addresses collapsed
+  (`[h264_nvenc @ 000001c3…]` → `[h264_nvenc]`) so the same failure produces the same string twice. A
+  1 MB stderr still yields a ~60-char reason. The unabridged stderr still goes to the console exactly
+  as before.
+- Missing/empty output and exceptions get their own honest wording rather than a fabricated stderr
+  quote; a `TimeoutExpired` is described by its timeout, not by its 4000-character argv.
+
 ### Stage 5 runs out-of-process
 
 `video_analysis.py` never loads a model in-process. It writes a JSON request into
@@ -334,6 +367,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `progress.py` | `ProgressEvent` + `StageCounter` + `emit()` — structured pipeline progress |
 | `progress_view.py` | `ProgressView` — folds events into the status panel text |
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
+| `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 
 ### Video source modes and the confirmation gate
 

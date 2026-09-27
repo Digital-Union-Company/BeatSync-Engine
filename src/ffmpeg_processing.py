@@ -29,6 +29,9 @@ from logger import (
 )
 from gpu_cpu_utils import MAX_THREADS
 
+# [FORK] Digital-Union (Phase 3B): bounded FFmpeg failure summaries (stdlib-only fork module).
+from beatsync_fork import ffmpeg_diagnostics as fork_diagnostics
+
 # Initialize environment
 setup_environment()
 
@@ -295,9 +298,32 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
                                 gpu_encoder: str = 'h264_nvenc') -> bool:
     """
     Extract a video segment using FFmpeg with FRAME-ACCURATE timing.
-    
+
     ✅ FRAME-ACCURATE: Uses exact frame counts instead of floating-point seconds
     ✅ ZERO DRIFT: No cumulative timing errors
+
+    Returns a plain bool, unchanged. [FORK] Digital-Union: callers that also want to know *why* a clip
+    failed use :func:`extract_clip_segment_ffmpeg_detailed`; this signature stays boolean so existing
+    and upstream callers are unaffected.
+    """
+    success, _reason = extract_clip_segment_ffmpeg_detailed(
+        video_file=video_file, start_time=start_time, duration=duration,
+        output_file=output_file, fps=fps, target_size=target_size,
+        use_nvenc=use_nvenc, gpu_encoder=gpu_encoder,
+    )
+    return success
+
+
+def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, duration: float,
+                                         output_file: str, fps: float,
+                                         target_size: Tuple[int, int], use_nvenc: bool,
+                                         gpu_encoder: str = 'h264_nvenc') -> Tuple[bool, str]:
+    """[FORK] Digital-Union (Phase 3B): the same extraction, plus a bounded failure reason.
+
+    Returns ``(success, reason)`` where ``reason`` is ``""`` on success. The FFmpeg command, the
+    frame-accurate arithmetic, the encoder arguments and the success/failure conditions are all
+    identical to the boolean version — the only addition is that a failure now carries the short
+    explanation FFmpeg already printed, so Stage 6 can show it instead of a generic string.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
@@ -363,20 +389,25 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
         ])
         
         result = _run_media_command(cmd, timeout=120)
-        
+
         if result.returncode != 0:
             print(f"   ⚠️  FFmpeg error: {result.stderr}")
-            return False
-        
+            # [FORK] The full text still goes to the console exactly as before; only a bounded
+            # summary travels onward, because ProgressView is a status line, not a log sink.
+            reason = fork_diagnostics.summarize_ffmpeg_failure(result.stderr)
+            return False, reason or f"FFmpeg exited with code {result.returncode}"
+
         # Verify output exists and has content
         if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            return False
-        
-        return True
-        
+            exists = os.path.exists(output_file)
+            size = os.path.getsize(output_file) if exists else 0
+            return False, fork_diagnostics.describe_output_problem(exists, size)
+
+        return True, ""
+
     except Exception as e:
         print(f"   ⚠️  Error extracting clip: {e}")
-        return False
+        return False, fork_diagnostics.describe_exception(e)
 
 
 def extract_prores_segment_random(video_file: str, duration: float, fps: float,

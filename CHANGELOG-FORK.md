@@ -20,6 +20,52 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-27 (Phase 3B: Stage 6 FFmpeg failure diagnostics)
+
+A Stage 6 render of 701 sources lost every clip and reported `283 clip(s) failed; refusing to
+concatenate an incomplete timeline`. FFmpeg had already said exactly why —
+`Driver does not support the required nvenc API version. Required: 13.1 Found: 13.0` — but
+`extract_clip_segment_ffmpeg()` printed that to stdout and returned a bare `False`, `create_clip_parallel`
+turned the `False` into the fixed string `"FFmpeg extraction failed"`, and the GUI redirects stdout into
+`QuietConsole`. Identifying the cause took a dedicated forensic phase. This change makes the reason
+travel with the failure. Diagnostics only: no encoder, command, timing or render behaviour changed.
+
+- **New fork module `src/beatsync_fork/ffmpeg_diagnostics.py`** (stdlib-only). `summarize_ffmpeg_failure`
+  ranks stderr lines and returns one bounded line; `describe_output_problem` and `describe_exception`
+  cover the cases where there is no stderr worth quoting. Vendor-neutral by construction — a test
+  asserts the marker tuples never mention NVENC/CUDA/drivers — so the next failure family benefits too.
+- **`extract_clip_segment_ffmpeg()` keeps its `-> bool` signature** and becomes a thin delegate to the
+  new `extract_clip_segment_ffmpeg_detailed() -> Tuple[bool, str]`. The call graph shows exactly one
+  in-repo caller, but the boolean function is a module-level API in an upstream file, so it was left
+  compatible rather than converted. The FFmpeg command construction is **byte-identical** to the base
+  commit (all 17 `cmd`/`filters`/frame-arithmetic statements compare equal by AST).
+- **`create_clip_parallel` reports `f"FFmpeg extraction failed: {reason}"`**, keeping the historical
+  wording as a prefix so existing expectations still match. Everything downstream already worked:
+  `clip_failures` → Stage 6 warning → `first_failures[:3]` on the refusal → `ProgressView`. No GUI, no
+  `progress.py` and no `ProgressView` change was required; `gui.py` is untouched.
+- **A successful clip stays successful.** The summariser is only reached inside the
+  `returncode != 0` branch, asserted by a seam test. This matters concretely: on driver 617.14 every
+  successful NVENC clip emits `cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE` / `more than 32 (33) decode
+  surfaces` while FFmpeg falls back to software decode, and the validated 150-clip render would otherwise
+  have acquired 150 spurious "reasons".
+- **Bounded**: 240 characters, one line, control characters stripped, heap addresses collapsed so the
+  same failure yields a reproducible string. A 1 MB stderr produced a 61-character reason in test. The
+  full text still reaches the console through the pre-existing print.
+- **The complete-timeline refusal is untouched.** Measured against real `create_music_video` with two
+  clips forced to fail out of nine: `RuntimeError: 2 clip(s) failed; refusing to concatenate an
+  incomplete timeline.`, no output file written, `failed_clips=2 total_clips=9`, two warning events and
+  two `first_failures` entries each carrying the decisive driver/API text within 215 characters.
+
+One defect the fixture caught before commit: the first selector took the *earliest* diagnostic line,
+which in the real capture is the recovered nvdec warning four lines above the fatal encoder error. The
+selector now anchors on FFmpeg's consequence lines and picks the specific lines nearest that boundary.
+
+Verified on the current environment (RTX 3080, driver 617.14): real NVENC extraction returns `True` with
+2,964,751 bytes and exactly 60 frames, its detailed reason empty; real CPU H.264 extraction returns
+`True` with 11,944,372 bytes and exactly 60 frames. `ANALYSIS_VERSION`, cache identity, the frame-lock
+timeline builder, NVENC/CPU quality arguments, `_effective_clip_workers`, `-hwaccel cuda` and
+`logger.check_nvenc()` are all unchanged; 21 protected files are blob-identical to the base commit.
+
 ### Added — 2026-09-26 (Phase 2B: live Qwen worker progress)
 
 Closes the last observability hole in the pipeline: the parent → Python-worker subprocess boundary.
