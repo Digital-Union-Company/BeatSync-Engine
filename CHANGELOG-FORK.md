@@ -20,6 +20,46 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-09-27 (Phase 3C: NVENC clips decode in software)
+
+The NVENC extraction path no longer asks FFmpeg for CUDA input decoding. **`h264_nvenc` still does the
+encoding** — only the input-side `-hwaccel cuda` request is gone, so the architecture is now software
+decode → the existing CPU filter chain → NVENC encode. The CPU-encode branch keeps its `-hwaccel auto`
+and is untouched.
+
+A read-only decode-path study measured three real paths on RTX 3080 / driver 617.14 over 5 real sources
+× 4 deterministic windows (2.0 s, 1280×720, 30 fps, 60 frames per clip), in balanced interleaved order:
+
+- **`-hwaccel cuda` was not actually decoding on hardware for most sources.** It failed to initialise on
+  48 of 60 clips (33 requested nvdec decode surfaces against a limit of 32) and FFmpeg fell back to
+  software decode anyway — the warning was the only thing it reliably produced.
+- **Where real NVDEC *did* engage, it was slower.** On the one sampled source whose surface count fits,
+  hardware decode was positively confirmed from FFmpeg's own verbose decoder log and ran ~20 % slower
+  than software decode (0.530 s vs 0.436 s per clip), because this CPU filter chain
+  (`trim,setpts,scale,fps`) has to pull the frames back to system memory.
+- **Genuine CUDA decode is achievable but still not worth it.** `-hwaccel cuda -threads 8` produced
+  confirmed hardware decode on all 5 sources with zero failures, exact frame counts and byte-identical
+  output — and was slower than plain software decode on 20 of 20 clips. (`-threads 16` and
+  `-extra_hw_frames 0` did not resolve the surface count at all.) It is not adopted.
+- **Output is unchanged, byte for byte.** All 20 A/B pairs produced identical output *files* — not
+  merely equal frame counts or equivalent content — and each variant was deterministic across
+  repetitions. The post-change smoke reproduces the study's Variant-B files exactly: 5/5 SHA-256 match.
+- **Modest, consistent speedup.** Sequential median 0.434 s vs 0.449 s (faster on 18/20 clips, and in
+  every balanced repetition); at the real 4-worker NVENC cap, 12.17 s vs 13.46 s wall for 40 clips
+  (3.286 vs 2.972 clips/s), with 0 decode-init failures instead of 32 and ~500 MiB lower peak VRAM.
+
+The FFmpeg argv delta is exactly the removal of the two tokens `-hwaccel cuda`, proven by diffing the
+argv the production function really constructs, before and after, with every other token in the same
+order. No filter graph, encoder, quality-argument, frame-lock, worker-policy, resolution or FPS change;
+`get_nvenc_quality_args`, `get_cpu_h264_quality_args`, `seconds_to_frame_count`,
+`frame_count_to_seconds`, `build_frame_aligned_cut_timeline` and `_effective_clip_workers` are all
+AST-identical to the base commit, and `video_processor.py`, the Phase 3B diagnostic module,
+`ANALYSIS_VERSION` and the analysis-cache identity are unmodified.
+
+The Phase 3B regression fixture that carries the old `cuvidCreateDecoder` / decode-surface warning text
+is **deliberately retained**. Phase 3C removes the production trigger, not the requirement that the
+diagnostic selector keep telling a recovered warning apart from the fatal encoder cause.
+
 ### Fixed — 2026-09-27 (Phase 3B: Stage 6 FFmpeg failure diagnostics)
 
 A Stage 6 render of 701 sources lost every clip and reported `283 clip(s) failed; refusing to
@@ -47,10 +87,12 @@ travel with the failure. Diagnostics only: no encoder, command, timing or render
   `clip_failures` → Stage 6 warning → `first_failures[:3]` on the refusal → `ProgressView`. No GUI, no
   `progress.py` and no `ProgressView` change was required; `gui.py` is untouched.
 - **A successful clip stays successful.** The summariser is only reached inside the
-  `returncode != 0` branch, asserted by a seam test. This matters concretely: on driver 617.14 every
-  successful NVENC clip emits `cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE` / `more than 32 (33) decode
-  surfaces` while FFmpeg falls back to software decode, and the validated 150-clip render would otherwise
-  have acquired 150 spurious "reasons".
+  `returncode != 0` branch, asserted by a seam test. This mattered concretely *at the time of Phase 3B*,
+  when the NVENC path still requested `-hwaccel cuda`: on driver 617.14 every successful NVENC clip
+  emitted `cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE` / `more than 32 (33) decode surfaces` while
+  FFmpeg fell back to software decode, and the validated 150-clip render would otherwise have acquired
+  150 spurious "reasons". (Phase 3C later removed that request, so current renders no longer emit it —
+  the rule itself is unchanged and still load-bearing.)
 - **Bounded**: 240 characters, one line, control characters stripped, heap addresses collapsed so the
   same failure yields a reproducible string. A 1 MB stderr produced a 61-character reason in test. The
   full text still reaches the console through the pre-existing print.

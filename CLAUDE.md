@@ -130,11 +130,13 @@ No new transport, no stdout scraping, and `gui.py` needed no change.
 `beatsync_fork/ffmpeg_diagnostics.py` owns the summarising and is stdlib-only, so the ranking is testable
 without FFmpeg or a GPU. Load-bearing details:
 
-- **Only consulted when `returncode != 0`.** On driver 617.14 *every successful* NVENC clip prints a
-  scary nvdec fallback warning (`cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE`, `more than 32 (33)
-  decode surfaces`). Summarising unconditionally would attach a "reason" to all 150 clips of a perfectly
-  good render. `rc=0` plus a non-empty output is success, full stop — a test pins the call inside the
-  `returncode != 0` branch.
+- **Only consulted when `returncode != 0`.** `rc=0` plus a non-empty output is success, full stop — a
+  test pins the call inside the `returncode != 0` branch. The rule was written because, while the NVENC
+  path still requested `-hwaccel cuda`, *every successful* clip on driver 617.14 printed a scary nvdec
+  fallback warning (`cuvidCreateDecoder … CUDA_ERROR_INVALID_VALUE`, `more than 32 (33) decode
+  surfaces`), and summarising unconditionally would have attached a "reason" to all 150 clips of a
+  perfectly good render. Phase 3C removed that request, so current renders no longer emit it — but the
+  rule stands on its own: a warning a tool recovered from is not a failure, whatever produced it.
 - **The selector anchors on FFmpeg's *consequence* lines, not on line order.** FFmpeg prints the root
   cause immediately before the wrapper it triggers (`Error while opening encoder` → `Task finished with
   error code` → `Conversion failed!`), so the specific lines nearest that boundary win. "Earliest
@@ -145,7 +147,11 @@ without FFmpeg or a GPU. Load-bearing details:
   and no incident-specific version literals (`13.1`, `610.00`); a test asserts that vendor-token set
   against the marker tuples directly. Generic diagnostic words *are* allowed and `_SPECIFIC_MARKERS`
   does contain `"driver"` — that matches any vendor's driver complaint and is deliberately not treated
-  as a vendor special case. The real pre-driver stderr is committed as the regression fixture.
+  as a vendor special case. The real pre-driver stderr is committed as the regression fixture — and it
+  is **retained deliberately** even though Phase 3C removed the production trigger for its nvdec warning
+  lines. The fixture's job is to prove the selector still tells a recovered warning apart from the fatal
+  encoder cause sitting four lines after it; that property is independent of whether current renders
+  happen to produce those lines. Do not "modernise" it by stripping the CUDA/NVDEC text.
 - **Bounded at 240 chars**, one line, control characters stripped and heap addresses collapsed
   (`[h264_nvenc @ 000001c3…]` → `[h264_nvenc]`) so the same failure produces the same string twice. A
   1 MB stderr still yields a ~60-char reason. The unabridged stderr still goes to the console exactly
@@ -313,6 +319,20 @@ branch extracts clips in a `ThreadPoolExecutor` — capped by `_effective_clip_w
 simultaneous NVENC sessions contend for one hardware encoder. Final assembly tries concat stream-copy
 first and falls back to a full re-encode (`BEATSYNC_FAST_CONCAT_COPY`). Audio is always re-laid as
 `pcm_s24le` @ 48 kHz with `-shortest`, audio as master timeline.
+
+**NVENC clips decode in software on purpose (Phase 3C).** `extract_clip_segment_ffmpeg_detailed` adds
+**no** input `-hwaccel` when `use_nvenc=True`; the CPU-encode branch keeps `-hwaccel auto`. So the NVENC
+path is software decode → the CPU filter chain (`trim,setpts,scale,fps`) → `h264_nvenc` encode. This is
+measured, not stylistic: `-hwaccel cuda` failed to initialise on 48 of 60 sampled clips (33 nvdec decode
+surfaces against a limit of 32) and FFmpeg fell back to software decode anyway; on the one source where
+real NVDEC did engage it was ~20 % *slower*, because a CPU filter graph has to pull the frames back to
+system memory. `-hwaccel cuda -threads 8` does produce positively confirmed hardware decode on every
+sampled source — and was still slower than plain software decode on 20 of 20 clips, so it was rejected
+on evidence rather than on feasibility. Removing the request left output **byte-identical** on 20/20
+clips and gained ~10 % wall-clock at the 4-worker cap. Do not reintroduce `-hwaccel cuda`,
+`-hwaccel auto`, `-threads`, `-extra_hw_frames` or `-hwaccel_output_format cuda` on the NVENC path
+without new measurements; making real NVDEC pay off needs a GPU filter graph (`scale_cuda`/`hwdownload`),
+which is a separate architecture task, not a flag tweak.
 
 ## Environment variables
 
