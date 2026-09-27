@@ -28,9 +28,9 @@ _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
 
 # The exact set of cache primitives D1 owns. All stdlib-only by construction.
-_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_qwen_job_completed",
-          "_deterministic_analysis_completed", "_cache_entry_is_complete",
-          "_load_cache", "_save_cache", "_checkpoint_cache")
+_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_count",
+          "_reported_count", "_qwen_job_completed", "_deterministic_analysis_completed",
+          "_cache_entry_is_complete", "_load_cache", "_save_cache", "_checkpoint_cache")
 _CONSTS = ("ANALYSIS_VERSION", "_QWEN_COMPLETED_KEY", "_QWEN_SINGLE_JOB_ID",
            "_DETERMINISTIC_SCORING_KEY")
 
@@ -536,16 +536,51 @@ def test_malformed_or_incomplete_timing_is_not_completed(timing, why):
 def test_the_shared_completion_rule_is_used_by_both_paths(cache):
     """The arithmetic exists once; exercise it directly at its boundaries."""
     rule = cache["_qwen_job_completed"]
+    abc = {"a", "b", "c"}
 
-    assert rule({"frame_count": 3, "tag_count": 3}, True) is True
-    assert rule({"frame_count": 3, "tag_count": 0}, True) is False
-    assert rule({"frame_count": 3, "tag_count": 2}, True) is False
-    assert rule({"frame_count": 0, "tag_count": 0}, True) is False
-    assert rule({"frame_count": 3, "tag_count": 3}, False) is False, "no envelope, no completion"
-    assert rule(None, True) is False
-    assert rule({"frame_count": 3, "tag_count": 4}, True) is False, "more tags than frames"
-    assert rule({"frame_count": 3, "tag_count": 3}, True, 3) is True
-    assert rule({"frame_count": 3, "tag_count": 3}, True, 1) is False, "incoherent record count"
+    assert rule({"frame_count": 3, "tag_count": 3}, True, abc, abc) is True
+    assert rule({"frame_count": 3, "tag_count": 0}, True, abc, set()) is False
+    assert rule({"frame_count": 3, "tag_count": 2}, True, abc, {"a", "b"}) is False
+    assert rule({"frame_count": 0, "tag_count": 0}, True, abc, set()) is False
+    assert rule({"frame_count": 3, "tag_count": 3}, False, abc, abc) is False, "no envelope"
+    assert rule(None, True, abc, abc) is False
+    assert rule({"frame_count": 3, "tag_count": 4}, True, abc, abc) is False, "more tags than frames"
+    assert rule({"frame_count": 3, "tag_count": 3}, True, set(), set()) is False, "nothing requested"
+
+    # R5: the decoded set must cover the requested set, and the ids must be ours
+    assert rule({"frame_count": 2, "tag_count": 2}, True, abc, {"a", "b"}) is False, (
+        "2 of 3 requested candidates decoded is not complete")
+    assert rule({"frame_count": 3, "tag_count": 3}, True, abc, {"x", "y", "z"}) is False, (
+        "foreign ids are not evidence that our candidates completed")
+    assert rule({"frame_count": 3, "tag_count": 3}, True, abc, {"a", "b", "x"}) is False, (
+        "one expected id replaced by a foreign one")
+    assert rule({"frame_count": 3, "tag_count": 3}, True, abc, abc | {"x"}) is False, (
+        "an extra id means the response does not match the request")
+
+    # R5: bool is an int subclass, but it is not a count
+    assert rule({"frame_count": True, "tag_count": True}, True, {"a"}, {"a"}) is False
+    assert rule({"frame_count": 1, "tag_count": True}, True, {"a"}, {"a"}) is False
+
+
+def test_count_type_validation_rejects_bools(cache):
+    is_count = cache["_is_count"]
+    assert is_count(3) is True and is_count(0) is True
+    assert is_count(True) is False and is_count(False) is False
+    assert is_count(3.0) is False and is_count("3") is False and is_count(None) is False
+
+
+def test_a_reported_zero_count_is_not_rewritten_as_the_requested_count(cache):
+    """R5: `timing.get(key) or default` turned a genuine frame_count=0 into the requested count."""
+    reported = cache["_reported_count"]
+
+    assert reported({"frame_count": 0}, "frame_count", 10) == 0, "a real zero must stay zero"
+    assert reported({"tag_count": 0}, "tag_count", 7) == 0
+    assert reported({"frame_count": 4}, "frame_count", 10) == 4
+    # absent -> the caller's default is the only information available
+    assert reported({}, "frame_count", 10) == 10
+    assert reported(None, "frame_count", 10) == 10
+    # present but unreadable is not evidence of anything
+    assert reported({"frame_count": "three"}, "frame_count", 10) == 0
 
 
 def test_an_empty_worker_response_is_not_completed():
@@ -609,6 +644,90 @@ def test_no_selected_candidates_is_a_completed_no_op():
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
     assert info["qwen_tag_count"] == 0
     assert ns["_calls"]["worker_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R5: the requested Qwen candidate set must be covered end to end
+# ---------------------------------------------------------------------------
+
+
+def _single(ns, candidate_count=3):
+    return ns["_annotate_candidates_with_qwen"](
+        video_file=r"C:\src\clip.mp4", fps=25.0,
+        candidates=[{"id": f"clip.mp4-{i}"} for i in range(candidate_count)],
+        qwen_model_path="m", use_gpu=False, audio_profile={})
+
+
+def test_a_decoded_subset_of_the_requested_candidates_is_not_complete():
+    """R5's core defect: `_prefetch_candidate_frames` returns only the frames it could read, so
+    requested=3 / decoded=2 / tagged=2 satisfied R4's `tag_count == frame_count` while one requested
+    candidate silently had no semantics at all."""
+    response = _worker_ok(frame_count=2, tag_count=2, semantics=_semantic_records(2))
+    ns = _load_pipeline(response)
+
+    info = _single(ns, candidate_count=3)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert info["qwen_frame_count"] == 2, "the worker's own count is reported, not the request"
+
+
+def test_full_coverage_of_the_requested_set_is_complete():
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=3, semantics=_semantic_records(3)))
+    info = _single(ns, candidate_count=3)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is True
+    assert info["qwen_frame_count"] == 3 and info["qwen_tag_count"] == 3
+
+
+def test_semantics_for_foreign_candidate_ids_are_not_completion_evidence():
+    """Counts look perfect, but none of the returned ids are ours."""
+    foreign = {f"other.mp4-{i}": {"action": 0.9} for i in range(3)}
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=3, semantics=foreign))
+
+    info = _single(ns, candidate_count=3)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert ns["_calls"]["merged"] == [], "nothing of ours could be merged"
+
+
+def test_one_requested_id_replaced_by_a_foreign_id_is_not_complete():
+    mixed = {"clip.mp4-0": {"action": 0.9}, "clip.mp4-1": {"action": 0.9},
+             "other.mp4-9": {"action": 0.9}}
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=3, semantics=mixed))
+
+    info = _single(ns, candidate_count=3)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1"], (
+        "the two genuine tags are still merged; only the verdict changes")
+
+
+def test_an_extra_foreign_id_alongside_a_full_set_is_not_complete():
+    extra = dict(_semantic_records(3))
+    extra["other.mp4-9"] = {"action": 0.9}
+    ns = _load_pipeline(_worker_ok(frame_count=3, tag_count=3, semantics=extra))
+
+    assert _single(ns, candidate_count=3)[ns["_QWEN_COMPLETED_KEY"]] is False
+
+
+def test_a_reported_zero_frame_count_is_reported_back_as_zero():
+    """R5: it used to be rewritten as the requested candidate count in the stored timings."""
+    ns = _load_pipeline(_worker_ok(frame_count=0, tag_count=0, semantics={}))
+    info = _single(ns, candidate_count=3)
+
+    assert info[ns["_QWEN_COMPLETED_KEY"]] is False
+    assert info["qwen_frame_count"] == 0, "a genuine zero must survive into the timings"
+    assert info["qwen_tag_count"] == 0
+
+
+def test_bool_counts_are_rejected_by_the_single_path():
+    response = {
+        "model_load_seconds": 8.0, "model_id": "q", "batch_size": 1, "peak_vram_gb": 3.0,
+        "timings_by_job": {"single": {"frame_count": True, "tag_count": True}},
+        "semantics": {"clip.mp4-0": {"action": 0.9}},
+    }
+    ns = _load_pipeline(response)
+    assert _single(ns, candidate_count=1)[ns["_QWEN_COMPLETED_KEY"]] is False
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +838,59 @@ def test_a_successful_sibling_survives_a_failing_one(cache, tmp_path):
 
     assert good["ai_enabled"] is True and os.path.exists(good_path)
     assert half["ai_enabled"] is False and not os.path.exists(half_path)
+
+
+def test_a_batch_job_with_full_counts_but_foreign_ids_is_not_complete(cache, tmp_path):
+    """R5 in the batch path: perfect counts, but the semantics are for someone else's candidates."""
+    response = _batch_response({"1": (3, 3, 3, "good.mp4")})
+    response["semantics_by_job"]["1"] = {f"other.mp4-{i}": {"action": 0.9} for i in range(3)}
+    ns = _load_batch(response)
+    record = _deferred_record(cache["ANALYSIS_VERSION"], "good.mp4")
+    path = str(tmp_path / "good.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": path}, record)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+
+    assert record["ai_enabled"] is False
+    assert not os.path.exists(path)
+
+
+def test_a_batch_job_that_decoded_only_a_subset_is_not_complete(cache, tmp_path):
+    """requested 3, decoded 2, tagged 2 - R4 accepted this."""
+    ns = _load_batch(_batch_response({"1": (2, 2, 2, "part.mp4")}))
+    record = _deferred_record(cache["ANALYSIS_VERSION"], "part.mp4")
+    path = str(tmp_path / "part.json")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": path}, record)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+
+    assert record["ai_enabled"] is False
+    assert not os.path.exists(path)
+    assert record["timings"]["qwen_frame_count"] == 2, "the worker's own count is stored"
+
+
+def test_one_complete_job_survives_two_differently_broken_siblings(cache, tmp_path):
+    """§8: complete + decoded-subset + foreign-ids, all in one batch."""
+    response = _batch_response({"1": (3, 3, 3, "ok.mp4"),
+                                "2": (2, 2, 2, "subset.mp4"),
+                                "3": (3, 3, 3, "foreign.mp4")})
+    response["semantics_by_job"]["3"] = {f"elsewhere-{i}": {"action": 0.9} for i in range(3)}
+    ns = _load_batch(response)
+
+    records = {name: _deferred_record(cache["ANALYSIS_VERSION"], f"{name}.mp4")
+               for name in ("ok", "subset", "foreign")}
+    paths = {name: str(tmp_path / f"{name}.json") for name in records}
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=[({"index": i, "cache_file": paths[name]}, records[name])
+                     for i, name in enumerate(("ok", "subset", "foreign"), 1)],
+        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=3)
+
+    assert records["ok"]["ai_enabled"] is True and os.path.exists(paths["ok"])
+    assert records["subset"]["ai_enabled"] is False and not os.path.exists(paths["subset"])
+    assert records["foreign"]["ai_enabled"] is False and not os.path.exists(paths["foreign"])
 
 
 def test_a_requested_job_absent_from_the_response_is_not_complete(cache, tmp_path):

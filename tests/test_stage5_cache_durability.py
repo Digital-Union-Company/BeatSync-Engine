@@ -179,8 +179,9 @@ def test_the_deferred_batch_path_checkpoints_each_job_independently(tree):
 def test_single_qwen_completion_comes_from_an_explicit_signal(tree, module_source):
     """Not from "no exception raised", and not from a non-zero tag count.
 
-    A worker that dies and a worker that legitimately returns zero tags are different outcomes; the
-    pre-D1 code could not tell them apart and marked both AI-complete.
+    A worker that dies and a worker that finished are different outcomes, and the pre-D1 code could
+    not tell them apart. A finished worker is still not proof of completed AI work - see
+    ``_qwen_job_completed`` and the behavioural suite.
     """
     deferred = _func(tree, "_complete_deferred_qwen")
     body = ast.unparse(deferred)
@@ -320,21 +321,33 @@ def test_both_qwen_paths_share_one_completion_rule(tree):
     """The arithmetic must exist once, so single and batch cannot drift apart."""
     rule = _func(tree, "_qwen_job_completed")
     body = ast.unparse(rule)
+    args = [arg.arg for arg in rule.args.args + rule.args.kwonlyargs]
 
     assert "frame_count" in body and "tag_count" in body
-    assert "envelope_present" in ast.unparse(rule.args), "the envelope is an input to the rule"
+    assert "envelope_present" in args, "the envelope is an input to the rule"
+    assert "requested_ids" in args and "returned_ids" in args, (
+        f"R5: the requested and returned candidate sets are inputs; got {args}")
 
     for caller in ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch"):
         calls = _calls(_func(tree, caller), "_qwen_job_completed")
         assert calls, f"{caller} must use the shared rule"
 
-    # frame_count > 0 and tag_count == frame_count are both load-bearing
+    # R5: frame_count is compared against the REQUESTED set size, not merely against zero
     assert any(isinstance(node, ast.Compare) and "frame_count" in ast.unparse(node)
-               and any(isinstance(op, (ast.LtE, ast.Lt)) for op in node.ops)
-               for node in ast.walk(rule)), "a zero frame count must not count as completion"
+               and "len(expected)" in ast.unparse(node)
+               for node in ast.walk(rule)), (
+        "every requested candidate must have been decoded, not just 'more than none'")
+    # an empty request can never be complete (that is the candidate-less case, handled elsewhere)
+    assert any(isinstance(node, ast.If) and "not expected" in ast.unparse(node.test)
+               for node in ast.walk(rule)), "an empty requested set must be rejected here"
     assert any(isinstance(node, ast.Compare) and any(isinstance(op, ast.NotEq) for op in node.ops)
                and "tag_count" in ast.unparse(node) and "frame_count" in ast.unparse(node)
                for node in ast.walk(rule)), "every decoded frame must have produced a semantic"
+    # and the ids must be ours, exactly
+    assert any(isinstance(node, ast.Compare) and any(isinstance(op, ast.Eq) for op in node.ops)
+               and "returned" in ast.unparse(node) and "expected" in ast.unparse(node)
+               for node in ast.walk(rule)), "the returned semantic ids must equal the requested ids"
+    assert _calls(rule, "_is_count"), "bools must be rejected as counts"
 
 
 def test_batch_completion_also_delegates_to_the_shared_rule(tree):
@@ -353,9 +366,11 @@ def test_batch_completion_also_delegates_to_the_shared_rule(tree):
 def test_worker_counts_are_read_defensively(tree):
     """A malformed subprocess payload must not crash the analysis with ValueError."""
     _func(tree, "_coerce_count")
+    _func(tree, "_reported_count")
     for name in ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch"):
         func = _func(tree, name)
-        assert _calls(func, "_coerce_count"), f"{name} must coerce worker counts safely"
+        assert _calls(func, "_reported_count") or _calls(func, "_coerce_count"), (
+            f"{name} must read worker counts through a coercing helper")
         bare_int_on_counts = [
             node for node in ast.walk(func)
             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "int"
@@ -364,6 +379,25 @@ def test_worker_counts_are_read_defensively(tree):
         assert not bare_int_on_counts, (
             f"{name} still calls int() directly on a worker count: "
             f"{[ast.unparse(n) for n in bare_int_on_counts]}")
+
+
+def test_a_reported_zero_count_is_never_replaced_by_a_fallback(tree):
+    """R5: `timing.get(key) or default` rewrote a genuine 0 into the requested candidate count."""
+    reporter = _func(tree, "_reported_count")
+    assert any(isinstance(node, ast.Compare) and any(isinstance(op, ast.In) for op in node.ops)
+               for node in ast.walk(reporter)), (
+        "presence must decide, not truthiness")
+
+    for name in ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch"):
+        func = _func(tree, name)
+        truthy_fallbacks = [
+            ast.unparse(node) for node in ast.walk(func)
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+            and ("frame_count" in ast.unparse(node) or "tag_count" in ast.unparse(node))
+            and "get(" in ast.unparse(node)
+        ]
+        assert not truthy_fallbacks, (
+            f"{name} still uses an `or`-fallback on a worker count: {truthy_fallbacks}")
 
 
 def test_the_deterministic_scoring_evidence_discriminator_exists(tree):

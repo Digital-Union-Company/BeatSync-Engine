@@ -60,9 +60,9 @@ cold rebuild is 0.85–1.26 hours, all of which a single Ctrl-C could previously
 - **`ai_enabled` stopped lying.** Previously `_complete_deferred_qwen` swallowed a Qwen exception and
   then set `ai_enabled=True` unconditionally, so a failed run was cached as AI-complete and Qwen
   never retried for that source. Completion now comes from an explicit signal the Qwen facade
-  reports on every return path — *not* from "no exception was raised", and *not* from tag count,
-  because a dead worker and a worker that legitimately returns zero tags both produce
-  `qwen_tag_count == 0`. Deterministic candidates and visual tags are untouched on failure.
+  reports on every return path — *not* from "no exception was raised". (What that signal is allowed to
+  mean was itself tightened twice afterwards; see R4 and R5 below.) Deterministic candidates and
+  visual tags are untouched on failure.
 - **Batch failure is judged per job.** A globally non-empty `semantics_by_job` was being treated as
   proof that every requested job completed; a job simply absent from the response became
   `ai_enabled=True` with 0 tags and was reused as AI-complete forever. Completion is now a per-job
@@ -140,6 +140,31 @@ successful worker process can still return an incomplete per-job semantic result
 now read through `_coerce_count`, closing a latent `ValueError` crash on a malformed payload (present
 in the batch path before R4). The candidate-less no-Qwen-work case is untouched and remains separate:
 no job is submitted, so the per-frame rule does not apply to it.
+
+**R5 — completion must cover the *requested* candidate set, not just the decoded one.** R4 required
+`frame_count > 0` and `tag_count == frame_count`, which proves every *decoded* frame was tagged. But
+`_prefetch_candidate_frames` returns only the frames it could actually read
+(`ready = [p for p in plans if p["image"] is not None]`), so `frame_count` can be smaller than the
+candidate set the parent submitted — the worker even logs `{len(ready)}/{len(candidates)}`. Measured
+against the R4 commit: a job requesting 3 candidates that decoded and tagged only 2 was reported
+complete and cached as AI-complete, leaving a requested candidate with no semantics at all.
+
+Completion now requires the requested set to be covered end to end — `frame_count` must equal the
+number of candidates `_select_ai_candidates` submitted, `tag_count` must equal `frame_count`, and the
+**returned semantic ids must equal the requested ids exactly**. R4 passed only
+`len(semantic_by_id)`, so a response whose counts looked perfect but whose ids were foreign counted as
+completion; measured on R4, three foreign ids satisfied it. An extra id now also fails, because the
+worker keys semantics by our own candidate ids and anything else means the response does not match the
+request.
+
+Two robustness corrections alongside it. A worker-reported `frame_count = 0` was being rewritten into
+the requested candidate count in the stored timings by `timing.get(key) or default`; `_reported_count`
+now decides on **presence**, so a genuine zero survives and the fallback applies only when the field is
+absent. And `bool` subclasses `int`, so R4's `isinstance(..., int)` check accepted
+`frame_count: true` and then compared it equal to 1; `_is_count` rejects bools.
+
+The candidate-less no-Qwen-work case is untouched and deliberately does **not** go through these
+requested-count rules: no job is submitted, so there is nothing to cover.
 
 `BEATSYNC_QWEN_MAX_WINDOWS=0` now reports not-completed rather than AI-complete, deliberately:
 `QWEN_MAX_WINDOWS` is not part of cache identity, so a knowingly Qwen-less record must not be stored

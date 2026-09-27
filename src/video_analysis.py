@@ -240,47 +240,83 @@ def _coerce_count(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _is_count(value: Any) -> bool:
+    """[FORK] Digital-Union (D1 R5): a real integer count, not a bool.
+
+    ``bool`` subclasses ``int``, so ``isinstance(True, int)`` is ``True`` and a response carrying
+    ``frame_count: true`` would otherwise have passed the R4 type check and then compared equal to 1.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _reported_count(timing: Any, key: str, default: int) -> int:
+    """[FORK] Digital-Union (D1 R5): report the worker's own count, including a genuine zero.
+
+    ``timing.get(key) or default`` silently rewrote a real ``frame_count = 0`` into the requested
+    candidate count, so the stored timings claimed frames that were never decoded. Presence decides:
+    a present value is used (coerced to 0 if unreadable, because "present but malformed" is not
+    evidence of anything), and the caller's default applies only when the field is genuinely absent.
+    """
+    if isinstance(timing, dict) and key in timing:
+        return _coerce_count(timing.get(key), 0)
+    return int(default)
+
+
 def _qwen_job_completed(timing: Any, envelope_present: bool,
-                        semantic_record_count: int | None = None) -> bool:
-    """[FORK] Digital-Union (D1 R4): did the AI work for one *submitted* Qwen job actually complete?
+                        requested_ids: Any, returned_ids: Any) -> bool:
+    """[FORK] Digital-Union (D1 R5): did the AI work for one *submitted* Qwen job actually complete?
 
     Shared by the single and batch paths so the arithmetic exists once.
 
-    Response-envelope membership alone is **not** enough, which is what R2/R3 got wrong. Read against
-    the worker: ``_run_semantics_for_video`` always returns a timings dict and ``main`` always records
-    it under the job id, so the envelope only proves *the job loop returned*. Inside that loop,
-    ``_normalize_semantic`` yields ``{}`` for any candidate whose semantic content is invalid,
-    ``_run_inference_wave`` classifies ``{}`` as failed and retries it (server retry, reduced-slot
-    restart, serial fallback), and a candidate still failing afterwards is simply **absent** from the
-    returned semantics. The worker then publishes ``frame_count = len(frame_items)`` (what prefetch
-    decoded) and ``tag_count = len(semantics)``.
+    Three earlier definitions of this were too weak, in order:
 
-    So completion for a submitted job is:
+    1. *emptiness of ``semantics``* - conflated a finished worker with a dead one (fixed in R2);
+    2. *response-envelope membership alone* - ``_run_semantics_for_video`` always returns a timings
+       dict and ``main`` always records it under the job id, so the envelope only proves **the job
+       loop returned**. Inside that loop ``_normalize_semantic`` yields ``{}`` for any candidate whose
+       semantic content is invalid, ``_run_inference_wave`` classifies ``{}`` as failed and retries it
+       (server retry, reduced-slot restart, serial fallback), and a candidate still failing is simply
+       **absent** from the returned semantics (fixed in R4);
+    3. *``tag_count == frame_count``* - proves every *decoded* frame was tagged, but
+       ``_prefetch_candidate_frames`` returns only the frames it could actually read
+       (``ready = [p for p in plans if p["image"] is not None]``), so ``frame_count`` may be **smaller
+       than the requested candidate set**. A job that asked for 10 candidates, decoded 8 and tagged 8
+       therefore looked complete while 2 candidates silently had no semantics at all (this, R5).
 
-    * the expected per-job envelope exists;
-    * ``timing`` is a dict;
-    * ``frame_count > 0`` — otherwise no AI frame work happened at all;
-    * ``tag_count == frame_count`` — every decoded frame item produced a valid normalized semantic.
+    Completion now requires the requested set to be covered end to end:
 
-    ``tag_count`` alone is never the predicate; it is meaningful only against the envelope and the
-    actual ``frame_count``. ``semantic_record_count``, when supplied, additionally rejects an
-    incoherent response that claims more tags than it returned semantic records for.
+    * the expected per-job envelope exists and ``timing`` is a dict;
+    * ``frame_count`` and ``tag_count`` are real integer counts (not bools);
+    * the requested candidate set is non-empty;
+    * ``frame_count == len(requested_ids)`` - every requested candidate was decoded;
+    * ``tag_count == frame_count`` - every decoded frame produced a valid semantic;
+    * ``returned_ids == requested_ids`` - and those semantics are for *our* candidates. A foreign id
+      is not evidence that one of ours completed, and an extra id means the response does not match
+      the request; the worker keys semantics by our own candidate ids, so an exact match is the
+      contract.
 
-    A source with no candidates never submits a job at all — that is the separate no-Qwen-work case
+    Neither the envelope nor a count is sufficient alone. ``requested_ids`` is the set selected by
+    ``_select_ai_candidates`` - the candidates actually submitted - not every deterministic candidate.
+
+    A source with no candidates never submits a job at all: that is the separate no-Qwen-work case
     handled by ``_cache_entry_is_complete``/``_deterministic_analysis_completed``, not here.
     """
     if not envelope_present or not isinstance(timing, dict):
         return False
-    if not isinstance(timing.get("frame_count"), int) or not isinstance(timing.get("tag_count"), int):
-        # a non-integer count is a malformed response, not a completed job
+    if not _is_count(timing.get("frame_count")) or not _is_count(timing.get("tag_count")):
         return False
-    frame_count = _coerce_count(timing.get("frame_count"), -1)
-    tag_count = _coerce_count(timing.get("tag_count"), -1)
-    if frame_count <= 0 or tag_count != frame_count:
+    try:
+        expected = {str(item) for item in requested_ids}
+        returned = {str(item) for item in returned_ids}
+    except TypeError:
         return False
-    if semantic_record_count is not None and tag_count > semantic_record_count:
+    if not expected:
         return False
-    return True
+    frame_count = int(timing["frame_count"])
+    tag_count = int(timing["tag_count"])
+    if frame_count != len(expected) or tag_count != frame_count:
+        return False
+    return returned == expected
 
 
 def _deterministic_analysis_completed(data: Any) -> bool:
@@ -956,8 +992,8 @@ def _complete_deferred_qwen(
             event_callback=event_callback,
         )
         # [FORK] Digital-Union (D1): completion comes from the facade's explicit signal, never from
-        # "no exception was raised" and never from a non-zero tag count. A worker that dies and a
-        # worker that legitimately returns zero tags are different outcomes.
+        # "no exception was raised". The facade applies `_qwen_job_completed`, so a worker process
+        # that merely *finished* is not the same as one whose submitted candidates were all tagged.
         qwen_completed = bool((qwen_info or {}).pop(_QWEN_COMPLETED_KEY, False))
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
@@ -1105,7 +1141,10 @@ def _complete_deferred_qwen_batch(
         timing = timings_by_job.get(str(job_id), {}) if isinstance(timings_by_job, dict) else {}
         if not isinstance(timing, dict):
             timing = {}
-        job_completed = _qwen_job_completed(timing, envelope_present, len(semantic_by_id))
+        # [FORK] Digital-Union (D1 R5): same rule, using this job's own submitted candidate set.
+        job_completed = _qwen_job_completed(
+            timing, envelope_present,
+            {str(candidate.get("id")) for candidate in ai_candidates}, set(semantic_by_id))
         qwen_seconds = (
             float(timing.get("prefetch_seconds") or 0.0)
             + float(timing.get("inference_seconds") or 0.0)
@@ -1116,8 +1155,8 @@ def _complete_deferred_qwen_batch(
         timings["qwen_model_load_seconds_amortized"] = amortized_model
         timings["qwen_prefetch_seconds"] = float(timing.get("prefetch_seconds") or 0.0)
         timings["qwen_inference_seconds"] = float(timing.get("inference_seconds") or 0.0)
-        timings["qwen_frame_count"] = _coerce_count(timing.get("frame_count") or len(ai_candidates))
-        timings["qwen_tag_count"] = _coerce_count(timing.get("tag_count") or merged_count)
+        timings["qwen_frame_count"] = _reported_count(timing, "frame_count", len(ai_candidates))
+        timings["qwen_tag_count"] = _reported_count(timing, "tag_count", merged_count)
         timings["qwen_model_id"] = qwen_model_id
         timings["qwen_concurrency"] = qwen_concurrency
         timings["qwen_peak_vram_gb"] = qwen_peak_vram_gb
@@ -1130,10 +1169,10 @@ def _complete_deferred_qwen_batch(
             print(
                 f"      Qwen semantic pass incomplete for "
                 f"{_safe_name(video_data.get('video_file', 'video'))} "
-                f"({_coerce_count(timing.get('tag_count'))}/"
-                f"{_coerce_count(timing.get('frame_count'))} "
-                f"decoded frames tagged); deterministic visual tags retained and AI analysis will "
-                f"retry on the next run."
+                f"({_reported_count(timing, 'tag_count', merged_count)} of "
+                f"{_reported_count(timing, 'frame_count', 0)} decoded frames tagged for "
+                f"{len(ai_candidates)} requested candidate(s)); deterministic visual tags retained "
+                f"and AI analysis will retry on the next run."
             )
         print(
             f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)} "
@@ -1145,8 +1184,10 @@ def _complete_deferred_qwen_batch(
             f"inference {_fmt_seconds(timings['qwen_inference_seconds'])}, "
             f"model share {_fmt_seconds(amortized_model)})"
         )
-        # [FORK] Digital-Union (D1): checkpoint this job now. A later job's failure - or an abort
-        # part way through a long shared batch - must not cost work that is already finished.
+        # [FORK] Digital-Union (D1, wording corrected in R5): checkpoint this job now, so a later
+        # job's failure - or a parent interruption during this post-response merge loop - cannot cost
+        # a job that is already finished. Work still inside an in-flight worker is NOT covered: the
+        # batch response only exists once the worker's whole job loop has returned.
         _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
@@ -1758,7 +1799,9 @@ def _annotate_candidates_with_qwen(
         timing = {}
     semantics = response.get("semantics") if isinstance(response, dict) else {}
     semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
-    completed = _qwen_job_completed(timing, envelope_present, len(semantic_by_id))
+    # [FORK] Digital-Union (D1 R5): the requested set is what `_select_ai_candidates` submitted.
+    requested_ids = {str(candidate.get("id")) for candidate in ai_candidates}
+    completed = _qwen_job_completed(timing, envelope_present, requested_ids, set(semantic_by_id))
 
     merged_count = 0
     for candidate in ai_candidates:
@@ -1771,17 +1814,20 @@ def _annotate_candidates_with_qwen(
         print("      Qwen returned no usable response; deterministic visual tags remain active.")
     elif not completed:
         print(
-            f"      Qwen tagged {_coerce_count(timing.get('tag_count'))}/"
-            f"{_coerce_count(timing.get('frame_count'))} decoded frames; the semantic pass did not "
-            f"complete, so deterministic visual tags remain active and AI analysis will retry."
+            f"      Qwen tagged {_reported_count(timing, 'tag_count', merged_count)} of "
+            f"{_reported_count(timing, 'frame_count', 0)} decoded frames for "
+            f"{len(requested_ids)} requested candidate(s); the semantic pass did not complete, so "
+            f"deterministic visual tags remain active and AI analysis will retry."
         )
     else:
         print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
 
     return {
         _QWEN_COMPLETED_KEY: completed,
-        "qwen_frame_count": _coerce_count(timing.get("frame_count") or len(ai_candidates)),
-        "qwen_tag_count": _coerce_count(timing.get("tag_count") or merged_count),
+        # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback
+        # applies only when the field is genuinely absent.
+        "qwen_frame_count": _reported_count(timing, "frame_count", len(ai_candidates)),
+        "qwen_tag_count": _reported_count(timing, "tag_count", merged_count),
         "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
         "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
         "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
