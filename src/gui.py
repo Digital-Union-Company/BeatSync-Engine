@@ -275,7 +275,12 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
 
     qwen_jobs = int(video_analysis.get("qwen_jobs_this_run") or 0)
     qwen_tags_run = int(video_analysis.get("qwen_tag_count_this_run") or 0)
-    qwen_frames_run = int(video_analysis.get("qwen_frame_count_this_run") or 0)
+    # [FORK] Digital-Union (R2): the denominator is what was SUBMITTED, not what the worker managed
+    # to decode. Using the decoded frame count would render a job that requested 10 candidates and
+    # decoded only 8 as a flawless "8/8", hiding the two that never arrived - and on a worker-level
+    # failure there is no decoded count at all. Decoded frames stay available to structured
+    # consumers through `qwen_frame_count_this_run`.
+    qwen_requested_run = int(video_analysis.get("qwen_requested_count_this_run") or 0)
     qwen_incomplete = int(video_analysis.get("qwen_incomplete_jobs_this_run") or 0)
     qwen_seconds_run = video_analysis.get("qwen_seconds_this_run")
 
@@ -290,7 +295,7 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
     elif qwen_jobs == 0:
         console_logger.line("Qwen: enabled, no inference this run")
     else:
-        bits = [f"Qwen this run: {qwen_jobs} job(s)", f"{qwen_tags_run}/{qwen_frames_run} tags"]
+        bits = [f"Qwen this run: {qwen_jobs} job(s)", f"{qwen_tags_run}/{qwen_requested_run} tags"]
         # A failure path may not be able to prove elapsed time; omit it rather than understate it.
         if qwen_seconds_run:
             bits.append(f"in {_fmt_stage_seconds(qwen_seconds_run)}")

@@ -564,9 +564,19 @@ the Qwen runtime behaved correctly throughout.
   timings with no inference having happened this run.
 - **Current-run facts** carry the `_this_run` suffix (`sources_analyzed_this_run`,
   `analysis_workers_used`, `qwen_jobs_this_run`, `qwen_completed_jobs_this_run`,
-  `qwen_incomplete_jobs_this_run`, `qwen_frame_count_this_run`, `qwen_tag_count_this_run`,
-  `qwen_seconds_this_run`, `qwen_inference_seconds_this_run`). **Any claim about work performed or
-  performance achieved must use these.**
+  `qwen_incomplete_jobs_this_run`, `qwen_requested_count_this_run`, `qwen_frame_count_this_run`,
+  `qwen_tag_count_this_run`, `qwen_seconds_this_run`, `qwen_inference_seconds_this_run`). **Any
+  claim about work performed or performance achieved must use these.**
+
+**Requested, decoded and tagged are three different facts** and must not be conflated:
+`qwen_requested_count_this_run` is what was *submitted*; `qwen_frame_count_this_run` is what the
+worker *proved* it decoded; `qwen_tag_count_this_run` is what was *actually merged*. Only the first
+is knowable without a usable worker response, which is what makes a failed attempt reportable at
+all. **The UI's `N/M tags` denominator is the requested count**, never the decoded count — a job
+that requested 10 and decoded 8 must not render as a flawless `8/8`. Current-run decoded frames are
+counted only when the worker reported a real integer: the persisted `timings["qwen_frame_count"]`
+falls back to the requested count for source-record compatibility, and **that fallback must never
+leak into current-run truth** (the legacy field keeps it unchanged).
 
 Load-bearing details:
 
@@ -575,6 +585,21 @@ Load-bearing details:
   hit cannot inflate it, and a second call in the same process starts from zero. It is ephemeral
   top-level metadata: a separate object from `video_data`, so there is no path by which it reaches
   `_checkpoint_cache`. **No cache field, no cache identity, no contract bump.**
+- **Batch accounting is two-phase, and submission truth comes first.** `_complete_deferred_qwen_batch`
+  records jobs, requested candidates and the shared-worker wall time **immediately after
+  `_run_qwen_worker_batch` returns — before the empty-response branch**. A worker that timed out,
+  exited non-zero or produced an unreadable response still consumed a real attempt on real sources;
+  recording only in the per-job merge loop reported `0 jobs`, which the UI rendered as "no inference
+  this run". Every submitted job starts *incomplete* and is promoted only by its own returned
+  evidence, so an empty response leaves them all incomplete with no extra bookkeeping. The per-job
+  loop therefore must **not** increment `qwen_jobs` — that would double-count every success.
+- **Current-run wall time counts each worker invocation once.** `qwen_seconds_this_run` adds the one
+  measured `batch_seconds` for a shared batch, and the one measured call duration for a
+  single/inline invocation. Never sum the amortized per-source figures — they scale with source
+  count and would inflate the total. Worker-reported inference time is added only where it is
+  present and numeric; missing timing is absence of evidence, so it contributes zero and is never
+  invented. Accounting is observability and must stay non-fatal: it may not introduce an exception
+  on malformed timing data that the runtime would otherwise survive.
 - **A Qwen job is counted only where a request is genuinely issued**, which is why
   `qwen_jobs_this_run` is *not* `len(deferred_jobs)`. That would be wrong in both directions: the
   serial path (`_analyze_single_video` with `defer_ai=False`) runs Qwen **inline** and never appears

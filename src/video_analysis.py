@@ -78,6 +78,12 @@ def _new_run_stats() -> Dict[str, Any]:
         "qwen_jobs": 0,
         "qwen_completed_jobs": 0,
         "qwen_incomplete_jobs": 0,
+        # [FORK] Digital-Union (R2): requested, decoded and tagged are three different facts, and the
+        # UI needs the first as its denominator. `qwen_requested_count` is what was SUBMITTED,
+        # `qwen_frame_count` is what the worker PROVED it decoded, `qwen_tag_count` is what was
+        # actually merged. Only "requested" is knowable without a usable worker response, which is
+        # what makes a failed attempt reportable at all.
+        "qwen_requested_count": 0,
         "qwen_frame_count": 0,
         "qwen_tag_count": 0,
         "qwen_seconds": 0.0,
@@ -1148,6 +1154,7 @@ def analyze_video_sources(
         # consumer never has to guess which kind of number it is holding.
         sources_analyzed_this_run=int(len(jobs)),
         qwen_jobs_this_run=int(run_stats["qwen_jobs"]),
+        qwen_requested_count_this_run=int(run_stats["qwen_requested_count"]),
         qwen_tag_count_this_run=int(run_stats["qwen_tag_count"]),
         qwen_frame_count_this_run=int(run_stats["qwen_frame_count"]),
         qwen_tag_count=int(qwen_tag_count), qwen_frame_count=int(qwen_frame_count),
@@ -1173,6 +1180,7 @@ def analyze_video_sources(
         "qwen_jobs_this_run": int(run_stats["qwen_jobs"]),
         "qwen_completed_jobs_this_run": int(run_stats["qwen_completed_jobs"]),
         "qwen_incomplete_jobs_this_run": int(run_stats["qwen_incomplete_jobs"]),
+        "qwen_requested_count_this_run": int(run_stats["qwen_requested_count"]),
         "qwen_frame_count_this_run": int(run_stats["qwen_frame_count"]),
         "qwen_tag_count_this_run": int(run_stats["qwen_tag_count"]),
         "qwen_seconds_this_run": float(run_stats["qwen_seconds"]),
@@ -1497,6 +1505,20 @@ def _complete_deferred_qwen_batch(
         event_callback=event_callback,
     )
     batch_seconds = time.perf_counter() - batch_started
+    # [FORK] Digital-Union (R2): SUBMISSION truth, recorded the moment the shared worker returns and
+    # therefore BEFORE the empty-response branch below. A worker that timed out, exited non-zero or
+    # produced an unreadable response still consumed a real attempt on real sources; R1 returned
+    # early and reported `0 jobs`, which the UI rendered as "no inference this run" - false.
+    # Every submitted job starts incomplete and is promoted only by its own returned evidence, so an
+    # empty response correctly leaves all of them incomplete with no further bookkeeping.
+    # `batch_seconds` is the one measured wall time of the one shared worker invocation: added
+    # exactly once here, never per source, and never from the amortized per-source figures below.
+    if run_stats is not None:
+        run_stats["qwen_jobs"] += len(request_jobs)
+        run_stats["qwen_incomplete_jobs"] += len(request_jobs)
+        run_stats["qwen_requested_count"] += sum(
+            len(selected_by_job.get(str(job.get("job_id")), ())) for job in request_jobs)
+        run_stats["qwen_seconds"] += float(batch_seconds)
     semantics_by_job = response.get("semantics_by_job") or {}
     timings_by_job = response.get("timings_by_job") or {}
     if not semantics_by_job:
@@ -1583,18 +1605,26 @@ def _complete_deferred_qwen_batch(
         # job's failure - or a parent interruption during this post-response merge loop - cannot cost
         # a job that is already finished. Work still inside an in-flight worker is NOT covered: the
         # batch response only exists once the worker's whole job loop has returned.
-        # [FORK] Digital-Union (R1): one current-run Qwen job for this source, counted whether or
-        # not it completed. Inline rather than via a helper - see `_new_run_stats`.
+        # [FORK] Digital-Union (R2): RESPONSE truth only. The job was already counted at submission,
+        # so nothing here touches `qwen_jobs` - doing so would double-count every successful source.
+        # Completion promotes one job out of the incomplete tally; decoded/tagged/inference numbers
+        # are added only where the worker actually proved them.
         if run_stats is not None:
-            run_stats["qwen_jobs"] += 1
             if job_completed:
                 run_stats["qwen_completed_jobs"] += 1
-            else:
-                run_stats["qwen_incomplete_jobs"] += 1
-            run_stats["qwen_frame_count"] += timings["qwen_frame_count"]
-            run_stats["qwen_tag_count"] += timings["qwen_tag_count"]
-            run_stats["qwen_seconds"] += float(qwen_seconds)
-            run_stats["qwen_inference_seconds"] += float(timings["qwen_inference_seconds"])
+                run_stats["qwen_incomplete_jobs"] -= 1
+            # Decoded frames count only when the worker reported a real integer. The persisted
+            # `timings["qwen_frame_count"]` falls back to the requested count for source-record
+            # compatibility; that fallback is not evidence of decoding and must not leak into
+            # current-run truth.
+            reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
+            if _is_count(reported_frames):
+                run_stats["qwen_frame_count"] += reported_frames
+            # Tags are the semantics actually merged into candidates - directly observed.
+            run_stats["qwen_tag_count"] += merged_count
+            reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
+            if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
+                run_stats["qwen_inference_seconds"] += float(reported_inference)
         _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
@@ -2240,17 +2270,27 @@ def _annotate_candidates_with_qwen(
     # serial/inline path visible - it never appears in `deferred_jobs`. Inline rather than via a
     # helper - see `_new_run_stats`.
     if run_stats is not None:
+        # Submission truth: one attempt over `len(ai_candidates)` submitted candidates, plus the one
+        # measured wall time of this worker invocation. All true even when the response is unusable.
         run_stats["qwen_jobs"] += 1
+        run_stats["qwen_requested_count"] += len(ai_candidates)
+        run_stats["qwen_seconds"] += float(time.perf_counter() - _qwen_request_started)
+        # Response truth: completion, then only what the worker actually proved.
         if completed:
             run_stats["qwen_completed_jobs"] += 1
         else:
             run_stats["qwen_incomplete_jobs"] += 1
-        # `_reported_count` already returns a real int (bools and non-numerics rejected), so no
-        # bare int() here - that is exactly the coercion D1 banned on worker-reported counts.
-        run_stats["qwen_frame_count"] += _reported_count(timing, "frame_count", len(ai_candidates))
-        run_stats["qwen_tag_count"] += _reported_count(timing, "tag_count", merged_count)
-        run_stats["qwen_seconds"] += float(time.perf_counter() - _qwen_request_started)
-        run_stats["qwen_inference_seconds"] += float(timing.get("inference_seconds") or 0.0)
+        # Decoded frames count ONLY when reported as a real integer. `_reported_count` falls back to
+        # the requested count for source-record compatibility; that fallback stays for the persisted
+        # field but is not evidence of decoding, so it must not reach current-run truth.
+        reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
+        if _is_count(reported_frames):
+            run_stats["qwen_frame_count"] += reported_frames
+        # Tags are the semantics actually merged into candidates - directly observed.
+        run_stats["qwen_tag_count"] += merged_count
+        reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
+        if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
+            run_stats["qwen_inference_seconds"] += float(reported_inference)
     return {
         _QWEN_COMPLETED_KEY: completed,
         # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback

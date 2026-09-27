@@ -97,9 +97,34 @@ run — `total_elapsed` brackets the whole `analyze_video_sources` body and flow
 ~2.52 GB of bounded fingerprint windows were already in the OS cache, measured **~3.2–3.4 s**. The
 discrepancy is **unresolved**; this work changes reporting truth, not Stage-5 performance.
 
-Changed: `src/video_analysis.py`, `src/gui.py`, `tests/test_stage5_reporting_truth.py` (22 tests),
-`CLAUDE.md`, `CHANGELOG-FORK.md`. Suite 639 passed / 2 skipped (617 + 22 new; same two pre-existing
-`WinError 1314` symlink skips).
+**R2 — failed Qwen attempts are still current-run work.** Review of the first cut found a real
+defect in the new accounting: `_complete_deferred_qwen_batch` recorded only inside its per-job merge
+loop, which sits *after* the early return taken when the shared worker produces no usable response.
+A worker that timed out, exited non-zero or returned unreadable output therefore reported
+`qwen_jobs_this_run = 0`, and the UI rendered `Qwen: enabled, no inference this run` — false, since a
+real attempt had been made on real sources. Batch accounting is now two-phase: **submission truth**
+(jobs, requested candidates, the one measured shared-worker wall time) is recorded the moment
+`_run_qwen_worker_batch` returns, before the empty-response branch, with every submitted job starting
+incomplete; **response truth** (completion, decoded frames, merged tags, inference seconds) is
+applied per job afterwards and deliberately does not re-count the job, which would double-count every
+success.
+
+R2 also separates three facts that the first cut conflated. `qwen_requested_count_this_run` (new) is
+what was submitted, `qwen_frame_count_this_run` is what the worker proved it decoded, and
+`qwen_tag_count_this_run` is what was actually merged. The UI's `N/M tags` denominator is now the
+**requested** count: previously a job that requested 10 candidates and decoded only 8 rendered as a
+flawless `8/8`, hiding the two that never arrived, and on a worker-level failure there was no decoded
+count at all. Current-run decoded frames are counted only when the worker reports a real integer —
+the persisted `timings["qwen_frame_count"]` keeps its legacy fallback to the requested count for
+source-record compatibility, and that fallback is now prevented from leaking into current-run truth.
+Current-run wall time counts each worker invocation once (one `batch_seconds`, or one single-call
+duration), never the amortized per-source figures, which scale with source count.
+
+Changed: `src/video_analysis.py`, `src/gui.py`, `tests/test_stage5_reporting_truth.py` (34 tests),
+`CLAUDE.md`, `CHANGELOG-FORK.md`. Suite 651 passed / 2 skipped (617 + 34 new; same two pre-existing
+`WinError 1314` symlink skips). The R2 tests execute the real `_annotate_candidates_with_qwen` and
+`_complete_deferred_qwen_batch` bodies with only the worker subprocess stubbed — the first cut
+asserted on shape and so never exercised the failure path it got wrong.
 
 ### Fixed — 2026-09-27 (Qwen targeted semantic recovery: one persistent rejection no longer retires a source)
 
