@@ -261,48 +261,57 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
     if console_logger is None or not isinstance(video_analysis, dict):
         return
 
+    # [FORK] Digital-Union (R1): Stage 5 returns two different kinds of number and this summary used
+    # to blend them. The `qwen_*` fields without a `_this_run` suffix aggregate the whole returned
+    # library, cache hits included, so a fully warm run rendered the cached library's historical
+    # 8704/8704 tags and 3031.9s of inference as if this invocation had produced them - while the
+    # five-line budget pushed out the one line that was actually true of the run. Current-run truth
+    # is now sourced exclusively from the explicit `*_this_run` fields, and the lines are ordered so
+    # the authoritative `Analysis time … cache H/N` can never be the one that gets dropped.
     source_count = int(video_analysis.get("source_count") or len(video_analysis.get("videos") or []))
-    worker_count = int(video_analysis.get("worker_count") or 1)
     cache_hits = int(video_analysis.get("cache_hits") or 0)
+    analyzed = int(video_analysis.get("sources_analyzed_this_run") or 0)
     ai_enabled = bool(video_analysis.get("ai_enabled"))
-    qwen_total = int(video_analysis.get("qwen_frame_count") or 0)
-    qwen_tags = int(video_analysis.get("qwen_tag_count") or 0)
-    model_id = _short_model_name(video_analysis.get("qwen_model_id"))
-    batch_size = int(video_analysis.get("qwen_concurrency") or 0)
 
-    console_logger.line(f"Source videos: {source_count}, visual workers: {worker_count}")
-    if ai_enabled:
-        qwen_bits = ["Qwen: enabled"]
-        if model_id:
-            qwen_bits.append(f"model {model_id}")
-        if batch_size:
-            qwen_bits.append(f"batch {batch_size}")
-        console_logger.line(", ".join(qwen_bits))
-        if qwen_total:
-            inference_seconds = float(video_analysis.get("qwen_inference_seconds") or video_analysis.get("qwen_seconds") or 0.0)
-            qwen_rate = (qwen_total / inference_seconds) if inference_seconds > 0 else 0.0
-            peak_vram = float(video_analysis.get("qwen_peak_vram_gb") or 0.0)
-            perf_bits = []
-            if batch_size:
-                perf_bits.append(f"batch {batch_size}")
-            if peak_vram > 0:
-                perf_bits.append(f"~{peak_vram:.2f} GB VRAM")
-            if qwen_rate > 0:
-                perf_bits.append(f"{qwen_rate:.2f} candidates/s")
-            if perf_bits:
-                console_logger.line(f"Qwen performance: {', '.join(perf_bits)}")
-            console_logger.line(
-                f"Qwen tags: {qwen_tags}/{qwen_total} in {_fmt_stage_seconds(video_analysis.get('qwen_seconds'))}"
-            )
-    else:
+    qwen_jobs = int(video_analysis.get("qwen_jobs_this_run") or 0)
+    qwen_tags_run = int(video_analysis.get("qwen_tag_count_this_run") or 0)
+    qwen_frames_run = int(video_analysis.get("qwen_frame_count_this_run") or 0)
+    qwen_incomplete = int(video_analysis.get("qwen_incomplete_jobs_this_run") or 0)
+    qwen_seconds_run = video_analysis.get("qwen_seconds_this_run")
+
+    # 1. sources / cache / analysed-this-run
+    console_logger.line(
+        f"Sources: {source_count}, cache {cache_hits}/{source_count}, analyzed this run {analyzed}"
+    )
+
+    # 2. current-run Qwen status - never the library aggregate
+    if not ai_enabled:
         console_logger.line("Qwen: disabled")
+    elif qwen_jobs == 0:
+        console_logger.line("Qwen: enabled, no inference this run")
+    else:
+        bits = [f"Qwen this run: {qwen_jobs} job(s)", f"{qwen_tags_run}/{qwen_frames_run} tags"]
+        # A failure path may not be able to prove elapsed time; omit it rather than understate it.
+        if qwen_seconds_run:
+            bits.append(f"in {_fmt_stage_seconds(qwen_seconds_run)}")
+        if qwen_incomplete:
+            bits.append(f"{qwen_incomplete} incomplete, not cached")
+        console_logger.line(", ".join(bits))
 
-    summary = video_analysis.get("summary")
-    if summary:
-        console_logger.line(f"Visual library: {summary}")
+    # 3. the authoritative measurement - must survive the five-line budget
     console_logger.line(
         f"Analysis time: {_fmt_stage_seconds(video_analysis.get('analysis_seconds'))}, cache {cache_hits}/{source_count}"
     )
+
+    # 4. library summary
+    summary = video_analysis.get("summary")
+    if summary:
+        console_logger.line(f"Visual library: {summary}")
+
+    # 5. optional historical metadata, explicitly labelled as cached and only if space remains.
+    library_tags = int(video_analysis.get("qwen_tag_count") or 0)
+    if ai_enabled and library_tags and qwen_jobs == 0:
+        console_logger.line(f"Cached library: {library_tags} previously tagged candidates")
 
 
 def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict | None) -> None:
