@@ -956,6 +956,229 @@ def test_poison_pill_order_does_not_matter(ns, tmp_path):
     assert math.isfinite(_aggregate([bad, good])["qwen_seconds"])
 
 
+# ================================================ 9b. FINITE PARTS, OVERFLOWING SUMS (R2)
+#
+# R1 validated every telemetry scalar individually and made the *final library aggregate*
+# overflow-safe, then claimed newly written records carry no non-finite telemetry. Review found two
+# earlier sums still using raw floating-point addition, so that claim did not hold. Both are
+# reproduced here as behaviour, against the real extracted bodies:
+#
+#   1e308 (valid) + 1e308 (valid) -> inf
+#
+# Measured on the R1 head before this fix: the per-job case wrote `"qwen_seconds": Infinity` into a
+# checkpointed record whose semantics were *complete*, so the source stayed reusable while carrying
+# precisely the value R1 existed to exclude; and the current-run totals reached `inf` in both the
+# batch and the inline path. Validating the parts is necessary but not sufficient - every telemetry
+# sum has to preserve finiteness too.
+_OVERFLOW = 1e308
+
+
+def test_per_job_sum_of_two_valid_durations_cannot_overflow_the_stored_record(tmp_path):
+    """A. prefetch and inference are each individually valid; their sum is not representable."""
+    record, stats, scope = _run_batch(
+        tmp_path, timing={"prefetch_seconds": _OVERFLOW, "inference_seconds": _OVERFLOW})
+    timings = record["timings"]
+    # each part was accepted on its own merits - the inputs really were valid
+    assert timings["qwen_prefetch_seconds"] == _OVERFLOW
+    assert timings["qwen_inference_seconds"] == _OVERFLOW
+    # ...and the sum is still a finite, non-negative number rather than `inf`
+    assert math.isfinite(timings["qwen_seconds"])
+    assert timings["qwen_seconds"] >= 0.0
+    # completion is decided without consulting any duration, so it is untouched
+    assert record["ai_enabled"] is True
+    assert stats["qwen_completed_jobs"] == 1
+    # and the record is still durable
+    assert os.path.exists(str(tmp_path / "a.json"))
+
+
+def test_the_checkpointed_json_from_an_overflowing_sum_has_no_infinity(tmp_path):
+    """The R1-head failure was visible on disk as `"qwen_seconds": Infinity`."""
+    _run_batch(tmp_path, timing={"prefetch_seconds": _OVERFLOW, "inference_seconds": _OVERFLOW},
+               top={"model_load_seconds": _OVERFLOW})
+    path = str(tmp_path / "a.json")
+    assert os.path.exists(path)
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "Infinity" not in text
+    assert "NaN" not in text
+    stored = json.loads(text)["timings"]
+    for key in ("qwen_seconds", "qwen_prefetch_seconds", "qwen_inference_seconds",
+                "qwen_model_load_seconds_amortized", "total_seconds"):
+        assert math.isfinite(stored[key]), key
+        assert stored[key] >= 0.0, key
+
+
+def test_an_overflowing_per_job_sum_leaves_the_record_reusable(ns, tmp_path):
+    """The whole point: a complete job stays cacheable, and what it stores is readable next run."""
+    record, _, scope = _run_batch(
+        tmp_path, timing={"prefetch_seconds": _OVERFLOW, "inference_seconds": _OVERFLOW})
+    with open(str(tmp_path / "a.json"), encoding="utf-8") as handle:
+        stored = json.load(handle)
+    assert scope["_cache_entry_is_complete"](stored, True) is True
+    result = _aggregate([stored])
+    assert math.isfinite(result["qwen_seconds"])
+    assert math.isfinite(result["qwen_inference_seconds"])
+
+
+@pytest.mark.parametrize("model_load", [8.0, _OVERFLOW])
+def test_an_overflowing_amortized_model_share_stays_finite(tmp_path, model_load):
+    record, _, _ = _run_batch(tmp_path, timing={"inference_seconds": _OVERFLOW},
+                              top={"model_load_seconds": model_load})
+    assert math.isfinite(record["timings"]["qwen_seconds"])
+    assert math.isfinite(record["timings"]["qwen_model_load_seconds_amortized"])
+
+
+def test_current_run_batch_inference_total_cannot_overflow(tmp_path):
+    """B. two submitted jobs, each reporting an individually valid duration."""
+    frames = 3
+    response = {
+        "semantics_by_job": {"1": _semantics("a.mp4", frames), "2": _semantics("b.mp4", frames)},
+        "timings_by_job": {
+            job: {"frame_count": frames, "tag_count": frames,
+                  "prefetch_seconds": 0.1, "inference_seconds": _OVERFLOW}
+            for job in ("1", "2")},
+        "model_load_seconds": 8.0, "model_id": "qwen3vl-2b",
+        "batch_size": 4, "peak_vram_gb": 3.0,
+    }
+    scope = _namespace(_run_qwen_worker_batch=lambda **kwargs: response,
+                       _env_int=lambda name, default, lo=None, hi=None: default)
+    first, second = _deferred_record(scope, "a.mp4", n=frames), _deferred_record(scope, "b.mp4", n=frames)
+    stats = _new_stats()
+    scope["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": str(tmp_path / "a.json")}, first),
+                     ({"index": 2, "cache_file": str(tmp_path / "b.json")}, second)],
+        use_gpu=False, qwen_model_path="m.gguf", audio_profile={},
+        total_video_count=2, run_stats=stats)
+    assert stats["qwen_jobs"] == 2
+    assert stats["qwen_completed_jobs"] == 2
+    assert math.isfinite(stats["qwen_inference_seconds"])
+    assert stats["qwen_inference_seconds"] >= 0.0
+    assert math.isfinite(stats["qwen_seconds"])
+
+
+def test_current_run_inline_inference_total_cannot_overflow():
+    """C. one `run_stats` shared across two real facade calls, as the serial path does."""
+    response = _single_response(timing={"inference_seconds": _OVERFLOW})
+    scope = _namespace(_run_qwen_worker=lambda **kwargs: response)
+    stats = _new_stats()
+    for _ in range(2):
+        candidates = [{"id": f"c-{i}", "start": i, "end": i + 2, "action_score": 0.5,
+                       "beauty_score": 0.4, "quality_score": 0.6, "editorial_score": 0.9 - i * 0.1}
+                      for i in range(3)]
+        scope["_annotate_candidates_with_qwen"](
+            video_file=r"C:\src\a.mp4", fps=25.0, candidates=candidates,
+            qwen_model_path="m.gguf", use_gpu=False, audio_profile={}, run_stats=stats)
+    assert stats["qwen_jobs"] == 2
+    assert math.isfinite(stats["qwen_inference_seconds"])
+    assert stats["qwen_inference_seconds"] >= 0.0
+
+
+def test_current_run_wall_time_is_still_parent_measured_and_counted_once(tmp_path):
+    """D. R2 routes this through `_telemetry_total`; the semantics must not move."""
+    _, stats, _ = _run_batch(tmp_path, timing={"inference_seconds": _OVERFLOW,
+                                               "prefetch_seconds": _OVERFLOW})
+    assert stats["qwen_seconds"] > 0.0, "a real measured duration, not zeroed"
+    assert math.isfinite(stats["qwen_seconds"])
+    assert stats["qwen_seconds"] < 60.0, "one stubbed invocation, not a worker-supplied 1e308"
+    assert stats["qwen_jobs"] == 1
+
+
+def test_inline_wall_time_accumulates_once_per_invocation():
+    response = _single_response()
+    scope = _namespace(_run_qwen_worker=lambda **kwargs: response)
+    stats = _new_stats()
+    seen = []
+    for _ in range(3):
+        candidates = [{"id": f"c-{i}", "start": i, "end": i + 2, "action_score": 0.5,
+                       "beauty_score": 0.4, "quality_score": 0.6, "editorial_score": 0.9 - i * 0.1}
+                      for i in range(3)]
+        scope["_annotate_candidates_with_qwen"](
+            video_file=r"C:\src\a.mp4", fps=25.0, candidates=candidates,
+            qwen_model_path="m.gguf", use_gpu=False, audio_profile={}, run_stats=stats)
+        seen.append(stats["qwen_seconds"])
+    assert stats["qwen_jobs"] == 3
+    assert seen == sorted(seen), "monotonically accumulating, one measurement per invocation"
+    assert math.isfinite(stats["qwen_seconds"]) and stats["qwen_seconds"] > 0.0
+
+
+def test_healthy_telemetry_sums_are_unchanged_by_the_overflow_fix(tmp_path):
+    """E. 1.0 prefetch + 4.0 inference + 2.0 model share is still exactly 7.0."""
+    record, stats, _ = _run_batch(
+        tmp_path, timing={"prefetch_seconds": 1.0, "inference_seconds": 4.0},
+        top={"model_load_seconds": 2.0})
+    timings = record["timings"]
+    assert timings["qwen_prefetch_seconds"] == pytest.approx(1.0)
+    assert timings["qwen_inference_seconds"] == pytest.approx(4.0)
+    assert timings["qwen_model_load_seconds_amortized"] == pytest.approx(2.0)
+    assert timings["qwen_seconds"] == pytest.approx(7.0)
+    assert stats["qwen_inference_seconds"] == pytest.approx(4.0)
+
+
+def test_healthy_multi_job_inference_totals_still_add_up(tmp_path):
+    """Overflow safety must not have turned accumulation into something lossy."""
+    frames = 3
+    response = {
+        "semantics_by_job": {"1": _semantics("a.mp4", frames), "2": _semantics("b.mp4", frames)},
+        "timings_by_job": {
+            "1": {"frame_count": frames, "tag_count": frames,
+                  "prefetch_seconds": 0.1, "inference_seconds": 4.0},
+            "2": {"frame_count": frames, "tag_count": frames,
+                  "prefetch_seconds": 0.1, "inference_seconds": 6.0}},
+        "model_load_seconds": 8.0, "model_id": "qwen3vl-2b",
+        "batch_size": 4, "peak_vram_gb": 3.0,
+    }
+    scope = _namespace(_run_qwen_worker_batch=lambda **kwargs: response,
+                       _env_int=lambda name, default, lo=None, hi=None: default)
+    first, second = _deferred_record(scope, "a.mp4", n=frames), _deferred_record(scope, "b.mp4", n=frames)
+    stats = _new_stats()
+    scope["_complete_deferred_qwen_batch"](
+        video_items=[({"index": 1, "cache_file": str(tmp_path / "a.json")}, first),
+                     ({"index": 2, "cache_file": str(tmp_path / "b.json")}, second)],
+        use_gpu=False, qwen_model_path="m.gguf", audio_profile={},
+        total_video_count=2, run_stats=stats)
+    assert stats["qwen_inference_seconds"] == pytest.approx(10.0)
+    assert first["timings"]["qwen_seconds"] == pytest.approx(0.1 + 4.0 + 4.0)
+    assert second["timings"]["qwen_seconds"] == pytest.approx(0.1 + 6.0 + 4.0)
+
+
+def test_a_legitimate_zero_sum_is_still_zero(tmp_path):
+    record, stats, _ = _run_batch(
+        tmp_path, timing={"prefetch_seconds": 0.0, "inference_seconds": 0.0},
+        top={"model_load_seconds": 0.0})
+    assert record["timings"]["qwen_seconds"] == 0.0
+    assert stats["qwen_inference_seconds"] == 0.0
+
+
+def test_every_telemetry_sum_in_orchestration_goes_through_the_safe_aggregator():
+    """Structural guard: no raw `+`/`+=` may reappear on a telemetry quantity in these bodies.
+
+    Behavioural tests catch today's sites; this catches a *new* one being added later, which is how
+    the R1 gap survived its own review.
+    """
+    tree = _tree()
+    guarded = {"qwen_seconds", "qwen_inference_seconds"}
+    for name in ("_complete_deferred_qwen_batch", "_annotate_candidates_with_qwen"):
+        func = _func(tree, name)
+        for node in ast.walk(func):
+            # run_stats["<telemetry>"] += ...  is no longer allowed for float telemetry
+            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Subscript) \
+                    and isinstance(node.target.slice, ast.Constant) \
+                    and node.target.slice.value in guarded:
+                raise AssertionError(
+                    f"{name}: raw augmented assignment to {node.target.slice.value!r}")
+        code = ast.unparse(func)
+        assert "_telemetry_total" in code, f"{name} must use the safe aggregator"
+
+
+def test_the_safe_aggregator_is_shared_not_duplicated():
+    """R2 adds no new summation helper; it reuses the R1 one."""
+    tree = _tree()
+    summers = [n.name for n in tree.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and "total" in n.name and "telemetry" in n.name]
+    assert summers == ["_telemetry_total"], f"expected exactly one telemetry summer, got {summers}"
+
+
 # ============================================================== 10. CACHE ISOLATION (N)
 def _names_used(func: ast.FunctionDef) -> set:
     return {node.id for node in ast.walk(func) if isinstance(node, ast.Name)}

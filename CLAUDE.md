@@ -678,6 +678,22 @@ than one blind coercer. Load-bearing details:
 - **No aggregate may be non-finite, including from individually finite parts.** Enough finite values
   overflow a running total, so `_telemetry_total` checks the accumulator and degrades to a neutral
   `0.0` rather than reporting `inf`. Never fabricate a plausible measurement to keep a number finite.
+- **Validating the parts is necessary but not sufficient: *every* telemetry sum goes through
+  `_telemetry_total`.** R1 validated each scalar and made only the final library aggregate
+  overflow-safe, which left two earlier sums on raw floating-point addition — and `1e308 + 1e308` is
+  `inf` from two values that each passed finite-and-non-negative. Measured on the R1 head: the
+  per-job `prefetch + inference + amortized_model` wrote **`"qwen_seconds": Infinity` into a
+  checkpointed record whose semantics were complete**, so the source stayed reusable while carrying
+  exactly the value the contract excludes; and `qwen_inference_seconds_this_run` reached `inf` from
+  two jobs in the batch path and from two successive calls in the inline path. So the rule is about
+  the *operation*, not just its inputs: any place telemetry quantities are combined — a per-job sum
+  or a running `run_stats` total — uses the shared aggregator, never `+` or `+=`. The parent-measured
+  `run_stats["qwen_seconds"]` accumulations were routed through it too; they are `perf_counter`
+  deltas and were never at risk, but the invariant is then structural rather than resting on an
+  argument about how large a monotonic-clock delta can get. A test walks both orchestration bodies
+  and fails on any augmented assignment to a float telemetry key, because a *future* site is the
+  failure mode that got through R1's own review. **Do not add a second summation helper** — reuse
+  `_telemetry_total`; a test asserts it is the only one.
 - **Counts respect their natural bound.** `_is_count` admits negatives (`_is_count(-5)` is `True`),
   which is how a worker-reported `frame_count: -5` reached `qwen_frame_count_this_run`; the sign and
   bound checks therefore live in `_bounded_count`, not in `_is_count`. Current-run decoded frames must

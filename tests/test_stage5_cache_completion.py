@@ -34,12 +34,14 @@ _FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_coun
           "_load_cache", "_save_cache", "_checkpoint_cache",
           # T1 telemetry-boundary helpers. Not cache primitives - they are here only because the
           # orchestration bodies extracted below call them, and an extracted body resolves every
-          # name from this namespace. Exactly the transitive set those bodies need: the
-          # aggregation-only helpers (`_telemetry_total`, `_record_telemetry`,
-          # `_record_candidate_count`) live in `analyze_video_sources`, which this suite does not
-          # extract, so they are deliberately absent.
+          # name from this namespace. Exactly the transitive set those bodies need.
+          # `_telemetry_total` is included as of R2: it is no longer aggregation-only, because the
+          # orchestration bodies now use it for overflow-safe accumulation as well. The two genuinely
+          # aggregation-only helpers (`_record_telemetry`, `_record_candidate_count`) are used solely
+          # inside `analyze_video_sources`, which this suite does not extract, so they stay absent.
           "_as_mapping", "_bounded_count", "_is_nonnegative_count", "_is_real_number",
-          "_optional_telemetry_number", "_telemetry_seconds", "_telemetry_text")
+          "_optional_telemetry_number", "_telemetry_seconds", "_telemetry_text",
+          "_telemetry_total")
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
            "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
 

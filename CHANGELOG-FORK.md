@@ -20,6 +20,53 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-28 (R2: individually valid telemetry could still sum to Infinity)
+
+Follow-up to the telemetry-boundary work below, from review of that change. R1 validated every
+telemetry scalar individually — finite, non-negative, real `int`/`float` — and made the **final library
+aggregate** overflow-safe via `_telemetry_total`, then claimed that newly written records carry no
+non-finite optional telemetry. Two earlier sums were still using raw floating-point addition, so that
+claim did not hold: `1e308 + 1e308` is `inf` from two values that each passed the R1 contract.
+
+Reproduced against the R1 head with the real extracted production bodies:
+
+1. **Per-job batch telemetry.** `qwen_seconds = prefetch_seconds + inference_seconds +
+   amortized_model` produced `inf` from `prefetch_seconds = inference_seconds = 1e308`, and — because
+   completion is correctly independent of telemetry — the job was still complete, so the record was
+   checkpointed with **`"qwen_seconds": Infinity` on disk** and stayed reusable. That is precisely the
+   value R1 set out to keep out of a newly written record.
+2. **Current-run inference total.** `run_stats["qwen_inference_seconds"] += inference_seconds` reached
+   `inf` from two jobs each reporting an individually valid `1e308`, in the shared-batch path and,
+   across two successive calls, in the single/inline path. `qwen_inference_seconds_this_run` could
+   therefore still be `Infinity`, contradicting the published "current-run floats stay finite" rule.
+
+**Fixed** by routing those combinations through the **existing** `_telemetry_total` — no new helper,
+and a test asserts it remains the only telemetry summer. The per-job sum becomes
+`_telemetry_total((prefetch_seconds, inference_seconds, amortized_model))`; both current-run inference
+accumulations become `_telemetry_total((running_total, contribution))`. The two parent-measured
+`run_stats["qwen_seconds"]` accumulations were routed through it as well: they are `perf_counter`
+deltas and were never at risk, so this is behaviour-preserving for every reachable value, but the
+invariant is then structural instead of resting on an argument about how large a monotonic-clock delta
+can be. Current-run wall time is still parent-measured and still counted once per worker invocation.
+
+Healthy telemetry is untouched — `1.0 + 4.0 + 2.0` is still exactly `7.0`, multi-job totals still add
+up (`4.0 + 6.0 = 10.0`), and a legitimate zero sum is still zero. Nothing about the R1 number contract
+changed: no wall-time ceiling was reintroduced, numeric strings and bools are still rejected, and
+`_is_real_number` / `_optional_telemetry_number` / `_telemetry_seconds` / `_bounded_count` /
+`_is_nonnegative_count` / `_telemetry_text` / `_as_mapping` / `_record_telemetry` /
+`_record_candidate_count` are unchanged. Completion, cache identity, checkpointing and semantic merge
+are untouched; `CACHE_CONTRACT_VERSION` stays `stage5_cache_v2` and `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`; no re-key, no migration, no cache rewrite.
+
+`tests/test_qwen_scalar_boundary.py` gains 14 tests. Six of them are red against the R1 head and green
+after the fix (per-job stored sum, the on-disk `Infinity`, the amortized-model share, and the batch and
+inline current-run totals); the rest are regression guards for healthy values, legitimate zero,
+wall-time provenance, and record reusability. One is structural rather than behavioural: it walks both
+orchestration bodies and fails on any augmented assignment to a float telemetry key, because a *new*
+unsafe sum being added later is exactly the failure mode that survived R1's own review.
+`tests/test_stage5_cache_completion.py` adds `_telemetry_total` to its AST extraction tuple — the
+orchestration bodies now call it, so its previous "aggregation-only" note is corrected there.
+
 ### Fixed — 2026-09-28 (Qwen telemetry trust boundary: optional metadata can no longer crash or poison Stage 5)
 
 **Scope note first, because it matters for how this reads.** This is boundary robustness, not a report
@@ -89,6 +136,9 @@ truthy non-dict `timings` raised `AttributeError` before any scalar was read; an
   value is not sufficient: enough finite values overflow a running total. `_telemetry_total` checks the
   accumulator and degrades to the neutral `0.0` rather than reporting `inf`. No plausible figure is
   ever fabricated to keep a number finite — unknown is preferable to false precision.
+- **Every telemetry sum goes through that aggregator, not only the final library one.** Validating the
+  individual scalars is necessary but *not* sufficient, and the first cut of this work got that wrong —
+  see the R2 correction below.
 - **Counts respect their natural bound.** Current-run decoded frames count only when the worker
   reported a real non-negative integer `<= ` the candidates that job actually submitted, so a claim
   larger than the request is not evidence. Library totals are bounded by the record's own candidate

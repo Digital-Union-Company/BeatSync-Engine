@@ -1703,7 +1703,13 @@ def _complete_deferred_qwen_batch(
         run_stats["qwen_incomplete_jobs"] += len(request_jobs)
         run_stats["qwen_requested_count"] += sum(
             len(selected_by_job.get(str(job.get("job_id")), ())) for job in request_jobs)
-        run_stats["qwen_seconds"] += float(batch_seconds)
+        # [FORK] Digital-Union (T1 R2): still the parent's own `perf_counter` delta for the one shared
+        # worker invocation, still added exactly once - `_telemetry_total` only makes the accumulation
+        # structurally overflow-safe so the published "current-run floats stay finite" invariant does
+        # not rest on an argument about how large a monotonic-clock delta can get. Behaviour is
+        # unchanged for every reachable value.
+        run_stats["qwen_seconds"] = _telemetry_total(
+            (run_stats["qwen_seconds"], float(batch_seconds)))
     # [FORK] Digital-Union (T1): the nested containers are normalised before they are believed. A
     # truthy non-dict `semantics_by_job` - a list, a string - used to pass the emptiness test below
     # and then raise `AttributeError` on `.get` further down. Collapsing it to `{}` gives it the same
@@ -1758,7 +1764,12 @@ def _complete_deferred_qwen_batch(
         # complete, checkpointable and cached.
         prefetch_seconds = _telemetry_seconds(timing, "prefetch_seconds")
         inference_seconds = _telemetry_seconds(timing, "inference_seconds")
-        qwen_seconds = prefetch_seconds + inference_seconds + amortized_model
+        # [FORK] Digital-Union (T1 R2): the SUM goes through `_telemetry_total` too. Validating each
+        # part is necessary but not sufficient - `1e308 + 1e308` is `inf` from two values that each
+        # passed finite-and-non-negative. Measured on the R1 head: this wrote
+        # `"qwen_seconds": Infinity` into a checkpointed record whose semantics were complete, so the
+        # source stayed reusable while carrying exactly the non-finite telemetry R1 set out to exclude.
+        qwen_seconds = _telemetry_total((prefetch_seconds, inference_seconds, amortized_model))
         timings = video_data.setdefault("timings", {})
         timings["qwen_seconds"] = qwen_seconds
         timings["qwen_model_load_seconds_amortized"] = amortized_model
@@ -1822,7 +1833,11 @@ def _complete_deferred_qwen_batch(
             run_stats["qwen_tag_count"] += merged_count
             # [FORK] Digital-Union (T1): the already-sanitised value, so NaN, +/-Infinity and a
             # negative all contribute nothing instead of contaminating the current-run figure.
-            run_stats["qwen_inference_seconds"] += inference_seconds
+            # [FORK] Digital-Union (T1 R2): and the accumulation itself is overflow-safe, because two
+            # jobs each reporting an individually valid duration could still drive `+=` to `inf` -
+            # measured, with two jobs at 1e308.
+            run_stats["qwen_inference_seconds"] = _telemetry_total(
+                (run_stats["qwen_inference_seconds"], inference_seconds))
         _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
@@ -2473,7 +2488,10 @@ def _annotate_candidates_with_qwen(
         # measured wall time of this worker invocation. All true even when the response is unusable.
         run_stats["qwen_jobs"] += 1
         run_stats["qwen_requested_count"] += len(ai_candidates)
-        run_stats["qwen_seconds"] += float(time.perf_counter() - _qwen_request_started)
+        # [FORK] Digital-Union (T1 R2): same as the batch site - still parent-measured, still once per
+        # invocation, now structurally overflow-safe.
+        run_stats["qwen_seconds"] = _telemetry_total(
+            (run_stats["qwen_seconds"], float(time.perf_counter() - _qwen_request_started)))
         # Response truth: completion, then only what the worker actually proved.
         if completed:
             run_stats["qwen_completed_jobs"] += 1
@@ -2490,7 +2508,10 @@ def _annotate_candidates_with_qwen(
         # [FORK] Digital-Union (T1): finite and non-negative, or it contributes nothing.
         # `isinstance(..., (int, float))` alone admitted NaN, +/-Infinity and negatives into the
         # current-run figure.
-        run_stats["qwen_inference_seconds"] += _telemetry_seconds(timing, "inference_seconds")
+        # [FORK] Digital-Union (T1 R2): overflow-safe accumulation, because this function is called
+        # once per serial source and two individually valid durations could drive `+=` to `inf`.
+        run_stats["qwen_inference_seconds"] = _telemetry_total(
+            (run_stats["qwen_inference_seconds"], _telemetry_seconds(timing, "inference_seconds")))
     return {
         _QWEN_COMPLETED_KEY: completed,
         # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback
