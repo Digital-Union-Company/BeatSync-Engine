@@ -20,6 +20,167 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-28 (R2: individually valid telemetry could still sum to Infinity)
+
+Follow-up to the telemetry-boundary work below, from review of that change. R1 validated every
+telemetry scalar individually — finite, non-negative, real `int`/`float` — and made the **final library
+aggregate** overflow-safe via `_telemetry_total`, then claimed that newly written records carry no
+non-finite optional telemetry. Two earlier sums were still using raw floating-point addition, so that
+claim did not hold: `1e308 + 1e308` is `inf` from two values that each passed the R1 contract.
+
+Reproduced against the R1 head with the real extracted production bodies:
+
+1. **Per-job batch telemetry.** `qwen_seconds = prefetch_seconds + inference_seconds +
+   amortized_model` produced `inf` from `prefetch_seconds = inference_seconds = 1e308`, and — because
+   completion is correctly independent of telemetry — the job was still complete, so the record was
+   checkpointed with **`"qwen_seconds": Infinity` on disk** and stayed reusable. That is precisely the
+   value R1 set out to keep out of a newly written record.
+2. **Current-run inference total.** `run_stats["qwen_inference_seconds"] += inference_seconds` reached
+   `inf` from two jobs each reporting an individually valid `1e308`, in the shared-batch path and,
+   across two successive calls, in the single/inline path. `qwen_inference_seconds_this_run` could
+   therefore still be `Infinity`, contradicting the published "current-run floats stay finite" rule.
+
+**Fixed** by routing those combinations through the **existing** `_telemetry_total` — no new helper,
+and a test asserts it remains the only telemetry summer. The per-job sum becomes
+`_telemetry_total((prefetch_seconds, inference_seconds, amortized_model))`; both current-run inference
+accumulations become `_telemetry_total((running_total, contribution))`. The two parent-measured
+`run_stats["qwen_seconds"]` accumulations were routed through it as well: they are `perf_counter`
+deltas and were never at risk, so this is behaviour-preserving for every reachable value, but the
+invariant is then structural instead of resting on an argument about how large a monotonic-clock delta
+can be. Current-run wall time is still parent-measured and still counted once per worker invocation.
+
+Healthy telemetry is untouched — `1.0 + 4.0 + 2.0` is still exactly `7.0`, multi-job totals still add
+up (`4.0 + 6.0 = 10.0`), and a legitimate zero sum is still zero. Nothing about the R1 number contract
+changed: no wall-time ceiling was reintroduced, numeric strings and bools are still rejected, and
+`_is_real_number` / `_optional_telemetry_number` / `_telemetry_seconds` / `_bounded_count` /
+`_is_nonnegative_count` / `_telemetry_text` / `_as_mapping` / `_record_telemetry` /
+`_record_candidate_count` are unchanged. Completion, cache identity, checkpointing and semantic merge
+are untouched; `CACHE_CONTRACT_VERSION` stays `stage5_cache_v2` and `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`; no re-key, no migration, no cache rewrite.
+
+`tests/test_qwen_scalar_boundary.py` gains 14 tests. Six of them are red against the R1 head and green
+after the fix (per-job stored sum, the on-disk `Infinity`, the amortized-model share, and the batch and
+inline current-run totals); the rest are regression guards for healthy values, legitimate zero,
+wall-time provenance, and record reusability. One is structural rather than behavioural: it walks both
+orchestration bodies and fails on any augmented assignment to a float telemetry key, because a *new*
+unsafe sum being added later is exactly the failure mode that survived R1's own review.
+`tests/test_stage5_cache_completion.py` adds `_telemetry_total` to its AST extraction tuple — the
+orchestration bodies now call it, so its previous "aggregation-only" note is corrected there.
+
+### Fixed — 2026-09-28 (Qwen telemetry trust boundary: optional metadata can no longer crash or poison Stage 5)
+
+**Scope note first, because it matters for how this reads.** This is boundary robustness, not a report
+that the shipping worker misbehaves. `stage5_qwen_scene_worker.py` cannot emit any of the malformed
+shapes below: it reports `time.perf_counter()` deltas, `max(1, min(32, int(slots)))` and a literal
+`0.0` for VRAM. The exposure is the request/response and cache JSON that is **deliberately retained**
+under `input/video_analysis_cache/` (and therefore visible and editable), plus any future worker change
+or regression. The worker was not modified.
+
+**The defect.** Optional Qwen telemetry — durations, VRAM, batch size, model id — was converted with
+bare `int()`/`float()` at two independent boundaries, while the semantic-completion contract never
+reads any of it.
+
+1. **Worker-response ingestion.** `float(timing.get("inference_seconds") or 0.0)` in
+   `_complete_deferred_qwen_batch` raised `ValueError` on a non-numeric string — the case originally
+   reproduced while testing the Stage-5 reporting work, and deliberately left unfixed there. The same
+   shape reached `model_load_seconds`, `prefetch_seconds`, `batch_size` and `peak_vram_gb`, in both the
+   shared-batch and the single/inline path. The batch call site is unguarded, so a telemetry field
+   could abort Stage 5 after real GPU minutes; the inline path *is* wrapped in `except Exception`,
+   which was worse — a malformed `batch_size` turned a fully tagged source into `ai_enabled=False`,
+   i.e. permanent re-analysis caused by a field no completion rule reads.
+
+2. **Library aggregation.** The tail of `analyze_video_sources` reads the same kinds of field back out
+   of every returned record, and on a warm run **every one of those records is a cache hit**. A record
+   can satisfy `_cache_entry_is_complete` *and* `_stored_ai_cache_is_consistent` while carrying
+   malformed optional telemetry, because neither rule looks at durations, VRAM, concurrency or the
+   model id. Such a record stayed reusable — so nothing ever recomputed it — and crashed or poisoned
+   the aggregation on every subsequent warm run. A poison pill.
+
+**The NaN/Infinity half is the dangerous half, and it is real rather than theoretical.**
+`json.loads`/`json.load` accept the bare `NaN`, `Infinity` and `-Infinity` tokens through Python's
+default non-standard `parse_constant`, and `json.dump` emits them because `allow_nan` defaults to
+`True`. A non-finite value therefore survives the worker response file *and* a full cache round trip,
+`float()` will not reject it, and one of them makes every sum it enters non-finite **silently and
+permanently**. Two tests demonstrate this end to end rather than asserting it.
+
+Secondary findings, all reproduced: `_is_count` admits negatives (`_is_count(-5)` is `True`), so a
+worker-reported `frame_count: -5` reached `qwen_frame_count_this_run`; `int(2.7)`/`int(True)` laundered
+a float and a bool into a fabricated concurrency; `str(...)` turned `123` and `{"a": 1}` into invented
+model ids `"123"` and `"{'a': 1}"`; `qwen_concurrency`'s `next(...)` converted only up to the first
+truthy record, so whether Stage 5 crashed depended on where a malformed source happened to sort; a
+truthy non-dict `timings` raised `AttributeError` before any scalar was read; and a truthy non-dict
+`semantics_by_job` slipped past the empty-response branch and then raised on `.get`.
+
+**Fixed.**
+
+- **Counts and optional telemetry now have explicitly different trust contracts.** `_is_count`,
+  `_coerce_count` and `_reported_count` are load-bearing for completion and are **unchanged** — a
+  frozen D1 contract. A separate seam handles telemetry: `_is_real_number`,
+  `_optional_telemetry_number`, `_telemetry_seconds`, `_telemetry_total`, `_is_nonnegative_count`,
+  `_bounded_count`, `_telemetry_text`, `_as_mapping`, `_record_telemetry`, `_record_candidate_count`.
+- **An accepted telemetry number must be a real `int`/`float`, not a `bool`, finite and `>= 0`.** A
+  numeric string is *not* accepted: `float("2.5")` succeeding is not a reason to believe a string in a
+  numeric field, and laundering it would hide a broken producer. Negatives are rejected because every
+  field here is physically non-negative — and because `_fmt_seconds` already clamps display with
+  `max(0.0, ...)`, so a negative stayed invisible on screen while still corrupting the total.
+- **Semantic completion never depends on optional telemetry**, which is now pinned by test rather than
+  by convention. 3 requested / 3 decoded / 3 returned for exactly the requested ids stays complete,
+  checkpointable and cached even when `inference_seconds` is `"not-a-number"`, `NaN` or negative, and
+  when `batch_size`, `peak_vram_gb`, `model_load_seconds` or `model_id` are malformed.
+  `_qwen_job_completed`, `_stored_ai_cache_is_consistent`, `_cache_entry_is_complete` and
+  `_checkpoint_cache` are untouched; a test asserts none of them reads a telemetry field or helper.
+- **Unknown is kept distinct from a legitimate zero.** An unprovable `peak_vram_gb` is stored as
+  `None`, not `0.0`, precisely because the worker reports a real `0.0` — coercing would make a corrupt
+  record indistinguishable from every healthy one. A genuine `0` still reads as `0` everywhere.
+- **No aggregate can be non-finite, including from individually finite parts.** Filtering NaN/Inf per
+  value is not sufficient: enough finite values overflow a running total. `_telemetry_total` checks the
+  accumulator and degrades to the neutral `0.0` rather than reporting `inf`. No plausible figure is
+  ever fabricated to keep a number finite — unknown is preferable to false precision.
+- **Every telemetry sum goes through that aggregator, not only the final library one.** Validating the
+  individual scalars is necessary but *not* sufficient, and the first cut of this work got that wrong —
+  see the R2 correction below.
+- **Counts respect their natural bound.** Current-run decoded frames count only when the worker
+  reported a real non-negative integer `<= ` the candidates that job actually submitted, so a claim
+  larger than the request is not evidence. Library totals are bounded by the record's own candidate
+  count, so a candidate-less record with hand-edited huge counts cannot inflate them.
+- **Nested containers are normalised, the top-level one is not re-checked.**
+  `beatsync_fork.qwen_progress` already proves the loaded response is an object and was not modified.
+  A malformed `semantics_by_job` now degrades to the same outcome as no usable semantics: the job stays
+  attempted, stays incomplete, nothing is invented, Stage 5 survives. Collapsing a non-dict to `{}` can
+  only make a completion check *fail*, never pass.
+- **Old cache files are tolerated on read, never rewritten.** There is no migration and no cache
+  rewrite; a valid entry round-trips byte-identically. The fix for the poison pill is that the
+  aggregation reads tolerantly, not that the loader rejects more.
+- **New records are sanitised before they are written**, so nothing malformed reaches a cache payload —
+  done at ingestion, not by making `_save_cache` reject a record and not by changing
+  `json.dump(allow_nan=...)`. The writer is not the semantic-policy layer.
+
+**Current-run reporting invariants are preserved.** `qwen_seconds_this_run` stays the parent's own
+`perf_counter` measurement, counted once per worker invocation, and is untouched.
+`qwen_jobs_this_run`, `qwen_requested_count_this_run`, `qwen_tag_count_this_run` and the
+completed/incomplete tallies stay parent-derived. `qwen_frame_count_this_run` and
+`qwen_inference_seconds_this_run` are hardened as above. The requested/decoded/tagged split and the
+`tagged / requested` UI denominator are unchanged; `src/gui.py` needed no change.
+
+**No wall-time ceiling on durations, and that is deliberate.** Bounding a worker-reported duration by
+the parent's measurement of the call looks attractive, but it makes the value depend on how long the
+surrounding call happened to take, so a stubbed or replayed worker — the only way this code is testable
+without a GPU — has every legitimate duration silently rejected. Finiteness and sign are what make the
+aggregate safe. Counts keep a bound because they have a real one in the same scope.
+
+**No cache-contract bump and no analysis-version bump.** `CACHE_CONTRACT_VERSION` stays
+`stage5_cache_v2` and `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`. Semantic
+output meaning, candidate scoring, the candidate schema, cache identity and the completion contract are
+all unchanged; this is optional-telemetry sanitisation plus tolerant reading. Reading is strictly *more*
+tolerant, so no record that current main accepts becomes unreadable, and no stored value is
+contradicted.
+
+`tests/test_qwen_scalar_boundary.py` is new and covers the malformed-shape matrix at both boundaries,
+completion independence, the nested-container cases, the NaN/Infinity poison pill against a genuinely
+reusable synthetic record, aggregate finiteness and order-independence, legitimate zero, the frozen D1
+count semantics, and cache isolation. No model inference, no production run and no runtime-cache write
+was involved in authoring or validating it.
+
 ### Fixed — 2026-09-28 (Stage 5 reports current-run work, not cached-library history)
 
 **The defect, observed in production.** A fully warm run — 845/845 cache hits, **zero** sources

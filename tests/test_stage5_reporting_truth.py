@@ -504,7 +504,12 @@ _PIPE_DEPS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_
               "_reported_count", "_stored_ai_cache_is_consistent", "_qwen_job_completed",
               "_deterministic_analysis_completed", "_cache_entry_is_complete",
               "_load_cache", "_save_cache", "_checkpoint_cache", "_fmt_seconds",
-              "_new_run_stats")
+              "_new_run_stats",
+              # T1 telemetry-boundary helpers. The extracted orchestration bodies call these, so they
+              # have to be extracted alongside - the same coupling CLAUDE.md records for this pattern.
+              "_as_mapping", "_is_real_number", "_optional_telemetry_number", "_telemetry_seconds",
+              "_telemetry_total", "_is_nonnegative_count", "_bounded_count", "_telemetry_text",
+              "_record_telemetry", "_record_candidate_count")
 _PIPE_CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
                 "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
 
@@ -742,12 +747,15 @@ def test_r2_g_malformed_worker_timings_do_not_raise(tmp_path):
     response = {
         "model_load_seconds": None, "model_id": "q", "batch_size": 1,
         "semantics_by_job": {"1": _semantics("a.mp4", 2)},
-        # NOTE: `inference_seconds` stays numeric on purpose. The pre-existing merge loop does
-        # `float(timing.get("inference_seconds") or 0.0)`, which raises on a non-numeric string -
-        # a fragility that predates R2 and is out of scope here. This test proves only that the NEW
-        # accounting adds no exception of its own on data the pre-R2 runtime already survived.
+        # `inference_seconds` used to stay numeric here on purpose: the merge loop did
+        # `float(timing.get("inference_seconds") or 0.0)`, which raised on a non-numeric string, so
+        # R2 could only prove that its own *new* accounting added no exception. T1 repaired that
+        # boundary, so the string now belongs in this fixture - a malformed duration must degrade to
+        # a zero contribution rather than taking Stage 5 down. The exhaustive malformed-shape matrix
+        # lives in `tests/test_qwen_scalar_boundary.py`; this case only keeps the R2 accounting
+        # assertions honest against data the runtime has to survive.
         "timings_by_job": {"1": {"frame_count": True, "tag_count": "nine",
-                                 "inference_seconds": 5.0, "prefetch_seconds": None}},
+                                 "inference_seconds": "not-a-number", "prefetch_seconds": None}},
     }
     ns = _pipeline_ns(("_qwen_max_windows", "_complete_deferred_qwen_batch"),
                       _env_int=lambda name, default, lo, hi: default,
@@ -763,7 +771,11 @@ def test_r2_g_malformed_worker_timings_do_not_raise(tmp_path):
     assert stats["qwen_jobs"] == 1
     # `frame_count: True` is a bool, not a count - it must be rejected, not counted as 1
     assert stats["qwen_frame_count"] == 0
-    assert stats["qwen_inference_seconds"] == pytest.approx(5.0)
+    # T1: a malformed duration is not evidence, so it contributes nothing - and does not raise.
+    assert stats["qwen_inference_seconds"] == pytest.approx(0.0)
+    assert _math.isfinite(stats["qwen_inference_seconds"])
+    # The job was still attempted, and its wall time is still the parent's own measurement.
+    assert stats["qwen_seconds"] > 0.0 and _math.isfinite(stats["qwen_seconds"])
 
 
 # ------------------------------------------------------------------ F/H. WARM + CACHE ISOLATION

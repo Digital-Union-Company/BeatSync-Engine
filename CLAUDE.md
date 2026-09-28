@@ -633,6 +633,112 @@ event's `elapsed_seconds`), while later profiling — run after the same ~2.52 G
 fingerprint windows were already in the OS cache — measured **~3.2–3.4 s**. That discrepancy is
 **unresolved**. This work fixes reporting truth, not Stage-5 performance.
 
+### Counts and optional telemetry have different trust contracts (T1)
+
+Everything Stage 5 reads out of a Qwen response arrived as parsed JSON from a subprocess, and
+everything it reads out of a cache record arrived off disk. Those values split into two kinds, and
+conflating them is what produced a class of crashes:
+
+- **Counts are load-bearing.** `frame_count`/`tag_count` decide semantic completion, so `_is_count`,
+  `_coerce_count` and `_reported_count` keep their D1 semantics **frozen**. Do not redefine them.
+- **Durations, VRAM, batch size and the model id are optional telemetry** — pure observability.
+  `_qwen_job_completed`, `_stored_ai_cache_is_consistent` and `_cache_entry_is_complete` never read
+  them, and a test asserts those bodies reference neither the fields nor the telemetry helpers.
+
+**Semantic completion must never depend on optional telemetry.** 10 requested / 10 decoded / 10
+returned for exactly the requested ids is a *complete* job even if `inference_seconds` is `"bad"`. The
+old code got this wrong in two different ways: the shared-batch call site is unguarded, so a malformed
+duration aborted Stage 5 outright; the inline facade *is* wrapped in `except Exception`, so a malformed
+`batch_size` or `peak_vram_gb` silently produced `ai_enabled=False` — permanent re-analysis of a fully
+tagged source, caused by a field no completion rule reads.
+
+**`NaN`/`Infinity` are a real hazard here, not a hypothetical.** `json.loads`/`json.load` accept the
+bare `NaN`, `Infinity`, `-Infinity` tokens (Python's default non-standard `parse_constant`) and
+`json.dump` emits them (`allow_nan=True` by default). So a non-finite value survives the worker
+response file *and* a full cache round trip, `float()` will not reject it, and one of them makes every
+sum it enters non-finite silently and permanently. Two tests demonstrate this rather than assert it.
+Do not "simplify" that away, and do not try to fix this by turning `allow_nan` off in `_save_cache` —
+the writer is a transport primitive, not the semantic-policy layer.
+
+The telemetry seam (`_is_real_number`, `_optional_telemetry_number`, `_telemetry_seconds`,
+`_telemetry_total`, `_is_nonnegative_count`, `_bounded_count`, `_telemetry_text`, `_as_mapping`,
+`_record_telemetry`, `_record_candidate_count`) is stdlib-only and deliberately field-specific rather
+than one blind coercer. Load-bearing details:
+
+- **An accepted telemetry number is a real `int`/`float`, not a `bool`, finite and `>= 0`.** A numeric
+  string is **not** accepted — `float("2.5")` succeeding is no reason to believe a string in a numeric
+  field, and laundering it hides a broken producer. `int(2.7)` → 2 and `int(True)` → 1 were exactly
+  that kind of fabrication for `batch_size`. Negatives are rejected because every field here is
+  physically non-negative *and* because `_fmt_seconds` already clamps display with `max(0.0, …)`, so a
+  negative stayed invisible on screen while corrupting the total.
+- **`None` means unknown and is not the same as `0.0`.** An unprovable `peak_vram_gb` persists as
+  `None`, because the worker reports a literal `0.0` — coercing malformed to `0.0` would make a corrupt
+  record indistinguishable from every healthy one in the library. A genuine `0` stays `0` everywhere;
+  never write `value or default` on a field where zero is a measurement.
+- **No aggregate may be non-finite, including from individually finite parts.** Enough finite values
+  overflow a running total, so `_telemetry_total` checks the accumulator and degrades to a neutral
+  `0.0` rather than reporting `inf`. Never fabricate a plausible measurement to keep a number finite.
+- **Validating the parts is necessary but not sufficient: *every* telemetry sum goes through
+  `_telemetry_total`.** R1 validated each scalar and made only the final library aggregate
+  overflow-safe, which left two earlier sums on raw floating-point addition — and `1e308 + 1e308` is
+  `inf` from two values that each passed finite-and-non-negative. Measured on the R1 head: the
+  per-job `prefetch + inference + amortized_model` wrote **`"qwen_seconds": Infinity` into a
+  checkpointed record whose semantics were complete**, so the source stayed reusable while carrying
+  exactly the value the contract excludes; and `qwen_inference_seconds_this_run` reached `inf` from
+  two jobs in the batch path and from two successive calls in the inline path. So the rule is about
+  the *operation*, not just its inputs: any place telemetry quantities are combined — a per-job sum
+  or a running `run_stats` total — uses the shared aggregator, never `+` or `+=`. The parent-measured
+  `run_stats["qwen_seconds"]` accumulations were routed through it too; they are `perf_counter`
+  deltas and were never at risk, but the invariant is then structural rather than resting on an
+  argument about how large a monotonic-clock delta can get. A test walks both orchestration bodies
+  and fails on any augmented assignment to a float telemetry key, because a *future* site is the
+  failure mode that got through R1's own review. **Do not add a second summation helper** — reuse
+  `_telemetry_total`; a test asserts it is the only one.
+- **Counts respect their natural bound.** `_is_count` admits negatives (`_is_count(-5)` is `True`),
+  which is how a worker-reported `frame_count: -5` reached `qwen_frame_count_this_run`; the sign and
+  bound checks therefore live in `_bounded_count`, not in `_is_count`. Current-run decoded frames must
+  be `<= ` the candidates that job submitted, and library totals are bounded by the record's own
+  candidate count, so a candidate-less record with hand-edited huge counts cannot inflate them.
+- **There is deliberately no wall-time ceiling on durations.** Bounding a worker-reported duration by
+  the parent's measurement of the call makes the value depend on how long the surrounding call happened
+  to take, so a stubbed or replayed worker — the only way this code is testable without a GPU — has
+  every legitimate duration rejected. Finiteness and sign are what make the aggregate safe; the ceiling
+  added nothing there and cost testability. Counts keep a bound because they have a real one in scope.
+- **Nested containers are untrusted; the top-level response is not re-checked.**
+  `beatsync_fork.qwen_progress` already proves the loaded payload is an object — do not duplicate that.
+  A truthy non-dict `semantics_by_job` used to pass the empty-response branch and then raise
+  `AttributeError` on `.get`; it now degrades to the same outcome as no usable semantics (job attempted,
+  job incomplete, nothing invented). `_as_mapping` is safe at load-bearing containers too, and that is a
+  property rather than luck: collapsing a non-dict to `{}` can only make a completion check *fail*.
+- **The library aggregation reads cache hits, so it must be tolerant rather than strict.** On a warm run
+  every value in that block comes off disk. A record can pass `_cache_entry_is_complete` *and*
+  `_stored_ai_cache_is_consistent` while carrying malformed optional telemetry, stay reusable — so
+  nothing recomputes it — and crash or poison the aggregate on every later warm run. The fix is tolerant
+  reading, **not** a stricter loader: old cache files are never rewritten and never migrated, and a
+  valid entry round-trips byte-identically. Malformed-record *order* must not change the outcome either;
+  the old `next(...)` converted only up to the first truthy record, so whether Stage 5 crashed depended
+  on where a malformed source sorted. (Which *valid* `model_id` wins is still first-come and legitimately
+  order-sensitive.)
+- **Sanitise at ingestion, before a record is written.** Never by rejecting the whole record in
+  `_save_cache`, and never by changing `json.dump(allow_nan=…)`.
+- **This is robustness at a trust boundary, not a claim about the shipping worker.** It emits
+  `perf_counter` deltas, `max(1, min(32, int(slots)))` and a literal `0.0`, so it cannot produce these
+  shapes; `stage5_qwen_scene_worker.py` was **not** modified and producer-side validation was shown not
+  to be required. The exposure is the retained request/response and cache JSON under
+  `input/video_analysis_cache/`, a future worker change, or a regression. Concurrency gets
+  non-negative-integer robustness only, because its real ceiling (`min(32, …)`) lives in the worker and
+  restating it here would be a drifting magic number.
+- **No cache-contract or analysis-version bump.** `stage5_cache_v2` and
+  `auto_av_analysis_v8_llama_vulkan_batched` are unchanged: semantic meaning, candidate scoring, the
+  candidate schema, cache identity and the completion contract are all untouched, and tolerant reading
+  never contradicts a stored value.
+- **The extraction lists are part of this contract.** `_complete_deferred_qwen_batch` and
+  `_annotate_candidates_with_qwen` are AST-extracted and *executed* by
+  `tests/test_stage5_reporting_truth.py` and `tests/test_stage5_cache_completion.py`. Any module-level
+  helper those bodies call must be added to both suites' extraction tuples, or they fail with
+  `NameError` — that coupling is the price of testing the real bodies on a bare interpreter, and it is
+  the reason those two suites list helper names explicitly.
+
 ### Console vs. UI output — structured progress
 
 In GUI runs `gui.process_video` still redirects stdout/stderr into `QuietConsole` (discarded), so **a
