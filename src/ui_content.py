@@ -255,7 +255,8 @@ def get_success_message_auto(total_cuts, total_beats, tempo, sections_info,
                             parallel_workers, gpu_info, encoder_info,
                             codec_info, fps_info, filename, audio_info,
                             audio_duration=None, output_fps=None,
-                            total_processing_seconds=None, processing_label=None):
+                            total_processing_seconds=None, processing_label=None,
+                            variation_text=None):
     """Success message for Auto mode. Compatible with Auto Mode V1/V2/V3/V3.2."""
 
     section_summary = _format_auto_section_summary(sections_info)
@@ -273,12 +274,15 @@ def get_success_message_auto(total_cuts, total_beats, tempo, sections_info,
         total_seconds_i = 0
     processing_text = processing_label or encoder_info
     fps_text = f"{output_fps_f:.1f}" if output_fps_f else str(fps_info).split()[0]
+    # [FORK] Digital-Union (Phase A): optional, so existing callers render exactly as before.
+    # A seed is only worth reading back when the user actually chose one.
+    variation_line = f"Creative variation: {variation_text}\n" if variation_text else ""
 
     return f"""✅ Video created successfully!
 
 Statistics:
 Video processing: {processing_text}
-Total cuts: {total_cuts}
+{variation_line}Total cuts: {total_cuts}
 Audio duration: {audio_duration_f:.2f} seconds
 Output FPS: {fps_text}
 {total_beats} beats detected at {tempo:.1f} BPM
@@ -338,6 +342,19 @@ INFO_PARALLEL_WORKERS = "Clips processed simultaneously. More workers with GPU."
 # Output
 LABEL_OUTPUT_FILENAME = "📝 Output Filename"
 INFO_OUTPUT_FILENAME = "Timestamp added automatically (.mkv or .mov)"
+
+# ============================================================================
+# [FORK] Digital-Union: creative direction (Phase A — variation seed)
+# See src/beatsync_fork/variation.py for the selection rule these labels describe.
+# ============================================================================
+
+LABEL_VARIATION_SEED = "🎲 Variation Seed"
+INFO_VARIATION_SEED = (
+    "0 = default BeatSync selection. Any positive number picks a different but reproducible "
+    "clip plan from the same analysed sources — same seed always gives the same edit. "
+    "Changing this does not re-analyse your videos."
+)
+LABEL_RANDOMIZE_SEED = "🎲 Randomize"
 
 # ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels

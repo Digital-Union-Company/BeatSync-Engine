@@ -98,6 +98,8 @@ from gpu_cpu_utils import GPU_AVAILABLE, clear_gpu_memory
 
 # [FORK] Digital-Union: structured progress events (stdlib-only fork module).
 from beatsync_fork import progress as fork_progress
+# [FORK] Digital-Union: creative variation seed (stdlib-only fork module).
+from beatsync_fork import variation as fork_variation
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -265,7 +267,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        qwen_model_path: str = None,
                        progress_callback: Callable[[str], None] | None = None,
                        console_callback: Callable[[int, str], None] | None = None,
-                       event_callback: Callable[[object], None] | None = None) -> Tuple[np.ndarray, Dict]:
+                       event_callback: Callable[[object], None] | None = None,
+                       creative: Dict | None = None) -> Tuple[np.ndarray, Dict]:
     """
     Build a cleaner Auto Mode cut plan.
 
@@ -276,8 +279,17 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     """
     cfg = CONFIG
 
+    # [FORK] Digital-Union (Phase A): creative settings are planner state, not analysis identity.
+    # Normalised once here so everything downstream sees a clean int, and deliberately kept out of
+    # `audio_visual_profile` — that dict feeds Stage 5's Qwen config token, and a creative knob must
+    # never re-key the video analysis cache.
+    variation_seed = fork_variation.normalize_seed(
+        (creative or {}).get("seed") if isinstance(creative, dict) else None
+    )
+
     print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
     print("   Rhythm-first audio cuts + semantic video moment matching")
+    print(f"   🎲 Creative variation: {fork_variation.describe(variation_seed)}")
 
     duration = None
     if end_time and end_time > start_time:
@@ -483,6 +495,9 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "audio_duration": audio_duration,
         "mode": "auto_v4_audio_visual_rhythmic_planner",
         "auto_style": "audio_visual_rhythmic_gmv_amv",
+        # [FORK] Digital-Union (Phase A): read by Stage 6 only. `beat_info` is already the shared
+        # bus, so this reaches the planner without touching any analysis or cache signature.
+        "creative": {"seed": variation_seed},
     }
 
     try:

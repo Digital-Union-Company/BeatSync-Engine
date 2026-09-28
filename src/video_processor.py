@@ -47,10 +47,16 @@ from ffmpeg_processing import (
     seconds_to_frame_count,
     frame_count_to_seconds,
 )
-from auto_mode.stage6_av_planner import build_planned_clip_sequence, summarize_clip_plan
+from auto_mode.stage6_av_planner import (
+    build_planned_clip_sequence,
+    creative_seed,
+    summarize_clip_plan,
+)
 
 # [FORK] Digital-Union: structured progress events (stdlib-only fork module).
 from beatsync_fork import progress as fork_progress
+# [FORK] Digital-Union: creative variation seed (stdlib-only fork module).
+from beatsync_fork import variation as fork_variation
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -195,6 +201,13 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=None,
         help='Output FPS (frames per second). If not specified, auto-detect from input video (default: auto)'
+    )
+    # [FORK] Digital-Union (Phase A): creative variation seed. 0 keeps today's planner exactly.
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=0,
+        help='Creative variation seed: 0 = default BeatSync selection, positive = reproducible variation'
     )
 
     return parser.parse_args()
@@ -480,8 +493,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         beat_info=beat_info,
         video_files=video_files,
     )
+    # [FORK] Digital-Union (Phase A): the seed is reported, not recomputed — the planner already
+    # read it off `beat_info` and acted on it.
+    variation_seed = creative_seed(beat_info)
+    render_info["creative_seed"] = int(variation_seed)
+    print(f"🎲 Creative variation: {fork_variation.describe(variation_seed)}")
     if planned_clip_sequence:
-        plan_summary = summarize_clip_plan(planned_clip_sequence)
+        plan_summary = summarize_clip_plan(planned_clip_sequence, seed=variation_seed)
         if beat_info is not None:
             beat_info['clip_plan_summary'] = plan_summary
             render_info["plan_summary"] = plan_summary
@@ -884,11 +902,18 @@ def main() -> None:
         end_time=args.end_time,
         use_gpu=args.gpu,
         video_files=video_files,
+        creative={"seed": args.seed},
     )
- 
+
     print(f'✓ Selected {len(selected_beats)} cuts for video')
- 
+
     output_file = args.output
+    # [FORK] Digital-Union (Phase A): a variation render is identifiable by its filename; a legacy
+    # (seed 0) render keeps exactly the name it has today.
+    seed_suffix = fork_variation.filename_suffix(args.seed)
+    if seed_suffix:
+        base, extension = os.path.splitext(output_file)
+        output_file = f"{base}{seed_suffix}{extension}"
     if args.lossless and not output_file.lower().endswith('.mov'):
         base, _ = os.path.splitext(output_file)
         output_file = base + '.mov'

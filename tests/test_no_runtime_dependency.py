@@ -106,6 +106,7 @@ def test_fork_modules_import_only_stdlib():
         "hashlib",
         "json",
         "os",
+        "random",
         "re",
         "stat",
         "subprocess",

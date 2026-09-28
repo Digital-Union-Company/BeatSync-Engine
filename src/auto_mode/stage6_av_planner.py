@@ -10,6 +10,9 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
+# [FORK] Digital-Union: seeded creative variation (stdlib-only fork module).
+from beatsync_fork import variation as fork_variation
+
 
 def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
     try:
@@ -25,6 +28,21 @@ def _stable_rng(*parts) -> random.Random:
     raw = "|".join(str(p) for p in parts)
     seed = int(hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12], 16)
     return random.Random(seed)
+
+
+def creative_seed(beat_info: Dict | None) -> int:
+    """[FORK] Digital-Union: read the user's variation seed off the shared ``beat_info`` bus.
+
+    Absent, malformed or non-positive means legacy. Stage 6 is the only stage that reads it, which is
+    why the seed rides on ``beat_info`` instead of being threaded through the analysis signatures —
+    it must never reach Stage 5's cache identity.
+    """
+    if not isinstance(beat_info, dict):
+        return fork_variation.LEGACY_SEED
+    creative = beat_info.get("creative")
+    if not isinstance(creative, dict):
+        return fork_variation.LEGACY_SEED
+    return fork_variation.normalize_seed(creative.get("seed"))
 
 
 def build_planned_clip_sequence(
@@ -51,6 +69,7 @@ def build_planned_clip_sequence(
         return []
 
     profiles = _build_segment_profiles(cut_times_arr, durations_arr, beat_info)
+    seed = creative_seed(beat_info)
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
@@ -64,6 +83,7 @@ def build_planned_clip_sequence(
             recent_videos=recent_videos,
             usage=usage,
             index=i,
+            seed=seed,
         )
         if not candidate:
             continue
@@ -83,9 +103,13 @@ def build_planned_clip_sequence(
     return planned
 
 
-def summarize_clip_plan(plan: Sequence[Dict]) -> Dict:
+def summarize_clip_plan(plan: Sequence[Dict], seed: int = 0) -> Dict:
+    # [FORK] Digital-Union: `seed` is optional and defaults to legacy, so existing callers are
+    # unchanged. It is reported, never re-derived — the plan itself carries no seed.
+    seed = fork_variation.normalize_seed(seed)
     if not plan:
-        return {"clip_count": 0, "targets": {}, "ai_tagged": 0}
+        return {"clip_count": 0, "targets": {}, "ai_tagged": 0, "seed": seed,
+                "variation": fork_variation.describe(seed)}
     targets = Counter(str(item.get("target", "flow")) for item in plan)
     ai_tagged = sum(1 for item in plan if item.get("ai_analyzed"))
     source_count = len(set(item.get("video_file") for item in plan))
@@ -94,6 +118,8 @@ def summarize_clip_plan(plan: Sequence[Dict]) -> Dict:
         "targets": dict(targets),
         "ai_tagged": ai_tagged,
         "source_count": source_count,
+        "seed": seed,
+        "variation": fork_variation.describe(seed),
     }
 
 
@@ -169,6 +195,38 @@ def _target_for_segment(section: Dict, wave: float, impact: float, rhythm: float
     return "flow"
 
 
+def _adjusted_score(
+    candidate: Dict,
+    profile: Dict,
+    recent_ids: deque,
+    recent_videos: deque,
+    usage: Counter,
+) -> float:
+    """The planner's score for one candidate, repeat and duration penalties applied.
+
+    [FORK] Digital-Union: lifted verbatim out of ``_choose_candidate`` so the legacy argmax and the
+    seeded variation branch score identically — the seed changes only which of the good candidates
+    wins, never what "good" means. The arithmetic and its order are unchanged from current main.
+    """
+    score = _score_candidate(candidate, profile)
+    cid = candidate.get("id")
+    video_file = candidate.get("video_file")
+
+    if cid in recent_ids:
+        score -= 0.28
+    if video_file in recent_videos:
+        score -= 0.10
+    score -= min(0.28, usage[cid] * 0.10)
+    score -= min(0.18, usage[video_file] * 0.012)
+
+    required_source = max(0.05, profile["duration"])
+    candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
+    if candidate_duration < required_source * 0.55:
+        score -= 0.18
+
+    return score
+
+
 def _choose_candidate(
     candidates: Sequence[Dict],
     profile: Dict,
@@ -176,34 +234,35 @@ def _choose_candidate(
     recent_videos: deque,
     usage: Counter,
     index: int,
+    seed: int = 0,
 ) -> Dict | None:
-    best_candidate = None
-    best_score = -999.0
-    rng = _stable_rng(index, profile.get("target"), profile.get("start"))
+    # [FORK] Digital-Union: seed 0 is the legacy path and must stay bit-identical to current main —
+    # including the RNG stream, which is why it still hashes exactly `(index, target, start)` with no
+    # seed component. A positive seed takes the variation branch below.
+    if not fork_variation.is_variation(seed):
+        best_candidate = None
+        best_score = -999.0
+        rng = _stable_rng(index, profile.get("target"), profile.get("start"))
 
-    for candidate in candidates:
-        score = _score_candidate(candidate, profile)
-        cid = candidate.get("id")
-        video_file = candidate.get("video_file")
+        for candidate in candidates:
+            score = _adjusted_score(candidate, profile, recent_ids, recent_videos, usage)
+            score += rng.random() * 0.015
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
 
-        if cid in recent_ids:
-            score -= 0.28
-        if video_file in recent_videos:
-            score -= 0.10
-        score -= min(0.28, usage[cid] * 0.10)
-        score -= min(0.18, usage[video_file] * 0.012)
+        return best_candidate
 
-        required_source = max(0.05, profile["duration"])
-        candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
-        if candidate_duration < required_source * 0.55:
-            score -= 0.18
+    if not candidates:
+        return None
 
-        score += rng.random() * 0.015
-        if score > best_score:
-            best_score = score
-            best_candidate = candidate
-
-    return best_candidate
+    # The tiny legacy jitter is dropped here rather than stacked: seeded selection subsumes it.
+    scores = [
+        _adjusted_score(candidate, profile, recent_ids, recent_videos, usage)
+        for candidate in candidates
+    ]
+    rng = _stable_rng(seed, index, profile.get("target"), profile.get("start"))
+    return candidates[fork_variation.select_index(scores, rng)]
 
 
 def _score_candidate(candidate: Dict, profile: Dict) -> float:
