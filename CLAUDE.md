@@ -548,6 +548,91 @@ cache**. This has actually happened during a study. Any script that imports pipe
 inspection must first strip that path entry, then assert `video_analysis.__file__` is the intended
 file and that the redirected cache directory is not the runtime one — and refuse to run otherwise.
 
+### Stage 5 returns two different truths (R1)
+
+`analyze_video_sources` returns **current-run execution facts** and **cached-library aggregates**, and
+they must never be presented as the same thing. Production proved why: a fully warm run — 845/845
+cache hits, **zero** sources re-analysed, **zero** Qwen workers launched, zero inference — printed
+`visual workers: 1`, `Qwen performance: … 3.12 candidates/s` and `Qwen tags: 8704/8704 in 3031.9s`.
+Every one of those numbers came from cached records. This is a reporting defect only; the cache and
+the Qwen runtime behaved correctly throughout.
+
+- **Library aggregates** (`qwen_tag_count`, `qwen_frame_count`, `qwen_seconds`,
+  `qwen_inference_seconds`, `qwen_model_id`, `qwen_concurrency`, `qwen_peak_vram_gb`) sum or select
+  over `videos`, which contains every cache hit. They are **historical by construction** and are
+  preserved unchanged for compatibility. A warm library legitimately carries large Qwen counts and
+  timings with no inference having happened this run.
+- **Current-run facts** carry the `_this_run` suffix (`sources_analyzed_this_run`,
+  `analysis_workers_used`, `qwen_jobs_this_run`, `qwen_completed_jobs_this_run`,
+  `qwen_incomplete_jobs_this_run`, `qwen_requested_count_this_run`, `qwen_frame_count_this_run`,
+  `qwen_tag_count_this_run`, `qwen_seconds_this_run`, `qwen_inference_seconds_this_run`). **Any
+  claim about work performed or performance achieved must use these.**
+
+**Requested, decoded and tagged are three different facts** and must not be conflated:
+`qwen_requested_count_this_run` is what was *submitted*; `qwen_frame_count_this_run` is what the
+worker *proved* it decoded; `qwen_tag_count_this_run` is what was *actually merged*. Only the first
+is knowable without a usable worker response, which is what makes a failed attempt reportable at
+all. **The UI's `N/M tags` denominator is the requested count**, never the decoded count — a job
+that requested 10 and decoded 8 must not render as a flawless `8/8`. Current-run decoded frames are
+counted only when the worker reported a real integer: the persisted `timings["qwen_frame_count"]`
+falls back to the requested count for source-record compatibility, and **that fallback must never
+leak into current-run truth** (the legacy field keeps it unchanged).
+
+Load-bearing details:
+
+- **Current-run counts come from `_new_run_stats()`**, an invocation-scoped dict threaded only into
+  the paths that analyse an *uncached* source. It is never populated from a cached record, so a cache
+  hit cannot inflate it, and a second call in the same process starts from zero. It is ephemeral
+  top-level metadata: a separate object from `video_data`, so there is no path by which it reaches
+  `_checkpoint_cache`. **No cache field, no cache identity, no contract bump.**
+- **Batch accounting is two-phase, and submission truth comes first.** `_complete_deferred_qwen_batch`
+  records jobs, requested candidates and the shared-worker wall time **immediately after
+  `_run_qwen_worker_batch` returns — before the empty-response branch**. A worker that timed out,
+  exited non-zero or produced an unreadable response still consumed a real attempt on real sources;
+  recording only in the per-job merge loop reported `0 jobs`, which the UI rendered as "no inference
+  this run". Every submitted job starts *incomplete* and is promoted only by its own returned
+  evidence, so an empty response leaves them all incomplete with no extra bookkeeping. The per-job
+  loop therefore must **not** increment `qwen_jobs` — that would double-count every success.
+- **Current-run wall time counts each worker invocation once.** `qwen_seconds_this_run` adds the one
+  measured `batch_seconds` for a shared batch, and the one measured call duration for a
+  single/inline invocation. Never sum the amortized per-source figures — they scale with source
+  count and would inflate the total. Worker-reported inference time is added only where it is
+  present and numeric; missing timing is absence of evidence, so it contributes zero and is never
+  invented. Accounting is observability and must stay non-fatal: it may not introduce an exception
+  on malformed timing data that the runtime would otherwise survive.
+- **A Qwen job is counted only where a request is genuinely issued**, which is why
+  `qwen_jobs_this_run` is *not* `len(deferred_jobs)`. That would be wrong in both directions: the
+  serial path (`_analyze_single_video` with `defer_ai=False`) runs Qwen **inline** and never appears
+  in `deferred_jobs`, while a deferred source whose candidate list is empty passes through the batch
+  orchestration and never reaches the worker. The counters therefore live at the two places that
+  actually submit work — after `_run_qwen_worker` in the facade, and in the batch's per-job merge
+  loop, which only runs for sources that made it into `request_jobs`.
+- **Both recording sites are written inline rather than through a shared helper.**
+  `_annotate_candidates_with_qwen` and `_complete_deferred_qwen_batch` are AST-extracted and executed
+  by `tests/test_stage5_cache_completion.py`, so they must stay self-contained with respect to
+  helpers outside that suite's extraction list. Do not "tidy" this into a module-level function
+  without also updating that suite.
+- **A job that ran but did not complete is still a job.** It is counted and separately tallied as
+  incomplete, so a failed pass can neither be reported as success nor silently vanish. On a failure
+  path where elapsed time is not provable, the UI **omits** the timing rather than understating it.
+- **Zero uncached jobs means zero analysis workers used.** `_video_analysis_workers` keeps its
+  `video_count <= 1 → 1` contract untouched — the genuine single-source case needs it — and the call
+  site supplies the truth (`… if jobs else 0`). The analysis block is guarded by `if jobs:`, so
+  nothing is ever submitted when the library is fully warm.
+- **The Stage-5 START event is pre-cache-classification.** It fires before the cache scan, so it
+  cannot know how many sources need analysing; it says `Checking N source video(s)`. The post-scan
+  metric (`H cached, J to analyze, W worker(s)`) remains the authority on real work.
+- **The five-line CMD budget is not the bug and must not be raised.** `_stage5_summary` is ordered so
+  current-run truth wins: sources/cache/analysed → current-run Qwen status → `Analysis time …,
+  cache H/N` → library summary → optional *explicitly labelled* cached metadata. The authoritative
+  `Analysis time` line used to be the one dropped; a test now pins that it survives.
+
+Not fixed here, and deliberately out of scope: production measured **~69 s** inside Stage 5 on that
+warm run (`total_elapsed` brackets the whole `analyze_video_sources` body and flows to the END
+event's `elapsed_seconds`), while later profiling — run after the same ~2.52 GB of bounded
+fingerprint windows were already in the OS cache — measured **~3.2–3.4 s**. That discrepancy is
+**unresolved**. This work fixes reporting truth, not Stage-5 performance.
+
 ### Console vs. UI output — structured progress
 
 In GUI runs `gui.process_video` still redirects stdout/stderr into `QuietConsole` (discarded), so **a

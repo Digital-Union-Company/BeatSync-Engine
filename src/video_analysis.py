@@ -52,6 +52,44 @@ _LLAMA_VERSION_TOKENS: Dict[str, str] = {}
 # record carries the *consequence* (ai_enabled) rather than this bookkeeping flag.
 _QWEN_COMPLETED_KEY = "_qwen_completed"
 
+
+def _new_run_stats() -> Dict[str, Any]:
+    """[FORK] Digital-Union (R1): per-invocation accounting of what THIS run actually executed.
+
+    Stage 5 returns two different kinds of truth and used to conflate them. The `qwen_*` aggregates
+    near the end of `analyze_video_sources` sum over `videos`, which includes every cache hit, so a
+    fully warm run reported the cached library's historical tag counts, model id, batch size and
+    inference seconds as though this invocation had produced them. Production proved it: 845/845
+    cache hits, zero sources analysed, zero Qwen workers launched - and a console summary reading
+    `Qwen tags: 8704/8704 in 3031.9s`.
+
+    This dict is the *execution* half. It is created once per `analyze_video_sources` call, threaded
+    only into the paths that analyse an uncached source, and never derived from a cached record, so
+    a cache hit cannot inflate it. It is returned as top-level metadata and is **never** written into
+    a source-cache payload: it is a separate object from `video_data`, so no path exists by which it
+    could reach `_checkpoint_cache`.
+
+    The two places that increment it do so inline rather than through a shared helper. That is
+    deliberate - `_annotate_candidates_with_qwen` and `_complete_deferred_qwen_batch` are both
+    AST-extracted and executed by `tests/test_stage5_cache_completion.py`, so they must stay
+    self-contained with respect to helpers outside that suite's extraction list.
+    """
+    return {
+        "qwen_jobs": 0,
+        "qwen_completed_jobs": 0,
+        "qwen_incomplete_jobs": 0,
+        # [FORK] Digital-Union (R2): requested, decoded and tagged are three different facts, and the
+        # UI needs the first as its denominator. `qwen_requested_count` is what was SUBMITTED,
+        # `qwen_frame_count` is what the worker PROVED it decoded, `qwen_tag_count` is what was
+        # actually merged. Only "requested" is knowable without a usable worker response, which is
+        # what makes a failed attempt reportable at all.
+        "qwen_requested_count": 0,
+        "qwen_frame_count": 0,
+        "qwen_tag_count": 0,
+        "qwen_seconds": 0.0,
+        "qwen_inference_seconds": 0.0,
+    }
+
 # [FORK] Digital-Union (D1 R2): the worker always publishes a per-job timings entry once a job has
 # finished (`timings_by_job["single"]` for the legacy single-job request), while every
 # `_run_qwen_worker` failure path returns `{}`. Membership is therefore the completion evidence -
@@ -819,8 +857,11 @@ def analyze_video_sources(
     # [FORK] Digital-Union: structured progress. `total` is the real source count, and cache hits
     # count as already-completed deterministic analysis, so the counter reflects work actually done
     # rather than restarting from zero on a cached run.
+    # [FORK] Digital-Union (R1): this fires BEFORE the cache scan, so it cannot yet know how many
+    # sources need analysing - on a fully warm library the answer is none. "Checking" is what the
+    # system actually knows here; the post-scan metric below stays the authority on real work.
     fork_progress.emit(event_callback, fork_progress.start(
-        5, f"Analyzing {len(existing)} source video(s)",
+        5, f"Checking {len(existing)} source video(s)",
         current=0, total=len(existing), unit="sources",
     ))
     source_counter = fork_progress.StageCounter(5, len(existing), min_interval=0.5)
@@ -850,6 +891,10 @@ def analyze_video_sources(
         fork_progress.emit(event_callback, fork_progress.warning(
             5, "Qwen backend identity unverifiable; AI analysis cache disabled for this run."))
 
+    # [FORK] Digital-Union (R1): execution truth for THIS invocation, kept strictly separate from
+    # the library aggregates computed later over `videos` (which include every cache hit).
+    run_stats = _new_run_stats()
+
     for idx, video_file in enumerate(existing, 1):
         cache_file = None if ai_cache_disabled else _cache_path(
             video_file, ai_available, qwen_model_path,
@@ -872,7 +917,11 @@ def analyze_video_sources(
         else:
             jobs.append({"index": idx, "video_file": video_file, "cache_file": cache_file})
 
-    workers = _video_analysis_workers(len(jobs))
+    # [FORK] Digital-Union (R1): `_video_analysis_workers` keeps its one-job contract untouched
+    # (`video_count <= 1 -> 1`), which the genuine single-source case relies on. What was untrue was
+    # reporting one analysis worker when there are no jobs at all - the analysis block below is
+    # guarded by `if jobs:`, so nothing is ever submitted. Report the workers actually used.
+    workers = _video_analysis_workers(len(jobs)) if jobs else 0
     fork_progress.emit(event_callback, fork_progress.metric(
         5,
         f"{cache_hits} cached, {len(jobs)} to analyze, {workers} worker(s)",
@@ -946,6 +995,10 @@ def analyze_video_sources(
         else:
             print("   CPU visual analysis workers: 1 (serial)")
             for job in jobs:
+                # [FORK] Digital-Union (R1): only this call passes `defer_ai=False`, so it is the
+                # one that runs Qwen inline and must feed the current-run accounting. The parallel
+                # submissions above defer Qwen and never record, which also keeps `run_stats`
+                # mutated solely from this single thread.
                 results_by_index[job["index"]] = _analyze_single_video(
                     job["video_file"],
                     use_gpu,
@@ -956,6 +1009,7 @@ def analyze_video_sources(
                     job["index"],
                     len(existing),
                     event_callback,
+                    run_stats,
                 )
                 # [FORK] Digital-Union (D1): serial mode runs Qwen inline (defer_ai=False), so this
                 # source is genuinely finished here - make it durable before starting the next one.
@@ -994,6 +1048,7 @@ def analyze_video_sources(
             audio_profile=audio_profile or {},
             total_video_count=len(existing),
             event_callback=event_callback,
+            run_stats=run_stats,
         )
     else:
         for job in deferred_jobs:
@@ -1009,6 +1064,7 @@ def analyze_video_sources(
                 label=f"{idx}/{len(existing)}",
                 event_callback=event_callback,
                 cache_file=job["cache_file"],
+                run_stats=run_stats,
             )
 
     if deferred_jobs:
@@ -1094,6 +1150,13 @@ def analyze_video_sources(
         elapsed_seconds=float(total_elapsed),
         sources=len(existing), cache_hits=int(cache_hits), workers=int(workers),
         candidates=len(all_candidates), ai_enabled=bool(ai_available),
+        # [FORK] Digital-Union (R1): the structured channel carries the two truths separately, so a
+        # consumer never has to guess which kind of number it is holding.
+        sources_analyzed_this_run=int(len(jobs)),
+        qwen_jobs_this_run=int(run_stats["qwen_jobs"]),
+        qwen_requested_count_this_run=int(run_stats["qwen_requested_count"]),
+        qwen_tag_count_this_run=int(run_stats["qwen_tag_count"]),
+        qwen_frame_count_this_run=int(run_stats["qwen_frame_count"]),
         qwen_tag_count=int(qwen_tag_count), qwen_frame_count=int(qwen_frame_count),
         unit="sources",
     ))
@@ -1108,6 +1171,23 @@ def analyze_video_sources(
         "cache_hits": cache_hits,
         "source_count": len(existing),
         "worker_count": workers,
+        # [FORK] Digital-Union (R1): CURRENT-RUN execution facts. Computed from the uncached `jobs`
+        # set and the Qwen requests those jobs actually issued - never from `videos`, which contains
+        # every cache hit. On a fully warm run they are all zero while the library aggregates below
+        # stay truthfully historical. Ephemeral top-level metadata; never enters a cache payload.
+        "sources_analyzed_this_run": len(jobs),
+        "analysis_workers_used": workers,
+        "qwen_jobs_this_run": int(run_stats["qwen_jobs"]),
+        "qwen_completed_jobs_this_run": int(run_stats["qwen_completed_jobs"]),
+        "qwen_incomplete_jobs_this_run": int(run_stats["qwen_incomplete_jobs"]),
+        "qwen_requested_count_this_run": int(run_stats["qwen_requested_count"]),
+        "qwen_frame_count_this_run": int(run_stats["qwen_frame_count"]),
+        "qwen_tag_count_this_run": int(run_stats["qwen_tag_count"]),
+        "qwen_seconds_this_run": float(run_stats["qwen_seconds"]),
+        "qwen_inference_seconds_this_run": float(run_stats["qwen_inference_seconds"]),
+        # [FORK] Digital-Union: LIBRARY AGGREGATES over the returned records, cache hits included.
+        # Historical by nature; preserved unchanged for compatibility. The UI must not present these
+        # as work performed by the current run - that was the production reporting defect.
         "qwen_tag_count": qwen_tag_count,
         "qwen_frame_count": qwen_frame_count,
         "qwen_seconds": qwen_seconds,
@@ -1128,6 +1208,7 @@ def _analyze_single_video(
     index: int | None = None,
     total: int | None = None,
     event_callback=None,
+    run_stats: Dict[str, Any] | None = None,
 ) -> Dict:
     started = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -1215,6 +1296,7 @@ def _analyze_single_video(
                 use_gpu=use_gpu,
                 audio_profile=audio_profile,
                 event_callback=event_callback,
+                run_stats=run_stats,
             )
             qwen_seconds = time.perf_counter() - step_started
             # Pop before the update: the private flag must never reach timings or the cache payload.
@@ -1279,6 +1361,7 @@ def _complete_deferred_qwen(
     label: str = "",
     event_callback=None,
     cache_file: str | None = None,
+    run_stats: Dict[str, Any] | None = None,
 ) -> Dict:
     candidates = video_data.get("candidates") or []
     if not candidates:
@@ -1304,6 +1387,7 @@ def _complete_deferred_qwen(
             use_gpu=use_gpu,
             audio_profile=audio_profile,
             event_callback=event_callback,
+            run_stats=run_stats,
         )
         # [FORK] Digital-Union (D1): completion comes from the facade's explicit signal, never from
         # "no exception was raised". The facade applies `_qwen_job_completed`, so a worker process
@@ -1355,7 +1439,12 @@ def _complete_deferred_qwen_batch(
     audio_profile: Dict,
     total_video_count: int,
     event_callback=None,
+    run_stats: Dict[str, Any] | None = None,
 ) -> None:
+    # [FORK] Digital-Union (R1): `request_jobs` below is the authoritative set of sources that reach
+    # the shared worker. Candidate-less sources `continue` before it and a configured skip returns
+    # earlier still, so counting from the per-job merge loop - not from `video_items` or
+    # `deferred_jobs` - is what makes "Qwen jobs this run" mean a request was genuinely issued.
     max_windows = _qwen_max_windows()
     if max_windows == 0:
         for _, video_data in video_items:
@@ -1416,6 +1505,20 @@ def _complete_deferred_qwen_batch(
         event_callback=event_callback,
     )
     batch_seconds = time.perf_counter() - batch_started
+    # [FORK] Digital-Union (R2): SUBMISSION truth, recorded the moment the shared worker returns and
+    # therefore BEFORE the empty-response branch below. A worker that timed out, exited non-zero or
+    # produced an unreadable response still consumed a real attempt on real sources; R1 returned
+    # early and reported `0 jobs`, which the UI rendered as "no inference this run" - false.
+    # Every submitted job starts incomplete and is promoted only by its own returned evidence, so an
+    # empty response correctly leaves all of them incomplete with no further bookkeeping.
+    # `batch_seconds` is the one measured wall time of the one shared worker invocation: added
+    # exactly once here, never per source, and never from the amortized per-source figures below.
+    if run_stats is not None:
+        run_stats["qwen_jobs"] += len(request_jobs)
+        run_stats["qwen_incomplete_jobs"] += len(request_jobs)
+        run_stats["qwen_requested_count"] += sum(
+            len(selected_by_job.get(str(job.get("job_id")), ())) for job in request_jobs)
+        run_stats["qwen_seconds"] += float(batch_seconds)
     semantics_by_job = response.get("semantics_by_job") or {}
     timings_by_job = response.get("timings_by_job") or {}
     if not semantics_by_job:
@@ -1502,6 +1605,26 @@ def _complete_deferred_qwen_batch(
         # job's failure - or a parent interruption during this post-response merge loop - cannot cost
         # a job that is already finished. Work still inside an in-flight worker is NOT covered: the
         # batch response only exists once the worker's whole job loop has returned.
+        # [FORK] Digital-Union (R2): RESPONSE truth only. The job was already counted at submission,
+        # so nothing here touches `qwen_jobs` - doing so would double-count every successful source.
+        # Completion promotes one job out of the incomplete tally; decoded/tagged/inference numbers
+        # are added only where the worker actually proved them.
+        if run_stats is not None:
+            if job_completed:
+                run_stats["qwen_completed_jobs"] += 1
+                run_stats["qwen_incomplete_jobs"] -= 1
+            # Decoded frames count only when the worker reported a real integer. The persisted
+            # `timings["qwen_frame_count"]` falls back to the requested count for source-record
+            # compatibility; that fallback is not evidence of decoding and must not leak into
+            # current-run truth.
+            reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
+            if _is_count(reported_frames):
+                run_stats["qwen_frame_count"] += reported_frames
+            # Tags are the semantics actually merged into candidates - directly observed.
+            run_stats["qwen_tag_count"] += merged_count
+            reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
+            if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
+                run_stats["qwen_inference_seconds"] += float(reported_inference)
         _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
@@ -2075,7 +2198,12 @@ def _annotate_candidates_with_qwen(
     use_gpu: bool,
     audio_profile: Dict,
     event_callback=None,
+    run_stats: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    # [FORK] Digital-Union (R1): `run_stats` is the optional current-run accounting sink. It stays
+    # `None` for every pre-existing caller, and a job is recorded only on the branch below that
+    # actually calls `_run_qwen_worker` - so a configured skip and a candidate-less source, neither
+    # of which issues a request, are correctly not counted as Qwen work performed this run.
     # [FORK] Digital-Union (D1 R3): annotation corrected from `-> None`. Every normal branch returns
     # a timings dict, and since D1 it also carries the load-bearing private `_QWEN_COMPLETED_KEY`
     # that the caller pops to decide `ai_enabled`. Annotation only - no behaviour or shape change.
@@ -2093,6 +2221,7 @@ def _annotate_candidates_with_qwen(
         return {"qwen_frame_count": 0, "qwen_tag_count": 0, _QWEN_COMPLETED_KEY: True}
 
     print(f"   Qwen semantic analysis: {len(ai_candidates)} candidate moments")
+    _qwen_request_started = time.perf_counter()
     response = _run_qwen_worker(
         video_file=video_file,
         fps=fps,
@@ -2136,6 +2265,32 @@ def _annotate_candidates_with_qwen(
     else:
         print(f"      Qwen semantic tags merged: {merged_count}/{len(ai_candidates)}")
 
+    # [FORK] Digital-Union (R1): a request was genuinely issued for this source, so it counts as
+    # one current-run Qwen job whether or not it completed. This is the seam that makes the
+    # serial/inline path visible - it never appears in `deferred_jobs`. Inline rather than via a
+    # helper - see `_new_run_stats`.
+    if run_stats is not None:
+        # Submission truth: one attempt over `len(ai_candidates)` submitted candidates, plus the one
+        # measured wall time of this worker invocation. All true even when the response is unusable.
+        run_stats["qwen_jobs"] += 1
+        run_stats["qwen_requested_count"] += len(ai_candidates)
+        run_stats["qwen_seconds"] += float(time.perf_counter() - _qwen_request_started)
+        # Response truth: completion, then only what the worker actually proved.
+        if completed:
+            run_stats["qwen_completed_jobs"] += 1
+        else:
+            run_stats["qwen_incomplete_jobs"] += 1
+        # Decoded frames count ONLY when reported as a real integer. `_reported_count` falls back to
+        # the requested count for source-record compatibility; that fallback stays for the persisted
+        # field but is not evidence of decoding, so it must not reach current-run truth.
+        reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
+        if _is_count(reported_frames):
+            run_stats["qwen_frame_count"] += reported_frames
+        # Tags are the semantics actually merged into candidates - directly observed.
+        run_stats["qwen_tag_count"] += merged_count
+        reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
+        if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
+            run_stats["qwen_inference_seconds"] += float(reported_inference)
     return {
         _QWEN_COMPLETED_KEY: completed,
         # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback

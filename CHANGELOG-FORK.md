@@ -20,6 +20,112 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-09-28 (Stage 5 reports current-run work, not cached-library history)
+
+**The defect, observed in production.** A fully warm run — 845/845 cache hits, **zero** sources
+re-analysed, **zero** Qwen workers launched, zero model inference, zero Stage-5 cache writes, all of
+it independently verified — printed a Stage-5 summary reading `Source videos: 845, visual workers: 1`,
+`Qwen: enabled, model Qwen3VL-2B-Instruct-Q8_0 (llama.cpp Vulkan), batch 4`,
+`Qwen performance: batch 4, 3.12 candidates/s` and `Qwen tags: 8704/8704 in 3031.9s`. Every one of
+those figures was loaded from cached records and described historical work. The five-line CMD budget
+was then exhausted, dropping the one line that actually described the run:
+`Analysis time: …, cache 845/845`.
+
+This was a reporting and observability defect only. The cache, the completion contract and the Qwen
+runtime all behaved correctly; nothing about stored results was wrong.
+
+**Root cause.** Three independent issues:
+
+1. the top-level `qwen_*` aggregates sum or select over `videos`, which includes every cache hit, so
+   on a warm run they are pure history — yet the UI rendered them as current performance;
+2. `_video_analysis_workers(0)` returns `1` (its `video_count <= 1 → 1` contract), and `workers` was
+   computed unconditionally even though the analysis block is guarded by `if jobs:`, so the summary
+   claimed one analysis worker where none was used;
+3. the five-line budget dropped `Analysis time …` because the historical Qwen lines came first.
+
+A fourth, smaller issue found in the same audit: the Stage-5 START event fires *before* the cache
+scan yet announced `Analyzing N source video(s)` — stronger than the system can know at that point.
+
+**The change — additive, ephemeral, cache-neutral.** Stage 5 now returns explicit current-run
+execution facts alongside the untouched library aggregates: `sources_analyzed_this_run`,
+`analysis_workers_used`, `qwen_jobs_this_run`, `qwen_completed_jobs_this_run`,
+`qwen_incomplete_jobs_this_run`, `qwen_frame_count_this_run`, `qwen_tag_count_this_run`,
+`qwen_seconds_this_run`, `qwen_inference_seconds_this_run`. They come from an invocation-scoped
+`_new_run_stats()` dict threaded only into the paths that analyse an uncached source, so a cache hit
+cannot inflate them and a second call in the same process starts from zero. The existing aggregate
+fields keep their values and meaning for compatibility; the UI simply stops presenting them as
+current work.
+
+**The accounting invariant, which is subtler than it looks.** `qwen_jobs_this_run` is deliberately
+**not** `len(deferred_jobs)`. That would be wrong in both directions: the serial path
+(`_analyze_single_video` with `defer_ai=False`) runs Qwen **inline** and never appears in
+`deferred_jobs`, while a deferred source whose candidate list is empty passes through batch
+orchestration without ever reaching the worker. Counting therefore happens at the two places that
+genuinely submit work — immediately after `_run_qwen_worker` in the facade, and in the batch's
+per-job merge loop, which only runs for sources that made it into `request_jobs`. A configured skip
+(`BEATSYNC_QWEN_MAX_WINDOWS=0`) and a candidate-less source both correctly count as zero jobs. A job
+that ran but did not complete is still counted, and separately tallied as incomplete, so a failure
+can neither masquerade as success nor disappear.
+
+Both recording sites are written inline rather than via a shared helper, because
+`_annotate_candidates_with_qwen` and `_complete_deferred_qwen_batch` are AST-extracted and executed
+by `tests/test_stage5_cache_completion.py` and must stay self-contained.
+
+**Worker truth.** `_video_analysis_workers` is unchanged — its one-job contract is relied upon — and
+the call site now reports the workers actually used (`… if jobs else 0`).
+
+**START wording.** `Analyzing N source video(s)` → `Checking N source video(s)`. The post-scan metric
+(`H cached, J to analyze, W worker(s)`) remains the authority on real work.
+
+**Console summary.** `_stage5_summary` is reordered so current-run truth wins the five-line budget:
+sources/cache/analysed → current-run Qwen status → `Analysis time …, cache H/N` → library summary →
+optional cached metadata, explicitly labelled as cached. The budget itself is **not** raised; it was
+never the bug. Warm runs now read
+`Sources: 845, cache 845/845, analyzed this run 0` / `Qwen: enabled, no inference this run`;
+mixed runs read `Qwen this run: 2 job(s), 20/20 tags, in 14.0s` rather than the library's 8704/8704.
+
+**No cache impact.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v2` and `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`. The new fields are top-level return metadata on a dict
+that is separate from `video_data`, so they cannot reach `_checkpoint_cache`; a test pins that. No
+cache re-key, no source-cache payload change, no Qwen request-schema change, no semantic-output
+change, no candidate-scoring change, and no completion/checkpoint change. The 845 existing records
+remain reusable.
+
+**Not fixed, and explicitly out of scope.** Production measured **~69 s** inside Stage 5 on that warm
+run — `total_elapsed` brackets the whole `analyze_video_sources` body and flows to the END event's
+`elapsed_seconds`, so it was a genuine Stage-5 measurement. Later profiling, run once the same
+~2.52 GB of bounded fingerprint windows were already in the OS cache, measured **~3.2–3.4 s**. The
+discrepancy is **unresolved**; this work changes reporting truth, not Stage-5 performance.
+
+**R2 — failed Qwen attempts are still current-run work.** Review of the first cut found a real
+defect in the new accounting: `_complete_deferred_qwen_batch` recorded only inside its per-job merge
+loop, which sits *after* the early return taken when the shared worker produces no usable response.
+A worker that timed out, exited non-zero or returned unreadable output therefore reported
+`qwen_jobs_this_run = 0`, and the UI rendered `Qwen: enabled, no inference this run` — false, since a
+real attempt had been made on real sources. Batch accounting is now two-phase: **submission truth**
+(jobs, requested candidates, the one measured shared-worker wall time) is recorded the moment
+`_run_qwen_worker_batch` returns, before the empty-response branch, with every submitted job starting
+incomplete; **response truth** (completion, decoded frames, merged tags, inference seconds) is
+applied per job afterwards and deliberately does not re-count the job, which would double-count every
+success.
+
+R2 also separates three facts that the first cut conflated. `qwen_requested_count_this_run` (new) is
+what was submitted, `qwen_frame_count_this_run` is what the worker proved it decoded, and
+`qwen_tag_count_this_run` is what was actually merged. The UI's `N/M tags` denominator is now the
+**requested** count: previously a job that requested 10 candidates and decoded only 8 rendered as a
+flawless `8/8`, hiding the two that never arrived, and on a worker-level failure there was no decoded
+count at all. Current-run decoded frames are counted only when the worker reports a real integer —
+the persisted `timings["qwen_frame_count"]` keeps its legacy fallback to the requested count for
+source-record compatibility, and that fallback is now prevented from leaking into current-run truth.
+Current-run wall time counts each worker invocation once (one `batch_seconds`, or one single-call
+duration), never the amortized per-source figures, which scale with source count.
+
+Changed: `src/video_analysis.py`, `src/gui.py`, `tests/test_stage5_reporting_truth.py` (34 tests),
+`CLAUDE.md`, `CHANGELOG-FORK.md`. Suite 651 passed / 2 skipped (617 + 34 new; same two pre-existing
+`WinError 1314` symlink skips). The R2 tests execute the real `_annotate_candidates_with_qwen` and
+`_complete_deferred_qwen_batch` bodies with only the worker subprocess stubbed — the first cut
+asserted on shape and so never exercised the failure path it got wrong.
+
 ### Fixed — 2026-09-27 (Qwen targeted semantic recovery: one persistent rejection no longer retires a source)
 
 **The defect.** A candidate whose semantics `_normalize_semantic` rejected made its *entire source*
