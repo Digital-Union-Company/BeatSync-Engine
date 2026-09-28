@@ -509,6 +509,176 @@ def _reported_count(timing: Any, key: str, default: int) -> int:
     return int(default)
 
 
+# [FORK] Digital-Union (T1): OPTIONAL TELEMETRY has a different trust contract from counts.
+#
+# Counts are load-bearing: `_is_count`/`_reported_count` above decide semantic completion, so their
+# semantics are frozen by the D1 contract and are deliberately *not* redefined here. Durations, VRAM,
+# concurrency and the model id are pure observability - `_qwen_job_completed`,
+# `_stored_ai_cache_is_consistent` and `_cache_entry_is_complete` never read them - so a malformed one
+# must degrade to a neutral value and must never raise, never change completion, and never poison an
+# aggregate.
+#
+# Two hazards here are real rather than theoretical, both measured on the merged-main bodies:
+#
+# * ``json.loads``/``json.load`` ACCEPT ``NaN``/``Infinity``/``-Infinity`` (Python's non-standard
+#   default ``parse_constant``) and ``json.dump`` EMITS them, so a non-finite value survives the
+#   worker response file *and* a cache round trip. ``float()`` does not reject them, and one NaN
+#   makes every sum it enters NaN silently and permanently.
+# * bare ``int()``/``float()`` raise ``ValueError``/``TypeError``/``OverflowError`` on the other
+#   malformed shapes, and the shared-batch call site is unguarded, so a telemetry field could abort
+#   Stage 5 after real GPU minutes had been spent.
+#
+# This is robustness at a trust boundary, not a bug report about the shipping worker: today's worker
+# emits monotonic-clock deltas, ``max(1, min(32, int(slots)))`` and a literal ``0.0``, so it cannot
+# produce any of these shapes. The exposure is retained/hand-edited request-response and cache JSON
+# (both deliberately preserved in `input/video_analysis_cache/`), a future worker change, or a
+# regression.
+
+
+def _as_mapping(value: Any) -> Dict:
+    """Return ``value`` when it is a dict, otherwise an empty one.
+
+    Nested containers inside a worker response are untrusted even though the streaming runner has
+    already proven the *top-level* payload is an object (`beatsync_fork.qwen_progress` owns that
+    check, and it is not duplicated here). Truthiness is not evidence of shape: a truthy non-dict
+    ``semantics_by_job`` slipped past the empty-response branch and then raised ``AttributeError`` on
+    ``.get``.
+
+    Safe at load-bearing containers too, and that is a property rather than an accident: collapsing a
+    non-dict to ``{}`` can only make a completion check *fail* (no envelope, no returned ids), never
+    pass. It is never used to skip a validation that would otherwise have run.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _is_real_number(value: Any) -> bool:
+    """A real, finite ``int``/``float`` - not a ``bool``, and not a numeric string.
+
+    ``float("2.5")`` succeeding is not a reason to treat ``"2.5"`` as a measurement: a string in a
+    numeric field means the producer is wrong, and laundering it would hide that. ``bool`` is
+    excluded for the same reason `_is_count` excludes it. ``math.isfinite`` is called inside a
+    ``try`` because an integer too large to convert to ``float`` raises ``OverflowError`` there,
+    which is exactly one of the shapes this has to survive.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, OverflowError, ValueError):
+        return False
+
+
+def _optional_telemetry_number(value: Any) -> float | None:
+    """One optional non-negative telemetry number, or ``None`` when it is not evidence.
+
+    ``None`` means *unknown* and is deliberately distinct from a legitimate ``0.0``: the worker
+    reports ``peak_vram_gb`` as a literal ``0.0``, so coercing a malformed value to ``0.0`` would
+    make a corrupt record indistinguishable from every healthy one in the library.
+
+    Negatives are rejected because every field this guards is physically non-negative - durations are
+    monotonic-clock deltas, VRAM is a size - so a negative proves a broken producer. `_fmt_seconds`
+    already clamps *display* with ``max(0.0, ...)``, which is why a negative has to be rejected here
+    instead: otherwise it stays invisible on the console while still corrupting the total.
+
+    There is deliberately **no** wall-time ceiling. Bounding a worker-reported duration by the
+    parent's own measurement of the call looks attractive and is wrong in practice: it makes the value
+    depend on how long the surrounding call happened to take, so a stubbed or replayed worker - the
+    only way this code is testable without a GPU - has every legitimate duration silently rejected.
+    Finiteness and sign are what make the aggregate safe; the ceiling added no safety for that and
+    cost testability. Counts are different: `_bounded_count` has a real bound in the same scope (the
+    submitted candidate set), which is why it keeps one.
+    """
+    if not _is_real_number(value):
+        return None
+    number = float(value)
+    if number < 0.0:
+        return None
+    return number
+
+
+def _telemetry_seconds(mapping: Any, key: str) -> float:
+    """A duration-like telemetry field as a float, contributing ``0.0`` when it is not evidence.
+
+    Absent and malformed both contribute nothing, which is what the R2 accounting contract already
+    says about missing timing ("absence of evidence ... contributes zero and is never invented"). A
+    genuine ``0.0`` is preserved, so this is never written as ``value or default``.
+    """
+    number = _optional_telemetry_number(_as_mapping(mapping).get(key))
+    return 0.0 if number is None else number
+
+
+def _telemetry_total(values: Iterable[Any]) -> float:
+    """Sum optional telemetry so the *aggregate* can never be non-finite.
+
+    Rejecting individual NaN/Inf values is not sufficient: enough individually finite values can
+    still overflow a running total to ``inf``. If that happens the aggregate is not a measurement any
+    more, so it degrades to the neutral ``0.0`` rather than reporting ``inf`` - unknown is preferable
+    to false precision, and no plausible figure is fabricated to keep it finite.
+    """
+    total = 0.0
+    for value in values:
+        number = _optional_telemetry_number(value)
+        if number is None:
+            continue
+        total += number
+        if not math.isfinite(total):
+            return 0.0
+    return total
+
+
+def _is_nonnegative_count(value: Any) -> bool:
+    """A real non-negative integer count, not a ``bool``.
+
+    Separate from `_is_count` on purpose: `_is_count` is load-bearing for completion and its
+    semantics are frozen, but it admits negatives (``_is_count(-5)`` is ``True``), which is how a
+    worker-reported ``frame_count: -5`` reached `qwen_frame_count_this_run`.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _bounded_count(value: Any, limit: int | None = None) -> int:
+    """A count telemetry value as an int, contributing ``0`` when it is not evidence.
+
+    ``limit`` is the count's natural bound - the number of candidates actually submitted, or the
+    number a record holds. A worker claiming it decoded more frames than were requested is not
+    reporting evidence, and a candidate-less record claiming a huge tag count cannot be allowed to
+    inflate a library total.
+    """
+    if not _is_nonnegative_count(value):
+        return 0
+    if limit is not None and value > limit:
+        return 0
+    return int(value)
+
+
+def _telemetry_text(value: Any) -> str:
+    """A non-empty string, or ``""``.
+
+    ``str(response.get("model_id") or "")`` turned ``123`` into ``"123"`` and ``{"a": 1}`` into
+    ``"{'a': 1}"``, i.e. invented a model identity out of a malformed field.
+    """
+    return value if isinstance(value, str) and value else ""
+
+
+def _record_telemetry(record: Any) -> Dict:
+    """A source record's ``timings`` mapping, for reading OPTIONAL TELEMETRY only.
+
+    A truthy non-dict ``timings`` raised ``AttributeError`` out of the library aggregation before any
+    scalar was even looked at (``(v.get("timings") or {})`` returns the string, then ``.get`` fails).
+
+    Strictly for telemetry. It must never stand in for load-bearing validation: the completion rules
+    do their own ``isinstance(timings, dict)`` check, and `_deterministic_analysis_completed` and
+    `_stored_ai_cache_is_consistent` keep theirs.
+    """
+    return _as_mapping(_as_mapping(record).get("timings"))
+
+
+def _record_candidate_count(record: Any) -> int:
+    """How many candidates a record actually holds - the natural bound for its own count telemetry."""
+    candidates = _as_mapping(record).get("candidates")
+    return len(candidates) if isinstance(candidates, list) else 0
+
+
 def _qwen_job_completed(timing: Any, envelope_present: bool,
                         requested_ids: Any, returned_ids: Any) -> bool:
     """[FORK] Digital-Union (D1 R5): did the AI work for one *submitted* Qwen job actually complete?
@@ -1068,10 +1238,14 @@ def analyze_video_sources(
             )
 
     if deferred_jobs:
-        tagged = sum(int((results_by_index.get(j["index"], {}).get("timings") or {}).get("qwen_tag_count", 0))
-                     for j in deferred_jobs)
-        frames = sum(int((results_by_index.get(j["index"], {}).get("timings") or {}).get("qwen_frame_count", 0))
-                     for j in deferred_jobs)
+        # [FORK] Digital-Union (T1): same tolerant count reading as the library aggregate below - a
+        # progress line must not be able to raise out of Stage 5, and a record's own candidate list is
+        # the natural bound on any count it claims.
+        deferred_records = [results_by_index.get(j["index"]) for j in deferred_jobs]
+        tagged = sum(_bounded_count(_record_telemetry(r).get("qwen_tag_count"),
+                                    _record_candidate_count(r)) for r in deferred_records)
+        frames = sum(_bounded_count(_record_telemetry(r).get("qwen_frame_count"),
+                                    _record_candidate_count(r)) for r in deferred_records)
         qwen_elapsed = time.perf_counter() - qwen_started
         if tagged:
             fork_progress.emit(event_callback, fork_progress.metric(
@@ -1114,29 +1288,40 @@ def analyze_video_sources(
         )
 
     total_elapsed = time.perf_counter() - total_started
-    qwen_tag_count = sum(int((v.get("timings") or {}).get("qwen_tag_count", 0)) for v in videos)
-    qwen_frame_count = sum(int((v.get("timings") or {}).get("qwen_frame_count", 0)) for v in videos)
-    qwen_seconds = sum(float((v.get("timings") or {}).get("qwen_seconds", 0.0)) for v in videos)
-    qwen_inference_seconds = sum(float((v.get("timings") or {}).get("qwen_inference_seconds", 0.0)) for v in videos)
+    # [FORK] Digital-Union (T1): these aggregate over `videos`, which contains every CACHE HIT, so on a
+    # warm library every value below comes off disk rather than from this run. A record that satisfies
+    # `_cache_entry_is_complete`/`_stored_ai_cache_is_consistent` can still carry malformed optional
+    # telemetry, because neither rule reads durations, VRAM, concurrency or the model id - so such a
+    # record stays reusable and used to crash or poison this block on every subsequent warm run, with
+    # nothing to trigger a recompute. Reading tolerantly here is what defuses that.
+    #
+    # Old cache files are never rewritten and never migrated; a valid entry stays byte-identical.
+    qwen_tag_count = sum(_bounded_count(_record_telemetry(v).get("qwen_tag_count"),
+                                        _record_candidate_count(v)) for v in videos)
+    qwen_frame_count = sum(_bounded_count(_record_telemetry(v).get("qwen_frame_count"),
+                                          _record_candidate_count(v)) for v in videos)
+    qwen_seconds = _telemetry_total(_record_telemetry(v).get("qwen_seconds") for v in videos)
+    qwen_inference_seconds = _telemetry_total(
+        _record_telemetry(v).get("qwen_inference_seconds") for v in videos)
+    # Selected metadata: an invalid value is skipped so a valid sibling can still be chosen, which is
+    # also what makes the result independent of where a malformed record happens to sort. The old
+    # `next(...)` converted only up to the first truthy record, so whether Stage 5 crashed depended on
+    # source discovery order. A legitimate 0/"" is falsy and skipped exactly as it was before.
     qwen_model_id = next(
-        (
-            str((v.get("timings") or {}).get("qwen_model_id"))
-            for v in videos
-            if (v.get("timings") or {}).get("qwen_model_id")
-        ),
+        (text for text in (_telemetry_text(_record_telemetry(v).get("qwen_model_id"))
+                           for v in videos) if text),
         "",
     )
     qwen_concurrency = next(
-        (
-            int((v.get("timings") or {}).get("qwen_concurrency"))
-            for v in videos
-            if (v.get("timings") or {}).get("qwen_concurrency")
-        ),
+        (count for count in (_bounded_count(_record_telemetry(v).get("qwen_concurrency"))
+                             for v in videos) if count),
         0,
     )
-    qwen_peak_vram_gb = max(
-        [float((v.get("timings") or {}).get("qwen_peak_vram_gb") or 0.0) for v in videos] or [0.0]
-    )
+    # `max` over a comprehension evaluates every element, so ordering never saved this one. Only
+    # provable values compete; 0.0 is the existing neutral when nothing is provable.
+    _vram_values = [number for number in (_optional_telemetry_number(
+        _record_telemetry(v).get("qwen_peak_vram_gb")) for v in videos) if number is not None]
+    qwen_peak_vram_gb = max(_vram_values) if _vram_values else 0.0
     print(
         f"   Visual library ready: {summary} "
         f"[total {_fmt_seconds(total_elapsed)}, cache hits {cache_hits}/{len(existing)}]"
@@ -1519,8 +1704,14 @@ def _complete_deferred_qwen_batch(
         run_stats["qwen_requested_count"] += sum(
             len(selected_by_job.get(str(job.get("job_id")), ())) for job in request_jobs)
         run_stats["qwen_seconds"] += float(batch_seconds)
-    semantics_by_job = response.get("semantics_by_job") or {}
-    timings_by_job = response.get("timings_by_job") or {}
+    # [FORK] Digital-Union (T1): the nested containers are normalised before they are believed. A
+    # truthy non-dict `semantics_by_job` - a list, a string - used to pass the emptiness test below
+    # and then raise `AttributeError` on `.get` further down. Collapsing it to `{}` gives it the same
+    # semantic outcome as no usable semantics: every submitted job stays attempted and incomplete,
+    # nothing is invented, and Stage 5 survives. The top-level payload is already proven to be an
+    # object by `beatsync_fork.qwen_progress`, so that check is not repeated here.
+    semantics_by_job = _as_mapping(response.get("semantics_by_job"))
+    timings_by_job = _as_mapping(response.get("timings_by_job"))
     if not semantics_by_job:
         for video_data in job_to_video.values():
             video_data["ai_deferred"] = False
@@ -1528,11 +1719,14 @@ def _complete_deferred_qwen_batch(
         print("      Qwen llama.cpp returned no semantic response; AI analysis will retry on the next run.")
         print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
         return
-    model_load_seconds = float(response.get("model_load_seconds") or 0.0)
+    # [FORK] Digital-Union (T1): optional telemetry, sanitised once at ingestion so nothing malformed
+    # reaches a per-source record, a library aggregate or the current-run counters.
+    model_load_seconds = _telemetry_seconds(response, "model_load_seconds")
     amortized_model = model_load_seconds / max(1, len(request_jobs))
-    qwen_model_id = str(response.get("model_id") or "")
-    qwen_concurrency = int(response.get("batch_size") or 0)
-    qwen_peak_vram_gb = float(response.get("peak_vram_gb") or 0.0)
+    qwen_model_id = _telemetry_text(response.get("model_id"))
+    qwen_concurrency = _bounded_count(response.get("batch_size"))
+    # `None` = unknown, deliberately distinct from the literal `0.0` the worker really reports.
+    qwen_peak_vram_gb = _optional_telemetry_number(response.get("peak_vram_gb"))
 
     for job_id, video_data in job_to_video.items():
         ai_candidates = selected_by_job.get(job_id, [])
@@ -1543,10 +1737,8 @@ def _complete_deferred_qwen_batch(
         # records a job's timings whenever its loop returns, even when every candidate's semantic
         # failed. `_qwen_job_completed` applies the shared rule. One failing job never fails its
         # siblings.
-        envelope_present = str(job_id) in (semantics_by_job if isinstance(semantics_by_job, dict)
-                                           else {})
-        semantics = semantics_by_job.get(str(job_id), {})
-        semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
+        envelope_present = str(job_id) in semantics_by_job
+        semantic_by_id = {str(k): v for k, v in _as_mapping(semantics_by_job.get(str(job_id))).items()}
         merged_count = 0
         for candidate in ai_candidates:
             semantic = semantic_by_id.get(str(candidate.get("id")))
@@ -1555,23 +1747,26 @@ def _complete_deferred_qwen_batch(
                 merged_count += 1
         candidates = video_data.get("candidates") or []
         candidates.sort(key=lambda c: c.get("editorial_score", 0.0), reverse=True)
-        timing = timings_by_job.get(str(job_id), {}) if isinstance(timings_by_job, dict) else {}
-        if not isinstance(timing, dict):
-            timing = {}
+        timing = _as_mapping(timings_by_job.get(str(job_id)))
         # [FORK] Digital-Union (D1 R5): same rule, using this job's own submitted candidate set.
         job_completed = _qwen_job_completed(
             timing, envelope_present,
             {str(candidate.get("id")) for candidate in ai_candidates}, set(semantic_by_id))
-        qwen_seconds = (
-            float(timing.get("prefetch_seconds") or 0.0)
-            + float(timing.get("inference_seconds") or 0.0)
-            + amortized_model
-        )
+        # [FORK] Digital-Union (T1): each duration is read once, sanitised, and reused - the two reads
+        # per field the old code did could disagree with themselves. `job_completed` above is decided
+        # without consulting any of these: a fully tagged job whose telemetry is malformed stays
+        # complete, checkpointable and cached.
+        prefetch_seconds = _telemetry_seconds(timing, "prefetch_seconds")
+        inference_seconds = _telemetry_seconds(timing, "inference_seconds")
+        qwen_seconds = prefetch_seconds + inference_seconds + amortized_model
         timings = video_data.setdefault("timings", {})
         timings["qwen_seconds"] = qwen_seconds
         timings["qwen_model_load_seconds_amortized"] = amortized_model
-        timings["qwen_prefetch_seconds"] = float(timing.get("prefetch_seconds") or 0.0)
-        timings["qwen_inference_seconds"] = float(timing.get("inference_seconds") or 0.0)
+        timings["qwen_prefetch_seconds"] = prefetch_seconds
+        timings["qwen_inference_seconds"] = inference_seconds
+        # D1 count semantics are untouched: `_reported_count` still preserves a genuine 0 and still
+        # treats present-but-malformed as 0, and `_stored_ai_cache_is_consistent` still decides
+        # whether the stored pair may be reused.
         timings["qwen_frame_count"] = _reported_count(timing, "frame_count", len(ai_candidates))
         timings["qwen_tag_count"] = _reported_count(timing, "tag_count", merged_count)
         timings["qwen_model_id"] = qwen_model_id
@@ -1613,18 +1808,21 @@ def _complete_deferred_qwen_batch(
             if job_completed:
                 run_stats["qwen_completed_jobs"] += 1
                 run_stats["qwen_incomplete_jobs"] -= 1
-            # Decoded frames count only when the worker reported a real integer. The persisted
-            # `timings["qwen_frame_count"]` falls back to the requested count for source-record
-            # compatibility; that fallback is not evidence of decoding and must not leak into
-            # current-run truth.
-            reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
-            if _is_count(reported_frames):
-                run_stats["qwen_frame_count"] += reported_frames
-            # Tags are the semantics actually merged into candidates - directly observed.
+            # Decoded frames count only when the worker reported a real non-negative integer within
+            # its natural bound. The persisted `timings["qwen_frame_count"]` falls back to the
+            # requested count for source-record compatibility; that fallback is not evidence of
+            # decoding and must not leak into current-run truth.
+            # [FORK] Digital-Union (T1): `_is_count` alone admitted a negative - it is frozen for the
+            # completion contract, so the sign and bound checks live in `_bounded_count`. A worker
+            # cannot have decoded more frames than the job actually submitted.
+            run_stats["qwen_frame_count"] += _bounded_count(
+                timing.get("frame_count"), len(ai_candidates))
+            # Tags are the semantics actually merged into candidates - directly observed, never the
+            # worker's own tag_count.
             run_stats["qwen_tag_count"] += merged_count
-            reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
-            if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
-                run_stats["qwen_inference_seconds"] += float(reported_inference)
+            # [FORK] Digital-Union (T1): the already-sanitised value, so NaN, +/-Infinity and a
+            # negative all contribute nothing instead of contaminating the current-run figure.
+            run_stats["qwen_inference_seconds"] += inference_seconds
         _checkpoint_cache(job_to_cache.get(job_id), video_data, require_ai=True)
 
     print(f"      ⏱ Shared Qwen batch total: {_fmt_seconds(batch_seconds)}")
@@ -2235,13 +2433,14 @@ def _annotate_candidates_with_qwen(
     # job's AI work actually *completed* is then decided by `_qwen_job_completed`, which requires
     # every decoded frame item to have produced a valid semantic. Envelope membership alone only
     # proves the worker's job loop returned - see that helper for the worker-contract reasoning.
-    job_timings = response.get("timings_by_job") if isinstance(response, dict) else None
-    envelope_present = isinstance(job_timings, dict) and _QWEN_SINGLE_JOB_ID in job_timings
-    timing = job_timings.get(_QWEN_SINGLE_JOB_ID) if envelope_present else {}
-    if not isinstance(timing, dict):
-        timing = {}
-    semantics = response.get("semantics") if isinstance(response, dict) else {}
-    semantic_by_id = {str(k): v for k, v in semantics.items()} if isinstance(semantics, dict) else {}
+    # [FORK] Digital-Union (T1): one normalisation of the response and its nested containers, instead
+    # of repeating `if isinstance(response, dict)` at five separate reads. A non-dict nested container
+    # collapses to `{}`, which can only make the completion check below fail - never pass.
+    response_map = _as_mapping(response)
+    job_timings = _as_mapping(response_map.get("timings_by_job"))
+    envelope_present = _QWEN_SINGLE_JOB_ID in job_timings
+    timing = _as_mapping(job_timings.get(_QWEN_SINGLE_JOB_ID))
+    semantic_by_id = {str(k): v for k, v in _as_mapping(response_map.get("semantics")).items()}
     # [FORK] Digital-Union (D1 R5): the requested set is what `_select_ai_candidates` submitted.
     requested_ids = {str(candidate.get("id")) for candidate in ai_candidates}
     completed = _qwen_job_completed(timing, envelope_present, requested_ids, set(semantic_by_id))
@@ -2280,26 +2479,33 @@ def _annotate_candidates_with_qwen(
             run_stats["qwen_completed_jobs"] += 1
         else:
             run_stats["qwen_incomplete_jobs"] += 1
-        # Decoded frames count ONLY when reported as a real integer. `_reported_count` falls back to
-        # the requested count for source-record compatibility; that fallback stays for the persisted
-        # field but is not evidence of decoding, so it must not reach current-run truth.
-        reported_frames = timing.get("frame_count") if isinstance(timing, dict) else None
-        if _is_count(reported_frames):
-            run_stats["qwen_frame_count"] += reported_frames
+        # Decoded frames count ONLY when reported as a real non-negative integer no larger than the
+        # submitted set. `_reported_count` falls back to the requested count for source-record
+        # compatibility; that fallback stays for the persisted field but is not evidence of decoding,
+        # so it must not reach current-run truth.
+        run_stats["qwen_frame_count"] += _bounded_count(
+            timing.get("frame_count"), len(ai_candidates))
         # Tags are the semantics actually merged into candidates - directly observed.
         run_stats["qwen_tag_count"] += merged_count
-        reported_inference = timing.get("inference_seconds") if isinstance(timing, dict) else None
-        if isinstance(reported_inference, (int, float)) and not isinstance(reported_inference, bool):
-            run_stats["qwen_inference_seconds"] += float(reported_inference)
+        # [FORK] Digital-Union (T1): finite and non-negative, or it contributes nothing.
+        # `isinstance(..., (int, float))` alone admitted NaN, +/-Infinity and negatives into the
+        # current-run figure.
+        run_stats["qwen_inference_seconds"] += _telemetry_seconds(timing, "inference_seconds")
     return {
         _QWEN_COMPLETED_KEY: completed,
         # [FORK] Digital-Union (D1 R5): a worker-reported 0 stays 0; the requested/merged fallback
         # applies only when the field is genuinely absent.
         "qwen_frame_count": _reported_count(timing, "frame_count", len(ai_candidates)),
         "qwen_tag_count": _reported_count(timing, "tag_count", merged_count),
-        "qwen_model_id": str(response.get("model_id") or "") if isinstance(response, dict) else "",
-        "qwen_concurrency": int(response.get("batch_size") or 0) if isinstance(response, dict) else 0,
-        "qwen_peak_vram_gb": float(response.get("peak_vram_gb") or 0.0) if isinstance(response, dict) else 0.0,
+        # [FORK] Digital-Union (T1): optional telemetry, sanitised before it can reach `timings` and
+        # therefore before it can reach a cache payload. These three used to raise out of the facade on
+        # a malformed value - and because both callers wrap the facade in `except Exception`, that
+        # turned a fully tagged source into `ai_enabled=False`, i.e. permanent re-analysis caused by a
+        # field no completion rule reads. `None` for VRAM means unknown, kept distinct from the
+        # literal `0.0` the worker really reports.
+        "qwen_model_id": _telemetry_text(response_map.get("model_id")),
+        "qwen_concurrency": _bounded_count(response_map.get("batch_size")),
+        "qwen_peak_vram_gb": _optional_telemetry_number(response_map.get("peak_vram_gb")),
     }
 
 

@@ -31,7 +31,15 @@ _VIDEO_ANALYSIS = os.path.join(
 _FUNCS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_count",
           "_reported_count", "_stored_ai_cache_is_consistent", "_qwen_job_completed",
           "_deterministic_analysis_completed", "_cache_entry_is_complete",
-          "_load_cache", "_save_cache", "_checkpoint_cache")
+          "_load_cache", "_save_cache", "_checkpoint_cache",
+          # T1 telemetry-boundary helpers. Not cache primitives - they are here only because the
+          # orchestration bodies extracted below call them, and an extracted body resolves every
+          # name from this namespace. Exactly the transitive set those bodies need: the
+          # aggregation-only helpers (`_telemetry_total`, `_record_telemetry`,
+          # `_record_candidate_count`) live in `analyze_video_sources`, which this suite does not
+          # extract, so they are deliberately absent.
+          "_as_mapping", "_bounded_count", "_is_nonnegative_count", "_is_real_number",
+          "_optional_telemetry_number", "_telemetry_seconds", "_telemetry_text")
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
            "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
 
