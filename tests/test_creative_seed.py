@@ -40,15 +40,22 @@ _GUI_PATH = os.path.join(_REPO_ROOT, "src", "gui.py")
 @pytest.mark.parametrize(
     "value, expected",
     [
-        (0, 0), (None, 0), (-1, 0), (-999, 0), ("", 0), ("abc", 0), ([], 0),
+        # rejected: not a positive whole number
+        (0, 0), (-1, 0), (-999, 0), (None, 0), ("", 0), ("abc", 0), ([], 0), ({}, 0),
         (float("nan"), 0), (float("inf"), 0), (float("-inf"), 0),
-        (7, 7), ("7", 7), (7.0, 7), (7.9, 7), (381944, 381944),
+        (7.9, 0), (0.5, 0), (-7.0, 0), (0.0, 0), ("7.0", 0), ("-7", 0), (" ", 0),
+        # rejected: bool subclasses int, so `True` would otherwise slip through as seed 1
+        (True, 0), (False, 0),
+        # accepted
+        (7, 7), (7.0, 7), ("7", 7), ("  7  ", 7), (381944, 381944), (1, 1),
     ],
 )
-def test_normalize_seed_rejects_everything_that_is_not_a_positive_whole_number(value, expected):
+def test_normalize_seed_accepts_only_a_positive_whole_number(value, expected):
     """A Gradio number box yields floats, an emptied one yields None, and a user can type anything.
 
-    None of that may raise mid-render, and none of it may be guessed at into a variation request.
+    None of that may raise mid-render, and none of it may be *guessed at*: truncating ``7.9`` to 7
+    would render a seed the user never chose, and would make two different inputs reproduce as the
+    same "reproducible" variation. Only an exact positive whole number is a variation request.
     """
     assert variation.normalize_seed(value) == expected
 

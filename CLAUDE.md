@@ -861,8 +861,11 @@ The user picks a **Variation Seed**; it changes which clips the planner chooses,
   no source handler and no `source_outputs`, so changing it cannot clear a confirmed source set. It is
   a render-request input alongside FPS and the encoder, and `test_gui_guard_seam.py` still pins the
   positional alignment between the click `inputs` list and the handler's parameters.
-- Anything not a positive whole number normalises to legacy — `None`, `""`, a negative, `NaN`, `inf`.
-  A number box can produce all of those and none of them may raise mid-render.
+- **Anything not a positive whole number normalises to legacy**, and the boundary is an explicit type
+  check rather than `int(value)`: `None`, `""`, a negative, `NaN`, `inf`, **`7.9` and `True`** all
+  become 0. Truncating `7.9` to 7 would render a seed the user never chose and would make two
+  different inputs reproduce as the same "reproducible" variation; `bool` has to be rejected first
+  because it subclasses `int`. A number box can produce all of these and none may raise mid-render.
 
 ### Rendering modes
 

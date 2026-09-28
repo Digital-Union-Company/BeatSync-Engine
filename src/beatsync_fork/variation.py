@@ -44,17 +44,33 @@ _WEIGHT_FLOOR = 0.25
 
 
 def normalize_seed(value) -> int:
-    """Coerce any UI/CLI value to a usable seed. Anything not a positive integer becomes legacy.
+    """Coerce any UI/CLI value to a usable seed. Anything not a positive whole number is legacy.
 
     Gradio's number box yields floats, an emptied box yields ``None``, and a hand-typed value can be
     anything at all. None of that should raise in the middle of a render, and none of it should be
-    guessed at — a value that is not a positive whole number is simply not a variation request.
+    *guessed at*: the contract is a positive whole number, so ``7.9`` is not a request for seed 7 and
+    ``True`` is not a request for seed 1. Truncating either would silently render a seed the user
+    never chose — and, worse, would make two different inputs reproduce as the same "reproducible"
+    variation. The type boundary is therefore explicit rather than a blanket ``int(value)``.
+
+    ``bool`` is rejected first because it subclasses ``int``, so ``True`` would otherwise pass the
+    integer check. Only a plain decimal integer string is accepted; ``"7.0"`` is not.
     """
-    try:
-        seed = int(value)
-    except (TypeError, ValueError, OverflowError):
+    if isinstance(value, bool):
         return LEGACY_SEED
-    return seed if seed > 0 else LEGACY_SEED
+    if isinstance(value, int):
+        return value if value > 0 else LEGACY_SEED
+    if isinstance(value, float):
+        # `is_integer()` is False for NaN and both infinities, so they need no separate guard.
+        if value.is_integer() and value > 0:
+            return int(value)
+        return LEGACY_SEED
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdecimal():
+            seed = int(text)
+            return seed if seed > 0 else LEGACY_SEED
+    return LEGACY_SEED
 
 
 def is_variation(seed) -> bool:
