@@ -29,6 +29,7 @@ set PY=bin\python-3.13.14-embed-amd64\python.exe
 %PY% -X utf8 src\gui.py                             :: UI without run.bat
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --gpu --gpu-encoder h264_nvenc
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mov --lossless --fps 30 -s 10 -e 45
+%PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --seed 381944   :: creative variation
 %PY% -X utf8 src\auto_mode\stage5_qwen_scene_worker.py --request req.json --response resp.json
 ```
 
@@ -832,6 +833,40 @@ silent stretch of a run, ~8s even for the 2B model), `job_start`, `job_progress`
   call sites go through the streaming runner and that `event_callback` reaches every orchestrator seam,
   so live progress cannot silently become batch-only.
 
+### The creative variation seed (Phase A)
+
+The user picks a **Variation Seed**; it changes which clips the planner chooses, and nothing else.
+
+- **Seed 0 is legacy, and that is a product contract, not an implementation detail.** `_choose_candidate`
+  keeps its original argmax branch for seed 0 — same penalties, same `rng.random() * 0.015`, and
+  critically the same RNG stream: `_stable_rng(index, target, start)` with **no** seed component.
+  Prepending a `0` would change the hash input, change the jitter and silently change every default
+  render. A positive seed uses `_stable_rng(seed, index, target, start)` instead. A test recomputes
+  the pre-seed algorithm independently and pins the legacy plan against it.
+- **A positive seed changes the winner rule, not the scoring.** `_adjusted_score` is the old inline
+  arithmetic lifted out verbatim so both branches score identically; `variation.select_index` then
+  takes the best `TOP_K = 6`, drops anything more than `SCORE_WINDOW = 0.12` below the best, and makes
+  a weighted draw. The window is deliberately smaller than the planner's own 0.28 "seen recently"
+  penalty, so variation can never undo a repeat penalty the planner applied on purpose.
+- **The seed rides on `beat_info["creative"]`.** `analyze_beats_auto(creative={"seed": n})` normalises
+  it once and stores it; Stage 6 is the only reader. No analysis signature changed, and
+  `create_music_video` did not change at all.
+- **It must never touch cache identity.** `video_analysis.py` is unmodified, both version constants
+  are unchanged, and the seed is absent from `_video_signature` / `_cache_path` /
+  `_qwen_config_token` and from `audio_visual_profile` — whose `smart_preset` *is* keyed into the Qwen
+  config token, which is the one field a future creative control could accidentally re-key the whole
+  845-record cache through. Tests assert all of that by AST. Changing the seed re-plans; it never
+  re-analyses.
+- **It is not source identity either.** The widget is outside the Video Source group and is wired into
+  no source handler and no `source_outputs`, so changing it cannot clear a confirmed source set. It is
+  a render-request input alongside FPS and the encoder, and `test_gui_guard_seam.py` still pins the
+  positional alignment between the click `inputs` list and the handler's parameters.
+- **Anything not a positive whole number normalises to legacy**, and the boundary is an explicit type
+  check rather than `int(value)`: `None`, `""`, a negative, `NaN`, `inf`, **`7.9` and `True`** all
+  become 0. Truncating `7.9` to 7 would render a seed the user never chose and would make two
+  different inputs reproduce as the same "reproducible" variation; `bool` has to be rejected first
+  because it subclasses `int`. A number box can produce all of these and none may raise mid-render.
+
 ### Rendering modes
 
 `prores_proxy` takes a separate branch in `create_music_video`: sources are transcoded to intra-frame
@@ -911,6 +946,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `progress_view.py` | `ProgressView` — folds events into the status panel text |
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
+| `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
 
 ### Video source modes and the confirmation gate
 

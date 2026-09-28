@@ -115,6 +115,10 @@ from auto_mode import analyze_beats_auto
 from beatsync_fork.progress import EventKind, ProgressEvent
 from beatsync_fork.progress_view import ProgressView
 
+# [FORK] Digital-Union: creative variation seed (Phase A). Selection rule and seed normalisation
+# live in src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires them to widgets.
+from beatsync_fork import variation as fork_variation
+
 # [FORK] Digital-Union: source-input confirmation gate. All decision logic lives in
 # src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires it to widgets.
 from beatsync_fork.input_confirmation import SourceMode
@@ -350,11 +354,14 @@ def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict |
 
     plan_summary = render_info.get("plan_summary") or {}
     if plan_summary:
+        # [FORK] Digital-Union (Phase A): the seed rides on the existing planner line rather than
+        # spending one of the five console slots on its own.
         console_logger.line(
             "Planner: "
             f"{int(plan_summary.get('clip_count') or 0)} clips, "
             f"{int(plan_summary.get('source_count') or 0)} sources, "
-            f"AI moments {int(plan_summary.get('ai_tagged') or 0)}"
+            f"AI moments {int(plan_summary.get('ai_tagged') or 0)}, "
+            f"{fork_variation.describe(plan_summary.get('seed'))}"
         )
 
     final_bits = []
@@ -404,7 +411,7 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
-                       custom_fps: float, session_state: dict,
+                       custom_fps: float, variation_seed: int, session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
                        event_callback: Callable[[ProgressEvent], None] | None = None) -> StatusResult:
@@ -478,7 +485,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         name, _ = os.path.splitext(output_filename)
         ext = '.mov' if is_prores else '.mp4'
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}{ext}"
+        # [FORK] Digital-Union (Phase A): a variation render carries its seed in the filename so a
+        # good result can be found again. Seed 0 keeps today's name exactly.
+        seed = fork_variation.normalize_seed(variation_seed)
+        filename = f"{name}_{timestamp}{fork_variation.filename_suffix(seed)}{ext}"
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
@@ -489,6 +499,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             progress_callback=progress_callback,
             console_callback=lambda stage, message: console_logger.stage_line(stage, message) if console_logger else None,
             event_callback=event_callback,
+            creative={"seed": seed},
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
@@ -551,7 +562,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             audio_duration=beat_info.get('audio_duration'),
             output_fps=output_fps,
             total_processing_seconds=total_processing_seconds,
-            processing_label=processing_label
+            processing_label=processing_label,
+            variation_text=fork_variation.describe(seed) if seed else None,
         )
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
@@ -565,7 +577,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
-                 custom_fps: float, session_state: dict) -> Iterator[StatusResult]:
+                 custom_fps: float, session_state: dict,
+                 variation_seed: int = 0) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -601,6 +614,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
                     custom_fps=custom_fps,
+                    variation_seed=variation_seed,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
@@ -702,7 +716,7 @@ def _on_confirm_click(state) -> Tuple:
 def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
-                          custom_fps: float, session_state: dict,
+                          custom_fps: float, variation_seed: int, session_state: dict,
                           source_state) -> Iterator[StatusResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
@@ -723,6 +737,9 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     # Parameter names deliberately mirror the widget names in process_btn.click(inputs=...):
     # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
     # the two lists line up name-for-name.
+    #
+    # `variation_seed` is a render-request input like FPS or the encoder, NOT source identity: it is
+    # not wired into the source-confirmation handlers, so changing it cannot clear a confirmation.
     decision = resolve_for_render(
         source_state,
         live_declaration(source_mode, source_folder, source_recursive, video_input),
@@ -738,6 +755,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         processing_mode=processing_mode,
         custom_fps=custom_fps,
         session_state=session_state,
+        variation_seed=variation_seed,
     )
 
 
@@ -852,6 +870,21 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown('### ⚙️ Video Settings')
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
+                # [FORK] Digital-Union (Phase A): creative variation seed. Deliberately outside the
+                # Video Source group and never wired into `source_outputs`, so changing it cannot
+                # invalidate a confirmed source set.
+                with gr.Group():
+                    gr.Markdown('### 🎨 Creative Direction')
+                    variation_seed = gr.Number(
+                        label=LABEL_VARIATION_SEED,
+                        value=0,
+                        precision=0,
+                        minimum=0,
+                        info=INFO_VARIATION_SEED,
+                        elem_id='variation-seed-input',
+                    )
+                    randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
                     if NVENC_AVAILABLE:
@@ -914,6 +947,14 @@ def create_ui() -> gr.Blocks:
             outputs=source_outputs,
         )
 
+        # [FORK] Digital-Union (Phase A): writes a fresh positive seed into the box and nothing else.
+        # Note what is absent: `source_outputs`. The seed is creative state, not source identity.
+        randomize_btn.click(
+            fn=fork_variation.random_seed,
+            inputs=[],
+            outputs=[variation_seed],
+        )
+
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the
         # gate validates what the widgets currently declare rather than possibly-stale gr.State.
         process_btn.click(
@@ -921,7 +962,7 @@ def create_ui() -> gr.Blocks:
             inputs=[
                 audio_input,
                 source_mode, source_folder, source_recursive, video_input,
-                output_filename, processing_mode, custom_fps,
+                output_filename, processing_mode, custom_fps, variation_seed,
                 session_state, source_state
             ],
             outputs=[video_output, status_output, session_state],

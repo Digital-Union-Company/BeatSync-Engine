@@ -20,6 +20,28 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-29 (Creative Phase A: user-controlled variation seed)
+
+A **Variation Seed** in the UI (plus `--seed` on the CLI) that produces a different but reproducible
+clip plan from the same analysed source library.
+
+- **Seed 0 is legacy and is the default.** Stage 6 keeps its existing argmax, its existing penalties
+  and its existing `_stable_rng(index, target, start)` jitter stream, unchanged. Upgrading and
+  leaving the box alone cannot change anyone's edit merely because this feature now exists, so seed 0
+  never reaches the new selection rule. Output filenames for seed 0 are also unchanged.
+- **A positive seed changes the winner rule only.** Scoring and penalties are untouched; the planner
+  takes the best 6 candidates, drops anything more than 0.12 below the best, and makes a seeded
+  weighted draw favouring the near-best. The previous `rng.random() * 0.015` jitter was far too small
+  to make a user-facing seed useful — that is what this replaces, for positive seeds only.
+- **The seed is creative state, never analysis identity.** It rides on `beat_info["creative"]`, which
+  Stage 6 already receives. `video_analysis.py` is unmodified; `CACHE_CONTRACT_VERSION` and
+  `ANALYSIS_VERSION` are unchanged; the seed is absent from every cache-identity function and from
+  `audio_visual_profile` (whose `smart_preset` *is* keyed into the Qwen config token). Changing the
+  seed re-plans; it never re-analyses. It is likewise not wired into any source-confirmation handler,
+  so it cannot clear a confirmed source set.
+- New stdlib-only fork module `src/beatsync_fork/variation.py` owns seed normalisation and the
+  selection rule; `tests/test_creative_seed.py` covers it, the planner wiring and both boundaries.
+
 ### Fixed — 2026-09-28 (R2: individually valid telemetry could still sum to Infinity)
 
 Follow-up to the telemetry-boundary work below, from review of that change. R1 validated every
