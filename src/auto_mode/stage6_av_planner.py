@@ -70,6 +70,21 @@ def build_planned_clip_sequence(
 
     profiles = _build_segment_profiles(cut_times_arr, durations_arr, beat_info)
     seed = creative_seed(beat_info)
+
+    # [FORK] Digital-Union (L1A): the static half of the score, computed once per
+    # (candidate, target) instead of once per (candidate, segment). A real run measured 148 segments
+    # × 9241 candidates = 1,367,668 evaluations across at most five distinct targets, so this is
+    # `candidates × distinct targets` work instead — the candidate pool, its order, the targets and
+    # every penalty are untouched. `dict.fromkeys` keeps first-seen target order, so the work is
+    # deterministic; the default matches `_score_candidate`'s own `profile.get("target", "flow")`.
+    # This runs inside `build_planned_clip_sequence`, so the L0 planner timing in
+    # `video_processor.create_music_video` still describes the whole call, precomputation included.
+    segment_targets = [profile.get("target", "flow") for profile in profiles]
+    base_scores_by_target = {
+        target: tuple(_static_base_score(candidate, target) for candidate in candidates)
+        for target in dict.fromkeys(segment_targets)
+    }
+
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
     usage = Counter()
@@ -84,6 +99,7 @@ def build_planned_clip_sequence(
             usage=usage,
             index=i,
             seed=seed,
+            base_scores=base_scores_by_target[segment_targets[i]],
         )
         if not candidate:
             continue
@@ -201,14 +217,21 @@ def _adjusted_score(
     recent_ids: deque,
     recent_videos: deque,
     usage: Counter,
+    base_score: float | None = None,
 ) -> float:
     """The planner's score for one candidate, repeat and duration penalties applied.
 
     [FORK] Digital-Union: lifted verbatim out of ``_choose_candidate`` so the legacy argmax and the
     seeded variation branch score identically — the seed changes only which of the good candidates
     wins, never what "good" means. The arithmetic and its order are unchanged from current main.
+
+    [FORK] Digital-Union (L1A): everything below the first line is the **dynamic** half — it depends
+    on what this plan has already chosen (`recent_ids`, `recent_videos`, `usage`) and on this
+    segment's duration, so it must still run per segment and is untouched. Only the static base score
+    may be supplied by the caller; ``base_score=None`` keeps the original behaviour of computing it
+    here, which is what every existing caller and unit test gets.
     """
-    score = _score_candidate(candidate, profile)
+    score = _score_candidate(candidate, profile) if base_score is None else float(base_score)
     cid = candidate.get("id")
     video_file = candidate.get("video_file")
 
@@ -235,7 +258,16 @@ def _choose_candidate(
     usage: Counter,
     index: int,
     seed: int = 0,
+    base_scores: Sequence[float] | None = None,
 ) -> Dict | None:
+    # [FORK] Digital-Union (L1A): `base_scores` is the precomputed static score for THIS segment's
+    # target, aligned with `candidates` by position — candidate ids are not used as the key, because
+    # they are not guaranteed unique across a 900-source library. The alignment is checked rather
+    # than assumed; a mismatched table is ignored and every score is computed the old way, so a
+    # future caller can never silently score against the wrong candidates.
+    if base_scores is not None and len(base_scores) != len(candidates):
+        base_scores = None
+
     # [FORK] Digital-Union: seed 0 is the legacy path and must stay bit-identical to current main —
     # including the RNG stream, which is why it still hashes exactly `(index, target, start)` with no
     # seed component. A positive seed takes the variation branch below.
@@ -244,8 +276,13 @@ def _choose_candidate(
         best_score = -999.0
         rng = _stable_rng(index, profile.get("target"), profile.get("start"))
 
-        for candidate in candidates:
-            score = _adjusted_score(candidate, profile, recent_ids, recent_videos, usage)
+        # Iteration order, comparison and the one `rng.random()` draw per candidate are unchanged;
+        # only where the base score comes from differs.
+        for position, candidate in enumerate(candidates):
+            score = _adjusted_score(
+                candidate, profile, recent_ids, recent_videos, usage,
+                base_score=None if base_scores is None else base_scores[position],
+            )
             score += rng.random() * 0.015
             if score > best_score:
                 best_score = score
@@ -258,15 +295,41 @@ def _choose_candidate(
 
     # The tiny legacy jitter is dropped here rather than stacked: seeded selection subsumes it.
     scores = [
-        _adjusted_score(candidate, profile, recent_ids, recent_videos, usage)
-        for candidate in candidates
+        _adjusted_score(
+            candidate, profile, recent_ids, recent_videos, usage,
+            base_score=None if base_scores is None else base_scores[position],
+        )
+        for position, candidate in enumerate(candidates)
     ]
     rng = _stable_rng(seed, index, profile.get("target"), profile.get("start"))
     return candidates[fork_variation.select_index(scores, rng)]
 
 
 def _score_candidate(candidate: Dict, profile: Dict) -> float:
-    target = profile.get("target", "flow")
+    """The planner's base score for one candidate under one segment profile.
+
+    [FORK] Digital-Union (L1A): kept as the compatibility surface every existing caller uses
+    (`_materialize_clip`, tests, any internal caller). It now only resolves the target and delegates,
+    because the arithmetic below reads **nothing else** from the profile.
+    """
+    return _static_base_score(candidate, profile.get("target", "flow"))
+
+
+def _static_base_score(candidate: Dict, target: str) -> float:
+    """The candidate-and-target-only half of the planner's score.
+
+    [FORK] Digital-Union (L1A): this signature *is* the contract. The score of a candidate depends on
+    the candidate's own features and on the segment's target — nothing else — so it is constant for a
+    given (candidate, target) pair and can be computed once per plan instead of once per segment. The
+    measured run that motivated this was 148 segments × 9241 candidates = 1,367,668 evaluations of
+    arithmetic with only five distinct target values behind it.
+
+    Because the profile is deliberately **not** a parameter, a future scoring term that depends on
+    anything else in the profile (duration, position, section, energy) cannot be added here by
+    accident: it has nowhere to read it from, and belongs in the dynamic half, `_adjusted_score`.
+    Everything that already varies per segment — repeat penalties, usage penalties, duration
+    suitability, the legacy jitter and seeded selection — stays there and is unchanged.
+    """
     semantic = candidate.get("semantic") or {}
     tags = {str(t).lower() for t in candidate.get("tags", [])}
     quality = _clamp(candidate.get("quality_score", semantic.get("visual_quality", 0.5)), default=0.5)
