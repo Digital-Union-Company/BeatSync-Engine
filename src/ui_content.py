@@ -383,6 +383,32 @@ INFO_CONFIRMATION_GATE = (
     "Confirmation covers the actual files, not just the count, and is re-checked before rendering."
 )
 
+# ============================================================================
+# [FORK] Digital-Union (P V1): media library preparation labels
+# See src/beatsync_fork/library_prep.py for the workflow these labels describe.
+# ============================================================================
+
+LABEL_PREP_SECTION = "📚 Media Library Preparation"
+INFO_PREP_SECTION = (
+    "Analyze new or changed videos ahead of rendering so future renders can reuse the prepared "
+    "visual-analysis cache. Preparation is matched to the edit style the chosen track resolves to, "
+    "and it never renders a video. This is separate from the Video Source selection above."
+)
+
+LABEL_PREP_FOLDER = "📂 Library Folder"
+INFO_PREP_FOLDER = (
+    "Local path to your persistent video library. Browser uploads are not supported here: they "
+    "live in temporary folders that are cleared on restart, so preparing them would be pointless."
+)
+LABEL_PREP_RECURSIVE = "Include subfolders"
+LABEL_PREP_TRACK = "🎵 Track (MP3/WAV/FLAC)"
+INFO_PREP_TRACK = (
+    "Used only to resolve the edit style this preparation applies to. No video is rendered."
+)
+LABEL_PREP_SCAN = "🔍 Scan Library"
+LABEL_PREP_ANALYZE = "⚙️ Analyze New / Changed"
+LABEL_PREP_REPORT = "📋 Preparation Status"
+
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
     """GPU status info."""
     if gpu_available and nvenc_available:

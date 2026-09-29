@@ -35,6 +35,10 @@ from logger import ROOT_DIR, setup_environment
 from beatsync_fork import progress as fork_progress
 # [FORK] Digital-Union (Phase 2B): streaming Qwen worker runner + stdout progress protocol.
 from beatsync_fork import qwen_progress as fork_qwen
+# [FORK] Digital-Union (P V1): media library preparation vocabulary. Imported for the classification
+# status/reason VALUES only, so the runtime classifier and the stdlib-only state module cannot drift
+# apart on a string. The dependency runs one way: the fork module never imports this one.
+from beatsync_fork import library_prep as fork_prep
 
 
 setup_environment()
@@ -125,6 +129,12 @@ _NO_AI_CONFIG_TOKEN = "cfg_no_ai"
 # "no usable moments" result is told apart from an OpenCV-open failure - both of which end up with
 # an empty candidate list.
 _DETERMINISTIC_SCORING_KEY = "candidate_scoring_seconds"
+
+# [FORK] Digital-Union (P V1): the library-classification phase of Stage 0 (`Stage.INPUT`, which
+# already covers pre-Stage-1 source work). A named phase rather than a new stage number, because
+# `ProgressView` enforces monotonicity per `(stage, phase)` and Stage 0 already carries the L0
+# source-verification END event in a render run.
+_PREP_PHASE = "library_classify"
 
 
 def _clamp(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -1424,6 +1434,173 @@ def analyze_video_sources(
         "qwen_concurrency": qwen_concurrency,
         "qwen_peak_vram_gb": qwen_peak_vram_gb,
     }
+
+
+def classify_library_sources(
+    video_files: Sequence[str],
+    audio_profile: Dict | None = None,
+    enable_ai: bool = True,
+    qwen_model_path: str | None = None,
+    event_callback=None,
+) -> Dict:
+    """[FORK] Digital-Union (P V1): which library sources already have reusable Stage-5 cache?
+
+    Read-only classification for the Media Library Preparation workflow. It answers, for each
+    source, the *same* question the warm-cache loop in `analyze_video_sources` answers - using the
+    same primitives - and then stops. No record is created, updated or checkpointed; no
+    deterministic analysis runs; no Qwen worker is launched; nothing is rendered.
+
+    Three boundaries are load-bearing:
+
+    * **No alternate key formula.** Identity comes from `_cache_path`/`_video_signature` and reuse
+      from `_load_cache`/`_cache_entry_is_complete`, exactly as the orchestrator uses them. A
+      classifier that re-answered "is this reusable?" independently is precisely the scattered
+      completion rule D1 removed; a second key formula would drift from the real one silently.
+    * **The orchestrator is not refactored.** The invocation-scoped identity block below mirrors
+      `analyze_video_sources`'s own (backend availability, backend token once, config token once,
+      both threaded into every `_cache_path`) rather than being extracted out of it. Existing tests
+      deliberately assert that structure *inside* `analyze_video_sources`, and the expensive logic -
+      the fingerprints and the key formula - is shared through the helpers either way. Only the
+      six-line call pattern is repeated.
+    * **`ai_cache_disabled` short-circuits the whole scan.** When AI is available but its strong
+      backend identity cannot be proven, the orchestrator does not call `_cache_path` at all, so no
+      source could be classified anyway - and, crucially, a preparation run in that state would
+      spend GPU hours and persist nothing, because `analyze_video_sources` would also have caching
+      off. Per-source work is skipped entirely (it would be ~5 ms of fingerprinting per source for a
+      verdict that cannot exist) and the caller is told to stop. That is narrower than "no AI": a
+      legitimately AI-disabled run uses the existing `no_ai` identity and classifies normally.
+
+    The three-way split of a lookup miss is reporting detail layered on top of the existing rule,
+    not a change to it: an absent key file means no record was ever written under this identity
+    (a new source, or a changed one that re-keyed - indistinguishable under path+content identity),
+    while a present file that `_load_cache` rejects means a record exists but is deferred, wrong
+    contract or AI-inconsistent. Both need the same work; only the wording differs.
+    """
+    started = time.perf_counter()
+    requested_qwen_model_path = qwen_model_path or DEFAULT_QWEN_MODEL_DIR
+    qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
+    # Not filtered by existence, unlike `analyze_video_sources`: a source that vanished between the
+    # folder scan and here must be reported, not silently dropped from the counts. `_cache_path`
+    # already fails closed on an unstat-able file, which is exactly the verdict such a source needs.
+    sources = [os.path.abspath(path) for path in video_files if path]
+
+    ai_available = bool(enable_ai and _qwen_backend_available(requested_qwen_model_path))
+
+    fork_progress.emit(event_callback, fork_progress.start(
+        0, f"Classifying {len(sources)} library source(s)",
+        current=0, total=len(sources), unit="sources", phase=_PREP_PHASE,
+    ))
+
+    # Mirrors `analyze_video_sources`: computed ONCE for the whole scan, then threaded into every
+    # `_cache_path`. Per source this would be N backend fingerprints - measured at 61.7 minutes for
+    # 702 sources - instead of one ~20 ms computation.
+    invocation_backend_token = _qwen_backend_signature_token(qwen_model_path) if ai_available else None
+    invocation_config_token = _qwen_config_token(audio_profile) if ai_available else None
+    ai_cache_disabled = ai_available and invocation_backend_token is None
+
+    result: Dict[str, Any] = {
+        "source_count": len(sources),
+        "ai_available": bool(ai_available),
+        "ai_cache_disabled": bool(ai_cache_disabled),
+        "backend_token": invocation_backend_token or "",
+        "config_token": invocation_config_token or "",
+        "qwen_model_path": qwen_model_path if ai_available else "",
+        "smart_preset": _qwen_prompt_style_hint(audio_profile) if ai_available else "",
+        "classifications": [],
+        "prepared_count": 0,
+        "needs_analysis_count": 0,
+        "unavailable_count": 0,
+        "cache_identity_seconds": 0.0,
+        "cache_lookup_seconds": 0.0,
+        "cache_lookups": 0,
+        "classify_seconds": 0.0,
+    }
+
+    if ai_cache_disabled:
+        print("   Warning: Qwen backend identity could not be verified; "
+              "library preparation cannot classify or cache this library.")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            0, "Qwen backend identity unverifiable; preparation analysis unavailable.",
+            phase=_PREP_PHASE))
+        fork_progress.emit(event_callback, fork_progress.end(
+            0, "Preparation unavailable: Qwen backend identity unverifiable",
+            elapsed_seconds=float(time.perf_counter() - started), phase=_PREP_PHASE))
+        result["classify_seconds"] = float(time.perf_counter() - started)
+        return result
+
+    counter = fork_progress.StageCounter(0, len(sources), min_interval=0.5)
+    classifications: List[Dict[str, str]] = []
+    cache_identity_seconds = 0.0
+    cache_lookup_seconds = 0.0
+    cache_lookups = 0
+
+    for video_file in sources:
+        identity_started = time.perf_counter()
+        cache_file = _cache_path(
+            video_file, ai_available, qwen_model_path,
+            backend_token=invocation_backend_token,
+            config_token=invocation_config_token,
+            audio_profile=audio_profile)
+        cache_identity_seconds += time.perf_counter() - identity_started
+
+        if cache_file is None:
+            status = fork_prep.PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value
+            reason = ""
+        elif not os.path.exists(cache_file):
+            status = fork_prep.PrepStatus.NEEDS_ANALYSIS.value
+            reason = fork_prep.NeedReason.NEW_OR_CHANGED.value
+        else:
+            lookup_started = time.perf_counter()
+            cached = _load_cache(cache_file, require_ai=ai_available,
+                                 expected_video_file=video_file)
+            cache_lookup_seconds += time.perf_counter() - lookup_started
+            cache_lookups += 1
+            if cached:
+                status = fork_prep.PrepStatus.PREPARED.value
+                reason = ""
+            else:
+                status = fork_prep.PrepStatus.NEEDS_ANALYSIS.value
+                reason = fork_prep.NeedReason.INCOMPLETE_OR_INVALID.value
+
+        classifications.append({"path": video_file, "status": status, "reason": reason})
+        fork_progress.emit(event_callback, counter.advance(
+            1, "classified", unit="sources", phase=_PREP_PHASE))
+
+    prepared = sum(1 for item in classifications
+                   if item["status"] == fork_prep.PrepStatus.PREPARED.value)
+    needs = sum(1 for item in classifications
+                if item["status"] == fork_prep.PrepStatus.NEEDS_ANALYSIS.value)
+    unavailable = len(classifications) - prepared - needs
+    elapsed = time.perf_counter() - started
+
+    result.update({
+        "classifications": classifications,
+        "prepared_count": prepared,
+        "needs_analysis_count": needs,
+        "unavailable_count": unavailable,
+        "cache_identity_seconds": float(cache_identity_seconds),
+        "cache_lookup_seconds": float(cache_lookup_seconds),
+        "cache_lookups": int(cache_lookups),
+        "classify_seconds": float(elapsed),
+    })
+
+    print(
+        f"   Library preparation scan: {prepared} prepared, {needs} need analysis, "
+        f"{unavailable} unreadable "
+        f"[identity {_fmt_seconds(cache_identity_seconds)}, "
+        f"records {_fmt_seconds(cache_lookup_seconds)}]"
+    )
+    fork_progress.emit(event_callback, fork_progress.end(
+        0,
+        f"{prepared} prepared, {needs} need analysis, {unavailable} unreadable",
+        current=len(sources), total=len(sources),
+        elapsed_seconds=float(elapsed), phase=_PREP_PHASE,
+        prepared=int(prepared), needs_analysis=int(needs), unavailable=int(unavailable),
+        cache_identity_seconds=float(cache_identity_seconds),
+        cache_lookup_seconds=float(cache_lookup_seconds),
+        cache_lookups=int(cache_lookups),
+    ))
+    return result
 
 
 def _analyze_single_video(
