@@ -109,7 +109,7 @@ def gui():
         "EventKind": EventKind, "ProgressEvent": ProgressEvent,
     }
     _extract(_GUI, {"StageConsoleLogger", "_fmt_stage_seconds", "_stage5_summary",
-                    "_stage6_summary"}, ns)
+                    "_stage6_summary", "_scale_diagnostics_block"}, ns)
     return ns
 
 
@@ -679,6 +679,176 @@ def test_g_this_pr_did_not_touch_seeded_selection():
                          encoding="utf-8").read()
     for forbidden in ("planner_seconds", "candidate_count", "diagnostic"):
         assert forbidden not in variation_src, forbidden
+
+
+# ======================================================================================
+# L0.1. the final success panel carries the baseline, because the console may not
+# ======================================================================================
+
+
+def _real_run_beat_info():
+    """The first real L0 run: 41 sources, fully warm, no Qwen inference."""
+    return {
+        "video_analysis": {
+            "source_count": 41, "cache_hits": 41,
+            "cache_identity_seconds": 3.4, "cache_lookup_seconds": 0.2,
+            "candidate_count": 742,
+        },
+        "render_info": {
+            "planner_seconds": 0.4, "planner_candidate_count": 742,
+            "planner_segment_count": 148,
+        },
+    }
+
+
+def test_l01_final_block_carries_the_measurements_the_console_may_have_dropped(gui):
+    block = gui["_scale_diagnostics_block"](0.0, _real_run_beat_info())
+
+    assert block.splitlines() == [
+        "Scale diagnostics:",
+        "Source verification: 0.0s",
+        "Stage 5: identity 3.4s · records 0.2s · cache 41/41 · 742 candidates",
+        "Planner: 148 segments × 742 candidates · 0.4s",
+    ]
+
+
+def test_l01_a_measured_zero_is_shown_not_treated_as_missing(gui):
+    """The real run verified 41 confirmed sources in 0.0s. That is a result, not an absence."""
+    block = gui["_scale_diagnostics_block"](0.0, _real_run_beat_info())
+    assert "Source verification: 0.0s" in block
+
+    # and the same rule applies to every other measured zero
+    zeroed = {
+        "video_analysis": {"cache_identity_seconds": 0.0, "cache_lookup_seconds": 0.0,
+                           "cache_hits": 0, "source_count": 0, "candidate_count": 0},
+        "render_info": {"planner_seconds": 0.0, "planner_candidate_count": 0,
+                        "planner_segment_count": 0},
+    }
+    text = gui["_scale_diagnostics_block"](0.0, zeroed)
+    assert "Stage 5: identity 0.0s · records 0.0s · cache 0/0 · 0 candidates" in text
+    assert "Planner: 0 segments × 0 candidates · 0.0s" in text
+
+
+def test_l01_missing_metrics_are_omitted_never_fabricated(gui):
+    partial = {
+        "video_analysis": {"cache_identity_seconds": 3.4, "candidate_count": 742},
+        "render_info": {"planner_seconds": 0.4},
+    }
+    block = gui["_scale_diagnostics_block"](None, partial)
+
+    assert "Source verification" not in block, "an unsupplied measurement must not render as 0.0s"
+    assert block.splitlines() == [
+        "Scale diagnostics:",
+        "Stage 5: identity 3.4s · 742 candidates",
+        "Planner: 0.4s",
+    ]
+    assert "records" not in block and "cache " not in block and "segments" not in block
+
+
+@pytest.mark.parametrize("beat_info", [None, {}, {"video_analysis": None, "render_info": None},
+                                       {"video_analysis": [], "render_info": "nope"},
+                                       {"video_analysis": {}, "render_info": {}}])
+def test_l01_nothing_measured_means_no_block_at_all(gui, beat_info):
+    """A direct/legacy caller that provides none of it leaves the success message untouched."""
+    assert gui["_scale_diagnostics_block"](None, beat_info) == ""
+
+
+def test_l01_candidate_count_comes_from_stage5_metadata(gui):
+    """The Stage 5 line reads ``video_analysis``, never render_info or a recomputed list."""
+    info = _real_run_beat_info()
+    info["video_analysis"]["candidate_count"] = 999
+    stage5_line = next(l for l in gui["_scale_diagnostics_block"](0.0, info).splitlines()
+                       if l.startswith("Stage 5:"))
+    assert "999 candidates" in stage5_line
+
+    # removing it drops only that fragment; the rest of the Stage 5 line survives
+    del info["video_analysis"]["candidate_count"]
+    stage5_line = next(l for l in gui["_scale_diagnostics_block"](0.0, info).splitlines()
+                       if l.startswith("Stage 5:"))
+    assert "candidates" not in stage5_line
+    assert "identity 3.4s" in stage5_line and "cache 41/41" in stage5_line
+
+
+def test_l01_planner_figures_come_from_render_info_and_are_not_recomputed(gui):
+    """Stage 6's own numbers win: the block must not re-derive them from Stage 5's candidates."""
+    info = _real_run_beat_info()
+    info["render_info"]["planner_candidate_count"] = 700   # deliberately != Stage 5's 742
+    info["render_info"]["planner_segment_count"] = 148
+    planner_line = next(l for l in gui["_scale_diagnostics_block"](0.0, info).splitlines()
+                        if l.startswith("Planner:"))
+
+    assert planner_line == "Planner: 148 segments × 700 candidates · 0.4s"
+    assert "742" not in planner_line
+
+
+def test_l01_block_is_appended_to_the_existing_success_message():
+    """The success statistics are unchanged; the block is added after them."""
+    code = _body_code(_func(_tree(_GUI), "_process_video_impl"))
+
+    assert "status_msg = get_success_message_auto(" in code, "the existing builder still runs"
+    assert "diagnostics = _scale_diagnostics_block(verification_seconds, beat_info)" in code
+    assert "status_msg = f'{status_msg}\\n\\n{diagnostics}'" in code
+    lines = code.splitlines()
+    built = next(i for i, l in enumerate(lines) if "status_msg = get_success_message_auto(" in l)
+    appended = next(i for i, l in enumerate(lines) if "_scale_diagnostics_block(" in l)
+    assert built < appended, "the block is appended, never substituted"
+
+
+def test_l01_verification_seconds_is_threaded_without_remeasuring():
+    """It is invocation metadata already known to ``process_video`` — not measured again here."""
+    tree = _tree(_GUI)
+    impl = _func(tree, "_process_video_impl")
+    assert "verification_seconds" in [a.arg for a in impl.args.args]
+
+    body = _body_code(impl)
+    assert "resolve_for_render" not in body, "the impl must never re-run the gate"
+    assert "verification_seconds = " not in body, "it is received, never recomputed"
+
+    # process_video passes through the value it already received
+    worker = _body_code(_func(tree, "process_video"))
+    assert "verification_seconds=verification_seconds" in worker
+
+
+def test_l01_reads_only_values_l0_already_measured():
+    """No rescan, no cache access, no analysis call inside the block builder."""
+    body = _body_code(_func(_tree(_GUI), "_scale_diagnostics_block"))
+
+    for forbidden in ("scan_folder", "_cache_path", "_load_cache", "os.stat", "os.path.getsize",
+                      "build_planned_clip_sequence", "analyze_video_sources", "open("):
+        assert forbidden not in body, forbidden
+    # presence is `is not None`, so a measured zero survives and an absent value is dropped
+    assert "is not None" in body
+    assert "or 0" not in body, "a missing value must never be coerced to a fabricated zero"
+
+
+def test_l01_pipeline_cache_and_planner_semantics_are_untouched():
+    """L0.1 is presentation only."""
+    with open(_VA, "r", encoding="utf-8") as handle:
+        va = handle.read()
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in va
+    assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in va
+
+    vp_tree = _tree(_VP)
+    calls = _calls(_func(vp_tree, "create_music_video"), "build_planned_clip_sequence")
+    assert len(calls) == 1
+    assert [kw.arg for kw in calls[0].keywords] == [
+        "cut_times", "segment_durations", "beat_info", "video_files"]
+
+    # the gate still resolves exactly once, in the handler, before any delegation
+    guard = _body_code(_func(_tree(_GUI), "process_video_guarded"))
+    assert guard.count("resolve_for_render(") == 1
+    assert "if not decision.allowed:" in guard
+
+    # the block builder cannot mutate what it reads
+    block = _body_code(_func(_tree(_GUI), "_scale_diagnostics_block"))
+    for forbidden in ("beat_info[", "analysis[", "render_info[", ".pop(", ".update("):
+        if forbidden in ("analysis[", "render_info["):
+            continue  # read-only subscripts are fine; assignment is what matters
+        assert forbidden not in block, forbidden
+    assigns = [ast.unparse(n) for n in ast.walk(_func(_tree(_GUI), "_scale_diagnostics_block"))
+               if isinstance(n, (ast.Assign, ast.AugAssign))]
+    for statement in assigns:
+        assert not statement.startswith(("beat_info[", "analysis[", "render_info[")), statement
 
 
 # ======================================================================================

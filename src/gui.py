@@ -345,6 +345,62 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
         console_logger.line(f"Cached library: {library_tags} previously tagged candidates")
 
 
+def _scale_diagnostics_block(verification_seconds: float | None,
+                             beat_info: Dict | None) -> str:
+    """[FORK] Digital-Union (L0.1): the L0 measurements, repeated in the final success panel.
+
+    Every number here was already measured by L0 and is only being re-read: nothing is recomputed,
+    no folder is rescanned and no cache is consulted. The reason this exists is presentation, not
+    instrumentation - `_stage5_summary`/`_stage6_summary` write to `StageConsoleLogger` from the
+    worker thread while the generator thread drives the same logger from the event queue, so whether
+    those console lines survive is timing-dependent. A real 41-source run reproduced exactly that:
+    the candidate count and the planner figures never reached the console. The final success message
+    is deterministic and stays on screen, so the baseline can be copied from it reliably.
+
+    Presence is tested with ``is not None``, never truthiness: a measured ``0.0s`` (the real run's
+    source verification) is a result and must stay visible, while an absent value is omitted rather
+    than rendered as a fabricated zero. A caller that supplies nothing gets an empty string and the
+    success message is unchanged.
+    """
+    info = beat_info if isinstance(beat_info, dict) else {}
+    analysis = info.get("video_analysis")
+    analysis = analysis if isinstance(analysis, dict) else {}
+    render_info = info.get("render_info")
+    render_info = render_info if isinstance(render_info, dict) else {}
+
+    lines: list[str] = []
+    if verification_seconds is not None:
+        lines.append(f"Source verification: {_fmt_stage_seconds(verification_seconds)}")
+
+    stage5: list[str] = []
+    if analysis.get("cache_identity_seconds") is not None:
+        stage5.append(f"identity {_fmt_stage_seconds(analysis['cache_identity_seconds'])}")
+    if analysis.get("cache_lookup_seconds") is not None:
+        stage5.append(f"records {_fmt_stage_seconds(analysis['cache_lookup_seconds'])}")
+    if analysis.get("cache_hits") is not None and analysis.get("source_count") is not None:
+        stage5.append(f"cache {int(analysis['cache_hits'])}/{int(analysis['source_count'])}")
+    if analysis.get("candidate_count") is not None:
+        stage5.append(f"{int(analysis['candidate_count'])} candidates")
+    if stage5:
+        lines.append("Stage 5: " + " · ".join(stage5))
+
+    planner: list[str] = []
+    segments = render_info.get("planner_segment_count")
+    candidates = render_info.get("planner_candidate_count")
+    if segments is not None and candidates is not None:
+        planner.append(f"{int(segments)} segments × {int(candidates)} candidates")
+    elif segments is not None:
+        planner.append(f"{int(segments)} segments")
+    elif candidates is not None:
+        planner.append(f"{int(candidates)} candidates")
+    if render_info.get("planner_seconds") is not None:
+        planner.append(_fmt_stage_seconds(render_info["planner_seconds"]))
+    if planner:
+        lines.append("Planner: " + " · ".join(planner))
+
+    return "Scale diagnostics:\n" + "\n".join(lines) if lines else ""
+
+
 def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict | None) -> None:
     if console_logger is None or not isinstance(beat_info, dict):
         return
@@ -451,7 +507,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        custom_fps: float, variation_seed: int, session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
-                       event_callback: Callable[[ProgressEvent], None] | None = None) -> StatusResult:
+                       event_callback: Callable[[ProgressEvent], None] | None = None,
+                       verification_seconds: float | None = None) -> StatusResult:
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -602,6 +659,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             processing_label=processing_label,
             variation_text=fork_variation.describe(seed) if seed else None,
         )
+        # [FORK] Digital-Union (L0.1): append the L0 baseline. The success statistics above are
+        # untouched; this only adds a block the user can copy after the run, from values already
+        # measured this run.
+        diagnostics = _scale_diagnostics_block(verification_seconds, beat_info)
+        if diagnostics:
+            status_msg = f"{status_msg}\n\n{diagnostics}"
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
@@ -657,6 +720,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
                     event_callback=event_callback,
+                    verification_seconds=verification_seconds,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
