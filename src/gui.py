@@ -207,10 +207,17 @@ class StageConsoleLogger:
             self._write(f"  {message}\n")
             self.stage_line_count += 1
 
-    def end_stage(self) -> None:
+    def end_stage(self, elapsed_seconds: float | None = None) -> None:
+        # [FORK] Digital-Union (L0): `elapsed_seconds` is for a stage this logger never saw start -
+        # Stage 0 is reported by a single END event carrying its own measurement, so the logger's
+        # own clock would print "0 seconds" for work that already happened. Normal stages pass
+        # nothing and keep measuring themselves exactly as before.
         if self.stage_number is None:
             return
-        elapsed = int(round(time.perf_counter() - self.stage_started))
+        if elapsed_seconds is None:
+            elapsed = int(round(time.perf_counter() - self.stage_started))
+        else:
+            elapsed = int(round(max(0.0, float(elapsed_seconds))))
         self._write(f"Stage {self.stage_number} ended in {elapsed} seconds.\n\n")
         self.stage_number = None
         self.stage_started = 0.0
@@ -237,10 +244,14 @@ class StageConsoleLogger:
             if event.message:
                 self.line(event.message)
         elif event.kind is EventKind.END:
+            # A stage whose END is the first event seen for it was never timed by this logger (the
+            # L0 Stage-0 verification report is the only such case today), so its own measurement is
+            # used instead of a stage that existed for microseconds.
+            unseen = self.stage_number != event.stage
             if event.message:
                 self.stage_line(event.stage, event.message)
             if self.stage_number == event.stage:
-                self.end_stage()
+                self.end_stage(event.elapsed_seconds if unseen else None)
         elif event.kind in (EventKind.METRIC, EventKind.STATE):
             if event.message:
                 self.stage_line(event.stage, event.message)
@@ -307,17 +318,28 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
             bits.append(f"{qwen_incomplete} incomplete, not cached")
         console_logger.line(", ".join(bits))
 
-    # 3. the authoritative measurement - must survive the five-line budget
+    # 3. [FORK] Digital-Union (L0): what the cache scan itself cost, split into strong identity
+    # (the D2 content fingerprint) and record load/validation. Omitted entirely when the producer
+    # did not report it, so an older/other caller renders exactly as before.
+    identity_seconds = video_analysis.get("cache_identity_seconds")
+    lookup_seconds = video_analysis.get("cache_lookup_seconds")
+    if identity_seconds is not None or lookup_seconds is not None:
+        console_logger.line(
+            f"Cache check: identity {_fmt_stage_seconds(identity_seconds)}, "
+            f"records {_fmt_stage_seconds(lookup_seconds)}"
+        )
+
+    # 4. the authoritative measurement - must survive the five-line budget
     console_logger.line(
         f"Analysis time: {_fmt_stage_seconds(video_analysis.get('analysis_seconds'))}, cache {cache_hits}/{source_count}"
     )
 
-    # 4. library summary
+    # 5. library summary
     summary = video_analysis.get("summary")
     if summary:
         console_logger.line(f"Visual library: {summary}")
 
-    # 5. optional historical metadata, explicitly labelled as cached and only if space remains.
+    # 6. optional historical metadata, explicitly labelled as cached and only if space remains.
     library_tags = int(video_analysis.get("qwen_tag_count") or 0)
     if ai_enabled and library_tags and qwen_jobs == 0:
         console_logger.line(f"Cached library: {library_tags} previously tagged candidates")
@@ -356,12 +378,27 @@ def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict |
     if plan_summary:
         # [FORK] Digital-Union (Phase A): the seed rides on the existing planner line rather than
         # spending one of the five console slots on its own.
+        # [FORK] Digital-Union (L0): the planner's scale facts ride on the line that already exists
+        # rather than spending another of the five console slots. Candidates and elapsed time are
+        # appended only when Stage 6 reported them.
+        planner_bits = [
+            f"{int(plan_summary.get('clip_count') or 0)} clips",
+            f"{int(plan_summary.get('source_count') or 0)} sources",
+            f"AI moments {int(plan_summary.get('ai_tagged') or 0)}",
+        ]
+        if render_info.get("planner_candidate_count") is not None:
+            planner_bits.append(f"{int(render_info['planner_candidate_count'])} candidates")
+        if render_info.get("planner_seconds") is not None:
+            planner_bits.append(_fmt_stage_seconds(render_info["planner_seconds"]))
+        planner_bits.append(fork_variation.describe(plan_summary.get("seed")))
+        console_logger.line("Planner: " + ", ".join(planner_bits))
+    elif render_info.get("planner_seconds") is not None:
+        # The planner ran and produced no usable plan (renderer falls back to random sampling).
+        # It still cost real time at library scale, so report it instead of losing the measurement.
         console_logger.line(
-            "Planner: "
-            f"{int(plan_summary.get('clip_count') or 0)} clips, "
-            f"{int(plan_summary.get('source_count') or 0)} sources, "
-            f"AI moments {int(plan_summary.get('ai_tagged') or 0)}, "
-            f"{fork_variation.describe(plan_summary.get('seed'))}"
+            f"Planner: fallback, {int(render_info.get('planner_segment_count') or 0)} segments over "
+            f"{int(render_info.get('planner_candidate_count') or 0)} candidates, "
+            f"{_fmt_stage_seconds(render_info['planner_seconds'])}"
         )
 
     final_bits = []
@@ -578,7 +615,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, session_state: dict,
-                 variation_seed: int = 0) -> Iterator[StatusResult]:
+                 variation_seed: int = 0,
+                 verification_seconds: float | None = None) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -627,6 +665,21 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
             console_logger.finish()
         result_queue.put(result)
         status_queue.put(None)
+
+    # [FORK] Digital-Union (L0): the source verification already happened in the caller (it decides
+    # whether this generator runs at all), so it is reported as a completed Stage 0 - `Stage.INPUT`,
+    # which the progress model already defines for pre-Stage-1 source work. One event, on the queue
+    # the loop below already drains, so both the status panel and the CMD log get it from the same
+    # channel. No new logging system, and nothing here can affect the gate.
+    if verification_seconds is not None:
+        status_queue.put(ProgressEvent(
+            stage=0,
+            kind=EventKind.END,
+            message=(f"Source verification: {_fmt_stage_seconds(verification_seconds)} "
+                     f"for {len(video_files or [])} files"),
+            elapsed_seconds=float(verification_seconds),
+            data={"verified_source_count": len(video_files or [])},
+        ))
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -740,10 +793,17 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     #
     # `variation_seed` is a render-request input like FPS or the encoder, NOT source identity: it is
     # not wired into the source-confirmation handlers, so changing it cannot clear a confirmation.
+    #
+    # [FORK] Digital-Union (L0): the verification is timed, not changed. In local-folder mode it is
+    # an authoritative filesystem re-scan of every confirmed source, so it is one of the costs that
+    # grows with the library. Measuring wraps the existing call: the gate, the snapshot identity and
+    # the allow/deny outcome are all untouched, and nothing is reused between renders.
+    verification_started = time.perf_counter()
     decision = resolve_for_render(
         source_state,
         live_declaration(source_mode, source_folder, source_recursive, video_input),
     )
+    verification_seconds = time.perf_counter() - verification_started
     if not decision.allowed:
         yield None, f"❌ {decision.message}", session_state
         return
@@ -756,6 +816,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         custom_fps=custom_fps,
         session_state=session_state,
         variation_seed=variation_seed,
+        verification_seconds=verification_seconds,
     )
 
 
