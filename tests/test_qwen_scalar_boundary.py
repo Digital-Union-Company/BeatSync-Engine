@@ -199,7 +199,7 @@ def _run_batch(tmp_path, timing=None, top=None, response=None, frames=3):
     stats = _new_stats()
     items = [({"index": 1, "cache_file": str(tmp_path / "a.json")}, record)]
     scope["_complete_deferred_qwen_batch"](
-        video_items=items, use_gpu=False, qwen_model_path="m.gguf", audio_profile={},
+        video_items=items, use_gpu=False, qwen_model_path="m.gguf",
         total_video_count=1, run_stats=stats)
     return record, stats, scope
 
@@ -213,7 +213,7 @@ def _run_single(timing=None, top=None, response=None, frames=3):
     stats = _new_stats()
     info = scope["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\a.mp4", fps=25.0, candidates=candidates,
-        qwen_model_path="m.gguf", use_gpu=False, audio_profile={}, run_stats=stats)
+        qwen_model_path="m.gguf", use_gpu=False, run_stats=stats)
     return info, stats, candidates, scope
 
 
@@ -1047,7 +1047,7 @@ def test_current_run_batch_inference_total_cannot_overflow(tmp_path):
     scope["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": str(tmp_path / "a.json")}, first),
                      ({"index": 2, "cache_file": str(tmp_path / "b.json")}, second)],
-        use_gpu=False, qwen_model_path="m.gguf", audio_profile={},
+        use_gpu=False, qwen_model_path="m.gguf",
         total_video_count=2, run_stats=stats)
     assert stats["qwen_jobs"] == 2
     assert stats["qwen_completed_jobs"] == 2
@@ -1067,7 +1067,7 @@ def test_current_run_inline_inference_total_cannot_overflow():
                       for i in range(3)]
         scope["_annotate_candidates_with_qwen"](
             video_file=r"C:\src\a.mp4", fps=25.0, candidates=candidates,
-            qwen_model_path="m.gguf", use_gpu=False, audio_profile={}, run_stats=stats)
+            qwen_model_path="m.gguf", use_gpu=False, run_stats=stats)
     assert stats["qwen_jobs"] == 2
     assert math.isfinite(stats["qwen_inference_seconds"])
     assert stats["qwen_inference_seconds"] >= 0.0
@@ -1094,7 +1094,7 @@ def test_inline_wall_time_accumulates_once_per_invocation():
                       for i in range(3)]
         scope["_annotate_candidates_with_qwen"](
             video_file=r"C:\src\a.mp4", fps=25.0, candidates=candidates,
-            qwen_model_path="m.gguf", use_gpu=False, audio_profile={}, run_stats=stats)
+            qwen_model_path="m.gguf", use_gpu=False, run_stats=stats)
         seen.append(stats["qwen_seconds"])
     assert stats["qwen_jobs"] == 3
     assert seen == sorted(seen), "monotonically accumulating, one measurement per invocation"
@@ -1134,7 +1134,7 @@ def test_healthy_multi_job_inference_totals_still_add_up(tmp_path):
     scope["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": str(tmp_path / "a.json")}, first),
                      ({"index": 2, "cache_file": str(tmp_path / "b.json")}, second)],
-        use_gpu=False, qwen_model_path="m.gguf", audio_profile={},
+        use_gpu=False, qwen_model_path="m.gguf",
         total_video_count=2, run_stats=stats)
     assert stats["qwen_inference_seconds"] == pytest.approx(10.0)
     assert first["timings"]["qwen_seconds"] == pytest.approx(0.1 + 4.0 + 4.0)
@@ -1235,7 +1235,7 @@ def test_the_cache_generation_is_frozen():
                 if isinstance(target, ast.Name) and target.id in (
                         "CACHE_CONTRACT_VERSION", "ANALYSIS_VERSION"):
                     found[target.id] = ast.literal_eval(node.value)
-    assert found["CACHE_CONTRACT_VERSION"] == "stage5_cache_v2"
+    assert found["CACHE_CONTRACT_VERSION"] == "stage5_cache_v3"
     assert found["ANALYSIS_VERSION"] == "auto_av_analysis_v8_llama_vulkan_batched"
 
 

@@ -1,4 +1,4 @@
-"""Media Library Preparation (P V1).
+"""Media Library Preparation (P V1 + P2 media-neutral / trackless).
 
 Two halves, tested two ways:
 
@@ -12,8 +12,14 @@ Two halves, tested two ways:
 The GUI seam is checked structurally with ``ast`` for the same reason ``test_gui_guard_seam.py``
 does it: ``gui.py`` needs Gradio and the whole runtime.
 
-No Qwen model is loaded, no GPU is required, no video is rendered, and every path lives inside
-pytest's ``tmp_path``. The real runtime cache is never touched.
+No Qwen model is loaded, no GPU is required, no audio is analysed, no video is rendered, and every
+path lives inside pytest's ``tmp_path``. The real runtime cache is never touched.
+
+P2 deliberately retires this suite's track expectations. Preparation used to require an audio file so
+it could resolve ``smart_preset`` — the one ``audio_profile`` field that reached a cache key — and to
+guard against that file changing between the two clicks. Persisted Stage-5 semantics are media-neutral
+now, so there is no track control, no Stage 1–4 pass during a scan, no ``TrackIdentity`` and no edit
+style anywhere in the workflow.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ _FUNCS = (
     "_path_signature_token", "_bounded_fingerprint", "_full_fingerprint",
     "_backend_component_token", "_llama_version_token", "_resolve_qwen_backend_paths",
     "_qwen_backend_available", "_qwen_backend_model_path", "_qwen_backend_signature_token",
-    "_qwen_prompt_style_hint", "_qwen_config_token", "_video_signature", "_cache_path",
+    "_qwen_config_token", "_video_signature", "_cache_path",
     "_same_source", "_is_count", "_stored_ai_cache_is_consistent",
     "_deterministic_analysis_completed", "_cache_entry_is_complete", "_load_cache",
     "classify_library_sources",
@@ -173,14 +179,6 @@ def va(tmp_path):
     return ns
 
 
-PROFILE = {
-    "tempo": 128.0,
-    "smart_preset": "hybrid_drop_story",
-    "average_wave": 0.51,
-    "section_types": ["intro", "drop", "outro"],
-}
-
-
 def _source(tmp_path, name: str, byte: bytes = b"v", size: int = 4096,
             mtime_ns: int = _SECOND) -> str:
     return _write(os.path.join(str(tmp_path), "library", name), byte, size, mtime_ns)
@@ -205,18 +203,18 @@ def _complete_record(ns, video_file: str) -> Dict[str, Any]:
     }
 
 
-def _put_record(ns, video_file: str, payload: Dict[str, Any], profile=PROFILE) -> str:
+def _put_record(ns, video_file: str, payload: Dict[str, Any]) -> str:
     """Write a payload at the source's CURRENT production cache key."""
-    path = ns["_cache_path"](video_file, True, ns["DEFAULT_QWEN_MODEL_DIR"], audio_profile=profile)
+    path = ns["_cache_path"](video_file, True, ns["DEFAULT_QWEN_MODEL_DIR"])
     assert path is not None
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
     return path
 
 
-def _classify(ns, sources, profile=PROFILE, enable_ai=True, event_callback=None):
+def _classify(ns, sources, enable_ai=True, event_callback=None):
     return ns["classify_library_sources"](
-        sources, audio_profile=profile, enable_ai=enable_ai,
+        sources, enable_ai=enable_ai,
         qwen_model_path=ns["DEFAULT_QWEN_MODEL_DIR"], event_callback=event_callback)
 
 
@@ -259,7 +257,7 @@ def test_a_changed_same_path_file_re_keys_and_misses(va, tmp_path):
     assert _verdicts(_classify(va, [source]))[source] == PREPARED
 
     _write(source, b"w", 4096, mtime_ns=_SECOND + 5_000_000_000)
-    new_key = va["_cache_path"](source, True, va["DEFAULT_QWEN_MODEL_DIR"], audio_profile=PROFILE)
+    new_key = va["_cache_path"](source, True, va["DEFAULT_QWEN_MODEL_DIR"])
 
     assert new_key != old_key, "a changed file must re-key"
     assert os.path.exists(old_key), "the old record is orphaned, never deleted"
@@ -308,7 +306,6 @@ def test_a_source_without_provable_identity_is_unavailable(va, tmp_path):
     assert result["unavailable_count"] == 1
     assert missing not in lp.PrepScanResult(
         folder="f", recursive=True,
-        track=lp.TrackIdentity("t", 1, 1, "p"), audio_profile={},
         runtime=lp.RuntimeIdentity(True, True, False),
         classifications=tuple(lp.SourceClassification.from_mapping(i)
                               for i in result["classifications"]),
@@ -387,8 +384,7 @@ def test_unprovable_backend_identity_blocks_preparation(va, tmp_path, monkeypatc
     runtime = lp.runtime_identity_from_classification(result, qwen_enabled=True)
     assert runtime.is_usable() is False
     scan = lp.build_scan_result(
-        folder="F", recursive=True, track=lp.TrackIdentity("t", 1, 1, "hybrid_drop_story"),
-        audio_profile=PROFILE, runtime=runtime,
+        folder="F", recursive=True, runtime=runtime,
         classification_items=result["classifications"], supported_count=1)
     assert scan.can_analyze() is False
     assert lp.BACKEND_UNVERIFIED_TEXT in scan.render_text()
@@ -440,8 +436,8 @@ def test_b_classification_mutates_no_cache_record(va, tmp_path):
 
     assert before == after, "no record may be created, updated or removed by a scan"
     assert set(before) == {os.path.basename(p) for p in (
-        va["_cache_path"](warm, True, va["DEFAULT_QWEN_MODEL_DIR"], audio_profile=PROFILE),
-        va["_cache_path"](broken, True, va["DEFAULT_QWEN_MODEL_DIR"], audio_profile=PROFILE),
+        va["_cache_path"](warm, True, va["DEFAULT_QWEN_MODEL_DIR"]),
+        va["_cache_path"](broken, True, va["DEFAULT_QWEN_MODEL_DIR"]),
     )}
 
 
@@ -537,7 +533,8 @@ def test_c_every_cache_path_call_receives_the_invocation_tokens():
         rendered = ast.unparse(call)
         assert "backend_token=invocation_backend_token" in rendered, rendered
         assert "config_token=invocation_config_token" in rendered, rendered
-        assert "audio_profile=audio_profile" in rendered, rendered
+        assert "audio_profile" not in rendered, (
+            "P2: nothing about the music may reach the key formula")
 
     assert len(_calls_named(fn, "_qwen_backend_signature_token")) == 1
     assert len(_calls_named(fn, "_qwen_config_token")) == 1
@@ -552,13 +549,24 @@ def test_c_the_orchestrator_identity_structure_is_untouched():
     assert "ai_cache_disabled" in _body_code(orchestrator)
 
 
-def test_c_a_different_edit_style_re_keys_the_whole_library(va, tmp_path):
-    """`smart_preset` reaches the key through `_qwen_config_token`, which is why the scan binds it."""
+def test_c_the_classifier_has_no_edit_style_input_at_all(va, tmp_path):
+    """The P2 inverse of the P V1 expectation this replaces.
+
+    Preparation used to re-key the whole library per ``smart_preset``, so a scan had to bind the
+    resolved edit style. A prepared source is now prepared for *every* track and every preset,
+    because the classifier has no way to be told about one: there is no parameter, and repeated scans
+    return the identical verdict.
+    """
     source = _source(tmp_path, "styled.mp4")
     _put_record(va, source, _complete_record(va, source))
 
-    other = dict(PROFILE, smart_preset="cinematic_soft_amv")
-    assert _verdicts(_classify(va, [source], profile=other))[source] == NEW_OR_CHANGED
+    fn = _func(_tree(_VA), "classify_library_sources")
+    params = [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+    assert "audio_profile" not in params, params
+    for leaked in ("audio_profile", "smart_preset", "_qwen_prompt_style_hint"):
+        assert leaked not in _body_code(fn), leaked
+
+    assert _verdicts(_classify(va, [source]))[source] == PREPARED
     assert _verdicts(_classify(va, [source]))[source] == PREPARED
 
 
@@ -570,8 +578,6 @@ def test_c_a_different_edit_style_re_keys_the_whole_library(va, tmp_path):
 def _scan_with(items, runtime=None) -> lp.PrepScanResult:
     return lp.build_scan_result(
         folder="F", recursive=True,
-        track=lp.TrackIdentity("t.mp3", 1, 1, "hybrid_drop_story"),
-        audio_profile=PROFILE,
         runtime=runtime or lp.RuntimeIdentity(True, True, False, "b", "c", "m"),
         classification_items=items, supported_count=len(items))
 
@@ -595,7 +601,8 @@ def test_d_a_fully_prepared_library_offers_no_work():
 
     assert scan.subset_for_analysis() == ()
     assert scan.can_analyze() is False
-    assert "already prepared" in scan.render_text()
+    assert "Everything in this library is prepared." in scan.render_text()
+    assert "edit style" not in scan.render_text(), "P2: no style dependence may be implied"
     assert lp.record_scan(lp.initial_state(), scan).can_analyze() is False
 
 
@@ -657,7 +664,7 @@ def test_e_the_scan_handler_classifies_and_does_not_analyse():
 
 
 def _prepared_state() -> lp.PrepSessionState:
-    state = lp.set_track(lp.set_folder(lp.initial_state(), "F"), "t.mp3")
+    state = lp.set_folder(lp.initial_state(), "F")
     items = [{"path": "new", "status": NEW_OR_CHANGED[0], "reason": NEW_OR_CHANGED[1]}]
     return lp.record_scan(state, _scan_with(items))
 
@@ -665,7 +672,6 @@ def _prepared_state() -> lp.PrepSessionState:
 @pytest.mark.parametrize("change", [
     lambda s: lp.set_folder(s, "OTHER"),
     lambda s: lp.set_recursive(s, False),
-    lambda s: lp.set_track(s, "other.mp3"),
 ])
 def test_f_every_classification_input_clears_the_scan(change):
     state = _prepared_state()
@@ -680,50 +686,54 @@ def test_f_every_classification_input_clears_the_scan(change):
 
 
 def test_f_the_live_declaration_guard_is_practical_equality():
-    """Unit level: what counts as "the user changed the inputs"."""
-    scan = _scan_with([{"path": "new", "status": NEW_OR_CHANGED[0],
-                        "reason": NEW_OR_CHANGED[1]}])
+    """Unit level: what counts as "the user changed the inputs".
+
+    After P2 the declaration surface is folder + recursive, which is the whole of preparation's
+    input. The guard is unchanged in strength - it simply has one fewer field to compare.
+    """
     scan = lp.build_scan_result(
         folder=os.path.join("C:", os.sep, "lib"), recursive=True,
-        track=lp.TrackIdentity(os.path.join("C:", os.sep, "a.mp3"), 1, 1, "hybrid_drop_story"),
-        audio_profile=PROFILE, runtime=lp.RuntimeIdentity(True, True, False, "b", "c", "m"),
+        runtime=lp.RuntimeIdentity(True, True, False, "b", "c", "m"),
         classification_items=[{"path": "new", "status": NEW_OR_CHANGED[0],
                                "reason": NEW_OR_CHANGED[1]}],
         supported_count=1)
     state = lp.record_scan(lp.initial_state(), scan)
 
-    same = lp.LivePrepDeclaration.from_widgets(scan.folder, True, scan.track.path)
+    same = lp.LivePrepDeclaration.from_widgets(scan.folder, True)
     assert lp.declaration_refusal(state, same) is None
 
     for changed in (
-        lp.LivePrepDeclaration.from_widgets(os.path.join("C:", os.sep, "other"), True,
-                                            scan.track.path),
-        lp.LivePrepDeclaration.from_widgets(scan.folder, False, scan.track.path),
-        lp.LivePrepDeclaration.from_widgets(scan.folder, True,
-                                            os.path.join("C:", os.sep, "b.mp3")),
-        lp.LivePrepDeclaration.from_widgets("", True, scan.track.path),
-        lp.LivePrepDeclaration.from_widgets(scan.folder, True, ""),
+        lp.LivePrepDeclaration.from_widgets(os.path.join("C:", os.sep, "other"), True),
+        lp.LivePrepDeclaration.from_widgets(scan.folder, False),
+        lp.LivePrepDeclaration.from_widgets("", True),
     ):
         assert lp.declaration_refusal(state, changed) == lp.STALE_DECLARATION_TEXT
 
     # cosmetic differences are not changes
     assert lp.declaration_refusal(state, lp.LivePrepDeclaration.from_widgets(
-        scan.folder + os.sep, True, scan.track.path)) is None
+        scan.folder + os.sep, True)) is None
     assert lp.declaration_refusal(state, lp.LivePrepDeclaration.from_widgets(
-        scan.folder.upper(), 1, scan.track.path)) is None
+        scan.folder.upper(), 1)) is None
 
     # nothing to compare: no scan, or a caller with no widgets (tests, scripts)
     assert lp.declaration_refusal(lp.initial_state(), same) is None
     assert lp.declaration_refusal(state, None) is None
 
 
-def test_f_the_live_guard_does_not_replace_the_track_identity_check(tmp_path):
-    """Two different guards. The live one is earlier and cheaper; it never stats the track."""
-    body = _body_code(_func(_tree(_PREP), "declaration_refusal"))
-    assert "still_matches" not in body and "os.stat" not in body
+def test_f_the_live_guard_stays_cheap_and_stats_nothing(tmp_path):
+    """It runs before anything is stat'ed, probed or analysed, and must stay that way.
 
-    identity_body = _body_code(_func(_tree(_PREP), "analyze_refusal"))
-    assert "still_matches" in identity_body, "TrackIdentity.still_matches must remain"
+    P2 removed the later ``TrackIdentity.still_matches()`` content check along with the track itself,
+    so the live declaration guard plus the runtime-identity recheck are now the whole of the Analyze
+    gate. Neither may quietly start touching the filesystem per source.
+    """
+    body = _body_code(_func(_tree(_PREP), "declaration_refusal"))
+    assert "os.stat" not in body and "open(" not in body
+
+    prep_source = open(_PREP, "r", encoding="utf-8").read()
+    for retired in ("TrackIdentity", "still_matches", "track_path", "smart_preset",
+                    "audio_profile", "profile_snapshot", "profile_seconds", "set_track"):
+        assert retired not in prep_source, f"{retired} must be gone from preparation state"
 
     describes = _body_code(_func(_tree(_PREP), "describes"))
     for forbidden in ("size", "mtime_ns", "blake2b", "open(", "fingerprint"):
@@ -731,13 +741,9 @@ def test_f_the_live_guard_does_not_replace_the_track_identity_check(tmp_path):
 
 
 def test_f_a_changed_runtime_identity_refuses_the_run(tmp_path):
-    track = str(tmp_path / "t.mp3")
-    with open(track, "wb") as handle:
-        handle.write(b"audio")
-    identity = lp.TrackIdentity.from_file(track, "hybrid_drop_story")
     runtime = lp.RuntimeIdentity(True, True, False, "backend-A", "config-A", "m")
     scan = lp.build_scan_result(
-        folder="F", recursive=True, track=identity, audio_profile=PROFILE, runtime=runtime,
+        folder="F", recursive=True, runtime=runtime,
         classification_items=[{"path": "new", "status": NEW_OR_CHANGED[0],
                                "reason": NEW_OR_CHANGED[1]}],
         supported_count=1)
@@ -755,23 +761,26 @@ def test_f_a_changed_runtime_identity_refuses_the_run(tmp_path):
         assert refusal is not None and "Scan Library again" in refusal
 
 
-def test_f_a_changed_track_refuses_the_run(tmp_path):
-    track = str(tmp_path / "t.mp3")
-    with open(track, "wb") as handle:
-        handle.write(b"audio")
-    identity = lp.TrackIdentity.from_file(track, "hybrid_drop_story")
+def test_f_the_analyze_gate_has_no_track_refusal_left(tmp_path):
+    """Retired by P2, and this asserts the retirement rather than leaving a hole.
+
+    A track could invalidate a P V1 scan because it resolved the edit style the whole
+    classification was keyed under. Nothing about the music reaches a key now, so there is no track
+    to change - and the refusal list must not have acquired a substitute for it either.
+    """
     runtime = lp.RuntimeIdentity(True, True, False, "b", "c", "m")
-    state = lp.record_scan(lp.initial_state(), lp.build_scan_result(
-        folder="F", recursive=True, track=identity, audio_profile=PROFILE, runtime=runtime,
-        classification_items=[{"path": "new", "status": NEW_OR_CHANGED[0],
-                               "reason": NEW_OR_CHANGED[1]}],
-        supported_count=1))
+    state = lp.record_scan(lp.initial_state(), _scan_with(
+        [{"path": "new", "status": NEW_OR_CHANGED[0], "reason": NEW_OR_CHANGED[1]}],
+        runtime=runtime))
 
     assert lp.analyze_refusal(state, runtime) is None
 
-    os.utime(track, ns=(_SECOND, _SECOND))
-    refusal = lp.analyze_refusal(state, runtime)
-    assert refusal is not None and "track changed" in refusal.lower()
+    body = _body_code(_func(_tree(_PREP), "analyze_refusal"))
+    for retired in ("track", "still_matches", "smart_preset", "audio", "preset"):
+        assert retired not in body, f"analyze_refusal must not mention {retired}"
+    # the refusals that DO remain
+    assert "scan is None" in body and "is_usable" in body
+    assert "subset_for_analysis" in body and "matches(runtime)" in body
 
 
 def test_f_a_refused_or_finished_run_drops_the_scan():
@@ -795,7 +804,7 @@ def test_f_the_analyze_handler_rechecks_identity_before_running():
     assert body.rindex("analyze_refusal") < body.index("analyze_video_sources(")
     assert "runtime_identity_from_classification" in body
 
-    # the live-declaration guard is FIRST: before the track stat, before the identity probe
+    # the live-declaration guard is FIRST: before the identity probe, before anything is analysed
     assert body.count("declaration_refusal") == 1
     assert body.index("declaration_refusal") < body.index("analyze_refusal")
     assert body.index("declaration_refusal") < body.index("classify_library_sources(")
@@ -807,7 +816,7 @@ def test_f_the_analyze_click_submits_the_live_preparation_controls():
     kwargs = _click_kwargs(_tree(_GUI), "prep_analyze_btn")
     names = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
 
-    assert names == ["prep_folder", "prep_recursive", "prep_track", "prep_state"]
+    assert names == ["prep_folder", "prep_recursive", "prep_state"]
     assert getattr(kwargs["fn"], "id", None) == "_on_prep_analyze_click"
 
 
@@ -820,82 +829,109 @@ def test_f_the_analyze_handler_signature_matches_its_click_inputs():
     widgets = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
     params = [a.arg for a in _func(_tree(_GUI), "_on_prep_analyze_click").args.args]
 
-    assert params == ["folder_path", "recursive", "track_path", "state"]
+    assert params == ["folder_path", "recursive", "state"]
     assert len(params) == len(widgets)
     for widget, param in zip(widgets, params):
         assert widget.removeprefix("prep_").rstrip("_") in param.replace("_path", ""), \
             f"{widget} vs {param}"
 
     body = _body_code(_func(_tree(_GUI), "_on_prep_analyze_click"))
-    assert "LivePrepDeclaration.from_widgets(folder_path, recursive, track_path)" in body
+    assert "LivePrepDeclaration.from_widgets(folder_path, recursive)" in body
 
 
-def test_f_the_scan_click_inputs_are_unchanged():
+def test_f_the_scan_click_takes_the_folder_controls_only():
     kwargs = _click_kwargs(_tree(_GUI), "prep_scan_btn")
     names = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
-    assert names == ["prep_folder", "prep_recursive", "prep_track", "prep_state"]
+    assert names == ["prep_folder", "prep_recursive", "prep_state"]
     assert getattr(kwargs["fn"], "id", None) == "_on_prep_scan_click"
+    params = [a.arg for a in _func(_tree(_GUI), "_on_prep_scan_click").args.args]
+    assert params == ["folder_path", "recursive", "state"]
 
 
 # ===========================================================================
-# G. PROFILE PARITY
+# G. TRACKLESS, MEDIA-NEUTRAL PREPARATION (P2)
+#
+# Replaces P V1's "PROFILE PARITY" section wholesale. There is no profile to keep parity with: the
+# scan derives no edit style, so it runs no audio analysis and needs no audio file.
 # ===========================================================================
 
 
-def test_g_the_profile_comes_from_analyze_beats_auto_with_no_video_files():
+def test_g_the_scan_runs_no_audio_analysis_at_all():
+    """No `analyze_beats_auto`, and therefore no Stages 1-4 during a preparation scan.
+
+    This is where the measured ~15-20 s per-scan track-profile component went.
+    """
     fn = _func(_tree(_GUI), "_prep_scan_impl")
-    calls = _calls_named(fn, "analyze_beats_auto")
-    assert len(calls) == 1
-    rendered = ast.unparse(calls[0])
-    assert "video_files=None" in rendered, rendered
+    assert _calls_named(fn, "analyze_beats_auto") == []
 
     body = _body_code(fn)
-    assert 'beat_info.get(\'audio_visual_profile\')' in body
-    assert "_build_audio_visual_profile" not in body, "the formula must never be duplicated"
-    assert "smart_preset =" not in body, "the preset is read, never recomputed"
+    for forbidden in ("analyze_beats_auto", "audio_visual_profile", "_build_audio_visual_profile",
+                      "smart_preset", "audio_profile", "TrackIdentity", "_as_existing_source_path",
+                      "profile_seconds", "set_track"):
+        assert forbidden not in body, f"a trackless scan must not reference {forbidden}"
 
 
-def test_g_the_profile_formula_lives_only_in_auto_mode():
+def test_g_the_profile_formula_still_lives_only_in_auto_mode():
+    """Unchanged: normal Create Video still builds it for Stage 6. It just never reaches Stage 5."""
     for path in (_GUI, _VA, _PREP):
         with open(path, "r", encoding="utf-8") as handle:
             assert "def _build_audio_visual_profile" not in handle.read(), path
 
 
-def test_g_the_stored_profile_is_an_independent_serialisable_snapshot():
-    live = {"smart_preset": "hybrid_drop_story", "tempo": 128.0,
-            "section_types": ["intro", "drop"], "cut_count": 148}
-    scan = _scan_with([])
-    snapshot = lp.profile_snapshot(live)
-
-    assert snapshot == live
-    assert snapshot is not live
-    live["section_types"].append("mutated")
-    assert snapshot["section_types"] == ["intro", "drop"], "no shared mutable container"
-    assert json.loads(json.dumps(snapshot)) == snapshot, "must survive a state round trip"
-    assert scan.audio_profile == PROFILE and scan.audio_profile is not PROFILE
+def test_g_no_preparation_call_forwards_an_audio_profile():
+    """Both runtime calls are media-neutral: the classifier has no such parameter, and Stage 5's
+    retained one is simply not passed."""
+    analyze = _func(_tree(_GUI), "_prep_analyze_impl")
+    for call in _calls_named(analyze, "analyze_video_sources"):
+        assert "audio_profile" not in ast.unparse(call), ast.unparse(call)
+    for fn_name in ("_prep_scan_impl", "_prep_analyze_impl"):
+        for call in _calls_named(_func(_tree(_GUI), fn_name), "classify_library_sources"):
+            assert "audio_profile" not in ast.unparse(call), ast.unparse(call)
 
 
-def test_g_the_stored_profile_is_forwarded_unchanged_to_stage_5():
-    call = _calls_named(_func(_tree(_GUI), "_prep_analyze_impl"), "analyze_video_sources")[0]
-    rendered = ast.unparse(call)
-    assert "audio_profile=dict(scan.audio_profile)" in rendered, rendered
+def test_g_preparation_state_carries_no_audio_or_style_field():
+    """The state machine's whole surface, checked against the dataclasses themselves."""
+    assert set(lp.PrepScanResult.__dataclass_fields__) == {
+        "folder", "recursive", "runtime", "classifications", "supported_count",
+        "folder_scan_seconds", "classify_seconds", "cache_identity_seconds",
+        "cache_lookup_seconds",
+    }
+    assert set(lp.PrepSessionState.__dataclass_fields__) == {
+        "folder", "recursive", "scan", "report_text", "notice",
+    }
+    assert set(lp.LivePrepDeclaration.__dataclass_fields__) == {"folder", "recursive"}
+    for retired in ("TrackIdentity", "profile_snapshot", "set_track"):
+        assert not hasattr(lp, retired), f"{retired} must be gone"
+        assert retired not in lp.__all__
 
-    scan_call = _calls_named(_func(_tree(_GUI), "_prep_scan_impl"), "classify_library_sources")[0]
-    assert "audio_profile=profile" in ast.unparse(scan_call)
+
+def test_g_the_report_states_the_semantic_mode_and_implies_no_track():
+    scan = _scan_with([{"path": f"/lib/c{i}.mp4", "status": PREPARED[0], "reason": ""}
+                       for i in range(903)])
+    text = scan.render_text()
+
+    assert "MEDIA LIBRARY PREPARATION" in text
+    assert f"Semantic mode:     {lp.SEMANTIC_MODE_TEXT}" in text
+    assert lp.SEMANTIC_MODE_TEXT == "media-neutral"
+    assert "Supported videos:  903" in text
+    assert "Prepared:          903" in text
+    assert "New / changed:     0" in text
+    assert "Scan time:         folder " in text and "identity " in text and "records " in text
+    for forbidden in ("Track:", "Edit style:", "edit style", "smart_preset", "track"):
+        assert forbidden not in text, f"the report must not imply track/style dependence: {forbidden}"
 
 
-def test_g_a_profile_snapshot_survives_odd_values():
-    """A report must never be able to raise because a future profile field carried an exotic type."""
-    class Weird:
-        def __float__(self):
-            raise TypeError("nope")
+def test_g_no_preparation_ui_text_implies_a_track_or_an_edit_style():
+    ui = open(os.path.join(_REPO, "src", "ui_content.py"), "r", encoding="utf-8").read()
+    block = ui[ui.index("LABEL_PREP_SECTION"):ui.index("LABEL_PREP_SCAN")]
+    for forbidden in ("LABEL_PREP_TRACK", "INFO_PREP_TRACK", "edit style the chosen track",
+                      "MP3", "WAV", "FLAC"):
+        assert forbidden not in block, forbidden
+    assert "LABEL_PREP_TRACK" not in ui and "INFO_PREP_TRACK" not in ui
 
-        def __str__(self):
-            return "weird"
-
-    snapshot = lp.profile_snapshot({"a": Weird(), "b": (1, 2), "c": None, 1: True})
-    assert snapshot == {"a": "weird", "b": [1, 2], "c": None, "1": True}
-    assert lp.profile_snapshot(None) == {}
+    prep_source = open(_PREP, "r", encoding="utf-8").read()
+    assert "prepared for this edit style" not in prep_source
+    assert "Everything in this library is prepared." in prep_source
 
 
 def test_g_qwen_runtime_resolution_mirrors_auto_mode():
@@ -913,7 +949,7 @@ def test_g_qwen_runtime_resolution_mirrors_auto_mode():
 
 _PREP_FUNCTIONS = (
     "_prep_ui_updates", "_prep_busy_updates", "_on_prep_folder_change",
-    "_on_prep_recursive_change", "_on_prep_track_change", "_resolve_prep_qwen_runtime",
+    "_on_prep_recursive_change", "_resolve_prep_qwen_runtime",
     "_prep_scan_impl", "_prep_analyze_impl", "_run_prep_in_worker",
     "_on_prep_scan_click", "_on_prep_analyze_click",
 )
@@ -1024,9 +1060,11 @@ def test_i_preparation_offers_no_browser_upload_mode():
 # ===========================================================================
 
 
-def test_j_cache_and_analysis_versions_are_unchanged():
+def test_j_the_cache_contract_is_v3_and_the_analysis_version_is_unchanged():
+    """P2 makes exactly one deliberate bump, because a v3 semantic record means something different
+    from a v2 one. Deterministic candidate scoring / windows / schema are untouched."""
     source = open(_VA, "r", encoding="utf-8").read()
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in source
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in source
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in source
 
 
@@ -1113,8 +1151,11 @@ def test_progress_the_worker_callback_only_touches_the_queue():
 # The structural checks above prove intent; these prove behaviour. `gui.py` needs Gradio and the
 # whole runtime, so its two preparation impl functions are lifted out by their `ast` source ranges
 # and executed against stubs — a fake ``video_analysis`` module registered in ``sys.modules`` for
-# their local imports, plus a recording `analyze_beats_auto` and `scan_folder`. Nothing real runs:
-# no Qwen, no OpenCV, no FFmpeg, no render.
+# their local imports, plus a recording `scan_folder`. Nothing real runs: no Qwen, no OpenCV, no
+# FFmpeg, no render.
+#
+# P2: `analyze_beats_auto` is still registered in the namespace, but as a stub that FAILS the test if
+# it is ever called. Absence would only produce a NameError; a tripwire says why.
 # ===========================================================================
 
 
@@ -1133,7 +1174,6 @@ class _Recorder:
         self.classify_result: dict = {}
         self.probe_result: dict | None = None
         self.ready_paths: list[str] = []
-        self.profile: dict = dict(PROFILE)
 
 
 def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
@@ -1147,10 +1187,10 @@ def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
         source = handle.read()
     tree = ast.parse(source)
 
-    def classify_library_sources(video_files, audio_profile=None, enable_ai=True,
+    def classify_library_sources(video_files, enable_ai=True,
                                  qwen_model_path=None, event_callback=None):
         recorder.classify_calls.append({
-            "video_files": list(video_files), "audio_profile": audio_profile,
+            "video_files": list(video_files),
             "enable_ai": enable_ai, "qwen_model_path": qwen_model_path,
         })
         if not video_files and recorder.probe_result is not None:
@@ -1172,11 +1212,11 @@ def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
     fake_va.DEFAULT_QWEN_MODEL_DIR = str(tmp_path / "models")
     sys.modules["video_analysis"] = fake_va
 
-    def analyze_beats_auto(audio_file, use_gpu=False, video_files=None,
-                           console_callback=None, event_callback=None, **kwargs):
-        recorder.beats_calls.append({"audio_file": audio_file, "video_files": video_files,
-                                     "use_gpu": use_gpu})
-        return ([], {"audio_visual_profile": recorder.profile})
+    def analyze_beats_auto(*_args, **_kwargs):
+        """P2 tripwire: a trackless preparation scan must never run audio analysis."""
+        recorder.beats_calls.append({})
+        raise AssertionError(
+            "preparation called analyze_beats_auto; a P2 scan runs no audio Stages 1-4")
 
     class _Media:
         def __init__(self, path):
@@ -1221,19 +1261,25 @@ def _gui_namespace(recorder: _Recorder, tmp_path) -> Dict[str, Any]:
 
 @pytest.fixture
 def gui(tmp_path):
+    """The two preparation handlers, executed against stubs.
+
+    An audio file is still written, and a third tuple element still carries it, purely so a
+    regression that reintroduces a track input has something plausible to be handed — the handlers
+    themselves take (folder, recursive, state) and must never look at it.
+    """
     recorder = _Recorder()
     namespace = _gui_namespace(recorder, tmp_path)
-    track = str(tmp_path / "track.mp3")
-    with open(track, "wb") as handle:
+    unused_track = str(tmp_path / "track.mp3")
+    with open(unused_track, "wb") as handle:
         handle.write(b"audio bytes")
-    yield namespace, recorder, track
+    yield namespace, recorder, unused_track
     import sys
     sys.modules.pop("video_analysis", None)
 
 
 def _live_for(scan: lp.PrepScanResult) -> lp.LivePrepDeclaration:
     """The declaration a user who has changed nothing since the scan would submit."""
-    return lp.LivePrepDeclaration.from_widgets(scan.folder, scan.recursive, scan.track.path)
+    return lp.LivePrepDeclaration.from_widgets(scan.folder, scan.recursive)
 
 
 def _classification_payload(prepared: int, new: int, incomplete: int) -> dict:
@@ -1246,38 +1292,38 @@ def _classification_payload(prepared: int, new: int, incomplete: int) -> dict:
     return {
         "classifications": items, "ai_available": True, "ai_cache_disabled": False,
         "backend_token": "backend-A", "config_token": "config-A",
-        "qwen_model_path": "M", "smart_preset": "hybrid_drop_story",
+        "qwen_model_path": "M",
         "cache_identity_seconds": 7.4, "cache_lookup_seconds": 3.9, "classify_seconds": 11.7,
     }
 
 
 def test_real_scan_handler_classifies_the_whole_library_once(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = [f"/lib/f{i}.mp4" for i in range(10)]
     recorder.classify_result = _classification_payload(8, 1, 1)
 
-    state = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    state = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
 
     assert len(recorder.scan_calls) == 1
     assert recorder.scan_calls[0]["detect_duplicates"] is False
-    assert len(recorder.beats_calls) == 1
-    assert recorder.beats_calls[0]["video_files"] is None, "Stage 5 must be skipped here"
+    assert recorder.beats_calls == [], "a trackless scan runs no audio analysis"
     assert len(recorder.classify_calls) == 1
     assert recorder.classify_calls[0]["video_files"] == recorder.ready_paths
+    assert "audio_profile" not in recorder.classify_calls[0]
     assert not recorder.analyze_calls, "a scan must not analyse anything"
 
     assert state.scan is not None
     assert (state.scan.prepared_count, state.scan.needs_analysis_count) == (8, 2)
-    assert state.scan.smart_preset == "hybrid_drop_story"
     assert state.can_analyze() is True
     assert "Prepared:          8" in state.report_text
+    assert "media-neutral" in state.report_text
 
 
 def test_real_analyze_handler_sends_only_the_subset(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = [f"/lib/f{i}.mp4" for i in range(10)]
     recorder.classify_result = _classification_payload(8, 1, 1)
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
 
     recorder.probe_result = dict(recorder.classify_result, classifications=[])
     finished = namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan))
@@ -1286,8 +1332,8 @@ def test_real_analyze_handler_sends_only_the_subset(gui, tmp_path):
     call = recorder.analyze_calls[0]
     assert call["video_files"] == ["/lib/new_0.mp4", "/lib/bad_0.mp4"]
     assert len(call["video_files"]) == 2 and len(recorder.ready_paths) == 10
-    assert call["audio_profile"] == PROFILE
-    assert call["audio_profile"] is not scanned.scan.audio_profile, "a copy, not the stored object"
+    assert call["audio_profile"] is None, "P2: Stage 5 is called media-neutrally"
+    assert recorder.beats_calls == []
     assert call["enable_ai"] is True
 
     # the identity re-check ran through the same classifier seam, with no sources
@@ -1300,25 +1346,25 @@ def test_real_analyze_handler_sends_only_the_subset(gui, tmp_path):
 
 
 @pytest.mark.parametrize("mutate", [
-    pytest.param(lambda folder, rec, track: ("/other/library", rec, track), id="folder"),
-    pytest.param(lambda folder, rec, track: (folder, not rec, track), id="recursive"),
-    pytest.param(lambda folder, rec, track: (folder, rec, track + ".other.mp3"), id="track"),
+    pytest.param(lambda folder, rec: ("/other/library", rec), id="folder"),
+    pytest.param(lambda folder, rec: (folder, not rec), id="recursive"),
 ])
 def test_real_analyze_refuses_when_a_live_control_changed(gui, tmp_path, mutate):
     """The queued-`change` race: the widgets declare B while the state still holds A's scan.
 
-    Refused before anything is stat'ed, probed or analysed — so neither the runtime identity probe
-    nor the analyzer is reached, and the stale scan is dropped rather than silently re-targeted.
+    Refused before anything is probed or analysed - so neither the runtime identity probe nor the
+    analyzer is reached, and the stale scan is dropped rather than silently re-targeted. Folder and
+    recursive are the whole live surface after P2, so this covers all of it.
     """
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = _classification_payload(0, 1, 0)
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
     assert scanned.can_analyze() is True
     calls_after_scan = len(recorder.classify_calls)
 
-    folder, recursive, track_path = mutate("/lib", True, track)
-    live = lp.LivePrepDeclaration.from_widgets(folder, recursive, track_path)
+    folder, recursive = mutate("/lib", True)
+    live = lp.LivePrepDeclaration.from_widgets(folder, recursive)
     refused = namespace["_prep_analyze_impl"](scanned, live)
 
     assert not recorder.analyze_calls, "the analyzer must not be reached"
@@ -1331,10 +1377,10 @@ def test_real_analyze_refuses_when_a_live_control_changed(gui, tmp_path, mutate)
 
 def test_real_analyze_proceeds_when_every_live_control_matches(gui, tmp_path):
     """The guard must not become a false refusal: unchanged controls analyse exactly as before."""
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = [f"/lib/f{i}.mp4" for i in range(10)]
     recorder.classify_result = _classification_payload(8, 1, 1)
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
 
     recorder.probe_result = dict(recorder.classify_result, classifications=[])
     finished = namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan))
@@ -1347,15 +1393,15 @@ def test_real_analyze_proceeds_when_every_live_control_matches(gui, tmp_path):
 
 def test_real_analyze_tolerates_cosmetic_path_differences(gui, tmp_path):
     """A trailing separator or a case difference is not the user changing their mind."""
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = _classification_payload(0, 1, 0)
     folder = str(tmp_path / "lib")
     os.makedirs(folder, exist_ok=True)
-    scanned = namespace["_prep_scan_impl"](folder, True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"](folder, True, lp.initial_state())
 
     recorder.probe_result = dict(recorder.classify_result, classifications=[])
-    cosmetic = lp.LivePrepDeclaration.from_widgets(folder + os.sep, True, track)
+    cosmetic = lp.LivePrepDeclaration.from_widgets(folder + os.sep, True)
     finished = namespace["_prep_analyze_impl"](scanned, cosmetic)
 
     assert len(recorder.analyze_calls) == 1, "a trailing separator must not refuse"
@@ -1363,10 +1409,10 @@ def test_real_analyze_tolerates_cosmetic_path_differences(gui, tmp_path):
 
 
 def test_real_analyze_handler_refuses_when_identity_drifted(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = _classification_payload(0, 1, 0)
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
 
     # a swapped GGUF between the two clicks
     recorder.probe_result = dict(recorder.classify_result, classifications=[],
@@ -1378,30 +1424,15 @@ def test_real_analyze_handler_refuses_when_identity_drifted(gui, tmp_path):
     assert "Scan Library again" in refused.report_text
 
 
-def test_real_analyze_handler_refuses_when_the_track_changed(gui, tmp_path):
-    namespace, recorder, track = gui
-    recorder.ready_paths = ["/lib/f0.mp4"]
-    recorder.classify_result = _classification_payload(0, 1, 0)
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
-
-    with open(track, "wb") as handle:
-        handle.write(b"a different track entirely")
-    refused = namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan))
-
-    assert not recorder.analyze_calls
-    assert refused.scan is None
-    assert "track changed" in refused.report_text.lower()
-
-
 def test_real_scan_handler_refuses_an_unverifiable_backend(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = {
         "classifications": [], "ai_available": True, "ai_cache_disabled": True,
-        "backend_token": "", "config_token": "", "qwen_model_path": "", "smart_preset": "",
+        "backend_token": "", "config_token": "", "qwen_model_path": "",
     }
 
-    state = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    state = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
 
     assert state.scan is not None, "the scan is recorded, but unusable"
     assert state.can_analyze() is False
@@ -1410,28 +1441,25 @@ def test_real_scan_handler_refuses_an_unverifiable_backend(gui, tmp_path):
     assert not recorder.analyze_calls
 
 
-@pytest.mark.parametrize("folder,track_ok,expected", [
-    ("", True, "No library folder selected"),
-    ("/lib", False, "No track selected"),
-])
-def test_real_scan_handler_validates_its_inputs(gui, tmp_path, folder, track_ok, expected):
-    namespace, recorder, track = gui
-    state = namespace["_prep_scan_impl"](
-        folder, True, track if track_ok else "", lp.initial_state())
+@pytest.mark.parametrize("folder", ["", "   ", None])
+def test_real_scan_handler_requires_a_folder_and_nothing_else(gui, tmp_path, folder):
+    """The folder is now the only mandatory input - there is no track to be missing."""
+    namespace, recorder, _track = gui
+    state = namespace["_prep_scan_impl"](folder, True, lp.initial_state())
 
     assert state.scan is None
-    assert expected in state.report_text
-    assert not recorder.scan_calls or not track_ok
+    assert "No library folder selected" in state.report_text
+    assert not recorder.scan_calls and not recorder.beats_calls
 
 
 def test_real_scan_handler_applies_the_live_widget_values(gui, tmp_path):
     """A Textbox `change` may not have fired when the user types a path and clicks Scan at once."""
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = _classification_payload(1, 0, 0)
 
     stale = lp.set_folder(lp.initial_state(), "OLD")
-    state = namespace["_prep_scan_impl"]("/live/folder", False, track, stale)
+    state = namespace["_prep_scan_impl"]("/live/folder", False, stale)
 
     assert recorder.scan_calls[0]["root"] == "/live/folder"
     assert recorder.scan_calls[0]["recursive"] is False
@@ -1439,32 +1467,17 @@ def test_real_scan_handler_applies_the_live_widget_values(gui, tmp_path):
 
 
 def test_real_scan_handler_survives_a_failed_folder_scan(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
 
     def exploding(root, recursive=True, detect_duplicates=True):
         raise namespace["InputScanError"]("no such directory")
 
     namespace["scan_library_folder"] = exploding
-    state = namespace["_prep_scan_impl"]("/missing", True, track, lp.initial_state())
+    state = namespace["_prep_scan_impl"]("/missing", True, lp.initial_state())
 
     assert state.scan is None
     assert "LIBRARY SCAN FAILED" in state.report_text
-    assert not recorder.beats_calls, "a failed enumeration must not start audio analysis"
-
-
-def test_real_scan_handler_survives_a_failed_track_analysis(gui, tmp_path):
-    namespace, recorder, track = gui
-    recorder.ready_paths = ["/lib/f0.mp4"]
-
-    def exploding(*_args, **_kwargs):
-        raise ValueError("Audio file is empty or could not be decoded.")
-
-    namespace["analyze_beats_auto"] = exploding
-    state = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
-
-    assert state.scan is None
-    assert "TRACK ANALYSIS FAILED" in state.report_text
-    assert not recorder.classify_calls, "no classification without a resolved edit style"
+    assert not recorder.classify_calls, "a failed enumeration must not classify anything"
 
 
 def test_real_runtime_resolution_honours_the_disable_switch(gui, monkeypatch):
@@ -1479,11 +1492,11 @@ def test_real_runtime_resolution_honours_the_disable_switch(gui, monkeypatch):
 
 
 def test_real_handlers_forward_the_resolved_runtime_to_both_calls(gui, tmp_path):
-    namespace, recorder, track = gui
+    namespace, recorder, _track = gui
     recorder.ready_paths = ["/lib/f0.mp4"]
     recorder.classify_result = _classification_payload(0, 1, 0)
 
-    scanned = namespace["_prep_scan_impl"]("/lib", True, track, lp.initial_state())
+    scanned = namespace["_prep_scan_impl"]("/lib", True, lp.initial_state())
     recorder.probe_result = dict(recorder.classify_result, classifications=[])
     namespace["_prep_analyze_impl"](scanned, _live_for(scanned.scan))
 
@@ -1492,7 +1505,8 @@ def test_real_handlers_forward_the_resolved_runtime_to_both_calls(gui, tmp_path)
     assert scan_call["enable_ai"] == probe_call["enable_ai"] == analyze_call["enable_ai"]
     assert (scan_call["qwen_model_path"] == probe_call["qwen_model_path"]
             == analyze_call["qwen_model_path"])
-    assert scan_call["audio_profile"] == analyze_call["audio_profile"]
+    assert analyze_call["audio_profile"] is None, "neither call carries an audio profile"
+    assert recorder.beats_calls == []
 
 
 # ===========================================================================

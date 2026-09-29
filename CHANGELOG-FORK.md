@@ -20,6 +20,56 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-09-30 (P2: persisted Stage-5 semantics are media-neutral)
+
+Stage 5's Qwen semantics now describe the **video itself** rather than the video as seen through one
+edit style. This establishes a deliberate architectural boundary: Stage 5 records intrinsic media
+truth (persistent), while Stage 6 and any future creative/director layer interpret it for the current
+project (ephemeral, per render).
+
+- **The Qwen prompt no longer carries music or edit context.**
+  `stage5_qwen_scene_worker._build_prompt()` takes no arguments and instructs the model to assess the
+  moment only from what is visually present, explicitly not adapting its tags to music, song energy,
+  edit style or pacing. The previous `"The music edit style is {smart_preset}."` conditioning is gone.
+  The semantic schema is **unchanged** — same eight numeric keys, same `emotion` and
+  `recommended_use` enums, same description contract, same greedy sampling — because the validation
+  experiment tested the existing schema under a media-neutral prompt.
+- **No audio profile crosses the worker boundary.** Neither the single nor the batch request JSON
+  carries `audio_profile`; `_build_prompt` was its only consumer. Every private seam that existed
+  solely to forward it lost the parameter. `analyze_video_sources(..., audio_profile=None, ...)` is
+  retained as an integration signature with **zero** effect — it reaches no cache key, no request, no
+  prompt and no persisted record.
+- **`smart_preset` is out of cache identity.** `_qwen_config_token()` now takes no arguments and keys
+  only `BEATSYNC_QWEN_MAX_WINDOWS`, `_FRAME_WIDTH` and `_MAX_NEW_TOKENS` — all three still re-key.
+  `_qwen_prompt_style_hint` is removed. A source therefore needs one semantic analysis per compatible
+  source identity + Qwen backend identity + media-semantic Qwen configuration, not one per preset.
+- **`CACHE_CONTRACT_VERSION` moves `stage5_cache_v2` → `stage5_cache_v3`**, because a v3 record means
+  something different from a v2 one. `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`
+  (deterministic candidate scoring, window building and the candidate schema are untouched). There is
+  **no migration**: v2 keys are never produced or looked up again, no v2 semantics are reused, and the
+  old records are left on disk untouched — no compatibility loader, no rewriter, no automatic deletion.
+  A one-off cold v3 rebuild is the intended cost.
+- **Media Library Preparation is now trackless.** The audio-file control, the Stage 1–4 profile pass
+  during a scan, `TrackIdentity`, the stored profile snapshot and the track staleness guard are all
+  removed; preparation inputs are the folder and the recursive flag. One preparation serves every
+  track, preset and creative seed, and the report states `Semantic mode: media-neutral`. The live
+  stale-widget guard, the P.1 subset-only Analyze rule and the strict separation from the Create Video
+  confirmation gate are unchanged. This removes the measured ~15–20 s track-profile component from
+  every preparation scan.
+- **Normal Create Video is unchanged.** Stages 1–4 still run and Stage 6 still receives `beat_info`,
+  sections, energy, targets, the creative seed and the candidate tags/scores. Stage 6 scoring and
+  planning logic were not modified.
+- **Validated on real material before adoption** (23 analysed sources, 17 source groups, 10,913
+  deterministic candidates, 115 identical A/B semantic moments): 115/115 decoded and tagged with zero
+  failures on both sides; post-merge mean score differences ≤ ~0.023; planner seeds 0/101/202 with zero
+  fallbacks and near-identical editorial scores; blind human review of 40 frames preferring the neutral
+  side 10/16 decisive, with fewer editorial-leak and false-action flags. The conclusion is that
+  media-neutral semantics are not materially worse on real content, remain equally usable by Stage 6,
+  and stop music/edit intent leaking into persisted media semantics.
+- No Freestyle, Director, Hybrid or Neutral/Music-aware mode is implemented here, and no speculative
+  abstraction was added for them. `tests/test_media_neutral_semantics.py` covers the prompt, the
+  request payloads, the identity invariant, the v2→v3 boundary and the creative-state boundary.
+
 ### Added — 2026-09-29 (Creative Phase A: user-controlled variation seed)
 
 A **Variation Seed** in the UI (plus `--seed` on the CLI) that produces a different but reproducible

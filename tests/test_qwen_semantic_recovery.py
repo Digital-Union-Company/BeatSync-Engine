@@ -475,7 +475,7 @@ def test_recovery_13_no_cache_or_completion_change_and_no_rekey(worker_tree):
     record at all - recovery can only turn an absence into a record, never contradict a stored one.
     """
     parent = _source(_PARENT)
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in parent
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in parent
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in parent
 
     # recovery must be invisible to cache identity and to the completion rules
@@ -487,9 +487,12 @@ def test_recovery_13_no_cache_or_completion_change_and_no_rekey(worker_tree):
     config = _code(_func(parent_tree, "_qwen_config_token"))
     assert "RECOVERY" not in config.upper()
     # MAX_WINDOWS reaches the token through `_qwen_max_windows()`; the other two are read inline.
+    # P2 retired the fourth component (`smart_preset`) along with style-conditioned prompting; these
+    # three are the whole of media-semantic Qwen configuration now, and recovery touches none of them.
     for key in ("_qwen_max_windows()", "BEATSYNC_QWEN_FRAME_WIDTH",
-                "BEATSYNC_QWEN_MAX_NEW_TOKENS", "smart_preset"):
+                "BEATSYNC_QWEN_MAX_NEW_TOKENS"):
         assert key in config, f"{key} must remain in the cache config token"
+    assert "smart_preset" not in config
 
     # the completion rules still exist and still demand exact requested-set coverage
     completed = _code(_func(parent_tree, "_qwen_job_completed"))
@@ -500,19 +503,21 @@ def test_recovery_13_no_cache_or_completion_change_and_no_rekey(worker_tree):
         assert _func(parent_tree, name) is not None
 
 
-def test_recovery_14_worker_prompt_is_unchanged(worker_tree):
+def test_recovery_14_worker_prompt_is_untouched_by_recovery(worker_tree):
+    """Recovery changes the token budget and bounds `description`; it never touches the prompt.
+
+    The prompt's own conditioning is P2's business (see `tests/test_media_neutral_semantics.py`);
+    what this pins is that the semantic key list, the enums and the description contract - the parts
+    recovery's bounded schema has to agree with - are still exactly what they were.
+    """
     fn = _func(worker_tree, "_build_prompt")
     # `ast.unparse` normalises quoting, so compare the literal string pieces themselves.
     prompt = "".join(
         node.value for node in ast.walk(fn)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     )
-    code = _code(fn)
-    assert "smart_preset" in code and "rhythmic_gmv_amv" in prompt, (
-        "the prompt must still default smart_preset to rhythmic_gmv_amv")
     for fragment in (
         "You are tagging one source-video moment for professional AMV/GMV editing. ",
-        "The music edit style is ",
         "Return JSON only. Keys: action_intensity, beauty_score, combat, chase, explosion, ",
         "character_focus, camera_motion, visual_quality as numbers 0..1; ",
         "emotion as one of soft,tension,hype,sad,neutral; ",

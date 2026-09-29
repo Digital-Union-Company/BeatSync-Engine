@@ -302,11 +302,11 @@ subsequent identical warm run should show 845/845 cache hits and launch no Qwen 
 
 `input/video_analysis_cache/*.json` is keyed by `CACHE_CONTRACT_VERSION` + `ANALYSIS_VERSION` + source
 identity (absolute path, size, `st_mtime_ns`, bounded content fingerprint) + a backend token (or
-`no_ai`) + an effective Qwen config token covering `MAX_WINDOWS`, `FRAME_WIDTH`, `MAX_NEW_TOKENS` and
-`smart_preset`. **The exact contract — including the fingerprint windows, backend identity,
-fail-closed behaviour and the persisted `cache_contract` marker — is the D2 section immediately
-below; read that rather than this summary before changing anything.** Swapping the GGUF model or
-llama.cpp build still invalidates automatically.
+`no_ai`) + an effective Qwen config token covering `MAX_WINDOWS`, `FRAME_WIDTH` and `MAX_NEW_TOKENS`.
+**The exact contract — including the fingerprint windows, backend identity, fail-closed behaviour and
+the persisted `cache_contract` marker — is the D2 section immediately below; read that rather than
+this summary before changing anything.** Swapping the GGUF model or llama.cpp build still invalidates
+automatically. Nothing about the *music* is in there — see the media-neutral contract (P2) below.
 
 `ANALYSIS_VERSION` keeps its own narrower job and does **not** own cache-generation semantics: **bump
 it in `video_analysis.py` whenever candidate scoring, window building, or the candidate schema
@@ -315,7 +315,7 @@ belong to `CACHE_CONTRACT_VERSION`.
 
 #### Cache identity and the contract generation (D2)
 
-**`CACHE_CONTRACT_VERSION = "stage5_cache_v2"` is the single constant owning cache identity *and* the
+**`CACHE_CONTRACT_VERSION = "stage5_cache_v3"` is the single constant owning cache identity *and* the
 persisted contract.** It is the first component of every signature *and* the value stored as
 `cache_contract` in every record, so a key and its payload can never disagree about their generation.
 There is deliberately no second version constant. **Bump it whenever a change alters what a cached
@@ -323,7 +323,11 @@ result means** — the identity algorithm, the Qwen prompt, the semantic normali
 or a result-affecting Qwen setting not already in the signature. Do *not* hash the worker source into
 the key: a progress or performance-only worker edit must not invalidate semantic cache.
 `ANALYSIS_VERSION` keeps its own narrower job (candidate scoring, window building, candidate schema)
-and D2 does not touch it.
+and neither D2 nor P2 touches it.
+
+**It has been bumped once, `stage5_cache_v2` → `stage5_cache_v3`, by P2** — the media-neutral prompt
+changed what a persisted semantic record *means*. See the media-neutral section for why there is no
+migration.
 
 **Source identity** = `CACHE_CONTRACT_VERSION | ANALYSIS_VERSION | abspath | st_size | st_mtime_ns |
 bounded content fingerprint | backend token (or `no_ai`) | Qwen config token`. Pre-D2 it was
@@ -350,8 +354,9 @@ pointing at another copy did not re-key. The `llama --version` string stays as e
 longer load-bearing alone, so a failed version probe remains non-fatal.
 
 **The backend token is computed once per `analyze_video_sources` invocation — on success *and* on
-failure — and threaded into every source signature** (`backend_token=` / `config_token=` /
-`audio_profile=` on `_video_signature`/`_cache_path`). It used to be reached *from* `_video_signature`,
+failure — and threaded into every source signature** (`backend_token=` / `config_token=` on
+`_video_signature`/`_cache_path`; there is no `audio_profile=` there any more, see P2). It used to be
+reached *from* `_video_signature`,
 i.e. once per source; with content fingerprints that is 702 reads of a ~2.65 GB backend, measured at
 **61.7 minutes**. Threaded it is ~9–20 ms once. It is invocation-scoped, not module-cached, so a later
 call in the same process still observes a swapped model or llama build.
@@ -364,26 +369,21 @@ and let a transient later success re-enable caching *mid-run*. Never overload `N
 supplied" and "supplied but failed" at that boundary, and **do not** claim a per-source retry can
 restore caching: it must not. Analysis, Qwen and rendering continue normally; only the cache is off.
 
-**Qwen identity keys four things**, on *effective* values mirroring the runtime's own parsing and
-clamps, so behaviourally identical configurations key identically (unset == explicit default; a
-malformed value == the default the worker actually uses):
+**Qwen identity keys three things** — `_qwen_config_token()` takes no arguments — on *effective*
+values mirroring the runtime's own parsing and clamps, so behaviourally identical configurations key
+identically (unset == explicit default; a malformed value == the default the worker actually uses):
 
 - `BEATSYNC_QWEN_MAX_WINDOWS` — default 120, then `max(0, …)`. D1 proved this changes how many
   candidates get semantics while being absent from identity.
 - `BEATSYNC_QWEN_FRAME_WIDTH` — 512, clamp 224–768. Changes the image the VLM sees.
 - `BEATSYNC_QWEN_MAX_NEW_TOKENS` — 128, clamp 32–256. Can truncate the semantic JSON.
-- `audio_profile["smart_preset"]` — **prompt context**. `analyze_video_sources` forwards the audio
-  profile into the worker request, and the worker's `_build_prompt` interpolates this value directly
-  into the Qwen prompt (`"The music edit style is {style_hint}."`), defaulting to `rhythmic_gmv_amv`.
-  `_qwen_prompt_style_hint` mirrors that default in one place; a seam test reads the worker's own
-  `audio_profile.get("smart_preset", …)` call and asserts the parent agrees, so a worker-side change
-  to the key or default fails the suite.
 
-The **whole `audio_profile` is deliberately not hashed** — almost all of it drives beat and render
-decisions, not the prompt; only fields proven to reach the persisted result belong in identity.
-Runtime-only knobs stay **excluded**: slots, device, timeouts, batching, ctx, prefetch. A `no_ai` run
-gets a canonical no-AI config token, so neither Qwen settings nor `smart_preset` perturb a
-deterministic key.
+There was a fourth, `audio_profile["smart_preset"]`, because the worker interpolated it into the
+prompt. **P2 retired it**, along with `_qwen_prompt_style_hint` and the whole notion of an edit style
+in persisted semantics; that is the media-neutral section below, and the D2 R2 tests asserting the
+opposite were deliberately replaced. Runtime-only knobs stay **excluded**: slots, device, timeouts,
+batching, ctx, prefetch. A `no_ai` run gets a canonical no-AI config token, so Qwen settings never
+perturb a deterministic key.
 
 **Unprovable identity means no cache, never a weak key.** If a stat or fingerprint fails —
 source *or* backend — `_video_signature` and `_cache_path` return `None`: that source gets no lookup and
@@ -532,10 +532,11 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   `int(st_mtime)`'s same-second collision re-keys the whole cache.
 
   **Current state:** the D2 identity contract above supersedes all of that. Identity now uses
-  `st_mtime_ns` plus a bounded content fingerprint under `CACHE_CONTRACT_VERSION = "stage5_cache_v2"`,
-  so pre-D2 records are naturally orphaned and are never reachable by a D2 lookup — including the two
-  records whose completeness D1 could not prove, which that transition retires without a judgement
-  call. The D1 figures above describe the D1-era loader and cache, not current behaviour.
+  `st_mtime_ns` plus a bounded content fingerprint under `CACHE_CONTRACT_VERSION = "stage5_cache_v3"`,
+  so pre-D2 records are naturally orphaned and are never reachable by a current lookup — including the
+  two records whose completeness D1 could not prove, which that transition retires without a judgement
+  call. P2's `v2 → v3` bump orphans the D2 generation the same way, by the same mechanism. The D1
+  figures above describe the D1-era loader and cache, not current behaviour.
 - **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in
   `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...`; the runtime cache is read-only for study work.
 
@@ -729,10 +730,11 @@ than one blind coercer. Load-bearing details:
   `input/video_analysis_cache/`, a future worker change, or a regression. Concurrency gets
   non-negative-integer robustness only, because its real ceiling (`min(32, …)`) lives in the worker and
   restating it here would be a drifting magic number.
-- **No cache-contract or analysis-version bump.** `stage5_cache_v2` and
-  `auto_av_analysis_v8_llama_vulkan_batched` are unchanged: semantic meaning, candidate scoring, the
-  candidate schema, cache identity and the completion contract are all untouched, and tolerant reading
-  never contradicts a stored value.
+- **No cache-contract or analysis-version bump *for T1*.** T1 changed neither semantic meaning,
+  candidate scoring, the candidate schema, cache identity nor the completion contract, and tolerant
+  reading never contradicts a stored value. (The contract constant later moved to `stage5_cache_v3`
+  for an unrelated reason — P2's media-neutral prompt; `auto_av_analysis_v8_llama_vulkan_batched` is
+  still unchanged.)
 - **The extraction lists are part of this contract.** `_complete_deferred_qwen_batch` and
   `_annotate_candidates_with_qwen` are AST-extracted and *executed* by
   `tests/test_stage5_reporting_truth.py` and `tests/test_stage5_cache_completion.py`. Any module-level
@@ -851,12 +853,14 @@ The user picks a **Variation Seed**; it changes which clips the planner chooses,
 - **The seed rides on `beat_info["creative"]`.** `analyze_beats_auto(creative={"seed": n})` normalises
   it once and stores it; Stage 6 is the only reader. No analysis signature changed, and
   `create_music_video` did not change at all.
-- **It must never touch cache identity.** `video_analysis.py` is unmodified, both version constants
-  are unchanged, and the seed is absent from `_video_signature` / `_cache_path` /
-  `_qwen_config_token` and from `audio_visual_profile` — whose `smart_preset` *is* keyed into the Qwen
-  config token, which is the one field a future creative control could accidentally re-key the whole
-  845-record cache through. Tests assert all of that by AST. Changing the seed re-plans; it never
-  re-analyses.
+- **It must never touch cache identity.** `video_analysis.py` was unmodified by Phase A, both version
+  constants were unchanged, and the seed is absent from `_video_signature` / `_cache_path` /
+  `_qwen_config_token` and from `audio_visual_profile`. At the time, that last clause mattered because
+  `audio_visual_profile["smart_preset"]` *was* keyed into the Qwen config token, so the profile was the
+  one dict a future creative control could accidentally re-key 845 Qwen records through. **P2 closed
+  that route entirely**: no `audio_profile` field reaches Stage-5 identity any more. Keeping creative
+  state off the profile is still right — it describes the track — but it is no longer the last line of
+  defence. Tests assert all of it by AST. Changing the seed re-plans; it never re-analyses.
 - **It is not source identity either.** The widget is outside the Video Source group and is wired into
   no source handler and no `source_outputs`, so changing it cannot clear a confirmed source set. It is
   a render-request input alongside FPS and the encoder, and `test_gui_guard_seam.py` still pins the
@@ -990,27 +994,24 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
-| `library_prep.py` | media library preparation: classification vocabulary, scan state, report text |
+| `library_prep.py` | media library preparation: classification vocabulary, scan state, report text (trackless since P2) |
 
-### Media Library Preparation (P V1)
+### Media Library Preparation (P V1 + P2)
 
 Preparing a library means running the Stage-5 work for new/changed sources **before** a render, so
 the render finds a warm cache. `video_analysis.classify_library_sources()` answers "which sources
 already have reusable cache?" and `beatsync_fork/library_prep.py` holds the state and the report.
 
-**It prepares for an edit *style*, not for one exact music file.** Only `smart_preset` reaches the
-cache key (through `_qwen_config_token`), and `_build_audio_visual_profile` emits one of four
-values, so preparation done for one track is genuinely reusable by any track resolving to the same
-preset. The report therefore shows `Edit style: <preset>`; do not reword it to imply per-file
-exclusivity. Media-neutral preparation is the separate, unbuilt P2.
+**It prepares the library, full stop — not a track and not an edit style.** P V1 required an audio
+file and derived `smart_preset` from it, because that preset was the one `audio_profile` field
+reaching the cache key. P2 made persisted semantics media-neutral, so preparation is now **trackless**:
+no audio control, no Stage 1–4 pass during a scan, no `TrackIdentity`, no stored profile. One
+preparation serves every track, every preset and every creative seed. The report says
+`Semantic mode: media-neutral`; do not reword anything here to imply track or style dependence.
 
-- **The profile comes from the existing seam, never a cheaper approximation.**
-  `analyze_beats_auto(track, video_files=None)` runs audio Stages 1–4 and skips Stage 5 (line 426's
-  `should_analyze_video` requires a non-empty video list), so the profile is *the same object shape*
-  a render forwards. `_build_audio_visual_profile` needs tempo, features, sections **and** the
-  selected beats, so there is no shorter path — all four stages are mandatory. It is stored as a
-  serialisable snapshot (`profile_snapshot`), because Gradio round-trips state and object identity
-  across events is not a thing to rely on.
+That removal is also where the measured **~15–20 s** per-scan track-profile component went. A scan
+now costs folder enumeration + source identity (the D2 bounded fingerprints) + cache-record lookups.
+
 - **`classify_library_sources` reuses the production primitives and adds no key formula.** Identity
   is `_cache_path`/`_video_signature`; reuse is `_load_cache`, i.e. the one completion rule. It
   splits a miss three ways purely for wording — key file absent → `new_or_changed`, key file present
@@ -1036,27 +1037,103 @@ exclusivity. Media-neutral preparation is the separate, unbuilt P2.
   calls `_analyze_single_video`, `_checkpoint_cache` or `_save_cache` itself. Per-source staleness
   between the two clicks is deliberately unchecked — the analyzer re-derives each selected source's
   own identity anyway.
-- **What invalidates a scan:** folder, recursive flag, track (path/size/`mtime_ns`), and — rechecked
-  at Analyze time — the backend token, the config token and the effective Qwen mode. Those last
-  three are the only identity inputs beyond the obvious ones, because `config_token` already covers
-  the Qwen env knobs *and* `smart_preset`.
+- **What invalidates a scan:** the folder, the recursive flag, and — rechecked at Analyze time — the
+  backend token, the config token and the effective Qwen mode. That is the whole list: `config_token`
+  covers the three Qwen env knobs, and after P2 there is nothing else in identity for a preparation
+  to bind. The P V1 track check (path/size/`mtime_ns` plus the derived preset) is **retired**, and a
+  test asserts `analyze_refusal` acquired no substitute for it.
 - **Analyze takes the live preparation controls, not just `gr.State`.** Gradio delivers widget
-  changes as separate queued events, so a user can retarget the folder or the track and click
+  changes as separate queued events, so a user can retarget the folder or the recursive flag and click
   Analyze before the `change` handler has run — which would analyse the *previous* library's
   classification while the screen declared something else. `declaration_refusal` compares the live
-  declaration against the recorded scan **first**, before the track is stat'ed, before the runtime
-  identity is recomputed and before anything is analysed; a mismatch drops the scan and asks for a
-  rescan rather than silently re-targeting it. It is practical equality only (normalised paths,
-  exact `recursive`) and never fingerprints the track — `TrackIdentity.still_matches()` remains the
-  separate, later content check. Never reduce `prep_analyze_btn`'s inputs back to `prep_state`
-  alone; a test pins the click inputs against the handler's parameter order.
+  declaration against the recorded scan **first**, before the runtime identity is recomputed and
+  before anything is analysed; a mismatch drops the scan and asks for a rescan rather than silently
+  re-targeting it. It is practical equality only (normalised folder, exact `recursive`) and stats
+  nothing. Never reduce `prep_analyze_btn`'s inputs back to `prep_state` alone; a test pins the click
+  inputs against the handler's parameter order.
 - **Strictly separate from the Create Video gate.** Its own `gr.State`, its own `prep_outputs`, and
   no overlap with `source_state` / `source_outputs` / `confirm_action` / `process_btn`. Local folder
   only: browser uploads live under `input/gradio_uploads/`, which `cleanup_on_startup` clears, so a
   path-keyed preparation of them would be worthless.
-- **No cache-contract or analysis-version change, and nothing new in identity.** Preparation adds no
-  field to any cache payload and no input to any key; a test asserts the identity and completion
-  functions never mention it.
+- **Nothing new in identity.** Preparation adds no field to any cache payload and no input to any
+  key; a test asserts the identity and completion functions never mention it. (P2's `v2 → v3`
+  contract bump is about the Qwen prompt, not about preparation.)
+- **Progress:** a trackless scan has no Stages 1–4 to report, so it shows only Stage 0 under the
+  `library_classify` phase; Analyze uses the existing Stage 5 events. Do not fake the removed stages.
+
+### Persisted Stage-5 semantics are media-neutral (P2)
+
+**This is an architectural boundary, not an optimisation:**
+
+```
+STAGE 5                      = INTRINSIC MEDIA TRUTH      (persistent)
+STAGE 6 / FUTURE DIRECTOR    = CREATIVE INTERPRETATION    (ephemeral, per render)
+```
+
+Stage 5 records what is visually present — motion, character focus, visual quality, beauty, action
+intensity, tension/softness, semantic content. It must **not** answer "what should I do with this shot
+for this particular song?" That interpretation belongs downstream, and it may vary per render, per
+section and per seed without invalidating or rewriting a single cache record.
+
+A source therefore needs one semantic analysis per compatible **source identity** + **Qwen backend
+identity** + **result-affecting media-semantic Qwen configuration** — not one per `smart_preset`.
+
+**The prompt is the whole mechanism.** `stage5_qwen_scene_worker._build_prompt()` takes no arguments
+and carries the validated instruction *"Assess the moment only from what is visually present; do not
+adapt the tags to music, song energy, edit style, or desired pacing."* The old
+`"The music edit style is {style_hint}."` conditioning, `_qwen_prompt_style_hint` and the
+`smart_preset` component of `_qwen_config_token` are all gone. Do **not** replace the removed hint
+with a fake constant style: after P2 there is no edit style in persisted Stage-5 semantics at all.
+
+Load-bearing details:
+
+- **Nothing about the music crosses the worker boundary.** Neither request JSON (single or batch)
+  carries `audio_profile`; `_build_prompt` was its only consumer. Tests execute the real
+  request-building bodies and assert the exact key sets.
+- **`audio_profile` survives on `analyze_video_sources` as a retained integration signature with zero
+  effect.** `auto_mode.analyze_beats_auto` still passes it, so that call site needed no change, but it
+  reaches no cache key, no Qwen request, no prompt and no persisted record — a test asserts the
+  parameter is absent from the function body, and that two arbitrarily different profiles produce the
+  identical cache path. Every *private* seam that existed only to forward it
+  (`_analyze_single_video`, `_annotate_candidates_with_qwen`, `_complete_deferred_qwen`,
+  `_complete_deferred_qwen_batch`, `_run_qwen_worker`, `_run_qwen_worker_batch`,
+  `_video_signature`, `_cache_path`, `classify_library_sources`) lost the parameter outright. Do not
+  find it a new use.
+- **The three media-semantic settings still re-key.** `BEATSYNC_QWEN_MAX_WINDOWS`, `_FRAME_WIDTH` and
+  `_MAX_NEW_TOKENS` change how many candidates get semantics, what the model sees and whether the JSON
+  truncates, so they stay in `_qwen_config_token()`. Runtime-only knobs stay out.
+- **`stage5_cache_v2 → stage5_cache_v3`, and the cold rebuild is intentional.** A v3 record *means*
+  something different from a v2 one, so the one generation constant was bumped. There is deliberately
+  **no migration**: v2 filenames are never produced or looked up again, nothing reuses their Qwen
+  semantics, and the old files are left on disk untouched by the retention policy — no compatibility
+  loader, no rewriter, no automatic deletion. `ANALYSIS_VERSION` is unchanged, because deterministic
+  candidate scoring, window building and the candidate schema are.
+- **The schema was deliberately *not* redesigned.** The real-material A/B validated the *existing*
+  schema under a media-neutral prompt, so `recommended_use`, `emotion`, all eight numeric fields and
+  the description contract are untouched; changing them here would have invalidated that evidence and
+  widened the rebuild boundary. Under P2, read `recommended_use` as a media-neutral suggestion from the
+  model, **not** an instruction tied to the current song — a future planner may weight it, ignore it or
+  reinterpret it without touching the cache. Schema evolution is separate, later work.
+- **The evidence.** Validated on the user's real material (`J:\New folder`): 23 analysed sources, 17
+  source groups, 10,913 deterministic candidates, 115 identical A/B semantic moments; 115/115
+  decoded/tagged with 0 failures on both sides; post-`_merge_semantic` mean score differences
+  ≤ ~0.023; planner seeds 0/101/202 with 0 fallbacks and near-identical editorial scores; blind human
+  review of 40 frames giving B a 10/16 decisive win rate with fewer editorial-leak (4 → 1) and
+  false-action (2 → 1) flags. The reading is *not* "B is dramatically better" — it is that
+  media-neutral semantics are not materially worse on real content, remain equally usable by Stage 6,
+  and stop music/edit intent leaking into persisted media semantics. The earlier hockey human-scoring
+  experiment is **superseded** and must not be cited as implementation evidence.
+- **Normal Create Video is unchanged and still music-aware.** Stages 1–4 still run, Stage 6 still
+  receives `beat_info`, sections, energy, targets, the creative seed and the candidate tags/scores, and
+  its scoring and planning logic were not touched. The only difference is that Stage-5 semantics no
+  longer change because Stage 1–4 resolved a different edit style.
+- **Future creative modes must not undo this.** Neutral / music-aware / hybrid / freestyle / AI
+  Director interpretation, section-specific weighting, a Master Seed, or an optional second style-aware
+  pass over a *small shortlisted* candidate set are all legitimate future work — **none of it is
+  implemented here**, and no speculative abstraction was added for it (a test asserts no
+  director/freestyle/shortlist machinery exists). The permanent constraints are: creative state never
+  enters Stage-5 cache identity; no per-render interpretation overwrites persistent semantics; and a
+  future second pass stays run-scoped rather than becoming the library's durable truth.
 
 ### Video source modes and the confirmation gate
 

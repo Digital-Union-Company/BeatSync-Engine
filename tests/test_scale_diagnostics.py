@@ -316,7 +316,7 @@ def test_d_timings_never_reach_a_per_source_cache_payload():
 def test_d_cache_contract_and_analysis_version_are_untouched():
     with open(_VA, "r", encoding="utf-8") as handle:
         source = handle.read()
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in source
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in source
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in source
 
 
@@ -825,7 +825,7 @@ def test_l01_pipeline_cache_and_planner_semantics_are_untouched():
     """L0.1 is presentation only."""
     with open(_VA, "r", encoding="utf-8") as handle:
         va = handle.read()
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in va
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in va
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in va
 
     vp_tree = _tree(_VP)

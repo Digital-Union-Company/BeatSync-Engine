@@ -891,7 +891,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     )
 
 
-# [FORK] Digital-Union (P V1): media library preparation.
+# [FORK] Digital-Union (P V1 / P2): media library preparation.
 #
 # A deliberately separate workflow. It has its own `gr.State`, its own handlers and its own buttons,
 # and it touches NONE of the Create Video machinery above: not `source_state`, not `source_outputs`,
@@ -900,8 +900,11 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
 #
 # The division of labour mirrors the rest of the fork: every decision (what invalidates a scan, what
 # may be analysed, what the report says) lives in `beatsync_fork.library_prep`, which is stdlib-only
-# and tested without Gradio. This module supplies only the three runtime calls that module may not
-# make itself - the folder scan, the Stage 1-4 track profile, and the Stage 5 classifier/analyzer.
+# and tested without Gradio. This module supplies only the two runtime calls that module may not make
+# itself - the folder scan and the Stage 5 classifier/analyzer.
+#
+# P2: preparation is media-neutral and therefore trackless. There is no audio input, no Stage 1-4
+# pass and no edit style anywhere in here, because none of that reaches Stage-5 cache identity.
 
 
 def _prep_ui_updates(state) -> Tuple:
@@ -927,10 +930,6 @@ def _on_prep_recursive_change(recursive: bool, state) -> Tuple:
     return _prep_ui_updates(fork_prep.set_recursive(state, recursive))
 
 
-def _on_prep_track_change(track_path: str, state) -> Tuple:
-    return _prep_ui_updates(fork_prep.set_track(state, track_path))
-
-
 def _resolve_prep_qwen_runtime() -> Tuple[bool, str]:
     """Resolve Qwen enablement and model path exactly as the normal Auto Mode render path does.
 
@@ -951,29 +950,28 @@ def _resolve_prep_qwen_runtime() -> Tuple[bool, str]:
     return qwen_enabled, model_path
 
 
-def _prep_scan_impl(folder_path: str, recursive: bool, track_path: str, state,
+def _prep_scan_impl(folder_path: str, recursive: bool, state,
                     event_callback=None, console_logger: StageConsoleLogger | None = None):
-    """Classify the whole library once, against the edit style the chosen track resolves to.
+    """Classify the whole library once, media-neutrally.
 
     This is the expensive half of the P.1 rule: the Scan click pays for the full-library
     classification so the Analyze click can pass only the subset it identified.
+
+    [FORK] Digital-Union (P2): trackless. No audio file, no `analyze_beats_auto`, no Stages 1-4 and
+    no edit style - persisted Stage-5 semantics describe the media itself, so there is nothing about
+    a song for a classification to depend on. The remaining cost is folder enumeration, source
+    identity and the cache-record lookups, which is what the measured ~15-20 s track-profile
+    component used to sit on top of.
     """
     from video_analysis import classify_library_sources
 
     # Re-apply the LIVE widget values first. A Textbox `change` event may not have fired if the user
     # typed a path and clicked Scan immediately - the same reason `_on_scan_click` does this.
-    state = fork_prep.set_track(
-        fork_prep.set_recursive(fork_prep.set_folder(state, folder_path), recursive),
-        track_path,
-    )
+    state = fork_prep.set_recursive(fork_prep.set_folder(state, folder_path), recursive)
 
     if not state.folder.strip():
         return fork_prep.record_failure(
             state, "No library folder selected. Enter a folder path and press Scan Library.")
-    audio_path = _as_existing_source_path(state.track_path)
-    if not audio_path:
-        return fork_prep.record_failure(
-            state, "No track selected. Choose the audio track you will render with.")
 
     # 1. Enumerate the folder with the existing scanner. `detect_duplicates=False`: duplicate
     #    grouping is a reporting feature of the source screen and would be pure extra reads here.
@@ -986,29 +984,10 @@ def _prep_scan_impl(folder_path: str, recursive: bool, track_path: str, state,
     folder_scan_seconds = time.perf_counter() - scan_started
     ready_paths = [media.path for media in input_set.files]
 
-    # 2. Derive the profile through the existing seam. `video_files=None` makes
-    #    `analyze_beats_auto` run audio Stages 1-4 and skip Stage 5 entirely, so this is the same
-    #    `_build_audio_visual_profile` output a render would forward - not an approximation of it.
-    profile_started = time.perf_counter()
-    try:
-        _selected, beat_info = analyze_beats_auto(
-            audio_path,
-            use_gpu=GPU_AVAILABLE,
-            video_files=None,
-            console_callback=(lambda stage, message:
-                              console_logger.stage_line(stage, message) if console_logger else None),
-            event_callback=event_callback,
-        )
-    except Exception as exc:
-        return fork_prep.record_failure(state, f"TRACK ANALYSIS FAILED\n{exc}")
-    profile = beat_info.get("audio_visual_profile") or {}
-    profile_seconds = time.perf_counter() - profile_started
-
-    # 3/4. Resolve the runtime exactly as Stage 5 expects, then classify read-only.
+    # 2. Resolve the runtime exactly as Stage 5 expects, then classify read-only.
     qwen_enabled, model_path = _resolve_prep_qwen_runtime()
     classification = classify_library_sources(
         ready_paths,
-        audio_profile=profile,
         enable_ai=qwen_enabled,
         qwen_model_path=model_path,
         event_callback=event_callback,
@@ -1016,22 +995,14 @@ def _prep_scan_impl(folder_path: str, recursive: bool, track_path: str, state,
 
     runtime = fork_prep.runtime_identity_from_classification(
         classification, qwen_enabled=qwen_enabled)
-    preset = str(profile.get("smart_preset") or classification.get("smart_preset") or "")
-    track = fork_prep.TrackIdentity.from_file(audio_path, preset)
-    if track is None:
-        return fork_prep.record_failure(
-            state, "The track became unreadable during the scan. Choose it again.")
 
     scan = fork_prep.build_scan_result(
         folder=state.folder,
         recursive=state.recursive,
-        track=track,
-        audio_profile=profile,
         runtime=runtime,
         classification_items=classification.get("classifications") or (),
         supported_count=len(ready_paths),
         folder_scan_seconds=folder_scan_seconds,
-        profile_seconds=profile_seconds,
         classify_seconds=classification.get("classify_seconds") or 0.0,
         cache_identity_seconds=classification.get("cache_identity_seconds") or 0.0,
         cache_lookup_seconds=classification.get("cache_lookup_seconds") or 0.0,
@@ -1044,12 +1015,15 @@ def _prep_analyze_impl(state, live, event_callback=None,
     """Analyze only the subset the recorded scan classified as needing work.
 
     `live` is the preparation controls as the widgets declare them at click time, and checking it
-    comes **first** - before the track is stat'ed, before the runtime identity is recomputed and
-    long before anything is analysed. Gradio delivers widget changes as separate queued events, so
-    a user can retype the folder or pick a different track and click Analyze before the `change`
-    handler has updated the state; without this guard the previous library's classification would
-    be analysed while the screen declared something else. It is the same reason
-    `process_video_guarded` takes the live source controls rather than trusting `gr.State` alone.
+    comes **first** - before the runtime identity is recomputed and long before anything is
+    analysed. Gradio delivers widget changes as separate queued events, so a user can retype the
+    folder or toggle subfolders and click Analyze before the `change` handler has updated the state;
+    without this guard the previous library's classification would be analysed while the screen
+    declared something else. It is the same reason `process_video_guarded` takes the live source
+    controls rather than trusting `gr.State` alone.
+
+    [FORK] Digital-Union (P2): Stage 5 is called media-neutrally - no audio profile is forwarded,
+    because none of it reaches the Qwen prompt, the Qwen request or the cache key any more.
 
     Persistence is entirely the existing analyzer's: this never calls `_analyze_single_video`,
     `_checkpoint_cache` or `_save_cache`, and the returned candidate library is discarded apart from
@@ -1070,8 +1044,7 @@ def _prep_analyze_impl(state, live, event_callback=None,
     # here. No progress callback: this probe is not a phase the user needs to watch.
     qwen_enabled, model_path = _resolve_prep_qwen_runtime()
     probe = classify_library_sources(
-        [], audio_profile=scan.audio_profile, enable_ai=qwen_enabled,
-        qwen_model_path=model_path, event_callback=None)
+        [], enable_ai=qwen_enabled, qwen_model_path=model_path, event_callback=None)
     runtime = fork_prep.runtime_identity_from_classification(probe, qwen_enabled=qwen_enabled)
     refusal = fork_prep.analyze_refusal(state, runtime)
     if refusal is not None:
@@ -1083,7 +1056,6 @@ def _prep_analyze_impl(state, live, event_callback=None,
     try:
         result = analyze_video_sources(
             video_files=subset,
-            audio_profile=dict(scan.audio_profile),
             use_gpu=GPU_AVAILABLE,
             enable_ai=qwen_enabled,
             qwen_model_path=model_path,
@@ -1151,22 +1123,21 @@ def _run_prep_in_worker(work, state) -> Iterator[Tuple]:
     yield _prep_ui_updates(result_queue.get())
 
 
-def _on_prep_scan_click(folder_path: str, recursive: bool, track_path: str, state) -> Iterator[Tuple]:
+def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tuple]:
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_scan_impl(
-            folder_path, recursive, track_path, state,
+            folder_path, recursive, state,
             event_callback=event_callback, console_logger=console_logger),
         state,
     )
 
 
-def _on_prep_analyze_click(folder_path: str, recursive: bool, track_path: str,
-                           state) -> Iterator[Tuple]:
+def _on_prep_analyze_click(folder_path: str, recursive: bool, state) -> Iterator[Tuple]:
     # The live preparation controls are inputs to the Analyze request, not just `gr.State` - a
     # queued `change` event must not be able to let a stale scan be analysed. Parameter names
     # mirror the widget names in `prep_analyze_btn.click(inputs=...)`, which Gradio supplies
     # positionally; a test asserts the two lists line up.
-    live = fork_prep.LivePrepDeclaration.from_widgets(folder_path, recursive, track_path)
+    live = fork_prep.LivePrepDeclaration.from_widgets(folder_path, recursive)
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_analyze_impl(
             state, live, event_callback=event_callback, console_logger=console_logger),
@@ -1335,13 +1306,6 @@ def create_ui() -> gr.Blocks:
                     prep_recursive = gr.Checkbox(
                         value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
                     )
-                    prep_track = gr.File(
-                        label=LABEL_PREP_TRACK,
-                        file_types=['.mp3', '.wav', '.flac'],
-                        type='filepath',
-                        elem_id='prep-track-input',
-                    )
-                    gr.Markdown(INFO_PREP_TRACK)
                     prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
                     prep_report = gr.Textbox(
                         label=LABEL_PREP_REPORT,
@@ -1417,8 +1381,9 @@ def create_ui() -> gr.Blocks:
         # widget, no confirmation widget and not `process_btn`, so preparation can never enable,
         # disable or invalidate the Create Video gate. Conversely no source handler writes here.
         #
-        # Every classification input - folder, recursive, track - clears the recorded scan, which
-        # is what stops Analyze from acting on a classification that no longer describes reality.
+        # Every classification input - folder and recursive, which after P2 is all of them - clears
+        # the recorded scan, which is what stops Analyze from acting on a classification that no
+        # longer describes reality.
         prep_outputs = [prep_report, prep_status, prep_analyze_btn, prep_state]
 
         prep_folder.change(
@@ -1431,14 +1396,9 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_recursive, prep_state],
             outputs=prep_outputs,
         )
-        prep_track.change(
-            fn=_on_prep_track_change,
-            inputs=[prep_track, prep_state],
-            outputs=prep_outputs,
-        )
         prep_scan_btn.click(
             fn=_on_prep_scan_click,
-            inputs=[prep_folder, prep_recursive, prep_track, prep_state],
+            inputs=[prep_folder, prep_recursive, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
         )
@@ -1447,7 +1407,7 @@ def create_ui() -> gr.Blocks:
         # scan the user is no longer declaring must be impossible, not merely unlikely.
         prep_analyze_btn.click(
             fn=_on_prep_analyze_click,
-            inputs=[prep_folder, prep_recursive, prep_track, prep_state],
+            inputs=[prep_folder, prep_recursive, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
         )

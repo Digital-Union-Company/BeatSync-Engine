@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Media Library Preparation (P V1): plain data, state and the report text.
+"""Media Library Preparation: plain data, state and the report text.
 
 The preparation workflow lets a user analyse new or changed sources **before** rendering, so a later
 render finds a warm Stage-5 cache instead of discovering the work mid-run.
@@ -16,10 +16,12 @@ Two boundaries are load-bearing:
 * **Preparation is a separate workflow from the Create Video confirmation gate.** Nothing here
   touches :mod:`beatsync_fork.input_session`, its ``SourceSnapshot`` identity or the render gate. A
   preparation change must never clear a render confirmation or enable/disable Create Music Video.
-* **The stored audio profile is a serialisable snapshot, not a live object.** Gradio round-trips
-  state between events, so the second button click must not depend on object identity with the dict
-  Stage 4 produced. :func:`profile_snapshot` makes an independent copy of plain containers and
-  scalars, which is exactly what ``audio_visual_profile`` contains.
+* **(P2) Preparation is media-neutral, and therefore trackless.** Persisted Stage-5 semantics
+  describe the video itself, so no track, tempo, section, edit style or creative state reaches a
+  cache key — see ``_qwen_config_token`` in ``video_analysis.py``. There is consequently no audio
+  input to this workflow, no Stage 1–4 pass during a scan, and nothing here that could bind a
+  preparation to one song or one edit style. Music/edit interpretation is downstream, in Stage 6 and
+  in any future creative/director layer, and it is ephemeral per render.
 """
 
 from __future__ import annotations
@@ -33,8 +35,12 @@ from beatsync_fork.input_report import format_seconds
 
 DEFAULT_RECURSIVE = True
 
+SEMANTIC_MODE_TEXT = "media-neutral"
+"""What the persisted Stage-5 semantics describe. Not a user-selectable mode — a statement of the
+P2 contract, shown so the report never implies track or edit-style dependence."""
+
 INTRO_TEXT = (
-    "Choose the library folder and the track you will render with, then press Scan Library."
+    "Choose the library folder, then press Scan Library."
 )
 
 BACKEND_UNVERIFIED_TEXT = (
@@ -67,7 +73,7 @@ class NeedReason(str, Enum):
     ``NEW_OR_CHANGED`` is deliberately one combined label. Cache identity is path + size +
     ``st_mtime_ns`` + content fingerprint, so a changed file simply re-keys and its new key has no
     record — indistinguishable from a file that was never analysed. Claiming to tell those apart
-    would need a content-addressed library index, which V1 does not build.
+    would need a content-addressed library index, which this workflow does not build.
     """
 
     NEW_OR_CHANGED = "new_or_changed"
@@ -76,30 +82,6 @@ class NeedReason(str, Enum):
 
 _STATUS_VALUES = {item.value for item in PrepStatus}
 _REASON_VALUES = {item.value for item in NeedReason}
-
-
-def profile_snapshot(profile: Any) -> dict:
-    """An independent, serialisable copy of the Stage-4 audio profile.
-
-    ``audio_visual_profile`` holds only plain scalars and a list of section-type strings (every
-    numeric field is already coerced with ``float()``/``int()`` where it is built), so a structural
-    copy is faithful. Anything unexpected degrades to ``str`` rather than raising: a report must
-    never be able to fail because a future profile field carried an exotic type.
-    """
-    return _snapshot_value(profile) if isinstance(profile, Mapping) else {}
-
-
-def _snapshot_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _snapshot_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_snapshot_value(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return str(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,40 +112,6 @@ class SourceClassification:
 
 
 @dataclass(frozen=True, slots=True)
-class TrackIdentity:
-    """The stale-scan guard for the chosen track. **Not** a cache key.
-
-    Stage-5 cache identity is untouched by preparation: only the *derived* ``smart_preset`` ever
-    reaches a cache key, through ``_qwen_config_token``. This record exists so the UI can notice that
-    the user swapped or re-saved the audio file between Scan and Analyze, which would change the
-    derived profile and therefore the whole classification.
-    """
-
-    path: str
-    size: int
-    mtime_ns: int
-    smart_preset: str
-
-    @classmethod
-    def from_file(cls, path: str, smart_preset: str) -> "TrackIdentity | None":
-        try:
-            stat = os.stat(path)
-        except OSError:
-            return None
-        return cls(
-            path=os.path.abspath(path),
-            size=int(stat.st_size),
-            mtime_ns=int(stat.st_mtime_ns),
-            smart_preset=str(smart_preset),
-        )
-
-    def still_matches(self) -> bool:
-        """Re-stat the track and compare. ``False`` when it moved, changed or became unreadable."""
-        current = TrackIdentity.from_file(self.path, self.smart_preset)
-        return current is not None and current == self
-
-
-@dataclass(frozen=True, slots=True)
 class RuntimeIdentity:
     """The Stage-5 identity inputs that are shared by every source in one scan.
 
@@ -171,8 +119,9 @@ class RuntimeIdentity:
     into every ``_cache_path`` call. Binding them into the scan result is what makes P.1 safe: the
     full-library classification stays valid for the Analyze click only while they still hold.
 
-    ``config_token`` already covers ``BEATSYNC_QWEN_MAX_WINDOWS``, ``_FRAME_WIDTH``,
-    ``_MAX_NEW_TOKENS`` **and** the resolved ``smart_preset``, so there is nothing further to bind.
+    ``config_token`` covers ``BEATSYNC_QWEN_MAX_WINDOWS``, ``_FRAME_WIDTH`` and ``_MAX_NEW_TOKENS`` —
+    the whole of result-affecting media-semantic Qwen configuration after P2 — so there is nothing
+    further to bind. In particular there is no edit style to bind any more.
     """
 
     qwen_enabled: bool
@@ -219,38 +168,35 @@ class LivePrepDeclaration:
     """What the preparation widgets declare *right now*, at the moment a button was clicked.
 
     Gradio delivers widget changes as separate queued events, so the stored state can lag behind
-    the screen: a user can retype the folder or pick a different track and click Analyze before the
+    the screen: a user can retype the folder or toggle the recursive box and click Analyze before the
     ``change`` handler has run. The Create Video gate solves exactly this by making the live source
     controls inputs to the render request; preparation does the same.
+
+    After P2 the declaration is the whole of preparation's input surface: folder and recursive.
     """
 
     folder: str = ""
     recursive: bool = DEFAULT_RECURSIVE
-    track_path: str = ""
 
     @classmethod
-    def from_widgets(cls, folder: Any, recursive: Any, track_path: Any) -> "LivePrepDeclaration":
+    def from_widgets(cls, folder: Any, recursive: Any) -> "LivePrepDeclaration":
         """Tolerant of the shapes Gradio hands back (``None``, a path, a non-bool truthy)."""
         return cls(
             folder="" if folder is None else str(folder),
             recursive=bool(recursive),
-            track_path="" if track_path is None else str(track_path),
         )
 
     def describes(self, scan: "PrepScanResult | None") -> bool:
         """Does this declaration still describe the scan that was recorded?
 
-        Practical equality only: normalised folder and track paths, exact ``recursive``. It is
-        deliberately **not** an identity check — the track's size/mtime is
-        :meth:`TrackIdentity.still_matches`' job, and this guard runs earlier and cheaper, before
-        anything is stat'ed, probed or analysed.
+        Practical equality only: normalised folder, exact ``recursive``. It is deliberately **not**
+        an identity check — it runs earlier and cheaper than anything that stats, probes or analyses.
         """
         if scan is None:
             return True
         return (
             _normalized_path(self.folder) == _normalized_path(scan.folder)
             and bool(self.recursive) == bool(scan.recursive)
-            and _normalized_path(self.track_path) == _normalized_path(scan.track.path)
         )
 
 
@@ -265,23 +211,13 @@ class PrepScanResult:
 
     folder: str
     recursive: bool
-    track: TrackIdentity
-    audio_profile: dict
-    """Serialisable snapshot of ``beat_info["audio_visual_profile"]``, forwarded unchanged to
-    ``analyze_video_sources`` at Analyze time."""
-
     runtime: RuntimeIdentity
     classifications: tuple[SourceClassification, ...] = ()
     supported_count: int = 0
     folder_scan_seconds: float = 0.0
-    profile_seconds: float = 0.0
     classify_seconds: float = 0.0
     cache_identity_seconds: float = 0.0
     cache_lookup_seconds: float = 0.0
-
-    @property
-    def smart_preset(self) -> str:
-        return self.track.smart_preset
 
     @property
     def prepared_count(self) -> int:
@@ -318,8 +254,7 @@ class PrepScanResult:
             "MEDIA LIBRARY PREPARATION",
             "",
             f"Folder:            {self.folder}",
-            f"Track:             {os.path.basename(self.track.path) or self.track.path}",
-            f"Edit style:        {self.smart_preset or 'n/a'}",
+            f"Semantic mode:     {SEMANTIC_MODE_TEXT}",
             "",
             f"Supported videos:  {self.supported_count}",
         ]
@@ -337,7 +272,6 @@ class PrepScanResult:
         lines.append(
             "Scan time:         "
             f"folder {format_seconds(self.folder_scan_seconds)}, "
-            f"track {format_seconds(self.profile_seconds)}, "
             f"identity {format_seconds(self.cache_identity_seconds)}, "
             f"records {format_seconds(self.cache_lookup_seconds)}"
         )
@@ -345,7 +279,7 @@ class PrepScanResult:
         if needs:
             lines.append(f"Ready to analyze {needs} video(s).")
         elif self.supported_count:
-            lines.append("Everything in this library is already prepared for this edit style.")
+            lines.append("Everything in this library is prepared.")
         else:
             lines.append("No supported videos found in this folder.")
         if self.unavailable_count:
@@ -371,7 +305,6 @@ class PrepSessionState:
 
     folder: str = ""
     recursive: bool = DEFAULT_RECURSIVE
-    track_path: str = ""
     scan: PrepScanResult | None = None
     report_text: str = INTRO_TEXT
     notice: str = ""
@@ -419,20 +352,13 @@ def set_recursive(state: PrepSessionState, recursive: bool) -> PrepSessionState:
     )
 
 
-def set_track(state: PrepSessionState, track_path: str) -> PrepSessionState:
-    return _invalidated(
-        state, "Track changed. Scan Library again.",
-        track_path="" if track_path is None else str(track_path),
-    )
-
-
 def record_scan(state: PrepSessionState, scan: PrepScanResult) -> PrepSessionState:
     if not scan.runtime.is_usable():
         notice = "Preparation unavailable — Qwen backend identity could not be verified."
     elif scan.needs_analysis_count:
         notice = f"{scan.needs_analysis_count} video(s) need analysis."
     else:
-        notice = "Library is fully prepared for this edit style."
+        notice = "Library is fully prepared."
     return replace(state, scan=scan, report_text=scan.render_text(), notice=notice)
 
 
@@ -473,8 +399,8 @@ def declaration_refusal(state: PrepSessionState,
 
     ``live`` carries the widget values submitted with the Analyze click. Without it the recorded
     scan is the only authority, and a queued ``change`` event lets the user retarget the folder or
-    the track and still have the *previous* library's classification analysed — the same race the
-    Create Video gate takes live source controls to avoid.
+    the recursive flag and still have the *previous* library's classification analysed — the same
+    race the Create Video gate takes live source controls to avoid.
 
     A mismatch is a refusal, never a silent re-target: the recorded classification describes a
     different library, and preparation does not rescan 902 sources on the user's behalf.
@@ -490,11 +416,11 @@ def declaration_refusal(state: PrepSessionState,
 def analyze_refusal(state: PrepSessionState, runtime: RuntimeIdentity | None) -> str | None:
     """Why this preparation run must not start, or ``None`` when it may.
 
-    Deliberately small. The three cheap checks are: a recorded scan exists and has work; the track
-    on disk is still the one it was classified against; and the runtime identity the scan was
-    classified under still holds. Per-source staleness is **not** checked — ``analyze_video_sources``
-    re-derives each selected source's own identity anyway, so a file changed since the scan simply
-    analyses under its new key and one that became prepared is an ordinary cache hit.
+    Deliberately small. The cheap checks are: a recorded scan exists and has work, and the runtime
+    identity the scan was classified under still holds. Per-source staleness is **not** checked —
+    ``analyze_video_sources`` re-derives each selected source's own identity anyway, so a file
+    changed since the scan simply analyses under its new key and one that became prepared is an
+    ordinary cache hit.
     """
     scan = state.scan
     if scan is None:
@@ -503,8 +429,6 @@ def analyze_refusal(state: PrepSessionState, runtime: RuntimeIdentity | None) ->
         return BACKEND_UNVERIFIED_TEXT
     if not scan.subset_for_analysis():
         return "Nothing to analyze — every scanned source is already prepared."
-    if not scan.track.still_matches():
-        return "The track changed since the scan. Press Scan Library again."
     if runtime is not None and not scan.runtime.matches(runtime):
         return (
             "The Qwen backend or analysis configuration changed since the scan, so the scanned "
@@ -517,13 +441,10 @@ def build_scan_result(
     *,
     folder: str,
     recursive: bool,
-    track: TrackIdentity,
-    audio_profile: Any,
     runtime: RuntimeIdentity,
     classification_items: Iterable[Any],
     supported_count: int,
     folder_scan_seconds: float = 0.0,
-    profile_seconds: float = 0.0,
     classify_seconds: float = 0.0,
     cache_identity_seconds: float = 0.0,
     cache_lookup_seconds: float = 0.0,
@@ -531,20 +452,17 @@ def build_scan_result(
     """Assemble a scan result from the runtime classifier's plain output.
 
     Kept here rather than in the GUI so the whole shape is constructible — and testable — without
-    Gradio, and so the profile is snapshotted exactly once, at the boundary.
+    Gradio.
     """
     return PrepScanResult(
         folder=str(folder),
         recursive=bool(recursive),
-        track=track,
-        audio_profile=profile_snapshot(audio_profile),
         runtime=runtime,
         classifications=tuple(
             SourceClassification.from_mapping(item) for item in (classification_items or ())
         ),
         supported_count=int(supported_count),
         folder_scan_seconds=float(folder_scan_seconds),
-        profile_seconds=float(profile_seconds),
         classify_seconds=float(classify_seconds),
         cache_identity_seconds=float(cache_identity_seconds),
         cache_lookup_seconds=float(cache_lookup_seconds),
@@ -610,20 +528,18 @@ __all__ = [
     "PrepStatus",
     "RESCAN_HINT",
     "RuntimeIdentity",
+    "SEMANTIC_MODE_TEXT",
     "STALE_DECLARATION_TEXT",
     "SourceClassification",
-    "TrackIdentity",
     "analyze_refusal",
     "build_scan_result",
     "declaration_refusal",
     "initial_state",
-    "profile_snapshot",
     "record_analysis_complete",
     "record_failure",
     "record_scan",
     "runtime_identity_from_classification",
     "set_folder",
     "set_recursive",
-    "set_track",
     "summarize_analysis_run",
 ]

@@ -384,15 +384,19 @@ INFO_CONFIRMATION_GATE = (
 )
 
 # ============================================================================
-# [FORK] Digital-Union (P V1): media library preparation labels
+# [FORK] Digital-Union (P V1 / P2): media library preparation labels
 # See src/beatsync_fork/library_prep.py for the workflow these labels describe.
+#
+# P2: the persisted Stage-5 semantics are media-neutral, so preparation needs no track and applies
+# to no particular edit style. Nothing here may imply otherwise.
 # ============================================================================
 
 LABEL_PREP_SECTION = "📚 Media Library Preparation"
 INFO_PREP_SECTION = (
     "Analyze new or changed videos ahead of rendering so future renders can reuse the prepared "
-    "visual-analysis cache. Preparation is matched to the edit style the chosen track resolves to, "
-    "and it never renders a video. This is separate from the Video Source selection above."
+    "visual-analysis cache. The analysis describes the video itself, so one preparation serves every "
+    "track and every edit style, and no audio is needed here. Nothing is rendered. This is separate "
+    "from the Video Source selection above."
 )
 
 LABEL_PREP_FOLDER = "📂 Library Folder"
@@ -401,10 +405,6 @@ INFO_PREP_FOLDER = (
     "live in temporary folders that are cleared on restart, so preparing them would be pointless."
 )
 LABEL_PREP_RECURSIVE = "Include subfolders"
-LABEL_PREP_TRACK = "🎵 Track (MP3/WAV/FLAC)"
-INFO_PREP_TRACK = (
-    "Used only to resolve the edit style this preparation applies to. No video is rendered."
-)
 LABEL_PREP_SCAN = "🔍 Scan Library"
 LABEL_PREP_ANALYZE = "⚙️ Analyze New / Changed"
 LABEL_PREP_REPORT = "📋 Preparation Status"

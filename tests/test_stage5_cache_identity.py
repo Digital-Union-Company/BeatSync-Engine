@@ -26,7 +26,7 @@ _FUNCS = (
     "_safe_name", "_hash_text", "_env_int", "_qwen_max_windows", "_path_signature_token",
     "_bounded_fingerprint", "_full_fingerprint", "_backend_component_token",
     "_llama_version_token", "_resolve_qwen_backend_paths", "_qwen_backend_signature_token",
-    "_qwen_prompt_style_hint", "_qwen_config_token", "_video_signature", "_cache_path",
+    "_qwen_config_token", "_video_signature", "_cache_path",
     "_is_count", "_stored_ai_cache_is_consistent", "_deterministic_analysis_completed",
     "_cache_entry_is_complete",
 )
@@ -122,7 +122,7 @@ def va(tmp_path):
 def test_one_constant_owns_identity_and_the_persisted_contract(va):
     """`CACHE_CONTRACT_VERSION` is both the first signature component and the stored marker, so a key
     and its payload can never disagree about which generation they belong to."""
-    assert va["CACHE_CONTRACT_VERSION"] == "stage5_cache_v2"
+    assert va["CACHE_CONTRACT_VERSION"] == "stage5_cache_v3"
 
     source = open(_VIDEO_ANALYSIS, encoding="utf-8").read()
     tree = ast.parse(source)
@@ -134,11 +134,18 @@ def test_one_constant_owns_identity_and_the_persisted_contract(va):
     assert "CACHE_CONTRACT_VERSION" in ast.unparse(rule), "must gate reuse"
     # no second, drifting generation constant
     assert "cache_id_v2" not in source
+    assert "cache_id_v3" not in source
+    # P2 bumped the ONE constant; there is no parallel v2 generation left in the code
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in source
+    assert "stage5_cache_v2" not in source, (
+        "there is no v2 compatibility loader and no migration - v2 keys are simply never produced "
+        "or looked up again")
 
 
-def test_analysis_version_is_untouched_by_d2():
-    """Its documented job is candidate scoring / window building / candidate schema, none of which
-    D2 changes."""
+def test_analysis_version_is_untouched_by_d2_and_by_p2():
+    """Its documented job is candidate scoring / window building / candidate schema, and neither D2
+    nor P2 changes any of those. P2 only changes what a *semantic* record means, which is the cache
+    contract's job."""
     source = open(_VIDEO_ANALYSIS, encoding="utf-8").read()
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in source
 
@@ -446,96 +453,113 @@ def test_config_5_a_no_ai_run_has_its_own_identity(va, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PROMPT-ID-1..4 — prompt context is part of identity (D2 R2)
+# MEDIA-TRUTH-1..5 — the P2 invariant: no music/edit state may reach identity
+#
+# These deliberately REPLACE the D2 R2 "PROMPT-ID" tests, which asserted the opposite: that
+# `smart_preset` re-keys. That expectation is intentionally obsolete. The P2 real-material A/B
+# validated media-neutral semantics on the user's own content (115 identical moments, 115/115 tagged
+# on both sides, post-merge score deltas <= ~0.023, no new planner fallback pattern), so Stage 5 now
+# records intrinsic media evidence and Stage 6 does the music-specific interpretation.
 # ---------------------------------------------------------------------------
 
 
 _WORKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "src", "auto_mode", "stage5_qwen_scene_worker.py")
 
-
-def test_prompt_id_4_the_worker_prompt_really_consumes_smart_preset():
-    """Structural seam against the byte-identical worker: this is *why* smart_preset is in identity.
-
-    If `_build_prompt` ever stops interpolating the preset, or starts using a different default, this
-    fails and the mirrored default in `_qwen_prompt_style_hint` must be revisited.
-    """
-    tree = ast.parse(open(_WORKER, encoding="utf-8").read())
-    build = next(n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "_build_prompt")
-    body = ast.unparse(build)
-
-    assert "audio_profile.get('smart_preset', 'rhythmic_gmv_amv')" in body, body
-    assert "style_hint" in body
-    # the hint is interpolated into the returned prompt, not merely computed
-    returns = [ast.unparse(n) for n in ast.walk(build) if isinstance(n, ast.Return)]
-    assert any("style_hint" in text for text in returns), returns
+_PRESETS = ("hybrid_drop_story", "cinematic_soft_amv", "rhythmic_hype_gmv_amv",
+            "rhythmic_flow_gmv_amv", "rhythmic_gmv_amv")
 
 
-def test_the_parent_mirrors_the_workers_default_exactly(va):
-    """Same key, same default string — read from the worker, asserted against the parent."""
-    tree = ast.parse(open(_WORKER, encoding="utf-8").read())
-    build = next(n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "_build_prompt")
-    call = next(n for n in ast.walk(build) if isinstance(n, ast.Call)
-                and ast.unparse(n).startswith("audio_profile.get("))
-    key, default = (ast.literal_eval(call.args[0]), ast.literal_eval(call.args[1]))
-
-    assert va["_qwen_prompt_style_hint"]({}) == default
-    assert va["_qwen_prompt_style_hint"]({key: "something_else"}) == "something_else"
-    assert va["_qwen_prompt_style_hint"](None) == default
-    assert va["_qwen_prompt_style_hint"]("not-a-dict") == default
-
-
-def test_prompt_id_1_a_different_smart_preset_changes_the_ai_key(va, tmp_path):
-    """`analyze_video_sources` forwards the audio profile into the worker request, and the worker
-    interpolates `smart_preset` straight into the Qwen prompt — so two runs differing only in preset
-    produce different semantics. Before R2 they shared one cache key."""
-    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
-    token = va["_qwen_backend_signature_token"](None)
-
-    def key(profile):
-        return va["_cache_path"](clip, True, None, backend_token=token,
-                                 config_token=va["_qwen_config_token"](profile))
-
-    hype = key({"smart_preset": "rhythmic_hype_gmv_amv"})
-    soft = key({"smart_preset": "cinematic_soft_amv"})
-    assert hype != soft
-    # and unrelated audio-profile fields must NOT perturb identity
-    assert key({"smart_preset": "cinematic_soft_amv", "tempo": 174.0, "beat_count": 812}) == soft
-
-
-def test_prompt_id_2_a_missing_smart_preset_equals_the_explicit_default(va, tmp_path):
-    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
-    token = va["_qwen_backend_signature_token"](None)
-
-    def key(profile):
-        return va["_cache_path"](clip, True, None, backend_token=token,
-                                 config_token=va["_qwen_config_token"](profile))
-
-    default = key({})
-    assert key({"smart_preset": "rhythmic_gmv_amv"}) == default
-    assert key(None) == default
-    assert key({"tempo": 128.0}) == default, "an audio profile without a preset is still the default"
-
-
-def test_prompt_id_3_a_no_ai_key_ignores_smart_preset(va, tmp_path):
-    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
-    baseline = va["_cache_path"](clip, False, None)
-
-    for preset in ("rhythmic_hype_gmv_amv", "cinematic_soft_amv", "rhythmic_gmv_amv"):
-        assert va["_cache_path"](clip, False, None,
-                                 audio_profile={"smart_preset": preset}) == baseline
-
-
-def test_the_whole_audio_profile_is_not_hashed():
-    """Only fields proven to reach the persisted result belong in identity."""
+def test_media_truth_1_the_config_token_takes_no_arguments(va):
+    """`_qwen_config_token()` represents media-semantic configuration only, so it has nothing to be
+    parameterised by. An argument here is how an edit style got into identity in the first place."""
     tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
-    token = ast.unparse(next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                             and n.name == "_qwen_config_token"))
-    assert "smart_preset" in token or "_qwen_prompt_style_hint" in token
-    for reckless in ("json.dumps(audio_profile", "str(audio_profile)", "sorted(audio_profile"):
-        assert reckless not in token, f"must not hash the whole profile: {reckless}"
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+              and n.name == "_qwen_config_token")
+    args = fn.args
+    assert not args.args and not args.posonlyargs and not args.kwonlyargs, ast.unparse(args)
+    assert args.vararg is None and args.kwarg is None
+    assert va["_qwen_config_token"]() == va["_qwen_config_token"]()
+
+
+def test_media_truth_2_the_identity_primitives_have_no_audio_profile_input():
+    """Structural: the parameter is gone from the key formula, so a caller *cannot* re-key by style."""
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    for name in ("_video_signature", "_cache_path", "_qwen_config_token"):
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        params = [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+        assert "audio_profile" not in params, f"{name} still takes audio_profile"
+        body = "\n".join(
+            ast.unparse(node) for node in fn.body
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+        for leaked in ("audio_profile", "smart_preset", "_qwen_prompt_style_hint",
+                       "tempo", "section", "seed"):
+            assert leaked not in body, f"{name} must not reference {leaked}"
+
+
+def test_media_truth_3_the_retired_style_hint_helper_is_gone():
+    """`_qwen_prompt_style_hint` existed only to mirror the worker's `smart_preset` interpolation.
+    That concept no longer exists, and it must not be replaced by a fake constant style hint."""
+    source = open(_VIDEO_ANALYSIS, encoding="utf-8").read()
+    assert "_qwen_prompt_style_hint" not in source
+    assert "rhythmic_gmv_amv" not in source, "no fabricated default edit style may remain"
+
+
+@pytest.mark.parametrize("preset", _PRESETS)
+def test_media_truth_4_every_edit_style_targets_one_identity(va, tmp_path, preset):
+    """The strong invariant. Same source, same backend, same media-semantic Qwen configuration =>
+    one key, whatever edit style the *render* happens to want."""
+    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
+    token = va["_qwen_backend_signature_token"](None)
+    config = va["_qwen_config_token"]()
+    baseline = va["_cache_path"](clip, True, None, backend_token=token, config_token=config)
+
+    # There is no seam through which a profile could even be supplied - which is the point. The
+    # config token is computed from the environment alone, so every preset resolves here.
+    assert preset  # named for the record; identity cannot vary with it
+    assert va["_cache_path"](clip, True, None, backend_token=token,
+                             config_token=va["_qwen_config_token"]()) == baseline
+
+
+def test_media_truth_5_arbitrary_audio_and_creative_state_cannot_re_key(va, tmp_path):
+    """Two wildly different renders — different preset, tempo, sections, energy, cut count, and a
+    different variation seed — reach the same Stage-5 identity, because none of it is an input."""
+    clip = _write(str(tmp_path / "clip.mp4"), b"A", 4096)
+    token = va["_qwen_backend_signature_token"](None)
+
+    profile_a = {"smart_preset": "hybrid_drop_story", "tempo": 174.0, "beat_count": 812,
+                 "section_types": ["intro", "drop", "outro"], "average_wave": 0.81,
+                 "cut_count": 240, "creative": {"seed": 101}}
+    profile_b = {"smart_preset": "cinematic_soft_amv", "tempo": 82.0, "beat_count": 210,
+                 "section_types": ["intro", "verse", "breakdown"], "average_wave": 0.22,
+                 "cut_count": 61, "creative": {"seed": 202}}
+    assert profile_a != profile_b
+
+    # The only identity inputs are the source, the backend and the media-semantic config token.
+    keys = {va["_cache_path"](clip, True, None, backend_token=token,
+                              config_token=va["_qwen_config_token"]())
+            for _ in (profile_a, profile_b)}
+    assert len(keys) == 1
+    assert next(iter(keys)) is not None
+
+
+def test_no_audio_or_creative_state_appears_anywhere_in_the_key_formula():
+    """A stricter version of the old "the whole profile is not hashed": nothing describing HOW to
+    edit may appear in the key formula at all, in any form.
+
+    Executable statements only — the docstring legitimately names the retired `smart_preset`
+    component to explain why it is gone, exactly as the `ai_missing` test above does.
+    """
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+              and n.name == "_qwen_config_token")
+    token = "\n".join(
+        ast.unparse(node) for node in fn.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+    for reckless in ("json.dumps(audio_profile", "str(audio_profile)", "sorted(audio_profile",
+                     "smart_preset", "audio_profile", "tempo", "seed", "creative",
+                     "master_seed", "freestyle", "director"):
+        assert reckless not in token, f"must not enter cache identity: {reckless}"
 
 
 # ---------------------------------------------------------------------------
@@ -596,14 +620,26 @@ def test_a_failed_backend_token_disables_ai_caching_for_the_whole_invocation(va)
     assert ast.unparse(guarded[0].body) == "None", ast.unparse(guarded[0])
 
 
-def test_the_orchestrator_threads_the_audio_profile_into_identity(va):
+def test_the_orchestrator_keeps_the_audio_profile_out_of_identity(va):
+    """The P2 inverse of the D2 R2 test this replaces.
+
+    `analyze_video_sources` still *accepts* `audio_profile` - a retained integration signature so
+    `auto_mode.analyze_beats_auto` needs no change - but it may not thread it anywhere near the key.
+    """
     orchestrator = _orchestrator()
     config_calls = _calls_named(orchestrator, "_qwen_config_token")
-    assert config_calls, "the config token must be computed once per invocation"
-    for call in config_calls:
-        assert "audio_profile" in ast.unparse(call), ast.unparse(call)
-    for call in _calls_named(orchestrator, "_cache_path"):
-        assert "audio_profile" in ast.unparse(call), ast.unparse(call)
+    assert len(config_calls) == 1, "the config token must be computed once per invocation"
+    for call in config_calls + _calls_named(orchestrator, "_cache_path"):
+        assert "audio_profile" not in ast.unparse(call), ast.unparse(call)
+
+    # the parameter survives for compatibility, and is used by nothing
+    params = [a.arg for a in orchestrator.args.args + orchestrator.args.kwonlyargs]
+    assert "audio_profile" in params
+    body = "\n".join(
+        ast.unparse(node) for node in orchestrator.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+    assert "audio_profile" not in body, (
+        "audio_profile must have ZERO effect: no cache key, no Qwen request, no prompt")
 
 
 def test_runtime_only_knobs_are_absent_from_the_config_token():
