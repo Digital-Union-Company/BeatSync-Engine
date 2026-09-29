@@ -990,6 +990,63 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
+| `library_prep.py` | media library preparation: classification vocabulary, scan state, report text |
+
+### Media Library Preparation (P V1)
+
+Preparing a library means running the Stage-5 work for new/changed sources **before** a render, so
+the render finds a warm cache. `video_analysis.classify_library_sources()` answers "which sources
+already have reusable cache?" and `beatsync_fork/library_prep.py` holds the state and the report.
+
+**It prepares for an edit *style*, not for one exact music file.** Only `smart_preset` reaches the
+cache key (through `_qwen_config_token`), and `_build_audio_visual_profile` emits one of four
+values, so preparation done for one track is genuinely reusable by any track resolving to the same
+preset. The report therefore shows `Edit style: <preset>`; do not reword it to imply per-file
+exclusivity. Media-neutral preparation is the separate, unbuilt P2.
+
+- **The profile comes from the existing seam, never a cheaper approximation.**
+  `analyze_beats_auto(track, video_files=None)` runs audio Stages 1–4 and skips Stage 5 (line 426's
+  `should_analyze_video` requires a non-empty video list), so the profile is *the same object shape*
+  a render forwards. `_build_audio_visual_profile` needs tempo, features, sections **and** the
+  selected beats, so there is no shorter path — all four stages are mandatory. It is stored as a
+  serialisable snapshot (`profile_snapshot`), because Gradio round-trips state and object identity
+  across events is not a thing to rely on.
+- **`classify_library_sources` reuses the production primitives and adds no key formula.** Identity
+  is `_cache_path`/`_video_signature`; reuse is `_load_cache`, i.e. the one completion rule. It
+  splits a miss three ways purely for wording — key file absent → `new_or_changed`, key file present
+  but rejected → `incomplete_or_invalid`, `_cache_path is None` → `source_identity_unavailable`. A
+  brand-new file and a changed same-path file are deliberately **one** label: path+content identity
+  cannot tell them apart, and inventing the distinction would need a content-addressed index.
+- **It mirrors the orchestrator's once-per-invocation identity block rather than extracting it.**
+  `tests/test_stage5_cache_identity.py` asserts that structure *inside* `analyze_video_sources`, and
+  the expensive part (fingerprints, key formula) is shared through the helpers regardless. Do not
+  "DRY" the six-line pattern without rewriting those assertions.
+- **Unprovable backend identity blocks preparation entirely.** When AI is available but
+  `_qwen_backend_signature_token` returns `None`, Stage 5 runs with caching off — a preparation run
+  would then spend GPU hours and persist nothing, and the next scan would show the same counts. The
+  classifier skips per-source work (no verdict could exist) and Analyze stays disabled. This is
+  *narrower* than "no AI": a legitimately AI-disabled run uses the existing `no_ai` identity and
+  classifies normally.
+- **Scan is read-only with respect to cache *records*.** It creates the cache directory, because
+  `_cache_path` always has; it never writes, updates or checkpoints a record. Do not "fix"
+  `_cache_path`'s `os.makedirs` to make the claim tidier.
+- **Scan classifies the whole library once; Analyze sends only `subset_for_analysis()`.** On the
+  measured 902-source library that is 4 paths, not 902. Analyze then calls the *existing*
+  `analyze_video_sources`, so all persistence stays with `_checkpoint_cache`; preparation never
+  calls `_analyze_single_video`, `_checkpoint_cache` or `_save_cache` itself. Per-source staleness
+  between the two clicks is deliberately unchecked — the analyzer re-derives each selected source's
+  own identity anyway.
+- **What invalidates a scan:** folder, recursive flag, track (path/size/`mtime_ns`), and — rechecked
+  at Analyze time — the backend token, the config token and the effective Qwen mode. Those last
+  three are the only identity inputs beyond the obvious ones, because `config_token` already covers
+  the Qwen env knobs *and* `smart_preset`.
+- **Strictly separate from the Create Video gate.** Its own `gr.State`, its own `prep_outputs`, and
+  no overlap with `source_state` / `source_outputs` / `confirm_action` / `process_btn`. Local folder
+  only: browser uploads live under `input/gradio_uploads/`, which `cleanup_on_startup` clears, so a
+  path-keyed preparation of them would be worthless.
+- **No cache-contract or analysis-version change, and nothing new in identity.** Preparation adds no
+  field to any cache payload and no input to any key; a test asserts the identity and completion
+  functions never mention it.
 
 ### Video source modes and the confirmation gate
 
