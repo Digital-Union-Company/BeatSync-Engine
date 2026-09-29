@@ -490,12 +490,15 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     # [FORK] Digital-Union (L0): scale diagnostics. The planner scores every candidate moment for
     # every segment, so its cost is the product of two numbers that both grow with the library.
     # Measured around the existing call only - no input, no behaviour and no scoring changes here.
-    # `planner_candidate_count` is the candidate MOMENTS presented to Stage 6, never the source-file
-    # count; `planner_segment_count` is the frame-aligned segment count being planned.
-    planner_candidate_count = (
-        len((beat_info.get("video_analysis") or {}).get("candidates") or [])
-        if isinstance(beat_info, dict) else 0
-    )
+    # `planner_candidate_count` is the candidate MOMENTS the planner actually scores, never the
+    # source-file count; `planner_segment_count` is the frame-aligned segment count being planned.
+    # `build_planned_clip_sequence` drops candidates without a `video_file` before scoring, so the
+    # same predicate is applied here - counting the raw list would overstate the scored pool. This
+    # reads the list; it never mutates it, and the planner call is untouched.
+    planner_candidate_count = sum(
+        1 for candidate in ((beat_info.get("video_analysis") or {}).get("candidates") or [])
+        if candidate.get("video_file")
+    ) if isinstance(beat_info, dict) else 0
     planner_started = time.perf_counter()
     planned_clip_sequence = build_planned_clip_sequence(
         cut_times=selected_beats,

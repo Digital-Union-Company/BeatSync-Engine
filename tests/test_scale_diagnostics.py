@@ -416,6 +416,76 @@ def test_e_planner_candidate_count_is_moments_not_source_files():
     assert "video_files" not in assignment, "this must never degrade into a source-file count"
 
 
+def _planner_count_statement() -> ast.Assign:
+    """The real ``planner_candidate_count = …`` statement, lifted out of ``create_music_video``."""
+    fn = _func(_tree(_VP), "create_music_video")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "planner_candidate_count" for t in node.targets
+        ):
+            return node
+    raise AssertionError("planner_candidate_count assignment not found")
+
+
+def _count_candidates(beat_info) -> int:
+    """Execute that real statement against a synthetic ``beat_info``."""
+    module = ast.Module(body=[_planner_count_statement()], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ns: dict = {"beat_info": beat_info}
+    exec(compile(module, _VP, "exec"), ns)  # noqa: S102 - real source, isolated namespace
+    return ns["planner_candidate_count"]
+
+
+def test_e_planner_candidate_count_counts_only_the_pool_stage6_scores():
+    """``build_planned_clip_sequence`` drops candidates without ``video_file`` before scoring.
+
+    Counting the raw list overstated the work: a loaded-but-unusable candidate was reported as
+    evaluated. The diagnostic applies the planner's own existing predicate instead.
+    """
+    candidates = [
+        {"id": "a", "video_file": "C:/lib/one.mp4"},
+        {"id": "b"},                                    # no video_file - the planner drops it
+        {"id": "c", "video_file": "C:/lib/two.mp4"},
+    ]
+    beat_info = {"video_analysis": {"candidates": candidates}}
+
+    assert _count_candidates(beat_info) == 2
+    # the list itself is untouched - counting must never filter in place
+    assert [c.get("id") for c in beat_info["video_analysis"]["candidates"]] == ["a", "b", "c"]
+    assert len(candidates) == 3
+
+    # the same predicate the planner uses, so the two can never disagree
+    planner_src = open(os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py"),
+                       encoding="utf-8").read()
+    assert 'candidates = [c for c in candidates if c.get("video_file")]' in planner_src
+
+
+@pytest.mark.parametrize("beat_info,expected", [
+    (None, 0),
+    ({}, 0),
+    ({"video_analysis": None}, 0),
+    ({"video_analysis": {}}, 0),
+    ({"video_analysis": {"candidates": []}}, 0),
+    ({"video_analysis": {"candidates": [{"video_file": "x.mp4"}]}}, 1),
+    ({"video_analysis": {"candidates": [{"video_file": ""}]}}, 0),
+])
+def test_e_planner_candidate_count_edge_shapes(beat_info, expected):
+    """Only the shapes Stage 6 already contracts for - no extra hardening was added here."""
+    assert _count_candidates(beat_info) == expected
+
+
+def test_e_planner_seconds_and_segment_count_are_unaffected_by_the_count_fix():
+    code = _body_code(_func(_tree(_VP), "create_music_video"))
+
+    assert "planner_seconds = time.perf_counter() - planner_started" in code
+    assert "'planner_segment_count': int(total_clips)" in code
+    # the count is computed before the timer opens, so it cannot inflate the measured planner time
+    lines = code.splitlines()
+    counted = next(i for i, l in enumerate(lines) if l.startswith("planner_candidate_count ="))
+    opened = next(i for i, l in enumerate(lines) if "planner_started = time.perf" in l)
+    assert counted < opened
+
+
 def test_e_segment_count_is_the_frame_aligned_segment_count():
     code = _body_code(_func(_tree(_VP), "create_music_video"))
 
