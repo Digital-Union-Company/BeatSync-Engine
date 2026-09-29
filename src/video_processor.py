@@ -487,11 +487,31 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     print(f"⏱️  Cut timeline: {len(selected_beats)} boundaries, {sum(segment_frames)} frames")
     if dropped_boundaries:
         print(f"   ⚠️  Dropped {dropped_boundaries} duplicate/too-close cut boundaries after frame quantization")
+    # [FORK] Digital-Union (L0): scale diagnostics. The planner scores every candidate moment for
+    # every segment, so its cost is the product of two numbers that both grow with the library.
+    # Measured around the existing call only - no input, no behaviour and no scoring changes here.
+    # `planner_candidate_count` is the candidate MOMENTS presented to Stage 6, never the source-file
+    # count; `planner_segment_count` is the frame-aligned segment count being planned.
+    planner_candidate_count = (
+        len((beat_info.get("video_analysis") or {}).get("candidates") or [])
+        if isinstance(beat_info, dict) else 0
+    )
+    planner_started = time.perf_counter()
     planned_clip_sequence = build_planned_clip_sequence(
         cut_times=selected_beats,
         segment_durations=segment_durations,
         beat_info=beat_info,
         video_files=video_files,
+    )
+    planner_seconds = time.perf_counter() - planner_started
+    render_info.update({
+        "planner_seconds": float(planner_seconds),
+        "planner_candidate_count": int(planner_candidate_count),
+        "planner_segment_count": int(total_clips),
+    })
+    print(
+        f"⏱️  Planner: {total_clips} segments over {planner_candidate_count} candidates "
+        f"in {planner_seconds:.2f}s"
     )
     # [FORK] Digital-Union (Phase A): the seed is reported, not recomputed — the planner already
     # read it off `beat_info` and acted on it.

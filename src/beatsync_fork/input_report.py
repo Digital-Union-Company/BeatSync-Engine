@@ -32,6 +32,22 @@ def format_bytes(size: int) -> str:
     return f"{value:.1f} {_BYTE_UNITS[-1]}"  # pragma: no cover - loop always returns
 
 
+def format_seconds(seconds: float) -> str:
+    """One-decimal seconds for the report block.
+
+    [FORK] Digital-Union (L0). Deliberately total: a report is a diagnostic, so a non-numeric or
+    non-finite value renders as ``0.0s`` rather than raising inside a UI callback. Negatives clamp
+    for the same reason — the module stays a pure, deterministic function of the scan it describes.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "0.0s"
+    if value != value or value in (float("inf"), float("-inf")):
+        return "0.0s"
+    return f"{max(0.0, value):.1f}s"
+
+
 @dataclass(frozen=True, slots=True)
 class InputReport:
     """Flat, serialisable summary of one folder scan."""
@@ -127,6 +143,10 @@ class InputReport:
             lines.append(f"Same file seen twice: {self.path_collisions} (counted once)")
 
         lines.append(f"Total size:  {format_bytes(self.total_ready_bytes)}")
+        # [FORK] Digital-Union (L0): the scan cost was already measured and serialised but never
+        # shown. It is the first thing that grows with the library, so a user aiming at 5,000+
+        # sources can see it without instrumenting anything.
+        lines.append(f"Scan time:   {format_seconds(self.scan_seconds)}")
         lines.append("")
         lines.append("INPUT READY" if self.is_ready else "NO USABLE SOURCE FILES")
         return "\n".join(lines)
@@ -147,4 +167,4 @@ def render_input_set(input_set: InputSet) -> str:
     return InputReport.from_input_set(input_set).render_text()
 
 
-__all__ = ["InputReport", "format_bytes", "render_input_set"]
+__all__ = ["InputReport", "format_bytes", "format_seconds", "render_input_set"]

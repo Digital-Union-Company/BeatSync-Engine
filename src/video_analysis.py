@@ -1065,15 +1065,30 @@ def analyze_video_sources(
     # the library aggregates computed later over `videos` (which include every cache hit).
     run_stats = _new_run_stats()
 
+    # [FORK] Digital-Union (L0): scale diagnostics. Two separate costs hide in the warm-cache loop
+    # and they grow differently with library size - strong identity (the D2 bounded content
+    # fingerprint, ~5.1 ms/source measured) versus reading and validating the record off disk.
+    # Measured around the EXISTING calls; neither their semantics nor the cache contract changes,
+    # and these numbers are invocation-level observability that never enters a cache payload.
+    cache_identity_seconds = 0.0
+    cache_lookup_seconds = 0.0
+    cache_lookups = 0
+
     for idx, video_file in enumerate(existing, 1):
+        identity_started = time.perf_counter()
         cache_file = None if ai_cache_disabled else _cache_path(
             video_file, ai_available, qwen_model_path,
             backend_token=invocation_backend_token,
             config_token=invocation_config_token,
             audio_profile=audio_profile)
+        cache_identity_seconds += time.perf_counter() - identity_started
         cache_paths[idx] = cache_file
+        lookup_started = time.perf_counter()
         cached = (_load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
                   if cache_file else None)
+        cache_lookup_seconds += time.perf_counter() - lookup_started
+        if cache_file:
+            cache_lookups += 1
         if cached:
             cache_hits += 1
             print(f"   Reusing cached visual analysis {idx}/{len(existing)}: {_safe_name(video_file)}")
@@ -1092,11 +1107,26 @@ def analyze_video_sources(
     # reporting one analysis worker when there are no jobs at all - the analysis block below is
     # guarded by `if jobs:`, so nothing is ever submitted. Report the workers actually used.
     workers = _video_analysis_workers(len(jobs)) if jobs else 0
+    # [FORK] Digital-Union (L0): the cache scan is complete here, so this existing metric is the
+    # natural place for its two measured costs. Message suffix only; the counts it already reported
+    # are unchanged.
     fork_progress.emit(event_callback, fork_progress.metric(
         5,
-        f"{cache_hits} cached, {len(jobs)} to analyze, {workers} worker(s)",
+        f"{cache_hits} cached, {len(jobs)} to analyze, {workers} worker(s) "
+        f"[identity {_fmt_seconds(cache_identity_seconds)}, "
+        f"records {_fmt_seconds(cache_lookup_seconds)}]",
         cache_hits=cache_hits, to_analyze=len(jobs), workers=int(workers),
+        cache_identity_seconds=float(cache_identity_seconds),
+        cache_lookup_seconds=float(cache_lookup_seconds),
+        cache_lookups=int(cache_lookups),
     ))
+    # [FORK] Digital-Union (L0): same two figures for the headless/CLI console, which never sees the
+    # structured channel.
+    print(
+        f"   Cache check: identity {_fmt_seconds(cache_identity_seconds)}, "
+        f"records {_fmt_seconds(cache_lookup_seconds)} "
+        f"({cache_lookups} lookup(s), {cache_hits} hit(s))"
+    )
     # Always publish the post-cache count, even when nothing needs analyzing.
     fork_progress.emit(event_callback, source_counter.snapshot(
         "cache scan complete", cache_hits=cache_hits, unit="sources"))
@@ -1343,6 +1373,11 @@ def analyze_video_sources(
         qwen_tag_count_this_run=int(run_stats["qwen_tag_count"]),
         qwen_frame_count_this_run=int(run_stats["qwen_frame_count"]),
         qwen_tag_count=int(qwen_tag_count), qwen_frame_count=int(qwen_frame_count),
+        # [FORK] Digital-Union (L0): scale diagnostics for this invocation's cache scan.
+        cache_identity_seconds=float(cache_identity_seconds),
+        cache_lookup_seconds=float(cache_lookup_seconds),
+        cache_lookups=int(cache_lookups),
+        candidate_count=len(all_candidates),
         unit="sources",
     ))
     return {
@@ -1356,6 +1391,14 @@ def analyze_video_sources(
         "cache_hits": cache_hits,
         "source_count": len(existing),
         "worker_count": workers,
+        # [FORK] Digital-Union (L0): scale diagnostics. Ephemeral invocation metadata, exactly like
+        # the `*_this_run` fields - measured around existing operations, never persisted, and absent
+        # from cache identity. `candidate_count` is the direct length of the returned candidate list
+        # rather than anything derived from telemetry, so it cannot drift from what Stage 6 receives.
+        "candidate_count": len(all_candidates),
+        "cache_identity_seconds": float(cache_identity_seconds),
+        "cache_lookup_seconds": float(cache_lookup_seconds),
+        "cache_lookups": int(cache_lookups),
         # [FORK] Digital-Union (R1): CURRENT-RUN execution facts. Computed from the uncached `jobs`
         # set and the Qwen requests those jobs actually issued - never from `videos`, which contains
         # every cache hit. On a fully warm run they are all zero while the library aggregates below
