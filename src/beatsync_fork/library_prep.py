@@ -198,6 +198,62 @@ class RuntimeIdentity:
         return other is not None and self == other
 
 
+def _normalized_path(value: Any) -> str:
+    """Compare-ready form of a path widget value. Empty stays empty.
+
+    ``abspath`` + ``normcase`` so a trailing separator, a relative spelling or a drive-letter case
+    difference is not read as the user having changed their mind. ``abspath("")`` would be the
+    process working directory, which is why the empty case short-circuits.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(text))
+    except (OSError, ValueError):
+        return os.path.normcase(text)
+
+
+@dataclass(frozen=True, slots=True)
+class LivePrepDeclaration:
+    """What the preparation widgets declare *right now*, at the moment a button was clicked.
+
+    Gradio delivers widget changes as separate queued events, so the stored state can lag behind
+    the screen: a user can retype the folder or pick a different track and click Analyze before the
+    ``change`` handler has run. The Create Video gate solves exactly this by making the live source
+    controls inputs to the render request; preparation does the same.
+    """
+
+    folder: str = ""
+    recursive: bool = DEFAULT_RECURSIVE
+    track_path: str = ""
+
+    @classmethod
+    def from_widgets(cls, folder: Any, recursive: Any, track_path: Any) -> "LivePrepDeclaration":
+        """Tolerant of the shapes Gradio hands back (``None``, a path, a non-bool truthy)."""
+        return cls(
+            folder="" if folder is None else str(folder),
+            recursive=bool(recursive),
+            track_path="" if track_path is None else str(track_path),
+        )
+
+    def describes(self, scan: "PrepScanResult | None") -> bool:
+        """Does this declaration still describe the scan that was recorded?
+
+        Practical equality only: normalised folder and track paths, exact ``recursive``. It is
+        deliberately **not** an identity check — the track's size/mtime is
+        :meth:`TrackIdentity.still_matches`' job, and this guard runs earlier and cheaper, before
+        anything is stat'ed, probed or analysed.
+        """
+        if scan is None:
+            return True
+        return (
+            _normalized_path(self.folder) == _normalized_path(scan.folder)
+            and bool(self.recursive) == bool(scan.recursive)
+            and _normalized_path(self.track_path) == _normalized_path(scan.track.path)
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PrepScanResult:
     """Everything the Analyze click needs, and nothing that belongs on disk.
@@ -406,6 +462,31 @@ def record_analysis_complete(state: PrepSessionState, summary: str) -> PrepSessi
 # ---------------------------------------------------------------------------
 
 
+STALE_DECLARATION_TEXT = (
+    "Preparation inputs changed since the scan. Press Scan Library again."
+)
+
+
+def declaration_refusal(state: PrepSessionState,
+                        live: LivePrepDeclaration | None) -> str | None:
+    """The stale-UI guard, run **before** anything is stat'ed, probed or analysed.
+
+    ``live`` carries the widget values submitted with the Analyze click. Without it the recorded
+    scan is the only authority, and a queued ``change`` event lets the user retarget the folder or
+    the track and still have the *previous* library's classification analysed — the same race the
+    Create Video gate takes live source controls to avoid.
+
+    A mismatch is a refusal, never a silent re-target: the recorded classification describes a
+    different library, and preparation does not rescan 902 sources on the user's behalf.
+
+    Returns ``None`` when there is nothing to compare (no scan recorded, or no live declaration
+    supplied by a caller that has no widgets), leaving :func:`analyze_refusal` to report that.
+    """
+    if state.scan is None or live is None:
+        return None
+    return None if live.describes(state.scan) else STALE_DECLARATION_TEXT
+
+
 def analyze_refusal(state: PrepSessionState, runtime: RuntimeIdentity | None) -> str | None:
     """Why this preparation run must not start, or ``None`` when it may.
 
@@ -522,16 +603,19 @@ __all__ = [
     "BACKEND_UNVERIFIED_TEXT",
     "DEFAULT_RECURSIVE",
     "INTRO_TEXT",
+    "LivePrepDeclaration",
     "NeedReason",
     "PrepScanResult",
     "PrepSessionState",
     "PrepStatus",
     "RESCAN_HINT",
     "RuntimeIdentity",
+    "STALE_DECLARATION_TEXT",
     "SourceClassification",
     "TrackIdentity",
     "analyze_refusal",
     "build_scan_result",
+    "declaration_refusal",
     "initial_state",
     "profile_snapshot",
     "record_analysis_complete",

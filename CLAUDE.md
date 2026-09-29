@@ -1040,6 +1040,16 @@ exclusivity. Media-neutral preparation is the separate, unbuilt P2.
   at Analyze time — the backend token, the config token and the effective Qwen mode. Those last
   three are the only identity inputs beyond the obvious ones, because `config_token` already covers
   the Qwen env knobs *and* `smart_preset`.
+- **Analyze takes the live preparation controls, not just `gr.State`.** Gradio delivers widget
+  changes as separate queued events, so a user can retarget the folder or the track and click
+  Analyze before the `change` handler has run — which would analyse the *previous* library's
+  classification while the screen declared something else. `declaration_refusal` compares the live
+  declaration against the recorded scan **first**, before the track is stat'ed, before the runtime
+  identity is recomputed and before anything is analysed; a mismatch drops the scan and asks for a
+  rescan rather than silently re-targeting it. It is practical equality only (normalised paths,
+  exact `recursive`) and never fingerprints the track — `TrackIdentity.still_matches()` remains the
+  separate, later content check. Never reduce `prep_analyze_btn`'s inputs back to `prep_state`
+  alone; a test pins the click inputs against the handler's parameter order.
 - **Strictly separate from the Create Video gate.** Its own `gr.State`, its own `prep_outputs`, and
   no overlap with `source_state` / `source_outputs` / `confirm_action` / `process_btn`. Local folder
   only: browser uploads live under `input/gradio_uploads/`, which `cleanup_on_startup` clears, so a

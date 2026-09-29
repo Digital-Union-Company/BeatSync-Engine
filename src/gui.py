@@ -1039,9 +1039,17 @@ def _prep_scan_impl(folder_path: str, recursive: bool, track_path: str, state,
     return fork_prep.record_scan(state, scan)
 
 
-def _prep_analyze_impl(state, event_callback=None,
+def _prep_analyze_impl(state, live, event_callback=None,
                        console_logger: StageConsoleLogger | None = None):
     """Analyze only the subset the recorded scan classified as needing work.
+
+    `live` is the preparation controls as the widgets declare them at click time, and checking it
+    comes **first** - before the track is stat'ed, before the runtime identity is recomputed and
+    long before anything is analysed. Gradio delivers widget changes as separate queued events, so
+    a user can retype the folder or pick a different track and click Analyze before the `change`
+    handler has updated the state; without this guard the previous library's classification would
+    be analysed while the screen declared something else. It is the same reason
+    `process_video_guarded` takes the live source controls rather than trusting `gr.State` alone.
 
     Persistence is entirely the existing analyzer's: this never calls `_analyze_single_video`,
     `_checkpoint_cache` or `_save_cache`, and the returned candidate library is discarded apart from
@@ -1050,7 +1058,9 @@ def _prep_analyze_impl(state, event_callback=None,
     from video_analysis import analyze_video_sources, classify_library_sources
 
     scan = state.scan
-    refusal = fork_prep.analyze_refusal(state, None)
+    refusal = fork_prep.declaration_refusal(state, live)
+    if refusal is None:
+        refusal = fork_prep.analyze_refusal(state, None)
     if refusal is not None:
         return fork_prep.record_failure(state, refusal, notice="Preparation run refused.")
 
@@ -1150,10 +1160,16 @@ def _on_prep_scan_click(folder_path: str, recursive: bool, track_path: str, stat
     )
 
 
-def _on_prep_analyze_click(state) -> Iterator[Tuple]:
+def _on_prep_analyze_click(folder_path: str, recursive: bool, track_path: str,
+                           state) -> Iterator[Tuple]:
+    # The live preparation controls are inputs to the Analyze request, not just `gr.State` - a
+    # queued `change` event must not be able to let a stale scan be analysed. Parameter names
+    # mirror the widget names in `prep_analyze_btn.click(inputs=...)`, which Gradio supplies
+    # positionally; a test asserts the two lists line up.
+    live = fork_prep.LivePrepDeclaration.from_widgets(folder_path, recursive, track_path)
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_analyze_impl(
-            state, event_callback=event_callback, console_logger=console_logger),
+            state, live, event_callback=event_callback, console_logger=console_logger),
         state,
     )
 
@@ -1426,9 +1442,12 @@ def create_ui() -> gr.Blocks:
             outputs=prep_outputs,
             show_progress='hidden',
         )
+        # Analyze takes the LIVE controls as well as the state, for the same reason
+        # `process_btn` does: at click time the state can lag behind the widgets, and analysing a
+        # scan the user is no longer declaring must be impossible, not merely unlikely.
         prep_analyze_btn.click(
             fn=_on_prep_analyze_click,
-            inputs=[prep_state],
+            inputs=[prep_folder, prep_recursive, prep_track, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
         )
