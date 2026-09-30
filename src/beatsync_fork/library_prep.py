@@ -473,10 +473,24 @@ def set_batch_size(state: PrepSessionState, batch_size: Any) -> PrepSessionState
     classification of the whole library — potentially minutes of source fingerprinting — to act on a
     different batch size would be pure waste.
 
-    The report text is left alone too. Re-rendering it here would need the scan's counts and would
-    overwrite a failure message; the button label is the live surface for this value.
+    The report **is** re-rendered, from the scan already in hand. It quotes the batch size
+    (``Analyze batch: 100 per run``, ``This run submits the next 100``), so leaving it alone let the
+    screen contradict itself: widget 50, button "Analyze next 50", report still claiming 100. The
+    handler always used the live value, so that was a reporting bug rather than an execution one —
+    but a report that disagrees with the button is exactly the kind of thing a user trusts over the
+    button. Re-rendering is pure presentation: :meth:`PrepScanResult.render_text` reads only counts
+    already recorded in the scan, so there is no filesystem access, no classification, no runtime
+    identity probe and no new source identity work.
+
+    When there is no scan the existing ``report_text`` is preserved verbatim, because it is then
+    something this value has no business overwriting: the intro, a failure message, or the summary
+    of a batch that just finished.
     """
-    return replace(state, batch_size=normalize_batch_size(batch_size))
+    normalized = normalize_batch_size(batch_size)
+    if state.scan is None:
+        return replace(state, batch_size=normalized)
+    return replace(state, batch_size=normalized,
+                   report_text=state.scan.render_text(batch_size=normalized))
 
 
 def record_scan(state: PrepSessionState, scan: PrepScanResult) -> PrepSessionState:

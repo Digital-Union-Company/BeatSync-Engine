@@ -1707,7 +1707,7 @@ def test_k_changing_the_batch_size_does_not_invalidate_the_scan():
     assert retuned.scan is state.scan, "the SAME scan object must survive"
     assert retuned.can_analyze() is True
     assert retuned.batch_size == 50
-    assert retuned.report_text == state.report_text, "no re-render, no invalidation notice"
+    assert retuned.notice == state.notice, "no invalidation notice"
 
 
 @pytest.mark.parametrize("value,expected", [(50, 50), (1, 1), (5000, 5000),
@@ -2058,3 +2058,226 @@ def test_k_no_incremental_worker_response_was_implemented():
 
     prep_source = open(_PREP, "r", encoding="utf-8").read()
     assert "does not make an in-flight worker resumable" in prep_source
+
+
+# ---------------------------------------------------------------------------
+# K (R1). LIVE REPORT CONSISTENCY
+#
+# Keeping the scan is not the same as keeping its rendered text. The report quotes the batch size,
+# so a retune that left it alone made the screen contradict itself: widget 50, button "Analyze next
+# 50", report still claiming 100. Execution was always correct - the handler reads the live value -
+# so this is reporting consistency, and the fix is presentation only.
+# ---------------------------------------------------------------------------
+
+
+def test_k_r1_retuning_the_batch_size_re_renders_the_report_from_the_same_scan():
+    """The exact reported defect: 1107 outstanding, 100 -> 50, no re-scan."""
+    state = lp.record_scan(lp.initial_state(), _outstanding_scan(1107))
+
+    assert "Analyze batch:     100 per run" in state.report_text
+    assert "This run submits the next 100" in state.report_text
+    assert state.analyze_button_label() == "⚙️ Analyze next 100"
+
+    retuned = lp.set_batch_size(state, 50)
+
+    # the invariant that must NOT change
+    assert retuned.scan is state.scan, "the SAME scan object must survive"
+    assert retuned.can_analyze() is True
+    assert retuned.batch_size == 50
+
+    # the presentation that must now agree with it
+    assert "Analyze batch:     50 per run" in retuned.report_text
+    assert "This run submits the next 50" in retuned.report_text
+    assert retuned.analyze_button_label() == "⚙️ Analyze next 50"
+
+    # and the stale claim is gone
+    assert "Analyze batch:     100 per run" not in retuned.report_text
+    assert "This run submits the next 100" not in retuned.report_text
+
+    # the classification itself is untouched: same counts, same outstanding set
+    assert "New / changed:     1107" in retuned.report_text
+    assert retuned.scan.needs_analysis_count == 1107
+    assert retuned.subset_for_analysis() == state.subset_for_analysis()
+
+
+def test_k_r1_a_second_retune_re_renders_again_and_still_keeps_the_scan():
+    """50 -> 250: presentation only, every time."""
+    state = lp.set_batch_size(lp.record_scan(lp.initial_state(), _outstanding_scan(1107)), 50)
+    original_scan = state.scan
+
+    retuned = lp.set_batch_size(state, 250)
+
+    assert retuned.scan is original_scan
+    assert retuned.batch_size == 250
+    assert "Analyze batch:     250 per run" in retuned.report_text
+    assert "This run submits the next 250" in retuned.report_text
+    # the full stale line, not the bare "50" - which is a substring of "250"
+    assert "Analyze batch:     50 per run" not in retuned.report_text
+    assert "This run submits the next 50;" not in retuned.report_text
+    assert retuned.analyze_button_label() == "⚙️ Analyze next 250"
+
+
+def test_k_r1_the_rendered_report_always_matches_the_button():
+    """The consistency property itself, swept across bounds and library sizes."""
+    for outstanding in (1, 37, 100, 250, 1107, 5000):
+        state = lp.record_scan(lp.initial_state(), _outstanding_scan(outstanding))
+        for size in (1, 7, 50, 100, 250, 5000):
+            retuned = lp.set_batch_size(state, size)
+            submitted = min(size, outstanding)
+            assert retuned.scan is state.scan
+
+            if outstanding > size:
+                assert f"Analyze batch:     {size} per run" in retuned.report_text
+                assert f"This run submits the next {size}" in retuned.report_text
+                assert retuned.analyze_button_label() == f"⚙️ Analyze next {size}"
+            else:
+                assert "Analyze batch:" not in retuned.report_text
+                assert "This run submits all of them." in retuned.report_text
+                assert retuned.analyze_button_label() == f"⚙️ Analyze {outstanding} remaining"
+
+            assert len(retuned.subset_for_analysis_batch(size)) == submitted
+
+
+def test_k_r1_a_retune_re_renders_but_never_re_classifies():
+    """Presentation only: the rendered text is exactly what the recorded scan already says."""
+    scan = _outstanding_scan(1107)
+    state = lp.record_scan(lp.initial_state(), scan)
+
+    retuned = lp.set_batch_size(state, 50)
+
+    # identical to rendering the untouched scan directly at the new size
+    assert retuned.report_text == scan.render_text(batch_size=50)
+
+    # nothing about the classification moved
+    assert retuned.scan is scan
+    assert retuned.scan.classifications is scan.classifications
+    assert retuned.scan.runtime == scan.runtime
+    assert (retuned.scan.supported_count, retuned.scan.prepared_count,
+            retuned.scan.unavailable_count) == (1107, 0, 0)
+    assert retuned.scan.cache_identity_seconds == scan.cache_identity_seconds
+
+
+@pytest.mark.parametrize("preserved", [
+    lp.INTRO_TEXT,
+    "❌ LIBRARY SCAN FAILED\nWinError 3: path not found",
+    "❌ Preparation inputs changed since the scan. Press Scan Library again.",
+    "PREPARATION BATCH COMPLETE\n\nSubmitted this batch:         100\n"
+    "Sources analyzed this batch:  100\n\nPreparation batch finished.\n" + lp.RESCAN_HINT,
+])
+def test_k_r1_with_no_scan_the_existing_report_text_is_preserved(preserved):
+    """A batch-size change may not overwrite the intro, a failure, or a finished batch's summary."""
+    state = lp.PrepSessionState(report_text=preserved)
+    assert state.scan is None
+
+    retuned = lp.set_batch_size(state, 50)
+
+    assert retuned.report_text == preserved, "no scan means nothing to re-render"
+    assert retuned.batch_size == 50
+    assert retuned.scan is None
+    assert retuned.can_analyze() is False
+
+
+def test_k_r1_the_real_no_scan_states_preserve_their_text():
+    """The same property reached through the actual transitions rather than a hand-built state."""
+    prepared = lp.record_scan(lp.initial_state(), _outstanding_scan(1107))
+
+    for state, label in (
+        (lp.initial_state(), "startup"),
+        (lp.record_failure(prepared, "LIBRARY SCAN FAILED\nboom"), "failure"),
+        (lp.record_analysis_complete(
+            prepared, lp.summarize_analysis_run(
+                {"sources_analyzed_this_run": 100, "analysis_seconds": 1.0}, submitted=100)),
+         "batch complete"),
+        (lp.set_folder(prepared, "OTHER"), "folder invalidation"),
+        (lp.set_recursive(prepared, False), "recursive invalidation"),
+    ):
+        assert state.scan is None, label
+        retuned = lp.set_batch_size(state, 50)
+        assert retuned.report_text == state.report_text, label
+        assert retuned.notice == state.notice, label
+        assert retuned.batch_size == 50, label
+        assert retuned.analyze_button_label() == "⚙️ Analyze New / Changed", label
+
+
+def test_k_r1_a_batch_completion_summary_survives_a_retune():
+    """Concretely: the rescan hint must still be on screen after the user fiddles with the box."""
+    prepared = lp.record_scan(lp.initial_state(), _outstanding_scan(1107))
+    finished = lp.record_analysis_complete(
+        prepared, lp.summarize_analysis_run(
+            {"sources_analyzed_this_run": 100, "qwen_jobs_this_run": 100,
+             "analysis_seconds": 1144.0}, submitted=100))
+
+    retuned = lp.set_batch_size(finished, 250)
+
+    assert "PREPARATION BATCH COMPLETE" in retuned.report_text
+    assert "Sources analyzed this batch:  100" in retuned.report_text
+    assert lp.RESCAN_HINT in retuned.report_text
+    assert lp.BATCH_FINISHED_TEXT in retuned.report_text
+    assert "Analyze batch:" not in retuned.report_text, "no scan to render a batch line from"
+
+
+def test_k_r1_set_batch_size_reaches_no_runtime_work_at_all():
+    """Structural: re-rendering must not have smuggled in a probe, a scan or a classification."""
+    body = _body_code(_func(_tree(_PREP), "set_batch_size"))
+
+    for forbidden in (
+        "classify_library_sources", "scan_library_folder", "analyze_video_sources",
+        "_cache_path", "_load_cache", "_video_signature", "_save_cache", "_checkpoint_cache",
+        "_qwen_backend_signature_token", "os.stat", "os.walk", "open(", "build_scan_result",
+        "runtime_identity_from_classification", "RuntimeIdentity(", "_invalidated",
+        "scan=None", "INTRO_TEXT", "LivePrepDeclaration",
+    ):
+        assert forbidden not in body, f"set_batch_size must not reach {forbidden}"
+
+    # The only thing it may render with is the scan it already holds.
+    assert "render_text" in body
+    assert "state.scan.render_text" in body
+    assert "normalize_batch_size" in body
+
+
+def test_k_r1_the_handler_is_still_the_only_gui_seam_and_still_not_an_invalidation(gui):
+    """The GUI wiring is unchanged by R1: same handler, same non-invalidating transition."""
+    tree = _tree(_GUI)
+    kwargs = _change_kwargs(tree, "prep_batch_size")
+
+    assert getattr(kwargs["fn"], "id", None) == "_on_prep_batch_size_change"
+    assert [getattr(n, "id", None) for n in kwargs["inputs"].elts] == \
+        ["prep_batch_size", "prep_state"]
+
+    body = _body_code(_func(tree, "_on_prep_batch_size_change"))
+    assert body.strip() == "return _prep_ui_updates(fork_prep.set_batch_size(state, batch_size))"
+
+    # and no runtime call was reached: the stub recorder saw nothing
+    _namespace, recorder, _track = gui
+    assert recorder.scan_calls == [] and recorder.classify_calls == []
+    assert recorder.analyze_calls == [] and recorder.beats_calls == []
+
+
+def test_k_r1_analyze_still_uses_the_live_widget_not_the_re_rendered_state(gui):
+    """The queued-event design is unchanged: the live value wins even over a retuned state."""
+    namespace, recorder, _track = gui
+    scanned = _scan_with_outstanding(namespace, recorder, 250)
+
+    # the user retuned to 50 (state re-rendered), but the widget now reads 25 at click time
+    retuned = lp.set_batch_size(scanned, 50)
+    assert retuned.batch_size == 50
+    assert "This run submits the next 50" in retuned.report_text
+
+    namespace["_prep_analyze_impl"](retuned, _live_for(retuned.scan), 25)
+
+    assert len(recorder.analyze_calls) == 1
+    assert len(recorder.analyze_calls[0]["video_files"]) == 25, "the LIVE widget, not the state"
+
+
+def test_k_r1_folder_and_recursive_still_invalidate_after_a_retune():
+    """The asymmetry survives R1: presentation re-render for batch size, real drop for the rest."""
+    state = lp.set_batch_size(lp.record_scan(lp.initial_state(), _outstanding_scan(1107)), 50)
+    assert state.scan is not None and "next 50" in state.report_text
+
+    for change, label in ((lambda s: lp.set_folder(s, "OTHER"), "folder"),
+                          (lambda s: lp.set_recursive(s, False), "recursive")):
+        changed = change(state)
+        assert changed.scan is None, label
+        assert changed.can_analyze() is False, label
+        assert changed.report_text == lp.INTRO_TEXT, label
+        assert changed.batch_size == 50, "the chosen batch size still survives an invalidation"

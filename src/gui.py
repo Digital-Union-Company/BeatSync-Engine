@@ -931,12 +931,16 @@ def _on_prep_recursive_change(recursive: bool, state) -> Tuple:
 
 
 def _on_prep_batch_size_change(batch_size, state) -> Tuple:
-    """Relabel the Analyze button. Deliberately NOT an invalidation.
+    """Relabel the Analyze button and re-render the report. Deliberately NOT an invalidation.
 
     Batch size is execution policy, not classification identity: it decides how many of the already
     classified outstanding sources one click submits, and changes nothing about how any of them were
     classified. `fork_prep.set_batch_size` therefore keeps the recorded scan, unlike every handler
     above it, so a user may retune this between Scan and Analyze without paying for a re-scan.
+
+    The report is re-rendered from that same scan because it quotes the batch size; leaving it alone
+    let the screen say "Analyze next 50" above a report still claiming 100. That is presentation
+    only - no folder scan, no classification, no identity probe.
     """
     return _prep_ui_updates(fork_prep.set_batch_size(state, batch_size))
 

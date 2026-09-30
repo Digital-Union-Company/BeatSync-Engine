@@ -1095,6 +1095,15 @@ Load-bearing details:
   through `_invalidated`, and the retuned state keeps the *same* scan object. Folder and recursive
   still invalidate. That asymmetry is the whole design — a scan valid at 100 is exactly as valid at
   50, and re-fingerprinting 1107 sources to act on a different bound would be pure waste.
+- **Keeping the scan is not the same as keeping its rendered text.** The report quotes the batch size
+  (`Analyze batch: 100 per run`, `This run submits the next 100`), so `set_batch_size` re-renders it
+  from the scan already in hand; otherwise the screen contradicted itself — widget 50, button
+  "Analyze next 50", report still claiming 100. That was only ever a *reporting* bug, since the
+  handler always used the live value, but a report disagreeing with the button is what a user
+  believes. Re-rendering reads only counts already recorded in the scan: no filesystem access, no
+  classification, no identity probe. With **no** scan recorded the existing text is preserved
+  verbatim, because it is then the intro, a failure message or a finished batch's summary — none of
+  which a batch-size change may overwrite.
 - **Analyze reads the live widget, Scan does not receive it at all.** `prep_analyze_btn` inputs are
   `[prep_folder, prep_recursive, prep_batch_size, prep_state]` and a test pins that against
   `_on_prep_analyze_click`'s parameter order; `prep_scan_btn` keeps `[prep_folder, prep_recursive,
