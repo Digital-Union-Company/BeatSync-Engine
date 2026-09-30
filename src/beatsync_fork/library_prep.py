@@ -22,6 +22,30 @@ Two boundaries are load-bearing:
   input to this workflow, no Stage 1–4 pass during a scan, and nothing here that could bind a
   preparation to one song or one edit style. Music/edit interpretation is downstream, in Stage 6 and
   in any future creative/director layer, and it is ephemeral per render.
+
+Bounded analysis batches
+------------------------
+
+Scan still classifies the **whole** library in one pass — that is the P.1 rule and it is unchanged.
+What one Analyze click submits is now bounded: :data:`DEFAULT_ANALYZE_BATCH_SIZE` sources at a time,
+taken as a prefix of the already-frozen :meth:`PrepScanResult.subset_for_analysis` ordering.
+
+The reason is a property of Stage 5's shared worker, not a deficiency of the cache. Stage 5 batches
+multiple videos into one Qwen worker process, and that worker writes its response JSON only after its
+**entire** job loop finishes, so the parent can checkpoint individual completed records only once the
+whole batch returns. Submitting 1107 sources therefore exposes the whole library to a single
+all-or-nothing worker invocation. Bounding the submission bounds that exposure.
+
+Two things this deliberately does **not** claim:
+
+* It does not make an in-flight worker resumable. If a batch's worker dies before producing its
+  response, that batch may still need repeating — the bound only limits how much work that costs.
+* It is not a library cap. A 5000-source scan still reports 5000 needing analysis; the batch size
+  only decides how many of them one click submits.
+
+Batch size is *execution policy*, never classification identity: it is absent from
+:class:`LivePrepDeclaration`, from :class:`PrepScanResult` and from :class:`RuntimeIdentity`, so
+changing it never invalidates a scan and never reaches a cache key.
 """
 
 from __future__ import annotations
@@ -34,6 +58,19 @@ from typing import Any, Iterable, Mapping
 from beatsync_fork.input_report import format_seconds
 
 DEFAULT_RECURSIVE = True
+
+DEFAULT_ANALYZE_BATCH_SIZE = 100
+"""How many outstanding sources one Analyze click submits, unless the user says otherwise.
+
+The value is a durability boundary, not a performance tuning constant, and it lives here — in the
+stdlib-only module — rather than in the GUI so there is exactly one definition of it.
+
+Scale for the choice: the measured P2 acceptance run analysed 41 sources producing 509 Qwen tags in
+490.8 s. A batch near 100 therefore lands in the tens-of-minutes range while still amortising one
+Qwen model load across many sources. That is an *order of magnitude*, not a promise: per-source cost
+tracks candidate count and clip length, both of which vary by more than 10x across a real library, so
+no UI text may present a batch as having a known duration.
+"""
 
 SEMANTIC_MODE_TEXT = "media-neutral"
 """What the persisted Stage-5 semantics describe. Not a user-selectable mode — a statement of the
@@ -50,7 +87,43 @@ BACKEND_UNVERIFIED_TEXT = (
     "Check the llama.cpp binaries and the GGUF model files, then scan again."
 )
 
-RESCAN_HINT = "Press Scan Library to refresh the prepared / needs-analysis counts."
+RESCAN_HINT = "Press Scan Library to refresh the prepared / remaining counts."
+
+BATCH_FINISHED_TEXT = "Preparation batch finished."
+
+
+def normalize_batch_size(value: Any) -> int:
+    """Coerce any UI value to a usable batch size; anything else is the default.
+
+    Same explicit-type boundary as ``variation.normalize_seed``, and for the same reason: a Gradio
+    number box yields floats, an emptied box yields ``None``, and a hand-typed value can be anything
+    at all. None of it may raise in the middle of a preparation run, and none of it may be *guessed
+    at* — ``100.5`` is not a request for 100, and ``True`` is not a request for 1. Truncating either
+    would silently submit a batch the user never asked for, so a fractional or otherwise malformed
+    value falls back to :data:`DEFAULT_ANALYZE_BATCH_SIZE` rather than acquiring a surprising meaning.
+
+    ``bool`` is rejected first because it subclasses ``int``. Only a plain decimal integer string is
+    accepted; ``"100.0"`` is not.
+
+    There is deliberately **no upper bound**. This is a batch size, not a library-size limit: a
+    5000-source library is legitimate, and clamping here would quietly turn execution policy into a
+    cap on what the product supports.
+    """
+    if isinstance(value, bool):
+        return DEFAULT_ANALYZE_BATCH_SIZE
+    if isinstance(value, int):
+        return value if value >= 1 else DEFAULT_ANALYZE_BATCH_SIZE
+    if isinstance(value, float):
+        # `is_integer()` is False for NaN and both infinities, so they need no separate guard.
+        if value.is_integer() and value >= 1:
+            return int(value)
+        return DEFAULT_ANALYZE_BATCH_SIZE
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdecimal():
+            size = int(text)
+            return size if size >= 1 else DEFAULT_ANALYZE_BATCH_SIZE
+    return DEFAULT_ANALYZE_BATCH_SIZE
 
 
 class PrepStatus(str, Enum):
@@ -246,10 +319,22 @@ class PrepScanResult:
         return tuple(item.path for item in self.classifications
                      if item.status is PrepStatus.NEEDS_ANALYSIS and item.path)
 
+    def subset_for_analysis_batch(self, limit: Any = None) -> tuple[str, ...]:
+        """The paths **one** Analyze click submits: a prefix of :meth:`subset_for_analysis`.
+
+        A plain prefix of the already-frozen ordering, and nothing else — no shuffling, no
+        re-ranking, no deduplication, no rescan and no new classification. Determinism is the point:
+        clicking Analyze repeatedly must walk the outstanding list in order rather than resampling
+        it, so every source is reached and none is reached twice within one scan.
+
+        When fewer sources are outstanding than the limit, all of them are returned.
+        """
+        return self.subset_for_analysis()[:normalize_batch_size(limit)]
+
     def can_analyze(self) -> bool:
         return bool(self.runtime.is_usable() and self.subset_for_analysis())
 
-    def render_text(self) -> str:
+    def render_text(self, batch_size: Any = None) -> str:
         lines = [
             "MEDIA LIBRARY PREPARATION",
             "",
@@ -264,10 +349,16 @@ class PrepScanResult:
             return "\n".join(lines)
 
         needs = self.needs_analysis_count
+        limit = normalize_batch_size(batch_size)
         lines.append(f"Prepared:          {self.prepared_count}")
         lines.append(f"New / changed:     {needs}{self._reason_suffix()}")
         if self.unavailable_count:
             lines.append(f"Unreadable:        {self.unavailable_count}")
+        if needs > limit:
+            # Both facts, side by side, but only when they differ: the whole outstanding set and
+            # what one click submits. When the batch covers everything the closing line says so, and
+            # repeating the same number under a second name would be noise, not information.
+            lines.append(f"Analyze batch:     {limit} per run")
         lines.append(f"Semantic tagging:  {'enabled' if self.runtime.ai_available else 'disabled'}")
         lines.append(
             "Scan time:         "
@@ -276,8 +367,11 @@ class PrepScanResult:
             f"records {format_seconds(self.cache_lookup_seconds)}"
         )
         lines.append("")
-        if needs:
-            lines.append(f"Ready to analyze {needs} video(s).")
+        if needs > limit:
+            lines.append(f"Ready to analyze {needs} video(s). This run submits the next {limit}; "
+                         "scan again afterwards to continue.")
+        elif needs:
+            lines.append(f"Ready to analyze {needs} video(s). This run submits all of them.")
         elif self.supported_count:
             lines.append("Everything in this library is prepared.")
         else:
@@ -310,19 +404,37 @@ class PrepSessionState:
     notice: str = ""
     """Short one-line status shown under the buttons; never the authority on anything."""
 
+    batch_size: int = DEFAULT_ANALYZE_BATCH_SIZE
+    """Execution policy, carried so the UI can label itself. **Not** classification identity.
+
+    It survives every invalidation (``_invalidated`` replaces the scan, not this), it is absent from
+    :class:`LivePrepDeclaration`, and the Analyze handler uses the *live* widget value rather than
+    this one — so this field is a display convenience and never the authority on what gets submitted.
+    """
+
     def can_analyze(self) -> bool:
         return self.scan is not None and self.scan.can_analyze()
 
-    def analyze_button_label(self) -> str:
+    def analyze_button_label(self, batch_size: Any = None) -> str:
+        """Name the work one click will do. ``batch_size`` overrides the stored value when given."""
         if self.scan is None:
             return "⚙️ Analyze New / Changed"
         count = self.scan.needs_analysis_count
         if not count or not self.scan.runtime.is_usable():
             return "⚙️ Analyze New / Changed"
-        return f"⚙️ Analyze {count} new / changed video{'s' if count != 1 else ''}"
+        limit = normalize_batch_size(self.batch_size if batch_size is None else batch_size)
+        if count <= limit:
+            return f"⚙️ Analyze {count} remaining"
+        return f"⚙️ Analyze next {limit}"
 
     def subset_for_analysis(self) -> tuple[str, ...]:
         return () if self.scan is None else self.scan.subset_for_analysis()
+
+    def subset_for_analysis_batch(self, limit: Any = None) -> tuple[str, ...]:
+        if self.scan is None:
+            return ()
+        return self.scan.subset_for_analysis_batch(
+            self.batch_size if limit is None else limit)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +464,35 @@ def set_recursive(state: PrepSessionState, recursive: bool) -> PrepSessionState:
     )
 
 
+def set_batch_size(state: PrepSessionState, batch_size: Any) -> PrepSessionState:
+    """Record a new batch size **without** touching the recorded scan.
+
+    Deliberately not routed through :func:`_invalidated`. Batch size is execution policy: it changes
+    how much of the outstanding set one click submits, and changes nothing about how those sources
+    were classified. A scan that was valid at 100 is exactly as valid at 50, so requiring a fresh
+    classification of the whole library — potentially minutes of source fingerprinting — to act on a
+    different batch size would be pure waste.
+
+    The report **is** re-rendered, from the scan already in hand. It quotes the batch size
+    (``Analyze batch: 100 per run``, ``This run submits the next 100``), so leaving it alone let the
+    screen contradict itself: widget 50, button "Analyze next 50", report still claiming 100. The
+    handler always used the live value, so that was a reporting bug rather than an execution one —
+    but a report that disagrees with the button is exactly the kind of thing a user trusts over the
+    button. Re-rendering is pure presentation: :meth:`PrepScanResult.render_text` reads only counts
+    already recorded in the scan, so there is no filesystem access, no classification, no runtime
+    identity probe and no new source identity work.
+
+    When there is no scan the existing ``report_text`` is preserved verbatim, because it is then
+    something this value has no business overwriting: the intro, a failure message, or the summary
+    of a batch that just finished.
+    """
+    normalized = normalize_batch_size(batch_size)
+    if state.scan is None:
+        return replace(state, batch_size=normalized)
+    return replace(state, batch_size=normalized,
+                   report_text=state.scan.render_text(batch_size=normalized))
+
+
 def record_scan(state: PrepSessionState, scan: PrepScanResult) -> PrepSessionState:
     if not scan.runtime.is_usable():
         notice = "Preparation unavailable — Qwen backend identity could not be verified."
@@ -359,7 +500,8 @@ def record_scan(state: PrepSessionState, scan: PrepScanResult) -> PrepSessionSta
         notice = f"{scan.needs_analysis_count} video(s) need analysis."
     else:
         notice = "Library is fully prepared."
-    return replace(state, scan=scan, report_text=scan.render_text(), notice=notice)
+    return replace(state, scan=scan,
+                   report_text=scan.render_text(batch_size=state.batch_size), notice=notice)
 
 
 def record_failure(state: PrepSessionState, message: str,
@@ -374,13 +516,18 @@ def record_failure(state: PrepSessionState, message: str,
 
 
 def record_analysis_complete(state: PrepSessionState, summary: str) -> PrepSessionState:
-    """Drop the recorded scan after a preparation run and show what the run did.
+    """Drop the recorded scan after a preparation batch and show what the batch did.
 
     The scan must not survive: its counts describe the library as it was *before* the analysis, so
-    keeping them would claim work is still outstanding that has just been done. Re-scanning is the
-    user's explicit choice — preparation never silently re-classifies a 902-source library.
+    keeping them would claim work is still outstanding that has just been done. That is true for a
+    bounded batch as well — the batch consumed a prefix of the outstanding set, so every count in the
+    recorded scan is now stale. Re-scanning is the user's explicit choice; preparation never silently
+    re-classifies a 1107-source library, and it never subtracts the batch size from the old count and
+    presents the result as fact, because sources can also change on disk between clicks.
+
+    ``batch_size`` survives, so the next scan labels itself with the size the user chose.
     """
-    return replace(state, scan=None, report_text=summary, notice="Preparation run finished.")
+    return replace(state, scan=None, report_text=summary, notice=BATCH_FINISHED_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -482,13 +629,21 @@ def runtime_identity_from_classification(result: Any, *, qwen_enabled: bool) -> 
     )
 
 
-def summarize_analysis_run(result: Any) -> str:
-    """One short block describing what a preparation run actually did.
+def summarize_analysis_run(result: Any, submitted: Any = None) -> str:
+    """One short block describing what a preparation batch actually did.
 
     Sourced exclusively from the R1 ``*_this_run`` fields. The unsuffixed ``qwen_*`` aggregates in
     the same payload sum over every returned record including cache hits, so quoting them here would
     reproduce the exact reporting defect R1 fixed — a preparation run of 4 sources reporting the
     whole library's historical tag count.
+
+    ``submitted`` is what the caller handed the analyzer, which is knowable without trusting the
+    result payload at all; it is reported separately from what the analyzer says it analysed so the
+    two can visibly disagree rather than one silently standing in for the other.
+
+    Nothing here states a remaining count. The scan that knew the old total has just been dropped as
+    stale, and the library can change on disk between clicks, so the only honest remaining figure
+    comes from a fresh scan — which is what :data:`RESCAN_HINT` asks for.
     """
     mapping = result if isinstance(result, Mapping) else {}
     analyzed = _int(mapping.get("sources_analyzed_this_run"))
@@ -497,16 +652,20 @@ def summarize_analysis_run(result: Any) -> str:
     requested = _int(mapping.get("qwen_requested_count_this_run"))
     incomplete = _int(mapping.get("qwen_incomplete_jobs_this_run"))
 
-    lines = ["PREPARATION RUN COMPLETE", "", f"Sources analyzed:  {analyzed}"]
+    lines = ["PREPARATION BATCH COMPLETE", ""]
+    if submitted is not None:
+        lines.append(f"Submitted this batch:         {_int(submitted)}")
+    lines.append(f"Sources analyzed this batch:  {analyzed}")
     if jobs:
-        detail = f"Qwen:              {jobs} job(s), {tags}/{requested} tags"
+        detail = f"Qwen:                         {jobs} job(s), {tags}/{requested} tags"
         if incomplete:
             detail += f", {incomplete} incomplete (not cached)"
         lines.append(detail)
     else:
-        lines.append("Qwen:              no inference this run")
-    lines.append(f"Analysis time:     {format_seconds(mapping.get('analysis_seconds'))}")
-    lines.extend(["", RESCAN_HINT])
+        lines.append("Qwen:                         no inference this run")
+    lines.append(
+        f"Analysis time:                {format_seconds(mapping.get('analysis_seconds'))}")
+    lines.extend(["", BATCH_FINISHED_TEXT, RESCAN_HINT])
     return "\n".join(lines)
 
 
@@ -519,6 +678,8 @@ def _int(value: Any) -> int:
 
 __all__ = [
     "BACKEND_UNVERIFIED_TEXT",
+    "BATCH_FINISHED_TEXT",
+    "DEFAULT_ANALYZE_BATCH_SIZE",
     "DEFAULT_RECURSIVE",
     "INTRO_TEXT",
     "LivePrepDeclaration",
@@ -535,10 +696,12 @@ __all__ = [
     "build_scan_result",
     "declaration_refusal",
     "initial_state",
+    "normalize_batch_size",
     "record_analysis_complete",
     "record_failure",
     "record_scan",
     "runtime_identity_from_classification",
+    "set_batch_size",
     "set_folder",
     "set_recursive",
     "summarize_analysis_run",

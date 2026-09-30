@@ -20,6 +20,38 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-30 (Media Library Preparation: bounded analysis batches)
+
+Preparation's Analyze click now submits one bounded batch of the outstanding sources instead of all
+of them. Default **100**, exposed as an `Analyze batch size` control.
+
+- **Why.** Stage 5 batches multiple videos into one shared Qwen worker, and that worker writes its
+  response JSON only after its entire job loop finishes — so the parent can checkpoint completed
+  semantic records only once the whole batch returns. A cold 1107-source library therefore exposed
+  every source to a single all-or-nothing worker invocation. Bounding the submission bounds that
+  interruption/retry exposure while still amortising one Qwen model load across each batch.
+- **Not incremental worker checkpointing.** The Qwen worker was **not** modified and an interrupted
+  in-flight batch does **not** resume internally — if its worker dies before producing a response,
+  that batch may need repeating. The change limits how much work one failure costs, nothing more.
+- **Not a library cap.** A 5000-source scan still reports 5000 needing analysis; `normalize_batch_size`
+  has no upper bound and the number box carries no `maximum`. Scan still classifies the whole library
+  in one pass (the P.1 rule, unchanged).
+- **Batch size is execution policy, not classification identity.** It is absent from
+  `LivePrepDeclaration`, `PrepScanResult` and `RuntimeIdentity`; `set_batch_size` keeps the recorded
+  scan, so retuning the bound between Scan and Analyze needs no re-scan. Folder and recursive still
+  invalidate. Analyze reads the **live** widget value; Scan does not receive it at all.
+- **No cache or contract change.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and
+  `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`. `src/video_analysis.py` was not
+  modified by this change at all, no cache payload gained a field, and persistence remains entirely
+  with the existing `analyze_video_sources` → `_checkpoint_cache` path. P2 media-neutral semantics are
+  unchanged.
+- **Reporting.** The post-run summary states what was submitted and what was analysed for that batch
+  and then asks for a re-scan; it never presents `old outstanding − N` as an authoritative remaining
+  count, because sources can change on disk between clicks. No UI text claims a batch has a known
+  duration.
+- Files: `src/beatsync_fork/library_prep.py`, `src/gui.py`, `src/ui_content.py`,
+  `tests/test_library_preparation.py`.
+
 ### Changed — 2026-09-30 (P2: persisted Stage-5 semantics are media-neutral)
 
 Stage 5's Qwen semantics now describe the **video itself** rather than the video as seen through one

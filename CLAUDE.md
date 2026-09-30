@@ -994,7 +994,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
-| `library_prep.py` | media library preparation: classification vocabulary, scan state, report text (trackless since P2) |
+| `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 
 ### Media Library Preparation (P V1 + P2)
 
@@ -1041,7 +1041,8 @@ now costs folder enumeration + source identity (the D2 bounded fingerprints) + c
   backend token, the config token and the effective Qwen mode. That is the whole list: `config_token`
   covers the three Qwen env knobs, and after P2 there is nothing else in identity for a preparation
   to bind. The P V1 track check (path/size/`mtime_ns` plus the derived preset) is **retired**, and a
-  test asserts `analyze_refusal` acquired no substitute for it.
+  test asserts `analyze_refusal` acquired no substitute for it. **Analyze batch size is deliberately
+  not on that list** — see the bounded-batch section below.
 - **Analyze takes the live preparation controls, not just `gr.State`.** Gradio delivers widget
   changes as separate queued events, so a user can retarget the folder or the recursive flag and click
   Analyze before the `change` handler has run — which would analyse the *previous* library's
@@ -1060,6 +1061,68 @@ now costs folder enumeration + source identity (the D2 bounded fingerprints) + c
   contract bump is about the Qwen prompt, not about preparation.)
 - **Progress:** a trackless scan has no Stages 1–4 to report, so it shows only Stage 0 under the
   `library_classify` phase; Analyze uses the existing Stage 5 events. Do not fake the removed stages.
+
+#### Analyze submits one bounded batch
+
+Scan still classifies the **whole** library — that is the P.1 rule and it is unchanged. What one
+Analyze click submits is bounded by `library_prep.DEFAULT_ANALYZE_BATCH_SIZE` (**100**), exposed as an
+`Analyze batch size` number box and taken as a prefix of the already-frozen
+`subset_for_analysis()` ordering via `subset_for_analysis_batch(limit)`.
+
+**The reason is a property of Stage 5's shared worker, not a deficiency of the cache.** Stage 5
+batches multiple videos into one Qwen worker process, and that worker writes its response JSON only
+after its **entire** job loop finishes — so the parent can checkpoint individual completed records
+only once the whole batch returns (this is the same D1 boundary already documented above: "while the
+shared worker is still in flight its per-job results are not durable at all"). Submitting a cold
+1107-source library therefore exposed all of it to a single all-or-nothing worker invocation.
+Bounding the submission bounds that exposure.
+
+Two claims this explicitly does **not** make:
+
+- **It does not make an in-flight worker resumable.** If a batch's worker dies before producing its
+  response, that batch may still need repeating; the bound only limits what that costs. The worker
+  was **not** modified — incremental worker responses remain possible future work, and a test asserts
+  no such machinery was invented here.
+- **It is not a library cap.** A 5000-source scan still reports 5000 needing analysis; the batch size
+  only decides how many of them one click submits. `normalize_batch_size` therefore has **no upper
+  bound** and the `gr.Number` carries no `maximum`. Tests pin both.
+
+Load-bearing details:
+
+- **Batch size is execution policy, never classification identity.** It is absent from
+  `LivePrepDeclaration`, from `PrepScanResult` and from `RuntimeIdentity`, so changing it never
+  invalidates a scan: `set_batch_size` is the one preparation transition that does **not** route
+  through `_invalidated`, and the retuned state keeps the *same* scan object. Folder and recursive
+  still invalidate. That asymmetry is the whole design — a scan valid at 100 is exactly as valid at
+  50, and re-fingerprinting 1107 sources to act on a different bound would be pure waste.
+- **Keeping the scan is not the same as keeping its rendered text.** The report quotes the batch size
+  (`Analyze batch: 100 per run`, `This run submits the next 100`), so `set_batch_size` re-renders it
+  from the scan already in hand; otherwise the screen contradicted itself — widget 50, button
+  "Analyze next 50", report still claiming 100. That was only ever a *reporting* bug, since the
+  handler always used the live value, but a report disagreeing with the button is what a user
+  believes. Re-rendering reads only counts already recorded in the scan: no filesystem access, no
+  classification, no identity probe. With **no** scan recorded the existing text is preserved
+  verbatim, because it is then the intro, a failure message or a finished batch's summary — none of
+  which a batch-size change may overwrite.
+- **Analyze reads the live widget, Scan does not receive it at all.** `prep_analyze_btn` inputs are
+  `[prep_folder, prep_recursive, prep_batch_size, prep_state]` and a test pins that against
+  `_on_prep_analyze_click`'s parameter order; `prep_scan_btn` keeps `[prep_folder, prep_recursive,
+  prep_state]`, because how much of a classification one click later consumes cannot affect how any
+  source was classified. A live batch size differing from the stored one is **not** a stale scan and
+  must never be refused as one.
+- **`normalize_batch_size` mirrors `variation.normalize_seed`.** `bool` rejected first (it subclasses
+  `int`), whole positive ints and whole positive floats accepted, plain decimal strings accepted, and
+  **fractional values fall back to the default rather than being floored** — `100.5` is not a request
+  for 100, and truncating would submit a batch the user never chose. Nothing here may raise mid-run.
+- **After a batch the scan is dropped, exactly as before.** Its counts describe the library as it was
+  before the run. The summary reports `Submitted this batch` and `Sources analyzed this batch` and
+  then asks for a re-scan; it **never** prints `old outstanding − N` as a remaining count, because the
+  library can also change on disk between clicks. A test asserts `summarize_analysis_run` contains no
+  subtraction at all. Preparation never silently re-scans 1107 sources on the user's behalf.
+- **No cache change whatsoever.** `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched, no
+  cache payload gained a field, and `video_analysis.py` was **not modified by this feature at all** —
+  a test asserts the batch names appear nowhere in it. Persistence stays entirely with the existing
+  `analyze_video_sources` → `_checkpoint_cache` path; bounding the input adds no write path.
 
 ### Persisted Stage-5 semantics are media-neutral (P2)
 
