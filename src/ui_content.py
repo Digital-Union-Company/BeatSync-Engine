@@ -405,6 +405,13 @@ INFO_PREP_FOLDER = (
     "live in temporary folders that are cleared on restart, so preparing them would be pointless."
 )
 LABEL_PREP_RECURSIVE = "Include subfolders"
+LABEL_PREP_BATCH_SIZE = "Analyze batch size"
+INFO_PREP_BATCH_SIZE = (
+    "How many outstanding videos one Analyze click submits. Scanning always classifies the whole "
+    "library; this only bounds how much work goes to a single analysis run, so an interruption "
+    "costs at most one batch. Scan again after each batch to continue. Changing this does not "
+    "require a new scan."
+)
 LABEL_PREP_SCAN = "🔍 Scan Library"
 LABEL_PREP_ANALYZE = "⚙️ Analyze New / Changed"
 LABEL_PREP_REPORT = "📋 Preparation Status"

@@ -930,6 +930,17 @@ def _on_prep_recursive_change(recursive: bool, state) -> Tuple:
     return _prep_ui_updates(fork_prep.set_recursive(state, recursive))
 
 
+def _on_prep_batch_size_change(batch_size, state) -> Tuple:
+    """Relabel the Analyze button. Deliberately NOT an invalidation.
+
+    Batch size is execution policy, not classification identity: it decides how many of the already
+    classified outstanding sources one click submits, and changes nothing about how any of them were
+    classified. `fork_prep.set_batch_size` therefore keeps the recorded scan, unlike every handler
+    above it, so a user may retune this between Scan and Analyze without paying for a re-scan.
+    """
+    return _prep_ui_updates(fork_prep.set_batch_size(state, batch_size))
+
+
 def _resolve_prep_qwen_runtime() -> Tuple[bool, str]:
     """Resolve Qwen enablement and model path exactly as the normal Auto Mode render path does.
 
@@ -1010,9 +1021,9 @@ def _prep_scan_impl(folder_path: str, recursive: bool, state,
     return fork_prep.record_scan(state, scan)
 
 
-def _prep_analyze_impl(state, live, event_callback=None,
+def _prep_analyze_impl(state, live, batch_size=None, event_callback=None,
                        console_logger: StageConsoleLogger | None = None):
-    """Analyze only the subset the recorded scan classified as needing work.
+    """Analyze one bounded batch of the subset the recorded scan classified as needing work.
 
     `live` is the preparation controls as the widgets declare them at click time, and checking it
     comes **first** - before the runtime identity is recomputed and long before anything is
@@ -1021,6 +1032,11 @@ def _prep_analyze_impl(state, live, event_callback=None,
     without this guard the previous library's classification would be analysed while the screen
     declared something else. It is the same reason `process_video_guarded` takes the live source
     controls rather than trusting `gr.State` alone.
+
+    `batch_size` is the live batch widget, and it is deliberately NOT part of `live`: it is not a
+    classification input, so a value that disagrees with the recorded state is not a stale scan and
+    must not be refused. It is read here rather than from the state for the same queued-event reason
+    the folder is - the user may retune it and click immediately.
 
     [FORK] Digital-Union (P2): Stage 5 is called media-neutrally - no audio profile is forwarded,
     because none of it reaches the Qwen prompt, the Qwen request or the cache key any more.
@@ -1050,9 +1066,12 @@ def _prep_analyze_impl(state, live, event_callback=None,
     if refusal is not None:
         return fork_prep.record_failure(state, refusal, notice="Preparation run refused.")
 
-    # The P.1 rule: only the classified subset. For the measured 902-source library that is 4 paths,
-    # not 902. The analyzer re-derives each selected source's own identity, which is correct.
-    subset = list(scan.subset_for_analysis())
+    # The P.1 rule: only the classified subset, and only one bounded batch of it. For the measured
+    # 902-source library the subset is 4 paths, not 902; for a cold 1107-source library it is 1107,
+    # and the batch bound is what stops all of it reaching one shared Qwen worker whose response -
+    # and therefore every checkpoint in it - arrives only after its whole job loop finishes.
+    # The analyzer re-derives each selected source's own identity, which is correct.
+    subset = list(scan.subset_for_analysis_batch(batch_size))
     try:
         result = analyze_video_sources(
             video_files=subset,
@@ -1066,7 +1085,8 @@ def _prep_analyze_impl(state, live, event_callback=None,
             state, f"PREPARATION ANALYSIS FAILED\n{exc}", notice="Preparation run failed.")
 
     _stage5_summary(console_logger, result if isinstance(result, dict) else None)
-    return fork_prep.record_analysis_complete(state, fork_prep.summarize_analysis_run(result))
+    return fork_prep.record_analysis_complete(
+        state, fork_prep.summarize_analysis_run(result, submitted=len(subset)))
 
 
 def _run_prep_in_worker(work, state) -> Iterator[Tuple]:
@@ -1132,15 +1152,21 @@ def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tu
     )
 
 
-def _on_prep_analyze_click(folder_path: str, recursive: bool, state) -> Iterator[Tuple]:
+def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
+                           state) -> Iterator[Tuple]:
     # The live preparation controls are inputs to the Analyze request, not just `gr.State` - a
     # queued `change` event must not be able to let a stale scan be analysed. Parameter names
     # mirror the widget names in `prep_analyze_btn.click(inputs=...)`, which Gradio supplies
     # positionally; a test asserts the two lists line up.
+    #
+    # `batch_size` is passed separately and is absent from `LivePrepDeclaration` on purpose: the
+    # declaration describes the *classification* (folder, recursive), and a batch-size change must
+    # never be read as "the scan no longer describes what the user is declaring".
     live = fork_prep.LivePrepDeclaration.from_widgets(folder_path, recursive)
     yield from _run_prep_in_worker(
         lambda event_callback, console_logger: _prep_analyze_impl(
-            state, live, event_callback=event_callback, console_logger=console_logger),
+            state, live, batch_size,
+            event_callback=event_callback, console_logger=console_logger),
         state,
     )
 
@@ -1306,6 +1332,16 @@ def create_ui() -> gr.Blocks:
                     prep_recursive = gr.Checkbox(
                         value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
                     )
+                    # No `maximum`: this bounds one analysis run, never the supported library size.
+                    # The default is the preparation module's constant, not a literal repeated here.
+                    prep_batch_size = gr.Number(
+                        value=fork_prep.DEFAULT_ANALYZE_BATCH_SIZE,
+                        precision=0,
+                        minimum=1,
+                        label=LABEL_PREP_BATCH_SIZE,
+                        info=INFO_PREP_BATCH_SIZE,
+                        elem_id='prep-batch-size',
+                    )
                     prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
                     prep_report = gr.Textbox(
                         label=LABEL_PREP_REPORT,
@@ -1383,7 +1419,8 @@ def create_ui() -> gr.Blocks:
         #
         # Every classification input - folder and recursive, which after P2 is all of them - clears
         # the recorded scan, which is what stops Analyze from acting on a classification that no
-        # longer describes reality.
+        # longer describes reality. Batch size is wired here too but is explicitly NOT one of them:
+        # it changes how much of a valid classification one click consumes, not what it says.
         prep_outputs = [prep_report, prep_status, prep_analyze_btn, prep_state]
 
         prep_folder.change(
@@ -1396,6 +1433,16 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_recursive, prep_state],
             outputs=prep_outputs,
         )
+        # Batch size is the one preparation control that does NOT clear the scan: it is execution
+        # policy, not a classification input, so the recorded classification stays exactly as valid.
+        # This handler only relabels the Analyze button.
+        prep_batch_size.change(
+            fn=_on_prep_batch_size_change,
+            inputs=[prep_batch_size, prep_state],
+            outputs=prep_outputs,
+        )
+        # Scan classifies the whole library and takes no batch size: how much of the result one
+        # click later submits has no bearing on how any source is classified.
         prep_scan_btn.click(
             fn=_on_prep_scan_click,
             inputs=[prep_folder, prep_recursive, prep_state],
@@ -1404,10 +1451,11 @@ def create_ui() -> gr.Blocks:
         )
         # Analyze takes the LIVE controls as well as the state, for the same reason
         # `process_btn` does: at click time the state can lag behind the widgets, and analysing a
-        # scan the user is no longer declaring must be impossible, not merely unlikely.
+        # scan the user is no longer declaring must be impossible, not merely unlikely. The live
+        # batch size rides along so the bound applied is the one currently on screen.
         prep_analyze_btn.click(
             fn=_on_prep_analyze_click,
-            inputs=[prep_folder, prep_recursive, prep_state],
+            inputs=[prep_folder, prep_recursive, prep_batch_size, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
         )
