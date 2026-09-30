@@ -36,8 +36,9 @@ def creative_profile(beat_info: Dict | None) -> fork_creative.CreativeProfile:
     """[FORK] Digital-Union: read the resolved Creative Profile off the shared ``beat_info`` bus.
 
     The single reader. Absent, malformed or stale creative state resolves to the all-neutral profile
-    — current main — because a planner must never raise on a bus it did not write. A Phase A
-    ``{"seed": n}`` dict still resolves correctly, with the three newer controls left neutral.
+    — current main — because a planner must never raise on a bus it did not write. Older buses still
+    resolve correctly with whatever they do not carry left neutral: a Phase A ``{"seed": n}`` dict,
+    and a Creative Controls Core dict without ``source_diversity``/``micro_cuts``.
 
     Stage 6 is the only stage that reads any of this, which is why the profile rides on ``beat_info``
     instead of being threaded through the analysis signatures: it must never reach Stage 5's cache
@@ -89,6 +90,14 @@ def build_planned_clip_sequence(
     profile_settings = creative_profile(beat_info)
     seed = profile_settings.seed
     controls = profile_settings.scoring_controls()
+    # [FORK] Digital-Union (Creative Controls Extra): Source Diversity is the DYNAMIC half. It reads
+    # `usage` and `recent_videos`, so it is resolved here but deliberately kept out of
+    # `ScoringControls` and out of the static table below - a diversity change must not trigger any
+    # static-score work at all. `None` means the exact legacy source penalties.
+    source_diversity_factor = (
+        None if profile_settings.is_neutral_source_diversity()
+        else profile_settings.source_diversity_factor()
+    )
 
     # [FORK] Digital-Union (L1A): the static half of the score, computed once per
     # (candidate, target) instead of once per (candidate, segment). A real run measured 148 segments
@@ -143,6 +152,7 @@ def build_planned_clip_sequence(
             seed=seed,
             base_scores=base_scores_by_target[segment_targets[i]],
             controls=controls,
+            source_diversity_factor=source_diversity_factor,
         )
         if not candidate:
             continue
@@ -279,6 +289,7 @@ def _adjusted_score(
     usage: Counter,
     base_score: float | None = None,
     controls: "fork_creative.ScoringControls | None" = None,
+    source_diversity_factor: float | None = None,
 ) -> float:
     """The planner's score for one candidate, repeat and duration penalties applied.
 
@@ -297,17 +308,33 @@ def _adjusted_score(
     recomputing the static score here must produce the same number the table would have held —
     otherwise a defensive path would silently drop back to legacy scoring on a render the user
     configured. ``None`` is neutral, so every existing caller is unchanged.
+
+    [FORK] Digital-Union (Creative Controls Extra): ``source_diversity_factor`` scales the two
+    **source-video-level** reuse penalties, and only those. The two candidate-level protections —
+    ``-0.28`` for a recently used candidate id and the capped ``usage[id] * 0.10`` — are identical
+    in both branches at every setting: Source Diversity decides how willing the plan is to return to
+    the same *source video*, and must never be able to buy a repeated *moment*. ``None`` is neutral
+    and takes the untouched legacy expressions; the two branches keep the same operation order so
+    the neutral one is arithmetically identical to current main, not merely equal in principle.
     """
     score = _score_candidate(candidate, profile, controls) if base_score is None else float(base_score)
     cid = candidate.get("id")
     video_file = candidate.get("video_file")
 
-    if cid in recent_ids:
-        score -= 0.28
-    if video_file in recent_videos:
-        score -= 0.10
-    score -= min(0.28, usage[cid] * 0.10)
-    score -= min(0.18, usage[video_file] * 0.012)
+    if source_diversity_factor is None:
+        if cid in recent_ids:
+            score -= 0.28
+        if video_file in recent_videos:
+            score -= 0.10
+        score -= min(0.28, usage[cid] * 0.10)
+        score -= min(0.18, usage[video_file] * 0.012)
+    else:
+        if cid in recent_ids:
+            score -= 0.28
+        if video_file in recent_videos:
+            score -= 0.10 * source_diversity_factor
+        score -= min(0.28, usage[cid] * 0.10)
+        score -= source_diversity_factor * min(0.18, usage[video_file] * 0.012)
 
     required_source = max(0.05, profile["duration"])
     candidate_duration = max(0.05, float(candidate.get("duration", required_source)))
@@ -327,6 +354,7 @@ def _choose_candidate(
     seed: int = 0,
     base_scores: Sequence[float] | None = None,
     controls: "fork_creative.ScoringControls | None" = None,
+    source_diversity_factor: float | None = None,
 ) -> Dict | None:
     # [FORK] Digital-Union (L1A): `base_scores` is the precomputed static score for THIS segment's
     # target, aligned with `candidates` by position — candidate ids are not used as the key, because
@@ -351,6 +379,7 @@ def _choose_candidate(
                 candidate, profile, recent_ids, recent_videos, usage,
                 base_score=None if base_scores is None else base_scores[position],
                 controls=controls,
+                source_diversity_factor=source_diversity_factor,
             )
             score += rng.random() * 0.015
             if score > best_score:
@@ -368,6 +397,7 @@ def _choose_candidate(
             candidate, profile, recent_ids, recent_videos, usage,
             base_score=None if base_scores is None else base_scores[position],
             controls=controls,
+            source_diversity_factor=source_diversity_factor,
         )
         for position, candidate in enumerate(candidates)
     ]

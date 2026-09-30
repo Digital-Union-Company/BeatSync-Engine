@@ -39,9 +39,10 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _AUTO_MODE_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "__init__.py")
 _STAGE4_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage4_select.py")
 
-#: Everything `stage4_select` imports from its package, plus the density-derived config builder.
+#: Everything `stage4_select` imports from its package, plus the two derived-config builders
+#: (`test_micro_cuts` reuses this loader, so the micro one is exported here as well).
 _SHARED = ("AutoWaveConfig", "_normalize", "_safe_percentile", "_unique_sorted",
-           "density_scaled_config")
+           "density_scaled_config", "micro_cut_scaled_config")
 
 
 def _load_stage4():

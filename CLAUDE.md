@@ -31,6 +31,7 @@ set PY=bin\python-3.13.14-embed-amd64\python.exe
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mov --lossless --fps 30 -s 10 -e 45
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --seed 381944   :: creative variation
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --cut-density 70 --energy-response 80 --motion-bias 30
+%PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --source-diversity 80 --micro-cuts 70
 %PY% -X utf8 src\auto_mode\stage5_qwen_scene_worker.py --request req.json --response resp.json
 ```
 
@@ -901,11 +902,20 @@ CreativeProfile(seed=0, cut_density=50, energy_response=50, motion_bias=50)
 |---|---|---|---|---|
 | Variation Seed | 0 / positive | 0 | Stage 6 | which of the good candidates wins |
 | Cut Density | 0–100 | 50 | **Stage 4** | how many beats become cuts |
-| Energy Response | 0–100 | 50 | Stage 6 | how hard scoring follows the segment's target |
-| Motion Bias | 0–100 | 50 | Stage 6 | calm vs. dynamic source material |
+| Micro Cuts | 0–100 | 50 | **Stage 4** | the rare half-beat accent layer, and only that |
+| Energy Response | 0–100 | 50 | Stage 6 (static) | how hard scoring follows the segment's target |
+| Motion Bias | 0–100 | 50 | Stage 6 (static) | calm vs. dynamic source material |
+| Source Diversity | 0–100 | 50 | Stage 6 (**dynamic**) | how hard cuts spread across source videos |
 
-Stages 1–3 read **none** of it; Stage 5 reads **none** of it. Stage 4 reads Cut Density only; Stage 6
-reads the seed, Energy Response and Motion Bias.
+Stages 1–3 read **none** of it; Stage 5 reads **none** of it. Stage 4 reads Cut Density and Micro
+Cuts; Stage 6 reads the seed, Energy Response, Motion Bias and Source Diversity.
+
+**Stage 6 has two halves and the split is load-bearing.** Energy Response and Motion Bias are
+*static* — they depend on (candidate, target) only, so they live in the L1A precompute table.
+Source Diversity is *dynamic*: it reads the running `usage` counter and the `recent_videos` window,
+so it must never enter that table. `ScoringControls` therefore carries the static half only, and the
+diversity factor is threaded separately as an explicit parameter. A control in the wrong half is one
+refactor away from becoming a table key.
 
 **50 is today, exactly, and that is a product contract.** An all-neutral profile reproduces current
 main's selected cut times, segment targets, candidate choices, legacy seed-0 RNG stream, plan length
@@ -957,6 +967,37 @@ through the existing grid differently. A cut at exactly `0.0` is reachable throu
 `final_wave_cleanup`'s pre-existing "too sparse, add clean anchors" branch, which a high density
 reaches more often; `build_frame_aligned_cut_timeline` drops it as it always has.
 
+#### Micro Cuts is the other Stage 4 control, and owns one layer
+
+`auto_mode.micro_cut_scaled_config` derives a config for the **rare half-beat accent layer** only —
+the extras `add_rare_micro_cuts` may add on top of the main grid. It rewrites exactly two fields:
+`max_micro_cut_ratio` (`0.025 * 3^d`, hard-capped at `MICRO_CUT_RATIO_CAP = 0.08`) and
+`micro_percentile` (`96.5 − 6·d`, clamped to 90 … 99.9).
+
+Three things it deliberately does **not** touch:
+
+- **`micro_min_gap`** — the anti-flicker floor, not a creative dial. The point of a bounded accent
+  layer is that it cannot become flicker.
+- **The `wave >= 0.88` gate inside `add_rare_micro_cuts`** — measured on real material, that gate is
+  *not* the binding constraint (the ratio budget is: at every percentile from 99 → 92 the candidate
+  count is identical for wave gates 0.88 … 0.70). Exposing it would add a configurable literal for no
+  behavioural gain.
+- **`add_rare_micro_cuts` itself** — it still only reads `cfg`. The control is a derived config, not
+  a new mechanism inside the algorithm.
+
+**At 0 the layer is switched off** (`enable_rare_micro_cuts=False`) rather than scaled down: `0.025/3`
+still rounds to one extra on a typical grid, and "None" on the slider has to mean none.
+
+Measured on the real Nero track (Stages 1–4 only, no Stage 5): 0 → 0 extras / 143 cuts; 25 → 2 / 145;
+**50 → 4 / 147, the exact production baseline**; 75 → 6 / 149; 100 → 11 / 154. Minimum gap constant at
+0.464 s throughout.
+
+**Composition order is density → micro, and the two are independent in policy.** Cut Density writes
+none of the four micro fields and Micro Cuts writes none of the grid fields, so neither rewrites the
+other. That is *not* a claim that the final counts are numerically independent: `max_extra` is a ratio
+of the selected grid, so a denser grid still permits proportionally more accents. That pre-existing
+proportionality is intended — do not "correct" it.
+
 #### Energy Response and Motion Bias are Stage 6 controls
 
 Neither touches the cut timeline, the audio features, the sections, the per-segment target
@@ -996,6 +1037,38 @@ held instead of silently dropping back to legacy scoring.
 plan reporting the legacy score for a render that chose on a modified one is a quietly misleading
 record. Clip timing and anchoring are untouched.
 
+#### Source Diversity is the dynamic Stage 6 control
+
+`factor = 3 ** ((source_diversity − 50) / 50)` — 1/3 at 0, 1.0 at 50, 3.0 at 100 — and it multiplies
+**exactly two** of `_adjusted_score`'s four repeat penalties:
+
+| Penalty | Level | Scaled by Source Diversity? |
+|---|---|---|
+| `cid in recent_ids` → −0.28 | candidate | **no** |
+| `min(0.28, usage[cid] * 0.10)` | candidate | **no** |
+| `video_file in recent_videos` → −0.10 | source | **yes** |
+| `min(0.18, usage[video_file] * 0.012)` | source | **yes** |
+
+The scaling is `factor * legacy_penalty`, i.e. applied to the **already-capped** amount, so the cap
+scales with the control rather than re-clipping it. Deque lengths (`recent_ids` 10, `recent_videos` 5)
+are unchanged.
+
+**The candidate-level protections are never scaled**, and that is the whole design: Source Diversity
+decides how willing the edit is to return to the same *source video*, and must never be able to buy a
+repeated *moment*. Tests assert both candidate penalties are exactly 0.28 / capped-0.28 at every
+setting.
+
+**It is dynamic, so it stays out of L1A.** It is resolved once per plan but read per segment against
+`usage`/`recent_videos`, so it is threaded as an explicit `source_diversity_factor` parameter through
+`build_planned_clip_sequence → _choose_candidate → _adjusted_score`, never through `ScoringControls`.
+A test asserts the `_static_base_score` evaluation count is identical at diversity 0 / 50 / 100, and
+that moving diversity alone does not trigger Energy Response's flow column.
+
+Base 3 is measured, not assumed. On the real 509-candidate / 41-source TEST1 pool over 148 real
+segments: unique sources 31 → 39, top-source usage 20 → 10, HHI 0.054 → 0.031, for a **~4 %** mean
+legacy-score cost, with zero adjacent source repeats even at the reuse end. Base 2 was visibly weaker
+(31 → 37); base 4 reached all 41 sources but started producing adjacent source repeats at 0.
+
 #### Stage 5 isolation is the real B0 invariant
 
 No control reaches `_qwen_config_token`, `_video_signature`, `_cache_path`, a Qwen request, the Qwen
@@ -1018,7 +1091,8 @@ still re-key, or the isolation would be achieved by keying on nothing.
 #### Wiring and reporting
 
 ```
-process_video_guarded(…, variation_seed, cut_density, energy_response, motion_bias, …)
+process_video_guarded(…, variation_seed, cut_density, energy_response, motion_bias,
+                      source_diversity, micro_cuts, …)
   → CreativeProfile.from_widgets(…)      # the one normalisation seam
   → process_video(…, creative=profile)
   → _process_video_impl(…, creative=profile)
@@ -1060,10 +1134,24 @@ There is **no stage cache in this PR**. The intended ownership when one is built
 | Variation Seed | Stages 1–5 | Stage 6 + render |
 | Energy Response | Stages 1–5 | Stage 6 + render |
 | Motion Bias | Stages 1–5 | Stage 6 + render |
+| Source Diversity | Stages 1–5 | Stage 6 + render |
 | Cut Density | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
+| Micro Cuts | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
 
-Cut Density is the only one that invalidates Stage 4 — and it still reuses the Stage-5 library
+Only the two Stage-4 controls invalidate Stage 4 — and both still reuse the Stage-5 library
 completely, which is the whole reason this boundary is worth having.
+
+#### Semantic Emphasis is deferred, deliberately
+
+A seventh control — weighting persisted Qwen semantics against deterministic visual evidence — is
+designed and **not implemented**, not even as a dormant field. A read-only study established that the
+deterministic candidate *is* exactly recomputable from the persisted record (`_merge_semantic`
+overwrites the five fused scores but never the CV primitives `motion`/`brightness`/`contrast`/
+`saturation`/`sharpness`/`colorfulness`, and deterministic `quality_score` is a pure function of
+those — verified to 0.000000000 on 509 real candidates). So it needs no Stage-5 schema change. But it
+would duplicate `video_analysis._build_candidate`'s formulas in a second module, which is a different
+drift-risk class from scaling an existing penalty, and it is measurably strong only on `soft`/`build`
+targets (mean |Δ| ≈ 0.14) while near-inert on `drop`/`rhythm` (≈ 0.02). It gets its own PR.
 
 #### Future Freestyle / Director boundary
 
@@ -1197,7 +1285,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
-| `creative.py` | the resolved `CreativeProfile`: four controls, their normalisation and their mappings (seed handling delegated to `variation.py`) |
+| `creative.py` | the resolved `CreativeProfile`: six controls, their normalisation and their mappings (seed handling delegated to `variation.py`) |
 | `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 
 ### Media Library Preparation (P V1 + P2)

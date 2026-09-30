@@ -220,6 +220,8 @@ def parse_arguments() -> argparse.Namespace:
         ('--cut-density', 'Sparse .. dense'),
         ('--energy-response', 'Weak .. strong target matching'),
         ('--motion-bias', 'Calm .. dynamic material'),
+        ('--source-diversity', 'Reuse .. diverse source videos'),
+        ('--micro-cuts', 'Fewer .. more rare half-beat accents; 0 disables them'),
     ):
         parser.add_argument(
             flag,
@@ -949,6 +951,8 @@ def main() -> None:
         cut_density=args.cut_density,
         energy_response=args.energy_response,
         motion_bias=args.motion_bias,
+        source_diversity=args.source_diversity,
+        micro_cuts=args.micro_cuts,
     )
     print(f"🎨 Creative profile: {cli_creative.describe()}")
     selected_beats, beat_info = analyze_beats_auto(

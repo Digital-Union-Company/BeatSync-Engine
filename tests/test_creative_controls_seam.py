@@ -40,8 +40,9 @@ _LIBRARY_PREP = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "library_prep.p
 #: Every name a creative control could travel under. Whole-word matched, so `os.makedirs(directory)`
 #: is not read as a Director reference and `_seconds` is not read as a seed.
 _CREATIVE_WORDS = ("creative", "seed", "variation", "cut_density", "energy_response",
-                   "motion_bias", "density", "profile_settings", "scoring_controls",
-                   "motion_centered", "energy_factor")
+                   "motion_bias", "source_diversity", "micro_cuts", "density",
+                   "profile_settings", "scoring_controls", "motion_centered", "energy_factor",
+                   "source_diversity_factor", "micro_cut_ratio_factor")
 
 
 def _tree(path: str) -> ast.Module:
@@ -125,8 +126,8 @@ def test_video_analysis_never_imports_the_creative_module():
 def test_the_whole_of_video_analysis_names_no_new_creative_control():
     """Stage 5 is not merely uninterested in the controls; it has never heard of them."""
     source = _executable_source(_VA).lower()
-    for word in ("cut_density", "energy_response", "motion_bias", "creativeprofile",
-                 "scoring_controls", "creative_profile"):
+    for word in ("cut_density", "energy_response", "motion_bias", "source_diversity",
+                 "micro_cuts", "creativeprofile", "scoring_controls", "creative_profile"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"video_analysis mentions {word!r}"
 
 
@@ -134,8 +135,8 @@ def test_the_qwen_worker_still_knows_nothing_about_creative_state():
     """The process boundary is where separation is easiest to lose: whatever the parent stops
     sending, the worker must also stop being able to ask for."""
     source = _executable_source(_WORKER).lower()
-    for word in ("cut_density", "energy_response", "motion_bias", "creative", "variation",
-                 "smart_preset", "audio_profile"):
+    for word in ("cut_density", "energy_response", "motion_bias", "source_diversity",
+                 "micro_cuts", "creative", "variation", "smart_preset", "audio_profile"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"the worker mentions {word!r}"
 
 
@@ -180,7 +181,8 @@ def test_media_library_preparation_gained_no_creative_input():
     """Preparation warms the Stage-5 cache. If it had to know about a creative control, the control
     would be in cache identity by definition."""
     source = _executable_source(_LIBRARY_PREP).lower()
-    for word in ("cut_density", "energy_response", "motion_bias", "creative", "variation", "seed"):
+    for word in ("cut_density", "energy_response", "motion_bias", "source_diversity",
+                 "micro_cuts", "creative", "variation", "seed"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"library_prep mentions {word!r}"
 
 
@@ -392,7 +394,8 @@ def test_the_three_media_semantic_settings_still_re_key(identity, tmp_path):
 # ===========================================================================
 
 
-_NEW_CONTROLS = ("cut_density", "energy_response", "motion_bias")
+_NEW_CONTROLS = ("cut_density", "energy_response", "motion_bias",
+                 "source_diversity", "micro_cuts")
 _ALL_CREATIVE_WIDGETS = ("variation_seed",) + _NEW_CONTROLS
 
 
@@ -599,7 +602,8 @@ def test_no_preset_randomizer_or_freestyle_control_was_added():
 
 
 _CLI_FLAGS = {"--cut-density": "cut_density", "--energy-response": "energy_response",
-              "--motion-bias": "motion_bias"}
+              "--motion-bias": "motion_bias", "--source-diversity": "source_diversity",
+              "--micro-cuts": "micro_cuts"}
 
 
 def _cli_flag_literals() -> list[str]:
@@ -671,7 +675,8 @@ def test_the_cli_builds_one_profile_and_hands_it_to_analyze_beats_auto():
     body = _body_code(_func(_tree(_VP), "main"))
 
     assert "fork_creative.CreativeProfile.from_widgets(" in body
-    for attribute in ("args.seed", "args.cut_density", "args.energy_response", "args.motion_bias"):
+    for attribute in ("args.seed", "args.cut_density", "args.energy_response", "args.motion_bias",
+                      "args.source_diversity", "args.micro_cuts"):
         assert attribute in body, attribute
     assert "creative=cli_creative.as_dict()" in body
 
@@ -693,6 +698,7 @@ def test_no_new_cli_mode_was_added():
     """Three optional creative flags, and nothing else: no new subcommand, no new mode."""
     flags = {flag for flag in _cli_flag_literals() if flag.startswith("--")}
     expected = {"--seed", "--cut-density", "--energy-response", "--motion-bias",
+                "--source-diversity", "--micro-cuts",
                 "--output", "--start-time", "--end-time", "--lossless", "--gpu",
                 "--gpu-encoder", "--fps"}
 

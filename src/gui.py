@@ -861,6 +861,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
                           output_filename: str, processing_mode: str,
                           custom_fps: float, variation_seed: int,
                           cut_density: int, energy_response: int, motion_bias: int,
+                          source_diversity: int, micro_cuts: int,
                           session_state: dict,
                           source_state) -> Iterator[StatusResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -883,7 +884,8 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
     # the two lists line up name-for-name.
     #
-    # `variation_seed`, `cut_density`, `energy_response` and `motion_bias` are render-request inputs
+    # `variation_seed`, `cut_density`, `energy_response`, `motion_bias`, `source_diversity` and
+    # `micro_cuts` are render-request inputs
     # like FPS or the encoder, NOT source identity: none of them is wired into the
     # source-confirmation handlers, so changing any of them cannot clear a confirmation, trigger a
     # scan or touch Media Library Preparation. They are still *live* inputs here for the same reason
@@ -912,6 +914,8 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         cut_density=cut_density,
         energy_response=energy_response,
         motion_bias=motion_bias,
+        source_diversity=source_diversity,
+        micro_cuts=micro_cuts,
     )
 
     yield from process_video(
@@ -1369,6 +1373,27 @@ def create_ui() -> gr.Blocks:
                         info=INFO_MOTION_BIAS,
                         elem_id='motion-bias-slider',
                     )
+                    # [FORK] Digital-Union (Creative Controls Extra): two more render-request
+                    # creative controls, wired exactly like the ones above — no handler, no reset,
+                    # no randomizer, and absent from every source and preparation output list.
+                    source_diversity = gr.Slider(
+                        minimum=fork_creative.CONTROL_MIN,
+                        maximum=fork_creative.CONTROL_MAX,
+                        step=1,
+                        value=fork_creative.DEFAULT_CONTROL,
+                        label=LABEL_SOURCE_DIVERSITY,
+                        info=INFO_SOURCE_DIVERSITY,
+                        elem_id='source-diversity-slider',
+                    )
+                    micro_cuts = gr.Slider(
+                        minimum=fork_creative.CONTROL_MIN,
+                        maximum=fork_creative.CONTROL_MAX,
+                        step=1,
+                        value=fork_creative.DEFAULT_CONTROL,
+                        label=LABEL_MICRO_CUTS,
+                        info=INFO_MICRO_CUTS,
+                        elem_id='micro-cuts-slider',
+                    )
 
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
@@ -1539,6 +1564,7 @@ def create_ui() -> gr.Blocks:
                 source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps, variation_seed,
                 cut_density, energy_response, motion_bias,
+                source_diversity, micro_cuts,
                 session_state, source_state
             ],
             outputs=[video_output, status_output, session_state],

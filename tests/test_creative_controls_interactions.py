@@ -82,6 +82,8 @@ def _run(pipeline, track, profile: fork_creative.CreativeProfile):
     else:
         factor = profile.cut_density_factor()
         cfg = shared.density_scaled_config(shared.CONFIG, factor)
+    if not profile.is_neutral_micro_cuts():
+        cfg = shared.micro_cut_scaled_config(cfg, profile)
     selected, _ = stage4.select_wave_cuts(
         beat_times=beat_times, sections=sections, features=features,
         tempo=_TEMPO, audio_duration=_DURATION, cfg=cfg, density_factor=factor)
@@ -121,6 +123,13 @@ _GRID = [
     fork_creative.CreativeProfile(motion_bias=100),
     fork_creative.CreativeProfile(cut_density=70, energy_response=80, motion_bias=30),
     fork_creative.CreativeProfile(seed=101, cut_density=70, energy_response=80, motion_bias=30),
+    # Creative Controls Extra: each new control alone, then the full combined profile.
+    fork_creative.CreativeProfile(source_diversity=0),
+    fork_creative.CreativeProfile(source_diversity=100),
+    fork_creative.CreativeProfile(micro_cuts=0),
+    fork_creative.CreativeProfile(micro_cuts=100),
+    fork_creative.CreativeProfile(seed=101, cut_density=75, energy_response=80, motion_bias=25,
+                                  source_diversity=80, micro_cuts=70),
 ]
 
 
@@ -177,21 +186,34 @@ def test_the_all_neutral_grid_entry_is_the_no_creative_state_render(pipeline, tr
     assert [i["candidate_id"] for i in neutral_plan] == [i["candidate_id"] for i in bare_plan]
 
 
-def test_only_cut_density_changes_the_segment_count(pipeline, track):
-    """Stage ownership, end to end: the Stage 6 controls and the seed must leave the timeline alone,
-    and Cut Density must move it."""
+def test_only_the_stage_4_controls_change_the_segment_count(pipeline, track):
+    """Stage ownership, end to end: every Stage-6 control and the seed must leave the timeline
+    alone, and Cut Density must move it."""
     neutral_cuts = _run(pipeline, track, fork_creative.CreativeProfile())[0]
 
     for profile in (fork_creative.CreativeProfile(energy_response=0),
                     fork_creative.CreativeProfile(energy_response=100),
                     fork_creative.CreativeProfile(motion_bias=0),
                     fork_creative.CreativeProfile(motion_bias=100),
+                    fork_creative.CreativeProfile(source_diversity=0),
+                    fork_creative.CreativeProfile(source_diversity=100),
                     fork_creative.CreativeProfile(seed=381944)):
         assert np.array_equal(_run(pipeline, track, profile)[0], neutral_cuts), profile.describe()
 
     sparse = _run(pipeline, track, fork_creative.CreativeProfile(cut_density=0))[0]
     dense = _run(pipeline, track, fork_creative.CreativeProfile(cut_density=100))[0]
     assert sparse.size < neutral_cuts.size < dense.size
+
+
+def test_source_diversity_spreads_the_plan_without_touching_the_timeline(pipeline, track):
+    """The two Extra controls, end to end and in their own stages."""
+    low_cuts, _, low_plan = _run(pipeline, track, fork_creative.CreativeProfile(source_diversity=0))
+    high_cuts, _, high_plan = _run(
+        pipeline, track, fork_creative.CreativeProfile(source_diversity=100))
+
+    assert np.array_equal(low_cuts, high_cuts), "diversity moved the Stage-4 timeline"
+    assert [i["target"] for i in low_plan] == [i["target"] for i in high_plan]
+    assert len({i["video_file"] for i in high_plan}) >= len({i["video_file"] for i in low_plan})
 
 
 def test_a_positive_seed_still_varies_and_reproduces_on_a_retimed_edit(pipeline, track):
