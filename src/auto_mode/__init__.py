@@ -20,7 +20,7 @@ import os
 import sys
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # This package lives at src/auto_mode. Add src to sys.path so shared modules
 # such as logger.py and gpu_cpu_utils.py remain importable.
@@ -98,8 +98,10 @@ from gpu_cpu_utils import GPU_AVAILABLE, clear_gpu_memory
 
 # [FORK] Digital-Union: structured progress events (stdlib-only fork module).
 from beatsync_fork import progress as fork_progress
-# [FORK] Digital-Union: creative variation seed (stdlib-only fork module).
-from beatsync_fork import variation as fork_variation
+# [FORK] Digital-Union: the resolved Creative Profile (stdlib-only fork module). Seed rules stay in
+# `beatsync_fork.variation`; `CreativeProfile` delegates to them, so this module needs only the one
+# import and the seed's meaning cannot fork.
+from beatsync_fork import creative as fork_creative
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -169,6 +171,47 @@ def _unique_sorted(times: np.ndarray, min_gap: float) -> np.ndarray:
             # over squeezing in nearby cuts.
             continue
     return np.asarray(out, dtype=float)
+
+
+def density_scaled_config(cfg: AutoWaveConfig, density_factor: float) -> AutoWaveConfig:
+    """[FORK] Digital-Union (Creative Controls Core): a per-render config for one Cut Density.
+
+    ``AutoWaveConfig`` is frozen and ``CONFIG`` is a module-level singleton shared by every render in
+    the process, so this derives a **new** immutable instance with ``dataclasses.replace`` and never
+    mutates anything. That is what makes one render's density unable to leak into the next.
+
+    Only the fields Cut Density owns are touched:
+
+    * the four ``*_min_interval`` safety floors are divided by the factor — a denser edit is allowed
+      to place cuts closer together, a sparser one is not;
+    * the four ``*_max_hold`` ceilings are divided by the factor, so a denser edit forces a cut
+      sooner and a sparser one may hold longer;
+    * the global ``target_cut_ratio_min``/``_max`` band is multiplied by the factor and capped, so
+      the final density cap scales with the request instead of clipping it straight back.
+
+    Everything else is untouched by construction: the sample rate and FFT sizes (Stage 1-3 facts),
+    the bar/phrase grid, the wave smoothing, the anchor bonuses, and the whole rare-micro-cut policy.
+
+    This is never called on a neutral render. ``analyze_beats_auto`` branches on
+    ``profile.is_neutral_cuts()`` and passes ``CONFIG`` itself through untouched, because a config
+    rebuilt with a factor of 1.0 would divide every float by 1.0 — harmless in principle, and
+    exactly the kind of "harmless" this feature's legacy-exactness contract refuses to rely on.
+    """
+    return replace(
+        cfg,
+        low_energy_min_interval=cfg.low_energy_min_interval / density_factor,
+        medium_energy_min_interval=cfg.medium_energy_min_interval / density_factor,
+        high_energy_min_interval=cfg.high_energy_min_interval / density_factor,
+        peak_energy_min_interval=cfg.peak_energy_min_interval / density_factor,
+        low_energy_max_hold=cfg.low_energy_max_hold / density_factor,
+        medium_energy_max_hold=cfg.medium_energy_max_hold / density_factor,
+        high_energy_max_hold=cfg.high_energy_max_hold / density_factor,
+        peak_energy_max_hold=cfg.peak_energy_max_hold / density_factor,
+        target_cut_ratio_min=min(fork_creative.CUT_RATIO_MIN_CAP,
+                                 cfg.target_cut_ratio_min * density_factor),
+        target_cut_ratio_max=min(fork_creative.CUT_RATIO_MAX_CAP,
+                                 cfg.target_cut_ratio_max * density_factor),
+    )
 
 
 def _interp_to_beats(curve: np.ndarray, beat_times: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
@@ -279,17 +322,23 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     """
     cfg = CONFIG
 
-    # [FORK] Digital-Union (Phase A): creative settings are planner state, not analysis identity.
-    # Normalised once here so everything downstream sees a clean int, and deliberately kept out of
-    # `audio_visual_profile` — that dict feeds Stage 5's Qwen config token, and a creative knob must
-    # never re-key the video analysis cache.
-    variation_seed = fork_variation.normalize_seed(
-        (creative or {}).get("seed") if isinstance(creative, dict) else None
-    )
+    # [FORK] Digital-Union (Creative Controls Core): the whole Creative Profile is resolved ONCE
+    # here, at the pipeline boundary, so every stage downstream sees normalised ints rather than raw
+    # widget values. Stage ownership from this point on:
+    #
+    #   Stages 1-3  read none of it (beat grid, audio features and sections are facts about the track)
+    #   Stage 4     reads Cut Density only
+    #   Stage 5     reads NONE of it — the B0 invariant; see the analyze_video_sources call below
+    #   Stage 6     reads the seed, Energy Response and Motion Bias, off `beat_info["creative"]`
+    #
+    # It is deliberately kept out of `audio_visual_profile`: that dict describes the *track*, and
+    # keeping creative state separable from it is what stops a future control leaking into anything
+    # downstream may forward.
+    profile = fork_creative.CreativeProfile.from_mapping(creative)
 
     print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
     print("   Rhythm-first audio cuts + semantic video moment matching")
-    print(f"   🎲 Creative variation: {fork_variation.describe(variation_seed)}")
+    print(f"   🎨 Creative profile: {profile.describe()}")
 
     duration = None
     if end_time and end_time > start_time:
@@ -373,17 +422,31 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     _emit(event_callback, fork_progress.start(4, "Selecting rhythmic cuts"))
     _stage_started = time.perf_counter()
     print("   🧠 Step 4: Selecting deliberate rhythmic cuts...")
+    # [FORK] Digital-Union (Creative Controls Core): Cut Density is a Stage 4 control and nothing
+    # else. Stages 1-3 above ran on the untouched `cfg` and are unaffected by construction — they
+    # are handed the same object they always were. A neutral density takes the explicit legacy
+    # branch: the same `CONFIG` singleton and `density_factor=None`, so Stage 4 runs the code path
+    # it has always run rather than a neutral-valued version of the new one.
+    if profile.is_neutral_cuts():
+        stage4_cfg = cfg
+        density_factor = None
+    else:
+        density_factor = profile.cut_density_factor()
+        stage4_cfg = density_scaled_config(cfg, density_factor)
+        print(f"      ✂️  Cut density {profile.cut_density} (factor {density_factor:.3f})")
+
     selected_beats, selection_info = select_wave_cuts(
         beat_times=beat_times,
         sections=sections,
         features=features,
         tempo=tempo,
         audio_duration=audio_duration,
-        cfg=cfg,
+        cfg=stage4_cfg,
+        density_factor=density_factor,
     )
 
     if selected_beats.size == 0:
-        selected_beats = _unique_sorted(beat_times[::4], cfg.low_energy_min_interval)
+        selected_beats = _unique_sorted(beat_times[::4], stage4_cfg.low_energy_min_interval)
 
     cut_ratio = len(selected_beats) / max(1, len(beat_times)) * 100.0
     avg_interval = float(np.mean(np.diff(selected_beats))) if len(selected_beats) > 1 else 0.0
@@ -495,9 +558,13 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         "audio_duration": audio_duration,
         "mode": "auto_v4_audio_visual_rhythmic_planner",
         "auto_style": "audio_visual_rhythmic_gmv_amv",
-        # [FORK] Digital-Union (Phase A): read by Stage 6 only. `beat_info` is already the shared
-        # bus, so this reaches the planner without touching any analysis or cache signature.
-        "creative": {"seed": variation_seed},
+        # [FORK] Digital-Union (Creative Controls Core): the whole resolved Creative Profile, on the
+        # shared bus. `beat_info` already carries everything Stage 6 reads, so this reaches the
+        # planner without touching any analysis or cache signature. Generalised from Phase A's
+        # `{"seed": n}`; `CreativeProfile.as_dict()` is the single authority on its shape, and
+        # `stage6_av_planner.creative_profile` reads it back through `from_mapping`, so a Phase A
+        # dict (seed only) still resolves correctly with the three controls left neutral.
+        "creative": profile.as_dict(),
     }
 
     try:
@@ -552,5 +619,6 @@ __all__ = [
     "CONFIG",
     "analyze_beats_auto",
     "analyze_beats_auto_fallback",
+    "density_scaled_config",
     "get_auto_mode_info",
 ]

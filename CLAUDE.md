@@ -30,6 +30,7 @@ set PY=bin\python-3.13.14-embed-amd64\python.exe
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --gpu --gpu-encoder h264_nvenc
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mov --lossless --fps 30 -s 10 -e 45
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --seed 381944   :: creative variation
+%PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --cut-density 70 --energy-response 80 --motion-bias 30
 %PY% -X utf8 src\auto_mode\stage5_qwen_scene_worker.py --request req.json --response resp.json
 ```
 
@@ -59,6 +60,19 @@ whole runtime; the Qwen worker needs cv2/PIL) by inspecting it with `ast` instea
 `tests/test_qwen_worker_protocol.py` and `tests/test_gui_guard_seam.py`. Prefer AST assertions over grep
 there — they match call sites by function and keyword, so e.g. the `llama-mtmd-cli --version` probe is
 distinguished from the streaming launches by its argv rather than by a line number.
+
+Two other loading tricks recur, and both are deliberate rather than convenient:
+
+- **Load a stage module by path** when it has no relative imports. `stage6_av_planner.py` imports only
+  numpy and fork modules, so `tests/test_creative_seed.py`, `test_stage6_score_precompute.py` and
+  `test_creative_scoring.py` load it with `importlib` and get the *real* planner without dragging in
+  `auto_mode/__init__` (librosa, cupy, logger).
+- **Load a stage module onto a synthesised parent package** when it does have relative imports.
+  `stage4_select.py` needs `AutoWaveConfig` and three numeric helpers from `auto_mode/__init__`, so
+  `tests/test_cut_density.py` AST-extracts exactly those, execs them into a stub package and loads the
+  real stage file as its child. Use `ast.unparse`, **not** `ast.get_source_segment`: a `ClassDef`'s
+  `lineno` points at the `class` keyword, so the source segment silently drops
+  `@dataclass(frozen=True)` and `AutoWaveConfig` comes back as a fieldless plain class.
 
 The upstream pipeline modules have no tests and cannot even be imported without the portable runtime;
 verification there is still end-to-end (run the CLI on a short audio file plus one source video and
@@ -850,9 +864,12 @@ The user picks a **Variation Seed**; it changes which clips the planner chooses,
   takes the best `TOP_K = 6`, drops anything more than `SCORE_WINDOW = 0.12` below the best, and makes
   a weighted draw. The window is deliberately smaller than the planner's own 0.28 "seen recently"
   penalty, so variation can never undo a repeat penalty the planner applied on purpose.
-- **The seed rides on `beat_info["creative"]`.** `analyze_beats_auto(creative={"seed": n})` normalises
-  it once and stores it; Stage 6 is the only reader. No analysis signature changed, and
-  `create_music_video` did not change at all.
+- **The seed rides on `beat_info["creative"]`.** `analyze_beats_auto(creative=…)` normalises it once
+  and stores it; Stage 6 is the only reader. No analysis signature changed, and `create_music_video`
+  did not change at all. **Creative Controls Core generalised that dict** from `{"seed": n}` to the
+  whole resolved profile — see the section below. `variation.py` remains the sole authority on what a
+  seed means, and `CreativeProfile` delegates every seed decision to it rather than reimplementing
+  any of this.
 - **It must never touch cache identity.** `video_analysis.py` was unmodified by Phase A, both version
   constants were unchanged, and the seed is absent from `_video_signature` / `_cache_path` /
   `_qwen_config_token` and from `audio_visual_profile`. At the time, that last clause mattered because
@@ -870,6 +887,192 @@ The user picks a **Variation Seed**; it changes which clips the planner chooses,
   become 0. Truncating `7.9` to 7 would render a seed the user never chose and would make two
   different inputs reproduce as the same "reproducible" variation; `bool` has to be rejected first
   because it subclasses `int`. A number box can produce all of these and none may raise mid-render.
+
+### The Creative Profile — three more controls (B0 + Creative Controls Core)
+
+`beatsync_fork/creative.py` holds one immutable, normalised **`CreativeProfile`** carrying four
+controls. It is stdlib-only, so the whole mapping is testable on a bare interpreter.
+
+```
+CreativeProfile(seed=0, cut_density=50, energy_response=50, motion_bias=50)
+```
+
+| Control | Range | Neutral | Owner | What it changes |
+|---|---|---|---|---|
+| Variation Seed | 0 / positive | 0 | Stage 6 | which of the good candidates wins |
+| Cut Density | 0–100 | 50 | **Stage 4** | how many beats become cuts |
+| Energy Response | 0–100 | 50 | Stage 6 | how hard scoring follows the segment's target |
+| Motion Bias | 0–100 | 50 | Stage 6 | calm vs. dynamic source material |
+
+Stages 1–3 read **none** of it; Stage 5 reads **none** of it. Stage 4 reads Cut Density only; Stage 6
+reads the seed, Energy Response and Motion Bias.
+
+**50 is today, exactly, and that is a product contract.** An all-neutral profile reproduces current
+main's selected cut times, segment targets, candidate choices, legacy seed-0 RNG stream, plan length
+and filenames. The mechanism is not "the arithmetic happens to be neutral" — every neutral control
+takes an **explicit branch that calls the pre-existing legacy path**, because even a harmless
+operation-order change (`flow + 1.0 * (target - flow)`, `score + 0.0`, a config rebuilt with a factor
+of 1.0) would make "upgrade and change nothing" untrue. `ScoringControls` therefore uses `None`, not a
+neutral number, for a neutral control, and Stage 4's `density_factor` is `None` rather than `1.0`.
+
+`normalize_control` mirrors `variation.normalize_seed`'s explicit type boundary, with one deliberate
+difference: a control has a real range with meaningful ends, so `120 → 100` and `-10 → 0` are
+**clamped** rather than refused. A *fractional* value is different in kind — `50.5` is not a request
+for 50, and flooring it would render a setting the user never chose — so it falls back to 50, as does
+`bool` (rejected first, since `True` would otherwise read as "nearly maximally sparse") and anything
+malformed. Nothing here may raise mid-render.
+
+#### Cut Density is a Stage 4 control
+
+`f = 2 ** ((cut_density - 50) / 50)` → 0.5 / 1.0 / 2.0 at 0 / 50 / 100. Exponential so the control is
+symmetric in *ratio*, which is how cut spacing is perceived. Applied in two halves, because density
+lives partly in the config's safety floors and partly in the selector's stepping:
+
+- `auto_mode.density_scaled_config` derives a **new** `AutoWaveConfig` with `dataclasses.replace`:
+  the four `*_min_interval` floors and four `*_max_hold` ceilings divided by `f`, and
+  `target_cut_ratio_min`/`_max` multiplied by it and capped at `0.95` / `0.98`. `AutoWaveConfig` is
+  frozen and `CONFIG` is a process-wide singleton — **never mutate it**; the caps never actually bind
+  at the reachable factor range (`0.46 × 2 = 0.92`) and exist only as a guard.
+- `select_wave_cuts` / `select_section_wave_cuts` take `density_factor`. `adaptive_beat_step` stays
+  the pure musical mapping it has always been — density **re-quantises its answer** afterwards via
+  `creative.scale_beat_step`, `max(1, min(8, floor(step / f + 0.5)))`. Explicit half-up, not
+  `round()`: banker's rounding sends both 1.5 and 2.5 to 2, flattening two different musical
+  situations onto one spacing. The weak-score breathing threshold `0.42` scales by `1/f`.
+
+**Rare micro-cut policy is not this control's business.** `enable_rare_micro_cuts`,
+`max_micro_cut_ratio`, `micro_min_gap` and `micro_percentile` are identical at every density. The
+absolute micro-cut *count* still moves, because `max_extra` is a ratio of a selected grid density does
+change — a proportional consequence, not a policy change. **This is not the future Micro Cuts
+control.**
+
+Measured on the accepted design probe's real track (566 beats, 123 BPM, 278 s, 13 sections): neutral
+147 cuts / 25.97 % / 1.876 s average interval; density 100 → 195 cuts / 34.45 % / 1.412 s (+33 %);
+density 0 → roughly −52 %. The mapping is monotonic and retains safe rhythmic spacing. The range is
+**asymmetric on purpose** — the selector is discrete and beat-anchored — so do not retune it to look
+symmetric. The synthetic fixture in `tests/test_cut_density.py` is shaped like that track and
+reproduces the same shape (139 → 204 at density 100, 139 → 75 at density 0).
+
+Cut Density does **not** add cuts after Stage 4, and it preserves beat/bar/phrase alignment: it steps
+through the existing grid differently. A cut at exactly `0.0` is reachable through
+`final_wave_cleanup`'s pre-existing "too sparse, add clean anchors" branch, which a high density
+reaches more often; `build_frame_aligned_cut_timeline` drops it as it always has.
+
+#### Energy Response and Motion Bias are Stage 6 controls
+
+Neither touches the cut timeline, the audio features, the sections, the per-segment target
+distribution or anything Stage 5 persisted. They change **only** the static candidate score, at one
+seam: `_effective_base_score(candidate, target, controls, flow_score=…)`.
+
+One explicit, documented ordering:
+
+1. the legacy `_static_base_score(candidate, target)` — **unchanged, and still taking only
+   `(candidate, target)`**, so a scoring term depending on anything else cannot be added there by
+   accident;
+2. **Energy Response** — `flow + factor * (target - flow)` where `factor = 1 + ((r - 50) / 50) * 0.6`
+   (0.40 … 1.60) and `flow` is the *same candidate's* score for the generic `flow` target. Low
+   settings pull every segment towards generic visual suitability; high settings exaggerate what the
+   music asked for. `flow` is its own fixed point, so a flow segment cannot move;
+3. **Motion Bias** — `+ centered * 0.15 * (2 * motion - 1)`, symmetric about `motion = 0.5`, reading
+   motion through the planner's existing `candidate["motion"] → semantic["camera_motion"] → 0.0`
+   fallback (`_candidate_motion`). A second definition of "dynamic" would silently diverge;
+4. one clamp back into the existing `[-1.0, 2.0]` range.
+
+**0.15 is sized, not arbitrary:** large enough to be visible against the seeded selector's
+`SCORE_WINDOW = 0.12`, and materially smaller than the planner's own `0.28` "seen recently" penalty —
+so a candidate's own bias gain can never offset its own repeat penalty. Do not retune it without a
+discovered defect. Neither control depends on the seed: they modulate scoring, the seed still picks
+the winner afterwards.
+
+**L1A survives, and that is load-bearing.** Both controls are render-scoped constants, so they add no
+dimension to the static table — it stays `candidates × distinct targets`. Energy Response needs one
+extra `candidates`-wide **`flow` column** (built only when the control is non-neutral, and only once),
+because the blend needs a flow reference for every target even when no segment targets flow. Never
+`candidates × segments`. The controls are **bound explicitly and passed down**, never read from a
+module global; `controls` rides alongside `base_scores` through `_choose_candidate` → `_adjusted_score`
+so the *fallback* path (a missing or misaligned table) recomputes the same number the table would have
+held instead of silently dropping back to legacy scoring.
+
+`_materialize_clip` records `plan["score"]` through the same effective scoring. It is diagnostic, but a
+plan reporting the legacy score for a render that chose on a modified one is a quietly misleading
+record. Clip timing and anchoring are untouched.
+
+#### Stage 5 isolation is the real B0 invariant
+
+No control reaches `_qwen_config_token`, `_video_signature`, `_cache_path`, a Qwen request, the Qwen
+prompt or a persisted semantic payload. `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`,
+`ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`, and `video_analysis.py`,
+`stage5_qwen_scene_worker.py` and the preparation workflow were **not modified**.
+
+**Cut Density legitimately changes `audio_visual_profile`.** It changes `selected_beats`, so
+`_build_audio_visual_profile` derives a different `average_cut_interval`, `cut_count` and possibly
+`smart_preset`. That is allowed, and a test asserting otherwise would be false. The invariant is:
+*whatever Cut Density changes upstream must never change Stage-5 cache identity or persisted media
+semantics.* Since P2 the audio profile has zero executable effect inside Stage 5, so nothing derived
+from it can reach a key — `tests/test_creative_controls_seam.py` proves it both structurally (no
+identity function mentions a control) and executably (two densities' profiles, one cache path per
+source, over the real extracted `_cache_path`).
+
+The separation cuts both ways: `BEATSYNC_QWEN_MAX_WINDOWS`, `_FRAME_WIDTH` and `_MAX_NEW_TOKENS` must
+still re-key, or the isolation would be achieved by keying on nothing.
+
+#### Wiring and reporting
+
+```
+process_video_guarded(…, variation_seed, cut_density, energy_response, motion_bias, …)
+  → CreativeProfile.from_widgets(…)      # the one normalisation seam
+  → process_video(…, creative=profile)
+  → _process_video_impl(…, creative=profile)
+  → analyze_beats_auto(…, creative=profile.as_dict())
+  → beat_info["creative"] = profile.as_dict()
+  → stage6_av_planner.creative_profile(beat_info)     # the one reader
+```
+
+- **Four sliders' worth of render-request creative state, not source identity.** All three new
+  controls sit in the Creative Direction group, register **no** handler of their own, appear in no
+  source or preparation handler's `inputs`/`outputs`, and are absent from `source_outputs` and
+  `prep_outputs` — so changing one cannot clear a confirmation, disable Create Video, trigger a scan
+  or touch Media Library Preparation. They *are* live inputs to `process_btn.click`, and
+  `tests/test_creative_controls_seam.py` pins the positional alignment against
+  `process_video_guarded`'s parameters (Gradio passes them positionally). The profile is built only
+  **after** the gate has allowed the render, and none of the four reaches `live_declaration`.
+  **Randomize still writes the seed only**, and there is deliberately no reset or randomizer for the
+  three controls.
+- **`creative_seed` is now `creative_profile(beat_info).seed`** — one reader for one dict, so the
+  creative state cannot fork into two independently-parsed views. `creative_seed` stays as the named
+  compatibility surface `video_processor` already uses.
+- **Filenames are unchanged.** `CreativeProfile.filename_suffix()` delegates to
+  `variation.filename_suffix(seed)`, so the existing `_seedNNN` rule is the whole rule and the three
+  new controls contribute nothing. The resolved profile is reported instead: `render_info["creative"]`,
+  `summarize_clip_plan`'s `creative` / `creative_text`, the success panel, and the console's existing
+  `Planner:` line — which prints exactly `legacy` on a neutral render, so the **five-line CMD budget is
+  not raised**.
+- **CLI parity:** `--cut-density`, `--energy-response`, `--motion-bias`, all optional with
+  `default=None` and **no argparse `type=`** — the values go through `normalize_control`, so a
+  malformed or out-of-range value clamps or falls back exactly as in the UI instead of aborting the run
+  inside argparse. Omitting all three is today's behaviour. No new CLI mode.
+
+#### Future L2 invalidation — documented, not implemented
+
+There is **no stage cache in this PR**. The intended ownership when one is built:
+
+| Control | Reuse | Rerun |
+|---|---|---|
+| Variation Seed | Stages 1–5 | Stage 6 + render |
+| Energy Response | Stages 1–5 | Stage 6 + render |
+| Motion Bias | Stages 1–5 | Stage 6 + render |
+| Cut Density | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
+
+Cut Density is the only one that invalidates Stage 4 — and it still reuses the Stage-5 library
+completely, which is the whole reason this boundary is worth having.
+
+#### Future Freestyle / Director boundary
+
+Not implemented, and no speculative abstraction was added for it (a test asserts no
+director/freestyle/variant-lab/shortlist/stage-cache machinery exists). The accepted direction is
+preserved: **persistent media truth + ephemeral Creative Profile.** A future Freestyle mode may vary
+these controls per section; a future Director may interpret the same Stage-5 library differently.
+Neither may require Stage-5 re-analysis, creative state may never enter Stage-5 cache identity, and no
+per-render interpretation may overwrite persistent semantics.
 
 ### Scale diagnostics (L0)
 
@@ -994,6 +1197,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
+| `creative.py` | the resolved `CreativeProfile`: four controls, their normalisation and their mappings (seed handling delegated to `variation.py`) |
 | `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 
 ### Media Library Preparation (P V1 + P2)

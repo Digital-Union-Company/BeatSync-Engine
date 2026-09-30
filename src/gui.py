@@ -118,6 +118,10 @@ from beatsync_fork.progress_view import ProgressView
 # [FORK] Digital-Union: creative variation seed (Phase A). Selection rule and seed normalisation
 # live in src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires them to widgets.
 from beatsync_fork import variation as fork_variation
+# [FORK] Digital-Union: the resolved Creative Profile (Creative Controls Core). Normalisation, the
+# control mappings and every neutrality decision live in src/beatsync_fork/creative.py; this module
+# only collapses the four widgets into one profile at the render boundary.
+from beatsync_fork import creative as fork_creative
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -453,7 +457,13 @@ def _stage6_summary(console_logger: StageConsoleLogger | None, beat_info: Dict |
             planner_bits.append(f"{int(render_info['planner_candidate_count'])} candidates")
         if render_info.get("planner_seconds") is not None:
             planner_bits.append(_fmt_stage_seconds(render_info["planner_seconds"]))
-        planner_bits.append(fork_variation.describe(plan_summary.get("seed")))
+        # [FORK] Digital-Union (Creative Controls Core): the resolved profile replaces the seed-only
+        # text on the line that already exists, rather than spending another of the console's five
+        # slots. A neutral render still prints exactly "legacy", as it does today; the fallback
+        # keeps a pre-Core plan summary (seed only) readable.
+        planner_bits.append(
+            plan_summary.get("creative_text") or fork_variation.describe(plan_summary.get("seed"))
+        )
         console_logger.line("Planner: " + ", ".join(planner_bits))
     elif render_info.get("planner_seconds") is not None:
         # The planner ran and produced no usable plan (renderer falls back to random sampling).
@@ -511,11 +521,17 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
-                       custom_fps: float, variation_seed: int, session_state: dict,
+                       custom_fps: float, creative: fork_creative.CreativeProfile | None,
+                       session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
                        event_callback: Callable[[ProgressEvent], None] | None = None,
                        verification_seconds: float | None = None) -> StatusResult:
+    # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
+    # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
+    # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
+    # supplying nothing has always got.
+    creative = creative if creative is not None else fork_creative.NEUTRAL_PROFILE
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -587,9 +603,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         ext = '.mov' if is_prores else '.mp4'
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         # [FORK] Digital-Union (Phase A): a variation render carries its seed in the filename so a
-        # good result can be found again. Seed 0 keeps today's name exactly.
-        seed = fork_variation.normalize_seed(variation_seed)
-        filename = f"{name}_{timestamp}{fork_variation.filename_suffix(seed)}{ext}"
+        # good result can be found again. Seed 0 keeps today's name exactly, and the three newer
+        # creative controls deliberately add nothing to the name.
+        filename = f"{name}_{timestamp}{creative.filename_suffix()}{ext}"
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
@@ -600,7 +616,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             progress_callback=progress_callback,
             console_callback=lambda stage, message: console_logger.stage_line(stage, message) if console_logger else None,
             event_callback=event_callback,
-            creative={"seed": seed},
+            creative=creative.as_dict(),
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
@@ -664,7 +680,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             output_fps=output_fps,
             total_processing_seconds=total_processing_seconds,
             processing_label=processing_label,
-            variation_text=fork_variation.describe(seed) if seed else None,
+            # [FORK] Digital-Union (Creative Controls Core): the whole resolved profile, so a render
+            # worth keeping can be reproduced from the panel. Omitted entirely on a neutral render,
+            # exactly as the seed-only line was.
+            variation_text=None if creative.is_neutral() else creative.describe(),
         )
         # [FORK] Digital-Union (L0.1): append the L0 baseline. The success statistics above are
         # untouched; this only adds a block the user can copy after the run, from values already
@@ -685,7 +704,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, session_state: dict,
-                 variation_seed: int = 0,
+                 creative: fork_creative.CreativeProfile | None = None,
                  verification_seconds: float | None = None) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
@@ -722,7 +741,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
                     custom_fps=custom_fps,
-                    variation_seed=variation_seed,
+                    creative=creative,
                     session_state=session_state,
                     progress_callback=progress_callback,
                     console_logger=console_logger,
@@ -840,7 +859,9 @@ def _on_confirm_click(state) -> Tuple:
 def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
-                          custom_fps: float, variation_seed: int, session_state: dict,
+                          custom_fps: float, variation_seed: int,
+                          cut_density: int, energy_response: int, motion_bias: int,
+                          session_state: dict,
                           source_state) -> Iterator[StatusResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
@@ -862,8 +883,11 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
     # the two lists line up name-for-name.
     #
-    # `variation_seed` is a render-request input like FPS or the encoder, NOT source identity: it is
-    # not wired into the source-confirmation handlers, so changing it cannot clear a confirmation.
+    # `variation_seed`, `cut_density`, `energy_response` and `motion_bias` are render-request inputs
+    # like FPS or the encoder, NOT source identity: none of them is wired into the
+    # source-confirmation handlers, so changing any of them cannot clear a confirmation, trigger a
+    # scan or touch Media Library Preparation. They are still *live* inputs here for the same reason
+    # the source controls are — the click must act on what is on screen.
     #
     # [FORK] Digital-Union (L0): the verification is timed, not changed. In local-folder mode it is
     # an authoritative filesystem re-scan of every confirmed source, so it is one of the costs that
@@ -879,6 +903,17 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         yield None, f"❌ {decision.message}", session_state
         return
 
+    # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
+    # one normalised profile here, at the render boundary, rather than being threaded onward as
+    # loose scalars. Nothing below this line ever sees an untrusted widget value, and nothing here
+    # can raise: `CreativeProfile` normalises every field on construction.
+    creative = fork_creative.CreativeProfile.from_widgets(
+        seed=variation_seed,
+        cut_density=cut_density,
+        energy_response=energy_response,
+        motion_bias=motion_bias,
+    )
+
     yield from process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
@@ -886,7 +921,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         processing_mode=processing_mode,
         custom_fps=custom_fps,
         session_state=session_state,
-        variation_seed=variation_seed,
+        creative=creative,
         verification_seconds=verification_seconds,
     )
 
@@ -1289,9 +1324,10 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown('### ⚙️ Video Settings')
                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
-                # [FORK] Digital-Union (Phase A): creative variation seed. Deliberately outside the
-                # Video Source group and never wired into `source_outputs`, so changing it cannot
-                # invalidate a confirmed source set.
+                # [FORK] Digital-Union (Phase A + Creative Controls Core): creative direction.
+                # Deliberately outside the Video Source group and never wired into `source_outputs`,
+                # so changing any of these cannot invalidate a confirmed source set. All four are
+                # render-request creative state: they re-plan, they never re-analyse.
                 with gr.Group():
                     gr.Markdown('### 🎨 Creative Direction')
                     variation_seed = gr.Number(
@@ -1303,6 +1339,36 @@ def create_ui() -> gr.Blocks:
                         elem_id='variation-seed-input',
                     )
                     randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+                    # Randomize stays seed-only on purpose; these three have no randomizer and no
+                    # reset. 50 is current BeatSync behaviour in every one of them, and the default
+                    # is the fork module's constant rather than a literal repeated here.
+                    cut_density = gr.Slider(
+                        minimum=fork_creative.CONTROL_MIN,
+                        maximum=fork_creative.CONTROL_MAX,
+                        step=1,
+                        value=fork_creative.DEFAULT_CONTROL,
+                        label=LABEL_CUT_DENSITY,
+                        info=INFO_CUT_DENSITY,
+                        elem_id='cut-density-slider',
+                    )
+                    energy_response = gr.Slider(
+                        minimum=fork_creative.CONTROL_MIN,
+                        maximum=fork_creative.CONTROL_MAX,
+                        step=1,
+                        value=fork_creative.DEFAULT_CONTROL,
+                        label=LABEL_ENERGY_RESPONSE,
+                        info=INFO_ENERGY_RESPONSE,
+                        elem_id='energy-response-slider',
+                    )
+                    motion_bias = gr.Slider(
+                        minimum=fork_creative.CONTROL_MIN,
+                        maximum=fork_creative.CONTROL_MAX,
+                        step=1,
+                        value=fork_creative.DEFAULT_CONTROL,
+                        label=LABEL_MOTION_BIAS,
+                        info=INFO_MOTION_BIAS,
+                        elem_id='motion-bias-slider',
+                    )
 
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
@@ -1472,6 +1538,7 @@ def create_ui() -> gr.Blocks:
                 audio_input,
                 source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps, variation_seed,
+                cut_density, energy_response, motion_bias,
                 session_state, source_state
             ],
             outputs=[video_output, status_output, session_state],

@@ -12,6 +12,8 @@ import numpy as np
 
 # [FORK] Digital-Union: seeded creative variation (stdlib-only fork module).
 from beatsync_fork import variation as fork_variation
+# [FORK] Digital-Union: the resolved Creative Profile (stdlib-only fork module).
+from beatsync_fork import creative as fork_creative
 
 
 def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -30,19 +32,30 @@ def _stable_rng(*parts) -> random.Random:
     return random.Random(seed)
 
 
-def creative_seed(beat_info: Dict | None) -> int:
-    """[FORK] Digital-Union: read the user's variation seed off the shared ``beat_info`` bus.
+def creative_profile(beat_info: Dict | None) -> fork_creative.CreativeProfile:
+    """[FORK] Digital-Union: read the resolved Creative Profile off the shared ``beat_info`` bus.
 
-    Absent, malformed or non-positive means legacy. Stage 6 is the only stage that reads it, which is
-    why the seed rides on ``beat_info`` instead of being threaded through the analysis signatures —
-    it must never reach Stage 5's cache identity.
+    The single reader. Absent, malformed or stale creative state resolves to the all-neutral profile
+    — current main — because a planner must never raise on a bus it did not write. A Phase A
+    ``{"seed": n}`` dict still resolves correctly, with the three newer controls left neutral.
+
+    Stage 6 is the only stage that reads any of this, which is why the profile rides on ``beat_info``
+    instead of being threaded through the analysis signatures: it must never reach Stage 5's cache
+    identity.
     """
     if not isinstance(beat_info, dict):
-        return fork_variation.LEGACY_SEED
-    creative = beat_info.get("creative")
-    if not isinstance(creative, dict):
-        return fork_variation.LEGACY_SEED
-    return fork_variation.normalize_seed(creative.get("seed"))
+        return fork_creative.NEUTRAL_PROFILE
+    return fork_creative.CreativeProfile.from_mapping(beat_info.get("creative"))
+
+
+def creative_seed(beat_info: Dict | None) -> int:
+    """[FORK] Digital-Union: the user's variation seed. Absent/malformed/non-positive means legacy.
+
+    Kept as the named compatibility surface it has been since Phase A (``video_processor`` reports
+    it, and it is the seed's public reader), now expressed through the one profile reader above so
+    the creative state cannot fork into two independently-parsed views of the same dict.
+    """
+    return creative_profile(beat_info).seed
 
 
 def build_planned_clip_sequence(
@@ -69,7 +82,13 @@ def build_planned_clip_sequence(
         return []
 
     profiles = _build_segment_profiles(cut_times_arr, durations_arr, beat_info)
-    seed = creative_seed(beat_info)
+    # [FORK] Digital-Union (Creative Controls Core): one resolved profile for the whole call. The
+    # scoring controls are render-scoped constants, so they are bound explicitly here and passed
+    # down — there is deliberately no module-global creative state, which is what keeps one render's
+    # settings from leaking into the next in a long-lived process.
+    profile_settings = creative_profile(beat_info)
+    seed = profile_settings.seed
+    controls = profile_settings.scoring_controls()
 
     # [FORK] Digital-Union (L1A): the static half of the score, computed once per
     # (candidate, target) instead of once per (candidate, segment). A real run measured 148 segments
@@ -79,11 +98,34 @@ def build_planned_clip_sequence(
     # deterministic; the default matches `_score_candidate`'s own `profile.get("target", "flow")`.
     # This runs inside `build_planned_clip_sequence`, so the L0 planner timing in
     # `video_processor.create_music_video` still describes the whole call, precomputation included.
+    #
+    # [FORK] Digital-Union (Creative Controls Core): Energy Response and Motion Bias do NOT add a
+    # dimension to this table — they are constants for the render, so the shape stays
+    # `candidates × distinct targets`. Energy Response needs one extra column, "flow", because it
+    # blends each target score against the generic one; that column is `candidates × 1` and is only
+    # built when the control is non-neutral. Neutral scoring keeps today's dict comprehension
+    # verbatim rather than running the new arithmetic with neutral coefficients.
     segment_targets = [profile.get("target", "flow") for profile in profiles]
-    base_scores_by_target = {
-        target: tuple(_static_base_score(candidate, target) for candidate in candidates)
-        for target in dict.fromkeys(segment_targets)
-    }
+    if controls.is_neutral:
+        base_scores_by_target = {
+            target: tuple(_static_base_score(candidate, target) for candidate in candidates)
+            for target in dict.fromkeys(segment_targets)
+        }
+    else:
+        flow_scores = (
+            tuple(_static_base_score(candidate, "flow") for candidate in candidates)
+            if controls.needs_flow_column else None
+        )
+        base_scores_by_target = {
+            target: tuple(
+                _effective_base_score(
+                    candidate, target, controls,
+                    flow_score=None if flow_scores is None else flow_scores[position],
+                )
+                for position, candidate in enumerate(candidates)
+            )
+            for target in dict.fromkeys(segment_targets)
+        }
 
     recent_ids = deque(maxlen=10)
     recent_videos = deque(maxlen=5)
@@ -100,6 +142,7 @@ def build_planned_clip_sequence(
             index=i,
             seed=seed,
             base_scores=base_scores_by_target[segment_targets[i]],
+            controls=controls,
         )
         if not candidate:
             continue
@@ -107,6 +150,7 @@ def build_planned_clip_sequence(
             candidate=candidate,
             profile=profile,
             index=i,
+            controls=controls,
         )
         planned.append(planned_clip)
         recent_ids.append(candidate.get("id"))
@@ -119,24 +163,40 @@ def build_planned_clip_sequence(
     return planned
 
 
-def summarize_clip_plan(plan: Sequence[Dict], seed: int = 0) -> Dict:
+def summarize_clip_plan(plan: Sequence[Dict], seed: int = 0, creative=None) -> Dict:
     # [FORK] Digital-Union: `seed` is optional and defaults to legacy, so existing callers are
     # unchanged. It is reported, never re-derived — the plan itself carries no seed.
-    seed = fork_variation.normalize_seed(seed)
-    if not plan:
-        return {"clip_count": 0, "targets": {}, "ai_tagged": 0, "seed": seed,
-                "variation": fork_variation.describe(seed)}
-    targets = Counter(str(item.get("target", "flow")) for item in plan)
-    ai_tagged = sum(1 for item in plan if item.get("ai_analyzed"))
-    source_count = len(set(item.get("video_file") for item in plan))
-    return {
-        "clip_count": len(plan),
-        "targets": dict(targets),
-        "ai_tagged": ai_tagged,
-        "source_count": source_count,
+    #
+    # [FORK] Digital-Union (Creative Controls Core): `creative` is the resolved profile (a
+    # `CreativeProfile` or its `as_dict()`), also optional. When it is absent the summary describes
+    # a seed-only profile, which is exactly what this function reported before. Reporting only: no
+    # part of the plan is re-derived from it.
+    if creative is None:
+        profile = fork_creative.CreativeProfile.from_widgets(seed=seed)
+    elif isinstance(creative, fork_creative.CreativeProfile):
+        profile = creative
+    else:
+        profile = fork_creative.CreativeProfile.from_mapping(creative)
+    seed = profile.seed
+    summary = {
+        "clip_count": 0,
+        "targets": {},
+        "ai_tagged": 0,
         "seed": seed,
         "variation": fork_variation.describe(seed),
+        "creative": profile.as_dict(),
+        "creative_text": profile.describe(),
     }
+    if not plan:
+        return summary
+    targets = Counter(str(item.get("target", "flow")) for item in plan)
+    summary.update({
+        "clip_count": len(plan),
+        "targets": dict(targets),
+        "ai_tagged": sum(1 for item in plan if item.get("ai_analyzed")),
+        "source_count": len(set(item.get("video_file") for item in plan)),
+    })
+    return summary
 
 
 def _build_segment_profiles(cut_times: np.ndarray, segment_durations: np.ndarray, beat_info: Dict) -> List[Dict]:
@@ -218,6 +278,7 @@ def _adjusted_score(
     recent_videos: deque,
     usage: Counter,
     base_score: float | None = None,
+    controls: "fork_creative.ScoringControls | None" = None,
 ) -> float:
     """The planner's score for one candidate, repeat and duration penalties applied.
 
@@ -230,8 +291,14 @@ def _adjusted_score(
     segment's duration, so it must still run per segment and is untouched. Only the static base score
     may be supplied by the caller; ``base_score=None`` keeps the original behaviour of computing it
     here, which is what every existing caller and unit test gets.
+
+    [FORK] Digital-Union (Creative Controls Core): ``controls`` rides alongside ``base_score``
+    precisely so the *fallback* stays correct. If the table is absent or rejected as misaligned,
+    recomputing the static score here must produce the same number the table would have held —
+    otherwise a defensive path would silently drop back to legacy scoring on a render the user
+    configured. ``None`` is neutral, so every existing caller is unchanged.
     """
-    score = _score_candidate(candidate, profile) if base_score is None else float(base_score)
+    score = _score_candidate(candidate, profile, controls) if base_score is None else float(base_score)
     cid = candidate.get("id")
     video_file = candidate.get("video_file")
 
@@ -259,6 +326,7 @@ def _choose_candidate(
     index: int,
     seed: int = 0,
     base_scores: Sequence[float] | None = None,
+    controls: "fork_creative.ScoringControls | None" = None,
 ) -> Dict | None:
     # [FORK] Digital-Union (L1A): `base_scores` is the precomputed static score for THIS segment's
     # target, aligned with `candidates` by position — candidate ids are not used as the key, because
@@ -282,6 +350,7 @@ def _choose_candidate(
             score = _adjusted_score(
                 candidate, profile, recent_ids, recent_videos, usage,
                 base_score=None if base_scores is None else base_scores[position],
+                controls=controls,
             )
             score += rng.random() * 0.015
             if score > best_score:
@@ -298,6 +367,7 @@ def _choose_candidate(
         _adjusted_score(
             candidate, profile, recent_ids, recent_videos, usage,
             base_score=None if base_scores is None else base_scores[position],
+            controls=controls,
         )
         for position, candidate in enumerate(candidates)
     ]
@@ -305,14 +375,73 @@ def _choose_candidate(
     return candidates[fork_variation.select_index(scores, rng)]
 
 
-def _score_candidate(candidate: Dict, profile: Dict) -> float:
+def _score_candidate(candidate: Dict, profile: Dict,
+                     controls: "fork_creative.ScoringControls | None" = None) -> float:
     """The planner's base score for one candidate under one segment profile.
 
     [FORK] Digital-Union (L1A): kept as the compatibility surface every existing caller uses
     (`_materialize_clip`, tests, any internal caller). It now only resolves the target and delegates,
     because the arithmetic below reads **nothing else** from the profile.
+
+    [FORK] Digital-Union (Creative Controls Core): ``controls`` defaults to ``None`` — neutral —
+    so every existing caller is unchanged and gets the legacy score exactly.
     """
-    return _static_base_score(candidate, profile.get("target", "flow"))
+    return _effective_base_score(candidate, profile.get("target", "flow"), controls)
+
+
+def _candidate_motion(candidate: Dict) -> float:
+    """The candidate's motion in ``[0, 1]``, with the planner's existing semantic fallback.
+
+    [FORK] Digital-Union (Creative Controls Core): extracted so Motion Bias reads motion the same
+    way the base score already does — the deterministic ``motion`` metric when present, the Qwen
+    ``camera_motion`` semantic otherwise, ``0.0`` when neither is. Motion Bias must weight the value
+    the planner already believes; deriving it any other way would be a second, silently diverging
+    definition of what "dynamic" means.
+    """
+    semantic = candidate.get("semantic") or {}
+    return _clamp(candidate.get("motion", semantic.get("camera_motion", 0.0)))
+
+
+def _effective_base_score(candidate: Dict, target: str,
+                          controls: "fork_creative.ScoringControls | None" = None,
+                          *, flow_score: float | None = None) -> float:
+    """The static score after this render's Energy Response and Motion Bias.
+
+    [FORK] Digital-Union (Creative Controls Core). One explicit, documented ordering:
+
+    1. the legacy static score for the segment's actual target;
+    2. **Energy Response** — blend that against the score the same candidate would get for the
+       generic ``flow`` target: ``flow + factor * (target - flow)``. ``factor`` runs 0.40 … 1.60, so
+       a low setting pulls every segment towards generic visual suitability (weak target matching)
+       and a high one exaggerates the difference the music asked for (strong target matching). At
+       ``factor == 1.0`` this is algebraically the target score, which is exactly why 50 takes the
+       neutral branch instead: algebraic identity is not floating-point identity;
+    3. **Motion Bias** — add ``centered * 0.15 * (2 * motion - 1)``, so calm settings reward
+       low-motion material and dynamic settings reward high-motion material, symmetrically about
+       ``motion = 0.5``;
+    4. clamp back into the planner's existing ``[-1.0, 2.0]`` score range.
+
+    Neither control depends on the seed, and neither is consulted before the legacy score exists —
+    they modulate scoring, they do not replace it. The seed still decides the winner afterwards.
+
+    ``flow_score`` lets the caller supply the precomputed flow column so Energy Response costs one
+    extra column of the static table rather than one extra evaluation per (candidate, target).
+
+    When ``controls`` is ``None`` or neutral this returns ``_static_base_score`` untouched: no
+    blend, no shift, no second clamp.
+    """
+    base = _static_base_score(candidate, target)
+    if controls is None or controls.is_neutral:
+        return base
+
+    score = base
+    if controls.energy_factor is not None:
+        flow = _static_base_score(candidate, "flow") if flow_score is None else float(flow_score)
+        score = flow + controls.energy_factor * (score - flow)
+    if controls.motion_centered is not None:
+        score += (controls.motion_centered * fork_creative.MOTION_BIAS_COEFFICIENT
+                  * (2.0 * _candidate_motion(candidate) - 1.0))
+    return _clamp(score, lo=-1.0, hi=2.0)
 
 
 def _static_base_score(candidate: Dict, target: str) -> float:
@@ -374,7 +503,8 @@ def _static_base_score(candidate: Dict, target: str) -> float:
     return _clamp(match + tag_bonus + 0.12 * quality - visibility_penalty, lo=-1.0, hi=2.0)
 
 
-def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
+def _materialize_clip(candidate: Dict, profile: Dict, index: int,
+                      controls: "fork_creative.ScoringControls | None" = None) -> Dict:
     final_duration = max(0.05, float(profile["duration"]))
     source_duration = final_duration
     video_duration = max(source_duration, float(candidate.get("video_duration", source_duration)))
@@ -404,7 +534,11 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int) -> Dict:
         "source_duration": source_duration,
         "final_duration": final_duration,
         "target": target,
-        "score": _score_candidate(candidate, profile),
+        # [FORK] Digital-Union (Creative Controls Core): diagnostic, but it must agree with the
+        # score selection actually used — a plan reporting the legacy score for a render that chose
+        # on a modified one would be a quietly misleading record. Clip timing and anchoring above
+        # are untouched by any creative control.
+        "score": _score_candidate(candidate, profile, controls),
         "candidate_id": candidate.get("id"),
         "tags": list(candidate.get("tags", [])),
         "ai_analyzed": bool(candidate.get("ai_analyzed")),

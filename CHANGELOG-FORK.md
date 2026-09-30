@@ -20,6 +20,61 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-30 (B0 + Creative Controls Core: Cut Density, Energy Response, Motion Bias)
+
+Phase A's single creative control — the variation seed — is generalised into one resolved **Creative
+Profile** carrying four controls, and three new ones are implemented on top of the boundary P2
+established.
+
+| Control | Range | Neutral | Owned by |
+|---|---|---|---|
+| Variation Seed | 0 / positive | 0 | Stage 6 — which of the good candidates wins |
+| Cut Density | 0–100 | 50 | Stage 4 — how many beats become cuts |
+| Energy Response | 0–100 | 50 | Stage 6 — how hard scoring follows the music's target |
+| Motion Bias | 0–100 | 50 | Stage 6 — calm vs. dynamic source material |
+
+- **50 is today, exactly.** `seed=0, cut_density=50, energy_response=50, motion_bias=50` reproduces
+  current main's selected cut times, segment targets, candidate choices, legacy seed-0 RNG stream,
+  plan length and output filenames. Every neutral control takes an explicit branch that calls the
+  pre-existing legacy path rather than running the new arithmetic with a neutral coefficient, because
+  even an operation-order change would make "upgrade and change nothing" untrue. Stage 4's neutral
+  result is pinned against an independent recomputation of the pre-Core algorithm.
+- **Mappings.** Cut Density: `f = 2 ** ((d - 50) / 50)`, so 0.5 / 1.0 / 2.0 at 0 / 50 / 100; minimum
+  intervals and maximum holds divide by `f`, the global cut-ratio band multiplies by it (capped at
+  0.95 / 0.98), beat steps re-quantise half-up into `[1, 8]`, and the weak-score breathing threshold
+  scales by `1/f`. Energy Response: `factor = 1 + ((r - 50) / 50) * 0.6` (0.40 … 1.60), blending each
+  target score against the same candidate's generic `flow` score. Motion Bias:
+  `centered * 0.15 * (2 * motion - 1)`. Ordering is fixed and documented: legacy score → energy blend
+  → motion shift → one clamp.
+- **Stage 5 is untouched, and that is the point.** No control reaches `_qwen_config_token`,
+  `_video_signature`, `_cache_path`, a Qwen request, the Qwen prompt or a persisted semantic payload.
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`; `video_analysis.py`, `stage5_qwen_scene_worker.py` and
+  the preparation workflow were not modified. Cut Density *does* legitimately change
+  `audio_visual_profile` (it changes `selected_beats`, hence `average_cut_interval`, `cut_count` and
+  possibly `smart_preset`) — allowed, because since P2 that profile has zero executable effect inside
+  Stage 5. A regression test proves two densities derive identical cache paths for the same sources.
+- **L1A survives.** Energy Response and Motion Bias are render-scoped constants, so the static score
+  table stays `candidates × distinct targets`; Energy Response adds one `candidates`-wide `flow`
+  column and nothing else. Never `candidates × segments`.
+- **UI / CLI.** Three sliders in Creative Direction (0–100, step 1, default 50) and three optional CLI
+  flags (`--cut-density`, `--energy-response`, `--motion-bias`). All are render-request creative
+  state: none registers a source-invalidating handler, so none can clear a source confirmation,
+  disable Create Video, trigger a scan or touch Media Library Preparation. Randomize still writes the
+  seed only. Filenames are unchanged — the existing `_seedNNN` suffix rule is the whole rule; the
+  resolved profile is reported in the console, the success panel, `render_info["creative"]` and the
+  plan summary instead.
+- **Not implemented, deliberately:** Freestyle, an AI Director, Variant Lab, Creative Recipe
+  persistence, per-section profiles, Micro Cuts, Source Diversity, Semantic Emphasis, L2 stage caching
+  and a second Qwen pass. The future L2 invalidation boundaries are documented in `CLAUDE.md`, not
+  built.
+- Files: `src/beatsync_fork/creative.py` (new), `src/auto_mode/__init__.py`,
+  `src/auto_mode/stage4_select.py`, `src/auto_mode/stage6_av_planner.py`, `src/gui.py`,
+  `src/ui_content.py`, `src/video_processor.py`, `tests/test_creative_profile.py` (new),
+  `tests/test_cut_density.py` (new), `tests/test_creative_scoring.py` (new),
+  `tests/test_creative_controls_interactions.py` (new), `tests/test_creative_controls_seam.py` (new),
+  `tests/test_creative_seed.py`, `tests/test_library_preparation.py`, `tests/test_scale_diagnostics.py`.
+
 ### Added — 2026-09-30 (Media Library Preparation: bounded analysis batches)
 
 Preparation's Analyze click now submits one bounded batch of the outstanding sources instead of all

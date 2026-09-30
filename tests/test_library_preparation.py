@@ -983,26 +983,31 @@ def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
     return {kw.arg: kw.value for kw in call.keywords}
 
 
-def test_i_the_render_click_inputs_are_unchanged():
+#: The render request, in order. Creative Controls Core added the three creative sliders alongside
+#: the variation seed; they are render-request creative state, not preparation state, which is what
+#: the assertions below actually care about.
+_RENDER_CLICK_INPUTS = [
+    "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
+    "output_filename", "processing_mode", "custom_fps", "variation_seed",
+    "cut_density", "energy_response", "motion_bias",
+    "session_state", "source_state",
+]
+
+
+def test_i_the_render_click_inputs_carry_no_preparation_state():
     kwargs = _click_kwargs(_tree(_GUI), "process_btn")
     names = [getattr(node, "id", None) for node in kwargs["inputs"].elts]
 
-    assert names == [
-        "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
-        "output_filename", "processing_mode", "custom_fps", "variation_seed",
-        "session_state", "source_state",
-    ]
+    assert names == _RENDER_CLICK_INPUTS
     assert getattr(kwargs["fn"], "id", None) == "process_video_guarded"
     assert not any(name and name.startswith("prep") for name in names)
 
 
-def test_i_the_guard_signature_is_unchanged():
+def test_i_the_guard_signature_carries_no_preparation_state():
     args = [a.arg for a in _func(_tree(_GUI), "process_video_guarded").args.args]
-    assert args == [
-        "audio_file", "source_mode", "source_folder", "source_recursive", "video_input",
-        "output_filename", "processing_mode", "custom_fps", "variation_seed",
-        "session_state", "source_state",
-    ]
+    # audio_input -> audio_file is the one deliberate rename between widget and parameter.
+    assert args == ["audio_file"] + _RENDER_CLICK_INPUTS[1:]
+    assert not any(name.startswith("prep") for name in args)
 
 
 def test_i_preparation_widgets_are_absent_from_source_outputs():
