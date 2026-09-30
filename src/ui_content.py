@@ -390,6 +390,15 @@ INFO_SOURCE_DIVERSITY = (
     "the same moment is unaffected, and so are the cut timing and the music analysis."
 )
 
+LABEL_SEMANTIC_EMPHASIS = "🧠 Semantic Emphasis"
+INFO_SEMANTIC_EMPHASIS = (
+    "Visual Metrics ↔ Semantic Context. 50 = current BeatSync behaviour. Lower leans on measured "
+    "visual metrics (motion, sharpness, colour, exposure); higher gives more weight to what the "
+    "scene was understood to contain. This does not switch analysis off — it only changes how your "
+    "already-analysed library is interpreted. Expect a clearer effect on soft and building sections "
+    "than on obvious action."
+)
+
 LABEL_MICRO_CUTS = "✨ Micro Cuts"
 INFO_MICRO_CUTS = (
     "Fewer ↔ More accents. 50 = current BeatSync behaviour. This is only the rare extra half-beat "

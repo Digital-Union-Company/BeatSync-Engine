@@ -126,7 +126,7 @@ def test_a_phase_a_seed_only_dict_still_resolves():
 
 def test_unknown_keys_on_the_bus_are_ignored():
     profile = creative.CreativeProfile.from_mapping(
-        {"seed": 5, "cut_density": 70, "semantic_emphasis": 90, "director": "freestyle"})
+        {"seed": 5, "cut_density": 70, "master_seed": 90, "director": "freestyle"})
 
     assert profile == creative.CreativeProfile(seed=5, cut_density=70)
 
@@ -170,11 +170,11 @@ def test_describe_seed_is_the_variation_wording():
 
 def test_as_dict_round_trips_exactly():
     profile = creative.CreativeProfile(seed=101, cut_density=70, energy_response=80, motion_bias=30,
-                                       source_diversity=20, micro_cuts=90)
+                                       source_diversity=20, micro_cuts=90, semantic_emphasis=35)
     payload = profile.as_dict()
 
     assert payload == {"seed": 101, "cut_density": 70, "energy_response": 80, "motion_bias": 30,
-                       "source_diversity": 20, "micro_cuts": 90}
+                       "source_diversity": 20, "micro_cuts": 90, "semantic_emphasis": 35}
     assert all(isinstance(value, int) for value in payload.values())
     assert creative.CreativeProfile.from_mapping(payload) == profile
 
@@ -363,17 +363,18 @@ def test_describe_reports_legacy_for_a_neutral_render():
 
 def test_describe_lists_every_control_once_anything_is_set():
     text = creative.CreativeProfile(seed=101, cut_density=65, energy_response=80, motion_bias=40,
-                                    source_diversity=80, micro_cuts=70).describe()
+                                    source_diversity=80, micro_cuts=70,
+                                    semantic_emphasis=35).describe()
 
-    assert text == ("Seed 101 · Cut Density 65 · Micro Cuts 70 · Energy Response 80 "
-                    "· Motion Bias 40 · Source Diversity 80")
+    assert text == ("Seed 101 · Cut Density 65 · Micro Cuts 70 · Semantic Emphasis 35 "
+                    "· Energy Response 80 · Motion Bias 40 · Source Diversity 80")
 
 
 def test_describe_still_names_a_default_seed_when_only_a_control_moved():
     text = creative.CreativeProfile(cut_density=65).describe()
 
-    assert text == ("Seed default · Cut Density 65 · Micro Cuts 50 · Energy Response 50 "
-                    "· Motion Bias 50 · Source Diversity 50")
+    assert text == ("Seed default · Cut Density 65 · Micro Cuts 50 · Semantic Emphasis 50 "
+                    "· Energy Response 50 · Motion Bias 50 · Source Diversity 50")
 
 
 def test_describe_is_enough_to_reproduce_the_render():
@@ -431,7 +432,8 @@ def test_a_phase_a_mapping_still_reads_back_neutral_for_everything_but_the_seed(
 
     assert profile.seed == 381944
     assert profile.as_dict() == {"seed": 381944, "cut_density": 50, "energy_response": 50,
-                                 "motion_bias": 50, "source_diversity": 50, "micro_cuts": 50}
+                                 "motion_bias": 50, "source_diversity": 50, "micro_cuts": 50,
+                                 "semantic_emphasis": 50}
 
 
 def test_from_widgets_accepts_the_new_controls_and_treats_none_as_neutral():
@@ -541,10 +543,123 @@ def test_the_new_controls_add_no_filename_suffix():
             ).filename_suffix() == "_seed101"
 
 
-def test_no_semantic_emphasis_field_was_added():
-    """Explicitly out of scope for this PR: a dormant field would be placeholder state."""
-    assert not hasattr(creative.CreativeProfile(), "semantic_emphasis")
-    assert "semantic_emphasis" not in creative.CreativeProfile().as_dict()
+# ---------------------------------------------------------------------------
+# Creative Controls Extra PR2: Semantic Emphasis
+# ---------------------------------------------------------------------------
+
+
+def test_semantic_emphasis_defaults_to_neutral():
+    profile = creative.CreativeProfile()
+
+    assert profile.semantic_emphasis == 50
+    assert profile.is_neutral_semantic_emphasis()
+    assert profile.is_neutral_scoring()
+    assert profile.is_neutral()
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0, 0), (50, 50), (100, 100), (250, 100), (-10, 0), ("75", 75),
+    (75.0, 75), (75.5, 50), (True, 50), (None, 50), ("", 50), ("abc", 50),
+    (float("nan"), 50), (float("inf"), 50),
+])
+def test_semantic_emphasis_uses_the_existing_normalisation(value, expected):
+    profile = creative.CreativeProfile(semantic_emphasis=value)
+
+    assert profile.semantic_emphasis == expected
+    assert profile.semantic_emphasis == creative.normalize_control(value)
+
+
+def test_a_pr1_mapping_reads_back_neutral_semantic_emphasis():
+    """Backward compatibility: a bus written before PR2 carries no `semantic_emphasis`."""
+    pr1 = {"seed": 101, "cut_density": 75, "energy_response": 80, "motion_bias": 25,
+           "source_diversity": 80, "micro_cuts": 70}
+    profile = creative.CreativeProfile.from_mapping(pr1)
+
+    assert profile.semantic_emphasis == 50
+    assert profile.is_neutral_semantic_emphasis()
+    for field, value in pr1.items():
+        assert getattr(profile, field) == value
+
+
+@pytest.mark.parametrize("emphasis, expected", [
+    (0, 0.0), (25, 0.5), (50, 1.0), (75, 1.5), (100, 2.0)])
+def test_semantic_emphasis_factor_is_the_accepted_mapping(emphasis, expected):
+    assert creative.CreativeProfile(
+        semantic_emphasis=emphasis).semantic_emphasis_factor() == pytest.approx(expected)
+
+
+def test_semantic_emphasis_factor_is_exactly_one_at_neutral_and_zero_at_zero():
+    assert creative.CreativeProfile(semantic_emphasis=50).semantic_emphasis_factor() == 1.0
+    assert creative.CreativeProfile(semantic_emphasis=0).semantic_emphasis_factor() == 0.0
+
+
+def test_semantic_emphasis_factor_is_strictly_monotonic():
+    factors = [creative.CreativeProfile(semantic_emphasis=e).semantic_emphasis_factor()
+               for e in range(0, 101)]
+
+    assert all(a < b for a, b in zip(factors, factors[1:]))
+    assert all(math.isfinite(f) for f in factors)
+
+
+def test_semantic_emphasis_is_part_of_the_static_scoring_controls():
+    """Unlike Source Diversity, it *is* static and *does* belong in the precompute table."""
+    neutral = creative.CreativeProfile().scoring_controls()
+    assert neutral is creative.NEUTRAL_SCORING
+    assert neutral.semantic_factor is None
+    assert not neutral.needs_deterministic_views
+
+    for emphasis in (0, 25, 75, 100):
+        controls = creative.CreativeProfile(semantic_emphasis=emphasis).scoring_controls()
+        assert controls.semantic_factor == pytest.approx(
+            creative.CreativeProfile(semantic_emphasis=emphasis).semantic_emphasis_factor())
+        assert controls.needs_deterministic_views
+        assert not controls.is_neutral
+        # and it alone must not request Energy Response's flow column
+        assert not controls.needs_flow_column
+
+
+def test_each_static_control_is_still_decided_independently():
+    semantic_only = creative.CreativeProfile(semantic_emphasis=0).scoring_controls()
+    assert semantic_only.energy_factor is None and semantic_only.motion_centered is None
+
+    energy_only = creative.CreativeProfile(energy_response=100).scoring_controls()
+    assert energy_only.semantic_factor is None
+    assert not energy_only.needs_deterministic_views
+
+    both = creative.CreativeProfile(semantic_emphasis=0, energy_response=0).scoring_controls()
+    assert both.needs_deterministic_views and both.needs_flow_column
+
+
+def test_semantic_emphasis_is_not_confused_with_source_diversity_or_micro_cuts():
+    """The three Extra controls belong to three different halves of the pipeline."""
+    assert creative.CreativeProfile(source_diversity=0).is_neutral_scoring()
+    assert creative.CreativeProfile(micro_cuts=0).is_neutral_scoring()
+    assert not creative.CreativeProfile(semantic_emphasis=0).is_neutral_scoring()
+    assert creative.CreativeProfile(semantic_emphasis=0).is_neutral_cuts()
+    assert creative.CreativeProfile(semantic_emphasis=0).is_neutral_micro_cuts()
+    assert creative.CreativeProfile(semantic_emphasis=0).is_neutral_source_diversity()
+
+
+def test_is_neutral_includes_semantic_emphasis():
+    assert not creative.CreativeProfile(semantic_emphasis=0).is_neutral()
+    assert not creative.CreativeProfile(semantic_emphasis=100).is_neutral()
+    assert creative.CreativeProfile(semantic_emphasis=50).is_neutral()
+
+
+def test_semantic_emphasis_adds_no_filename_suffix():
+    for emphasis in (0, 50, 100):
+        assert creative.CreativeProfile(semantic_emphasis=emphasis).filename_suffix() == ""
+        assert creative.CreativeProfile(
+            seed=101, semantic_emphasis=emphasis).filename_suffix() == "_seed101"
+
+
+def test_no_preset_or_director_field_was_added():
+    """Presets and the director modes remain out of scope; a dormant field would be placeholder
+    state. (PR1's equivalent guard covered `semantic_emphasis`, which PR2 now implements.)"""
+    profile = creative.CreativeProfile()
+    for field in ("preset", "director", "freestyle", "master_seed", "recipe"):
+        assert not hasattr(profile, field), field
+        assert field not in profile.as_dict(), field
     # and a bus carrying one is simply ignored rather than half-honoured
-    profile = creative.CreativeProfile.from_mapping({"seed": 5, "semantic_emphasis": 90})
-    assert profile == creative.CreativeProfile(seed=5)
+    assert creative.CreativeProfile.from_mapping(
+        {"seed": 5, "preset": "cinematic"}) == creative.CreativeProfile(seed=5)

@@ -20,6 +20,65 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-01 (Creative Controls Extra PR2: Semantic Emphasis)
+
+A seventh creative control: how strongly Stage 6 weights the persisted media-neutral semantic reading
+against deterministic visual evidence. 0–100, **50 = current behaviour**, Stage 6 only.
+
+- **0 does not disable Qwen.** Stage 5 is untouched, its records are untouched, and on a cold cache
+  Qwen still runs and still writes the same semantics. The control changes only how an
+  *already-analysed* library is interpreted at plan time. The UI help text says this explicitly.
+- **The deterministic view is reconstructed, not read.** `_merge_semantic` fuses Qwen's reading into
+  `quality_score`, `action_score`, `beauty_score`, `tension_score`, `soft_score` and `tags` **in
+  place** and keeps no pre-fusion copy — so "deterministic evidence only" cannot be looked up. It
+  *can* be recomputed: the six raw CV primitives (`motion`, `brightness`, `contrast`, `saturation`,
+  `sharpness`, `colorfulness`) are never overwritten, and Stage 5's deterministic scores are a pure
+  function of exactly those. New stdlib-only `beatsync_fork/deterministic_view.py` recomputes the
+  pre-Qwen candidate forward from them — no inversion, no clamp undone, nothing inferred from the
+  semantic side, and the input candidate is never mutated.
+- **Stage 5 was deliberately not refactored to share the formulas.** Editing production Stage-5 code
+  to suit a Stage-6 creative feature would risk changing persisted floating-point values and drag the
+  cache contract into a PR with no business touching it. The duplication is the lesser risk
+  *provided drift is loud*, so two independent defences pin it against the real Stage-5 source rather
+  than against copied literals: a **fixed-point** test that runs the actual `_build_candidate` over a
+  threshold-crossing matrix and requires the view to return its output unchanged, and a
+  **quality-formula** test that extracts the arithmetic out of the window-measuring code and
+  evaluates it (also asserting the CPU and CuPy metric paths still agree). A third test fails if
+  `_merge_semantic` ever starts overwriting one of the six primitives the reconstruction depends on.
+- **Formula and ordering.** `factor = 1 + ((e - 50) / 50)` → 0.0 / 1.0 / 2.0; effective score is
+  `det + factor * (full - det)`, both sides through the *same* `_static_base_score` — there is no
+  second scorer. Static order is now: legacy score → **Semantic Emphasis** → Energy Response →
+  Motion Bias → one clamp. Energy Response blends against the **semantic-adjusted** flow score, so
+  both sides of that blend describe one candidate under one interpretation.
+- **L1A preserved.** Deterministic views are built **once per candidate per planner call** and reused
+  for every target, for the flow column and for the per-clip diagnostic score. The table stays
+  `candidates × distinct targets`; each cell costs two evaluations when the control is on. Neutral
+  builds **zero** views and leaves the evaluation count exactly as it was — asserted by counting, not
+  by inspecting the factor.
+- **It invents nothing.** On a candidate Qwen never touched the deterministic view *is* the
+  candidate, so the control is exactly inert — proved at every setting and every target.
+- **Honest limitation.** The effect is target-dependent by construction: Stage 5 motion-gates
+  semantic action, so on the real 509-candidate TEST1 pool the semantic/deterministic score
+  divergence is mean |Δ| ≈ 0.143 on `soft` and 0.142 on `build`, but only ≈ 0.023 on `drop` and 0.029
+  on `rhythm`. The factor was **not** retuned to manufacture drama on action material.
+- **Real-material evidence (read-only, no cache write).** Over all 509 prepared TEST1 candidates,
+  reconstructing deterministic quality and re-applying Stage 5's documented fusion reproduces the
+  persisted `quality_score` with max error **exactly 0.0** on 509/509.
+- **Stage 5 unchanged.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `src/video_analysis.py`,
+  `src/auto_mode/stage5_qwen_scene_worker.py` and `src/beatsync_fork/library_prep.py` are
+  byte-identical to main. No schema change, no migration.
+- **UI / CLI.** One more slider in Creative Direction (0–100, step 1, default 50) and
+  `--semantic-emphasis`. Render-request creative state: no handler, absent from
+  `source_outputs`/`prep_outputs`, live `process_btn` input with pinned positional alignment.
+  Randomize stays seed-only. No filename suffix — seed remains the only one.
+- **Presets remain deferred** to their own PR.
+- Files: `src/beatsync_fork/deterministic_view.py` (new), `src/beatsync_fork/creative.py`,
+  `src/auto_mode/stage6_av_planner.py`, `src/gui.py`, `src/ui_content.py`, `src/video_processor.py`,
+  `tests/test_deterministic_view.py` (new), `tests/test_semantic_emphasis.py` (new),
+  `tests/test_creative_profile.py`, `tests/test_creative_controls_seam.py`,
+  `tests/test_library_preparation.py`, `tests/test_no_runtime_dependency.py`.
+
 ### Added — 2026-09-30 (Creative Controls Extra PR1: Source Diversity, Micro Cuts)
 
 Two more controls on the Creative Controls Core seam. `CreativeProfile` grows to six fields; both

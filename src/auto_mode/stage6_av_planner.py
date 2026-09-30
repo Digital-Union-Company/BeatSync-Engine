@@ -14,6 +14,8 @@ import numpy as np
 from beatsync_fork import variation as fork_variation
 # [FORK] Digital-Union: the resolved Creative Profile (stdlib-only fork module).
 from beatsync_fork import creative as fork_creative
+# [FORK] Digital-Union: the pre-Qwen deterministic candidate view (stdlib-only fork module).
+from beatsync_fork import deterministic_view as fork_deterministic
 
 
 def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -115,14 +117,38 @@ def build_planned_clip_sequence(
     # built when the control is non-neutral. Neutral scoring keeps today's dict comprehension
     # verbatim rather than running the new arithmetic with neutral coefficients.
     segment_targets = [profile.get("target", "flow") for profile in profiles]
+    deterministic_views: tuple | None = None
+    deterministic_by_candidate: dict = {}
     if controls.is_neutral:
         base_scores_by_target = {
             target: tuple(_static_base_score(candidate, target) for candidate in candidates)
             for target in dict.fromkeys(segment_targets)
         }
     else:
+        # [FORK] Digital-Union (Creative Controls Extra PR2): the deterministic views are built
+        # ONCE per candidate here and reused for every target, for the flow column and for the
+        # per-clip diagnostic score. Rebuilding them per (candidate, target) would multiply the one
+        # genuinely expensive part of Semantic Emphasis by the target count for no benefit. Keyed by
+        # `id()` for the materialise lookup because candidates are dicts (unhashable) whose ids are
+        # not guaranteed unique across a large library — the list holds them alive for the call.
+        if controls.needs_deterministic_views:
+            deterministic_views = tuple(
+                fork_deterministic.deterministic_candidate_view(candidate)
+                for candidate in candidates
+            )
+            deterministic_by_candidate = {
+                id(candidate): view for candidate, view in zip(candidates, deterministic_views)
+            }
+        # The flow column Energy Response blends against is the SEMANTIC-ADJUSTED flow, so both
+        # sides of that blend describe the same candidate under the same interpretation.
         flow_scores = (
-            tuple(_static_base_score(candidate, "flow") for candidate in candidates)
+            tuple(
+                _semantic_adjusted_score(
+                    candidate, "flow", controls,
+                    None if deterministic_views is None else deterministic_views[position],
+                )
+                for position, candidate in enumerate(candidates)
+            )
             if controls.needs_flow_column else None
         )
         base_scores_by_target = {
@@ -130,6 +156,8 @@ def build_planned_clip_sequence(
                 _effective_base_score(
                     candidate, target, controls,
                     flow_score=None if flow_scores is None else flow_scores[position],
+                    deterministic=(None if deterministic_views is None
+                                   else deterministic_views[position]),
                 )
                 for position, candidate in enumerate(candidates)
             )
@@ -161,6 +189,7 @@ def build_planned_clip_sequence(
             profile=profile,
             index=i,
             controls=controls,
+            deterministic=deterministic_by_candidate.get(id(candidate)),
         )
         planned.append(planned_clip)
         recent_ids.append(candidate.get("id"))
@@ -406,7 +435,8 @@ def _choose_candidate(
 
 
 def _score_candidate(candidate: Dict, profile: Dict,
-                     controls: "fork_creative.ScoringControls | None" = None) -> float:
+                     controls: "fork_creative.ScoringControls | None" = None,
+                     deterministic: Dict | None = None) -> float:
     """The planner's base score for one candidate under one segment profile.
 
     [FORK] Digital-Union (L1A): kept as the compatibility surface every existing caller uses
@@ -416,7 +446,8 @@ def _score_candidate(candidate: Dict, profile: Dict,
     [FORK] Digital-Union (Creative Controls Core): ``controls`` defaults to ``None`` — neutral —
     so every existing caller is unchanged and gets the legacy score exactly.
     """
-    return _effective_base_score(candidate, profile.get("target", "flow"), controls)
+    return _effective_base_score(candidate, profile.get("target", "flow"), controls,
+                                 deterministic=deterministic)
 
 
 def _candidate_motion(candidate: Dict) -> float:
@@ -432,41 +463,77 @@ def _candidate_motion(candidate: Dict) -> float:
     return _clamp(candidate.get("motion", semantic.get("camera_motion", 0.0)))
 
 
+def _semantic_adjusted_score(candidate: Dict, target: str,
+                             controls: "fork_creative.ScoringControls",
+                             deterministic: Dict | None = None) -> float:
+    """Steps 1-2 of the static ordering: the legacy score, then Semantic Emphasis.
+
+    [FORK] Digital-Union (Creative Controls Extra PR2). Stage 5 fuses Qwen's reading into the
+    candidate's scores and does not keep the pre-fusion values, so "deterministic evidence only" has
+    to be *reconstructed* from the raw CV primitives that survive — see
+    ``beatsync_fork.deterministic_view``. Both readings then go through the **same**
+    ``_static_base_score``; there is deliberately no second scorer, so they can never disagree about
+    anything except the candidate each was handed.
+
+    ``deterministic`` is the precomputed view for this candidate. Supplying it is what keeps the
+    reconstruction at one per candidate per plan rather than one per (candidate, target).
+
+    Factored out rather than inlined because Energy Response needs this same quantity for its
+    ``flow`` reference: blending a semantic-adjusted target against a *legacy* flow score would mix
+    two different interpretations of one candidate.
+    """
+    full = _static_base_score(candidate, target)
+    if controls.semantic_factor is None:
+        return full
+    view = (deterministic if deterministic is not None
+            else fork_deterministic.deterministic_candidate_view(candidate))
+    det = _static_base_score(view, target)
+    return det + controls.semantic_factor * (full - det)
+
+
 def _effective_base_score(candidate: Dict, target: str,
                           controls: "fork_creative.ScoringControls | None" = None,
-                          *, flow_score: float | None = None) -> float:
-    """The static score after this render's Energy Response and Motion Bias.
+                          *, flow_score: float | None = None,
+                          deterministic: Dict | None = None) -> float:
+    """The static score after Semantic Emphasis, Energy Response and Motion Bias.
 
-    [FORK] Digital-Union (Creative Controls Core). One explicit, documented ordering:
+    [FORK] Digital-Union (Creative Controls Core + Extra). One explicit, documented ordering:
 
     1. the legacy static score for the segment's actual target;
-    2. **Energy Response** — blend that against the score the same candidate would get for the
-       generic ``flow`` target: ``flow + factor * (target - flow)``. ``factor`` runs 0.40 … 1.60, so
-       a low setting pulls every segment towards generic visual suitability (weak target matching)
-       and a high one exaggerates the difference the music asked for (strong target matching). At
-       ``factor == 1.0`` this is algebraically the target score, which is exactly why 50 takes the
-       neutral branch instead: algebraic identity is not floating-point identity;
-    3. **Motion Bias** — add ``centered * 0.15 * (2 * motion - 1)``, so calm settings reward
+    2. **Semantic Emphasis** — blend that against the score the same candidate would get from its
+       reconstructed *deterministic* view: ``det + factor * (full - det)``. ``factor`` runs
+       0.0 … 2.0, so 0 scores on visual metrics alone and 2 doubles whatever the semantics added.
+       This is interpretation, not analysis: Stage 5 is untouched and 0 does **not** disable Qwen;
+    3. **Energy Response** — blend against the same candidate's ``flow`` score:
+       ``flow + factor * (target - flow)``, ``factor`` 0.40 … 1.60. The flow reference is the
+       **semantic-adjusted** one, so both sides of the blend describe the same candidate under the
+       same interpretation. At ``factor == 1.0`` this is algebraically the target score, which is
+       exactly why 50 takes the neutral branch instead: algebraic identity is not floating-point
+       identity;
+    4. **Motion Bias** — add ``centered * 0.15 * (2 * motion - 1)``, so calm settings reward
        low-motion material and dynamic settings reward high-motion material, symmetrically about
-       ``motion = 0.5``;
-    4. clamp back into the planner's existing ``[-1.0, 2.0]`` score range.
+       ``motion = 0.5``. It reads the *persisted* motion, a raw CV primitive Stage 5 never fuses, so
+       Semantic Emphasis cannot move it;
+    5. clamp back into the planner's existing ``[-1.0, 2.0]`` score range.
 
-    Neither control depends on the seed, and neither is consulted before the legacy score exists —
-    they modulate scoring, they do not replace it. The seed still decides the winner afterwards.
+    No control depends on the seed, and none is consulted before the legacy score exists — they
+    modulate scoring, they do not replace it. The seed still decides the winner afterwards.
 
-    ``flow_score`` lets the caller supply the precomputed flow column so Energy Response costs one
-    extra column of the static table rather than one extra evaluation per (candidate, target).
+    ``flow_score`` and ``deterministic`` let the caller supply precomputed columns, so each control
+    costs table work proportional to ``candidates`` and never to ``segments``.
 
     When ``controls`` is ``None`` or neutral this returns ``_static_base_score`` untouched: no
-    blend, no shift, no second clamp.
+    reconstruction, no blend, no shift, no second clamp.
     """
-    base = _static_base_score(candidate, target)
     if controls is None or controls.is_neutral:
-        return base
+        return _static_base_score(candidate, target)
 
-    score = base
+    # `_semantic_adjusted_score` computes the legacy score itself (step 1) — computing it here too
+    # would double every cell of the static table for any non-neutral render.
+    score = _semantic_adjusted_score(candidate, target, controls, deterministic)
     if controls.energy_factor is not None:
-        flow = _static_base_score(candidate, "flow") if flow_score is None else float(flow_score)
+        flow = (_semantic_adjusted_score(candidate, "flow", controls, deterministic)
+                if flow_score is None else float(flow_score))
         score = flow + controls.energy_factor * (score - flow)
     if controls.motion_centered is not None:
         score += (controls.motion_centered * fork_creative.MOTION_BIAS_COEFFICIENT
@@ -534,7 +601,8 @@ def _static_base_score(candidate: Dict, target: str) -> float:
 
 
 def _materialize_clip(candidate: Dict, profile: Dict, index: int,
-                      controls: "fork_creative.ScoringControls | None" = None) -> Dict:
+                      controls: "fork_creative.ScoringControls | None" = None,
+                      deterministic: Dict | None = None) -> Dict:
     final_duration = max(0.05, float(profile["duration"]))
     source_duration = final_duration
     video_duration = max(source_duration, float(candidate.get("video_duration", source_duration)))
@@ -568,7 +636,7 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int,
         # score selection actually used — a plan reporting the legacy score for a render that chose
         # on a modified one would be a quietly misleading record. Clip timing and anchoring above
         # are untouched by any creative control.
-        "score": _score_candidate(candidate, profile, controls),
+        "score": _score_candidate(candidate, profile, controls, deterministic),
         "candidate_id": candidate.get("id"),
         "tags": list(candidate.get("tags", [])),
         "ai_analyzed": bool(candidate.get("ai_analyzed")),

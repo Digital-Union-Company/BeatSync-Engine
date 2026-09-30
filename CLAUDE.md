@@ -32,6 +32,7 @@ set PY=bin\python-3.13.14-embed-amd64\python.exe
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --seed 381944   :: creative variation
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --cut-density 70 --energy-response 80 --motion-bias 30
 %PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --source-diversity 80 --micro-cuts 70
+%PY% -X utf8 src\video_processor.py <audio> <video_dir> -o out.mkv --semantic-emphasis 80
 %PY% -X utf8 src\auto_mode\stage5_qwen_scene_worker.py --request req.json --response resp.json
 ```
 
@@ -903,15 +904,17 @@ CreativeProfile(seed=0, cut_density=50, energy_response=50, motion_bias=50)
 | Variation Seed | 0 / positive | 0 | Stage 6 | which of the good candidates wins |
 | Cut Density | 0–100 | 50 | **Stage 4** | how many beats become cuts |
 | Micro Cuts | 0–100 | 50 | **Stage 4** | the rare half-beat accent layer, and only that |
+| Semantic Emphasis | 0–100 | 50 | Stage 6 (static) | deterministic visual evidence vs. semantic reading |
 | Energy Response | 0–100 | 50 | Stage 6 (static) | how hard scoring follows the segment's target |
 | Motion Bias | 0–100 | 50 | Stage 6 (static) | calm vs. dynamic source material |
 | Source Diversity | 0–100 | 50 | Stage 6 (**dynamic**) | how hard cuts spread across source videos |
 
 Stages 1–3 read **none** of it; Stage 5 reads **none** of it. Stage 4 reads Cut Density and Micro
-Cuts; Stage 6 reads the seed, Energy Response, Motion Bias and Source Diversity.
+Cuts; Stage 6 reads the seed, Semantic Emphasis, Energy Response, Motion Bias and Source Diversity.
 
-**Stage 6 has two halves and the split is load-bearing.** Energy Response and Motion Bias are
-*static* — they depend on (candidate, target) only, so they live in the L1A precompute table.
+**Stage 6 has two halves and the split is load-bearing.** Semantic Emphasis, Energy Response and
+Motion Bias are *static* — they depend on (candidate, target) only, so they live in the L1A
+precompute table.
 Source Diversity is *dynamic*: it reads the running `usage` counter and the `recent_videos` window,
 so it must never enter that table. `ScoringControls` therefore carries the static half only, and the
 diversity factor is threaded separately as an explicit parameter. A control in the wrong half is one
@@ -1069,6 +1072,55 @@ segments: unique sources 31 → 39, top-source usage 20 → 10, HHI 0.054 → 0.
 legacy-score cost, with zero adjacent source repeats even at the reuse end. Base 2 was visibly weaker
 (31 → 37); base 4 reached all 41 sources but started producing adjacent source repeats at 0.
 
+#### Semantic Emphasis reinterprets persisted media truth (PR2)
+
+`factor = 1 + ((semantic_emphasis - 50) / 50)` -> 0.0 / 1.0 / 2.0. The effective static score is
+`det + factor * (full - det)`, where `full` is `_static_base_score(candidate, target)` and `det` is
+the **same scorer** applied to the candidate's reconstructed deterministic view. There is
+deliberately no second scorer, so the two readings can differ only in the candidate handed to them.
+
+**0 does not disable Qwen.** Stage 5 is untouched and still runs and persists exactly as before; this
+changes only how an already-analysed library is interpreted at plan time. Never describe it as
+"AI off" in UI text or docs.
+
+**The deterministic view has to be reconstructed, because Stage 5 does not keep it.**
+`_merge_semantic` fuses Qwen's reading into `quality_score`, `action_score`, `beauty_score`,
+`tension_score`, `soft_score` and `tags` **in place**, discarding the pre-fusion values. What
+survives is the raw CV layer underneath - `motion`, `brightness`, `contrast`, `saturation`,
+`sharpness`, `colorfulness` are never written by the fusion - and Stage 5's deterministic scores are
+a pure function of exactly those six. `beatsync_fork/deterministic_view.py` therefore recomputes the
+pre-Qwen candidate *forward* from them. It is not an inversion: nothing is divided back out, no clamp
+is undone, and nothing is inferred from the semantic side. The input candidate is never mutated.
+
+**Stage 5 was deliberately not refactored to share those formulas**, so `deterministic_view.py` is a
+second copy - and that is this feature's one real hazard. Editing production Stage-5 code to suit a
+Stage-6 creative feature would risk changing persisted floating-point values and pull the cache
+contract into it. The copy is the lesser risk **only because drift is made loud**:
+`tests/test_deterministic_view.py` runs the *real* `_build_candidate` over a threshold-crossing
+matrix and requires the view to be the **identity** on its output; separately extracts the quality
+arithmetic out of the window-measuring code and evaluates it (quality never reaches
+`_build_candidate` - it arrives in `metrics`, so the fixed-point test cannot see it); and fails if
+`_merge_semantic` ever starts overwriting one of the six primitives. If Stage 5's deterministic
+formulas change, those tests fail and reconciliation becomes a conscious decision.
+
+**Energy Response blends against the semantic-adjusted flow score**, not the legacy one - otherwise
+the two sides of that blend would describe the same candidate under two different interpretations.
+
+**The effect is target-dependent, by construction.** Stage 5 motion-gates semantic action
+(`0.28 * semantic * motion_gate`), so on high-motion material the persisted reading is already close
+to the deterministic one. Measured on the real 509-candidate TEST1 pool, mean |semantic -
+deterministic| static-score divergence is ~**0.143** on `soft` and **0.142** on `build`, but only
+~**0.023** on `drop` and **0.029** on `rhythm`. That is correct behaviour - do not retune the factor
+to manufacture drama on action material.
+
+**On a candidate Qwen never touched the control is exactly inert**: the deterministic view *is* the
+candidate, so `det + factor * (full - det)` is `det` for every factor. It cannot invent an "AI
+effect" where no AI reading exists.
+
+Real-material evidence (read-only): reconstructing deterministic quality and re-applying Stage 5's
+documented fusion reproduces the persisted `quality_score` with max error **exactly 0.0** on 509/509
+prepared TEST1 candidates.
+
 #### Stage 5 isolation is the real B0 invariant
 
 No control reaches `_qwen_config_token`, `_video_signature`, `_cache_path`, a Qwen request, the Qwen
@@ -1092,7 +1144,7 @@ still re-key, or the isolation would be achieved by keying on nothing.
 
 ```
 process_video_guarded(…, variation_seed, cut_density, energy_response, motion_bias,
-                      source_diversity, micro_cuts, …)
+                      source_diversity, micro_cuts, semantic_emphasis, …)
   → CreativeProfile.from_widgets(…)      # the one normalisation seam
   → process_video(…, creative=profile)
   → _process_video_impl(…, creative=profile)
@@ -1135,23 +1187,20 @@ There is **no stage cache in this PR**. The intended ownership when one is built
 | Energy Response | Stages 1–5 | Stage 6 + render |
 | Motion Bias | Stages 1–5 | Stage 6 + render |
 | Source Diversity | Stages 1–5 | Stage 6 + render |
+| Semantic Emphasis | Stages 1–5 | Stage 6 + render |
 | Cut Density | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
 | Micro Cuts | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
 
 Only the two Stage-4 controls invalidate Stage 4 — and both still reuse the Stage-5 library
 completely, which is the whole reason this boundary is worth having.
 
-#### Semantic Emphasis is deferred, deliberately
+#### Presets are deferred, deliberately
 
-A seventh control — weighting persisted Qwen semantics against deterministic visual evidence — is
-designed and **not implemented**, not even as a dormant field. A read-only study established that the
-deterministic candidate *is* exactly recomputable from the persisted record (`_merge_semantic`
-overwrites the five fused scores but never the CV primitives `motion`/`brightness`/`contrast`/
-`saturation`/`sharpness`/`colorfulness`, and deterministic `quality_score` is a pure function of
-those — verified to 0.000000000 on 509 real candidates). So it needs no Stage-5 schema change. But it
-would duplicate `video_analysis._build_candidate`'s formulas in a second module, which is a different
-drift-risk class from scaling an existing penalty, and it is measurably strong only on `soft`/`build`
-targets (mean |Δ| ≈ 0.14) while near-inert on `drop`/`rhythm` (≈ 0.02). It gets its own PR.
+Named Creative Profile values — a preset simply writes the sliders, after which the sliders remain
+the source of truth — are designed and **not implemented**, not even as a dormant field. They
+introduce no second scoring path, no Stage-5 mode flag and no persistent state of their own, and the
+seed stays independent of them. They get their own PR once the seven controls have runtime
+acceptance, so preset values can be chosen from measured behaviour rather than guessed.
 
 #### Future Freestyle / Director boundary
 
@@ -1285,7 +1334,8 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `qwen_progress.py` | Qwen worker stdout protocol + translator + the streaming `Popen` runner |
 | `ffmpeg_diagnostics.py` | bounded, vendor-neutral summaries of FFmpeg stderr for failed clips |
 | `variation.py` | creative variation seed: normalisation + the seeded top-K selection rule |
-| `creative.py` | the resolved `CreativeProfile`: six controls, their normalisation and their mappings (seed handling delegated to `variation.py`) |
+| `creative.py` | the resolved `CreativeProfile`: seven controls, their normalisation and their mappings (seed handling delegated to `variation.py`) |
+| `deterministic_view.py` | reconstructs a candidate's pre-Qwen deterministic scores from the raw CV primitives Stage 5 never fuses |
 | `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 
 ### Media Library Preparation (P V1 + P2)

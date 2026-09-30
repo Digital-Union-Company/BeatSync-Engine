@@ -222,6 +222,7 @@ def parse_arguments() -> argparse.Namespace:
         ('--motion-bias', 'Calm .. dynamic material'),
         ('--source-diversity', 'Reuse .. diverse source videos'),
         ('--micro-cuts', 'Fewer .. more rare half-beat accents; 0 disables them'),
+        ('--semantic-emphasis', 'Visual metrics .. semantic context; does NOT disable analysis'),
     ):
         parser.add_argument(
             flag,
@@ -953,6 +954,7 @@ def main() -> None:
         motion_bias=args.motion_bias,
         source_diversity=args.source_diversity,
         micro_cuts=args.micro_cuts,
+        semantic_emphasis=args.semantic_emphasis,
     )
     print(f"🎨 Creative profile: {cli_creative.describe()}")
     selected_beats, beat_info = analyze_beats_auto(
