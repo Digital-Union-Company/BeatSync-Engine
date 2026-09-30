@@ -111,7 +111,14 @@ _QWEN_SINGLE_JOB_ID = "single"
 # semantic normalisation/output contract, or any result-affecting Qwen configuration not already
 # represented in the signature. Do NOT hash the worker source into the key - a progress or
 # performance-only worker edit must not invalidate semantic cache.
-CACHE_CONTRACT_VERSION = "stage5_cache_v2"
+#
+# [FORK] Digital-Union (P2): bumped v2 -> v3 because the Qwen prompt became media-neutral, so a v3
+# record *means* something different from a v2 one - intrinsic media evidence rather than evidence
+# conditioned on one edit style. There is deliberately NO migration: v2 filenames are simply never
+# produced or looked up again, the old records are left on disk untouched, and the cold v3 rebuild is
+# the intended cost. `ANALYSIS_VERSION` stays put - deterministic candidate scoring, window building
+# and the candidate schema are all unchanged.
+CACHE_CONTRACT_VERSION = "stage5_cache_v3"
 
 # Bounded content fingerprint geometry. 1 MiB chunks; files at or below three chunks are read whole.
 _FINGERPRINT_CHUNK = 1 << 20
@@ -352,19 +359,7 @@ def _qwen_backend_signature_token(qwen_model_path: str | None) -> str | None:
     return "ai_" + _hash_text(raw, length=20)
 
 
-def _qwen_prompt_style_hint(audio_profile: Dict | None) -> str:
-    """[FORK] Digital-Union (D2 R2): the style hint the worker will actually put in the prompt.
-
-    Mirrors ``stage5_qwen_scene_worker._build_prompt`` exactly:
-    ``audio_profile.get("smart_preset", "rhythmic_gmv_amv")``. Kept as its own function so the
-    mirrored default lives in one place next to the reason it exists.
-    """
-    if not isinstance(audio_profile, dict):
-        return "rhythmic_gmv_amv"
-    return str(audio_profile.get("smart_preset", "rhythmic_gmv_amv"))
-
-
-def _qwen_config_token(audio_profile: Dict | None = None) -> str:
+def _qwen_config_token() -> str:
     """[FORK] Digital-Union (D2): identity for the Qwen inputs that change what gets persisted.
 
     Keyed on **effective** values, mirroring the runtime's own parsing and clamping, so behaviourally
@@ -377,14 +372,15 @@ def _qwen_config_token(audio_profile: Dict | None = None) -> str:
     * ``BEATSYNC_QWEN_FRAME_WIDTH``   - default 512, clamped 224..768 (the worker's own `_env_int`).
       Changes the image the VLM sees, so it changes the semantics.
     * ``BEATSYNC_QWEN_MAX_NEW_TOKENS`` - default 128, clamped 32..256. Can truncate the semantic JSON.
-    * ``audio_profile["smart_preset"]`` (D2 R2) - **prompt context**. `analyze_video_sources` forwards
-      the audio profile into the worker request, and the worker's `_build_prompt` interpolates this
-      value straight into the Qwen prompt ("The music edit style is {style_hint}."). Two runs differing
-      only in preset therefore get different semantics, yet shared one cache key before R2.
 
-    Only fields *proven* to reach the persisted result are included - the whole ``audio_profile`` is
-    deliberately **not** hashed, since almost all of it drives beat/render decisions rather than the
-    prompt. Runtime/performance knobs are excluded too: slots, device, timeouts, batching. Resolved
+    [FORK] Digital-Union (P2): this token now represents **media-semantic configuration only**, and
+    takes no arguments. ``audio_profile["smart_preset"]`` used to be the fourth component (D2 R2),
+    because the worker interpolated it into the Qwen prompt. The prompt is media-neutral now, so no
+    audio, tempo, section, edit-style, variation-seed or other creative state reaches the persisted
+    semantics - and therefore none of it may reach cache identity. Keep it that way: anything that
+    describes *how to edit* must not change *what the media is*.
+
+    Runtime/performance knobs stay excluded too: slots, device, timeouts, batching. Resolved
     model/mmproj/llama paths are covered by the backend token, and ``BEATSYNC_DISABLE_QWEN`` is
     represented indirectly - it produces ``enable_ai=False`` and therefore the separate no-AI identity,
     which carries no Qwen configuration at all.
@@ -393,14 +389,12 @@ def _qwen_config_token(audio_profile: Dict | None = None) -> str:
         f"max_windows={_qwen_max_windows()}",
         f"frame_width={_env_int('BEATSYNC_QWEN_FRAME_WIDTH', 512, lo=224, hi=768)}",
         f"max_new_tokens={_env_int('BEATSYNC_QWEN_MAX_NEW_TOKENS', 128, lo=32, hi=256)}",
-        f"smart_preset={_qwen_prompt_style_hint(audio_profile)}",
     ]), length=16)
 
 
 def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | None,
                      backend_token: str | None = None,
-                     config_token: str | None = None,
-                     audio_profile: Dict | None = None) -> str | None:
+                     config_token: str | None = None) -> str | None:
     """[FORK] Digital-Union (D2): the cache signature, or None when identity cannot be proven.
 
     Inputs: `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION`, the absolute source path, ``st_size``,
@@ -414,6 +408,10 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
 
     Pass ``backend_token``/``config_token`` to reuse one invocation's values instead of recomputing
     per source.
+
+    [FORK] Digital-Union (P2): there is no ``audio_profile`` input any more. Persisted Stage-5
+    semantics describe the media itself, so no track, tempo, section, edit style, variation seed or
+    creative state participates in identity - see `_qwen_config_token`.
     """
     try:
         stat = os.stat(video_file)
@@ -429,7 +427,7 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
         if backend_token is None:
             return None
         if config_token is None:
-            config_token = _qwen_config_token(audio_profile)
+            config_token = _qwen_config_token()
     else:
         backend_token = "no_ai"
         config_token = _NO_AI_CONFIG_TOKEN
@@ -452,8 +450,7 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
 
 def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
                 backend_token: str | None = None,
-                config_token: str | None = None,
-                audio_profile: Dict | None = None) -> str | None:
+                config_token: str | None = None) -> str | None:
     """[FORK] Digital-Union (D2): the cache filename, or None when identity cannot be proven.
 
     A ``None`` return is the fail-closed path: the caller performs no lookup and no write for that
@@ -461,8 +458,7 @@ def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
     treats a ``None`` cache file as a no-op, which is the seam this uses.
     """
     signature = _video_signature(video_file, enable_ai, qwen_model_path,
-                                 backend_token=backend_token, config_token=config_token,
-                                 audio_profile=audio_profile)
+                                 backend_token=backend_token, config_token=config_token)
     if signature is None:
         return None
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
@@ -1010,7 +1006,15 @@ def analyze_video_sources(
     qwen_model_path: str | None = None,
     event_callback=None,
 ) -> Dict:
-    """Analyze all source videos and return candidate moments for Auto Mode."""
+    """Analyze all source videos and return candidate moments for Auto Mode.
+
+    [FORK] Digital-Union (P2): ``audio_profile`` is a retained integration signature with **zero**
+    Stage-5 effect. It reaches no cache key, no Qwen request, no prompt and no persisted record;
+    Stage 5 describes the media itself, and music/edit interpretation happens downstream in Stage 6
+    (and in any future creative/director layer). It is kept as a parameter only so existing callers -
+    `auto_mode.analyze_beats_auto` above all - need no change, and tests assert that two arbitrarily
+    different profiles produce the identical cache key. Do not reintroduce a use for it here.
+    """
     total_started = time.perf_counter()
     requested_qwen_model_path = qwen_model_path or DEFAULT_QWEN_MODEL_DIR
     qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
@@ -1057,7 +1061,7 @@ def analyze_video_sources(
     # if the GGUFs are full-hashed. Invocation-scoped rather than module-cached, so a later call in the
     # same process still sees a swapped model or llama build.
     invocation_backend_token = _qwen_backend_signature_token(qwen_model_path) if ai_available else None
-    invocation_config_token = _qwen_config_token(audio_profile) if ai_available else None
+    invocation_config_token = _qwen_config_token() if ai_available else None
     # [FORK] Digital-Union (D2 R2): an explicit state, because `None` alone is ambiguous. Down in
     # `_video_signature` a `None` backend_token means "not supplied, compute it now", so passing the
     # failed `None` straight through made every source retry the fingerprinting - measured at 1 + N
@@ -1089,8 +1093,7 @@ def analyze_video_sources(
         cache_file = None if ai_cache_disabled else _cache_path(
             video_file, ai_available, qwen_model_path,
             backend_token=invocation_backend_token,
-            config_token=invocation_config_token,
-            audio_profile=audio_profile)
+            config_token=invocation_config_token)
         cache_identity_seconds += time.perf_counter() - identity_started
         cache_paths[idx] = cache_file
         lookup_started = time.perf_counter()
@@ -1156,7 +1159,6 @@ def analyze_video_sources(
                         use_gpu,
                         ai_available,
                         qwen_model_path,
-                        audio_profile or {},
                         True,
                         job["index"],
                         len(existing),
@@ -1189,7 +1191,6 @@ def analyze_video_sources(
                             use_gpu,
                             ai_available,
                             qwen_model_path,
-                            audio_profile or {},
                             True,
                             job["index"],
                             len(existing),
@@ -1214,7 +1215,6 @@ def analyze_video_sources(
                     use_gpu,
                     ai_available,
                     qwen_model_path,
-                    audio_profile or {},
                     False,
                     job["index"],
                     len(existing),
@@ -1255,7 +1255,6 @@ def analyze_video_sources(
             video_items=[(job, results_by_index[job["index"]]) for job in deferred_jobs],
             use_gpu=use_gpu,
             qwen_model_path=qwen_model_path,
-            audio_profile=audio_profile or {},
             total_video_count=len(existing),
             event_callback=event_callback,
             run_stats=run_stats,
@@ -1270,7 +1269,6 @@ def analyze_video_sources(
                 video_data=video_data,
                 use_gpu=use_gpu,
                 qwen_model_path=qwen_model_path,
-                audio_profile=audio_profile or {},
                 label=f"{idx}/{len(existing)}",
                 event_callback=event_callback,
                 cache_file=job["cache_file"],
@@ -1438,12 +1436,15 @@ def analyze_video_sources(
 
 def classify_library_sources(
     video_files: Sequence[str],
-    audio_profile: Dict | None = None,
     enable_ai: bool = True,
     qwen_model_path: str | None = None,
     event_callback=None,
 ) -> Dict:
     """[FORK] Digital-Union (P V1): which library sources already have reusable Stage-5 cache?
+
+    [FORK] Digital-Union (P2): media-neutral, and therefore trackless. It takes no audio profile,
+    because nothing about the music reaches Stage-5 identity any more: preparation prepares *the
+    library*, not "the library for one edit style", and the caller needs no audio file to ask.
 
     Read-only classification for the Media Library Preparation workflow. It answers, for each
     source, the *same* question the warm-cache loop in `analyze_video_sources` answers - using the
@@ -1495,7 +1496,7 @@ def classify_library_sources(
     # `_cache_path`. Per source this would be N backend fingerprints - measured at 61.7 minutes for
     # 702 sources - instead of one ~20 ms computation.
     invocation_backend_token = _qwen_backend_signature_token(qwen_model_path) if ai_available else None
-    invocation_config_token = _qwen_config_token(audio_profile) if ai_available else None
+    invocation_config_token = _qwen_config_token() if ai_available else None
     ai_cache_disabled = ai_available and invocation_backend_token is None
 
     result: Dict[str, Any] = {
@@ -1505,7 +1506,6 @@ def classify_library_sources(
         "backend_token": invocation_backend_token or "",
         "config_token": invocation_config_token or "",
         "qwen_model_path": qwen_model_path if ai_available else "",
-        "smart_preset": _qwen_prompt_style_hint(audio_profile) if ai_available else "",
         "classifications": [],
         "prepared_count": 0,
         "needs_analysis_count": 0,
@@ -1539,8 +1539,7 @@ def classify_library_sources(
         cache_file = _cache_path(
             video_file, ai_available, qwen_model_path,
             backend_token=invocation_backend_token,
-            config_token=invocation_config_token,
-            audio_profile=audio_profile)
+            config_token=invocation_config_token)
         cache_identity_seconds += time.perf_counter() - identity_started
 
         if cache_file is None:
@@ -1608,7 +1607,6 @@ def _analyze_single_video(
     use_gpu: bool,
     enable_ai: bool,
     qwen_model_path: str,
-    audio_profile: Dict,
     defer_ai: bool = False,
     index: int | None = None,
     total: int | None = None,
@@ -1699,7 +1697,6 @@ def _analyze_single_video(
                 candidates=candidates,
                 qwen_model_path=qwen_model_path,
                 use_gpu=use_gpu,
-                audio_profile=audio_profile,
                 event_callback=event_callback,
                 run_stats=run_stats,
             )
@@ -1762,7 +1759,6 @@ def _complete_deferred_qwen(
     video_data: Dict,
     use_gpu: bool,
     qwen_model_path: str,
-    audio_profile: Dict,
     label: str = "",
     event_callback=None,
     cache_file: str | None = None,
@@ -1790,7 +1786,6 @@ def _complete_deferred_qwen(
             candidates=candidates,
             qwen_model_path=qwen_model_path,
             use_gpu=use_gpu,
-            audio_profile=audio_profile,
             event_callback=event_callback,
             run_stats=run_stats,
         )
@@ -1841,7 +1836,6 @@ def _complete_deferred_qwen_batch(
     video_items: Sequence[tuple[Dict, Dict]],
     use_gpu: bool,
     qwen_model_path: str,
-    audio_profile: Dict,
     total_video_count: int,
     event_callback=None,
     run_stats: Dict[str, Any] | None = None,
@@ -1906,7 +1900,6 @@ def _complete_deferred_qwen_batch(
         jobs=request_jobs,
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
-        audio_profile=audio_profile,
         event_callback=event_callback,
     )
     batch_seconds = time.perf_counter() - batch_started
@@ -2082,7 +2075,6 @@ def _run_qwen_worker_batch(
     jobs: Sequence[Dict],
     qwen_model_path: str,
     use_gpu: bool,
-    audio_profile: Dict,
     event_callback=None,
 ) -> Dict:
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
@@ -2090,11 +2082,12 @@ def _run_qwen_worker_batch(
     request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_request_{token}.json")
     response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_response_{token}.json")
     worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
+    # [FORK] Digital-Union (P2): no `audio_profile` key. The worker's only consumer of it was
+    # `_build_prompt`, which is media-neutral now, so music/edit context does not cross this boundary.
     request = {
         "jobs": list(jobs),
         "qwen_model_path": qwen_model_path,
         "use_gpu": bool(use_gpu),
-        "audio_profile": audio_profile,
     }
     with open(request_path, "w", encoding="utf-8") as f:
         json.dump(request, f)
@@ -2629,7 +2622,6 @@ def _annotate_candidates_with_qwen(
     candidates: List[Dict],
     qwen_model_path: str,
     use_gpu: bool,
-    audio_profile: Dict,
     event_callback=None,
     run_stats: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
@@ -2661,7 +2653,6 @@ def _annotate_candidates_with_qwen(
         candidates=ai_candidates,
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
-        audio_profile=audio_profile,
         event_callback=event_callback,
     )
     # [FORK] Digital-Union (D1 R4): the response envelope locates this job's timings; whether the
@@ -2756,7 +2747,6 @@ def _run_qwen_worker(
     candidates: Sequence[Dict],
     qwen_model_path: str,
     use_gpu: bool,
-    audio_profile: Dict,
     event_callback=None,
 ) -> Dict:
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
@@ -2764,12 +2754,12 @@ def _run_qwen_worker(
     request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_request_{token}.json")
     response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_response_{token}.json")
     worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
+    # [FORK] Digital-Union (P2): no `audio_profile` key - same reason as the batch request above.
     request = {
         "video_file": video_file,
         "fps": fps,
         "qwen_model_path": qwen_model_path,
         "use_gpu": bool(use_gpu),
-        "audio_profile": audio_profile,
         "candidates": [
             {
                 "id": c.get("id"),

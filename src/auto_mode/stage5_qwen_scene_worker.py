@@ -349,11 +349,24 @@ def _semantic_from_text(text: str) -> Dict:
     return _normalize_semantic(_parse_json_object(text))
 
 
-def _build_prompt(audio_profile: Dict) -> str:
-    style_hint = audio_profile.get("smart_preset", "rhythmic_gmv_amv")
+def _build_prompt() -> str:
+    """[FORK] Digital-Union (P2): media-neutral semantic conditioning.
+
+    Stage 5 records what the media *is*; Stage 6 and any future creative/director layer decide what
+    to do with it for the current song. The prompt therefore carries no ``smart_preset``, no tempo,
+    no section and no edit-style context, and it explicitly tells the model not to adapt its tags to
+    any of those. The wording below is the exact conditioning the P2 real-material A/B validated
+    (115 identical semantic moments, 115/115 tagged on both sides, post-`_merge_semantic` score
+    differences <= ~0.023, no new planner fallback pattern).
+
+    The schema, the enums, the eight numeric keys, the description contract and the sampling
+    settings are deliberately unchanged: the experiment validated the *existing* schema under a
+    media-neutral prompt, so redesigning it here would invalidate that evidence.
+    """
     return (
         "You are tagging one source-video moment for professional AMV/GMV editing. "
-        f"The music edit style is {style_hint}. "
+        "Assess the moment only from what is visually present; do not adapt the tags "
+        "to music, song energy, edit style, or desired pacing. "
         "Return JSON only. Keys: action_intensity, beauty_score, combat, chase, explosion, "
         "character_focus, camera_motion, visual_quality as numbers 0..1; "
         "emotion as one of soft,tension,hype,sad,neutral; "
@@ -1280,8 +1293,10 @@ def main() -> None:
         request = json.load(f)
 
     model_path = request.get("qwen_model_path")
-    audio_profile = request.get("audio_profile") or {}
-    prompt = _build_prompt(audio_profile)
+    # [FORK] Digital-Union (P2): the request carries no audio profile at all. `_build_prompt` was its
+    # only consumer, and the prompt is media-neutral now, so music/edit context no longer crosses the
+    # worker boundary in any form.
+    prompt = _build_prompt()
 
     # Model load is the longest silent stretch of a Qwen run, so announce both ends of it.
     _emit_progress("worker_state", state="loading_model", message="loading Qwen model (llama.cpp)")

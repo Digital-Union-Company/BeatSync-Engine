@@ -376,7 +376,7 @@ def test_h_a_missing_sink_really_is_a_no_op_at_runtime():
     ns["_annotate_candidates_with_qwen"](
         video_file="v.mp4", fps=25.0,
         candidates=[{"id": "x", "start": 0, "end": 1}], qwen_model_path="m",
-        use_gpu=False, audio_profile={})  # no run_stats at all
+        use_gpu=False)  # no run_stats at all
 
 
 # ------------------------------------------------------------------ I. CANDIDATE-LESS ANTI-DRIFT
@@ -479,7 +479,7 @@ def test_k_stage5_start_does_not_claim_all_sources_are_being_analyzed():
 def test_cache_identity_and_completion_are_untouched():
     with open(_VA, "r", encoding="utf-8") as handle:
         source = handle.read()
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in source
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in source
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in source
     tree = _tree(_VA)
     for name in ("_qwen_job_completed", "_stored_ai_cache_is_consistent",
@@ -577,7 +577,7 @@ def test_r2_a_shared_worker_failure_is_still_an_attempted_current_run_job(
              ({"index": 2, "cache_file": str(tmp_path / "b.json")}, _deferred_record(ns, "b.mp4"))]
 
     ns["_complete_deferred_qwen_batch"](
-        video_items=items, use_gpu=False, qwen_model_path="m", audio_profile={},
+        video_items=items, use_gpu=False, qwen_model_path="m",
         total_video_count=2, run_stats=stats)
 
     assert stats["qwen_jobs"] == 2, f"{label}: attempted jobs were not counted"
@@ -610,7 +610,7 @@ def test_r2_b_single_worker_failure_claims_no_decoded_frames():
 
     info = ns["_annotate_candidates_with_qwen"](
         video_file="v.mp4", fps=25.0, candidates=candidates, qwen_model_path="m",
-        use_gpu=False, audio_profile={}, run_stats=stats)
+        use_gpu=False, run_stats=stats)
 
     assert stats["qwen_jobs"] == 1
     assert stats["qwen_requested_count"] == 10
@@ -636,7 +636,7 @@ def test_r2_c_decode_short_keeps_the_requested_denominator(gui):
 
     ns["_annotate_candidates_with_qwen"](
         video_file="v.mp4", fps=25.0, candidates=candidates, qwen_model_path="m",
-        use_gpu=False, audio_profile={}, run_stats=stats)
+        use_gpu=False, run_stats=stats)
 
     assert stats["qwen_requested_count"] == 10
     assert stats["qwen_frame_count"] == 8
@@ -668,7 +668,7 @@ def test_r2_d_semantic_short_reports_tagged_over_requested(gui):
 
     ns["_annotate_candidates_with_qwen"](
         video_file="v.mp4", fps=25.0, candidates=candidates, qwen_model_path="m",
-        use_gpu=False, audio_profile={}, run_stats=stats)
+        use_gpu=False, run_stats=stats)
 
     assert stats["qwen_requested_count"] == 10
     assert stats["qwen_frame_count"] == 10
@@ -703,7 +703,7 @@ def test_r2_e_successful_batch_counts_each_job_once_and_wall_time_once(tmp_path)
              ({"index": 2, "cache_file": str(tmp_path / "b.json")}, _deferred_record(ns, "b.mp4"))]
 
     ns["_complete_deferred_qwen_batch"](
-        video_items=items, use_gpu=False, qwen_model_path="m", audio_profile={},
+        video_items=items, use_gpu=False, qwen_model_path="m",
         total_video_count=2, run_stats=stats)
 
     assert stats["qwen_jobs"] == 2, "submission and response phases must not both count the job"
@@ -733,7 +733,7 @@ def test_r2_g_batch_wall_time_is_one_shared_worker_duration(tmp_path):
               _deferred_record(ns, f"s{i}.mp4")) for i in (1, 2, 3)]
 
     ns["_complete_deferred_qwen_batch"](
-        video_items=items, use_gpu=False, qwen_model_path="m", audio_profile={},
+        video_items=items, use_gpu=False, qwen_model_path="m",
         total_video_count=3, run_stats=stats)
 
     # per-source amortized cost would be ~3 * (9 + 1 + 40/3) = ~70s; the real shared invocation is
@@ -765,7 +765,7 @@ def test_r2_g_malformed_worker_timings_do_not_raise(tmp_path):
               _deferred_record(ns, "a.mp4", n=2))]
 
     ns["_complete_deferred_qwen_batch"](
-        video_items=items, use_gpu=False, qwen_model_path="m", audio_profile={},
+        video_items=items, use_gpu=False, qwen_model_path="m",
         total_video_count=1, run_stats=stats)
 
     assert stats["qwen_jobs"] == 1

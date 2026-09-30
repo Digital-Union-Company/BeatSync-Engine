@@ -363,19 +363,28 @@ _SEED_WORDS = ("seed", "creative", "variation")
     "_video_signature",
     "_cache_path",
     "_qwen_config_token",
-    "_qwen_prompt_style_hint",
     "_qwen_backend_signature_token",
     "_path_signature_token",
 ])
 def test_no_cache_identity_function_mentions_the_seed(name):
-    """Requirement F. A creative knob that re-keys 845 Qwen records is a multi-hour cold rebuild."""
-    source = ast.unparse(_func(_tree(_ANALYSIS_PATH), name)).lower()
+    """Requirement F. A creative knob that re-keys 845 Qwen records is a multi-hour cold rebuild.
+
+    Executable statements only: since P2 these docstrings legitimately name the variation seed and
+    creative state in order to state that neither may enter identity, so prose must not be able to
+    fail — or satisfy — this assertion.
+    """
+    fn = _func(_tree(_ANALYSIS_PATH), name)
+    source = "\n".join(
+        ast.unparse(node) for node in fn.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ).lower()
     for word in _SEED_WORDS:
         assert word not in source, f"{name} mentions {word!r}"
 
 
-def test_the_cache_contract_and_analysis_versions_are_untouched():
-    """Nothing about what a cached record *means* changed, so neither constant may move."""
+def test_the_cache_contract_and_analysis_versions_are_as_p2_left_them():
+    """The seed still changes neither. `stage5_cache_v3` is P2's one deliberate bump — the Qwen
+    prompt became media-neutral — and the creative seed had nothing to do with it."""
     tree = _tree(_ANALYSIS_PATH)
     values = {}
     for node in ast.walk(tree):
@@ -386,14 +395,17 @@ def test_the_cache_contract_and_analysis_versions_are_untouched():
                 }:
                     values[target.id] = node.value.value
 
-    assert values["CACHE_CONTRACT_VERSION"] == "stage5_cache_v2"
+    assert values["CACHE_CONTRACT_VERSION"] == "stage5_cache_v3"
     assert values["ANALYSIS_VERSION"] == "auto_av_analysis_v8_llama_vulkan_batched"
 
 
 def test_the_seed_never_enters_the_audio_visual_profile():
-    """`smart_preset` is the one `audio_profile` field inside the Qwen config token.
+    """The profile is the bus Stage 6 reads for music-aware planning; creative state belongs on
+    `beat_info["creative"]` instead, so it stays separable from anything downstream may forward.
 
-    Anything creative landing in this dict is one step away from re-keying the whole cache.
+    Under P2 no `audio_profile` field reaches Stage-5 identity at all (`smart_preset` was the last
+    one, retired with the media-neutral prompt), so this is no longer the one-step-from-a-rebuild
+    hazard it was. Keeping the separation is still right: the profile describes the *track*.
     """
     source = ast.unparse(_func(_tree(_AUTO_MODE_PATH), "_build_audio_visual_profile")).lower()
     for word in _SEED_WORDS:

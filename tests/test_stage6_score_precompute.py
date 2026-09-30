@@ -506,7 +506,7 @@ def test_stage6_is_the_only_thing_touched():
     assert "base_score" not in variation_src, "the selection rule must be untouched by L1A"
 
     va = open(os.path.join(_REPO_ROOT, "src", "video_analysis.py"), encoding="utf-8").read()
-    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v2"' in va
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in va
     assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in va
 
 

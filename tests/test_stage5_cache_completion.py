@@ -505,7 +505,7 @@ def test_every_decoded_frame_must_have_produced_a_semantic(cache):
 
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0, candidates=candidates,
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
     assert info["qwen_tag_count"] == 3 and info["qwen_frame_count"] == 3
@@ -518,7 +518,7 @@ def test_all_semantic_inference_failed_is_not_completed():
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False
     assert ns["_calls"]["merged"] == [], "nothing to merge, and nothing was invented"
@@ -531,7 +531,7 @@ def test_partial_semantic_failure_is_not_completed():
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False
     assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1"], (
@@ -544,7 +544,7 @@ def test_no_decoded_frames_is_not_completed():
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False
 
@@ -556,7 +556,7 @@ def test_a_response_claiming_more_tags_than_it_returned_is_not_completed():
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False
 
@@ -578,7 +578,7 @@ def test_malformed_or_incomplete_timing_is_not_completed(timing, why):
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(3)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False, why
 
@@ -639,7 +639,7 @@ def test_an_empty_worker_response_is_not_completed():
     ns = _load_pipeline({})
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False
 
@@ -655,7 +655,7 @@ def test_completion_requires_this_jobs_envelope(response, why):
     ns = _load_pipeline(response)
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
     assert info[ns["_QWEN_COMPLETED_KEY"]] is False, why
 
 
@@ -665,7 +665,7 @@ def test_semantic_values_are_actually_merged_onto_the_candidates():
 
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0, candidates=candidates,
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
     assert ns["_calls"]["merged"] == ["clip.mp4-0", "clip.mp4-1", "clip.mp4-2"]
@@ -677,7 +677,7 @@ def test_max_windows_zero_reports_not_completed_and_never_calls_the_worker():
     try:
         info = ns["_annotate_candidates_with_qwen"](
             video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[{"id": "clip.mp4-0"}],
-            qwen_model_path="m", use_gpu=False, audio_profile={})
+            qwen_model_path="m", use_gpu=False)
     finally:
         os.environ.pop("BEATSYNC_QWEN_MAX_WINDOWS", None)
 
@@ -689,7 +689,7 @@ def test_no_selected_candidates_is_a_completed_no_op():
     ns = _load_pipeline(_worker_ok())
     info = ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0, candidates=[],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
     assert info[ns["_QWEN_COMPLETED_KEY"]] is True
     assert info["qwen_tag_count"] == 0
@@ -868,7 +868,7 @@ def _single(ns, candidate_count=3):
     return ns["_annotate_candidates_with_qwen"](
         video_file=r"C:\src\clip.mp4", fps=25.0,
         candidates=[{"id": f"clip.mp4-{i}"} for i in range(candidate_count)],
-        qwen_model_path="m", use_gpu=False, audio_profile={})
+        qwen_model_path="m", use_gpu=False)
 
 
 def test_a_decoded_subset_of_the_requested_candidates_is_not_complete():
@@ -1006,7 +1006,7 @@ def test_a_fully_successful_batch_job_is_complete_and_checkpointed(cache, tmp_pa
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": path}, record)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+        use_gpu=False, qwen_model_path="m", total_video_count=1)
 
     assert record["ai_enabled"] is True
     assert record["ai_deferred"] is False
@@ -1029,7 +1029,7 @@ def test_an_incomplete_batch_job_is_neither_complete_nor_checkpointed(cache, tmp
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": path}, record)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+        use_gpu=False, qwen_model_path="m", total_video_count=1)
 
     assert record["ai_enabled"] is False, why
     assert record["ai_deferred"] is False, "the deferral is resolved either way"
@@ -1050,7 +1050,7 @@ def test_a_successful_sibling_survives_a_failing_one(cache, tmp_path):
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": good_path}, good),
                      ({"index": 2, "cache_file": half_path}, half)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+        use_gpu=False, qwen_model_path="m", total_video_count=2)
 
     assert good["ai_enabled"] is True and os.path.exists(good_path)
     assert half["ai_enabled"] is False and not os.path.exists(half_path)
@@ -1066,7 +1066,7 @@ def test_a_batch_job_with_full_counts_but_foreign_ids_is_not_complete(cache, tmp
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": path}, record)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+        use_gpu=False, qwen_model_path="m", total_video_count=1)
 
     assert record["ai_enabled"] is False
     assert not os.path.exists(path)
@@ -1080,7 +1080,7 @@ def test_a_batch_job_that_decoded_only_a_subset_is_not_complete(cache, tmp_path)
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": path}, record)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+        use_gpu=False, qwen_model_path="m", total_video_count=1)
 
     assert record["ai_enabled"] is False
     assert not os.path.exists(path)
@@ -1102,7 +1102,7 @@ def test_one_complete_job_survives_two_differently_broken_siblings(cache, tmp_pa
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": i, "cache_file": paths[name]}, records[name])
                      for i, name in enumerate(("ok", "subset", "foreign"), 1)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=3)
+        use_gpu=False, qwen_model_path="m", total_video_count=3)
 
     assert records["ok"]["ai_enabled"] is True and os.path.exists(paths["ok"])
     assert records["subset"]["ai_enabled"] is False and not os.path.exists(paths["subset"])
@@ -1118,7 +1118,7 @@ def test_a_requested_job_absent_from_the_response_is_not_complete(cache, tmp_pat
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": p1}, present),
                      ({"index": 2, "cache_file": p2}, missing)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+        use_gpu=False, qwen_model_path="m", total_video_count=2)
 
     assert present["ai_enabled"] is True and os.path.exists(p1)
     assert missing["ai_enabled"] is False and not os.path.exists(p2)
@@ -1131,7 +1131,7 @@ def test_total_batch_failure_still_marks_every_job_incomplete(cache, tmp_path):
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": i + 1, "cache_file": paths[i]}, records[i]) for i in range(2)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=2)
+        use_gpu=False, qwen_model_path="m", total_video_count=2)
 
     for record, path in zip(records, paths):
         assert record["ai_enabled"] is False
@@ -1146,7 +1146,7 @@ def test_a_candidate_less_batch_job_is_still_the_no_qwen_work_case(cache, tmp_pa
 
     ns["_complete_deferred_qwen_batch"](
         video_items=[({"index": 1, "cache_file": path}, record)],
-        use_gpu=False, qwen_model_path="m", audio_profile={}, total_video_count=1)
+        use_gpu=False, qwen_model_path="m", total_video_count=1)
 
     assert record["ai_enabled"] is False, "honest: no AI work was done"
     assert record["ai_deferred"] is False
@@ -1162,7 +1162,7 @@ def test_a_candidate_less_batch_job_is_still_the_no_qwen_work_case(cache, tmp_pa
 
 def _inline(ns, **kwargs):
     defaults = dict(video_file=r"C:\src\clip.mp4", use_gpu=False, enable_ai=True,
-                    qwen_model_path="m", audio_profile={}, defer_ai=False)
+                    qwen_model_path="m", defer_ai=False)
     defaults.update(kwargs)
     return ns["_analyze_single_video"](**defaults)
 
