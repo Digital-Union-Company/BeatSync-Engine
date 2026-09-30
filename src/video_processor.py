@@ -49,14 +49,16 @@ from ffmpeg_processing import (
 )
 from auto_mode.stage6_av_planner import (
     build_planned_clip_sequence,
-    creative_seed,
+    creative_profile,
     summarize_clip_plan,
 )
 
 # [FORK] Digital-Union: structured progress events (stdlib-only fork module).
 from beatsync_fork import progress as fork_progress
-# [FORK] Digital-Union: creative variation seed (stdlib-only fork module).
-from beatsync_fork import variation as fork_variation
+# [FORK] Digital-Union: the resolved Creative Profile (stdlib-only fork module). Seed handling lives
+# in `beatsync_fork.variation`, which this module now reaches only through `CreativeProfile` — the
+# profile delegates every seed decision there, so the seed rules stay in exactly one place.
+from beatsync_fork import creative as fork_creative
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -209,6 +211,22 @@ def parse_arguments() -> argparse.Namespace:
         default=0,
         help='Creative variation seed: 0 = default BeatSync selection, positive = reproducible variation'
     )
+    # [FORK] Digital-Union (Creative Controls Core): CLI parity with the three UI sliders. No
+    # argparse `type=` and no custom type: the values go through `creative.normalize_control`, which
+    # is the same normalisation the UI uses, so a malformed or out-of-range value falls back or
+    # clamps identically instead of aborting the run inside argparse. Omitting all three leaves the
+    # profile neutral, which is exactly today's behaviour.
+    for flag, control in (
+        ('--cut-density', 'Sparse .. dense'),
+        ('--energy-response', 'Weak .. strong target matching'),
+        ('--motion-bias', 'Calm .. dynamic material'),
+    ):
+        parser.add_argument(
+            flag,
+            default=None,
+            help=(f'Creative control 0-100 ({control}); '
+                  f'{fork_creative.DEFAULT_CONTROL} = current BeatSync behaviour (default)')
+        )
 
     return parser.parse_args()
 
@@ -516,13 +534,17 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         f"⏱️  Planner: {total_clips} segments over {planner_candidate_count} candidates "
         f"in {planner_seconds:.2f}s"
     )
-    # [FORK] Digital-Union (Phase A): the seed is reported, not recomputed — the planner already
-    # read it off `beat_info` and acted on it.
-    variation_seed = creative_seed(beat_info)
+    # [FORK] Digital-Union (Creative Controls Core): the profile is reported, not recomputed — the
+    # planner already read it off `beat_info` and acted on it. `render_info["creative_seed"]` is an
+    # existing diagnostic field and is retained alongside the full profile.
+    resolved_creative = creative_profile(beat_info)
+    variation_seed = resolved_creative.seed
     render_info["creative_seed"] = int(variation_seed)
-    print(f"🎲 Creative variation: {fork_variation.describe(variation_seed)}")
+    render_info["creative"] = resolved_creative.as_dict()
+    print(f"🎨 Creative profile: {resolved_creative.describe()}")
     if planned_clip_sequence:
-        plan_summary = summarize_clip_plan(planned_clip_sequence, seed=variation_seed)
+        plan_summary = summarize_clip_plan(
+            planned_clip_sequence, seed=variation_seed, creative=resolved_creative)
         if beat_info is not None:
             beat_info['clip_plan_summary'] = plan_summary
             render_info["plan_summary"] = plan_summary
@@ -919,21 +941,32 @@ def main() -> None:
     print(f'✓ Found {len(video_files)} video files')
  
     print(f"🤖 Using AUTO mode")
+    # [FORK] Digital-Union (Creative Controls Core): one profile collapsed from the CLI flags, the
+    # same shape the GUI builds. Neutral defaults, so an existing invocation with no new flags is
+    # byte-for-byte today's run.
+    cli_creative = fork_creative.CreativeProfile.from_widgets(
+        seed=args.seed,
+        cut_density=args.cut_density,
+        energy_response=args.energy_response,
+        motion_bias=args.motion_bias,
+    )
+    print(f"🎨 Creative profile: {cli_creative.describe()}")
     selected_beats, beat_info = analyze_beats_auto(
         args.mp3_file,
         start_time=args.start_time,
         end_time=args.end_time,
         use_gpu=args.gpu,
         video_files=video_files,
-        creative={"seed": args.seed},
+        creative=cli_creative.as_dict(),
     )
 
     print(f'✓ Selected {len(selected_beats)} cuts for video')
 
     output_file = args.output
     # [FORK] Digital-Union (Phase A): a variation render is identifiable by its filename; a legacy
-    # (seed 0) render keeps exactly the name it has today.
-    seed_suffix = fork_variation.filename_suffix(args.seed)
+    # (seed 0) render keeps exactly the name it has today. The three newer controls deliberately
+    # contribute nothing here — they are recorded in `render_info["creative"]` instead.
+    seed_suffix = cli_creative.filename_suffix()
     if seed_suffix:
         base, extension = os.path.splitext(output_file)
         output_file = f"{base}{seed_suffix}{extension}"

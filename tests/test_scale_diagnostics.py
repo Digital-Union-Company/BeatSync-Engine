@@ -508,7 +508,9 @@ def test_f_the_planner_call_itself_is_untouched():
     code = _body_code(fn)
     # the plan still flows to the same consumers, unmodified
     assert "if planned_clip_sequence:" in code
-    assert "plan_summary = summarize_clip_plan(planned_clip_sequence, seed=variation_seed)" in code
+    # Creative Controls Core added the resolved profile to the summary; the plan itself is still
+    # handed over whole and unmodified, which is what this test is protecting.
+    assert "summarize_clip_plan(planned_clip_sequence, seed=variation_seed" in code
     assert "render_info['plan_summary'] = plan_summary" in code
 
 

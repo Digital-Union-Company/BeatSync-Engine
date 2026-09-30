@@ -7,9 +7,31 @@ import numpy as np
 from . import AutoWaveConfig
 from . import _normalize, _safe_percentile, _unique_sorted
 
+# [FORK] Digital-Union (Creative Controls Core): Cut Density is a Stage 4 control. Only the
+# normalised *factor* is threaded in — never a raw GUI value and never module-global render state.
+from beatsync_fork import creative as fork_creative
+
+#: Stage 4's own "let a weak beat breathe" threshold. Cut Density scales it by ``1 / factor``; the
+#: neutral path uses this literal unchanged, which is what it has always done.
+WEAK_SCORE_THRESHOLD = fork_creative.WEAK_SCORE_THRESHOLD
+
+
 def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dict,
                      tempo: float, audio_duration: float,
-                     cfg: AutoWaveConfig) -> Tuple[np.ndarray, List[Dict]]:
+                     cfg: AutoWaveConfig,
+                     density_factor: float | None = None) -> Tuple[np.ndarray, List[Dict]]:
+    """Select the deliberate subset of beats that become cuts.
+
+    [FORK] Digital-Union (Creative Controls Core): ``density_factor`` is the Cut Density control,
+    already resolved to ``2 ** ((cut_density - 50) / 50)`` by :class:`CreativeProfile`. ``None``
+    means **neutral** and is the default, so every existing caller — and every neutral render —
+    takes exactly the path this function has always taken. ``None`` rather than ``1.0`` on purpose:
+    a neutral render must not run the density arithmetic at all, not even with a neutral value.
+
+    The caller also supplies a ``cfg`` already derived for this density (intervals and holds divided
+    by the factor, the global cut-ratio band multiplied by it). Both halves are needed because
+    density lives partly in the config's safety floors and partly in the selector's beat stepping.
+    """
     selected: List[float] = []
     info: List[Dict] = []
 
@@ -18,7 +40,8 @@ def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dic
         if beat_indices.size == 0:
             continue
 
-        section_selected = select_section_wave_cuts(beat_indices, beat_times, features, section, cfg)
+        section_selected = select_section_wave_cuts(
+            beat_indices, beat_times, features, section, cfg, density_factor)
         selected.extend(section_selected)
         info.append({
             "section": section,
@@ -38,7 +61,8 @@ def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dic
 
 def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
                              features: Dict, section: Dict,
-                             cfg: AutoWaveConfig) -> List[float]:
+                             cfg: AutoWaveConfig,
+                             density_factor: float | None = None) -> List[float]:
     section_type = section.get("type", "verse")
     pattern = section.get("dominant_pattern", "mixed")
     selected: List[float] = []
@@ -49,6 +73,13 @@ def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
     current_pos = 0
     last_cut_time = -999.0
     max_hold = max_hold_for_section(section, cfg)
+
+    # [FORK] Digital-Union (Creative Controls Core): resolved once per section, not per beat. The
+    # neutral branch is the untouched literal — no division by 1.0 anywhere on a default render.
+    if density_factor is None:
+        weak_score_threshold = WEAK_SCORE_THRESHOLD
+    else:
+        weak_score_threshold = fork_creative.scale_weak_score_threshold(density_factor)
 
     # First cut in a section: use section start if there is a good downbeat nearby.
     first_idx = choose_best_nearby(beat_indices, 0, radius=1, scores=score_map, features=features)
@@ -62,6 +93,12 @@ def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
         wave = float(features["wave"][local_idx])
         impact = float(features["impact_score"][local_idx])
         step = adaptive_beat_step(wave, impact, section_type, pattern)
+        # [FORK] Digital-Union (Creative Controls Core): `adaptive_beat_step` stays exactly the
+        # musical mapping it has always been; density re-quantises its answer afterwards, so the
+        # rhythmic reasoning and the creative control remain separable. `radius` below still keys
+        # off the resulting step, so a denser edit keeps its tighter anchor search.
+        if density_factor is not None:
+            step = fork_creative.scale_beat_step(step, density_factor)
 
         target_pos = min(beat_indices.size - 1, current_pos + step)
         target_idx = choose_best_nearby(
@@ -85,7 +122,7 @@ def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
         # If the target score is weak and we are not exceeding max hold, let the
         # shot breathe until the next cleaner beat.
         score = score_map.get(int(target_idx), 0.0)
-        if score < 0.42 and target_time - last_cut_time < max_hold:
+        if score < weak_score_threshold and target_time - last_cut_time < max_hold:
             current_pos = target_pos
             continue
 
@@ -230,7 +267,15 @@ def max_hold_for_section(section: Dict, cfg: AutoWaveConfig) -> float:
 
 def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: Dict,
                         audio_duration: float, cfg: AutoWaveConfig) -> np.ndarray:
-    """Add extremely rare half-beat cuts only for huge impacts, not normal density."""
+    """Add extremely rare half-beat cuts only for huge impacts, not normal density.
+
+    [FORK] Digital-Union (Creative Controls Core): Cut Density deliberately does **not** touch this
+    policy. ``enable_rare_micro_cuts``, ``max_micro_cut_ratio``, ``micro_min_gap`` and
+    ``micro_percentile`` are identical at every density. The absolute number of micro-cuts still
+    moves, because ``max_extra`` is a ratio of the main selected grid, which density does change —
+    that is a proportional consequence, not a policy change. **This is not the future Micro Cuts
+    control**, which would be a separate creative control over these fields themselves.
+    """
     if not cfg.enable_rare_micro_cuts or len(beat_times) < 3 or selected.size == 0:
         return selected
 

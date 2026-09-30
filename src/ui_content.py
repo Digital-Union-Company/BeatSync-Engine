@@ -357,6 +357,33 @@ INFO_VARIATION_SEED = (
 LABEL_RANDOMIZE_SEED = "🎲 Randomize"
 
 # ============================================================================
+# [FORK] Digital-Union: creative direction (Creative Controls Core)
+# See src/beatsync_fork/creative.py for the mappings these labels describe.
+# All three are 0..100 with 50 meaning "exactly what BeatSync does today", and none of them
+# re-analyses anything: they change planning, never the video analysis cache.
+# ============================================================================
+
+LABEL_CUT_DENSITY = "✂️ Cut Density"
+INFO_CUT_DENSITY = (
+    "Sparse ↔ Dense. 50 = current BeatSync behaviour. Lower holds shots longer, higher cuts more "
+    "often — always on the detected beat/bar/phrase grid. Changing this does not re-analyse your "
+    "videos."
+)
+
+LABEL_ENERGY_RESPONSE = "⚡ Energy Response"
+INFO_ENERGY_RESPONSE = (
+    "Weak ↔ Strong target matching. 50 = current BeatSync behaviour. Higher follows the music's "
+    "drop/build/soft targets harder; lower favours generally good-looking moments. The cut timing "
+    "and the music analysis are unchanged either way."
+)
+
+LABEL_MOTION_BIAS = "🎥 Motion Bias"
+INFO_MOTION_BIAS = (
+    "Calm ↔ Dynamic. 50 = current BeatSync behaviour. Lower prefers steadier shots, higher prefers "
+    "moving ones. Only the choice of source moment changes — never the cut timing."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels
 # See src/beatsync_fork/input_session.py for the behaviour these labels describe.
 # ============================================================================

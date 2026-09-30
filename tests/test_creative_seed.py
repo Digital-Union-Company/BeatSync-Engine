@@ -413,12 +413,18 @@ def test_the_seed_never_enters_the_audio_visual_profile():
 
 
 def test_the_seed_reaches_stage_6_through_beat_info_only():
-    """`analyze_beats_auto` stores it on the bus and passes it to nothing else."""
+    """`analyze_beats_auto` stores it on the bus and passes it to nothing else.
+
+    Creative Controls Core generalised the bus value from Phase A's ``{"seed": n}`` to the whole
+    resolved profile, so what is pinned here is that the bus entry comes from the one authority
+    (``CreativeProfile.as_dict()``) rather than being assembled key by key at the call site.
+    """
     fn = _func(_tree(_AUTO_MODE_PATH), "analyze_beats_auto")
 
     assert "creative" in [arg.arg for arg in fn.args.kwonlyargs + fn.args.args]
     source = ast.unparse(fn)
-    assert "'creative': {'seed': variation_seed}" in source
+    assert "'creative': profile.as_dict()" in source
+    assert "profile = fork_creative.CreativeProfile.from_mapping(creative)" in source
     # analyze_video_sources is the Stage 5 entry point; it must not learn about the seed.
     stage5 = [n for n in ast.walk(fn)
               if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "analyze_video_sources"]
@@ -500,12 +506,20 @@ def test_the_seed_is_a_render_request_input():
 
 
 def test_the_gui_normalises_the_seed_before_it_reaches_the_pipeline():
-    """A raw widget value must never be trusted into `analyze_beats_auto`."""
-    source = ast.unparse(_func(_gui_tree(), "_process_video_impl"))
+    """A raw widget value must never be trusted into `analyze_beats_auto`.
 
-    assert "fork_variation.normalize_seed(variation_seed)" in source
-    assert "creative={'seed': seed}" in source
-    assert "fork_variation.filename_suffix(seed)" in source
+    Creative Controls Core moved the normalisation one seam earlier: the guarded handler collapses
+    the four raw widget values into one already-normalised ``CreativeProfile``, so what reaches the
+    pipeline is a profile rather than a scalar the implementation has to re-clean.
+    """
+    tree = _gui_tree()
+    guarded = ast.unparse(_func(tree, "process_video_guarded"))
+    assert "fork_creative.CreativeProfile.from_widgets(" in guarded
+    assert "seed=variation_seed" in guarded
+
+    source = ast.unparse(_func(tree, "_process_video_impl"))
+    assert "creative=creative.as_dict()" in source
+    assert "creative.filename_suffix()" in source
 
 
 # ---------------------------------------------------------------------------
