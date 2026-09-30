@@ -989,7 +989,7 @@ def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
 _RENDER_CLICK_INPUTS = [
     "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
     "output_filename", "processing_mode", "custom_fps", "variation_seed",
-    "cut_density", "energy_response", "motion_bias",
+    "cut_density", "energy_response", "motion_bias", "source_diversity", "micro_cuts",
     "session_state", "source_state",
 ]
 

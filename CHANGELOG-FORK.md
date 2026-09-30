@@ -20,6 +20,65 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-09-30 (Creative Controls Extra PR1: Source Diversity, Micro Cuts)
+
+Two more controls on the Creative Controls Core seam. `CreativeProfile` grows to six fields; both
+new controls are 0–100 with **50 = current behaviour**.
+
+| Control | Range | Neutral | Owned by | What it changes |
+|---|---|---|---|---|
+| Source Diversity | 0–100 | 50 | Stage 6 (**dynamic** half) | how hard the plan spreads across source videos |
+| Micro Cuts | 0–100 | 50 | Stage 4 | the rare half-beat accent layer, and only that |
+
+- **Source Diversity scales exactly two penalties.** `factor = 3 ** ((v - 50) / 50)` multiplies the
+  planner's `-0.10` recent-source penalty and its capped `usage[video_file] * 0.012` source-usage
+  penalty. The two **candidate-level** protections (`-0.28` for a recently used candidate id, and the
+  capped `usage[id] * 0.10`) are byte-identical at every setting — diversity decides whether the edit
+  returns to the same *source*, never whether it may repeat a *moment*. Deque lengths are unchanged.
+  Base 3 is measured: on the real 509-candidate / 41-source TEST1 pool over 148 real segments it moved
+  unique sources 31 → 39 and halved top-source usage 20 → 10 for a ~4 % mean legacy-score cost, with
+  zero adjacent source repeats even at the reuse end; base 2 was visibly weaker and base 4 started
+  producing adjacent source repeats at 0.
+- **Source Diversity is dynamic and stays out of L1A.** It reads `usage`/`recent_videos`, so it is
+  deliberately *not* in `ScoringControls` and not a key of the static table. A test asserts the
+  `_static_base_score` evaluation count is identical at diversity 0 / 50 / 100, and that moving it
+  does not trigger Energy Response's flow column.
+- **Micro Cuts owns one layer.** It derives only `max_micro_cut_ratio`
+  (`0.025 * 3^d`, hard-capped at 0.08) and `micro_percentile` (`96.5 − 6·d`, clamped to 90 … 99.9);
+  `micro_min_gap` is untouched because it is the anti-flicker floor, and the `wave >= 0.88` gate
+  inside `add_rare_micro_cuts` is untouched because measurement showed it is not the binding
+  constraint. At **0** the layer is switched off via `enable_rare_micro_cuts=False` rather than scaled
+  down — scaling alone cannot reach zero. Measured on the real Nero track: 0 → 0 extras (143 cuts),
+  50 → 4 (147, the exact production baseline), 75 → 6 (149), 100 → 11 (154), minimum gap constant at
+  0.464 s throughout.
+- **Cut Density and Micro Cuts compose, in that order, and neither rewrites the other's fields.**
+  Density shapes the main grid; Micro Cuts rewrites only the accent policy. `micro_cuts=50`
+  short-circuits before the micro config is derived, so Cut Density's Core behaviour is bit-identical
+  — a test recomputes it without any Micro Cuts involvement at densities 0/50/100 and requires exact
+  arrays. The absolute accent count still scales with grid size (`max_extra` is a ratio of the
+  selected grid); that pre-existing proportionality is intended and deliberately not "corrected".
+- **50 is still today, exactly.** Every neutral control takes an explicit branch: `micro_cuts=50`
+  passes the `CONFIG` singleton itself through (asserted by identity, not equality), and
+  `source_diversity=50` runs the untouched penalty expressions (asserted at the source, so equality of
+  results cannot hide a `× 1.0`).
+- **Stage 5 untouched.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `src/video_analysis.py`,
+  `src/auto_mode/stage5_qwen_scene_worker.py` and `src/beatsync_fork/library_prep.py` are byte-identical
+  to main.
+- **UI / CLI.** Two more sliders in Creative Direction (0–100, step 1, default 50) and
+  `--source-diversity` / `--micro-cuts`. Both are render-request creative state: no handler, absent
+  from `source_outputs`/`prep_outputs`, live `process_btn` inputs with pinned positional alignment.
+  Randomize stays seed-only. No filename suffix — seed remains the only one.
+- **Deferred deliberately:** Semantic Emphasis is *not* here, not even as a dormant field. It needs a
+  deterministic candidate view reconstructed from Stage-5 primitives and carries a different
+  drift-risk class, so it is its own PR. Presets follow after both have runtime acceptance.
+- Files: `src/beatsync_fork/creative.py`, `src/auto_mode/__init__.py`,
+  `src/auto_mode/stage6_av_planner.py`, `src/gui.py`, `src/ui_content.py`, `src/video_processor.py`,
+  `tests/test_source_diversity.py` (new), `tests/test_micro_cuts.py` (new),
+  `tests/test_creative_profile.py`, `tests/test_creative_controls_interactions.py`,
+  `tests/test_creative_controls_seam.py`, `tests/test_cut_density.py`,
+  `tests/test_library_preparation.py`.
+
 ### Added — 2026-09-30 (B0 + Creative Controls Core: Cut Density, Energy Response, Motion Bias)
 
 Phase A's single creative control — the variation seed — is generalised into one resolved **Creative

@@ -214,6 +214,43 @@ def density_scaled_config(cfg: AutoWaveConfig, density_factor: float) -> AutoWav
     )
 
 
+def micro_cut_scaled_config(cfg: AutoWaveConfig,
+                            profile: "fork_creative.CreativeProfile") -> AutoWaveConfig:
+    """[FORK] Digital-Union (Creative Controls Extra): a per-render config for one Micro Cuts value.
+
+    Micro Cuts owns Stage 4's **rare half-beat accent layer** and nothing else. Only the two policy
+    fields `add_rare_micro_cuts` actually reads as a budget are touched:
+
+    * ``max_micro_cut_ratio`` — how many extras the layer may add, as a fraction of the main grid;
+    * ``micro_percentile`` — how selective the impact threshold is about what qualifies.
+
+    ``micro_min_gap`` is deliberately **unchanged**: it is the anti-flicker floor, not a creative
+    dial, and the whole point of a bounded accent layer is that it cannot become flicker. The
+    ``wave >= 0.88`` gate inside `add_rare_micro_cuts` is likewise untouched — measured on real
+    material it is not the binding constraint (the ratio budget is), so exposing it would add a
+    configurable literal for no behavioural gain.
+
+    At exactly 0 the layer is switched **off** rather than scaled down, because scaling alone cannot
+    reach zero: ``0.025 / 3`` still rounds to one extra on a typical grid, and "None" must mean none.
+
+    Never called on a neutral render — `analyze_beats_auto` branches on
+    ``profile.is_neutral_micro_cuts()`` and passes its incoming config straight through, so a
+    default render never rebuilds these fields from unchanged values.
+
+    Composes *after* `density_scaled_config`: Cut Density shapes the main grid and does not write any
+    of these fields, so the two controls compose without either rewriting the other's policy.
+    """
+    if profile.disables_micro_cuts():
+        return replace(cfg, enable_rare_micro_cuts=False)
+    return replace(
+        cfg,
+        max_micro_cut_ratio=fork_creative.scale_micro_cut_ratio(
+            cfg.max_micro_cut_ratio, profile.micro_cut_ratio_factor()),
+        micro_percentile=fork_creative.scale_micro_percentile(
+            cfg.micro_percentile, profile.micro_cuts_centered()),
+    )
+
+
 def _interp_to_beats(curve: np.ndarray, beat_times: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
     if len(curve) == 0 or len(beat_times) == 0:
         return np.zeros(len(beat_times), dtype=float)
@@ -327,9 +364,10 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     # widget values. Stage ownership from this point on:
     #
     #   Stages 1-3  read none of it (beat grid, audio features and sections are facts about the track)
-    #   Stage 4     reads Cut Density only
+    #   Stage 4     reads Cut Density (main grid) and Micro Cuts (rare accent layer) only
     #   Stage 5     reads NONE of it — the B0 invariant; see the analyze_video_sources call below
-    #   Stage 6     reads the seed, Energy Response and Motion Bias, off `beat_info["creative"]`
+    #   Stage 6     reads the seed, Energy Response, Motion Bias and Source Diversity, off
+    #               `beat_info["creative"]`
     #
     # It is deliberately kept out of `audio_visual_profile`: that dict describes the *track*, and
     # keeping creative state separable from it is what stops a future control leaking into anything
@@ -434,6 +472,19 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         density_factor = profile.cut_density_factor()
         stage4_cfg = density_scaled_config(cfg, density_factor)
         print(f"      ✂️  Cut density {profile.cut_density} (factor {density_factor:.3f})")
+
+    # [FORK] Digital-Union (Creative Controls Extra): Micro Cuts layers on top of whatever config
+    # Cut Density produced, and rewrites only the rare-accent policy fields. Neutral passes the
+    # config through untouched, so `cut_density=50, micro_cuts=50` still hands Stage 4 the CONFIG
+    # singleton itself and `cut_density!=50, micro_cuts=50` is bit-for-bit Creative Controls Core.
+    if not profile.is_neutral_micro_cuts():
+        stage4_cfg = micro_cut_scaled_config(stage4_cfg, profile)
+        if profile.disables_micro_cuts():
+            print(f"      ✨ Micro cuts {profile.micro_cuts} (rare accent layer disabled)")
+        else:
+            print(f"      ✨ Micro cuts {profile.micro_cuts} "
+                  f"(ratio {stage4_cfg.max_micro_cut_ratio:.4f}, "
+                  f"percentile {stage4_cfg.micro_percentile:.1f})")
 
     selected_beats, selection_info = select_wave_cuts(
         beat_times=beat_times,
@@ -621,4 +672,5 @@ __all__ = [
     "analyze_beats_auto_fallback",
     "density_scaled_config",
     "get_auto_mode_info",
+    "micro_cut_scaled_config",
 ]

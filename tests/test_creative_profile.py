@@ -126,7 +126,7 @@ def test_a_phase_a_seed_only_dict_still_resolves():
 
 def test_unknown_keys_on_the_bus_are_ignored():
     profile = creative.CreativeProfile.from_mapping(
-        {"seed": 5, "cut_density": 70, "micro_cuts": 90, "director": "freestyle"})
+        {"seed": 5, "cut_density": 70, "semantic_emphasis": 90, "director": "freestyle"})
 
     assert profile == creative.CreativeProfile(seed=5, cut_density=70)
 
@@ -169,10 +169,12 @@ def test_describe_seed_is_the_variation_wording():
 
 
 def test_as_dict_round_trips_exactly():
-    profile = creative.CreativeProfile(seed=101, cut_density=70, energy_response=80, motion_bias=30)
+    profile = creative.CreativeProfile(seed=101, cut_density=70, energy_response=80, motion_bias=30,
+                                       source_diversity=20, micro_cuts=90)
     payload = profile.as_dict()
 
-    assert payload == {"seed": 101, "cut_density": 70, "energy_response": 80, "motion_bias": 30}
+    assert payload == {"seed": 101, "cut_density": 70, "energy_response": 80, "motion_bias": 30,
+                       "source_diversity": 20, "micro_cuts": 90}
     assert all(isinstance(value, int) for value in payload.values())
     assert creative.CreativeProfile.from_mapping(payload) == profile
 
@@ -360,22 +362,189 @@ def test_describe_reports_legacy_for_a_neutral_render():
 
 
 def test_describe_lists_every_control_once_anything_is_set():
-    text = creative.CreativeProfile(seed=101, cut_density=65, energy_response=80,
-                                    motion_bias=40).describe()
+    text = creative.CreativeProfile(seed=101, cut_density=65, energy_response=80, motion_bias=40,
+                                    source_diversity=80, micro_cuts=70).describe()
 
-    assert text == "Seed 101 · Cut Density 65 · Energy Response 80 · Motion Bias 40"
+    assert text == ("Seed 101 · Cut Density 65 · Micro Cuts 70 · Energy Response 80 "
+                    "· Motion Bias 40 · Source Diversity 80")
 
 
 def test_describe_still_names_a_default_seed_when_only_a_control_moved():
     text = creative.CreativeProfile(cut_density=65).describe()
 
-    assert text == "Seed default · Cut Density 65 · Energy Response 50 · Motion Bias 50"
+    assert text == ("Seed default · Cut Density 65 · Micro Cuts 50 · Energy Response 50 "
+                    "· Motion Bias 50 · Source Diversity 50")
 
 
 def test_describe_is_enough_to_reproduce_the_render():
     """The whole point of reporting it: every number the profile holds must be readable back."""
-    profile = creative.CreativeProfile(seed=7, cut_density=0, energy_response=100, motion_bias=0)
+    profile = creative.CreativeProfile(seed=7, cut_density=0, energy_response=100, motion_bias=0,
+                                       source_diversity=25, micro_cuts=75)
     text = profile.describe()
 
     for value in profile.as_dict().values():
         assert str(value) in text
+
+
+# ---------------------------------------------------------------------------
+# Creative Controls Extra: Source Diversity and Micro Cuts
+# ---------------------------------------------------------------------------
+
+
+def test_the_two_new_controls_default_to_neutral():
+    profile = creative.CreativeProfile()
+
+    assert profile.source_diversity == 50
+    assert profile.micro_cuts == 50
+    assert profile.is_neutral_source_diversity()
+    assert profile.is_neutral_micro_cuts()
+    assert profile.is_neutral()
+
+
+@pytest.mark.parametrize("field", ["source_diversity", "micro_cuts"])
+@pytest.mark.parametrize("value, expected", [
+    (0, 0), (50, 50), (100, 100), (250, 100), (-10, 0), ("75", 75),
+    (75.0, 75), (75.5, 50), (True, 50), (None, 50), ("", 50), ("abc", 50),
+    (float("nan"), 50), (float("inf"), 50),
+])
+def test_the_new_controls_use_the_existing_normalisation(field, value, expected):
+    """No new normalisation system: identical rules to every other 0..100 control."""
+    profile = creative.CreativeProfile(**{field: value})
+
+    assert getattr(profile, field) == expected
+    assert getattr(profile, field) == creative.normalize_control(value)
+
+
+def test_a_creative_controls_core_mapping_reads_back_neutral_for_the_new_controls():
+    """Backward compatibility: a bus written before this PR carries neither field."""
+    core = {"seed": 101, "cut_density": 75, "energy_response": 80, "motion_bias": 25}
+    profile = creative.CreativeProfile.from_mapping(core)
+
+    assert profile.seed == 101 and profile.cut_density == 75
+    assert profile.energy_response == 80 and profile.motion_bias == 25
+    assert profile.source_diversity == 50 and profile.micro_cuts == 50
+    assert profile.is_neutral_source_diversity() and profile.is_neutral_micro_cuts()
+
+
+def test_a_phase_a_mapping_still_reads_back_neutral_for_everything_but_the_seed():
+    profile = creative.CreativeProfile.from_mapping({"seed": 381944})
+
+    assert profile.seed == 381944
+    assert profile.as_dict() == {"seed": 381944, "cut_density": 50, "energy_response": 50,
+                                 "motion_bias": 50, "source_diversity": 50, "micro_cuts": 50}
+
+
+def test_from_widgets_accepts_the_new_controls_and_treats_none_as_neutral():
+    assert creative.CreativeProfile.from_widgets(
+        source_diversity=None, micro_cuts=None) == creative.NEUTRAL_PROFILE
+    assert creative.CreativeProfile.from_widgets(
+        source_diversity=10, micro_cuts=90) == creative.CreativeProfile(
+            source_diversity=10, micro_cuts=90)
+
+
+@pytest.mark.parametrize("diversity, expected", [
+    (0, 1.0 / 3.0), (25, 3 ** -0.5), (50, 1.0), (75, 3 ** 0.5), (100, 3.0)])
+def test_source_diversity_factor_is_the_accepted_mapping(diversity, expected):
+    assert creative.CreativeProfile(
+        source_diversity=diversity).source_diversity_factor() == pytest.approx(expected)
+
+
+def test_source_diversity_factor_is_exactly_one_at_neutral():
+    assert creative.CreativeProfile(source_diversity=50).source_diversity_factor() == 1.0
+
+
+def test_source_diversity_factor_is_strictly_monotonic():
+    factors = [creative.CreativeProfile(source_diversity=d).source_diversity_factor()
+               for d in range(0, 101)]
+
+    assert all(a < b for a, b in zip(factors, factors[1:]))
+    assert all(math.isfinite(f) and f > 0 for f in factors)
+
+
+@pytest.mark.parametrize("micro, expected", [
+    (0, 1.0 / 3.0), (25, 3 ** -0.5), (50, 1.0), (75, 3 ** 0.5), (100, 3.0)])
+def test_micro_cut_ratio_factor_is_the_accepted_mapping(micro, expected):
+    assert creative.CreativeProfile(
+        micro_cuts=micro).micro_cut_ratio_factor() == pytest.approx(expected)
+
+
+def test_micro_cut_ratio_factor_is_exactly_one_at_neutral():
+    assert creative.CreativeProfile(micro_cuts=50).micro_cut_ratio_factor() == 1.0
+    assert creative.CreativeProfile(micro_cuts=50).micro_cuts_centered() == 0.0
+
+
+def test_only_exactly_zero_disables_the_micro_layer():
+    """Everything else scales; 0 is the one setting that switches the layer off."""
+    assert creative.CreativeProfile(micro_cuts=0).disables_micro_cuts()
+    for value in (1, 5, 25, 50, 75, 100):
+        assert not creative.CreativeProfile(micro_cuts=value).disables_micro_cuts(), value
+
+
+def test_scale_micro_cut_ratio_is_capped():
+    base = 0.025
+
+    assert creative.scale_micro_cut_ratio(base, 1.0) == pytest.approx(base)
+    assert creative.scale_micro_cut_ratio(base, 3.0) == pytest.approx(0.075)
+    assert creative.scale_micro_cut_ratio(base, 1000.0) == creative.MICRO_CUT_RATIO_CAP
+    # the cap is a guard, not part of the reachable mapping
+    assert base * creative.MICRO_CUT_RATIO_BASE < creative.MICRO_CUT_RATIO_CAP
+
+
+def test_scale_micro_percentile_is_bounded_and_inverted():
+    base = 96.5
+
+    assert creative.scale_micro_percentile(base, 0.0) == pytest.approx(base)
+    assert creative.scale_micro_percentile(base, 1.0) == pytest.approx(90.5)     # micro 100
+    assert creative.scale_micro_percentile(base, -0.5) == pytest.approx(99.5)    # micro 25
+    # the sparse end runs into the upper bound: 96.5 + 6.0 = 102.5 clamps to 99.9. Only micro 0
+    # reaches that, and micro 0 disables the layer outright, so the clamp is never load-bearing.
+    assert creative.scale_micro_percentile(base, -1.0) == creative.MICRO_PERCENTILE_MAX
+    for centered in (-50.0, 50.0):
+        value = creative.scale_micro_percentile(base, centered)
+        assert creative.MICRO_PERCENTILE_MIN <= value <= creative.MICRO_PERCENTILE_MAX
+
+
+def test_the_new_controls_stay_out_of_the_static_scoring_controls():
+    """`ScoringControls` is the L1A half. Source Diversity is dynamic and Micro Cuts is Stage 4;
+    neither may make a static-table decision."""
+    for profile in (creative.CreativeProfile(source_diversity=0),
+                    creative.CreativeProfile(source_diversity=100),
+                    creative.CreativeProfile(micro_cuts=0),
+                    creative.CreativeProfile(micro_cuts=100)):
+        assert profile.is_neutral_scoring()
+        assert profile.scoring_controls() is creative.NEUTRAL_SCORING
+
+
+def test_is_neutral_cuts_still_means_cut_density_only():
+    """Core semantics preserved: the main-grid neutrality check must not start covering the
+    accent layer, or a Micro Cuts change would rebuild the density config for no reason."""
+    assert creative.CreativeProfile(micro_cuts=0).is_neutral_cuts()
+    assert creative.CreativeProfile(micro_cuts=100).is_neutral_cuts()
+    assert not creative.CreativeProfile(cut_density=0).is_neutral_cuts()
+    assert creative.CreativeProfile(cut_density=0).is_neutral_micro_cuts()
+
+
+@pytest.mark.parametrize("field", ["source_diversity", "micro_cuts"])
+def test_is_neutral_includes_each_new_control(field):
+    assert not creative.CreativeProfile(**{field: 0}).is_neutral()
+    assert not creative.CreativeProfile(**{field: 100}).is_neutral()
+    assert creative.CreativeProfile(**{field: 50}).is_neutral()
+
+
+def test_the_new_controls_add_no_filename_suffix():
+    for diversity in (0, 50, 100):
+        for micro in (0, 50, 100):
+            profile = creative.CreativeProfile(source_diversity=diversity, micro_cuts=micro)
+            assert profile.filename_suffix() == ""
+            assert creative.CreativeProfile(
+                seed=101, source_diversity=diversity, micro_cuts=micro
+            ).filename_suffix() == "_seed101"
+
+
+def test_no_semantic_emphasis_field_was_added():
+    """Explicitly out of scope for this PR: a dormant field would be placeholder state."""
+    assert not hasattr(creative.CreativeProfile(), "semantic_emphasis")
+    assert "semantic_emphasis" not in creative.CreativeProfile().as_dict()
+    # and a bus carrying one is simply ignored rather than half-honoured
+    profile = creative.CreativeProfile.from_mapping({"seed": 5, "semantic_emphasis": 90})
+    assert profile == creative.CreativeProfile(seed=5)

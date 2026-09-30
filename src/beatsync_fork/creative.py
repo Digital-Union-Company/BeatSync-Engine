@@ -20,9 +20,16 @@ Control                 Owned by
 ======================  ==========================================================
 Variation Seed          Stage 6 — which candidate wins among the good ones
 Cut Density             Stage 4 — how many beats become cuts
+Micro Cuts              Stage 4 — the rare half-beat accent layer, and only that
 Energy Response         Stage 6 — how hard scoring follows the segment's target
 Motion Bias             Stage 6 — calm vs. dynamic material preference
+Source Diversity        Stage 6 — how hard to spread cuts across source videos
 ======================  ==========================================================
+
+Two halves of Stage 6, and the split is load-bearing: Energy Response and Motion Bias are
+**static** (candidate × target, so they live in the L1A precompute table), while Source Diversity is
+**dynamic** — it reads the running ``usage`` counter and the ``recent_videos`` window, so it must
+never enter that table. :class:`ScoringControls` therefore carries the static half only.
 
 Stages 1-3 read **none** of it (beat grid, audio features and sections are facts about the track),
 and **Stage 5 reads none of it either** — that is the B0 invariant. Creative state never enters
@@ -108,6 +115,44 @@ ENERGY_RESPONSE_SPAN = 0.6
 #: materially smaller than the planner's own ``0.28`` "seen recently" penalty — so a bias can move
 #: the winner among comparable candidates but can never overturn a deliberate anti-repeat decision.
 MOTION_BIAS_COEFFICIENT = 0.15
+
+# ---------------------------------------------------------------------------
+# Source Diversity (Stage 6 — dynamic half only)
+# ---------------------------------------------------------------------------
+
+#: ``factor = 3 ** ((source_diversity - 50) / 50)`` — 1/3 at 0, 1.0 at 50, 3.0 at 100.
+#:
+#: The factor scales the planner's two **source-video-level** reuse penalties and nothing else. The
+#: two candidate-level protections (``-0.28`` for a recently used candidate id, and the capped
+#: ``usage[id] * 0.10``) stay at their exact current arithmetic at every setting: diversity is about
+#: which *source* a moment comes from, and must not be able to buy a repeated moment.
+#:
+#: Base 3 rather than 2 is measured, not assumed. On the real 509-candidate / 41-source TEST1 pool
+#: over 148 real segments, 3**d moved unique sources 31 → 39 and halved top-source usage 20 → 10 for
+#: a ~4% mean legacy-score cost, with zero adjacent source repeats even at the reuse end. Base 2 was
+#: visibly weaker (31 → 37) and base 4 started producing adjacent source repeats at 0.
+SOURCE_DIVERSITY_BASE = 3.0
+
+# ---------------------------------------------------------------------------
+# Micro Cuts (Stage 4 — the rare half-beat layer only)
+# ---------------------------------------------------------------------------
+
+#: ``max_micro_cut_ratio`` is multiplied by ``3 ** ((micro_cuts - 50) / 50)``.
+MICRO_CUT_RATIO_BASE = 3.0
+
+#: Hard ceiling on the scaled ratio, so the accent layer can never become flicker however the
+#: mapping is later retuned. At the reachable range it never binds (``0.025 * 3 = 0.075 < 0.08``);
+#: it is a guard, not part of the measured behaviour.
+MICRO_CUT_RATIO_CAP = 0.08
+
+#: ``micro_percentile`` moves by this many points across half the range, downward as the control
+#: rises (a lower percentile admits more impact peaks as micro-cut candidates).
+MICRO_PERCENTILE_SPAN = 6.0
+
+#: Bounds on the scaled percentile. Secondary to the ratio: on the measured real track the ratio cap
+#: binds at every setting, and the percentile only matters on material where fewer peaks qualify.
+MICRO_PERCENTILE_MIN = 90.0
+MICRO_PERCENTILE_MAX = 99.9
 
 
 def normalize_control(value: Any) -> int:
@@ -195,6 +240,8 @@ class CreativeProfile:
     cut_density: int = DEFAULT_CONTROL
     energy_response: int = DEFAULT_CONTROL
     motion_bias: int = DEFAULT_CONTROL
+    source_diversity: int = DEFAULT_CONTROL
+    micro_cuts: int = DEFAULT_CONTROL
 
     def __post_init__(self) -> None:
         # Seed normalisation is delegated, never reimplemented: `variation` is the single authority
@@ -203,18 +250,24 @@ class CreativeProfile:
         object.__setattr__(self, "cut_density", normalize_control(self.cut_density))
         object.__setattr__(self, "energy_response", normalize_control(self.energy_response))
         object.__setattr__(self, "motion_bias", normalize_control(self.motion_bias))
+        object.__setattr__(self, "source_diversity", normalize_control(self.source_diversity))
+        object.__setattr__(self, "micro_cuts", normalize_control(self.micro_cuts))
 
     # -- construction -------------------------------------------------------
 
     @classmethod
     def from_widgets(cls, seed: Any = None, cut_density: Any = None,
-                     energy_response: Any = None, motion_bias: Any = None) -> "CreativeProfile":
-        """Collapse four raw UI/CLI values into one profile. ``None`` anywhere means neutral."""
+                     energy_response: Any = None, motion_bias: Any = None,
+                     source_diversity: Any = None,
+                     micro_cuts: Any = None) -> "CreativeProfile":
+        """Collapse the raw UI/CLI values into one profile. ``None`` anywhere means neutral."""
         return cls(
             seed=fork_variation.LEGACY_SEED if seed is None else seed,
             cut_density=DEFAULT_CONTROL if cut_density is None else cut_density,
             energy_response=DEFAULT_CONTROL if energy_response is None else energy_response,
             motion_bias=DEFAULT_CONTROL if motion_bias is None else motion_bias,
+            source_diversity=DEFAULT_CONTROL if source_diversity is None else source_diversity,
+            micro_cuts=DEFAULT_CONTROL if micro_cuts is None else micro_cuts,
         )
 
     @classmethod
@@ -223,8 +276,9 @@ class CreativeProfile:
 
         Anything that is not a mapping — absent, ``None``, a string, a stale Phase A value — is a
         neutral profile, because every downstream reader must survive an old or malformed bus
-        without raising mid-render. A Phase A ``{"seed": n}`` dict still resolves correctly: the
-        three missing keys simply stay neutral.
+        without raising mid-render. Older buses still resolve correctly and stay neutral in whatever
+        they do not carry: a Phase A ``{"seed": n}`` dict, and a Creative Controls Core dict without
+        ``source_diversity``/``micro_cuts``, both read back with every missing control at 50.
         """
         if not isinstance(mapping, Mapping):
             return cls()
@@ -233,6 +287,8 @@ class CreativeProfile:
             cut_density=mapping.get("cut_density"),
             energy_response=mapping.get("energy_response"),
             motion_bias=mapping.get("motion_bias"),
+            source_diversity=mapping.get("source_diversity"),
+            micro_cuts=mapping.get("micro_cuts"),
         )
 
     # -- transport ----------------------------------------------------------
@@ -248,24 +304,44 @@ class CreativeProfile:
             "cut_density": self.cut_density,
             "energy_response": self.energy_response,
             "motion_bias": self.motion_bias,
+            "source_diversity": self.source_diversity,
+            "micro_cuts": self.micro_cuts,
         }
 
     # -- neutrality ---------------------------------------------------------
 
     def is_neutral_cuts(self) -> bool:
-        """True when Stage 4 must run its untouched legacy path."""
+        """True when Stage 4's **main rhythmic grid** must run its untouched legacy path.
+
+        Deliberately still Cut Density alone: that is the Core meaning, and Micro Cuts governs a
+        different Stage-4 layer with its own neutrality check below.
+        """
         return self.cut_density == DEFAULT_CONTROL
 
+    def is_neutral_micro_cuts(self) -> bool:
+        """True when Stage 4's rare half-beat layer must run its untouched legacy policy."""
+        return self.micro_cuts == DEFAULT_CONTROL
+
     def is_neutral_scoring(self) -> bool:
-        """True when Stage 6's static scoring must be today's arithmetic, unmodified."""
+        """True when Stage 6's **static** scoring must be today's arithmetic, unmodified.
+
+        Source Diversity is deliberately absent: it is the dynamic half, and folding it in here
+        would make a diversity change trigger static-table work it has no business triggering.
+        """
         return (self.energy_response == DEFAULT_CONTROL
                 and self.motion_bias == DEFAULT_CONTROL)
 
+    def is_neutral_source_diversity(self) -> bool:
+        """True when the planner's source-level reuse penalties must be the exact legacy ones."""
+        return self.source_diversity == DEFAULT_CONTROL
+
     def is_neutral(self) -> bool:
-        """True when this whole render is current main: legacy seed and three neutral controls."""
+        """True when this whole render is current main: legacy seed and every control neutral."""
         return (self.seed == fork_variation.LEGACY_SEED
                 and self.is_neutral_cuts()
-                and self.is_neutral_scoring())
+                and self.is_neutral_micro_cuts()
+                and self.is_neutral_scoring()
+                and self.is_neutral_source_diversity())
 
     # -- derived values -----------------------------------------------------
 
@@ -285,6 +361,30 @@ class CreativeProfile:
     def motion_centered(self) -> float:
         """``(motion_bias - 50) / 50`` — -1.0 at 0 (calm), 0.0 at 50, +1.0 at 100 (dynamic)."""
         return (self.motion_bias - DEFAULT_CONTROL) / _DENSITY_HALF_RANGE
+
+    def source_diversity_factor(self) -> float:
+        """``3 ** ((source_diversity - 50) / 50)`` — 1/3 at 0, exactly 1.0 at 50, 3.0 at 100.
+
+        Multiplies the planner's two source-video-level reuse penalties. Callers must still branch
+        on :meth:`is_neutral_source_diversity` rather than comparing this to 1.0.
+        """
+        return SOURCE_DIVERSITY_BASE ** ((self.source_diversity - DEFAULT_CONTROL) / _DENSITY_HALF_RANGE)
+
+    def micro_cuts_centered(self) -> float:
+        """``(micro_cuts - 50) / 50`` — -1.0 at 0, 0.0 at 50, +1.0 at 100."""
+        return (self.micro_cuts - DEFAULT_CONTROL) / _DENSITY_HALF_RANGE
+
+    def micro_cut_ratio_factor(self) -> float:
+        """``3 ** ((micro_cuts - 50) / 50)`` — the multiplier on ``max_micro_cut_ratio``."""
+        return MICRO_CUT_RATIO_BASE ** self.micro_cuts_centered()
+
+    def disables_micro_cuts(self) -> bool:
+        """True only at exactly 0, where the accent layer is switched off rather than scaled down.
+
+        Scaling alone would not reach zero — ``0.025 / 3`` still rounds to one extra cut on a
+        typical grid — and "None" on the slider has to mean none.
+        """
+        return self.micro_cuts == CONTROL_MIN
 
     def scoring_controls(self) -> ScoringControls:
         """The Stage-6 half, with ``None`` for each control that is neutral.
@@ -325,8 +425,10 @@ class CreativeProfile:
         return " · ".join([
             seed_text,
             f"Cut Density {self.cut_density}",
+            f"Micro Cuts {self.micro_cuts}",
             f"Energy Response {self.energy_response}",
             f"Motion Bias {self.motion_bias}",
+            f"Source Diversity {self.source_diversity}",
         ])
 
 
@@ -350,6 +452,26 @@ def scale_beat_step(step: int, factor: float) -> int:
     return max(BEAT_STEP_MIN, min(BEAT_STEP_MAX, scaled))
 
 
+def scale_micro_cut_ratio(base_ratio: float, factor: float) -> float:
+    """Stage 4's ``max_micro_cut_ratio`` under a Micro Cuts factor, hard-capped.
+
+    The cap is a safety ceiling rather than part of the mapping: at the reachable factor range the
+    scaled ratio tops out at ``0.025 * 3 = 0.075``, below :data:`MICRO_CUT_RATIO_CAP`. It exists so
+    a future retune cannot turn an accent layer into flicker by arithmetic alone.
+    """
+    return min(MICRO_CUT_RATIO_CAP, base_ratio * factor)
+
+
+def scale_micro_percentile(base_percentile: float, centered: float) -> float:
+    """Stage 4's ``micro_percentile`` under a Micro Cuts setting: lower admits more impact peaks.
+
+    Secondary to the ratio. On the measured real track the ratio cap binds at every setting, so this
+    matters only on material where too few peaks clear the percentile for the ratio to be reached.
+    """
+    return max(MICRO_PERCENTILE_MIN,
+               min(MICRO_PERCENTILE_MAX, base_percentile - MICRO_PERCENTILE_SPAN * centered))
+
+
 def scale_weak_score_threshold(factor: float) -> float:
     """Stage 4's breathing threshold under a density factor: ``0.42 / f``.
 
@@ -367,13 +489,21 @@ __all__ = [
     "CUT_RATIO_MIN_CAP",
     "DEFAULT_CONTROL",
     "ENERGY_RESPONSE_SPAN",
+    "MICRO_CUT_RATIO_BASE",
+    "MICRO_CUT_RATIO_CAP",
+    "MICRO_PERCENTILE_MAX",
+    "MICRO_PERCENTILE_MIN",
+    "MICRO_PERCENTILE_SPAN",
     "MOTION_BIAS_COEFFICIENT",
     "NEUTRAL_PROFILE",
     "NEUTRAL_SCORING",
+    "SOURCE_DIVERSITY_BASE",
     "WEAK_SCORE_THRESHOLD",
     "CreativeProfile",
     "ScoringControls",
     "normalize_control",
     "scale_beat_step",
+    "scale_micro_cut_ratio",
+    "scale_micro_percentile",
     "scale_weak_score_threshold",
 ]

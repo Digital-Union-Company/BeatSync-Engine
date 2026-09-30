@@ -383,6 +383,20 @@ INFO_MOTION_BIAS = (
     "moving ones. Only the choice of source moment changes — never the cut timing."
 )
 
+LABEL_SOURCE_DIVERSITY = "🗂️ Source Diversity"
+INFO_SOURCE_DIVERSITY = (
+    "Reuse ↔ Diverse. 50 = current BeatSync behaviour. Higher spreads the edit across more of your "
+    "source videos; lower lets a strong source come back more often. Protection against repeating "
+    "the same moment is unaffected, and so are the cut timing and the music analysis."
+)
+
+LABEL_MICRO_CUTS = "✨ Micro Cuts"
+INFO_MICRO_CUTS = (
+    "Fewer ↔ More accents. 50 = current BeatSync behaviour. This is only the rare extra half-beat "
+    "cut on the biggest impacts — 0 turns it off entirely. The main cut rhythm is Cut Density; this "
+    "never makes the edit flickery."
+)
+
 # ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels
 # See src/beatsync_fork/input_session.py for the behaviour these labels describe.
