@@ -21,15 +21,17 @@ Control                 Owned by
 Variation Seed          Stage 6 — which candidate wins among the good ones
 Cut Density             Stage 4 — how many beats become cuts
 Micro Cuts              Stage 4 — the rare half-beat accent layer, and only that
+Semantic Emphasis       Stage 6 — deterministic visual evidence vs. semantic understanding
 Energy Response         Stage 6 — how hard scoring follows the segment's target
 Motion Bias             Stage 6 — calm vs. dynamic material preference
 Source Diversity        Stage 6 — how hard to spread cuts across source videos
 ======================  ==========================================================
 
-Two halves of Stage 6, and the split is load-bearing: Energy Response and Motion Bias are
-**static** (candidate × target, so they live in the L1A precompute table), while Source Diversity is
-**dynamic** — it reads the running ``usage`` counter and the ``recent_videos`` window, so it must
-never enter that table. :class:`ScoringControls` therefore carries the static half only.
+Two halves of Stage 6, and the split is load-bearing: Semantic Emphasis, Energy Response and
+Motion Bias are **static** (candidate × target, so they live in the L1A precompute table), while
+Source Diversity is **dynamic** — it reads the running ``usage`` counter and the ``recent_videos``
+window, so it must never enter that table. :class:`ScoringControls` therefore carries the static
+half only.
 
 Stages 1-3 read **none** of it (beat grid, audio features and sections are facts about the track),
 and **Stage 5 reads none of it either** — that is the B0 invariant. Creative state never enters
@@ -115,6 +117,21 @@ ENERGY_RESPONSE_SPAN = 0.6
 #: materially smaller than the planner's own ``0.28`` "seen recently" penalty — so a bias can move
 #: the winner among comparable candidates but can never overturn a deliberate anti-repeat decision.
 MOTION_BIAS_COEFFICIENT = 0.15
+
+# ---------------------------------------------------------------------------
+# Semantic Emphasis (Stage 6 — static half)
+# ---------------------------------------------------------------------------
+
+#: ``factor = 1 + ((semantic_emphasis - 50) / 50)`` — 0.0 at 0, 1.0 at 50, 2.0 at 100.
+#:
+#: The factor interpolates between the score a candidate gets on **reconstructed deterministic
+#: visual evidence** and the score it gets on its **persisted fused semantics**: at 0 the semantic
+#: contribution is removed entirely, at 1 it is exactly today's score, at 2 the difference between
+#: the two is applied twice.
+#:
+#: This is NOT "AI off" at 0. Stage 5 is untouched and Qwen still runs on a cold cache; only Stage
+#: 6's *interpretation* of already-persisted media truth moves.
+SEMANTIC_EMPHASIS_SPAN = 1.0
 
 # ---------------------------------------------------------------------------
 # Source Diversity (Stage 6 — dynamic half only)
@@ -211,16 +228,24 @@ class ScoringControls:
 
     energy_factor: float | None = None
     motion_centered: float | None = None
+    semantic_factor: float | None = None
 
     @property
     def is_neutral(self) -> bool:
-        return self.energy_factor is None and self.motion_centered is None
+        return (self.energy_factor is None and self.motion_centered is None
+                and self.semantic_factor is None)
 
     @property
     def needs_flow_column(self) -> bool:
         """Energy Response blends each target against the generic "flow" score, so that column of
         the static table has to exist even when no segment in this plan actually targets flow."""
         return self.energy_factor is not None
+
+    @property
+    def needs_deterministic_views(self) -> bool:
+        """Semantic Emphasis scores each candidate twice — once as persisted, once as its
+        reconstructed deterministic view — so those views must be built, once per candidate."""
+        return self.semantic_factor is not None
 
 
 #: The scoring controls of an all-neutral render: current main, untouched.
@@ -242,6 +267,7 @@ class CreativeProfile:
     motion_bias: int = DEFAULT_CONTROL
     source_diversity: int = DEFAULT_CONTROL
     micro_cuts: int = DEFAULT_CONTROL
+    semantic_emphasis: int = DEFAULT_CONTROL
 
     def __post_init__(self) -> None:
         # Seed normalisation is delegated, never reimplemented: `variation` is the single authority
@@ -252,14 +278,15 @@ class CreativeProfile:
         object.__setattr__(self, "motion_bias", normalize_control(self.motion_bias))
         object.__setattr__(self, "source_diversity", normalize_control(self.source_diversity))
         object.__setattr__(self, "micro_cuts", normalize_control(self.micro_cuts))
+        object.__setattr__(self, "semantic_emphasis", normalize_control(self.semantic_emphasis))
 
     # -- construction -------------------------------------------------------
 
     @classmethod
     def from_widgets(cls, seed: Any = None, cut_density: Any = None,
                      energy_response: Any = None, motion_bias: Any = None,
-                     source_diversity: Any = None,
-                     micro_cuts: Any = None) -> "CreativeProfile":
+                     source_diversity: Any = None, micro_cuts: Any = None,
+                     semantic_emphasis: Any = None) -> "CreativeProfile":
         """Collapse the raw UI/CLI values into one profile. ``None`` anywhere means neutral."""
         return cls(
             seed=fork_variation.LEGACY_SEED if seed is None else seed,
@@ -268,6 +295,8 @@ class CreativeProfile:
             motion_bias=DEFAULT_CONTROL if motion_bias is None else motion_bias,
             source_diversity=DEFAULT_CONTROL if source_diversity is None else source_diversity,
             micro_cuts=DEFAULT_CONTROL if micro_cuts is None else micro_cuts,
+            semantic_emphasis=(DEFAULT_CONTROL if semantic_emphasis is None
+                               else semantic_emphasis),
         )
 
     @classmethod
@@ -289,6 +318,7 @@ class CreativeProfile:
             motion_bias=mapping.get("motion_bias"),
             source_diversity=mapping.get("source_diversity"),
             micro_cuts=mapping.get("micro_cuts"),
+            semantic_emphasis=mapping.get("semantic_emphasis"),
         )
 
     # -- transport ----------------------------------------------------------
@@ -306,6 +336,7 @@ class CreativeProfile:
             "motion_bias": self.motion_bias,
             "source_diversity": self.source_diversity,
             "micro_cuts": self.micro_cuts,
+            "semantic_emphasis": self.semantic_emphasis,
         }
 
     # -- neutrality ---------------------------------------------------------
@@ -322,14 +353,24 @@ class CreativeProfile:
         """True when Stage 4's rare half-beat layer must run its untouched legacy policy."""
         return self.micro_cuts == DEFAULT_CONTROL
 
+    def is_neutral_semantic_emphasis(self) -> bool:
+        """True when Stage 6 must score on the persisted candidate alone.
+
+        Load-bearing: the neutral branch must not construct a single deterministic candidate view,
+        because that reconstruction is the expensive and drift-prone half of this control.
+        """
+        return self.semantic_emphasis == DEFAULT_CONTROL
+
     def is_neutral_scoring(self) -> bool:
         """True when Stage 6's **static** scoring must be today's arithmetic, unmodified.
 
         Source Diversity is deliberately absent: it is the dynamic half, and folding it in here
         would make a diversity change trigger static-table work it has no business triggering.
+        Semantic Emphasis *is* here, because it is static and does belong to the precompute table.
         """
         return (self.energy_response == DEFAULT_CONTROL
-                and self.motion_bias == DEFAULT_CONTROL)
+                and self.motion_bias == DEFAULT_CONTROL
+                and self.is_neutral_semantic_emphasis())
 
     def is_neutral_source_diversity(self) -> bool:
         """True when the planner's source-level reuse penalties must be the exact legacy ones."""
@@ -342,6 +383,8 @@ class CreativeProfile:
                 and self.is_neutral_micro_cuts()
                 and self.is_neutral_scoring()
                 and self.is_neutral_source_diversity())
+
+    # `is_neutral_scoring` already covers Semantic Emphasis, so `is_neutral` needs no extra term.
 
     # -- derived values -----------------------------------------------------
 
@@ -361,6 +404,17 @@ class CreativeProfile:
     def motion_centered(self) -> float:
         """``(motion_bias - 50) / 50`` — -1.0 at 0 (calm), 0.0 at 50, +1.0 at 100 (dynamic)."""
         return (self.motion_bias - DEFAULT_CONTROL) / _DENSITY_HALF_RANGE
+
+    def semantic_emphasis_factor(self) -> float:
+        """``1 + ((semantic_emphasis - 50) / 50)`` — 0.0 at 0, exactly 1.0 at 50, 2.0 at 100.
+
+        Weights the *semantic* contribution: the effective score is
+        ``deterministic + factor * (persisted - deterministic)``. At 0 the persisted semantic
+        reading drops out entirely; at 2 its difference from deterministic evidence is doubled.
+        Callers must still branch on :meth:`is_neutral_semantic_emphasis` rather than comparing
+        this to 1.0.
+        """
+        return 1.0 + ((self.semantic_emphasis - DEFAULT_CONTROL) / _DENSITY_HALF_RANGE) * SEMANTIC_EMPHASIS_SPAN
 
     def source_diversity_factor(self) -> float:
         """``3 ** ((source_diversity - 50) / 50)`` — 1/3 at 0, exactly 1.0 at 50, 3.0 at 100.
@@ -397,6 +451,8 @@ class CreativeProfile:
         return ScoringControls(
             energy_factor=(None if self.energy_response == DEFAULT_CONTROL else self.energy_factor()),
             motion_centered=(None if self.motion_bias == DEFAULT_CONTROL else self.motion_centered()),
+            semantic_factor=(None if self.is_neutral_semantic_emphasis()
+                             else self.semantic_emphasis_factor()),
         )
 
     # -- reporting ----------------------------------------------------------
@@ -426,6 +482,7 @@ class CreativeProfile:
             seed_text,
             f"Cut Density {self.cut_density}",
             f"Micro Cuts {self.micro_cuts}",
+            f"Semantic Emphasis {self.semantic_emphasis}",
             f"Energy Response {self.energy_response}",
             f"Motion Bias {self.motion_bias}",
             f"Source Diversity {self.source_diversity}",
@@ -497,6 +554,7 @@ __all__ = [
     "MOTION_BIAS_COEFFICIENT",
     "NEUTRAL_PROFILE",
     "NEUTRAL_SCORING",
+    "SEMANTIC_EMPHASIS_SPAN",
     "SOURCE_DIVERSITY_BASE",
     "WEAK_SCORE_THRESHOLD",
     "CreativeProfile",

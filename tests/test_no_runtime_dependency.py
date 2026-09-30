@@ -115,6 +115,7 @@ def test_fork_modules_import_only_stdlib():
         "collections",
         "dataclasses",
         "enum",
+        "math",
         "types",
         "typing",
     }
