@@ -20,6 +20,44 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-02 (Smart Mix V1 — numpy-safe structure projection)
+
+**Smart Mix could not run at all.** The runtime acceptance render aborted after Stage 5, before
+Stage 6, with `ValueError: The truth value of an array with more than one element is ambiguous.`
+
+- **Root cause.** `smart_mix.project_structure` defaulted four `beat_info` fields with the
+  `value or ()` idiom. At real runtime `times`, `rhythm_data["impact_strength"]`,
+  `["is_bar_anchor"]` and `["is_phrase_anchor"]` are all numpy `ndarray` — 566 elements on the
+  calibration track — and `bool(ndarray)` raises for any length above one. The exception escaped
+  the `SmartMixStructureError` handler and aborted the whole render, so no video was produced
+  either.
+- **Why every test passed.** Every fixture in the suite, and the shipped `nero_structure.json`,
+  feed lists and tuples, whose truth value is perfectly well defined. The projection boundary is
+  the one place real arrays arrive, and nothing crossed it with them.
+- **The fix is the boundary only.** `_missing_as_empty` makes "missing means empty" explicit —
+  `None` becomes `()`, **anything else is returned untouched** — and the values are then consumed
+  by iteration and `len` alone. No numpy import: `beatsync_fork` stays stdlib-only, which is what
+  keeps the planner testable on a bare interpreter. It is not numpy-aware either, so any container
+  whose `__bool__` is ambiguous or forbidden now passes through. Empty and `None` still produce the
+  same clear `no usable beat times` / `misaligned` errors as before.
+- **The regression needs no numpy.** A stdlib `AmbiguousArray` iterates normally but raises on any
+  boolean coercion, exactly like `ndarray`. It covers each of the four fields **independently** —
+  the original failure hit `times` first and would have masked the other three — plus all four at
+  once, and the full 566-beat calibration fixture projected through ambiguous arrays with the
+  frozen ladder re-verified from it. A structural guard forbids those four keys appearing inside
+  any `BoolOp`, `bool(...)` or `not` within `project_structure`, narrowly rather than banning `or`
+  across the module. Verified load-bearing: reverting the production change fails 12 of them,
+  including all four per-field cases.
+- **Confirmed against the real runtime**: `project_structure` now accepts the live ndarray
+  `beat_info` (566 beats, 13 sections), and the accepted ladder reproduces exactly from that live
+  structure — 25 → 15, **50 → 19** (3 riser / 5 impact / 6 transition / 3 vocal_shot /
+  2 atmosphere), 75 → 24, 100 → 25, zero non-atmosphere overlaps, risers ending on
+  53.267 / 88.143 / 204.266, and the 87.655 collision skip intact.
+- Nothing else changed: the planner, percentile, Amount mapping, aliases, priority, occupancy,
+  asset cursor, R1 library diagnostics, the single report formatter, the FFmpeg graph, D's voice
+  behaviour and the Stage-5 constants are all untouched. `python -m pytest`: **3337 passed,
+  2 skipped** (up from 3322).
+
 ### Fixed — 2026-10-02 (Smart Mix V1 — R1 correction)
 
 One narrow reporting defect before merge. The accepted architecture is unchanged: the Amount

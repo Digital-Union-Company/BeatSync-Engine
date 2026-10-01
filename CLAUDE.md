@@ -1450,6 +1450,22 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
 - **The asset cursor advances on every candidate ATTEMPT, not every success.** Candidate `k` takes
   `pool[k % N]` whether or not it lands. Without that, one asset too long to fit would be retried at
   every later anchor and permanently block the rest of its pool.
+- **The four `beat_info` structure fields are numpy arrays and must NEVER be truth-tested.**
+  `times`, `rhythm_data["impact_strength"]`, `["is_bar_anchor"]` and `["is_phrase_anchor"]` arrive
+  as `ndarray` (566 long on the calibration track), and `bool(ndarray)` raises
+  `ValueError: The truth value of an array with more than one element is ambiguous` above length 1.
+  `project_structure` originally defaulted all four with `value or ()`, which **crashed every
+  active Smart Mix render after Stage 5** — and the entire suite passed anyway, because every
+  fixture fed lists and tuples, whose truth value is well defined. Missing-means-empty is now
+  expressed by `_missing_as_empty` (`None` → `()`, *anything else returned untouched*), and the
+  values are then consumed only by iteration and `len`. **Do not reintroduce `x or ()`, `if x` or
+  `bool(x)` on these four**, and do not "fix" a future variant by importing numpy and calling
+  `.size` — `beatsync_fork` is stdlib-only, which is exactly what makes the planner testable on a
+  bare interpreter. Zero-length and `None` both still reach the existing "no usable beat times" /
+  "misaligned" errors unchanged. The regression uses a stdlib `AmbiguousArray` whose `__bool__`
+  raises like `ndarray`'s, covers each field **independently** (the original failure hit `times`
+  first and would have masked the other three), and is backed by a structural guard that forbids
+  these four keys inside any `BoolOp`, `bool(...)` or `not` in `project_structure`.
 - **The impact percentile population is the WHOLE aligned beat array**; the bar-anchor mask is
   applied *after* the threshold. That is what the accepted calibration measured — restricting the
   population first silently shifts every threshold. The stdlib implementation reproduces
