@@ -122,6 +122,10 @@ from beatsync_fork import variation as fork_variation
 # control mappings and every neutrality decision live in src/beatsync_fork/creative.py; this module
 # only collapses the four widgets into one profile at the render boundary.
 from beatsync_fork import creative as fork_creative
+# [FORK] Digital-Union (Creative Controls Extra PR3): the named preset recipes. The table and the
+# three total helpers live in src/beatsync_fork/presets.py (stdlib-only, Gradio-free); this module
+# only wires them to the selector. Nothing below the widget layer ever learns a preset name.
+from beatsync_fork import presets as fork_presets
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -856,6 +860,53 @@ def _on_confirm_click(state) -> Tuple:
     return _source_ui_updates(confirm_action(state))
 
 
+# [FORK] Digital-Union (Creative Controls Extra PR3): the two preset handlers.
+#
+# They are the entire feature. Both are pure, both touch only Creative Direction widgets, and
+# neither knows that a render, a source set or a pipeline exists — a preset is a name for six
+# numbers, and these two functions are the only place that name is ever resolved.
+#
+# The pair forms an acyclic event graph because both are registered on `.input()`, which Gradio
+# fires only for a *user* change (`.change()` fires for programmatic updates too). So writing the
+# sliders from a preset cannot re-trigger the slider handler, and writing the selector from a
+# slider cannot re-trigger the preset handler. Nothing here needs a re-entrancy guard, and a
+# `.change()` registration on any of these seven widgets would reintroduce the cycle.
+
+
+def _on_preset_input(preset_name: str) -> Tuple:
+    """Write one named recipe into the six creative sliders, in `CREATIVE_CONTROL_FIELDS` order.
+
+    `Custom` is not a recipe — it is the selector's way of reporting that the live values match no
+    named one — so selecting it resolves to `None` and returns `gr.skip()` for every slider rather
+    than writing anything. The same branch covers an unknown or malformed selector value, so this
+    cannot raise mid-interaction.
+
+    The Variation Seed is deliberately not an output: it is independent creative state with its own
+    randomiser, and no preset may move it.
+    """
+    values = fork_presets.preset_values(preset_name)
+    if values is None:
+        return tuple(gr.skip() for _ in fork_presets.CREATIVE_CONTROL_FIELDS)
+    return values
+
+
+def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
+                               energy_response, motion_bias, source_diversity) -> str:
+    """Recompute the selector label from the six live slider values.
+
+    Registered from every one of the six sliders, and it reads *all* of them rather than being told
+    which one moved: the label is a statement about the whole six-value tuple, so it is derived from
+    the whole tuple. That is what lets a manual edit back onto a recipe correctly read that recipe's
+    name again instead of being stuck on `Custom`, and it is why there is no remembered
+    "last selected preset" anywhere in this module.
+
+    Parameter order mirrors `fork_presets.CREATIVE_CONTROL_FIELDS`, because Gradio passes `inputs`
+    positionally.
+    """
+    return fork_presets.matching_preset((cut_density, micro_cuts, semantic_emphasis,
+                                         energy_response, motion_bias, source_diversity))
+
+
 def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
@@ -1344,6 +1395,19 @@ def create_ui() -> gr.Blocks:
                         elem_id='variation-seed-input',
                     )
                     randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+                    # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
+                    # directly above the six sliders it writes, and below the seed — the layout is
+                    # the first statement that a preset moves those six and nothing else. It is NOT
+                    # a `process_btn` input: the sliders already are, and they stay the only thing
+                    # the render request carries. `Custom` is the last choice because it is a state
+                    # the selector reports, not a recipe a user picks.
+                    creative_preset = gr.Radio(
+                        choices=list(fork_presets.PRESET_NAMES),
+                        value=fork_presets.BALANCED_PRESET,
+                        label=LABEL_CREATIVE_PRESET,
+                        info=INFO_CREATIVE_PRESET,
+                        elem_id='creative-preset-radio',
+                    )
                     # Randomize stays seed-only on purpose; these three have no randomizer and no
                     # reset. 50 is current BeatSync behaviour in every one of them, and the default
                     # is the fork module's constant rather than a literal repeated here.
@@ -1517,6 +1581,65 @@ def create_ui() -> gr.Blocks:
             fn=fork_variation.random_seed,
             inputs=[],
             outputs=[variation_seed],
+        )
+
+        # [FORK] Digital-Union (Creative Controls Extra PR3): preset wiring, and the whole of it.
+        #
+        # The list is in `fork_presets.CREATIVE_CONTROL_FIELDS` order, not in widget-declaration
+        # order, because Gradio matches `inputs`/`outputs` positionally against the handlers — so
+        # this ordering and the field tuple are one contract, asserted by the seam tests.
+        #
+        # Note what is absent from both directions: `source_outputs`, `prep_outputs`,
+        # `variation_seed` and `process_btn`. A preset moves these six sliders and the label above
+        # them; it cannot clear a confirmation, disable Create Music Video, start a scan or touch
+        # the seed.
+        creative_control_sliders = [
+            cut_density, micro_cuts, semantic_emphasis,
+            energy_response, motion_bias, source_diversity,
+        ]
+
+        # Preset -> sliders. `.input()` rather than `.change()`: the slider handlers below write
+        # this selector programmatically, and only `.change()` would fire for that, which is what
+        # would turn these two registrations into an event loop.
+        creative_preset.input(
+            fn=_on_preset_input,
+            inputs=[creative_preset],
+            outputs=creative_control_sliders,
+        )
+
+        # Sliders -> preset. Registered explicitly per widget rather than in a loop or through
+        # `gr.on`, so each binding is visible where the widget is: the seam tests assert, per
+        # slider, that its one and only handler writes nothing but `creative_preset`. Every one
+        # reads all six values, because the label describes the whole tuple.
+        cut_density.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
+        )
+        micro_cuts.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
+        )
+        semantic_emphasis.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
+        )
+        energy_response.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
+        )
+        motion_bias.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
+        )
+        source_diversity.input(
+            fn=_on_creative_control_input,
+            inputs=creative_control_sliders,
+            outputs=[creative_preset],
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.

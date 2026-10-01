@@ -654,8 +654,15 @@ def test_semantic_emphasis_adds_no_filename_suffix():
 
 
 def test_no_preset_or_director_field_was_added():
-    """Presets and the director modes remain out of scope; a dormant field would be placeholder
-    state. (PR1's equivalent guard covered `semantic_emphasis`, which PR2 now implements.)"""
+    """A dormant field would be placeholder state. (PR1's equivalent guard covered
+    `semantic_emphasis`, which PR2 now implements.)
+
+    Creative Controls Extra PR3 implemented presets as a **UI layer only**, so this guard is not
+    retired — it became the load-bearing proof of that boundary. A preset is a name for six slider
+    values; the name never reaches the profile, so there is still no `preset` field, and a bus
+    carrying one is still ignored rather than half-honoured. The director modes remain out of scope
+    entirely.
+    """
     profile = creative.CreativeProfile()
     for field in ("preset", "director", "freestyle", "master_seed", "recipe"):
         assert not hasattr(profile, field), field

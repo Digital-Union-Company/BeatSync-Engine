@@ -407,6 +407,20 @@ INFO_MICRO_CUTS = (
 )
 
 # ============================================================================
+# [FORK] Digital-Union: creative presets (Creative Controls Extra PR3)
+# See src/beatsync_fork/presets.py for the four recipes this label describes. A preset is only a
+# named set of values for the six sliders below — the sliders stay the one thing that is rendered.
+# ============================================================================
+
+LABEL_CREATIVE_PRESET = "🎛️ Creative Preset"
+INFO_CREATIVE_PRESET = (
+    "A starting point for the six controls below. Picking one just moves those sliders — you can "
+    "still adjust any of them afterwards, and the selector then reads Custom. Balanced is current "
+    "BeatSync behaviour and is also the way back to it. The Variation Seed is never changed by a "
+    "preset, and no preset re-analyses your videos."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels
 # See src/beatsync_fork/input_session.py for the behaviour these labels describe.
 # ============================================================================
