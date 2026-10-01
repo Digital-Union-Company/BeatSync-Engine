@@ -468,11 +468,41 @@ def test_the_controls_live_in_the_creative_direction_group():
         assert heading < position < following, f"{widget} is outside the Creative Direction group"
 
 
+#: Everything a creative control's handler must never write. These are the widgets that make up the
+#: Create Music Video gate and the Media Library Preparation panel; writing any of them is how a
+#: creative control would clear a confirmation, disable the render button or disturb preparation.
+_GATE_AND_PREP_OUTPUTS = ("source_outputs", "source_report", "confirm_btn", "confirm_status",
+                          "process_btn", "source_state",
+                          "prep_outputs", "prep_report", "prep_status", "prep_analyze_btn",
+                          "prep_state")
+
+
 @pytest.mark.parametrize("widget", _NEW_CONTROLS)
 def test_no_control_registers_a_source_invalidating_handler(widget):
     """Every source handler writes `source_outputs`, which disables Create Music Video. A creative
-    control with any handler of its own is one refactor away from clearing a confirmation."""
-    assert _registration(_gui_tree(), widget) == [], f"{widget} registered an event handler"
+    control whose handler could reach that list is one refactor away from clearing a confirmation.
+
+    **Amended by Creative Controls Extra PR3.** Until presets, the controls registered no handler at
+    all and this asserted exactly that. They now each register one — the preset-label sync — so the
+    assertion moved to the stronger property the original was protecting: a control may have exactly
+    one handler, it must be `.input()` (user-only, so the preset -> slider write cannot re-trigger
+    it), and its only output is the preset selector. `.change()` is specifically rejected because
+    that is the event an event loop would be built on.
+    """
+    calls = _registration(_gui_tree(), widget)
+    assert len(calls) == 1, f"{widget} registers {len(calls)} handlers, expected exactly 1"
+
+    call = calls[0]
+    assert call.func.attr == "input", f"{widget} uses .{call.func.attr}() for preset sync"
+
+    kwargs = _kwargs(call)
+    assert ast.unparse(kwargs["fn"]) == "_on_creative_control_input"
+    assert _names(kwargs["outputs"]) == ["creative_preset"], (
+        f"{widget}'s handler writes {_names(kwargs['outputs'])}")
+    for forbidden in _GATE_AND_PREP_OUTPUTS:
+        assert forbidden not in _names(kwargs["outputs"]), f"{widget}'s handler writes {forbidden}"
+    # it reads the whole six-value tuple, so the label describes all of them rather than one
+    assert _names(kwargs["inputs"]) == ["creative_control_sliders"]
 
 
 @pytest.mark.parametrize("button", ["source_mode", "source_folder", "source_recursive",
@@ -492,16 +522,27 @@ def test_no_source_handler_reads_any_creative_control(button):
 
 
 @pytest.mark.parametrize("widget", _NEW_CONTROLS)
-def test_no_control_is_written_by_any_handler_output(widget):
-    """Nothing may write these boxes: Randomize is seed-only, and there is deliberately no reset."""
+def test_only_the_preset_selector_writes_a_creative_control(widget):
+    """Randomize is still seed-only and there is still no reset button.
+
+    **Amended by Creative Controls Extra PR3.** This asserted that *nothing* wrote these sliders.
+    The preset selector now does — that is the feature — so the assertion became an allow-list of
+    exactly one writer. Everything else is still forbidden, including any handler that would write a
+    slider as a side effect of a source, preparation or render event.
+    """
     tree = _gui_tree()
+    writers = []
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"click", "change", "input", "submit", "release"}):
             outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is not None:
-                assert widget not in _names(outputs), (
-                    f"{ast.unparse(node.func)} writes {widget}")
+            if outputs is None:
+                continue
+            names = _names(outputs)
+            if widget in names or "creative_control_sliders" in names:
+                writers.append(ast.unparse(node.func))
+
+    assert writers == ["creative_preset.input"], f"{widget} is written by {writers}"
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():
@@ -592,7 +633,12 @@ def test_the_gate_itself_is_unchanged():
 
 
 def test_no_preset_randomizer_or_freestyle_control_was_added():
-    """Explicitly out of scope for this PR."""
+    """Explicitly out of scope.
+
+    Creative Controls Extra PR3 added a preset *selector* (`creative_preset`, a `gr.Radio`), which
+    none of these tokens describes. What stays out of scope is a preset button, a randomiser or a
+    reset for the six controls, and every Freestyle / Director / Variant Lab mode.
+    """
     source = open(_GUI, encoding="utf-8").read().lower()
     for word in ("preset_btn", "freestyle", "director", "variant_lab", "creative_recipe",
                  "randomize_controls", "reset_creative"):

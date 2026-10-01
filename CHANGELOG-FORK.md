@@ -20,6 +20,82 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-01 (Creative Controls Extra PR3: Creative Presets)
+
+Four named recipes for the six 0–100 creative sliders, plus a `Custom` read-out. A **UI convenience
+layer only**: no new planner behaviour, no new `CreativeProfile` field, no Stage-4/5/6 change, no
+cache identity, no persistence.
+
+| Preset | Cut Density | Micro Cuts | Semantic Emphasis | Energy Response | Motion Bias | Source Diversity |
+|---|---|---|---|---|---|---|
+| Balanced | 50 | 50 | 50 | 50 | 50 | 50 |
+| Cinematic | 30 | 25 | **65** | 40 | 30 | 50 |
+| Dynamic | 65 | 60 | 50 | 70 | 70 | 75 |
+| High Energy | 100 | 85 | 50 | 85 | 80 | 80 |
+
+- **The sliders remain the sole execution truth.** Selecting a preset writes those six values and
+  then the name stops existing: it never reaches `CreativeProfile`, `beat_info["creative"]`,
+  `process_video_guarded`, any stage, `render_info` or the filename, and the selector is deliberately
+  **not** a `process_btn` input. The planner has no idea presets exist. A render is therefore still
+  fully described — and still reproducible — by the six integers the user ended up with, which is
+  also why the name is not persisted: if a recipe is ever retuned, an old render reproduces from *its
+  recorded values* rather than from a historical label.
+- **`Custom` is a state, not a recipe.** It means only "the six live values match no named recipe",
+  so it has no entry in the table and selecting it writes nothing (`gr.skip()` per slider).
+- **The selector is an honest read-out of the sliders, never remembered state.** Moving any slider
+  recomputes the label from all six values via `matching_preset`, so a manual edit shows `Custom`
+  *and* a manual edit back onto a recipe shows that recipe's name again. There is no "last selected
+  preset" anywhere.
+- **No event recursion, as a property of the event kind.** Both directions register on `.input()`,
+  which Gradio 6.19 fires only for a *user* change (`.change()` also fires for programmatic
+  updates). Writing the sliders from a preset therefore cannot re-trigger the slider handler, and
+  vice versa. A test rejects any `.change()`/`.release()` binding on the seven widgets, because that
+  is what an event loop would be built on.
+- **Balanced is exactly current behaviour**, and resolves through the *existing* profile to `legacy`
+  with no special branch anywhere in the pipeline. It is also the reset.
+- **Seed independence.** The Variation Seed is in no recipe, is not an output of any preset handler,
+  and the preset module has no seed concept at all. Randomize is unchanged (`inputs=[]`,
+  `outputs=[variation_seed]`).
+- **Not a diagonal through every slider.** Cinematic is the only preset that moves Semantic
+  Emphasis — the only name that genuinely implies contextual reading — and the only one that leaves
+  Source Diversity neutral, because at ~20 % fewer cuts the source-reuse pressure is already lower.
+  Dynamic and High Energy leave Semantic Emphasis neutral: Stage 5 motion-gates semantic action, so
+  on the action material a dense edit selects, moving it would be near-inert. High Energy is **not**
+  "all sliders at 100" — exactly one control is at its limit.
+- **Why High Energy's Cut Density is 100.** Cut Density has a pre-existing non-monotonic region
+  around 72–82 on real material, so an intermediate value measured barely faster than Dynamic
+  (density 90 → ~1.548 s average interval, only ~6 % shorter than Dynamic's ~1.650 s). 100 gives
+  ~1.377 s, ~17 % shorter, which is what makes the strongest named pacing recipe actually distinct.
+  Consuming that control's headroom is the accepted cost. **Cut Density itself was not modified.**
+- **New stdlib-only `beatsync_fork/presets.py`**: an immutable table (`MappingProxyType` at both
+  levels) and three total helpers. It imports no Gradio, no numpy, no planner, no filesystem — and
+  deliberately not `creative.py` either: recipe values are plain literal integers, and the tests
+  prove `normalize_control` returns each one **unchanged** rather than the module coercing them, so
+  a typo is a test failure instead of a silently clamped slider.
+- **`matching_preset` is total.** `None`, a string, a mapping, a wrong-length sequence, a `bool`
+  element, a non-numeric element, `NaN`/`inf`, or an object whose `__iter__` raises — all answer
+  `Custom`. It runs on live widget values during a UI interaction, so it may never raise. Floats are
+  accepted because a Gradio slider reports `50.0`; `bool` is rejected first because it subclasses
+  `int`. Preset names are matched **exactly and case-sensitively** (`"cinematic"` → `None`), so the
+  displayed value and the applied recipe can never be two separately-decided things.
+- **No CLI preset flag.** The CLI already exposes all six controls (`--cut-density`, `--micro-cuts`,
+  `--semantic-emphasis`, `--energy-response`, `--motion-bias`, `--source-diversity`), and six
+  explicit numbers are the reproducible contract. A `--preset` alias would add precedence ambiguity
+  (`--preset X --motion-bias 70`) and recipe-name versioning ambiguity for no gain.
+- **Source gate and preparation untouched.** `creative_preset` is absent from `source_outputs`,
+  `prep_outputs`, every source and preparation handler, `live_declaration` and the render request, so
+  preset interaction cannot clear a confirmation, disable Create Music Video, start a scan or disturb
+  Media Library Preparation.
+- **Nothing in the pipeline changed.** `src/auto_mode/*`, `src/video_analysis.py`,
+  `src/video_processor.py`, `src/beatsync_fork/creative.py`, `variation.py`, `deterministic_view.py`
+  and `library_prep.py` are byte-identical to main; `CACHE_CONTRACT_VERSION` stays
+  `stage5_cache_v3` and `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`.
+- **Two existing seam tests were amended, not weakened.** They previously asserted that a creative
+  slider registers *no* handler and that *nothing* writes one. Each slider now registers exactly one
+  — the preset-label sync — so the assertions moved to the stronger properties the originals were
+  protecting: a control may have exactly one handler, it must be `.input()`, its only output is
+  `creative_preset`, and the only widget permitted to write a slider is `creative_preset.input`.
+
 ### Added — 2026-10-01 (Creative Controls Extra PR2: Semantic Emphasis)
 
 A seventh creative control: how strongly Stage 6 weights the persisted media-neutral semantic reading
