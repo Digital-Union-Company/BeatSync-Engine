@@ -126,6 +126,14 @@ from beatsync_fork import creative as fork_creative
 # three total helpers live in src/beatsync_fork/presets.py (stdlib-only, Gradio-free); this module
 # only wires them to the selector. Nothing below the widget layer ever learns a preset name.
 from beatsync_fork import presets as fork_presets
+# [FORK] Digital-Union (Variant Lab V1 / C2): the reproducible recipe generator. The named RNG
+# sub-streams, the spread formula and every normalisation live in src/beatsync_fork/variant_lab.py,
+# and the resolved seven-integer recipe it returns is src/beatsync_fork/creative_recipe.py (both
+# stdlib-only, Gradio-free). This module only wires them to widgets: a resolved recipe is written
+# into the existing Variation Seed and six sliders, and nothing downstream of them learns that
+# Variant Lab exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
+# handles the resolution object, so it has no reason to name the recipe type.
+from beatsync_fork import variant_lab as fork_lab
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -907,6 +915,134 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
                                          energy_response, motion_bias, source_diversity))
 
 
+# [FORK] Digital-Union (Variant Lab V1 / C2): the two Variant Lab handlers.
+#
+# Both read the six LIVE slider values as inputs — there is no cached base profile anywhere, so a
+# preset change or a manual edit is picked up by the next Generate automatically. Neither handler
+# registers anything on a slider: the existing preset `.input()` graph is untouched, and these run
+# only on their own button clicks.
+#
+# What they write is deliberately the whole story: the master seed (so a freshly minted one is
+# always visible), the existing Variation Seed, the six sliders, the preset label and the report.
+# No source widget, no preparation widget, no `process_btn` — generating a variant cannot clear a
+# confirmation or start a render.
+
+
+#: Display label for each creative control inside the Variant Lab checkbox group. An explicit
+#: mapping, never derived from the field name by lowercasing or replacing underscores: the resolver
+#: keys on exact field names, so a heuristic here would be a silent correctness hazard. The choice
+#: list is ordered by `CREATIVE_CONTROL_FIELDS`, so it cannot drift from the resolver's order.
+_VARIANT_CONTROL_LABELS = {
+    'cut_density': LABEL_CUT_DENSITY,
+    'micro_cuts': LABEL_MICRO_CUTS,
+    'semantic_emphasis': LABEL_SEMANTIC_EMPHASIS,
+    'energy_response': LABEL_ENERGY_RESPONSE,
+    'motion_bias': LABEL_MOTION_BIAS,
+    'source_diversity': LABEL_SOURCE_DIVERSITY,
+}
+_VARIANT_RANDOMIZE_CHOICES = [
+    (_VARIANT_CONTROL_LABELS[field], field)
+    for field in fork_presets.CREATIVE_CONTROL_FIELDS
+]
+
+
+def _variant_apply_outputs(master_seed: int, resolution) -> Tuple:
+    """Project one resolution onto the widgets Variant Lab is allowed to write.
+
+    Ordered to match the `outputs` list: master seed, Variation Seed, the six sliders in
+    `CREATIVE_CONTROL_FIELDS` order, the preset label, the report. The preset label is computed
+    explicitly because programmatic slider writes do not fire the sliders' `.input()` handlers —
+    without it the label would keep claiming whatever preset the base came from.
+    """
+    recipe = resolution.recipe
+    values = tuple(getattr(recipe, field)
+                   for field in fork_presets.CREATIVE_CONTROL_FIELDS)
+    return (master_seed, recipe.seed) + values + (
+        fork_presets.matching_preset(values),
+        resolution.describe(),
+    )
+
+
+def _on_generate_variant(variant_master_seed, variation_spread, variant_randomize,
+                         range_cut_density_min, range_cut_density_max,
+                         range_micro_cuts_min, range_micro_cuts_max,
+                         range_semantic_emphasis_min, range_semantic_emphasis_max,
+                         range_energy_response_min, range_energy_response_max,
+                         range_motion_bias_min, range_motion_bias_max,
+                         range_source_diversity_min, range_source_diversity_max,
+                         cut_density, micro_cuts, semantic_emphasis,
+                         energy_response, motion_bias, source_diversity) -> Tuple:
+    """Resolve and apply exactly one recipe from the live base and the lab configuration.
+
+    An unusable master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh
+    positive one **which is returned as the first output**, so it is on screen before it is used.
+    That is the whole rule about hidden randomness: `fork_variation.random_seed()` is the only
+    non-deterministic call here, it happens in the GUI rather than in the pure resolver, and its
+    result is always surfaced. Everything after it is a pure function of visible values.
+
+    Parameter names and order mirror the `inputs` list, because Gradio passes them positionally.
+    """
+    master_seed = fork_lab.normalize_master_seed(variant_master_seed)
+    if master_seed <= 0:
+        master_seed = fork_variation.random_seed()
+
+    config = fork_lab.VariantLabConfig(
+        master_seed=master_seed,
+        spread=variation_spread,
+        randomized=variant_randomize,
+        ranges={
+            'cut_density': (range_cut_density_min, range_cut_density_max),
+            'micro_cuts': (range_micro_cuts_min, range_micro_cuts_max),
+            'semantic_emphasis': (range_semantic_emphasis_min, range_semantic_emphasis_max),
+            'energy_response': (range_energy_response_min, range_energy_response_max),
+            'motion_bias': (range_motion_bias_min, range_motion_bias_max),
+            'source_diversity': (range_source_diversity_min, range_source_diversity_max),
+        },
+    )
+    base = {
+        'cut_density': cut_density,
+        'micro_cuts': micro_cuts,
+        'semantic_emphasis': semantic_emphasis,
+        'energy_response': energy_response,
+        'motion_bias': motion_bias,
+        'source_diversity': source_diversity,
+    }
+    return _variant_apply_outputs(master_seed, fork_lab.resolve(config, base))
+
+
+def _fresh_variant_master_seed(previous) -> int:
+    """A positive master seed that is **guaranteed** to differ from the usable previous one.
+
+    `random_seed()` draws from 1..999999, so it can legitimately return the value already in the
+    box. "New Variant always mints a new master" is a product contract, and leaving it to a
+    one-in-a-million draw makes it a probability rather than a guarantee — including in tests, which
+    would then carry a rare random failure.
+
+    So: draw once, and on a collision step deterministically to an adjacent seed. One draw, no
+    retry loop — waiting on `SystemRandom` to disagree is exactly the unbounded behaviour this
+    avoids. The step is expressed in terms of the drawn candidate rather than a repeated range
+    literal, so it stays inside `random_seed()`'s own 1..999999 range by construction whatever that
+    range later becomes. Randomness stays here in the GUI; the pure resolver never draws.
+    """
+    previous_master = fork_lab.normalize_master_seed(previous)
+    candidate = fork_variation.random_seed()
+    if previous_master > 0 and candidate == previous_master:
+        # Both branches stay in range: the draw is >= 1, so stepping down is safe unless it is
+        # exactly the low bound, in which case stepping up is.
+        return candidate - 1 if candidate > 1 else candidate + 1
+    return candidate
+
+
+def _on_new_variant(variant_master_seed, *lab_and_base) -> Tuple:
+    """Always mint a fresh visible master seed, then take the ordinary Generate path.
+
+    The incoming master seed is deliberately discarded — that is what "new" means — but it is still
+    read, because "new" also has to mean *different*. Everything after that is delegated, so there
+    is exactly one resolver call site and no second implementation that could drift from it.
+    """
+    return _on_generate_variant(_fresh_variant_master_seed(variant_master_seed), *lab_and_base)
+
+
 def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
@@ -1472,6 +1608,80 @@ def create_ui() -> gr.Blocks:
                         elem_id='semantic-emphasis-slider',
                     )
 
+                    # [FORK] Digital-Union (Variant Lab V1 / C2): collapsed by default and placed
+                    # below the six sliders it generates values for — the layout says what the lab
+                    # does. Every widget in here is lab configuration read at click time only: none
+                    # registers a handler, none is a `process_btn` input, and none appears in
+                    # `source_outputs` or `prep_outputs`.
+                    with gr.Accordion(label=LABEL_VARIANT_LAB, open=False):
+                        gr.Markdown(INFO_VARIANT_LAB)
+                        variant_master_seed = gr.Number(
+                            label=LABEL_MASTER_SEED,
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                            info=INFO_MASTER_SEED,
+                            elem_id='variant-master-seed-input',
+                        )
+                        variation_spread = gr.Slider(
+                            minimum=fork_lab.SPREAD_MIN,
+                            maximum=fork_lab.SPREAD_MAX,
+                            step=1,
+                            value=fork_lab.DEFAULT_VARIATION_SPREAD,
+                            label=LABEL_VARIATION_SPREAD,
+                            info=INFO_VARIATION_SPREAD,
+                            elem_id='variation-spread-slider',
+                        )
+                        # One CheckboxGroup rather than six Checkboxes: it is the question the
+                        # feature asks, and Gradio 6.19 supports `(label, value)` choices, so the
+                        # displayed text stays human while the returned value is the exact field
+                        # name the resolver keys on. Default: all six.
+                        variant_randomize = gr.CheckboxGroup(
+                            choices=_VARIANT_RANDOMIZE_CHOICES,
+                            value=list(fork_presets.CREATIVE_CONTROL_FIELDS),
+                            label=LABEL_VARIANT_RANDOMIZE,
+                            info=INFO_VARIANT_RANDOMIZE,
+                            elem_id='variant-randomize-group',
+                        )
+                        gr.Markdown(INFO_VARIANT_RANGES)
+                        # `gr.RangeSlider` does not exist in Gradio 6.19.0 (verified against the
+                        # installed package), and a custom JS control is out of scope, so each
+                        # control gets an explicit min/max pair. Declared one widget at a time, like
+                        # every other control in this file, so the seam tests can read each one.
+                        with gr.Row():
+                            range_cut_density_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_CUT_DENSITY} min', elem_id='variant-range-cut-density-min')
+                            range_cut_density_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_CUT_DENSITY} max', elem_id='variant-range-cut-density-max')
+                        with gr.Row():
+                            range_micro_cuts_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MICRO_CUTS} min', elem_id='variant-range-micro-cuts-min')
+                            range_micro_cuts_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MICRO_CUTS} max', elem_id='variant-range-micro-cuts-max')
+                        with gr.Row():
+                            range_semantic_emphasis_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SEMANTIC_EMPHASIS} min', elem_id='variant-range-semantic-emphasis-min')
+                            range_semantic_emphasis_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SEMANTIC_EMPHASIS} max', elem_id='variant-range-semantic-emphasis-max')
+                        with gr.Row():
+                            range_energy_response_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_ENERGY_RESPONSE} min', elem_id='variant-range-energy-response-min')
+                            range_energy_response_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_ENERGY_RESPONSE} max', elem_id='variant-range-energy-response-max')
+                        with gr.Row():
+                            range_motion_bias_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MOTION_BIAS} min', elem_id='variant-range-motion-bias-min')
+                            range_motion_bias_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MOTION_BIAS} max', elem_id='variant-range-motion-bias-max')
+                        with gr.Row():
+                            range_source_diversity_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SOURCE_DIVERSITY} min', elem_id='variant-range-source-diversity-min')
+                            range_source_diversity_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SOURCE_DIVERSITY} max', elem_id='variant-range-source-diversity-max')
+                        with gr.Row():
+                            generate_variant_btn = gr.Button(LABEL_GENERATE_VARIANT, variant='secondary', elem_id='generate-variant-button')
+                            new_variant_btn = gr.Button(LABEL_NEW_VARIANT, elem_id='new-variant-button')
+                        # "Last generated", never "Current": the user may edit the seed or any
+                        # slider afterwards, and a read-out claiming to describe the render would
+                        # then be lying. The seed and sliders above stay the execution truth.
+                        variant_report = gr.Textbox(
+                            label=LABEL_VARIANT_REPORT,
+                            value='',
+                            placeholder=PLACEHOLDER_VARIANT_REPORT,
+                            lines=5,
+                            max_lines=5,
+                            interactive=False,
+                            elem_id='variant-report-box',
+                        )
+
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
                     if NVENC_AVAILABLE:
@@ -1640,6 +1850,43 @@ def create_ui() -> gr.Blocks:
             fn=_on_creative_control_input,
             inputs=creative_control_sliders,
             outputs=[creative_preset],
+        )
+
+        # [FORK] Digital-Union (Variant Lab V1 / C2): the lab's entire wiring — two button clicks.
+        #
+        # The lab's own config widgets register NOTHING: a master seed, a spread, a checkbox group
+        # and twelve range boxes are read at click time, so the preset event graph above stays
+        # exactly as PR3 left it and no creative slider gains a second handler.
+        #
+        # `inputs` is config first, then the six LIVE slider values, matching both handlers'
+        # parameter order (Gradio passes positionally). The base is read here and nowhere else,
+        # which is what makes "the current sliders are the base" true rather than aspirational.
+        variant_lab_inputs = [
+            variant_master_seed, variation_spread, variant_randomize,
+            range_cut_density_min, range_cut_density_max,
+            range_micro_cuts_min, range_micro_cuts_max,
+            range_semantic_emphasis_min, range_semantic_emphasis_max,
+            range_energy_response_min, range_energy_response_max,
+            range_motion_bias_min, range_motion_bias_max,
+            range_source_diversity_min, range_source_diversity_max,
+        ] + creative_control_sliders
+
+        # Note what is absent from `outputs`: `source_outputs`, `prep_outputs`, `process_btn` and
+        # every render setting. A variant moves the master seed, the Variation Seed, the six
+        # sliders, the preset label and the report — and starts nothing.
+        variant_lab_outputs = [
+            variant_master_seed, variation_seed,
+        ] + creative_control_sliders + [creative_preset, variant_report]
+
+        generate_variant_btn.click(
+            fn=_on_generate_variant,
+            inputs=variant_lab_inputs,
+            outputs=variant_lab_outputs,
+        )
+        new_variant_btn.click(
+            fn=_on_new_variant,
+            inputs=variant_lab_inputs,
+            outputs=variant_lab_outputs,
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.

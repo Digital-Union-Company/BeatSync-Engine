@@ -20,6 +20,126 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-01 (Variant Lab V1 — R1 correction)
+
+Two narrow corrections to the Variant Lab PR before merge. The accepted core — `CreativeRecipe`,
+named RNG sub-streams, golden vectors, the spread formula, range normalisation, the algorithm
+version and the isolation guarantees — is unchanged, and **every golden vector is untouched**.
+
+- **R1-A — the Master Seed help text was false.** It said "type a master seed you used before and
+  Generate to get that exact recipe back", which is not true on its own: the base is the live
+  sliders and Generate *writes the recipe back into them*, so an immediate second Generate resolves
+  from the first recipe rather than the original preset. The resolver was always correct; only the
+  wording over-promised. `INFO_MASTER_SEED` and `INFO_VARIANT_LAB` now state the real contract —
+  a master repeats a draw only with the same starting values, ranges, ticked controls and spread,
+  and the exact render settings are the Variation Seed plus the six sliders. **No cached base
+  snapshot was added to hide the behaviour**: hidden state that disagrees with the visible sliders
+  would be worse than the honest explanation. Pinned with exact values — Cinematic + master 582913
+  + spread 50 → `55/15/60/63/22/62`, immediately again → `71/9/55/77/16/71`, restore Cinematic →
+  `55/15/60/63/22/62`, with the clip seed `822019` throughout — plus a structural test that stops
+  the help text reclaiming master-only reproducibility.
+- **R1-B — `🎲 New Variant` now guarantees a different master.** `random_seed()` draws from
+  1..999999 and can legitimately return the value already in the box, so "always mints a new
+  master" was a probability rather than the product contract. `_fresh_variant_master_seed(previous)`
+  draws once and, on a collision with a usable previous master, steps deterministically to an
+  adjacent seed — one draw, never a retry loop waiting on `SystemRandom` to disagree. Randomness
+  stays in the GUI; the pure resolver is unchanged. The old test relied on the draw simply not
+  colliding; it is replaced by a monkeypatched forced-collision test, because no test here may
+  carry a one-in-a-million failure mode.
+
+### Added — 2026-10-01 (Variant Lab V1 — C2)
+
+The seed is no longer the only exploration axis. Declare which of the six creative controls may
+vary, within what bounds, and how far from your current settings — then generate **one**
+reproducible recipe. It writes the Variation Seed and the six sliders, and nothing else.
+
+- **One recipe at a time, and no render.** Multi-variant generation, batch rendering and variant
+  comparison are C3 and are deliberately absent (a test asserts no such machinery exists). The user
+  still presses Create Music Video.
+- **Execution truth is unchanged.** A resolved recipe is written into the *existing* Variation Seed
+  and six sliders; the pipeline keeps receiving only those seven values. No Variant Lab state
+  reaches `CreativeProfile`, `beat_info["creative"]`, `process_video_guarded`, `render_info`, the
+  filename or any stage — so there is no second planner interpretation path, and the resolved seven
+  integers remain the durable artifact even if the generator is later retuned.
+- **The base is always the live sliders.** No duplicate base controls and no cached snapshot: the
+  six current values are read at click time, so Balanced explores around Balanced and a hand-tuned
+  Custom explores around that. The preset *name* is never read. Ranges are explicit constraints and
+  deliberately do **not** follow the base around; when the base sits outside one, the anchor clamps
+  into it rather than raising.
+- **Named RNG sub-streams — the load-bearing part.** Every control draws from its own stream keyed
+  `"variant_lab|1|<master>|controls|<field>"` (SHA-1, first 12 hex digits, `hashlib` never `hash()`).
+  A single sequential `Random` would have been simpler and is exactly what this must not be: adding
+  one control later would shift every subsequent draw and silently invalidate every master seed a
+  user had written down. Enabling another control, re-ranging another control, reordering the
+  declarations, appending a future control and adding a whole future `audio` domain all leave a
+  control's value — and the clip seed — untouched. Each property has its own test.
+- **Golden vectors are pinned as literals** for the derived integers, clip seeds, per-control draws
+  and whole recipes, and are recomputed independently rather than by calling the helper twice. A
+  change to the namespace, separator, digest, hex slice or version position breaks a test instead of
+  quietly producing different-but-plausible recipes.
+- **Master Creative Seed is generator provenance**, distinct from the Variation Seed it resolves.
+  `🎲 New Variant` always mints a fresh one; `✨ Generate Variant` reuses what is in the box, or
+  mints one if it is unset. Either way the master is **returned as an output**, so it is on screen
+  before it is used — `random_seed()` is the only non-deterministic call and it lives in the GUI,
+  never in the pure resolver, which refuses to resolve without a positive master.
+- **A master seed alone does not identify a recipe.** `MASTER SEED = generator provenance`;
+  `CREATIVE RECIPE = the durable execution artifact`. A master repeats a draw only with the same
+  base, ranges, randomize selection, spread and algorithm version. Since the base is the live
+  sliders and Generate writes the recipe back into them, two Generates with one master
+  intentionally differ — the second resolves from the first recipe. The seven resolved values
+  remain the exact render settings.
+- **Spread 0 is not a legacy render.** It freezes the six controls at their anchors but still
+  resolves a *positive* clip seed, so clip selection still varies. The help text and a test both say
+  so. A recipe can never carry seed 0 — that is the planner's legacy branch, and validation refuses
+  it.
+- **Spread is distance, not height.** `anchor + spread * u * (headroom in that direction)`, with
+  explicit half-up quantisation (never `round()`, whose banker's rounding would collapse 2.5 and 3.5
+  onto even values). The bias contract is stated precisely because the obvious phrasing is false:
+  the anchor is the directional **median** and up/down is approximately a fair coin, but mean
+  displacement is *not* zero when the anchor sits off-centre — base 30 in 0..100 has 70 points of
+  headroom above and 30 below, so it drifts up, and a base on an endpoint can only move inward.
+  Measured at spread 100 over 200 master seeds: 99% of recipes move controls in **mixed** directions
+  and 2 in 200 move all six the same way.
+- **Defaults: Spread 50, all six controls randomized, every range 0..100** — including Source
+  Diversity, which is *not* quietly narrowed. Range-narrowing and spread are measurably redundant
+  (`base ± 25 at spread 50` is numerically identical to `full range at spread 25`), so Spread is the
+  single wildness dial and ranges express a genuine constraint. A test pins each default.
+- **Two new stdlib-only modules.** `creative_recipe.py` is the seven-integer execution contract with
+  **all-or-nothing** validation — one bad field rejects the whole recipe, because a half-applied
+  mixture of a generator's output and silent 50s looks deliberate and is not. That is deliberately
+  the opposite of `CreativeProfile.from_mapping`, which stays lenient because it reads a
+  possibly-stale internal bus; both contracts are asserted side by side. `variant_lab.py` owns the
+  named streams, the spread maths and every normalisation. Neither carries generator metadata into
+  the recipe, so a future AI Director can emit one without inventing a master seed it never had.
+- **No new slider handlers.** The PR3 preset event graph is untouched — one `.input()` per slider —
+  and the lab's own thirteen config widgets register nothing at all; they are read at click time.
+  Because programmatic writes do not fire `.input()`, the generate handler computes
+  `matching_preset(resolved six)` explicitly, so the label never keeps claiming a stale preset. At
+  spread 0 it correctly reads the base preset's own name.
+- **`gr.RangeSlider` does not exist in Gradio 6.19.0** (verified against the installed package), so
+  each control gets an explicit min/max `gr.Number` pair; a custom JS control was out of scope. One
+  `gr.CheckboxGroup` carries the randomize selection, using `(label, value)` choices so the display
+  stays human while the returned value is the exact field name — never derived from the label by a
+  lowercase/replace heuristic.
+- **Isolation.** Variant Lab widgets are absent from `source_outputs`, `prep_outputs`, every source
+  and preparation handler, `live_declaration` and `process_btn.click`; the generate handlers write
+  only the master seed, Variation Seed, six sliders, preset label and report, and start no render.
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `src/auto_mode/*`, `video_analysis.py`,
+  `video_processor.py`, `creative.py`, `presets.py` and `variation.py` are byte-identical to main.
+  **No CLI flag** — the CLI already exposes all seven resolved values, which are the reproducible
+  execution contract.
+- **The report says "Last generated recipe", never "Current".** The user may edit the seed or any
+  slider afterwards; the sliders stay the execution truth and the read-out must not pretend
+  otherwise.
+- **Three existing guards were amended honestly, not evaded.** Two forbade `variant_lab` /
+  `creative_recipe` vocabulary in `gui.py` as speculative — C2 implements them, so they left those
+  lists while `presets.py` keeps the full prohibition (presets stay recipes-only with no generator
+  concept). The third, which allow-listed the preset selector as the only writer of a creative
+  slider, gained the lab's two buttons — and its *detection* was strengthened at the same time to
+  resolve list variables transitively, so wrapping sliders in one more intermediate list can no
+  longer hide a writer from it.
+
 ### Added — 2026-10-01 (Creative Controls Extra PR3: Creative Presets)
 
 Four named recipes for the six 0–100 creative sliders, plus a `Custom` read-out. A **UI convenience

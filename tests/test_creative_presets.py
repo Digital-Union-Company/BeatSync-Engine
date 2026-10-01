@@ -484,15 +484,39 @@ def test_the_preset_module_names_no_pipeline_or_ui_machinery():
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
 
 
-def test_no_speculative_preset_machinery_was_added():
-    """Variant Lab, recipe persistence, Freestyle, an AI Director, source groups and L2 caching are
-    documented future work, not placeholder abstraction here."""
-    for path in (_PRESETS, _GUI):
-        source = _executable_source(path).lower()
-        for word in ("variant_lab", "creative_recipe", "freestyle", "master_seed", "shortlist",
-                     "stage_cache", "source_group", "per_section_profile", "preset_history",
-                     "last_preset", "preset_state"):
-            assert not re.search(rf"\b{re.escape(word)}\b", source), f"{path} mentions {word!r}"
+#: Still speculative everywhere, including the GUI: Freestyle, an AI Director, L2 stage caching,
+#: source groups, per-section profiles, and any remembered preset state.
+_STILL_SPECULATIVE = ("freestyle", "director", "shortlist", "stage_cache", "source_group",
+                      "per_section_profile", "preset_history", "last_preset", "preset_state")
+
+#: Variant Lab's own vocabulary. `presets.py` must still know none of it — a preset stays a named
+#: set of slider values with no generator concept — but `gui.py` legitimately wires the lab up.
+_VARIANT_LAB_VOCABULARY = ("variant_lab", "creative_recipe", "master_seed", "variation_spread")
+
+
+def test_presets_module_knows_nothing_about_generators_or_future_modes():
+    """**Amended by Variant Lab V1 (C2).** This forbade Variant Lab vocabulary in `presets.py` *and*
+    `gui.py`. C2 legitimately adds a Variant Lab to the GUI, so the assertion split rather than
+    weakened: `presets.py` keeps the full prohibition — presets remain recipes-only and must never
+    grow a generator — while the GUI keeps every prohibition that is still speculative.
+
+    Deliberately not evaded by renaming: the lab is called Variant Lab in the GUI, and this test now
+    says so out loud.
+    """
+    source = _executable_source(_PRESETS).lower()
+    for word in _STILL_SPECULATIVE + _VARIANT_LAB_VOCABULARY:
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
+
+
+def test_the_gui_added_no_speculative_mode_machinery():
+    """C3 multi-variant rendering, Freestyle, an AI Director and the rest stay out of the GUI."""
+    source = _executable_source(_GUI).lower()
+    for word in _STILL_SPECULATIVE:
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+    # and specifically no multi-variant / batch machinery crept in with the lab
+    for word in ("generate_variants", "variant_batch", "variant_count", "num_variants",
+                 "compare_variants", "variant_gallery"):
+        assert word not in source, f"gui.py mentions {word!r}"
 
 
 # ===========================================================================

@@ -527,22 +527,40 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
 
     **Amended by Creative Controls Extra PR3.** This asserted that *nothing* wrote these sliders.
     The preset selector now does — that is the feature — so the assertion became an allow-list of
-    exactly one writer. Everything else is still forbidden, including any handler that would write a
-    slider as a side effect of a source, preparation or render event.
+    writers. Everything else is still forbidden, including any handler that would write a slider as
+    a side effect of a source, preparation or render event.
+
+    **Amended again by Variant Lab V1 (C2):** generating a variant writes the six sliders too, so
+    the lab's two buttons joined the allow-list. The *detection* was strengthened at the same time —
+    it now resolves list variables transitively, so wrapping the sliders in one more intermediate
+    list cannot hide a writer from this test the way `variant_lab_outputs` otherwise would have.
     """
     tree = _gui_tree()
+
+    # Every name that transitively denotes a list containing this slider.
+    aliases = {widget}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id not in aliases
+                    and aliases & set(_names(node.value))):
+                aliases.add(node.targets[0].id)
+                changed = True
+
     writers = []
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"click", "change", "input", "submit", "release"}):
             outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is None:
-                continue
-            names = _names(outputs)
-            if widget in names or "creative_control_sliders" in names:
+            if outputs is not None and aliases & set(_names(outputs)):
                 writers.append(ast.unparse(node.func))
 
-    assert writers == ["creative_preset.input"], f"{widget} is written by {writers}"
+    assert sorted(writers) == ["creative_preset.input",
+                               "generate_variant_btn.click",
+                               "new_variant_btn.click"], f"{widget} is written by {writers}"
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():
@@ -637,10 +655,15 @@ def test_no_preset_randomizer_or_freestyle_control_was_added():
 
     Creative Controls Extra PR3 added a preset *selector* (`creative_preset`, a `gr.Radio`), which
     none of these tokens describes. What stays out of scope is a preset button, a randomiser or a
-    reset for the six controls, and every Freestyle / Director / Variant Lab mode.
+    reset for the six controls, and every Freestyle / Director mode.
+
+    **Amended by Variant Lab V1 (C2).** `variant_lab` and `creative_recipe` were forbidden here as
+    speculative; C2 implements them, so they left this list rather than being renamed around it.
+    `presets.py` still knows nothing about either — `test_creative_presets.py` owns that assertion —
+    and everything genuinely still speculative stays forbidden below.
     """
     source = open(_GUI, encoding="utf-8").read().lower()
-    for word in ("preset_btn", "freestyle", "director", "variant_lab", "creative_recipe",
+    for word in ("preset_btn", "freestyle", "director",
                  "randomize_controls", "reset_creative"):
         assert word not in source, f"gui.py contains {word!r}"
 

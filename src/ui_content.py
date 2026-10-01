@@ -421,6 +421,62 @@ INFO_CREATIVE_PRESET = (
 )
 
 # ============================================================================
+# [FORK] Digital-Union: Variant Lab V1 (C2)
+# See src/beatsync_fork/variant_lab.py for the resolver these labels describe. Variant Lab writes
+# the Variation Seed and the six sliders and nothing else — it never renders, and it never
+# re-analyses your videos.
+# ============================================================================
+
+LABEL_VARIANT_LAB = "🧪 Variant Lab"
+INFO_VARIANT_LAB = (
+    "Explore beyond the seed. Tick the controls that may vary, give each one an allowed range, "
+    "choose how far from your current settings to wander, and generate one recipe. "
+    "**Your current six sliders above are the starting point**, whatever preset they came from — "
+    "and generating writes the result back into them, so the next Generate starts from the new "
+    "values. Generating only moves the Variation Seed and those sliders: it never starts a render, "
+    "never re-analyses your videos, and never affects your confirmed source files."
+)
+
+LABEL_MASTER_SEED = "🧬 Master Creative Seed"
+INFO_MASTER_SEED = (
+    "The seed a recipe is generated from — not the same thing as the Variation Seed above, which "
+    "Variant Lab fills in for you. A Master Seed repeats a draw only when the starting slider "
+    "values and the Lab settings below (ranges, ticked controls, Spread) are the same. Because "
+    "Generate overwrites the sliders, pressing it twice in a row gives two different recipes: to "
+    "replay an old Master Seed, set the starting preset or values back first. The exact render "
+    "settings are always the Variation Seed plus the six sliders, not the Master Seed. "
+    "Leave this at 0 and a fresh one is created and shown here."
+)
+
+LABEL_VARIATION_SPREAD = "🎚️ Variation Spread"
+INFO_VARIATION_SPREAD = (
+    "Conservative ↔ Crazy. How far a generated recipe may wander from your current sliders — not "
+    "how high the values go: each control moves up or down independently, so a wild recipe might "
+    "be dense cuts with calm footage. 0 keeps the six controls exactly where they are, but you "
+    "still get a fresh Variation Seed, so the clip choices change."
+)
+
+LABEL_VARIANT_RANDOMIZE = "🎯 Controls that may vary"
+INFO_VARIANT_RANDOMIZE = (
+    "Unticked controls are left exactly as they are, and their range below is ignored."
+)
+
+INFO_VARIANT_RANGES = (
+    "**Allowed ranges** — a generated value for a ticked control always lands inside its range. "
+    "These stay put when you change preset or move a slider; if your current value falls outside a "
+    "range, variation is centred on the nearest edge instead. A min above its max is read as a "
+    "fixed value, never silently swapped."
+)
+
+LABEL_GENERATE_VARIANT = "✨ Generate Variant"
+LABEL_NEW_VARIANT = "🎲 New Variant"
+
+LABEL_VARIANT_REPORT = "Last generated recipe"
+PLACEHOLDER_VARIANT_REPORT = (
+    "No variant generated yet. Set a Variation Spread and press Generate Variant."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels
 # See src/beatsync_fork/input_session.py for the behaviour these labels describe.
 # ============================================================================
