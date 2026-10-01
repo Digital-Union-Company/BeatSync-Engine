@@ -16,6 +16,7 @@ the string we hand it.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import math
 import os
 import shutil
@@ -29,6 +30,7 @@ from typing import Any
 import pytest
 
 from beatsync_fork import audio_mix as fork_audio_mix
+from beatsync_fork import smart_mix as fork_smart_mix
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MIXDOWN = os.path.join(_REPO_ROOT, "src", "audio_mixdown.py")
@@ -39,6 +41,8 @@ _EXTRACTED = (
     "prepare_voice_inputs", "build_duck_expression", "escape_filter_expression",
     "build_mix_command", "master_path_for", "render_mixed_master", "discard_master",
     "build_mixed_master",
+    # [FORK] Digital-Union (Smart Mix V1 / E): the library preflight and its two helpers.
+    "_role_relative_component", "prepare_sfx_inputs", "_walk_error",
 )
 
 
@@ -72,6 +76,8 @@ def load_mixdown(subprocess_module=None, uuid_module=None):
         "FFMPEG_PATH": r"C:\fake\ffmpeg.exe",
         "FFPROBE_PATH": r"C:\fake\ffprobe.exe",
         "fork_audio_mix": fork_audio_mix,
+        "fork_smart_mix": fork_smart_mix,
+        "dataclasses": dataclasses,
         "__name__": "audio_mixdown_under_test",
     }
     exec(compile(ast.Module(body=wanted, type_ignores=[]), _MIXDOWN, "exec"), namespace)
@@ -394,8 +400,8 @@ def test_filter_complex_is_a_single_argv_item():
     assert command.count("-filter_complex") == 1
 
 
-def _graph(mix, plan, music="m.mp3", out="o.wav") -> str:
-    command = mix.build_mix_command(music, plan, out)
+def _graph(mix, plan, music="m.mp3", out="o.wav", **kwargs) -> str:
+    command = mix.build_mix_command(music, plan, out, **kwargs)
     return command[command.index("-filter_complex") + 1]
 
 
@@ -479,11 +485,25 @@ def test_exact_duration_enforcement_and_output_encoding():
 
 
 def test_a_voiceless_plan_still_builds_a_valid_command():
+    """**Amended by Smart Mix V1 / E.**
+
+    D synthesised a constant ``aevalsrc='1'`` envelope and ``amultiply``'d the music by it even
+    with no voice — an exact no-op that still generated a full-length 48 kHz stereo stream. E
+    routes the music directly when there are no duck events, which an SFX-only mix needs anyway.
+    The test was not deleted: it now pins the *stronger* property, that a voiceless graph contains
+    no envelope machinery at all while remaining a complete, valid command.
+    """
     mix = load_mixdown()
     graph = _graph(mix, plan_for((), ()))
     assert "amix=inputs=1" in graph
     assert "adelay" not in graph
-    assert "aevalsrc='1'" in graph
+    assert "aevalsrc" not in graph
+    assert "amultiply" not in graph
+    assert ("[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[music]"
+            in graph)
+    # still exactly one limiter and one exact-duration boundary
+    assert graph.count("alimiter") == 1
+    assert graph.count("amix=") == 1
 
 
 def test_master_path_is_unique_and_in_the_session_dir():
@@ -831,3 +851,662 @@ def test_real_voice_never_extends_the_master(tmp_path):
     # deliberately overrunning; the planner forbids this, the graph must not extend regardless
     out, _ = real_mix(tmp_path, music, [voice], [5.0], 6.0)
     assert abs(real_probe_duration(out) - 6.0) <= 0.001
+
+
+# ===========================================================================
+# SMART MIX V1 (E): the library preflight
+# ===========================================================================
+
+
+def _sfx_library(tmp_path, layout):
+    """Build a folder tree; `layout` maps a relative path to its bytes."""
+    for relative, payload in layout.items():
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    return str(tmp_path)
+
+
+_OK = b"x"
+_ALL_ROLES = fork_smart_mix.ALL_ROLES
+
+
+def _probes(count, duration="2.0"):
+    return [FakeCompleted(0, duration, "")] * count
+
+
+def test_prepare_sfx_inputs_classifies_orders_and_probes(tmp_path):
+    root = _sfx_library(tmp_path, {
+        "Impacts/02_b.wav": _OK, "Impacts/01_a.wav": _OK,
+        "Risers/sub/deep.wav": _OK,
+        "Ambience/pad.flac": _OK,
+        "Transitions/t.mp3": _OK,
+        "VocalShots/v.wav": _OK,
+    })
+    mix = load_mixdown(FakeSubprocess(_probes(10)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+    by_role = {}
+    for item in assets:
+        by_role.setdefault(item.role, []).append(os.path.basename(item.path))
+    assert by_role["impact"] == ["01_a.wav", "02_b.wav"], "filename order, not walk order"
+    assert by_role["riser"] == ["deep.wav"], "nested files inherit the first-level role"
+    assert by_role["atmosphere"] == ["pad.flac"], "Ambience is a frozen atmosphere alias"
+    assert set(by_role) == {"impact", "riser", "atmosphere", "transition", "vocal_shot"}
+    assert all(item.duration == 2.0 for item in assets)
+    assert dict(diagnostics.per_role)["impact"] == 2
+    assert diagnostics.root == root
+    assert not diagnostics.has_ignores, "a clean library reports nothing ignored"
+
+
+def test_unknown_folders_and_root_files_are_reported_and_never_probed(tmp_path):
+    root = _sfx_library(tmp_path, {
+        "Impacts/a.wav": _OK,
+        "Bogus/b.wav": _OK,
+        "my impacts/c.wav": _OK,
+        "loose.wav": _OK,
+        "Impacts/notes.txt": _OK,
+    })
+    fake = FakeSubprocess(_probes(10))
+    mix = load_mixdown(fake)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+    assert [os.path.basename(a.path) for a in assets] == ["a.wav"]
+    # already deterministically ordered by the scanner, not by os.walk
+    assert diagnostics.unknown_folders == ("Bogus", "my impacts")
+    assert diagnostics.root_level_files == 1
+    assert diagnostics.unsupported_files == 1
+    probed = [c[-1] for c in fake.calls]
+    assert len(probed) == 1 and probed[0].endswith("a.wav")
+
+
+def test_disabled_role_assets_are_neither_returned_nor_probed(tmp_path):
+    root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK, "Risers/b.wav": _OK})
+    fake = FakeSubprocess(_probes(10))
+    mix = load_mixdown(fake)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, ["impact"])
+
+    assert [a.role for a in assets] == ["impact"]
+    assert diagnostics.skipped_disabled_files == 1
+    assert len(fake.calls) == 1, "a disabled role must cost no ffprobe"
+
+
+@pytest.mark.parametrize("roles", [["impact"], ["riser", "vocal_shot"], _ALL_ROLES])
+def test_a_complete_enabled_selection_never_silently_shrinks(tmp_path, roles):
+    layout = {f"{folder}/{i}.wav": _OK
+              for folder in ("Impacts", "Risers", "VocalShots") for i in range(3)}
+    root = _sfx_library(tmp_path, layout)
+    mix = load_mixdown(FakeSubprocess(_probes(40)))
+    assets, _scan = mix.prepare_sfx_inputs(root, roles)
+    wanted = fork_smart_mix.normalize_roles(roles)
+    present = {"impact", "riser", "vocal_shot"} & wanted
+    assert len(assets) == 3 * len(present)
+
+
+def test_a_missing_root_is_fatal(tmp_path):
+    mix = load_mixdown(FakeSubprocess())
+    with pytest.raises(Exception, match="does not exist"):
+        mix.prepare_sfx_inputs(str(tmp_path / "nope"), _ALL_ROLES)
+
+
+def test_a_non_directory_root_is_fatal(tmp_path):
+    target = tmp_path / "a_file.wav"
+    target.write_bytes(_OK)
+    mix = load_mixdown(FakeSubprocess())
+    with pytest.raises(Exception, match="not a folder"):
+        mix.prepare_sfx_inputs(str(target), _ALL_ROLES)
+
+
+@pytest.mark.parametrize("root", ["", "   ", None, 7])
+def test_an_unusable_root_value_is_fatal(root):
+    mix = load_mixdown(FakeSubprocess())
+    with pytest.raises(Exception, match="no SFX library folder"):
+        mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+
+def test_zero_enabled_recognised_assets_is_fatal(tmp_path):
+    root = _sfx_library(tmp_path, {"Bogus/a.wav": _OK, "loose.mp3": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(5)))
+    with pytest.raises(Exception, match="no usable audio"):
+        mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+
+def test_only_unsupported_extensions_is_fatal(tmp_path):
+    root = _sfx_library(tmp_path, {"Impacts/a.m4a": _OK, "Impacts/b.ogg": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(5)))
+    with pytest.raises(Exception, match="no usable audio"):
+        mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+
+@pytest.mark.parametrize("result,match", [
+    (FakeCompleted(1, "", "moov atom not found"), "Could not read"),
+    (FakeCompleted(0, "not-a-number", ""), "Could not read a duration"),
+    (FakeCompleted(0, "0", ""), "unusable duration"),
+    (FakeCompleted(0, "-3.0", ""), "unusable duration"),
+    (FakeCompleted(0, "nan", ""), "unusable duration"),
+    (FakeCompleted(0, "inf", ""), "unusable duration"),
+])
+def test_a_corrupt_asset_in_an_enabled_role_is_fatal(tmp_path, result, match):
+    root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK})
+    mix = load_mixdown(FakeSubprocess([result]))
+    with pytest.raises(Exception, match=match):
+        mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+
+def test_a_probe_timeout_is_fatal(tmp_path):
+    root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK})
+
+    class Timeout(FakeSubprocess):
+        def run(self, command, **kwargs):
+            raise subprocess.TimeoutExpired(command, 30)
+
+    mix = load_mixdown(Timeout())
+    with pytest.raises(Exception, match="Timed out"):
+        mix.prepare_sfx_inputs(root, _ALL_ROLES)
+
+
+def test_one_empty_enabled_role_is_not_fatal(tmp_path):
+    """A role with no assets reports zero placements later; it does not fail the render."""
+    root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(5)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+    assert len(assets) == 1
+    assert dict(diagnostics.per_role)["riser"] == 0
+
+
+def test_the_role_component_is_the_first_one_under_the_root():
+    mix = load_mixdown(FakeSubprocess())
+    root = os.path.join("C:", os.sep, "sfx")
+    assert mix._role_relative_component(root, os.path.join(root, "Impacts", "a.wav")) == "Impacts"
+    assert mix._role_relative_component(
+        root, os.path.join(root, "Impacts", "deep", "a.wav")) == "Impacts"
+    assert mix._role_relative_component(root, os.path.join(root, "a.wav")) is None
+
+
+def test_an_unreadable_directory_is_never_silently_skipped():
+    mix = load_mixdown(FakeSubprocess())
+    with pytest.raises(OSError):
+        mix._walk_error(OSError("permission denied"))
+
+
+# ===========================================================================
+# SMART MIX V1 (E): the executor graph
+# ===========================================================================
+
+
+def sfx(role, start, duration, trimmed=False, play=None, name="s"):
+    play = play if play is not None else duration
+    return fork_smart_mix.SfxPlacement(
+        role=role, path=f"C:/sfx/{role}/{name}.wav", source_duration=duration,
+        play_duration=play, start=start, end=start + play,
+        anchor="x", reason="y", trimmed=trimmed)
+
+
+def plan_with_sfx(durations=(), starts=(), placements=(), duration=30.0):
+    """`plan_for`'s voice plan plus resolved SFX, attached exactly as the executor does."""
+    return dataclasses.replace(plan_for(durations, starts, duration),
+                               sfx_placements=tuple(placements))
+
+
+def test_input_order_is_music_then_voice_then_sfx():
+    mix = load_mixdown()
+    plan = plan_with_sfx(
+        durations=(2.0, 2.0), starts=(1.0, 5.0),
+        placements=(sfx("impact", 12.0, 0.3, name="i"), sfx("riser", 18.0, 3.0, name="r")))
+    command = mix.build_mix_command("C:/music.mp3", plan, "C:/out.wav", sfx_level_percent=50)
+    inputs = [command[i + 1] for i, token in enumerate(command) if token == "-i"]
+    assert inputs == ["C:/music.mp3", "C:/voices/00_clip.wav", "C:/voices/01_clip.wav",
+                      "C:/sfx/impact/i.wav", "C:/sfx/riser/r.wav"]
+
+
+def test_each_sfx_stream_index_matches_its_own_delay_and_path():
+    mix = load_mixdown()
+    placements = (sfx("impact", 2.0, 0.3, name="i"),
+                  sfx("transition", 12.5, 1.0, name="t"),
+                  sfx("vocal_shot", 20.25, 0.8, name="v"))
+    plan = plan_with_sfx(durations=(2.0,), starts=(1.0,), placements=placements)
+    command = mix.build_mix_command("C:/music.mp3", plan, "C:/out.wav")
+    graph = command[command.index("-filter_complex") + 1]
+    inputs = [command[i + 1] for i, token in enumerate(command) if token == "-i"]
+    for offset, placement in enumerate(placements):
+        index = 2 + offset                      # 0 music, 1 voice, then SFX
+        assert inputs[index] == placement.path
+        assert f"[{index}:a]" in graph
+        segment = graph.split(f"[{index}:a]")[1].split(";")[0]
+        assert f"adelay={int(round(placement.start * 1000))}:all=1" in segment
+
+
+@pytest.mark.parametrize("level,expected", [(0, "0.000000"), (50, "0.500000"),
+                                            (100, "1.000000"), (35, "0.350000")])
+def test_sfx_gain_is_the_linear_level(level, expected):
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("impact", 2.0, 0.3),))
+    graph = _graph(mix, plan, sfx_level_percent=level)
+    assert f"volume={expected}" in graph
+
+
+def test_a_malformed_sfx_level_falls_back_to_the_default():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("impact", 2.0, 0.3),))
+    for bad in (None, "50", 50.5, True, float("nan")):
+        assert "volume=0.500000" in _graph(mix, plan, sfx_level_percent=bad)
+
+
+def test_atrim_appears_only_for_a_trimmed_atmosphere():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(
+        sfx("atmosphere", 1.0, 40.0, trimmed=True, play=20.0, name="bed"),
+        sfx("impact", 25.0, 0.3, name="hit"),
+    ))
+    graph = _graph(mix, plan)
+    bed = graph.split("[1:a]")[1].split(";")[0]
+    hit = graph.split("[2:a]")[1].split(";")[0]
+    assert "atrim=end=20.000000" in bed
+    assert "atrim" not in hit
+    # the only other atrim in the graph is the master's exact-duration boundary
+    assert graph.count("atrim=") == 2
+
+
+def test_an_untrimmed_atmosphere_gets_no_atrim():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("atmosphere", 1.0, 5.0, trimmed=False, name="bed"),))
+    graph = _graph(mix, plan)
+    assert graph.count("atrim=") == 1
+
+
+def test_sfx_only_renders_without_any_envelope():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("impact", 2.0, 0.3), sfx("riser", 8.0, 3.0)))
+    graph = _graph(mix, plan)
+    assert "aevalsrc" not in graph and "amultiply" not in graph
+    assert "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[music]" in graph
+    assert "amix=inputs=3" in graph
+
+
+def test_voice_and_sfx_keep_the_duck_envelope_on_the_music_only():
+    mix = load_mixdown()
+    plan = plan_with_sfx(durations=(2.0,), starts=(1.0,),
+                         placements=(sfx("impact", 10.0, 0.3),))
+    graph = _graph(mix, plan)
+    assert "aevalsrc='1-" in graph
+    assert "[mus][env]amultiply[music]" in graph
+    sfx_segment = graph.split("[2:a]")[1].split(";")[0]
+    assert "amultiply" not in sfx_segment
+    voice_segment = graph.split("[1:a]")[1].split(";")[0]
+    assert "volume=" not in voice_segment, "voice is never attenuated by the SFX level"
+
+
+def test_exactly_one_amix_and_one_limiter_with_sfx():
+    mix = load_mixdown()
+    plan = plan_with_sfx(durations=(2.0,), starts=(1.0,),
+                         placements=tuple(sfx("impact", 5.0 + i, 0.3, name=f"i{i}")
+                                          for i in range(8)))
+    graph = _graph(mix, plan)
+    assert graph.count("amix=") == 1
+    assert graph.count("alimiter") == 1
+    assert graph.count("[outa]") == 1
+    assert "amix=inputs=10" in graph
+
+
+def test_the_master_boundary_is_unchanged_by_sfx():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("impact", 2.0, 0.3),), duration=123.456789)
+    graph = _graph(mix, plan)
+    assert "apad,atrim=end=123.456789,asetpts=N/SR/TB[outa]" in graph
+
+
+def test_sfx_paths_with_spaces_survive_as_one_argv_entry():
+    mix = load_mixdown()
+    placement = fork_smart_mix.SfxPlacement(
+        role="impact", path="C:\\My SFX\\big hit.wav", source_duration=0.3, play_duration=0.3,
+        start=2.0, end=2.3, anchor="x", reason="y", trimmed=False)
+    plan = plan_with_sfx(placements=(placement,))
+    command = mix.build_mix_command("C:/music.mp3", plan, "C:/out.wav")
+    assert "C:\\My SFX\\big hit.wav" in command
+
+
+def test_build_mixed_master_attaches_sfx_and_forwards_the_level():
+    """The executor never plans SFX — it receives resolved placements and attaches them.
+
+    The render itself cannot complete against a stubbed subprocess (no file is produced), so the
+    command is captured on its way out and the expected failure is allowed to surface.
+    """
+    placements = (sfx("impact", 2.0, 0.3),)
+    captured = []
+
+    class Recorder(FakeSubprocess):
+        def run(self, command, **kwargs):
+            captured.append(list(command))
+            return super().run(command, **kwargs)
+
+    mix = load_mixdown(Recorder([FakeCompleted(0, "", "")]))
+    with pytest.raises(Exception, match="produced no output file"):
+        mix.build_mixed_master(
+            music_path="C:/music.mp3", music_duration=30.0, beat_times=[0.0, 1.0],
+            sections=(), voices=(), config=fork_audio_mix.AudioMixConfig(),
+            session_dir="C:/session", sfx_placements=placements, sfx_level_percent=70)
+
+    graph = captured[0][captured[0].index("-filter_complex") + 1]
+    assert "volume=0.700000" in graph, "the resolved level must reach FFmpeg"
+    assert "C:/sfx/impact/s.wav" in captured[0]
+    assert "aevalsrc" not in graph, "no voice -> no envelope"
+
+
+def test_build_mixed_master_plans_no_sfx_itself():
+    """Structural: SFX planning lives in the pure module and is never re-done by the executor."""
+    source = ast.unparse(_module_tree())
+    for forbidden in ("plan_sfx", "project_structure", "amount_params", "_place_"):
+        assert forbidden not in source, f"audio_mixdown re-implements planning via {forbidden}"
+
+
+def test_build_mix_command_defaults_the_level_for_direct_callers():
+    mix = load_mixdown()
+    plan = plan_with_sfx(placements=(sfx("impact", 2.0, 0.3),))
+    graph = _graph(mix, plan)
+    assert "volume=0.500000" in graph
+
+
+def test_a_plan_without_the_sfx_field_still_builds():
+    """`AudioMixPlan`'s new field is defaulted, so every pre-existing construction stays valid."""
+    mix = load_mixdown()
+    plan = fork_audio_mix.AudioMixPlan(30.0, (), (), fork_audio_mix.AudioMixConfig())
+    assert plan.sfx_placements == ()
+    graph = _graph(mix, plan)
+    assert "amix=inputs=1" in graph
+
+
+# ===========================================================================
+# SMART MIX V1 (E): real-FFmpeg integration
+# ===========================================================================
+
+
+def real_sfx_mix(tmp_path, music, music_duration, placements, voices=(), starts=(),
+                 sfx_level_percent=50, out_name="sfxmix.wav", percent=35):
+    """Builds with the REAL shipped builder, then swaps in the real binary."""
+    mix = load_mixdown()
+    config = fork_audio_mix.AudioMixConfig(music_under_voice_percent=percent)
+    voice_placements = tuple(
+        fork_audio_mix.VoicePlacement(i, str(v), real_probe_duration(v), s,
+                                      s + real_probe_duration(v), "verse",
+                                      fork_audio_mix.ANCHOR_BEAT, 0.0)
+        for i, (v, s) in enumerate(zip(voices, starts)))
+    plan = fork_audio_mix.AudioMixPlan(
+        music_duration, voice_placements,
+        fork_audio_mix.build_duck_events(voice_placements, music_duration, config),
+        config, tuple(placements))
+    out = tmp_path / out_name
+    command = mix.build_mix_command(str(music), plan, str(out),
+                                    sfx_level_percent=sfx_level_percent)
+    command[0] = FFMPEG_BIN
+    result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-1500:]
+    return out, plan
+
+
+def real_sfx(role, path, start, trimmed=False, play=None):
+    duration = real_probe_duration(path)
+    play = play if play is not None else duration
+    return fork_smart_mix.SfxPlacement(
+        role=role, path=str(path), source_duration=duration, play_duration=play,
+        start=start, end=start + play, anchor="x", reason="y", trimmed=trimmed)
+
+
+@needs_ffmpeg
+def test_real_sfx_only_master_is_exact_and_needs_no_envelope(tmp_path):
+    music = write_tone(tmp_path / "music.wav", 12.0, 220, 0.4, rate=44100)
+    hit = write_clicks(tmp_path / "impact.wav", 0.5, (0.0,))
+    duration = real_probe_duration(music)
+    out, _ = real_sfx_mix(tmp_path, music, duration, [real_sfx("impact", hit, 4.0)])
+
+    assert abs(real_probe_duration(out) - duration) <= 0.001
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-show_entries",
+         "stream=codec_name,sample_rate,channels", "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, timeout=60)
+    assert "pcm_s24le" in result.stdout and "48000" in result.stdout and "2" in result.stdout
+
+
+@needs_ffmpeg
+def test_real_sfx_lands_on_the_exact_planned_sample(tmp_path):
+    music = write_tone(tmp_path / "music.wav", 10.0, 220, 0.2)
+    hit = write_clicks(tmp_path / "impact.wav", 0.5, (0.0,))
+    out, _ = real_sfx_mix(tmp_path, music, 10.0,
+                          [real_sfx("impact", hit, 3.0), real_sfx("impact", hit, 6.5)],
+                          sfx_level_percent=100)
+
+    samples = read_left(out)
+    peaks = [i for i, v in enumerate(samples) if abs(v) > 0.7]
+    grouped = []
+    for i in peaks:
+        if not grouped or i - grouped[-1][-1] > 100:
+            grouped.append([i])
+        else:
+            grouped[-1].append(i)
+    assert [g[0] for g in grouped] == [int(3.0 * RATE), int(6.5 * RATE)]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("level,expected", [(100, 1.0), (50, 0.5), (0, 0.0)])
+def test_real_sfx_level_is_a_linear_gain(tmp_path, level, expected):
+    """A silent music bed makes the SFX peak the only signal, so the level is measurable."""
+    music = write_tone(tmp_path / "music.wav", 6.0, 220, 0.0)
+    hit = write_clicks(tmp_path / "impact.wav", 0.5, (0.0,), amplitude=32000)
+    out, _ = real_sfx_mix(tmp_path, music, 6.0, [real_sfx("impact", hit, 2.0)],
+                          sfx_level_percent=level, out_name=f"g{level}.wav")
+    samples = read_left(out)
+    window = samples[int(1.9 * RATE):int(2.2 * RATE)]
+    peak = max(abs(v) for v in window) if window else 0.0
+    assert peak == pytest.approx(expected * (32000 / 32768.0), abs=0.02)
+
+
+@needs_ffmpeg
+def test_real_trimmed_atmosphere_stops_at_its_planned_length(tmp_path):
+    """`atrim` is applied before the delay, so a trimmed bed ends exactly where the plan says."""
+    music = write_tone(tmp_path / "music.wav", 14.0, 220, 0.0)
+    bed = write_tone(tmp_path / "bed.wav", 8.0, 1500, 0.6)
+    placement = real_sfx("atmosphere", bed, 2.0, trimmed=True, play=3.0)
+    out, _ = real_sfx_mix(tmp_path, music, 14.0, [placement], sfx_level_percent=100)
+
+    samples = read_left(out)
+
+    def energy(a, b):
+        chunk = samples[int(a * RATE):int(b * RATE)]
+        return max(abs(v) for v in chunk) if chunk else 0.0
+
+    assert energy(2.5, 4.5) > 0.3, "the bed must play for its trimmed length"
+    assert energy(5.5, 7.5) < 0.05, "and must be silent after it"
+
+
+@needs_ffmpeg
+def test_real_voice_and_sfx_share_one_master_with_voice_ducking_music_only(tmp_path):
+    music = write_tone(tmp_path / "music.wav", 16.0, 220, 0.5, rate=44100)
+    voice = write_tone(tmp_path / "01 voice.wav", 2.0, 700, 0.6)
+    hit = write_clicks(tmp_path / "impact.wav", 0.5, (0.0,), amplitude=32000)
+    duration = real_probe_duration(music)
+    out, _ = real_sfx_mix(tmp_path, music, duration,
+                          [real_sfx("impact", hit, 10.0)],
+                          voices=[voice], starts=[4.0], sfx_level_percent=100)
+
+    assert abs(real_probe_duration(out) - duration) <= 0.001
+    samples = read_left(out)
+    # the SFX impulse is outside the duck window and keeps its full level
+    window = samples[int(9.9 * RATE):int(10.2 * RATE)]
+    assert max(abs(v) for v in window) > 0.8
+
+
+@needs_ffmpeg
+def test_real_many_loud_sfx_do_not_clip_the_master(tmp_path):
+    """The one existing limiter is still the only safety ceiling, with SFX summed in."""
+    music = write_tone(tmp_path / "music.wav", 12.0, 220, 0.9, rate=44100)
+    hit = write_tone(tmp_path / "impact.wav", 0.4, 180, 1.0)
+    placements = [real_sfx("impact", hit, 1.0 + i) for i in range(9)]
+    out, _ = real_sfx_mix(tmp_path, music, real_probe_duration(music), placements,
+                          sfx_level_percent=100)
+
+    samples = read_left(out)
+    assert max(abs(v) for v in samples) <= 0.9701, "the limiter ceiling must still hold"
+
+
+@needs_ffmpeg
+def test_real_sfx_never_extends_the_master(tmp_path):
+    """A tail running past the music is cut by the master boundary, not allowed to grow it."""
+    music = write_tone(tmp_path / "music.wav", 6.0, 220, 0.3)
+    bed = write_tone(tmp_path / "long.wav", 10.0, 900, 0.5)
+    out, _ = real_sfx_mix(tmp_path, music, 6.0,
+                          [real_sfx("atmosphere", bed, 4.0)], sfx_level_percent=100)
+    assert abs(real_probe_duration(out) - 6.0) <= 0.001
+
+
+@needs_ffmpeg
+def test_real_sfx_paths_with_spaces_and_mixed_rates(tmp_path):
+    folder = tmp_path / "my sfx folder"
+    folder.mkdir()
+    music = write_tone(folder / "music.wav", 14.0, 220, 0.4, rate=44100)
+    a = write_tone(folder / "big hit.wav", 0.4, 180, 0.6, rate=22050)
+    b = write_tone(folder / "soft riser.wav", 2.0, 1200, 0.5, rate=32000)
+    duration = real_probe_duration(music)
+    out, _ = real_sfx_mix(folder, music, duration,
+                          [real_sfx("impact", a, 3.0), real_sfx("riser", b, 8.0)],
+                          out_name="mix out.wav")
+    assert abs(real_probe_duration(out) - duration) <= 0.001
+
+
+# ===========================================================================
+# SMART MIX V1 (E, R1): library diagnostics survive to the report
+# ===========================================================================
+#
+# The R1 defect was NOT that the scan failed to collect these — it collected all four and then
+# only `root` was ever read, so a typo'd folder was invisible to the user. Asserting on the
+# scanner's own return value would therefore have passed throughout the bug. These tests run the
+# REAL production chain instead: prepare_sfx_inputs -> plan_sfx -> SmartMixPlan.report_lines().
+
+
+def _structure_for_report():
+    sections = ((0.0, 29.0, "intro"), (29.0, 53.0, "intro"), (53.0, 74.0, "drop"),
+                (74.0, 100.0, "breakdown"))
+    beats = tuple(i * 0.5 for i in range(200))
+    count = len(beats)
+    return fork_smart_mix.MusicStructure(
+        music_duration=100.0, beat_times=beats,
+        is_bar_anchor=tuple(i % 4 == 0 for i in range(count)),
+        is_phrase_anchor=tuple(i % 8 == 0 for i in range(count)),
+        impact_strength=tuple((i % 13) / 13.0 for i in range(count)),
+        sections=sections)
+
+
+def _report_for(tmp_path, layout, roles=None):
+    """The real chain: scan the real tree, plan with the real planner, render the real report."""
+    root = _sfx_library(tmp_path, layout)
+    mix = load_mixdown(FakeSubprocess(_probes(40)))
+    assets, diagnostics = mix.prepare_sfx_inputs(
+        root, fork_smart_mix.ALL_ROLES if roles is None else roles)
+    plan = fork_smart_mix.plan_sfx(
+        _structure_for_report(), assets,
+        fork_smart_mix.SmartMixConfig(enabled_roles=(fork_smart_mix.ALL_ROLES
+                                                     if roles is None else roles)),
+        library_root=root, library_diagnostics=diagnostics)
+    return "\n".join(plan.report_lines()), plan, diagnostics
+
+
+def test_a_typo_folder_is_visible_in_the_final_report(tmp_path):
+    """The exact scenario from the contract: `Impats/` beside a valid `Risers/`.
+
+    Preflight succeeds because one usable enabled asset exists, so without R1 the user was told
+    only that there "happened to be no impacts".
+    """
+    text, _plan, _diag = _report_for(tmp_path, {
+        "Impats/typo.wav": _OK,
+        "Risers/valid.wav": _OK,
+        "loose.wav": _OK,
+        "Risers/notes.txt": _OK,
+    })
+    assert "Impats" in text, "the typo'd folder must be named in the report"
+    assert "Ignored unknown role folders: Impats" in text
+    assert "Ignored root-level files: 1" in text
+    assert "Ignored unsupported files: 1" in text
+
+
+def test_several_unknown_folders_are_listed_deterministically(tmp_path):
+    text, _plan, diagnostics = _report_for(tmp_path, {
+        "zeta/a.wav": _OK, "Misc/b.wav": _OK, "Impats/c.wav": _OK, "alpha/d.wav": _OK,
+        "Risers/valid.wav": _OK,
+    })
+    assert diagnostics.unknown_folders == ("alpha", "Impats", "Misc", "zeta")
+    assert "Ignored unknown role folders: alpha, Impats, Misc, zeta" in text
+
+
+def test_disabled_role_files_are_counted_neutrally_and_never_probed(tmp_path):
+    root = _sfx_library(tmp_path, {
+        "Risers/valid.wav": _OK,
+        "Impacts/a.wav": _OK, "Impacts/b.wav": _OK,
+    })
+    fake = FakeSubprocess(_probes(10))
+    mix = load_mixdown(fake)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, ["riser"])
+    plan = fork_smart_mix.plan_sfx(
+        _structure_for_report(), assets,
+        fork_smart_mix.SmartMixConfig(enabled_roles=["riser"]),
+        library_root=root, library_diagnostics=diagnostics)
+    text = "\n".join(plan.report_lines())
+
+    assert len(fake.calls) == 1, "disabled-role files must still cost no ffprobe"
+    assert "Files in disabled roles skipped: 2" in text
+    for loaded in ("error", "warning", "invalid", "wrong"):
+        assert loaded not in text.casefold(), "disabling a role is a choice, not a mistake"
+
+
+def test_a_clean_library_adds_no_ignored_noise(tmp_path):
+    text, _plan, diagnostics = _report_for(tmp_path, {
+        "Impacts/a.wav": _OK, "Risers/b.wav": _OK, "Atmosphere/c.wav": _OK,
+        "Transitions/d.wav": _OK, "VocalShots/e.wav": _OK,
+    })
+    assert not diagnostics.has_ignores
+    assert "Ignored" not in text
+    assert "disabled roles" not in text
+
+
+def test_the_zero_placement_report_still_explains_itself_and_shows_diagnostics(tmp_path):
+    """A valid library that yields no musical placements keeps every existing explanation."""
+    structure = fork_smart_mix.MusicStructure(
+        music_duration=60.0, beat_times=(0.0, 1.0),
+        is_bar_anchor=(False, False), is_phrase_anchor=(False, False),
+        impact_strength=(0.0, 0.0), sections=((0.0, 60.0, "verse"),))
+    root = _sfx_library(tmp_path, {"Risers/valid.wav": _OK, "Impats/typo.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(10)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    plan = fork_smart_mix.plan_sfx(structure, assets, fork_smart_mix.SmartMixConfig(),
+                                   library_root=root, library_diagnostics=diagnostics)
+    text = "\n".join(plan.report_lines())
+
+    assert plan.total == 0
+    assert "Smart Mix" in text and "Amount:" in text and "Total SFX: 0" in text
+    assert "No SFX placed" in text
+    assert "enabled but the library has no assets for it" in text
+    assert "Ignored unknown role folders: Impats" in text
+
+
+def test_the_diagnostics_reach_the_plan_without_touching_placements(tmp_path):
+    """Diagnostics are report provenance: identical placements with and without them."""
+    root = _sfx_library(tmp_path, {
+        "Risers/valid.wav": _OK, "Impats/typo.wav": _OK, "loose.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(10)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    structure = _structure_for_report()
+    config = fork_smart_mix.SmartMixConfig()
+
+    with_diag = fork_smart_mix.plan_sfx(structure, assets, config,
+                                        library_root=root, library_diagnostics=diagnostics)
+    without = fork_smart_mix.plan_sfx(structure, assets, config, library_root=root)
+    assert with_diag.placements == without.placements
+    assert with_diag.library_diagnostics.unknown_folders == ("Impats",)
+    assert without.library_diagnostics.unknown_folders == ()
+
+
+def test_prepare_sfx_inputs_returns_the_pure_diagnostic_value(tmp_path):
+    """The scan hands back an immutable value, not a loose dict only `root` was read from."""
+    root = _sfx_library(tmp_path, {"Risers/valid.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(5)))
+    _assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    assert isinstance(diagnostics, fork_smart_mix.SfxLibraryDiagnostics)
+    with pytest.raises(Exception):
+        diagnostics.root_level_files = 3        # frozen

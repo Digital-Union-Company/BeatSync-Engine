@@ -375,6 +375,59 @@ LABEL_AUDIO_LAYERS_REPORT = "Voice placement"
 PLACEHOLDER_AUDIO_LAYERS_REPORT = (
     "No voice clips selected. Add clips above and render to see where they land."
 )
+
+# ============================================================================
+# [FORK] Digital-Union: Smart Mix / SFX Pool V1 (E)
+# See src/beatsync_fork/smart_mix.py for the five placement rules and src/audio_mixdown.py for the
+# library scan and the FFmpeg streams. SFX land in the same final master Audio Layers already
+# produces: they change the final audio only, never the video edit.
+# ============================================================================
+
+LABEL_SMART_MIX = "🔊 Smart Mix / SFX"
+INFO_SMART_MIX = (
+    "Add sound-design accents — impacts on strong hits, risers into drops, atmosphere beds in "
+    "intros and breakdowns, transitions at section changes and short vocal shots. Point this at a "
+    "folder whose **first-level subfolders name the roles** (`Impacts/`, `Risers/`, `Atmosphere/`, "
+    "`Transitions/`, `VocalShots/`). Placement is deterministic and seedless: the same library, the "
+    "same track and the same settings always give the same result. SFX affect the **final audio "
+    "only** — the cuts and shot choices are still decided by your main music. Leave the folder "
+    "empty and nothing about your render changes."
+)
+
+LABEL_SFX_FOLDER = "📂 SFX library folder"
+PLACEHOLDER_SFX_FOLDER = r"D:\Audio\SFX"
+INFO_SFX_FOLDER = (
+    "Local folder read in place — nothing is copied. Accepted subfolder names: Impacts, Risers, "
+    "Atmosphere (or Ambience), Transitions, VocalShots. Anything else is ignored and reported. "
+    "MP3/WAV/FLAC only."
+)
+
+LABEL_SFX_ROLES = "🎚️ Enabled roles"
+INFO_SFX_ROLES = (
+    "Only ticked roles are scanned, probed and placed. Unticking a role is the clean way to use "
+    "part of a library."
+)
+
+LABEL_SFX_AMOUNT = "✨ SFX Amount"
+INFO_SFX_AMOUNT = (
+    "How busy the sound design is. 0 = no SFX at all. Higher values lower the impact threshold, "
+    "shorten the minimum spacing and raise the transition and vocal-shot limits. Risers and "
+    "atmospheres follow the song's structure and are not affected by this. Density is always "
+    "bounded — this control cannot turn the mix into noise."
+)
+
+LABEL_SFX_LEVEL = "🔊 SFX Level"
+INFO_SFX_LEVEL = (
+    "Percent of full level for every SFX. 50 = half level, 100 = full, 0 = silent (useful for "
+    "checking placement without hearing it). This is a plain level, not decibels, and it does not "
+    "duck the music — only voice does that."
+)
+
+LABEL_SMART_MIX_REPORT = "SFX placement"
+PLACEHOLDER_SMART_MIX_REPORT = (
+    "No SFX library selected. Choose a folder above and render to see what was placed."
+)
+
 LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV)"
 
 LABEL_CUSTOM_FPS = "🎞️ Custom FPS (Frame Rate)"

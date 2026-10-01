@@ -1400,6 +1400,110 @@ test asserts this against the real call — it is the most important test in D.
   delay) but keep its explicit type boundary; NaN/inf fall back to the default rather than clamping,
   so an infinite delay cannot become an enormous `adelay`.
 
+### Smart Mix V1 adds SFX to the same master (E)
+
+`beatsync_fork/smart_mix.py` (pure: roles, Amount mapping, percentile, five placement rules,
+occupancy) and `src/audio_mixdown.py` (library scan, ffprobe, the FFmpeg streams). E is a **second
+producer into D's single graph**, not a second pipeline:
+
+```
+ORIGINAL MUSIC -> Stages 1-5 -> selected_beats + beat_info          (the video edit)
+ORIGINAL MUSIC + voice + SFX + beat_info projection -> planners -> ONE mixdown -> ONE master WAV
+create_music_video(master, SAME selected_beats, SAME beat_info)     (render audio ONLY)
+```
+
+**`analyze_beats_auto` still receives `local_audio_path`.** SFX are planned *from* the finished
+`beat_info` and never fed back, so tempo, the grid, sections, Stage 4 cuts, Stage 5, Qwen and the
+visual planner are all decided before any SFX exists. `AudioMixPlan` gained exactly one trailing
+defaulted field (`sfx_placements`); there is still **one `amix`, one `alimiter`, one exact-duration
+master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
+
+- **Five frozen roles**, planned in this priority order: **riser → impact → transition →
+  vocal_shot → atmosphere**. Every accepted *non-atmosphere* interval is pairwise disjoint under
+  half-open `[start, end)`, so a riser ending exactly where a transition begins is legal. A
+  colliding candidate is **skipped with a reason**; anchors are never moved and nothing but an
+  atmosphere is ever trimmed. Atmospheres never enter occupancy — a bed underlays everything,
+  including voice.
+- **Folder = role, by an exact case-folded table** (`Impacts/ Risers/ Atmosphere|Ambience/
+  Transitions/ VocalShots/`, plural and `vocal shot`/`vocal_shot` variants — 15 aliases in all). No
+  `contains`, no `startswith`, no punctuation rewriting, no classifier. Unknown first-level folders
+  and root-level files are **reported and ignored, never guessed**; files nested below a recognised
+  role inherit it. Extensions are D's exactly — `.wav .mp3 .flac`, no `.m4a`.
+- **"Reported" means reported to the user, and that took a correction (R1).** `prepare_sfx_inputs`
+  collected `unknown_folders` / `root_level_files` / `unsupported` / `skipped_disabled` from the
+  start, but the scan's return value was read for `library_root` and nothing else, so all four were
+  dropped on the floor. A library with `Impats/` beside a valid `Risers/` still preflights — the
+  user was simply told there "happened to be no impacts", which defeats the entire point of exact
+  classification. The scan now returns the pure immutable `SfxLibraryDiagnostics`, `plan_sfx` carries
+  it on `SmartMixPlan`, and **`SmartMixPlan.report_lines()` is the one place it is rendered** —
+  `gui.py` threads the value and formats nothing, so there is still a single report formatter (a
+  test asserts the four phrases appear in neither `gui.py` nor `audio_mixdown.py`). Lines appear
+  only when non-empty, so a clean library gains no `Ignored …: 0` noise; unknown folder *names* are
+  shown (the names are the useful diagnostic) ordered **case-folded then by the original name**, never
+  by `os.walk`. Disabled-role files get the neutral `Files in disabled roles skipped: N` — disabling
+  a role is a choice, not a mistake. **This is reporting, not validation tightening**: all four stay
+  non-fatal and ignored, the fatal rules are untouched, and diagnostics reach no placement, no
+  `AudioMixPlan`, no creative state and no cache.
+- **Seedless.** Pools are ordered with `input_manager.order_key` and consumed round-robin, so the
+  same library, track and settings always reproduce. No `rng_for`, no Variation Seed, no Master
+  Creative Seed — E2 still owns the reserved `"audio"` RNG domain and it stays unused.
+- **The asset cursor advances on every candidate ATTEMPT, not every success.** Candidate `k` takes
+  `pool[k % N]` whether or not it lands. Without that, one asset too long to fit would be retried at
+  every later anchor and permanently block the rest of its pool.
+- **The impact percentile population is the WHOLE aligned beat array**; the bar-anchor mask is
+  applied *after* the threshold. That is what the accepted calibration measured — restricting the
+  population first silently shifts every threshold. The stdlib implementation reproduces
+  `numpy.percentile`'s default `linear` method with a measured maximum difference of **0.0** on the
+  real 566-beat array, which is how `beatsync_fork` stays numpy-free.
+- **Amount is total over 0..100.** Amount 0 is a hard off-branch (no scan, no probe, no planner, no
+  stream). Above it, continuous quantities interpolate piecewise-linearly between measured knots and
+  **clamp** below the lowest one rather than extrapolating; integer caps interpolate from a real 0
+  knot and quantise **half-up** (`floor(x+0.5)`, never `round()` — banker's rounding would collapse
+  two control positions onto one cap). Risers and atmospheres are structural and ignore Amount.
+  Pinned rows: 1 → `96/6.0/30.0/0/0`, 25 → `96/6/30/4/2`, 37 → `95.04/5.04/25.2/5/2`,
+  50 → `94/4/20/6/3`, 62 → `92.08/3.52/16.16/7/3`, 75 → `90/3/12/8/4`, 91 → `88.72/3/12/8/4`,
+  100 → `88/3/12/8/4`.
+- **Per role:** impacts on bar anchors above the threshold, spaced, **2 per section** (keyed on
+  section *identity*, not type) and `max(1, ceil(duration/20))` globally; risers end exactly on a
+  **genuine** drop entry (one whose predecessor is not `drop`/`finale`), never truncated or shifted;
+  transitions start exactly on a section-*type* change, no centring, no pre-roll; vocal shots sit on
+  phrase anchors inside `chorus`/`verse`/`breakdown` with **no impact threshold** and must fit
+  inside their own section; atmospheres fill the longest `intro`/`breakdown` sections ≥ 12 s, cap 2,
+  **trimmed to the section** and never looped.
+  The vocal-shot rule carries a measured reason: "high impact AND outside a drop" returned **0
+  shots** on the calibration track, because on that material the high-impact beats *are* the drops.
+- **SFX Level is a linear gain** — 50 % means 0.50, never −50 dB — applied as one `volume=` per SFX
+  stream. It is **execution state, not plan data**: `SfxPlacement` is frozen and carries no gain, so
+  the resolved level is threaded as a separate `sfx_level_percent` argument to `build_mixed_master`
+  / `build_mix_command`. Level 0 is a valid mute and does **not** deactivate Smart Mix.
+- **SFX are not ducked and do not duck.** The voice envelope multiplies the *music* only; voice is
+  never attenuated by the SFX level. With no voice there are no duck events and **no unity envelope
+  is synthesised** — the music routes straight to `[music]`, which an SFX-only mix needs anyway.
+- **Every enabled, recognised, supported asset is probed before Stage 1**, not only the ones a plan
+  selects: a corrupt file inside an enabled role is fatal before any analysis. Disabled roles,
+  unknown folders and root-level files are never probed. Zero usable assets in total is fatal; **one
+  empty enabled role while another has assets is not** — that role simply reports zero placements.
+  Musical outcomes are never fatal: no drops, no anchors, a collision or an asset that does not fit
+  all produce zero/skipped placements with reasons.
+- **Measured on the calibration track** (synthetic R0 pools, frozen occupancy): amount 25 → 15 SFX
+  (3/4/4/2/2), **50 → 19** (3 risers, 5 impacts, 6 transitions, 3 vocal shots, 2 atmospheres),
+  75 → 24, 100 → 25, with **zero non-atmosphere overlaps** at every setting. The default impact
+  count is **5, not 6**: the bar anchor at ~87.655 s falls inside the riser into the drop at
+  88.143 s and is skipped. That is the accepted consequence of riser priority — do not retune it
+  back. `tests/fixtures/nero_structure.json` holds the derived structure (no audio) so the suite
+  reproduces this without the production media file.
+- **Isolation.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`; `video_analysis.py`, `stage5_qwen_scene_worker.py`,
+  `library_prep.py`, `creative*.py`, `variant_lab.py`, `presets.py` and `variation.py` are
+  untouched. The SFX root is a runtime path argument and belongs to neither `CreativeProfile` nor
+  `CreativeRecipe`. **No CLI flag.**
+- **GUI: five components** in one collapsed `🔊 Smart Mix / SFX` accordion — folder Textbox, one
+  `CheckboxGroup` (all five roles on, `(label, value)` choices so the value *is* the internal role
+  name), Amount and Level sliders (0..100, step 1, default 50) and a read-only report. No Scan
+  button; the library is validated by the render preflight. The report mirrors D's R1-B lifecycle:
+  cleared before every attempt and before the gate, blank when inactive or on preflight failure,
+  populated only from `SmartMixPlan.report_lines()`, and written by **`process_btn.click` alone**.
+
 ### Variant Lab V1 generates one reproducible recipe (C2)
 
 `beatsync_fork/variant_lab.py` + `beatsync_fork/creative_recipe.py`. The user declares **what may
@@ -1673,6 +1777,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `creative_recipe.py` | the seven-integer `CreativeRecipe`: the exact execution configuration for one render, strictly validated as a whole, bridged to `CreativeProfile` |
 | `variant_lab.py` | Variant Lab V1: named stable RNG sub-streams, the frozen spread formula, range/config normalisation, and one resolved recipe per master seed |
 | `audio_mix.py` | Audio Layers V1: `AudioMixConfig`, deterministic voice placement and the duck model. Pure — no FFmpeg, no probing, no filesystem |
+| `smart_mix.py` | Smart Mix V1: the five SFX roles, the exact folder-alias table, `SmartMixConfig`, the Amount mapping, a stdlib percentile, all five placement rules and the cross-role occupancy policy. Pure — no FFmpeg, no probing, no filesystem walking, no numpy |
 | `deterministic_view.py` | reconstructs a candidate's pre-Qwen deterministic scores from the raw CV primitives Stage 5 never fuses |
 | `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 

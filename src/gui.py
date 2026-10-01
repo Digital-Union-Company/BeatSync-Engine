@@ -139,6 +139,11 @@ from beatsync_fork import variant_lab as fork_lab
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
 # the original music stays the one thing Stages 1-5 ever see.
 from beatsync_fork import audio_mix as fork_audio_mix
+# [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents. The role vocabulary and all
+# five placement rules live in src/beatsync_fork/smart_mix.py (stdlib-only, Gradio-free); the
+# library scan, probing and the FFmpeg streams reuse src/audio_mixdown.py — there is no second
+# mix engine, and SFX reach only the final render audio.
+from beatsync_fork import smart_mix as fork_smart_mix
 import audio_mixdown
 
 #: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
@@ -146,6 +151,11 @@ import audio_mixdown
 #: worker thread must never touch a Gradio component, so the value is carried on the dict the
 #: generator already yields and projected onto the widget there.
 AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
+
+#: [FORK] Digital-Union (Smart Mix V1 / E): the same bookkeeping seam as the Audio Layers report —
+#: the worker thread must never touch a Gradio component, so the text rides on `session_state` and
+#: the generator projects it onto the widget. Pure diagnostics: nothing downstream reads it.
+SMART_MIX_REPORT_KEY = 'smart_mix_report'
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -177,10 +187,11 @@ os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
 
 VideoFilesInput : TypeAlias = List[str]
 StatusResult : TypeAlias = Tuple[str, str, Dict]
-# [FORK] Digital-Union (Audio Layers V1 / D, R1-B): what `process_video_guarded` yields to Gradio —
-# the three values `process_video` streams, plus the Audio Layers placement read-out. The inner
+# [FORK] Digital-Union (Audio Layers V1 / D, R1-B; extended by Smart Mix V1 / E): what
+# `process_video_guarded` yields to Gradio — the three values `process_video` streams, plus the
+# Audio Layers placement read-out and the Smart Mix read-out. The inner
 # 3-value contract is deliberately unchanged; only the outermost handler projects onto the widgets.
-GuardedResult : TypeAlias = Tuple[str, str, Dict, str]
+GuardedResult : TypeAlias = Tuple[str, str, Dict, str, str]
 
 STATUS_BOX_CSS = """
 #status-output-box {
@@ -556,7 +567,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        event_callback: Callable[[ProgressEvent], None] | None = None,
                        verification_seconds: float | None = None,
                        voice_files: VideoFilesInput = None,
-                       audio_mix: fork_audio_mix.AudioMixConfig | None = None) -> StatusResult:
+                       audio_mix: fork_audio_mix.AudioMixConfig | None = None,
+                       sfx_root: str | None = None,
+                       smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
     # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
@@ -567,11 +580,15 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # early-return paths.
     mixed_master_path = None
     audio_plan = None
-    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is render
+    # [FORK] Digital-Union (Smart Mix V1 / E): same lifetime, same reason — the success panel asks
+    # afterwards whether any SFX was actually used.
+    smart_mix_plan = None
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): the read-outs are render
     # bookkeeping, cleared at the start of every attempt so a previous render's placements can
-    # never be mistaken for this one's. It is pure diagnostics: nothing downstream reads it, and
-    # it is not source or preparation state.
+    # never be mistaken for this one's. They are pure diagnostics: nothing downstream reads them,
+    # and they are not source or preparation state.
     session_state[AUDIO_LAYERS_REPORT_KEY] = ''
+    session_state[SMART_MIX_REPORT_KEY] = ''
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -641,6 +658,25 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             except audio_mixdown.AudioMixError as exc:
                 return None, f'❌ Audio Layers: {exc}', session_state
 
+        # [FORK] Digital-Union (Smart Mix V1 / E): the SFX library preflight, also BEFORE Stage 1
+        # and for the same reason. Smart Mix is ACTIVE only when a root is given, Amount > 0 and at
+        # least one role is enabled; otherwise nothing here runs at all — no scan, no ffprobe, no
+        # planner, no FFmpeg input — which is what keeps the no-SFX path structurally identical to
+        # D's (voice present) or to the original legacy path (no voice).
+        #
+        # SFX Level deliberately does NOT gate this: level 0 is a valid mute/debug value, so the
+        # plan and the report still resolve and the streams are simply added at gain 0.0.
+        smart_mix = smart_mix if smart_mix is not None else fork_smart_mix.SmartMixConfig()
+        smart_mix_active = bool(sfx_root and str(sfx_root).strip()) and smart_mix.plans_anything
+        sfx_assets = ()
+        sfx_diagnostics = None
+        if smart_mix_active:
+            try:
+                sfx_assets, sfx_diagnostics = audio_mixdown.prepare_sfx_inputs(
+                    sfx_root, smart_mix.enabled_roles)
+            except audio_mixdown.AudioMixError as exc:
+                return None, f'❌ Smart Mix: {exc}', session_state
+
         # Set GPU mode
         use_gpu = GPU_AVAILABLE
         set_gpu_mode(use_gpu)
@@ -692,11 +728,35 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # selection, Qwen and the visual targets were all decided before any voice existed. The
         # mixed master is produced *from* that finished analysis and is never fed back into it.
         #
-        # With no voice clips this branch does nothing at all: no planner, no FFmpeg, no temporary
-        # file, and `render_audio_path` is still the exact original path. That is a structural
-        # branch, not a mixed-but-equivalent WAV.
+        # With no voice clips and no SFX this branch does nothing at all: no planner, no FFmpeg, no
+        # temporary file, and `render_audio_path` is still the exact original path. That is a
+        # structural branch, not a mixed-but-equivalent WAV.
         render_audio_path = local_audio_path
-        if prepared_voices:
+
+        # [FORK] Digital-Union (Smart Mix V1 / E): SFX are planned HERE, from the finished
+        # `beat_info` — after the analysis, never before it and never fed back into it. The pure
+        # planner receives a small immutable projection rather than the mutable bus.
+        sfx_placements = ()
+        if smart_mix_active:
+            try:
+                structure = fork_smart_mix.project_structure(beat_info)
+            except fork_smart_mix.SmartMixStructureError as exc:
+                return None, f'❌ Smart Mix: {exc}', session_state
+            # The scan's diagnostics ride along untouched: the GUI never formats a warning of its
+            # own, so `SmartMixPlan.report_lines()` stays the single source of the report.
+            smart_mix_plan = fork_smart_mix.plan_sfx(
+                structure, sfx_assets, smart_mix,
+                library_root=str(sfx_root),
+                library_diagnostics=sfx_diagnostics)
+            sfx_placements = smart_mix_plan.placements
+            # The pure planner already produced these lines; the GUI never recomputes placement.
+            session_state[SMART_MIX_REPORT_KEY] = '\n'.join(smart_mix_plan.report_lines())
+
+        # Smart Mix that resolved ZERO placements must not manufacture a mixdown: with no voice
+        # either, the original music is still exactly the right render audio, and producing an
+        # identical-but-re-encoded WAV would be pure cost. The zero-placement report survives to
+        # explain why.
+        if prepared_voices or sfx_placements:
             try:
                 mixed_master_path, audio_plan = audio_mixdown.build_mixed_master(
                     music_path=local_audio_path,
@@ -707,17 +767,23 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     voices=prepared_voices,
                     config=audio_mix or fork_audio_mix.AudioMixConfig(),
                     session_dir=session_dir,
+                    sfx_placements=sfx_placements,
+                    sfx_level_percent=smart_mix.sfx_level_percent,
                 )
             except audio_mixdown.AudioMixError as exc:
-                # Deliberately before any clip extraction: the user asked for voice, so a silent
-                # fallback to the original music would render a plausible but wrong video.
+                # Deliberately before any clip extraction: the user asked for voice and/or SFX, so a
+                # silent fallback to the original music would render a plausible but wrong video.
                 return None, f'❌ Audio Layers: {exc}', session_state
             render_audio_path = mixed_master_path
             # The pure planner already produced these lines; the GUI never recomputes placement.
-            session_state[AUDIO_LAYERS_REPORT_KEY] = '\n'.join(audio_plan.report_lines())
-            if console_logger:
-                for line in audio_plan.report_lines():
-                    console_logger.line(line)
+            # Guarded on `prepared_voices`, not on the mixdown having happened: an SFX-only render
+            # also builds a master, and a voice report reading "Music + 0 voice clips" would be a
+            # read-out of something the user never asked for.
+            if prepared_voices:
+                session_state[AUDIO_LAYERS_REPORT_KEY] = '\n'.join(audio_plan.report_lines())
+                if console_logger:
+                    for line in audio_plan.report_lines():
+                        console_logger.line(line)
 
         if progress_callback:
             progress_callback(_stage_status(6))
@@ -791,8 +857,13 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             status_msg = f"{status_msg}\n\n{diagnostics}"
         # [FORK] Digital-Union (Audio Layers V1 / D): one concise line, and ONLY when voice was
         # actually used — a render without voice keeps the existing panel character for character.
-        if audio_plan is not None:
+        if audio_plan is not None and prepared_voices:
             status_msg = f"{status_msg}\n\n{audio_plan.summary_line()}"
+        # [FORK] Digital-Union (Smart Mix V1 / E): a separate concise line, and ONLY when at least
+        # one SFX was actually placed. An active Smart Mix that resolved zero placements keeps its
+        # explanatory report but adds no summary, because no SFX was used.
+        if smart_mix_plan is not None and smart_mix_plan.total:
+            status_msg = f"{status_msg}\n\n{smart_mix_plan.summary_line()}"
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
@@ -816,7 +887,9 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  creative: fork_creative.CreativeProfile | None = None,
                  verification_seconds: float | None = None,
                  voice_files: VideoFilesInput = None,
-                 audio_mix: fork_audio_mix.AudioMixConfig | None = None) -> Iterator[StatusResult]:
+                 audio_mix: fork_audio_mix.AudioMixConfig | None = None,
+                 sfx_root: str | None = None,
+                 smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -860,6 +933,8 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     verification_seconds=verification_seconds,
                     voice_files=voice_files,
                     audio_mix=audio_mix,
+                    sfx_root=sfx_root,
+                    smart_mix=smart_mix,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
@@ -1148,6 +1223,7 @@ def process_video_guarded(audio_file: str,
                           voice_files: VideoFilesInput, voice_start_delay: float,
                           voice_min_gap: float, voice_avoid_drops: bool,
                           music_under_voice: int,
+                          sfx_folder: str, sfx_roles, sfx_amount: int, sfx_level: int,
                           source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
@@ -1187,10 +1263,11 @@ def process_video_guarded(audio_file: str,
     # an authoritative filesystem re-scan of every confirmed source, so it is one of the costs that
     # grows with the library. Measuring wraps the existing call: the gate, the snapshot identity and
     # the allow/deny outcome are all untouched, and nothing is reused between renders.
-    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): clear the placement read-out before the
-    # gate, so a refused render shows no placements either — and so no path through this handler
-    # can leave the previous attempt's report on screen.
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): clear both read-outs
+    # before the gate, so a refused render shows no placements either — and so no path through this
+    # handler can leave the previous attempt's reports on screen.
     session_state[AUDIO_LAYERS_REPORT_KEY] = ''
+    session_state[SMART_MIX_REPORT_KEY] = ''
 
     verification_started = time.perf_counter()
     decision = resolve_for_render(
@@ -1199,7 +1276,7 @@ def process_video_guarded(audio_file: str,
     )
     verification_seconds = time.perf_counter() - verification_started
     if not decision.allowed:
-        yield None, f"❌ {decision.message}", session_state, ''
+        yield None, f"❌ {decision.message}", session_state, '', ''
         return
 
     # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
@@ -1232,11 +1309,23 @@ def process_video_guarded(audio_file: str,
         music_under_voice_percent=music_under_voice,
     )
 
-    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): `process_video` keeps its existing 3-value
-    # streaming contract — video, status, session_state — and this handler projects each yield onto
-    # the four Gradio outputs by appending the placement read-out that `_process_video_impl` has
-    # recorded on `session_state`. One extra output, no second placement computation, no new state
-    # object, and still nothing but `queue.put` happening on the worker thread.
+    # [FORK] Digital-Union (Smart Mix V1 / E): the three raw Smart Mix widget values become one
+    # normalised `SmartMixConfig` at the same render boundary, for the same reason. The SFX library
+    # ROOT stays a separate runtime path argument: it is a filesystem location the executor needs,
+    # not creative state, and it deliberately belongs to neither `CreativeProfile` nor
+    # `CreativeRecipe`. Like every other audio control these are render-request inputs and not video
+    # source identity, so changing any of them cannot clear a confirmation or start a scan.
+    smart_mix = fork_smart_mix.SmartMixConfig(
+        enabled_roles=sfx_roles,
+        amount=sfx_amount,
+        sfx_level_percent=sfx_level,
+    )
+
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): `process_video` keeps its
+    # existing 3-value streaming contract — video, status, session_state — and this handler projects
+    # each yield onto the five Gradio outputs by appending the two read-outs that
+    # `_process_video_impl` has recorded on `session_state`. Two extra outputs, no second placement
+    # computation, no new state object, and still nothing but `queue.put` on the worker thread.
     for video, status, state in process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
@@ -1248,8 +1337,12 @@ def process_video_guarded(audio_file: str,
         verification_seconds=verification_seconds,
         voice_files=voice_files,
         audio_mix=audio_mix,
+        sfx_root=sfx_folder,
+        smart_mix=smart_mix,
     ):
-        yield video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, '')
+        yield (video, status, state,
+               (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
+               (state or {}).get(SMART_MIX_REPORT_KEY, ''))
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -1658,6 +1751,62 @@ def create_ui() -> gr.Blocks:
                         max_lines=12,
                         interactive=False,
                         elem_id='audio-layers-report-box',
+                    )
+
+                # [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents, a collapsed
+                # sibling of Audio Layers because it layers onto the same final master.
+                #
+                # Five actual components. Exactly like the Audio Layers block, every one of them is
+                # a render-request input read at click time: none registers a handler, none appears
+                # in `source_outputs` or `prep_outputs`, and none is part of video-source identity,
+                # so changing the folder, the roles, Amount or Level cannot clear a confirmation,
+                # start a scan or touch Media Library Preparation. There is deliberately no Scan
+                # button — the library is validated by the Create Music Video preflight.
+                with gr.Accordion(label=LABEL_SMART_MIX, open=False):
+                    gr.Markdown(INFO_SMART_MIX)
+                    sfx_folder = gr.Textbox(
+                        label=LABEL_SFX_FOLDER,
+                        placeholder=PLACEHOLDER_SFX_FOLDER,
+                        info=INFO_SFX_FOLDER,
+                        elem_id='sfx-folder-input',
+                    )
+                    # `(label, value)` choices, so the value Gradio returns IS the exact internal
+                    # role name. Never a lowercase/replace heuristic over the display label: the
+                    # planner keys on these strings, so a derived name would be a silent
+                    # correctness hazard the moment a label is reworded.
+                    sfx_roles = gr.CheckboxGroup(
+                        choices=list(fork_smart_mix.ROLE_CHOICES),
+                        value=[role for _label, role in fork_smart_mix.ROLE_CHOICES],
+                        label=LABEL_SFX_ROLES,
+                        info=INFO_SFX_ROLES,
+                        elem_id='sfx-roles-group',
+                    )
+                    sfx_amount = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_AMOUNT,
+                        label=LABEL_SFX_AMOUNT,
+                        info=INFO_SFX_AMOUNT,
+                        elem_id='sfx-amount-slider',
+                    )
+                    sfx_level = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                        label=LABEL_SFX_LEVEL,
+                        info=INFO_SFX_LEVEL,
+                        elem_id='sfx-level-slider',
+                    )
+                    smart_mix_report = gr.Textbox(
+                        label=LABEL_SMART_MIX_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_SMART_MIX_REPORT,
+                        lines=6,
+                        max_lines=14,
+                        interactive=False,
+                        elem_id='smart-mix-report-box',
                     )
 
                 # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
@@ -2142,16 +2291,20 @@ def create_ui() -> gr.Blocks:
                 # `process_video_guarded`'s parameters, which a seam test pins name-for-name.
                 voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
                 music_under_voice,
+                # [FORK] Digital-Union (Smart Mix V1 / E): the four Smart Mix *config* widgets,
+                # same contract. The report is an output only and is deliberately absent here.
+                sfx_folder, sfx_roles, sfx_amount, sfx_level,
                 source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps, variation_seed,
                 cut_density, energy_response, motion_bias,
                 source_diversity, micro_cuts, semantic_emphasis,
                 session_state, source_state
             ],
-            # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is written
-            # here and nowhere else. It is an output only — never an input, never source or
+            # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
+            # written here and nowhere else. They are outputs only — never inputs, never source or
             # preparation state, and never consulted by the pipeline.
-            outputs=[video_output, status_output, session_state, audio_layers_report],
+            outputs=[video_output, status_output, session_state,
+                     audio_layers_report, smart_mix_report],
             show_progress='hidden'
         )
 

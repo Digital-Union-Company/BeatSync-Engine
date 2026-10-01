@@ -20,6 +20,116 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-02 (Smart Mix V1 — R1 correction)
+
+One narrow reporting defect before merge. The accepted architecture is unchanged: the Amount
+mapping, percentile population and formula, role vocabulary, alias matching, role priority,
+occupancy, the candidate-attempt asset cursor, the calibration ladder, the preflight probing policy,
+the SFX gain, the FFmpeg graph, the one-mix-engine design, `AudioMixPlan`'s single field and D's
+voice behaviour are all value-identical.
+
+- **Library scan diagnostics were collected and then silently dropped.** `prepare_sfx_inputs` has
+  always counted unknown role folders, root-level files, unsupported files and files in disabled
+  roles — but its return value was only ever read for `library_root`, so none of it reached the
+  report, the status panel, the console or any other user-visible surface. That broke the frozen
+  contract that these are *reported* and ignored: a library containing `Impats/` beside a valid
+  `Risers/` still preflights successfully, so the user was told only that there "happened to be no
+  impacts". The whole point of exact folder-role classification is that a typo is **visible**.
+- **The fix is reporting, not validation tightening.** Unknown folders, root-level files,
+  unsupported extensions and disabled-role assets all remain non-fatal and ignored, and the fatal
+  rules — missing/non-directory root, zero usable enabled assets, a missing or unprobeable enabled
+  asset, an invalid duration — are untouched.
+- **One pure value, one formatter.** `prepare_sfx_inputs` now returns the immutable
+  `SfxLibraryDiagnostics` instead of a loose dict, `plan_sfx` carries it on `SmartMixPlan` as a
+  trailing defaulted field, and `SmartMixPlan.report_lines()` is the only place it is rendered.
+  `gui.py` threads the value and formats nothing — a test asserts none of the four phrases appears
+  in `gui.py` or `audio_mixdown.py`, so there is no second report formatter. `SfxPlacement` is
+  unchanged, and the diagnostics reach no placement, no `AudioMixPlan`, no `CreativeProfile`, no
+  `CreativeRecipe` and no cache.
+- **Compact and deterministic.** A line appears only when its count or list is non-empty, so a clean
+  library gains no `Ignored …: 0` noise. Unknown folder *names* are listed (the names are the useful
+  diagnostic) sorted case-folded with the original name as tie-break, never in `os.walk` order;
+  everything else is a count rather than a list of paths. Disabled-role files read
+  `Files in disabled roles skipped: N` — deliberately neutral, since disabling a role is a choice.
+- **The zero-placement report is unregressed**: library header, `No SFX placed`, role-empty and
+  skip reasons, plus any diagnostics.
+- **The regression test runs the real chain** — `prepare_sfx_inputs` → `plan_sfx` →
+  `report_lines()` — on a real folder tree containing `Impats/typo.wav`, `Risers/valid.wav`,
+  `loose.wav` and `Risers/notes.txt`. Asserting on the scanner's own return value would have passed
+  throughout the bug, which is precisely why it was not caught.
+- No Gradio event was added: no scan button, no change or upload handler, no preflight callback.
+  `smart_mix_report` keeps exactly one writer, `process_btn.click`. `python -m pytest`: **3322
+  passed, 2 skipped** (up from 3292).
+
+### Added — 2026-10-01 (Smart Mix / SFX Pool V1 — E)
+
+Deterministic sound-design accents — impacts, risers, atmospheres, transitions and vocal shots —
+placed into the **same** final audio master Audio Layers already produces. Three controls: an SFX
+library folder, which roles are enabled, SFX Amount and SFX Level.
+
+- **No second mix engine.** E is a second producer into D's existing graph. `AudioMixPlan` gained
+  exactly one trailing defaulted field (`sfx_placements`), the executor gained one stream per
+  placement, and there is still one `amix`, one `alimiter` and one exact-duration master.
+  `video_processor.py` and `ffmpeg_processing.py` are untouched.
+- **The original music stays the only audio BeatSync analyses.** SFX are planned *from* the
+  finished `beat_info`, after the analysis and never fed back into it, so the cuts, the shot choices
+  and the whole video edit are unchanged by adding sound design.
+- **Folder = role, by an exact case-folded table** (`Impacts/`, `Risers/`,
+  `Atmosphere/`|`Ambience/`, `Transitions/`, `VocalShots/` and their plural / `vocal shot`
+  variants). No `contains`, no `startswith`, no punctuation rewriting and no classifier: unknown
+  folders and root-level files are reported and ignored rather than guessed, so a typo is visible
+  instead of silently becoming a role. `.wav .mp3 .flac` only — `.m4a` stays out for D's reason.
+- **Seedless and deterministic.** Pools are ordered with the project's existing
+  `input_manager.order_key` and consumed round-robin; the same library, track and settings always
+  reproduce exactly. The reserved `"audio"` RNG domain remains unused — that is E2.
+- **The asset cursor advances on every candidate attempt, not every success**, so one asset too long
+  to fit cannot be retried at every later anchor and permanently block the rest of its pool.
+- **Cross-role collisions are resolved by priority, never by moving an anchor.** Roles plan
+  riser → impact → transition → vocal_shot → atmosphere; every accepted non-atmosphere interval is
+  pairwise disjoint under half-open `[start, end)`, so a riser ending exactly where a transition
+  begins is legal. Atmospheres deliberately underlay everything and never enter occupancy.
+- **The impact percentile is taken over the whole aligned beat array**, with the bar-anchor mask
+  applied afterwards — what the accepted calibration measured. The stdlib implementation reproduces
+  `numpy.percentile`'s default method with a measured maximum difference of **0.0** on the real
+  566-beat array, keeping `beatsync_fork` numpy-free.
+- **SFX Amount is total over 0..100**: 0 is a hard off-branch; above it, continuous quantities
+  interpolate between measured knots and clamp below the lowest rather than extrapolating, and
+  integer caps quantise half-up. Risers and atmospheres follow the song's structure and ignore it.
+- **SFX Level is a linear gain** (50 % = 0.50, never −50 dB) applied as one `volume=` per stream. It
+  is execution state rather than plan data, so it rides as a separate argument and the frozen
+  `SfxPlacement` shape carries no gain. Level 0 is a valid mute and does not disable planning.
+- **SFX are neither ducked nor ducking.** The voice envelope multiplies the music only. With no
+  voice, no unity envelope is synthesised at all — the music routes straight through, which also
+  removes a full-length generated stream D was multiplying by one.
+- **The whole enabled library is probed before Stage 1**, so a corrupt asset in an enabled role
+  fails before any analysis is spent. Disabled roles, unknown folders and root-level files are never
+  probed. Zero usable assets is fatal; one empty enabled role beside a valid one is not, and no
+  musical outcome — no drops, no anchors, a collision, an asset that does not fit — is ever fatal.
+  Those report zero/skipped placements with reasons instead.
+- **Measured on the calibration track** with the frozen occupancy policy: amount 25 → 15 SFX,
+  **50 → 19** (3 risers, 5 impacts, 6 transitions, 3 vocal shots, 2 atmospheres), 75 → 24,
+  100 → 25, with **zero non-atmosphere overlaps** throughout. The default impact count is 5 rather
+  than the 6 an earlier approximate ladder showed: one high-impact bar anchor falls inside the riser
+  into the following drop and is skipped. That is the accepted consequence of riser priority and is
+  pinned by a test. `tests/fixtures/nero_structure.json` carries the derived structure — beat times,
+  anchor masks, the impact curve and the section table, **no audio** — so the suite reproduces the
+  calibration without depending on the production media file.
+- **Isolation.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `video_analysis.py`,
+  `stage5_qwen_scene_worker.py`, `library_prep.py`, `creative.py`, `creative_recipe.py`,
+  `variant_lab.py`, `presets.py` and `variation.py` are untouched. The SFX root is a runtime path
+  and belongs to neither `CreativeProfile` nor `CreativeRecipe`. **No CLI flag** — GUI only.
+- **Five GUI components** in one collapsed `🔊 Smart Mix / SFX` accordion, using a single
+  `CheckboxGroup` whose choices carry the exact internal role name rather than a label-derived
+  heuristic. No Scan button: the library is validated by the Create Music Video preflight. The
+  report mirrors Audio Layers' R1-B lifecycle and has exactly one writer.
+- **Three existing guards amended honestly, never evaded.** The pinned render click-input list
+  legitimately gained four config widgets (its real property — no preparation state in the render
+  request — is unchanged); the voiceless-graph test now pins the *stronger* property that no
+  envelope machinery is built at all; and the success-panel guard gained `and prepared_voices`,
+  since an SFX-only render also produces an `audio_plan`. `python -m pytest`: **3292 passed,
+  2 skipped** (up from 3063; the two skips are the pre-existing Windows symlink-privilege ones).
+
 ### Added — 2026-10-01 (Audio Layers V1 — D)
 
 Spoken voice over the music, with deterministic ducking, **without changing the edit the music

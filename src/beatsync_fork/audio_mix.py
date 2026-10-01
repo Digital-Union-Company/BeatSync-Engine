@@ -272,14 +272,30 @@ class PlacementFailure:
 
 @dataclass(frozen=True)
 class AudioMixPlan:
+    """The final audio plan: voice placements, their duck envelopes, and any Smart Mix SFX.
+
+    [FORK] Digital-Union (Smart Mix V1 / E): ``sfx_placements`` is the **one** field E added, and it
+    is last and defaulted so every pre-existing positional construction
+    ``AudioMixPlan(duration, placements, duck_events, config)`` stays valid. It deliberately carries
+    only *resolved placements*: Smart Mix's own config, amount, level and library root stay on
+    :class:`smart_mix.SmartMixPlan`, because the executor needs the events, not the generator that
+    produced them. The SFX gain reaches FFmpeg as a separate execution argument for the same reason.
+    There is no parallel final-audio plan type.
+    """
+
     music_duration: float
     placements: tuple
     duck_events: tuple
     config: AudioMixConfig
+    sfx_placements: tuple = ()
 
     @property
     def voice_count(self) -> int:
         return len(self.placements)
+
+    @property
+    def sfx_count(self) -> int:
+        return len(self.sfx_placements)
 
     def summary_line(self) -> str:
         """One line for the success panel. Only ever shown when voice was actually used."""
