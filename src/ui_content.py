@@ -325,6 +325,56 @@ def get_startup_header(cpu_count, max_threads, parallel_workers, python_status,
 # ============================================================================
 
 LABEL_AUDIO_FILE = "🎵 Audio File (MP3/WAV/FLAC)"
+
+# ============================================================================
+# [FORK] Digital-Union: Audio Layers V1 (D)
+# See src/beatsync_fork/audio_mix.py for the placement rules and src/audio_mixdown.py for the
+# mixdown. Voice changes the final audio only — the video edit is still decided entirely by the
+# main music, which is the only audio BeatSync analyses.
+# ============================================================================
+
+LABEL_AUDIO_LAYERS = "🎙️ Audio Layers"
+INFO_AUDIO_LAYERS = (
+    "Add spoken voice over the music. **Clips play in filename order** — name them `01_intro.wav`, "
+    "`02_quote.wav`, `03_outro.wav` to control the sequence; the order you pick them in the file "
+    "dialog is not used. Voice affects the **final audio only**: the cuts, the shot choices and the "
+    "whole video edit are still decided by your main music, which is the only audio analysed. "
+    "Leave this empty and nothing about your render changes."
+)
+
+LABEL_VOICE_FILES = "🎤 Voice clips (MP3/WAV/FLAC)"
+INFO_VOICE_FILES = (
+    "Played in filename order, never overlapping each other, and never extending past the music."
+)
+
+LABEL_VOICE_START_DELAY = "⏱️ Start delay (seconds)"
+INFO_VOICE_START_DELAY = (
+    "How long to wait before the first clip may start, so speech does not begin at 0:00. The clip "
+    "then lands on the first suitable beat after this point."
+)
+
+LABEL_VOICE_MIN_GAP = "↔️ Minimum gap (seconds)"
+INFO_VOICE_MIN_GAP = (
+    "Shortest silence between the end of one voice clip and the start of the next."
+)
+
+LABEL_VOICE_AVOID_DROPS = "🚫 Avoid drops"
+INFO_VOICE_AVOID_DROPS = (
+    "Keep speech entirely out of drop and finale sections — a clip may not even run into one. "
+    "Turn this off to allow talking over the biggest moments."
+)
+
+LABEL_MUSIC_UNDER_VOICE = "🔉 Music under voice"
+INFO_MUSIC_UNDER_VOICE = (
+    "Percent of the normal music level while voice is speaking. 35 = music at 35% of its usual "
+    "level under speech; 100 = no ducking at all; 0 = music silent under speech. The music fades "
+    "down and back up smoothly around each clip."
+)
+
+LABEL_AUDIO_LAYERS_REPORT = "Voice placement"
+PLACEHOLDER_AUDIO_LAYERS_REPORT = (
+    "No voice clips selected. Add clips above and render to see where they land."
+)
 LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV)"
 
 LABEL_CUSTOM_FPS = "🎞️ Custom FPS (Frame Rate)"

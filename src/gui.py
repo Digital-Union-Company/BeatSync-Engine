@@ -134,6 +134,18 @@ from beatsync_fork import presets as fork_presets
 # Variant Lab exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
 # handles the resolution object, so it has no reason to name the recipe type.
 from beatsync_fork import variant_lab as fork_lab
+# [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
+# src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
+# src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
+# the original music stays the one thing Stages 1-5 ever see.
+from beatsync_fork import audio_mix as fork_audio_mix
+import audio_mixdown
+
+#: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
+#: worker and the generator. It lives in `session_state` as ordinary render bookkeeping — the
+#: worker thread must never touch a Gradio component, so the value is carried on the dict the
+#: generator already yields and projected onto the widget there.
+AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -165,6 +177,10 @@ os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
 
 VideoFilesInput : TypeAlias = List[str]
 StatusResult : TypeAlias = Tuple[str, str, Dict]
+# [FORK] Digital-Union (Audio Layers V1 / D, R1-B): what `process_video_guarded` yields to Gradio —
+# the three values `process_video` streams, plus the Audio Layers placement read-out. The inner
+# 3-value contract is deliberately unchanged; only the outermost handler projects onto the widgets.
+GuardedResult : TypeAlias = Tuple[str, str, Dict, str]
 
 STATUS_BOX_CSS = """
 #status-output-box {
@@ -538,12 +554,24 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
                        event_callback: Callable[[ProgressEvent], None] | None = None,
-                       verification_seconds: float | None = None) -> StatusResult:
+                       verification_seconds: float | None = None,
+                       voice_files: VideoFilesInput = None,
+                       audio_mix: fork_audio_mix.AudioMixConfig | None = None) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
     # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
     # supplying nothing has always got.
     creative = creative if creative is not None else fork_creative.NEUTRAL_PROFILE
+    # [FORK] Digital-Union (Audio Layers V1 / D): declared before the `try` so the `finally` below
+    # can always run and the success panel can always ask whether voice was used, including on the
+    # early-return paths.
+    mixed_master_path = None
+    audio_plan = None
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is render
+    # bookkeeping, cleared at the start of every attempt so a previous render's placements can
+    # never be mistaken for this one's. It is pure diagnostics: nothing downstream reads it, and
+    # it is not source or preparation state.
+    session_state[AUDIO_LAYERS_REPORT_KEY] = ''
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -590,6 +618,29 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
              return None, f"❌ Error: Video files are missing or inaccessible.", session_state
         
+        # [FORK] Digital-Union (Audio Layers V1 / D): voice preflight, deliberately BEFORE Stage 1.
+        #
+        # Resolving paths and probing durations is cheap; a full Stage 1-5 analysis is not. A
+        # missing or unreadable voice clip is a user-fixable input problem, so it is caught here
+        # rather than after minutes of audio and video analysis. Placement needs `beat_info` and
+        # therefore cannot happen yet — only the file facts are established now.
+        #
+        # Ordering is the pure module's deterministic path order, never the browser's multi-select
+        # order. `prepare_voice_inputs` returns () for an empty selection, which is what keeps the
+        # no-voice path below structurally the original one.
+        #
+        # The selection is handed over WHOLE. `_as_existing_source_paths` is deliberately not used
+        # here: it filters out paths that no longer exist, which is right for video sources (the
+        # confirmation gate has already vouched for them) and wrong for voice — it would turn a
+        # three-clip selection with a missing middle file into a silent two-clip render. Validating
+        # the complete selection is `prepare_voice_inputs`'s job.
+        prepared_voices = ()
+        if voice_files:
+            try:
+                prepared_voices = audio_mixdown.prepare_voice_inputs(voice_files)
+            except audio_mixdown.AudioMixError as exc:
+                return None, f'❌ Audio Layers: {exc}', session_state
+
         # Set GPU mode
         use_gpu = GPU_AVAILABLE
         set_gpu_mode(use_gpu)
@@ -633,12 +684,47 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
 
+        # [FORK] Digital-Union (Audio Layers V1 / D): the ONE audio substitution, and the only
+        # place voice touches the render.
+        #
+        # Note what has already happened above: `analyze_beats_auto` was handed
+        # `local_audio_path` — the ORIGINAL music — so tempo, the beat grid, sections, energy, cut
+        # selection, Qwen and the visual targets were all decided before any voice existed. The
+        # mixed master is produced *from* that finished analysis and is never fed back into it.
+        #
+        # With no voice clips this branch does nothing at all: no planner, no FFmpeg, no temporary
+        # file, and `render_audio_path` is still the exact original path. That is a structural
+        # branch, not a mixed-but-equivalent WAV.
+        render_audio_path = local_audio_path
+        if prepared_voices:
+            try:
+                mixed_master_path, audio_plan = audio_mixdown.build_mixed_master(
+                    music_path=local_audio_path,
+                    music_duration=float(beat_info.get('audio_duration') or 0.0)
+                    or audio_mixdown.probe_duration(local_audio_path),
+                    beat_times=beat_times,
+                    sections=fork_audio_mix.project_sections(beat_info.get('sections')),
+                    voices=prepared_voices,
+                    config=audio_mix or fork_audio_mix.AudioMixConfig(),
+                    session_dir=session_dir,
+                )
+            except audio_mixdown.AudioMixError as exc:
+                # Deliberately before any clip extraction: the user asked for voice, so a silent
+                # fallback to the original music would render a plausible but wrong video.
+                return None, f'❌ Audio Layers: {exc}', session_state
+            render_audio_path = mixed_master_path
+            # The pure planner already produced these lines; the GUI never recomputes placement.
+            session_state[AUDIO_LAYERS_REPORT_KEY] = '\n'.join(audio_plan.report_lines())
+            if console_logger:
+                for line in audio_plan.report_lines():
+                    console_logger.line(line)
+
         if progress_callback:
             progress_callback(_stage_status(6))
 
         # Create video
         result_path = create_music_video(
-            local_audio_path, local_video_paths, selected_beats,
+            render_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
@@ -703,6 +789,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         diagnostics = _scale_diagnostics_block(verification_seconds, beat_info)
         if diagnostics:
             status_msg = f"{status_msg}\n\n{diagnostics}"
+        # [FORK] Digital-Union (Audio Layers V1 / D): one concise line, and ONLY when voice was
+        # actually used — a render without voice keeps the existing panel character for character.
+        if audio_plan is not None:
+            status_msg = f"{status_msg}\n\n{audio_plan.summary_line()}"
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
@@ -712,12 +802,21 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         traceback.print_exc()
         return None, error_msg, session_state
 
+    finally:
+        # [FORK] Digital-Union (Audio Layers V1 / D): the mixed master is temporary, so it goes on
+        # every path — success, render failure, and the early returns above. There is no persistent
+        # audio cache in V1 and a fresh uuid path per render, so nothing stale can be picked up
+        # later. The original music and the user's voice files are never touched.
+        audio_mixdown.discard_master(mixed_master_path)
+
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
                  custom_fps: float, session_state: dict,
                  creative: fork_creative.CreativeProfile | None = None,
-                 verification_seconds: float | None = None) -> Iterator[StatusResult]:
+                 verification_seconds: float | None = None,
+                 voice_files: VideoFilesInput = None,
+                 audio_mix: fork_audio_mix.AudioMixConfig | None = None) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -759,6 +858,8 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     console_logger=console_logger,
                     event_callback=event_callback,
                     verification_seconds=verification_seconds,
+                    voice_files=voice_files,
+                    audio_mix=audio_mix,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
@@ -1043,14 +1144,18 @@ def _on_new_variant(variant_master_seed, *lab_and_base) -> Tuple:
     return _on_generate_variant(_fresh_variant_master_seed(variant_master_seed), *lab_and_base)
 
 
-def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
+def process_video_guarded(audio_file: str,
+                          voice_files: VideoFilesInput, voice_start_delay: float,
+                          voice_min_gap: float, voice_avoid_drops: bool,
+                          music_under_voice: int,
+                          source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
                           custom_fps: float, variation_seed: int,
                           cut_density: int, energy_response: int, motion_bias: int,
                           source_diversity: int, micro_cuts: int, semantic_emphasis: int,
                           session_state: dict,
-                          source_state) -> Iterator[StatusResult]:
+                          source_state) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
@@ -1082,6 +1187,11 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     # an authoritative filesystem re-scan of every confirmed source, so it is one of the costs that
     # grows with the library. Measuring wraps the existing call: the gate, the snapshot identity and
     # the allow/deny outcome are all untouched, and nothing is reused between renders.
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): clear the placement read-out before the
+    # gate, so a refused render shows no placements either — and so no path through this handler
+    # can leave the previous attempt's report on screen.
+    session_state[AUDIO_LAYERS_REPORT_KEY] = ''
+
     verification_started = time.perf_counter()
     decision = resolve_for_render(
         source_state,
@@ -1089,7 +1199,7 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
     )
     verification_seconds = time.perf_counter() - verification_started
     if not decision.allowed:
-        yield None, f"❌ {decision.message}", session_state
+        yield None, f"❌ {decision.message}", session_state, ''
         return
 
     # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
@@ -1106,7 +1216,28 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         semantic_emphasis=semantic_emphasis,
     )
 
-    yield from process_video(
+    # [FORK] Digital-Union (Audio Layers V1 / D): the four raw audio-layer widget values are
+    # collapsed into one normalised `AudioMixConfig` here, at the same render boundary the creative
+    # profile uses, so nothing downstream ever sees an untrusted widget value. Nothing here can
+    # raise: every field is normalised on construction, and seconds are clamped into a sane range
+    # so an absurd typed value cannot become an enormous FFmpeg delay.
+    #
+    # Like the creative controls, these are render-request inputs and NOT video-source identity:
+    # none of them is wired into a source handler, so changing any of them cannot clear a
+    # confirmation, start a scan or touch Media Library Preparation.
+    audio_mix = fork_audio_mix.AudioMixConfig(
+        start_delay_seconds=voice_start_delay,
+        min_gap_seconds=voice_min_gap,
+        avoid_drops=voice_avoid_drops,
+        music_under_voice_percent=music_under_voice,
+    )
+
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): `process_video` keeps its existing 3-value
+    # streaming contract — video, status, session_state — and this handler projects each yield onto
+    # the four Gradio outputs by appending the placement read-out that `_process_video_impl` has
+    # recorded on `session_state`. One extra output, no second placement computation, no new state
+    # object, and still nothing but `queue.put` happening on the worker thread.
+    for video, status, state in process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
         output_filename=output_filename,
@@ -1115,7 +1246,10 @@ def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
         session_state=session_state,
         creative=creative,
         verification_seconds=verification_seconds,
-    )
+        voice_files=voice_files,
+        audio_mix=audio_mix,
+    ):
+        yield video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, '')
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -1466,6 +1600,65 @@ def create_ui() -> gr.Blocks:
             with gr.Column(scale=1):
                 gr.Markdown('### 📁 Input Files')
                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
+
+                # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed, and
+                # directly under the main audio input because that is what it layers onto.
+                #
+                # Every widget here is a render-request input read at click time: none registers a
+                # handler, none appears in `source_outputs` or `prep_outputs`, and none is part of
+                # video-source identity — so changing any of them cannot clear a confirmation.
+                with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
+                    gr.Markdown(INFO_AUDIO_LAYERS)
+                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
+                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
+                    # order is whatever the OS dialog supplies and is not the user's click order.
+                    voice_files = gr.File(
+                        label=LABEL_VOICE_FILES,
+                        file_count='multiple',
+                        file_types=['.mp3', '.wav', '.flac'],
+                        type='filepath',
+                        elem_id='voice-files-input',
+                    )
+                    voice_start_delay = gr.Number(
+                        label=LABEL_VOICE_START_DELAY,
+                        value=fork_audio_mix.DEFAULT_START_DELAY_SECONDS,
+                        minimum=fork_audio_mix.START_DELAY_MIN_SECONDS,
+                        maximum=fork_audio_mix.START_DELAY_MAX_SECONDS,
+                        info=INFO_VOICE_START_DELAY,
+                        elem_id='voice-start-delay-input',
+                    )
+                    voice_min_gap = gr.Number(
+                        label=LABEL_VOICE_MIN_GAP,
+                        value=fork_audio_mix.DEFAULT_MIN_GAP_SECONDS,
+                        minimum=fork_audio_mix.MIN_GAP_MIN_SECONDS,
+                        maximum=fork_audio_mix.MIN_GAP_MAX_SECONDS,
+                        info=INFO_VOICE_MIN_GAP,
+                        elem_id='voice-min-gap-input',
+                    )
+                    voice_avoid_drops = gr.Checkbox(
+                        label=LABEL_VOICE_AVOID_DROPS,
+                        value=True,
+                        info=INFO_VOICE_AVOID_DROPS,
+                        elem_id='voice-avoid-drops-checkbox',
+                    )
+                    music_under_voice = gr.Slider(
+                        minimum=fork_audio_mix.MUSIC_UNDER_VOICE_MIN,
+                        maximum=fork_audio_mix.MUSIC_UNDER_VOICE_MAX,
+                        step=1,
+                        value=fork_audio_mix.DEFAULT_MUSIC_UNDER_VOICE_PERCENT,
+                        label=LABEL_MUSIC_UNDER_VOICE,
+                        info=INFO_MUSIC_UNDER_VOICE,
+                        elem_id='music-under-voice-slider',
+                    )
+                    audio_layers_report = gr.Textbox(
+                        label=LABEL_AUDIO_LAYERS_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_AUDIO_LAYERS_REPORT,
+                        lines=6,
+                        max_lines=12,
+                        interactive=False,
+                        elem_id='audio-layers-report-box',
+                    )
 
                 # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
                 with gr.Group():
@@ -1944,13 +2137,21 @@ def create_ui() -> gr.Blocks:
             fn=process_video_guarded,
             inputs=[
                 audio_input,
+                # [FORK] Digital-Union (Audio Layers V1 / D): live render-request inputs, grouped
+                # with the audio they layer onto. Positionally aligned with
+                # `process_video_guarded`'s parameters, which a seam test pins name-for-name.
+                voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
+                music_under_voice,
                 source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps, variation_seed,
                 cut_density, energy_response, motion_bias,
                 source_diversity, micro_cuts, semantic_emphasis,
                 session_state, source_state
             ],
-            outputs=[video_output, status_output, session_state],
+            # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is written
+            # here and nowhere else. It is an output only — never an input, never source or
+            # preparation state, and never consulted by the pipeline.
+            outputs=[video_output, status_output, session_state, audio_layers_report],
             show_progress='hidden'
         )
 

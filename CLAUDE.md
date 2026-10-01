@@ -1303,6 +1303,103 @@ Cinematic 117 / 2.345 s / 34; Dynamic 167 / 1.650 s / 36; High Energy 200 / 1.37
 four produced complete plans with zero fallbacks, zero adjacent candidate repeats and an unchanged
 minimum cut gap across seeds 0, 7, 101, 4242, 381944 and 999999.
 
+### Audio Layers V1 adds voice without touching the edit (D)
+
+`beatsync_fork/audio_mix.py` (pure placement + duck model) and `src/audio_mixdown.py` (ffprobe +
+FFmpeg). The ordering is the whole architecture:
+
+```
+ORIGINAL MUSIC -> Stages 1-5 -> selected_beats + beat_info          (the video edit)
+ORIGINAL MUSIC + voice + beat_info projection -> planner -> mixdown -> mixed master WAV
+create_music_video(mixed master, SAME selected_beats, SAME beat_info)   (render audio ONLY)
+```
+
+**`analyze_beats_auto` always receives `local_audio_path`**, voice or no voice. The mixed master is
+produced *from* the finished analysis and never fed back into it, so tempo, the beat grid, sections,
+energy, cut selection, Qwen and the visual targets are all decided before any voice exists. A seam
+test asserts this against the real call — it is the most important test in D.
+
+- **No voice clips is the exact legacy path**, structurally: no ordering, no ffprobe, no planner, no
+  FFmpeg, no temporary file, and the same `local_audio_path` object reaches the renderer. The only
+  changed argument at the render boundary, ever, is `audio_file`.
+- **`video_processor.py` and `ffmpeg_processing.py` are untouched** and must stay that way: the
+  renderer already accepts an arbitrary audio path, and the CPU/NVENC/HEVC/ProRes branches all
+  consume it. Audio Layers terminates *before* the renderer.
+- **Deterministic filename order, never the browser's.** Voice clips are sorted with
+  `input_manager.order_key` — the project's existing documented total order — because the HTML File
+  API returns whatever the OS dialog supplies, which is not the user's click order. The help text
+  says so and recommends `01_`, `02_`, `03_`.
+- **The preflight validates the WHOLE selection and never returns a subset (R1-A).**
+  `prepare_voice_inputs` receives the raw widget value, keeps every entry
+  (`_selected_voice_paths` normalises a scalar/`PathLike`/iterable into a list and drops *nothing*),
+  and raises `AudioMixError` on the first entry that is not a usable path value, not a supported
+  extension, not an existing readable file, not probeable, or has a non-positive duration. Ordering
+  is applied **after** validation and its length is re-checked, so nothing can disappear in the sort
+  either. `_as_existing_source_paths` must **never** be used here: it filters out paths that no
+  longer exist, which is correct for video sources (the confirmation gate vouched for them) and
+  wrong for voice — it silently turned a 01/02/03 selection with a missing `02` into a two-clip
+  render that looked deliberate. The failure is raised before `analyze_beats_auto`, so a bad voice
+  file costs no analysis. A seam test asserts the call site passes `voice_files` and nothing else.
+- **The placement report is a real read-out, written by exactly one event (R1-B).**
+  `audio_layers_report` was declared with no writer, so the advertised report could never display
+  anything. A successful plan now populates it from `audio_plan.report_lines()` — the planner's own
+  lines, never recomputed in the GUI — via `session_state[AUDIO_LAYERS_REPORT_KEY]`, which
+  `process_video_guarded` projects onto a fourth output. `process_video` keeps its three-value
+  `StatusResult` contract; only the outer handler is `GuardedResult`. The key is cleared at the
+  start of every attempt and before the gate, so **no voice, a refused render, a preflight failure
+  and a mixdown failure all leave it blank rather than showing the previous render's placements.**
+  It is pure diagnostics: nothing downstream reads it, and it stays absent from the render inputs,
+  `source_outputs`, `prep_outputs`, every source and preparation handler and `live_declaration`.
+  The five *configuration* widgets remain unwritable by any handler — that guard was split, not
+  weakened, and the report has one permitted writer (`process_btn.click`) asserted by name.
+- **Placement is deterministic and seedless.** Cursor starts at the start delay; for each clip in
+  user order, take the earliest legal beat, then look at most `PLACEMENT_LOOKAHEAD_SECONDS = 4.0`
+  past it for a preferred section start (`intro, verse, breakdown, bridge, outro`), then any other
+  non-avoided section start. The bound is measured, not taste: preferring the best section start
+  *anywhere* threw the first clip 27 s forward and the second 83 s forward on the real track.
+- **Avoid drops is whole-interval**, and this is the rule most worth not weakening. A start-only
+  test let a 12 s clip begin 0.44 s before a drop and put **11.56 s — 96 % of its speech — inside
+  it**. Avoided types are exactly `drop` and `finale`, read from Stage 3's own vocabulary; `hook`
+  and `chorus` are deliberately not avoided. Intervals are half-open `[start, end)` throughout, so
+  boundary-touching is legal.
+- **Never drop, truncate, overlap or overrun.** No legal placement is an explicit failure naming the
+  clip, its duration and the cursor — raised before any video clip is extracted. A silent fallback
+  to music-only would look deliberate and be wrong.
+- **Music under voice is a linear gain.** 35 % means gain 0.35, *never* −35 dB, and the help text
+  must keep saying "percent of the normal music level". Attack/release are fixed at 250/400 ms, so
+  the music is already at the floor when the first syllable lands.
+- **Overlapping duck windows take the MINIMUM gain**, so a short gap leaves the music continuously
+  ducked. There is deliberately **no** hidden `min_gap >= attack + release` constraint. The FFmpeg
+  expression is `max()` of duck amounts and must never become a chain of `if()`, where whichever
+  event matched first would win.
+- **The envelope is `aevalsrc` + `amultiply`, not `volume`.** `volume=eval=frame` measured as a
+  staircase — ~5 steps across the 250 ms attack, largest 0.22 linear (~2.2 dB), an audible zipper —
+  and `volume` has no per-sample mode (`eval` accepts only `once`/`frame`). Per-sample evaluation
+  cut the deviation from the pure reference from **0.2245 to 0.0101**; a 280 s track mixes in 2.3 s.
+  Commas inside the expression are escaped for the graph parser.
+- **`alimiter` is a safety ceiling, not normalisation**, and `latency=1` is load-bearing. Full-scale
+  music plus full-scale voice clips **7.9 % of samples** without it. With
+  `limit=0.97:attack=1:release=50:level=0:latency=1` there is no clipping, impulses land on exactly
+  the planned sample, and a non-clipping fixture is **byte-identical** to the unlimited mix. Without
+  `latency=1` the whole master shifts 47 samples (0.979 ms). Verify any change to this on the
+  portable build before freezing it. `amix` uses `normalize=0`: `normalize=1` moved the same mix
+  from −21.28 to −27.09 dBFS, i.e. the music level would change with the voice count.
+- **One 48 kHz / stereo / `pcm_s24le` master, exactly the music's duration** (`apad` then
+  `atrim=end=D`). Measured delta 0.0000 ms across one voice, three voices, a voice ending at the
+  music's end and one deliberately overrunning; enforced at ≤ 1 ms because `create_music_video`
+  derives the frame-locked timeline from this file's duration.
+- **The master lives in `session_dir`, never `get_processing_dir()`** — `create_music_video` clears
+  that directory at startup and would delete the file moments after it was written. Fresh uuid path
+  per render, discarded in a `finally` on success and failure. No persistent audio cache; voice
+  sources are never copied or deleted.
+- **Isolation.** Voice never reaches Stage 5 (`stage5_cache_v3` and
+  `auto_av_analysis_v8_llama_vulkan_batched` unchanged), `CreativeProfile`, `CreativeRecipe`,
+  `VariantLabConfig` or the presets. Variant Lab audio integration is **E2** — `AudioMixConfig` is
+  its future destination, and D must not pre-empt it. **No CLI flag.**
+- Seconds controls deliberately do **not** reuse `creative.normalize_control` (`2.5` is a valid
+  delay) but keep its explicit type boundary; NaN/inf fall back to the default rather than clamping,
+  so an infinite delay cannot become an enormous `adelay`.
+
 ### Variant Lab V1 generates one reproducible recipe (C2)
 
 `beatsync_fork/variant_lab.py` + `beatsync_fork/creative_recipe.py`. The user declares **what may
@@ -1575,6 +1672,7 @@ enforces this both dynamically (subprocess module-table check) and statically (A
 | `presets.py` | the four named Creative Preset recipes: immutable data plus three total helpers. UI-only — the name reaches no stage, no profile and no cache |
 | `creative_recipe.py` | the seven-integer `CreativeRecipe`: the exact execution configuration for one render, strictly validated as a whole, bridged to `CreativeProfile` |
 | `variant_lab.py` | Variant Lab V1: named stable RNG sub-streams, the frozen spread formula, range/config normalisation, and one resolved recipe per master seed |
+| `audio_mix.py` | Audio Layers V1: `AudioMixConfig`, deterministic voice placement and the duck model. Pure — no FFmpeg, no probing, no filesystem |
 | `deterministic_view.py` | reconstructs a candidate's pre-Qwen deterministic scores from the raw CV primitives Stage 5 never fuses |
 | `library_prep.py` | media library preparation: classification vocabulary, scan state, report text, bounded analysis batches (trackless since P2) |
 
