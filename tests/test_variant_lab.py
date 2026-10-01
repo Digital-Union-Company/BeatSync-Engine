@@ -842,11 +842,17 @@ def test_variant_lab_writes_no_gate_or_preparation_widget():
 
 
 def test_new_variant_delegates_to_the_one_generate_path():
-    """One resolver call site: a second implementation is how the two buttons would drift apart."""
+    """One resolver call site: a second implementation is how the two buttons would drift apart.
+
+    **R1-B.** Minting moved out of this handler into `_fresh_variant_master_seed`, which is what
+    makes "a new master" a guarantee rather than a probability; the delegation property asserted
+    here is unchanged, and the minting itself is owned by the tests above.
+    """
     body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_new_variant")))
     assert "_on_generate_variant(" in body
-    assert "fork_variation.random_seed()" in body
+    assert "_fresh_variant_master_seed(" in body
     assert "fork_lab.resolve" not in body
+    assert "fork_lab.VariantLabConfig" not in body
 
 
 def test_the_generate_handler_mints_a_visible_master_seed_when_unset():
@@ -964,7 +970,8 @@ def test_a_generated_variant_almost_always_reads_custom():
 # dependency outside it fails here with NameError rather than silently going untested.
 # ---------------------------------------------------------------------------
 
-_HANDLER_NAMES = ("_variant_apply_outputs", "_on_generate_variant", "_on_new_variant")
+_HANDLER_NAMES = ("_variant_apply_outputs", "_on_generate_variant",
+                  "_fresh_variant_master_seed", "_on_new_variant")
 
 
 def _gui_handlers():
@@ -1025,19 +1032,171 @@ def test_an_unusable_master_seed_is_replaced_by_a_fresh_visible_one(bad_master: 
     assert _generate(minted, BALANCED) == outputs
 
 
-def test_new_variant_always_mints_a_fresh_visible_master():
-    handlers = _gui_handlers()
+def _new_variant(handlers, previous, base, spread=50):
     flat_ranges = [value for _ in FIELDS for value in (0, 100)]
+    return handlers["_on_new_variant"](
+        previous, spread, list(FIELDS), *flat_ranges, *[base[f] for f in FIELDS])
+
+
+def test_new_variant_mints_a_fresh_visible_master_on_the_normal_path():
+    handlers = _gui_handlers()
     seen = set()
     for _ in range(12):
-        outputs = handlers["_on_new_variant"](
-            582913, 50, list(FIELDS), *flat_ranges, *[BALANCED[f] for f in FIELDS])
+        outputs = _new_variant(handlers, 582913, BALANCED)
         assert outputs[0] != 582913, "New Variant must discard the incoming master seed"
         assert 1 <= outputs[0] <= 999_999
-        # and the minted master reproduces its own recipe
+        # and the minted master reproduces its own recipe from the same base
         assert _generate(outputs[0], BALANCED) == outputs
         seen.add(outputs[0])
     assert len(seen) > 1, "New Variant produced the same master every time"
+
+
+@pytest.mark.parametrize("collision", [1, 2, 582913, 999_999])
+def test_new_variant_is_guaranteed_not_probabilistic(monkeypatch, collision: int):
+    """**R1-B.** `random_seed()` draws from 1..999999, so it can legitimately return the value
+    already in the box. "New Variant always mints a new master" is a product contract, not a
+    probability — so the collision is *forced* here rather than hoped against.
+
+    The old version of this test relied on `SystemRandom` simply not returning 582913, which gave
+    it a one-in-a-million failure mode. No test in this suite may carry one.
+    """
+    from beatsync_fork import variation as fork_variation
+
+    monkeypatch.setattr(fork_variation, "random_seed", lambda: collision)
+    handlers = _gui_handlers()
+
+    # the helper, directly
+    fresh = handlers["_fresh_variant_master_seed"](collision)
+    assert fresh != collision
+    assert 1 <= fresh <= 999_999
+
+    # and through the button, which must still produce a usable reproducible recipe
+    outputs = _new_variant(handlers, collision, CINEMATIC)
+    assert outputs[0] != collision
+    assert 1 <= outputs[0] <= 999_999
+    assert outputs[1] > 0
+    assert _generate(outputs[0], CINEMATIC) == outputs
+
+
+@pytest.mark.parametrize("previous", [0, None, "", -5, 7.9, True, "nonsense"])
+def test_a_forced_collision_against_an_unusable_previous_master_is_not_a_collision(
+        monkeypatch, previous: Any):
+    """An unset or malformed box has no master to differ *from*, so the drawn seed is used as-is."""
+    from beatsync_fork import variation as fork_variation
+
+    monkeypatch.setattr(fork_variation, "random_seed", lambda: 4242)
+    handlers = _gui_handlers()
+    assert handlers["_fresh_variant_master_seed"](previous) == 4242
+
+
+def test_the_collision_step_stays_in_range_at_both_ends(monkeypatch):
+    from beatsync_fork import variation as fork_variation
+    handlers = _gui_handlers()
+
+    monkeypatch.setattr(fork_variation, "random_seed", lambda: 1)
+    assert handlers["_fresh_variant_master_seed"](1) == 2
+
+    monkeypatch.setattr(fork_variation, "random_seed", lambda: 999_999)
+    assert handlers["_fresh_variant_master_seed"](999_999) == 999_998
+
+
+def test_new_variant_reads_the_previous_master_rather_than_ignoring_it():
+    """"New" has to mean *different*, which is only checkable if the previous value is read."""
+    tree = _tree(_GUI)
+    body = ast.unparse(_strip_docstrings(_func(tree, "_on_new_variant")))
+    assert "_fresh_variant_master_seed(variant_master_seed)" in body
+    assert "_on_generate_variant(" in body
+    assert "fork_lab.resolve" not in body
+
+    helper = ast.unparse(_strip_docstrings(_func(tree, "_fresh_variant_master_seed")))
+    assert "fork_variation.random_seed()" in helper
+    assert "fork_lab.normalize_master_seed(previous)" in helper
+    # one draw, never a retry loop waiting on SystemRandom to disagree
+    assert "while" not in helper
+    assert "for " not in helper
+
+
+# ---------------------------------------------------------------------------
+# R1-A: the REAL live-base replay semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_generating_twice_with_the_same_master_intentionally_differs():
+    """**R1-A.** The base is the live sliders, and Generate writes the recipe back into them — so
+    an immediate second Generate resolves from the *first recipe*, not from the original preset.
+
+    This is correct under the accepted live-base architecture, and it is pinned here precisely so
+    the documentation cannot drift back to "a Master Seed alone reproduces a recipe". The clip seed
+    is unaffected, because it depends on the master seed alone.
+    """
+    first = _generate(582913, CINEMATIC, spread=50)
+    assert first[1:9] == (822019, 55, 15, 60, 63, 22, 62, "Custom")
+
+    # the sliders now hold the first recipe; press Generate again with the same master
+    second_base = dict(zip(FIELDS, first[2:8]))
+    second = _generate(582913, second_base, spread=50)
+
+    assert second[2:8] == (71, 9, 55, 77, 16, 71), "live-base semantics changed"
+    assert second[2:8] != first[2:8]
+    assert second[1] == first[1] == 822019, "the clip seed depends on the master seed alone"
+
+
+def test_restoring_the_base_replays_the_original_recipe_exactly():
+    """The actual reproducibility contract: same master **and** same base/config."""
+    first = _generate(582913, CINEMATIC, spread=50)
+    drifted = _generate(582913, dict(zip(FIELDS, first[2:8])), spread=50)
+    assert drifted[2:8] != first[2:8]
+
+    restored = _generate(582913, CINEMATIC, spread=50)
+    assert restored[1:9] == (822019, 55, 15, 60, 63, 22, 62, "Custom")
+    assert restored == first
+
+
+@pytest.mark.parametrize("changed", ["spread", "randomized", "ranges"])
+def test_replay_also_requires_the_same_lab_configuration(changed: str):
+    """Not just the base: the master seed is one input among several, and the others matter too."""
+    reference = _generate(582913, CINEMATIC, spread=50)
+    if changed == "spread":
+        other = _generate(582913, CINEMATIC, spread=51)
+    elif changed == "randomized":
+        other = _generate(582913, CINEMATIC, spread=50, randomized=["cut_density"])
+    else:
+        ranges = {f: (0, 100) for f in FIELDS}
+        ranges["cut_density"] = (0, 40)
+        other = _generate(582913, CINEMATIC, spread=50, ranges=ranges)
+
+    assert other[2:8] != reference[2:8], changed
+    assert other[1] == reference[1], "but the clip seed still depends on the master alone"
+
+
+def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
+    """**R1-A structural guard.** The help text said "Type a master seed you used before and
+    Generate to get that exact recipe back", which is false on its own: Generate overwrites the
+    sliders it generated from. This stops that claim returning."""
+    source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
+    start = source.index("INFO_MASTER_SEED")
+    info = source[start:source.index("\n)", start)]
+    lowered = info.lower()
+
+    # it must name the conditions
+    assert "starting slider" in lowered or "starting preset" in lowered or "starting value" in lowered
+    assert "spread" in lowered
+    assert "overwrites the sliders" in lowered or "generate overwrites" in lowered
+    # and it must say where the real render contract lives
+    assert "variation seed" in lowered and "six sliders" in lowered
+
+    # and it must not make the old unconditional promise
+    for overclaim in ("that exact recipe back", "get the same recipe back",
+                      "reproduces the recipe", "always reproduces"):
+        assert overclaim not in lowered, f"INFO_MASTER_SEED claims {overclaim!r}"
+
+
+def test_the_variant_lab_help_text_explains_the_write_back():
+    source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
+    start = source.index("INFO_VARIANT_LAB")
+    info = source[start:source.index("\n)", start)].lower()
+    assert "starting point" in info
+    assert "writes the result back" in info or "writes it back" in info
 
 
 def test_the_real_handler_honours_fixed_controls_and_spread_zero():

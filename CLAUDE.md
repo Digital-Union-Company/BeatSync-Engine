@@ -1347,6 +1347,28 @@ a test asserts none of that machinery exists.
   the box or mints one when unset. Either way the master is **an output**, so it is visible before
   it is used: `variation.random_seed()` is the only non-deterministic call, it lives in the GUI, and
   the pure resolver refuses to resolve without a positive master.
+- **A master seed alone is NOT a recipe identifier** (R1-A), and the help text must never say it is:
+
+  ```
+  MASTER SEED     = generator provenance   (reproduces a draw only with the same inputs)
+  CREATIVE RECIPE = execution artifact     (the seven values; durable on its own)
+  ```
+
+  The resolver's real contract is *same master **and** same base, ranges, randomize selection,
+  spread and algorithm version → same recipe*. Because the base is the live sliders and Generate
+  **writes the recipe back into them**, pressing Generate twice with one master deliberately yields
+  two different recipes — the second resolves from the first recipe. Pinned with exact values:
+  Cinematic + master 582913 + spread 50 → `55/15/60/63/22/62`; immediately again → `71/9/55/77/16/71`;
+  restore Cinematic → `55/15/60/63/22/62` again. The clip seed stays `822019` throughout, because it
+  depends on the master alone. **Do not "fix" this with a cached base snapshot** — hidden state that
+  disagrees with the visible sliders is worse than the honest explanation. A structural test keeps
+  `INFO_MASTER_SEED` from reclaiming master-only reproducibility.
+- **`🎲 New Variant` guarantees a different master, it does not merely hope for one** (R1-B).
+  `random_seed()` draws from 1..999999 and *can* return the value already in the box, so
+  `_fresh_variant_master_seed(previous)` draws once and, on a collision with a usable previous
+  master, steps deterministically to an adjacent seed. One draw, never a retry loop waiting on
+  `SystemRandom` to disagree. A monkeypatched forced-collision test replaces the old one that
+  relied on the draw simply not colliding — no test here may carry a one-in-a-million failure.
 - **Spread 0 is not a legacy render.** It freezes the six controls at their anchors *and still*
   resolves a positive clip seed, so clip selection varies. Help text and a test both say so.
 - **Spread is distance, not height**, and the bias wording matters because the obvious phrasing is

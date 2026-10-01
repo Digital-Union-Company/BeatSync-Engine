@@ -698,15 +698,28 @@ def test_e_the_worker_knows_nothing_about_creative_state():
 
 def test_e_no_director_or_freestyle_machinery_was_added():
     """P2 preserves the architectural space for those modes; it does not build them, and it adds no
-    speculative abstraction for them either."""
-    for path in (_VA, _WORKER, _GUI,
-                 os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py")):
+    speculative abstraction for them either.
+
+    **Amended by Variant Lab V1 R1 (C2).** `master_seed` was speculative when P2 wrote this; C2
+    implements it as a GUI generator input, and `_fresh_variant_master_seed` is named for exactly
+    what it does. The guard was therefore split rather than evaded by renaming the function: the
+    **Stage-5 side** — `video_analysis.py`, the Qwen worker and `library_prep.py` — must still know
+    nothing about a master seed, which is the architectural property P2 actually cared about, and
+    every other token stays forbidden everywhere including the GUI.
+    """
+    speculative_everywhere = ("director", "freestyle", "shortlist",
+                              "second_pass", "interpretation_mode")
+    stage5_side = (_VA, _WORKER, os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"))
+
+    for path in stage5_side + (_GUI,):
         source = open(path, "r", encoding="utf-8").read()
         tree = ast.parse(source)
         defined = {n.name.lower() for n in ast.walk(tree)
                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
-        for speculative in ("director", "freestyle", "master_seed", "shortlist",
-                            "second_pass", "interpretation_mode"):
+        forbidden = speculative_everywhere
+        if path in stage5_side:
+            forbidden = forbidden + ("master_seed",)
+        for speculative in forbidden:
             assert not any(speculative in name for name in defined), (
                 f"{path} defines speculative {speculative} machinery")
 

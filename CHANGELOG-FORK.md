@@ -20,6 +20,33 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-01 (Variant Lab V1 — R1 correction)
+
+Two narrow corrections to the Variant Lab PR before merge. The accepted core — `CreativeRecipe`,
+named RNG sub-streams, golden vectors, the spread formula, range normalisation, the algorithm
+version and the isolation guarantees — is unchanged, and **every golden vector is untouched**.
+
+- **R1-A — the Master Seed help text was false.** It said "type a master seed you used before and
+  Generate to get that exact recipe back", which is not true on its own: the base is the live
+  sliders and Generate *writes the recipe back into them*, so an immediate second Generate resolves
+  from the first recipe rather than the original preset. The resolver was always correct; only the
+  wording over-promised. `INFO_MASTER_SEED` and `INFO_VARIANT_LAB` now state the real contract —
+  a master repeats a draw only with the same starting values, ranges, ticked controls and spread,
+  and the exact render settings are the Variation Seed plus the six sliders. **No cached base
+  snapshot was added to hide the behaviour**: hidden state that disagrees with the visible sliders
+  would be worse than the honest explanation. Pinned with exact values — Cinematic + master 582913
+  + spread 50 → `55/15/60/63/22/62`, immediately again → `71/9/55/77/16/71`, restore Cinematic →
+  `55/15/60/63/22/62`, with the clip seed `822019` throughout — plus a structural test that stops
+  the help text reclaiming master-only reproducibility.
+- **R1-B — `🎲 New Variant` now guarantees a different master.** `random_seed()` draws from
+  1..999999 and can legitimately return the value already in the box, so "always mints a new
+  master" was a probability rather than the product contract. `_fresh_variant_master_seed(previous)`
+  draws once and, on a collision with a usable previous master, steps deterministically to an
+  adjacent seed — one draw, never a retry loop waiting on `SystemRandom` to disagree. Randomness
+  stays in the GUI; the pure resolver is unchanged. The old test relied on the draw simply not
+  colliding; it is replaced by a monkeypatched forced-collision test, because no test here may
+  carry a one-in-a-million failure mode.
+
 ### Added — 2026-10-01 (Variant Lab V1 — C2)
 
 The seed is no longer the only exploration axis. Declare which of the six creative controls may
@@ -55,6 +82,12 @@ reproducible recipe. It writes the Variation Seed and the six sliders, and nothi
   mints one if it is unset. Either way the master is **returned as an output**, so it is on screen
   before it is used — `random_seed()` is the only non-deterministic call and it lives in the GUI,
   never in the pure resolver, which refuses to resolve without a positive master.
+- **A master seed alone does not identify a recipe.** `MASTER SEED = generator provenance`;
+  `CREATIVE RECIPE = the durable execution artifact`. A master repeats a draw only with the same
+  base, ranges, randomize selection, spread and algorithm version. Since the base is the live
+  sliders and Generate writes the recipe back into them, two Generates with one master
+  intentionally differ — the second resolves from the first recipe. The seven resolved values
+  remain the exact render settings.
 - **Spread 0 is not a legacy render.** It freezes the six controls at their anchors but still
   resolves a *positive* clip seed, so clip selection still varies. The help text and a test both say
   so. A recipe can never carry seed 0 — that is the planner's legacy branch, and validation refuses

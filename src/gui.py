@@ -1010,14 +1010,37 @@ def _on_generate_variant(variant_master_seed, variation_spread, variant_randomiz
     return _variant_apply_outputs(master_seed, fork_lab.resolve(config, base))
 
 
+def _fresh_variant_master_seed(previous) -> int:
+    """A positive master seed that is **guaranteed** to differ from the usable previous one.
+
+    `random_seed()` draws from 1..999999, so it can legitimately return the value already in the
+    box. "New Variant always mints a new master" is a product contract, and leaving it to a
+    one-in-a-million draw makes it a probability rather than a guarantee — including in tests, which
+    would then carry a rare random failure.
+
+    So: draw once, and on a collision step deterministically to an adjacent seed. One draw, no
+    retry loop — waiting on `SystemRandom` to disagree is exactly the unbounded behaviour this
+    avoids. The step is expressed in terms of the drawn candidate rather than a repeated range
+    literal, so it stays inside `random_seed()`'s own 1..999999 range by construction whatever that
+    range later becomes. Randomness stays here in the GUI; the pure resolver never draws.
+    """
+    previous_master = fork_lab.normalize_master_seed(previous)
+    candidate = fork_variation.random_seed()
+    if previous_master > 0 and candidate == previous_master:
+        # Both branches stay in range: the draw is >= 1, so stepping down is safe unless it is
+        # exactly the low bound, in which case stepping up is.
+        return candidate - 1 if candidate > 1 else candidate + 1
+    return candidate
+
+
 def _on_new_variant(variant_master_seed, *lab_and_base) -> Tuple:
     """Always mint a fresh visible master seed, then take the ordinary Generate path.
 
-    The incoming master seed is deliberately discarded — that is what "new" means. Everything else
-    is delegated, so there is exactly one resolver call site and no second implementation that
-    could drift from it.
+    The incoming master seed is deliberately discarded — that is what "new" means — but it is still
+    read, because "new" also has to mean *different*. Everything after that is delegated, so there
+    is exactly one resolver call site and no second implementation that could drift from it.
     """
-    return _on_generate_variant(fork_variation.random_seed(), *lab_and_base)
+    return _on_generate_variant(_fresh_variant_master_seed(variant_master_seed), *lab_and_base)
 
 
 def process_video_guarded(audio_file: str, source_mode: str, source_folder: str,
