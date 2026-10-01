@@ -884,7 +884,7 @@ def test_prepare_sfx_inputs_classifies_orders_and_probes(tmp_path):
         "VocalShots/v.wav": _OK,
     })
     mix = load_mixdown(FakeSubprocess(_probes(10)))
-    assets, scan = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
 
     by_role = {}
     for item in assets:
@@ -894,7 +894,9 @@ def test_prepare_sfx_inputs_classifies_orders_and_probes(tmp_path):
     assert by_role["atmosphere"] == ["pad.flac"], "Ambience is a frozen atmosphere alias"
     assert set(by_role) == {"impact", "riser", "atmosphere", "transition", "vocal_shot"}
     assert all(item.duration == 2.0 for item in assets)
-    assert scan["per_role"]["impact"] == 2
+    assert dict(diagnostics.per_role)["impact"] == 2
+    assert diagnostics.root == root
+    assert not diagnostics.has_ignores, "a clean library reports nothing ignored"
 
 
 def test_unknown_folders_and_root_files_are_reported_and_never_probed(tmp_path):
@@ -907,12 +909,13 @@ def test_unknown_folders_and_root_files_are_reported_and_never_probed(tmp_path):
     })
     fake = FakeSubprocess(_probes(10))
     mix = load_mixdown(fake)
-    assets, scan = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
 
     assert [os.path.basename(a.path) for a in assets] == ["a.wav"]
-    assert sorted(scan["unknown_folders"]) == ["Bogus", "my impacts"]
-    assert scan["root_level_files"] == 1
-    assert scan["unsupported"] == 1
+    # already deterministically ordered by the scanner, not by os.walk
+    assert diagnostics.unknown_folders == ("Bogus", "my impacts")
+    assert diagnostics.root_level_files == 1
+    assert diagnostics.unsupported_files == 1
     probed = [c[-1] for c in fake.calls]
     assert len(probed) == 1 and probed[0].endswith("a.wav")
 
@@ -921,10 +924,10 @@ def test_disabled_role_assets_are_neither_returned_nor_probed(tmp_path):
     root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK, "Risers/b.wav": _OK})
     fake = FakeSubprocess(_probes(10))
     mix = load_mixdown(fake)
-    assets, scan = mix.prepare_sfx_inputs(root, ["impact"])
+    assets, diagnostics = mix.prepare_sfx_inputs(root, ["impact"])
 
     assert [a.role for a in assets] == ["impact"]
-    assert scan["skipped_disabled"] == 1
+    assert diagnostics.skipped_disabled_files == 1
     assert len(fake.calls) == 1, "a disabled role must cost no ffprobe"
 
 
@@ -1006,9 +1009,9 @@ def test_one_empty_enabled_role_is_not_fatal(tmp_path):
     """A role with no assets reports zero placements later; it does not fail the render."""
     root = _sfx_library(tmp_path, {"Impacts/a.wav": _OK})
     mix = load_mixdown(FakeSubprocess(_probes(5)))
-    assets, scan = mix.prepare_sfx_inputs(root, _ALL_ROLES)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, _ALL_ROLES)
     assert len(assets) == 1
-    assert scan["per_role"]["riser"] == 0
+    assert dict(diagnostics.per_role)["riser"] == 0
 
 
 def test_the_role_component_is_the_first_one_under_the_root():
@@ -1366,3 +1369,144 @@ def test_real_sfx_paths_with_spaces_and_mixed_rates(tmp_path):
                           [real_sfx("impact", a, 3.0), real_sfx("riser", b, 8.0)],
                           out_name="mix out.wav")
     assert abs(real_probe_duration(out) - duration) <= 0.001
+
+
+# ===========================================================================
+# SMART MIX V1 (E, R1): library diagnostics survive to the report
+# ===========================================================================
+#
+# The R1 defect was NOT that the scan failed to collect these — it collected all four and then
+# only `root` was ever read, so a typo'd folder was invisible to the user. Asserting on the
+# scanner's own return value would therefore have passed throughout the bug. These tests run the
+# REAL production chain instead: prepare_sfx_inputs -> plan_sfx -> SmartMixPlan.report_lines().
+
+
+def _structure_for_report():
+    sections = ((0.0, 29.0, "intro"), (29.0, 53.0, "intro"), (53.0, 74.0, "drop"),
+                (74.0, 100.0, "breakdown"))
+    beats = tuple(i * 0.5 for i in range(200))
+    count = len(beats)
+    return fork_smart_mix.MusicStructure(
+        music_duration=100.0, beat_times=beats,
+        is_bar_anchor=tuple(i % 4 == 0 for i in range(count)),
+        is_phrase_anchor=tuple(i % 8 == 0 for i in range(count)),
+        impact_strength=tuple((i % 13) / 13.0 for i in range(count)),
+        sections=sections)
+
+
+def _report_for(tmp_path, layout, roles=None):
+    """The real chain: scan the real tree, plan with the real planner, render the real report."""
+    root = _sfx_library(tmp_path, layout)
+    mix = load_mixdown(FakeSubprocess(_probes(40)))
+    assets, diagnostics = mix.prepare_sfx_inputs(
+        root, fork_smart_mix.ALL_ROLES if roles is None else roles)
+    plan = fork_smart_mix.plan_sfx(
+        _structure_for_report(), assets,
+        fork_smart_mix.SmartMixConfig(enabled_roles=(fork_smart_mix.ALL_ROLES
+                                                     if roles is None else roles)),
+        library_root=root, library_diagnostics=diagnostics)
+    return "\n".join(plan.report_lines()), plan, diagnostics
+
+
+def test_a_typo_folder_is_visible_in_the_final_report(tmp_path):
+    """The exact scenario from the contract: `Impats/` beside a valid `Risers/`.
+
+    Preflight succeeds because one usable enabled asset exists, so without R1 the user was told
+    only that there "happened to be no impacts".
+    """
+    text, _plan, _diag = _report_for(tmp_path, {
+        "Impats/typo.wav": _OK,
+        "Risers/valid.wav": _OK,
+        "loose.wav": _OK,
+        "Risers/notes.txt": _OK,
+    })
+    assert "Impats" in text, "the typo'd folder must be named in the report"
+    assert "Ignored unknown role folders: Impats" in text
+    assert "Ignored root-level files: 1" in text
+    assert "Ignored unsupported files: 1" in text
+
+
+def test_several_unknown_folders_are_listed_deterministically(tmp_path):
+    text, _plan, diagnostics = _report_for(tmp_path, {
+        "zeta/a.wav": _OK, "Misc/b.wav": _OK, "Impats/c.wav": _OK, "alpha/d.wav": _OK,
+        "Risers/valid.wav": _OK,
+    })
+    assert diagnostics.unknown_folders == ("alpha", "Impats", "Misc", "zeta")
+    assert "Ignored unknown role folders: alpha, Impats, Misc, zeta" in text
+
+
+def test_disabled_role_files_are_counted_neutrally_and_never_probed(tmp_path):
+    root = _sfx_library(tmp_path, {
+        "Risers/valid.wav": _OK,
+        "Impacts/a.wav": _OK, "Impacts/b.wav": _OK,
+    })
+    fake = FakeSubprocess(_probes(10))
+    mix = load_mixdown(fake)
+    assets, diagnostics = mix.prepare_sfx_inputs(root, ["riser"])
+    plan = fork_smart_mix.plan_sfx(
+        _structure_for_report(), assets,
+        fork_smart_mix.SmartMixConfig(enabled_roles=["riser"]),
+        library_root=root, library_diagnostics=diagnostics)
+    text = "\n".join(plan.report_lines())
+
+    assert len(fake.calls) == 1, "disabled-role files must still cost no ffprobe"
+    assert "Files in disabled roles skipped: 2" in text
+    for loaded in ("error", "warning", "invalid", "wrong"):
+        assert loaded not in text.casefold(), "disabling a role is a choice, not a mistake"
+
+
+def test_a_clean_library_adds_no_ignored_noise(tmp_path):
+    text, _plan, diagnostics = _report_for(tmp_path, {
+        "Impacts/a.wav": _OK, "Risers/b.wav": _OK, "Atmosphere/c.wav": _OK,
+        "Transitions/d.wav": _OK, "VocalShots/e.wav": _OK,
+    })
+    assert not diagnostics.has_ignores
+    assert "Ignored" not in text
+    assert "disabled roles" not in text
+
+
+def test_the_zero_placement_report_still_explains_itself_and_shows_diagnostics(tmp_path):
+    """A valid library that yields no musical placements keeps every existing explanation."""
+    structure = fork_smart_mix.MusicStructure(
+        music_duration=60.0, beat_times=(0.0, 1.0),
+        is_bar_anchor=(False, False), is_phrase_anchor=(False, False),
+        impact_strength=(0.0, 0.0), sections=((0.0, 60.0, "verse"),))
+    root = _sfx_library(tmp_path, {"Risers/valid.wav": _OK, "Impats/typo.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(10)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    plan = fork_smart_mix.plan_sfx(structure, assets, fork_smart_mix.SmartMixConfig(),
+                                   library_root=root, library_diagnostics=diagnostics)
+    text = "\n".join(plan.report_lines())
+
+    assert plan.total == 0
+    assert "Smart Mix" in text and "Amount:" in text and "Total SFX: 0" in text
+    assert "No SFX placed" in text
+    assert "enabled but the library has no assets for it" in text
+    assert "Ignored unknown role folders: Impats" in text
+
+
+def test_the_diagnostics_reach_the_plan_without_touching_placements(tmp_path):
+    """Diagnostics are report provenance: identical placements with and without them."""
+    root = _sfx_library(tmp_path, {
+        "Risers/valid.wav": _OK, "Impats/typo.wav": _OK, "loose.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(10)))
+    assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    structure = _structure_for_report()
+    config = fork_smart_mix.SmartMixConfig()
+
+    with_diag = fork_smart_mix.plan_sfx(structure, assets, config,
+                                        library_root=root, library_diagnostics=diagnostics)
+    without = fork_smart_mix.plan_sfx(structure, assets, config, library_root=root)
+    assert with_diag.placements == without.placements
+    assert with_diag.library_diagnostics.unknown_folders == ("Impats",)
+    assert without.library_diagnostics.unknown_folders == ()
+
+
+def test_prepare_sfx_inputs_returns_the_pure_diagnostic_value(tmp_path):
+    """The scan hands back an immutable value, not a loose dict only `root` was read from."""
+    root = _sfx_library(tmp_path, {"Risers/valid.wav": _OK})
+    mix = load_mixdown(FakeSubprocess(_probes(5)))
+    _assets, diagnostics = mix.prepare_sfx_inputs(root, fork_smart_mix.ALL_ROLES)
+    assert isinstance(diagnostics, fork_smart_mix.SfxLibraryDiagnostics)
+    with pytest.raises(Exception):
+        diagnostics.root_level_files = 3        # frozen

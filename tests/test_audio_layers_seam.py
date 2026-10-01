@@ -1141,3 +1141,67 @@ def test_the_reserved_audio_rng_domain_stays_unused():
         text = handle.read()
     assert 'rng_for(' not in text
     assert 'DOMAIN_AUDIO' not in text
+
+
+# ===========================================================================
+# SMART MIX V1 (E, R1): the GUI threads diagnostics, it never formats them
+# ===========================================================================
+
+
+def test_the_scan_diagnostics_are_threaded_into_the_planner():
+    """R1: the scan's return value used to reach only `library_root`, so everything it had
+    *ignored* was collected and then silently dropped."""
+    impl = body_source("_process_video_impl")
+    assert "sfx_assets, sfx_diagnostics = audio_mixdown.prepare_sfx_inputs(" in impl
+    assert "library_diagnostics=sfx_diagnostics" in impl
+    call = next(n for n in ast.walk(func("_process_video_impl"))
+                if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "fork_smart_mix.plan_sfx")
+    assert "library_diagnostics" in {kw.arg for kw in call.keywords}
+
+
+def test_the_gui_invents_no_diagnostic_text_of_its_own():
+    impl = body_source("_process_video_impl")
+    for phrase in ("Ignored unknown role folders", "Ignored root-level files",
+                   "Ignored unsupported files", "Files in disabled roles skipped",
+                   "unknown_folders", "root_level_files", "unsupported_files",
+                   "skipped_disabled_files"):
+        assert phrase not in impl, f"gui.py formats {phrase!r} itself"
+    assert "smart_mix_plan.report_lines()" in impl, "the plan is still the only source"
+
+
+def test_the_report_still_has_exactly_one_writer_after_r1():
+    writers = []
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is not None and SMART_MIX_REPORT_WIDGET in names_in(outputs):
+                writers.append(ast.unparse(node.func))
+    assert writers == ["process_btn.click"]
+
+
+def test_r1_added_no_gradio_event():
+    """No scan button, no change handler, no upload handler, no preflight callback."""
+    registrations = []
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release",
+                                       "upload", "select"}):
+            owner = getattr(node.func.value, "id", None)
+            if owner:
+                registrations.append(f"{owner}.{node.func.attr}")
+    for widget in SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,):
+        assert not any(r.startswith(widget + ".") for r in registrations), widget
+
+
+def test_diagnostics_stay_out_of_every_other_data_model():
+    """Report provenance only — never plan, creative or cache state."""
+    impl = func("_process_video_impl")
+    for callee in ("build_mixed_master", "analyze_beats_auto", "create_music_video",
+                   "CreativeProfile.from_widgets"):
+        for node in ast.walk(impl):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(callee):
+                assert "sfx_diagnostics" not in ast.unparse(node), callee
+    guarded = body_source("process_video_guarded")
+    assert "sfx_diagnostics" not in guarded

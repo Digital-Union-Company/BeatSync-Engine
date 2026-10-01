@@ -20,6 +20,47 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-02 (Smart Mix V1 — R1 correction)
+
+One narrow reporting defect before merge. The accepted architecture is unchanged: the Amount
+mapping, percentile population and formula, role vocabulary, alias matching, role priority,
+occupancy, the candidate-attempt asset cursor, the calibration ladder, the preflight probing policy,
+the SFX gain, the FFmpeg graph, the one-mix-engine design, `AudioMixPlan`'s single field and D's
+voice behaviour are all value-identical.
+
+- **Library scan diagnostics were collected and then silently dropped.** `prepare_sfx_inputs` has
+  always counted unknown role folders, root-level files, unsupported files and files in disabled
+  roles — but its return value was only ever read for `library_root`, so none of it reached the
+  report, the status panel, the console or any other user-visible surface. That broke the frozen
+  contract that these are *reported* and ignored: a library containing `Impats/` beside a valid
+  `Risers/` still preflights successfully, so the user was told only that there "happened to be no
+  impacts". The whole point of exact folder-role classification is that a typo is **visible**.
+- **The fix is reporting, not validation tightening.** Unknown folders, root-level files,
+  unsupported extensions and disabled-role assets all remain non-fatal and ignored, and the fatal
+  rules — missing/non-directory root, zero usable enabled assets, a missing or unprobeable enabled
+  asset, an invalid duration — are untouched.
+- **One pure value, one formatter.** `prepare_sfx_inputs` now returns the immutable
+  `SfxLibraryDiagnostics` instead of a loose dict, `plan_sfx` carries it on `SmartMixPlan` as a
+  trailing defaulted field, and `SmartMixPlan.report_lines()` is the only place it is rendered.
+  `gui.py` threads the value and formats nothing — a test asserts none of the four phrases appears
+  in `gui.py` or `audio_mixdown.py`, so there is no second report formatter. `SfxPlacement` is
+  unchanged, and the diagnostics reach no placement, no `AudioMixPlan`, no `CreativeProfile`, no
+  `CreativeRecipe` and no cache.
+- **Compact and deterministic.** A line appears only when its count or list is non-empty, so a clean
+  library gains no `Ignored …: 0` noise. Unknown folder *names* are listed (the names are the useful
+  diagnostic) sorted case-folded with the original name as tie-break, never in `os.walk` order;
+  everything else is a count rather than a list of paths. Disabled-role files read
+  `Files in disabled roles skipped: N` — deliberately neutral, since disabling a role is a choice.
+- **The zero-placement report is unregressed**: library header, `No SFX placed`, role-empty and
+  skip reasons, plus any diagnostics.
+- **The regression test runs the real chain** — `prepare_sfx_inputs` → `plan_sfx` →
+  `report_lines()` — on a real folder tree containing `Impats/typo.wav`, `Risers/valid.wav`,
+  `loose.wav` and `Risers/notes.txt`. Asserting on the scanner's own return value would have passed
+  throughout the bug, which is precisely why it was not caught.
+- No Gradio event was added: no scan button, no change or upload handler, no preflight callback.
+  `smart_mix_report` keeps exactly one writer, `process_btn.click`. `python -m pytest`: **3322
+  passed, 2 skipped** (up from 3292).
+
 ### Added — 2026-10-01 (Smart Mix / SFX Pool V1 — E)
 
 Deterministic sound-design accents — impacts, risers, atmospheres, transitions and vocal shots —

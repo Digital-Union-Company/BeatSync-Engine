@@ -425,7 +425,13 @@ def _role_relative_component(root: str, path: str):
 
 
 def prepare_sfx_inputs(root, enabled_roles):
-    """Enumerate, classify, order and probe the Smart Mix library. Returns ``(assets, scan)``.
+    """Enumerate, classify, order and probe the Smart Mix library.
+
+    Returns ``(assets, diagnostics)`` where ``diagnostics`` is the pure
+    :class:`smart_mix.SfxLibraryDiagnostics`. [FORK] Digital-Union (Smart Mix V1 / E, R1): it used
+    to be a loose dict that only ``library_root`` was ever read from, so everything the scan
+    *ignored* was collected and then silently dropped. Handing back the immutable value instead
+    means the planner can carry it and the report can render it, with no second formatter.
 
     Runs **before Stage 1** whenever Smart Mix is active, for the same reason D's voice preflight
     does: resolving paths and probing durations is cheap, a full Stage 1-5 analysis is not, and a
@@ -449,10 +455,10 @@ def prepare_sfx_inputs(root, enabled_roles):
         raise AudioMixError(f"Smart Mix: SFX library path is not a folder: {root}")
 
     wanted = fork_smart_mix.normalize_roles(enabled_roles)
-    scan = {
-        "root": root, "unknown_folders": [], "root_level_files": 0,
-        "unsupported": 0, "skipped_disabled": 0, "per_role": {},
-    }
+    unknown_folders = []
+    root_level_files = 0
+    unsupported_files = 0
+    skipped_disabled_files = 0
 
     by_role = {}
     try:
@@ -462,38 +468,49 @@ def prepare_sfx_inputs(root, enabled_roles):
                 full = os.path.join(directory, name)
                 component = _role_relative_component(root, full)
                 if component is None:
-                    scan["root_level_files"] += 1
+                    root_level_files += 1
                     continue
                 role = fork_smart_mix.role_for_folder(component)
                 if role is None:
-                    if component not in scan["unknown_folders"]:
-                        scan["unknown_folders"].append(component)
+                    if component not in unknown_folders:
+                        unknown_folders.append(component)
                     continue
                 if role not in wanted:
-                    scan["skipped_disabled"] += 1
+                    skipped_disabled_files += 1
                     continue
                 if not fork_smart_mix.has_supported_sfx_extension(full):
-                    scan["unsupported"] += 1
+                    unsupported_files += 1
                     continue
                 by_role.setdefault(role, []).append(full)
     except OSError as exc:
         raise AudioMixError(f"Smart Mix: could not read the SFX library: {exc}")
 
     assets = []
+    per_role = []
     for role in fork_smart_mix.ROLE_ORDER:
         ordered = fork_smart_mix.order_sfx_paths(by_role.get(role, ()))
-        scan["per_role"][role] = len(ordered)
+        per_role.append((role, len(ordered)))
         for path in ordered:
             if not os.path.isfile(path):
                 raise AudioMixError(f"Smart Mix: SFX asset is missing or unreadable: {path}")
             assets.append(fork_smart_mix.SfxAsset(
                 role=role, path=path, duration=probe_duration(path)))
 
+    diagnostics = fork_smart_mix.SfxLibraryDiagnostics(
+        root=root,
+        # Ordered here once, deterministically, so the report never depends on `os.walk`.
+        unknown_folders=fork_smart_mix.sort_unknown_folders(unknown_folders),
+        root_level_files=root_level_files,
+        unsupported_files=unsupported_files,
+        skipped_disabled_files=skipped_disabled_files,
+        per_role=tuple(per_role),
+    )
+
     if not assets:
         raise AudioMixError(
             "Smart Mix: the SFX library has no usable audio in any enabled role "
             f"({', '.join(sorted(wanted)) or 'none enabled'})")
-    return tuple(assets), scan
+    return tuple(assets), diagnostics
 
 
 def _walk_error(error):

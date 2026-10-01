@@ -669,10 +669,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         smart_mix = smart_mix if smart_mix is not None else fork_smart_mix.SmartMixConfig()
         smart_mix_active = bool(sfx_root and str(sfx_root).strip()) and smart_mix.plans_anything
         sfx_assets = ()
-        sfx_scan = None
+        sfx_diagnostics = None
         if smart_mix_active:
             try:
-                sfx_assets, sfx_scan = audio_mixdown.prepare_sfx_inputs(
+                sfx_assets, sfx_diagnostics = audio_mixdown.prepare_sfx_inputs(
                     sfx_root, smart_mix.enabled_roles)
             except audio_mixdown.AudioMixError as exc:
                 return None, f'❌ Smart Mix: {exc}', session_state
@@ -742,9 +742,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                 structure = fork_smart_mix.project_structure(beat_info)
             except fork_smart_mix.SmartMixStructureError as exc:
                 return None, f'❌ Smart Mix: {exc}', session_state
+            # The scan's diagnostics ride along untouched: the GUI never formats a warning of its
+            # own, so `SmartMixPlan.report_lines()` stays the single source of the report.
             smart_mix_plan = fork_smart_mix.plan_sfx(
                 structure, sfx_assets, smart_mix,
-                library_root=(sfx_scan or {}).get('root', str(sfx_root)))
+                library_root=str(sfx_root),
+                library_diagnostics=sfx_diagnostics)
             sfx_placements = smart_mix_plan.placements
             # The pure planner already produced these lines; the GUI never recomputes placement.
             session_state[SMART_MIX_REPORT_KEY] = '\n'.join(smart_mix_plan.report_lines())

@@ -1425,10 +1425,25 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
   atmosphere is ever trimmed. Atmospheres never enter occupancy — a bed underlays everything,
   including voice.
 - **Folder = role, by an exact case-folded table** (`Impacts/ Risers/ Atmosphere|Ambience/
-  Transitions/ VocalShots/`, plural and `vocal shot`/`vocal_shot` variants). No `contains`, no
-  `startswith`, no punctuation rewriting, no classifier. Unknown first-level folders and root-level
-  files are **reported and ignored, never guessed**; files nested below a recognised role inherit
-  it. Extensions are D's exactly — `.wav .mp3 .flac`, no `.m4a`.
+  Transitions/ VocalShots/`, plural and `vocal shot`/`vocal_shot` variants — 15 aliases in all). No
+  `contains`, no `startswith`, no punctuation rewriting, no classifier. Unknown first-level folders
+  and root-level files are **reported and ignored, never guessed**; files nested below a recognised
+  role inherit it. Extensions are D's exactly — `.wav .mp3 .flac`, no `.m4a`.
+- **"Reported" means reported to the user, and that took a correction (R1).** `prepare_sfx_inputs`
+  collected `unknown_folders` / `root_level_files` / `unsupported` / `skipped_disabled` from the
+  start, but the scan's return value was read for `library_root` and nothing else, so all four were
+  dropped on the floor. A library with `Impats/` beside a valid `Risers/` still preflights — the
+  user was simply told there "happened to be no impacts", which defeats the entire point of exact
+  classification. The scan now returns the pure immutable `SfxLibraryDiagnostics`, `plan_sfx` carries
+  it on `SmartMixPlan`, and **`SmartMixPlan.report_lines()` is the one place it is rendered** —
+  `gui.py` threads the value and formats nothing, so there is still a single report formatter (a
+  test asserts the four phrases appear in neither `gui.py` nor `audio_mixdown.py`). Lines appear
+  only when non-empty, so a clean library gains no `Ignored …: 0` noise; unknown folder *names* are
+  shown (the names are the useful diagnostic) ordered **case-folded then by the original name**, never
+  by `os.walk`. Disabled-role files get the neutral `Files in disabled roles skipped: N` — disabling
+  a role is a choice, not a mistake. **This is reporting, not validation tightening**: all four stay
+  non-fatal and ignored, the fatal rules are untouched, and diagnostics reach no placement, no
+  `AudioMixPlan`, no creative state and no cache.
 - **Seedless.** Pools are ordered with `input_manager.order_key` and consumed round-robin, so the
   same library, track and settings always reproduce. No `rng_for`, no Variation Seed, no Master
   Creative Seed — E2 still owns the reserved `"audio"` RNG domain and it stays unused.

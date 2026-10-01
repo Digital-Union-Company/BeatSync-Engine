@@ -911,3 +911,149 @@ def test_nothing_runs_past_the_end_of_the_music():
         plan = sm.plan_sfx(st, nero_pools(), sm.SmartMixConfig(amount=amount))
         for placement in plan.placements:
             assert placement.end <= st.music_duration + 1e-9, amount
+
+
+# ===========================================================================
+# 12. LIBRARY DIAGNOSTICS (R1)
+# ===========================================================================
+
+
+def test_diagnostics_default_to_empty_and_silent():
+    diagnostics = sm.SfxLibraryDiagnostics()
+    assert diagnostics.unknown_folders == ()
+    assert diagnostics.root_level_files == 0
+    assert diagnostics.unsupported_files == 0
+    assert diagnostics.skipped_disabled_files == 0
+    assert diagnostics.has_ignores is False
+    assert diagnostics.report_lines() == ()
+
+
+def test_only_non_empty_counts_produce_a_line():
+    assert sm.SfxLibraryDiagnostics(root_level_files=2).report_lines() == (
+        "Ignored root-level files: 2",)
+    assert sm.SfxLibraryDiagnostics(unsupported_files=3).report_lines() == (
+        "Ignored unsupported files: 3",)
+    assert sm.SfxLibraryDiagnostics(skipped_disabled_files=4).report_lines() == (
+        "Files in disabled roles skipped: 4",)
+    assert sm.SfxLibraryDiagnostics(unknown_folders=("Impats",)).report_lines() == (
+        "Ignored unknown role folders: Impats",)
+
+
+def test_all_four_lines_render_in_a_stable_order():
+    diagnostics = sm.SfxLibraryDiagnostics(
+        unknown_folders=("Impats", "Misc"), root_level_files=2,
+        unsupported_files=3, skipped_disabled_files=4)
+    assert diagnostics.report_lines() == (
+        "Ignored unknown role folders: Impats, Misc",
+        "Ignored root-level files: 2",
+        "Ignored unsupported files: 3",
+        "Files in disabled roles skipped: 4",
+    )
+    assert diagnostics.has_ignores is True
+
+
+@pytest.mark.parametrize("given,expected", [
+    (("zeta", "Alpha", "misc"), ("Alpha", "misc", "zeta")),
+    (("b", "A", "a", "B"), ("A", "a", "B", "b")),          # case-folded, original as tie-break
+    (("Impats", "impats"), ("Impats", "impats")),
+    ((), ()),
+    (None, ()),
+    (("ok", None, 7, ""), ("ok",)),
+])
+def test_unknown_folder_ordering_is_deterministic(given, expected):
+    assert sm.sort_unknown_folders(given) == expected
+
+
+def test_ordering_does_not_depend_on_the_order_it_was_handed():
+    names = ("zeta", "Alpha", "misc", "Bravo")
+    once = sm.sort_unknown_folders(names)
+    twice = sm.sort_unknown_folders(tuple(reversed(names)))
+    assert once == twice
+
+
+def test_the_report_renders_diagnostics_it_was_given():
+    plan = sm.plan_sfx(
+        structure(NERO_SECTIONS, duration=278.021), [asset("riser", 3.0)],
+        sm.SmartMixConfig(enabled_roles=["riser"]),
+        library_root="D:/sfx",
+        library_diagnostics=sm.SfxLibraryDiagnostics(
+            root="D:/sfx", unknown_folders=("Impats",), root_level_files=1))
+    text = "\n".join(plan.report_lines())
+    assert "Ignored unknown role folders: Impats" in text
+    assert "Ignored root-level files: 1" in text
+
+
+def test_diagnostics_never_influence_a_placement():
+    st = structure(NERO_SECTIONS, duration=278.021)
+    config = sm.SmartMixConfig(enabled_roles=["riser"])
+    plain = sm.plan_sfx(st, [asset("riser", 3.0)], config)
+    noisy = sm.plan_sfx(st, [asset("riser", 3.0)], config,
+                        library_diagnostics=sm.SfxLibraryDiagnostics(
+                            unknown_folders=("a", "b"), root_level_files=9,
+                            unsupported_files=9, skipped_disabled_files=9))
+    assert plain.placements == noisy.placements
+
+
+def test_diagnostics_are_optional_and_default_silently():
+    plan = sm.plan_sfx(structure(NERO_SECTIONS, duration=278.021),
+                       [asset("riser", 3.0)], sm.SmartMixConfig(enabled_roles=["riser"]))
+    assert plan.library_diagnostics == sm.SfxLibraryDiagnostics()
+    assert "Ignored" not in "\n".join(plan.report_lines())
+
+
+def test_an_amount_zero_plan_still_carries_its_diagnostics():
+    """Amount 0 is a hard off-branch, but a typo'd folder is still worth telling the user about."""
+    diagnostics = sm.SfxLibraryDiagnostics(unknown_folders=("Impats",))
+    plan = sm.plan_sfx(structure(NERO_SECTIONS, duration=278.021),
+                       [asset("riser", 3.0)], sm.SmartMixConfig(amount=0),
+                       library_diagnostics=diagnostics)
+    assert plan.total == 0
+    assert plan.library_diagnostics is diagnostics
+    assert "Ignored unknown role folders: Impats" in "\n".join(plan.report_lines())
+
+
+def test_the_diagnostics_value_is_immutable_and_hashable():
+    diagnostics = sm.SfxLibraryDiagnostics(
+        unknown_folders=("a",), per_role=(("impact", 2),))
+    with pytest.raises(Exception):
+        diagnostics.root_level_files = 1
+    assert isinstance(hash(diagnostics), int)
+
+
+def test_the_library_root_falls_back_to_the_diagnostics_root():
+    plan = sm.plan_sfx(structure(NERO_SECTIONS, duration=278.021),
+                       [asset("riser", 3.0)], sm.SmartMixConfig(enabled_roles=["riser"]),
+                       library_diagnostics=sm.SfxLibraryDiagnostics(root="D:/sfx"))
+    assert plan.library_root == "D:/sfx"
+
+
+def test_there_is_exactly_one_report_formatter():
+    """The diagnostics render through `SmartMixPlan.report_lines()` and nowhere else."""
+    import ast as _ast
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    for relative in ("src/gui.py", "src/audio_mixdown.py"):
+        with open(_os.path.join(repo, relative), "r", encoding="utf-8") as handle:
+            tree = _ast.parse(handle.read())
+        # strip docstrings: the prose legitimately explains what the report says
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef)):
+                if (node.body and isinstance(node.body[0], _ast.Expr)
+                        and isinstance(node.body[0].value, _ast.Constant)
+                        and isinstance(node.body[0].value.value, str)):
+                    node.body = node.body[1:] or [_ast.Pass()]
+        code = _ast.unparse(_ast.fix_missing_locations(tree))
+        for phrase in ("Ignored unknown role folders", "Ignored root-level files",
+                       "Ignored unsupported files", "Files in disabled roles skipped"):
+            assert phrase not in code, f"{relative} formats the report itself"
+
+
+def test_the_nero_ladder_is_untouched_by_r1():
+    """R1 is reporting only — the accepted calibration must be value-identical."""
+    for amount, expected in NERO_LADDER.items():
+        plan = sm.plan_sfx(_nero_structure(), nero_pools(), sm.SmartMixConfig(amount=amount),
+                           library_diagnostics=sm.SfxLibraryDiagnostics(
+                               unknown_folders=("Impats",), root_level_files=3))
+        assert plan.counts == {role: expected[role] for role in sm.ROLE_ORDER}
+        assert plan.total == expected["_total"]

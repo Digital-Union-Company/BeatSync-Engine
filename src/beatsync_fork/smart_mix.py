@@ -359,6 +359,57 @@ class SmartMixConfig:
 
 
 @dataclass(frozen=True)
+class SfxLibraryDiagnostics:
+    """What the library scan *ignored*, carried from the runtime scan to the report.
+
+    [FORK] Digital-Union (Smart Mix V1 / E, R1): collecting these was never the hard part —
+    *showing* them is. The whole point of exact folder-role classification is that a typo must be
+    visible: a library with ``Impats/`` beside a valid ``Risers/`` still preflights successfully,
+    and without this the user is told only that there "happened to be no impacts". These stay
+    strictly non-fatal — they are reported and ignored, exactly as the contract says.
+
+    Pure and immutable: built by the runtime scanner, rendered by :meth:`SmartMixPlan.report_lines`,
+    and never formatted anywhere else.
+    """
+
+    root: str = ""
+    unknown_folders: tuple = ()
+    root_level_files: int = 0
+    unsupported_files: int = 0
+    skipped_disabled_files: int = 0
+    per_role: tuple = ()          # ((role, count), ...) — a tuple so the value stays hashable
+
+    @property
+    def has_ignores(self) -> bool:
+        return bool(self.unknown_folders or self.root_level_files
+                    or self.unsupported_files or self.skipped_disabled_files)
+
+    def report_lines(self) -> tuple:
+        """Only non-empty counts produce a line — a clean library adds no ``Ignored …: 0`` noise."""
+        lines = []
+        if self.unknown_folders:
+            lines.append("Ignored unknown role folders: "
+                         + ", ".join(sort_unknown_folders(self.unknown_folders)))
+        if self.root_level_files:
+            lines.append(f"Ignored root-level files: {self.root_level_files}")
+        if self.unsupported_files:
+            lines.append(f"Ignored unsupported files: {self.unsupported_files}")
+        if self.skipped_disabled_files:
+            # Neutral wording on purpose: disabling a role is a choice, not a mistake.
+            lines.append(f"Files in disabled roles skipped: {self.skipped_disabled_files}")
+        return tuple(lines)
+
+
+def sort_unknown_folders(names) -> tuple:
+    """Deterministic order: case-folded, then the original name as tie-break.
+
+    Never `os.walk` order — two machines must render the same report for the same library.
+    """
+    usable = [name for name in (names or ()) if isinstance(name, str) and name]
+    return tuple(sorted(usable, key=lambda name: (name.casefold(), name)))
+
+
+@dataclass(frozen=True)
 class SfxAsset:
     """One prepared SFX file: already role-assigned, already ordered, already probed."""
 
@@ -421,6 +472,10 @@ class SmartMixPlan:
     library_root: str
     skips: tuple
     empty_roles: tuple
+    #: [FORK] Digital-Union (Smart Mix V1 / E, R1): what the library scan ignored. Trailing and
+    #: defaulted, so every existing construction stays valid. Generator/report provenance only —
+    #: it reaches no placement, no `AudioMixPlan`, no creative state and no cache.
+    library_diagnostics: SfxLibraryDiagnostics = SfxLibraryDiagnostics()
 
     @property
     def total(self) -> int:
@@ -469,7 +524,7 @@ class SmartMixPlan:
         if not rows:
             rows.append("No SFX placed — see the reasons below.")
 
-        tail = []
+        tail = list(self.library_diagnostics.report_lines())
         for role in self.empty_roles:
             tail.append(f"{role}: enabled but the library has no assets for it")
         if self.skips:
@@ -778,22 +833,29 @@ def _place_atmospheres(structure: MusicStructure, pool: Sequence, skips: list) -
 
 
 def plan_sfx(structure: MusicStructure, assets: Sequence, config: SmartMixConfig,
-             library_root: str = "") -> SmartMixPlan:
+             library_root: str = "",
+             library_diagnostics: SfxLibraryDiagnostics | None = None) -> SmartMixPlan:
     """Resolve every enabled role against the finished musical structure.
 
     Deterministic and seedless: the same structure, the same ordered pools and the same config
     always produce the same plan. Roles are planned in :data:`ROLE_PRIORITY` order and share one
     non-atmosphere occupancy set, so the result depends on that order and on nothing else.
+
+    ``library_diagnostics`` is carried straight through to the plan so the report can say what the
+    scan ignored; it never influences a single placement.
     """
     skips: list = []
     empty_roles: list = []
     placed: list = []
+    diagnostics = library_diagnostics or SfxLibraryDiagnostics()
+    library_root = library_root or diagnostics.root
 
     if not config.plans_anything:
         return SmartMixPlan(
             placements=(), config=config, library_asset_count=len(assets),
             library_role_count=len({asset.role for asset in assets}),
-            library_root=library_root, skips=(), empty_roles=())
+            library_root=library_root, skips=(), empty_roles=(),
+            library_diagnostics=diagnostics)
 
     params = amount_params(config.amount)
     occupancy = _Occupancy()
@@ -820,7 +882,8 @@ def plan_sfx(structure: MusicStructure, assets: Sequence, config: SmartMixConfig
     return SmartMixPlan(
         placements=tuple(placed), config=config, library_asset_count=len(assets),
         library_role_count=len({asset.role for asset in assets}),
-        library_root=library_root, skips=tuple(skips), empty_roles=tuple(empty_roles))
+        library_root=library_root, skips=tuple(skips), empty_roles=tuple(empty_roles),
+        library_diagnostics=diagnostics)
 
 
 __all__ = [
@@ -852,6 +915,7 @@ __all__ = [
     "RISER_BLOCKING_PREDECESSORS",
     "SUPPORTED_SFX_EXTENSIONS",
     "SfxAsset",
+    "SfxLibraryDiagnostics",
     "SfxPlacement",
     "SfxSkip",
     "SmartMixConfig",
@@ -868,4 +932,5 @@ __all__ = [
     "plan_sfx",
     "project_structure",
     "role_for_folder",
+    "sort_unknown_folders",
 ]
