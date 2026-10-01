@@ -92,6 +92,47 @@ produced**. Five controls: voice clips, start delay, minimum gap, avoid drops, m
   source and preparation handler and `live_declaration`, so changing one cannot clear a confirmation.
   One concise success-panel line when voice was used, and nothing at all when it was not.
 
+### Fixed — 2026-10-01 (Audio Layers V1 — R1 correction)
+
+Two narrow corrections before merge. The accepted architecture — the music-only analysis, the pure
+planner, the duck model, the measured FFmpeg filtergraph, the `session_dir` master and the isolation
+guarantees — is unchanged, and no measured expectation was retuned.
+
+- **R1-A — a selected voice file could be silently dropped.** The preflight was handed
+  `_as_existing_source_paths(voice_files) or voice_files`, and that helper *filters* to paths that
+  still exist. Selecting `01`, `02`, `03` with `02` missing therefore rendered a plausible two-clip
+  video instead of failing: exactly the silent-fallback outcome D exists to prevent, and worse than
+  the music-only fallback because it still looked deliberate. `prepare_voice_inputs` now receives
+  the raw selection and validates **all** of it — a usable path value, a supported extension, an
+  existing readable file, a successful probe and a positive duration — raising `AudioMixError` on
+  the first bad entry and **never** returning the valid subset. `_selected_voice_paths` normalises a
+  scalar, `PathLike` or arbitrary iterable into a list without discarding anything, and the
+  deterministic filename ordering is applied *after* validation with its length re-checked, so
+  nothing can vanish in the sort either. Still raised before `analyze_beats_auto`, so a bad voice
+  file costs no analysis. The helper's existing video-source use is unchanged — filtering is correct
+  there, because the confirmation gate has already vouched for those paths.
+- **R1-B — the placement report widget was dead.** `audio_layers_report` was declared with no
+  writer and was not among the render event's outputs, so the advertised read-out could never
+  display anything. A successful plan now populates it from the planner's own
+  `audio_plan.report_lines()` — never recomputed in the GUI — through
+  `session_state[AUDIO_LAYERS_REPORT_KEY]`, which `process_video_guarded` projects onto a fourth
+  output. `process_video` keeps its three-value contract; only the outer handler became
+  four-valued. The key is cleared at the start of every attempt and before the gate, so **no voice,
+  a refused render, a preflight failure and a mixdown failure all leave it blank** rather than
+  showing the previous render's placements. It remains pure diagnostics: nothing downstream reads
+  it, and it stays absent from the render inputs, `source_outputs`, `prep_outputs`, every source and
+  preparation handler and `live_declaration`.
+- **One guard split, not weakened.** The invariant "no Audio Layers widget is written by any
+  handler" became false for exactly one legitimate widget. The five *configuration* controls keep
+  the full prohibition, and the report gained a named single-writer assertion (`process_btn.click`)
+  plus an explicit check that no source, preparation, preset or Variant Lab handler touches it.
+- The report lifecycle is proven by **executing the real extracted orchestration** from
+  `_process_video_impl` against stubs, not by calling `report_lines()` in isolation — a hand-written
+  mirror would keep passing after the production code stopped matching it. `python -m pytest`:
+  **3063 passed, 2 skipped** (up from 3033; the two skips are the pre-existing Windows
+  symlink-privilege ones). No cache contract, analysis version, planner, renderer or pure-module
+  change: `src/beatsync_fork/audio_mix.py` was **not** modified.
+
 ### Fixed — 2026-10-01 (Variant Lab V1 — R1 correction)
 
 Two narrow corrections to the Variant Lab PR before merge. The accepted core — `CreativeRecipe`,

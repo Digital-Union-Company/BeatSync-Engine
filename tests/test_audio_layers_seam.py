@@ -29,8 +29,14 @@ from beatsync_fork import audio_mix as fork_audio_mix
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
 
-AUDIO_WIDGETS = ("voice_files", "voice_start_delay", "voice_min_gap",
-                 "voice_avoid_drops", "music_under_voice", "audio_layers_report")
+#: The five user-settable controls. These are render-request inputs and must NEVER be written back.
+AUDIO_CONFIG_WIDGETS = ("voice_files", "voice_start_delay", "voice_min_gap",
+                        "voice_avoid_drops", "music_under_voice")
+
+#: The read-only placement read-out. It is an output of the render event and of nothing else.
+AUDIO_REPORT_WIDGET = "audio_layers_report"
+
+AUDIO_WIDGETS = AUDIO_CONFIG_WIDGETS + (AUDIO_REPORT_WIDGET,)
 
 
 def tree() -> ast.Module:
@@ -341,17 +347,320 @@ def test_audio_widgets_are_absent_from_source_and_preparation_wiring():
                             assert widget not in names_in(kw.value), f"{button}.{kw.arg}"
 
 
-def test_no_audio_widget_is_written_by_any_handler():
-    """Nothing programmatically changes the user's voice selection or settings."""
+def test_no_audio_configuration_widget_is_ever_written():
+    """Nothing programmatically changes the user's voice selection or settings.
+
+    **Amended by R1-B.** This forbade *every* Audio Layers widget from being written, which made
+    the read-only `audio_layers_report` dead — declared but with no writer, so the advertised
+    placement report could never display anything. The invariant split rather than weakened: the
+    five *configuration* widgets stay unwritable, and the report gets exactly one permitted writer
+    (asserted separately below). Renaming around the guard would have been evasion.
+    """
     for node in ast.walk(tree()):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"click", "change", "input", "submit", "release"}):
             outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
             if outputs is None:
                 continue
-            for widget in AUDIO_WIDGETS:
+            for widget in AUDIO_CONFIG_WIDGETS:
                 assert widget not in names_in(outputs), (
                     f"{ast.unparse(node.func)} writes {widget}")
+
+
+def test_the_report_has_exactly_one_writer_and_it_is_the_render_event():
+    """R1-B: the report must have a real writer, and only one."""
+    writers = []
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is not None and "audio_layers_report" in names_in(outputs):
+                writers.append(ast.unparse(node.func))
+    assert writers == ["process_btn.click"], writers
+
+
+def test_no_source_preparation_preset_or_variant_handler_writes_the_report():
+    for button in ("source_mode", "source_folder", "source_recursive", "scan_btn", "video_input",
+                   "confirm_btn", "prep_folder", "prep_recursive", "prep_batch_size",
+                   "prep_scan_btn", "prep_analyze_btn", "creative_preset", "randomize_btn",
+                   "generate_variant_btn", "new_variant_btn"):
+        for node in ast.walk(tree()):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and getattr(node.func.value, "id", None) == button):
+                for kw in node.keywords:
+                    if kw.arg in ("inputs", "outputs"):
+                        assert "audio_layers_report" not in names_in(kw.value), button
+
+
+# ===========================================================================
+# 7b. R1-A / R1-B: the two corrections, asserted on the real orchestration
+# ===========================================================================
+
+
+def test_the_voice_preflight_receives_the_unfiltered_selection():
+    """**R1-A.** `_as_existing_source_paths` filters out paths that no longer exist — right for
+    video sources, wrong for voice, where it turned a three-clip selection with a missing middle
+    file into a silent two-clip render."""
+    source = body_source("_process_video_impl")
+    assert "audio_mixdown.prepare_voice_inputs(voice_files)" in source
+    assert "_as_existing_source_paths(voice_files)" not in source
+
+    # the call passes the raw widget value and nothing else
+    impl = func("_process_video_impl")
+    for node in ast.walk(impl):
+        if isinstance(node, ast.Call) and "prepare_voice_inputs" in ast.unparse(node.func):
+            assert [ast.unparse(a) for a in node.args] == ["voice_files"]
+            break
+    else:
+        raise AssertionError("prepare_voice_inputs is not called")
+
+
+def test_the_video_source_use_of_the_filter_helper_is_untouched():
+    """The helper is still correct for video sources, which the confirmation gate has vouched for."""
+    source = body_source("_process_video_impl")
+    assert "_as_existing_source_paths(video_files)" in source
+
+
+#: Statement selectors for the three real audio regions of `_process_video_impl`. The report
+#: lifecycle is *behaviour* — cleared, then populated, and specifically NOT populated on either
+#: failure path — which no structural assertion can show, so the real statements are extracted and
+#: executed rather than mirrored by hand. Mirroring would let the test keep passing after the
+#: production code stopped doing what the mirror says.
+def _audio_region_statements() -> list:
+    impl = func("_process_video_impl")
+    picked = []
+    for node in ast.walk(impl):
+        if (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript)
+                and getattr(node.targets[0].slice, "id", None) == "AUDIO_LAYERS_REPORT_KEY"
+                and getattr(node.value, "value", None) == ""):
+            picked.append(node)
+        elif isinstance(node, ast.Assign) and ast.unparse(node) in (
+                "prepared_voices = ()", "render_audio_path = local_audio_path"):
+            picked.append(node)
+        elif isinstance(node, ast.If) and getattr(node.test, "id", None) in (
+                "voice_files", "prepared_voices"):
+            picked.append(node)
+    picked.sort(key=lambda n: n.lineno)
+    # report-clear, prepared_voices = (), if voice_files, render_audio_path = …, if prepared_voices
+    assert len(picked) == 5, [ast.unparse(p)[:60] for p in picked]
+    return picked
+
+
+_AUDIO_BLOCK_ARGS = ("voice_files", "session_state", "local_audio_path", "beat_info", "beat_times",
+                     "audio_mix", "session_dir", "console_logger", "audio_mixdown",
+                     "fork_audio_mix", "AUDIO_LAYERS_REPORT_KEY")
+
+
+def _compile_audio_block():
+    """Wrap the extracted statements in a function so their real `return`s work."""
+    statements = _audio_region_statements()
+    prologue = ast.parse("mixed_master_path = None\naudio_plan = None").body
+    epilogue = ast.parse(
+        "return render_audio_path, session_state[AUDIO_LAYERS_REPORT_KEY], audio_plan").body
+    fn = ast.FunctionDef(
+        name="_audio_block",
+        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=a) for a in _AUDIO_BLOCK_ARGS],
+                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+        body=prologue + statements + epilogue,
+        decorator_list=[], returns=None, type_params=[])
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    namespace = {}
+    exec(compile(module, _GUI, "exec"), namespace)
+    return namespace["_audio_block"]
+
+
+def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None):
+    """Execute the REAL extracted audio region; return (state, calls, error_message)."""
+    calls = []
+
+    class Err(Exception):
+        pass
+
+    class FakeMixdown:
+        AudioMixError = Err
+
+        @staticmethod
+        def prepare_voice_inputs(selection):
+            calls.append(("prepare", selection))
+            if isinstance(voice_result, BaseException):
+                raise Err(str(voice_result))
+            return voice_result
+
+        @staticmethod
+        def probe_duration(path):
+            calls.append(("probe", path))
+            return 200.0
+
+        @staticmethod
+        def build_mixed_master(**kwargs):
+            calls.append(("mix", kwargs))
+            if mix_error is not None:
+                raise Err(str(mix_error))
+            return "C:/session/mix.wav", plan
+
+    state = {"audio_layers_report": "STALE REPORT FROM A PREVIOUS RENDER"}
+    result = _compile_audio_block()(
+        voice_files=voice_files,
+        session_state=state,
+        local_audio_path="C:/music/track.mp3",
+        beat_info={"audio_duration": 200.0, "sections": None},
+        beat_times=[0.0, 1.0, 2.0],
+        audio_mix=None,
+        session_dir="C:/session",
+        console_logger=None,
+        audio_mixdown=FakeMixdown,
+        fork_audio_mix=fork_audio_mix,
+        AUDIO_LAYERS_REPORT_KEY="audio_layers_report",
+    )
+    if result[0] is None:                       # a real refusal: (None, '❌ …', session_state)
+        return state, calls, result[1]
+    return state, calls, None
+
+
+def _sample_plan():
+    config = fork_audio_mix.AudioMixConfig()
+    placements = (
+        fork_audio_mix.VoicePlacement(0, "C:/v/01_intro.wav", 3.2, 12.4, 15.6, "verse",
+                                      fork_audio_mix.ANCHOR_PREFERRED_SECTION, 0.0),
+        fork_audio_mix.VoicePlacement(1, "C:/v/02_quote.wav", 4.1, 20.0, 24.1, "breakdown",
+                                      fork_audio_mix.ANCHOR_BEAT, 1.5),
+    )
+    return fork_audio_mix.AudioMixPlan(
+        200.0, placements,
+        fork_audio_mix.build_duck_events(placements, 200.0, config), config)
+
+
+def test_a_successful_plan_populates_the_report():
+    plan = _sample_plan()
+    state, _calls, error = _run_report_lifecycle(["a.wav", "b.wav"], ("v1", "v2"), plan=plan)
+    report = state["audio_layers_report"]
+
+    assert error is None
+    assert report
+    assert "01_intro.wav" in report and "02_quote.wav" in report
+    assert report.index("01_intro.wav") < report.index("02_quote.wav")   # resolved order
+    assert "12.4" in report and "15.6" in report                          # planned times
+    assert "verse" in report and fork_audio_mix.ANCHOR_PREFERRED_SECTION in report
+    assert "Music under voice: 35%" in report
+
+
+def test_no_voice_leaves_a_blank_report():
+    state, calls, error = _run_report_lifecycle([], ())
+    assert error is None
+    assert state["audio_layers_report"] == ''
+    assert calls == [], "no voice must mean no probing and no mixdown"
+
+
+def test_a_preflight_failure_leaves_no_stale_report():
+    state, calls, error = _run_report_lifecycle(
+        ["a.wav", "b.wav"], AssertionError("Voice clip is missing or unreadable: b.wav"))
+    assert state["audio_layers_report"] == ''
+    assert "missing or unreadable" in error
+    assert [kind for kind, _ in calls] == ["prepare"], "the mixdown must not be reached"
+
+
+def test_a_mix_failure_leaves_no_stale_report():
+    # a previous successful render really did leave a report behind
+    previous, _calls, _err = _run_report_lifecycle(["a.wav"], ("v1",), plan=_sample_plan())
+    assert previous["audio_layers_report"]
+
+    state, calls, error = _run_report_lifecycle(
+        ["a.wav"], ("v1",), mix_error=AssertionError("Audio mixdown failed: boom"))
+    assert state["audio_layers_report"] == ''
+    assert "mixdown failed" in error
+    assert "mix" in [kind for kind, _ in calls]
+
+
+def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():
+    """Every path through the handlers starts from a blank report, including a refused render."""
+    guarded = body_source("process_video_guarded")
+    impl = body_source("_process_video_impl")
+    assert "session_state[AUDIO_LAYERS_REPORT_KEY] = ''" in guarded
+    assert guarded.index("AUDIO_LAYERS_REPORT_KEY] = ''") < guarded.index("resolve_for_render(")
+    assert "session_state[AUDIO_LAYERS_REPORT_KEY] = ''" in impl
+    assert impl.index("AUDIO_LAYERS_REPORT_KEY] = ''") < impl.index("try:")
+
+
+def test_a_refused_render_yields_a_blank_report():
+    """The gate's own refusal is a yield, so it has to carry the fourth value itself."""
+    refusal = next(node for node in ast.walk(func("process_video_guarded"))
+                   if isinstance(node, ast.If)
+                   and ast.unparse(node.test) == "not decision.allowed")
+    yielded = next(n for n in ast.walk(refusal) if isinstance(n, ast.Yield))
+    assert isinstance(yielded.value, ast.Tuple)
+    assert len(yielded.value.elts) == 4, ast.unparse(yielded)
+    assert isinstance(yielded.value.elts[3], ast.Constant)
+    assert yielded.value.elts[3].value == ""
+
+
+def test_the_guard_projects_the_three_value_stream_onto_four_outputs():
+    """`process_video` keeps its 3-value contract; only the outermost handler projects."""
+    guarded = body_source("process_video_guarded")
+    assert "for video, status, state in process_video(" in guarded
+    assert "yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''))" in guarded
+    # the inner generator's 3-value contract is unchanged; only the outer handler is 4-valued
+    assert ast.unparse(func("process_video").returns) == "Iterator[StatusResult]"
+    assert ast.unparse(func("process_video_guarded").returns) == "Iterator[GuardedResult]"
+
+
+def test_the_report_is_populated_from_the_planner_and_never_recomputed():
+    """The GUI quotes the plan it was given; it does not re-derive placement for display."""
+    source = body_source("_process_video_impl")
+    assert "'\\n'.join(audio_plan.report_lines())" in source
+    for forbidden in ("plan_voice_placements", "build_duck_events", "duck_gain_at",
+                      "build_duck_expression", "order_voice_paths"):
+        assert forbidden not in source, forbidden
+
+
+def test_the_report_key_is_a_single_named_constant():
+    root = tree()
+    assignment = next(n for n in ast.walk(root) if isinstance(n, ast.Assign)
+                      and getattr(n.targets[0], "id", None) == "AUDIO_LAYERS_REPORT_KEY")
+    assert ast.literal_eval(assignment.value) == "audio_layers_report"
+
+
+def test_the_report_never_reaches_the_pipeline():
+    """Diagnostics only. No stage, no planner, no mixdown and no cache key may receive it."""
+    for callee in ("analyze_beats_auto", "create_music_video", "build_mixed_master",
+                   "prepare_voice_inputs", "project_sections"):
+        for node in ast.walk(func("_process_video_impl")):
+            if (isinstance(node, ast.Call)
+                    and ast.unparse(node.func).endswith(callee)):
+                rendered = ast.unparse(node)
+                assert "AUDIO_LAYERS_REPORT_KEY" not in rendered, callee
+                assert "audio_layers_report" not in rendered, callee
+
+
+def test_the_report_is_an_output_only_and_never_a_render_input():
+    click = next(node for node in ast.walk(tree())
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and ast.unparse(node.func) == "process_btn.click")
+    kwargs = {kw.arg: kw.value for kw in click.keywords}
+    assert "audio_layers_report" not in names_in(kwargs["inputs"])
+    outputs = names_in(kwargs["outputs"])
+    assert outputs == ["video_output", "status_output", "session_state", "audio_layers_report"]
+
+
+def test_the_report_is_absent_from_the_live_source_declaration():
+    """It is render diagnostics, not a declaration of what is being rendered."""
+    for node in ast.walk(tree()):
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("live_declaration"):
+            rendered = ast.unparse(node)
+            for widget in AUDIO_WIDGETS:
+                assert widget not in rendered, widget
+
+
+def test_the_worker_thread_touches_no_gradio_component():
+    """The report rides on `session_state`; the generator does the widget update."""
+    worker = None
+    for node in ast.walk(func("process_video")):
+        if isinstance(node, ast.FunctionDef) and node.name == "worker":
+            worker = node
+            break
+    assert worker is not None
+    rendered = ast.unparse(worker)
+    assert "audio_layers_report" not in rendered
+    assert "gr." not in rendered
 
 
 # ===========================================================================

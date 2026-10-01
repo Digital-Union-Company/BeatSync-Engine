@@ -35,9 +35,10 @@ _MIXDOWN = os.path.join(_REPO_ROOT, "src", "audio_mixdown.py")
 
 #: Everything the suite executes. Module-level constants come along so the bodies see them.
 _EXTRACTED = (
-    "AudioMixError", "_run", "_tail", "probe_duration", "prepare_voice_inputs",
-    "build_duck_expression", "escape_filter_expression", "build_mix_command",
-    "master_path_for", "render_mixed_master", "discard_master", "build_mixed_master",
+    "AudioMixError", "_run", "_tail", "probe_duration", "_selected_voice_paths",
+    "prepare_voice_inputs", "build_duck_expression", "escape_filter_expression",
+    "build_mix_command", "master_path_for", "render_mixed_master", "discard_master",
+    "build_mixed_master",
 )
 
 
@@ -228,6 +229,89 @@ def test_prepare_voice_inputs_rejects_unsupported_and_missing(tmp_path):
         mix.prepare_voice_inputs([str(bad)])
     with pytest.raises(Exception, match="missing or unreadable"):
         mix.prepare_voice_inputs([str(tmp_path / "gone.wav")])
+
+
+# ---------------------------------------------------------------------------
+# R1-A: a selected voice clip may never be silently dropped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("missing_name,arrangement", [
+    ("02_b.wav", "missing sorts in the middle"),
+    ("00_a.wav", "missing sorts first"),
+    ("99_z.wav", "missing sorts last"),
+])
+def test_a_partially_missing_selection_fails_instead_of_shrinking(
+        tmp_path, missing_name: str, arrangement: str):
+    """The R1-A defect: `_as_existing_source_paths` filtered the selection, so a three-clip pick
+    with one missing file became a silent two-clip render. The result must not depend on where the
+    missing name sorts, so all three arrangements are covered."""
+    present = []
+    for name in ("01_x.wav", "50_m.wav"):
+        (tmp_path / name).write_bytes(b"x")
+        present.append(str(tmp_path / name))
+    selection = present + [str(tmp_path / missing_name)]
+
+    mix = load_mixdown(FakeSubprocess([FakeCompleted(0, "1.0", "")] * 5))
+    with pytest.raises(Exception, match="missing or unreadable") as excinfo:
+        mix.prepare_voice_inputs(selection)
+    assert missing_name in str(excinfo.value), arrangement
+
+
+def test_a_partially_missing_selection_never_returns_the_valid_subset(tmp_path):
+    for name in ("01_a.wav", "03_c.wav"):
+        (tmp_path / name).write_bytes(b"x")
+    selection = [str(tmp_path / "01_a.wav"), str(tmp_path / "02_b.wav"),
+                 str(tmp_path / "03_c.wav")]
+
+    mix = load_mixdown(FakeSubprocess([FakeCompleted(0, "1.0", "")] * 5))
+    try:
+        result = mix.prepare_voice_inputs(selection)
+    except Exception:
+        return                      # the required outcome
+    pytest.fail(f"returned a {len(result)}-clip subset of a 3-clip selection: "
+                f"{[os.path.basename(v.path) for v in result]}")
+
+
+@pytest.mark.parametrize("entry", [None, "", "   ", 7, object(), b"x.wav"])
+def test_an_unusable_entry_fails_rather_than_being_dropped(tmp_path, entry):
+    """`order_voice_paths` drops non-strings by design (it runs on widget values); the preflight
+    must not inherit that, or a malformed entry would silently shrink the selection."""
+    good = tmp_path / "01_a.wav"
+    good.write_bytes(b"x")
+    mix = load_mixdown(FakeSubprocess([FakeCompleted(0, "1.0", "")] * 5))
+    with pytest.raises(Exception, match="not a usable file path"):
+        mix.prepare_voice_inputs([str(good), entry])
+
+
+def test_the_selection_is_taken_whole_without_filtering(tmp_path):
+    mix = load_mixdown(FakeSubprocess())
+    assert mix._selected_voice_paths(None) == []
+    assert mix._selected_voice_paths([]) == []
+    # a bare string is ONE selection, not an iterable of characters
+    assert mix._selected_voice_paths("a/01.wav") == ["a/01.wav"]
+    # nothing is filtered out at this stage, however malformed
+    assert mix._selected_voice_paths(["a.wav", None, "", 7]) == ["a.wav", None, "", 7]
+
+
+def test_a_complete_valid_selection_still_succeeds(tmp_path):
+    for name in ("03_c.wav", "01_a.wav", "02_b.wav"):
+        (tmp_path / name).write_bytes(b"x")
+    selection = [str(tmp_path / n) for n in ("03_c.wav", "01_a.wav", "02_b.wav")]
+    mix = load_mixdown(FakeSubprocess([FakeCompleted(0, str(1.0 + i), "") for i in range(3)]))
+    prepared = mix.prepare_voice_inputs(selection)
+    assert [os.path.basename(v.path) for v in prepared] == ["01_a.wav", "02_b.wav", "03_c.wav"]
+    assert len(prepared) == len(selection)
+
+
+def test_pathlike_entries_are_accepted(tmp_path):
+    """Gradio gives strings, but the boundary must not shrink a collection it merely did not
+    expect the type of."""
+    for name in ("01_a.wav", "02_b.wav"):
+        (tmp_path / name).write_bytes(b"x")
+    mix = load_mixdown(FakeSubprocess([FakeCompleted(0, "1.0", "")] * 3))
+    prepared = mix.prepare_voice_inputs([tmp_path / "01_a.wav", tmp_path / "02_b.wav"])
+    assert len(prepared) == 2
 
 
 # ===========================================================================

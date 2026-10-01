@@ -1329,6 +1329,29 @@ test asserts this against the real call — it is the most important test in D.
   `input_manager.order_key` — the project's existing documented total order — because the HTML File
   API returns whatever the OS dialog supplies, which is not the user's click order. The help text
   says so and recommends `01_`, `02_`, `03_`.
+- **The preflight validates the WHOLE selection and never returns a subset (R1-A).**
+  `prepare_voice_inputs` receives the raw widget value, keeps every entry
+  (`_selected_voice_paths` normalises a scalar/`PathLike`/iterable into a list and drops *nothing*),
+  and raises `AudioMixError` on the first entry that is not a usable path value, not a supported
+  extension, not an existing readable file, not probeable, or has a non-positive duration. Ordering
+  is applied **after** validation and its length is re-checked, so nothing can disappear in the sort
+  either. `_as_existing_source_paths` must **never** be used here: it filters out paths that no
+  longer exist, which is correct for video sources (the confirmation gate vouched for them) and
+  wrong for voice — it silently turned a 01/02/03 selection with a missing `02` into a two-clip
+  render that looked deliberate. The failure is raised before `analyze_beats_auto`, so a bad voice
+  file costs no analysis. A seam test asserts the call site passes `voice_files` and nothing else.
+- **The placement report is a real read-out, written by exactly one event (R1-B).**
+  `audio_layers_report` was declared with no writer, so the advertised report could never display
+  anything. A successful plan now populates it from `audio_plan.report_lines()` — the planner's own
+  lines, never recomputed in the GUI — via `session_state[AUDIO_LAYERS_REPORT_KEY]`, which
+  `process_video_guarded` projects onto a fourth output. `process_video` keeps its three-value
+  `StatusResult` contract; only the outer handler is `GuardedResult`. The key is cleared at the
+  start of every attempt and before the gate, so **no voice, a refused render, a preflight failure
+  and a mixdown failure all leave it blank rather than showing the previous render's placements.**
+  It is pure diagnostics: nothing downstream reads it, and it stays absent from the render inputs,
+  `source_outputs`, `prep_outputs`, every source and preparation handler and `live_declaration`.
+  The five *configuration* widgets remain unwritable by any handler — that guard was split, not
+  weakened, and the report has one permitted writer (`process_btn.click`) asserted by name.
 - **Placement is deterministic and seedless.** Cursor starts at the start delay; for each clip in
   user order, take the earliest legal beat, then look at most `PLACEMENT_LOOKAHEAD_SECONDS = 4.0`
   past it for a preferred section start (`intro, verse, breakdown, bridge, outro`), then any other

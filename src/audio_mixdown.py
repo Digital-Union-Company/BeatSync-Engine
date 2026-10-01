@@ -137,16 +137,55 @@ def probe_duration(path: str) -> float:
     return duration
 
 
+def _selected_voice_paths(voice_paths) -> list:
+    """The user's selection as a list, **without dropping anything**.
+
+    A bare string is one selection, not an iterable of characters. Nothing else is filtered here:
+    deciding whether an entry is usable is validation's job, and silently shrinking the collection
+    first is exactly the defect this function exists to prevent.
+    """
+    if voice_paths is None:
+        return []
+    if isinstance(voice_paths, (str, bytes, os.PathLike)):
+        return [voice_paths]
+    try:
+        return list(voice_paths)
+    except TypeError:
+        return [voice_paths]
+
+
 def prepare_voice_inputs(voice_paths) -> tuple:
     """Resolve, order and probe the voice clips — the cheap preflight, run *before* Stage 1.
 
-    Ordering is the pure module's deterministic path order, not the browser's. Every failure here
-    is a user-fixable input problem, and catching it now avoids spending a full Stage 1-5 analysis
-    on a render that cannot succeed.
+    **Every selected entry must survive into validation.** A non-empty selection may never come
+    back as a smaller valid subset: if the user picked three clips and the middle one has since
+    been moved, the render must fail saying so, not quietly produce a two-voice video that looks
+    deliberate. So the collection is taken whole (see :func:`_selected_voice_paths`), each entry is
+    checked, and the *first* invalid one raises — the caller never receives a partial result.
+
+    Ordering is applied only once the selection has been validated as a selection, and it is the
+    pure module's deterministic path order rather than the browser's. Catching all of this before
+    Stage 1 means a fixable input problem costs no analysis.
     """
-    ordered = fork_audio_mix.order_voice_paths(voice_paths)
-    if not ordered:
+    selected = _selected_voice_paths(voice_paths)
+    if not selected:
         return ()
+
+    for position, raw in enumerate(selected, start=1):
+        if isinstance(raw, os.PathLike):
+            raw = os.fspath(raw)
+        if not isinstance(raw, str) or not raw.strip():
+            raise AudioMixError(
+                f"Voice clip {position} of {len(selected)} is not a usable file path")
+
+    usable = [os.fspath(p) if isinstance(p, os.PathLike) else p for p in selected]
+    ordered = fork_audio_mix.order_voice_paths(usable)
+    if len(ordered) != len(usable):
+        # Defensive: the loop above already guarantees every entry is a non-empty string, so this
+        # can only fire if the ordering contract changes underneath us. Failing loudly is still
+        # better than returning fewer clips than the user chose.
+        raise AudioMixError(
+            f"Could not order all {len(usable)} selected voice clips")
 
     prepared = []
     for index, path in enumerate(ordered):

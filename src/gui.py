@@ -141,6 +141,12 @@ from beatsync_fork import variant_lab as fork_lab
 from beatsync_fork import audio_mix as fork_audio_mix
 import audio_mixdown
 
+#: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
+#: worker and the generator. It lives in `session_state` as ordinary render bookkeeping — the
+#: worker thread must never touch a Gradio component, so the value is carried on the dict the
+#: generator already yields and projected onto the widget there.
+AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
+
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
 # only wires it to widgets and supplies the runtime calls it must not make itself.
@@ -171,6 +177,10 @@ os.environ['GRADIO_TEMP_DIR'] = GRADIO_TEMP_DIR
 
 VideoFilesInput : TypeAlias = List[str]
 StatusResult : TypeAlias = Tuple[str, str, Dict]
+# [FORK] Digital-Union (Audio Layers V1 / D, R1-B): what `process_video_guarded` yields to Gradio —
+# the three values `process_video` streams, plus the Audio Layers placement read-out. The inner
+# 3-value contract is deliberately unchanged; only the outermost handler projects onto the widgets.
+GuardedResult : TypeAlias = Tuple[str, str, Dict, str]
 
 STATUS_BOX_CSS = """
 #status-output-box {
@@ -557,6 +567,11 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # early-return paths.
     mixed_master_path = None
     audio_plan = None
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is render
+    # bookkeeping, cleared at the start of every attempt so a previous render's placements can
+    # never be mistaken for this one's. It is pure diagnostics: nothing downstream reads it, and
+    # it is not source or preparation state.
+    session_state[AUDIO_LAYERS_REPORT_KEY] = ''
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -613,11 +628,16 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # Ordering is the pure module's deterministic path order, never the browser's multi-select
         # order. `prepare_voice_inputs` returns () for an empty selection, which is what keeps the
         # no-voice path below structurally the original one.
+        #
+        # The selection is handed over WHOLE. `_as_existing_source_paths` is deliberately not used
+        # here: it filters out paths that no longer exist, which is right for video sources (the
+        # confirmation gate has already vouched for them) and wrong for voice — it would turn a
+        # three-clip selection with a missing middle file into a silent two-clip render. Validating
+        # the complete selection is `prepare_voice_inputs`'s job.
         prepared_voices = ()
         if voice_files:
             try:
-                prepared_voices = audio_mixdown.prepare_voice_inputs(
-                    _as_existing_source_paths(voice_files) or voice_files)
+                prepared_voices = audio_mixdown.prepare_voice_inputs(voice_files)
             except audio_mixdown.AudioMixError as exc:
                 return None, f'❌ Audio Layers: {exc}', session_state
 
@@ -693,6 +713,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                 # fallback to the original music would render a plausible but wrong video.
                 return None, f'❌ Audio Layers: {exc}', session_state
             render_audio_path = mixed_master_path
+            # The pure planner already produced these lines; the GUI never recomputes placement.
+            session_state[AUDIO_LAYERS_REPORT_KEY] = '\n'.join(audio_plan.report_lines())
             if console_logger:
                 for line in audio_plan.report_lines():
                     console_logger.line(line)
@@ -1133,7 +1155,7 @@ def process_video_guarded(audio_file: str,
                           cut_density: int, energy_response: int, motion_bias: int,
                           source_diversity: int, micro_cuts: int, semantic_emphasis: int,
                           session_state: dict,
-                          source_state) -> Iterator[StatusResult]:
+                          source_state) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
@@ -1165,6 +1187,11 @@ def process_video_guarded(audio_file: str,
     # an authoritative filesystem re-scan of every confirmed source, so it is one of the costs that
     # grows with the library. Measuring wraps the existing call: the gate, the snapshot identity and
     # the allow/deny outcome are all untouched, and nothing is reused between renders.
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): clear the placement read-out before the
+    # gate, so a refused render shows no placements either — and so no path through this handler
+    # can leave the previous attempt's report on screen.
+    session_state[AUDIO_LAYERS_REPORT_KEY] = ''
+
     verification_started = time.perf_counter()
     decision = resolve_for_render(
         source_state,
@@ -1172,7 +1199,7 @@ def process_video_guarded(audio_file: str,
     )
     verification_seconds = time.perf_counter() - verification_started
     if not decision.allowed:
-        yield None, f"❌ {decision.message}", session_state
+        yield None, f"❌ {decision.message}", session_state, ''
         return
 
     # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
@@ -1205,7 +1232,12 @@ def process_video_guarded(audio_file: str,
         music_under_voice_percent=music_under_voice,
     )
 
-    yield from process_video(
+    # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): `process_video` keeps its existing 3-value
+    # streaming contract — video, status, session_state — and this handler projects each yield onto
+    # the four Gradio outputs by appending the placement read-out that `_process_video_impl` has
+    # recorded on `session_state`. One extra output, no second placement computation, no new state
+    # object, and still nothing but `queue.put` happening on the worker thread.
+    for video, status, state in process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
         output_filename=output_filename,
@@ -1216,7 +1248,8 @@ def process_video_guarded(audio_file: str,
         verification_seconds=verification_seconds,
         voice_files=voice_files,
         audio_mix=audio_mix,
-    )
+    ):
+        yield video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, '')
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -2115,7 +2148,10 @@ def create_ui() -> gr.Blocks:
                 source_diversity, micro_cuts, semantic_emphasis,
                 session_state, source_state
             ],
-            outputs=[video_output, status_output, session_state],
+            # [FORK] Digital-Union (Audio Layers V1 / D, R1-B): the placement read-out is written
+            # here and nowhere else. It is an output only — never an input, never source or
+            # preparation state, and never consulted by the pipeline.
+            outputs=[video_output, status_output, session_state, audio_layers_report],
             show_progress='hidden'
         )
 
