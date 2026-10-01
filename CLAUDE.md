@@ -1466,6 +1466,19 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
   raises like `ndarray`'s, covers each field **independently** (the original failure hit `times`
   first and would have masked the other three), and is backed by a structural guard that forbids
   these four keys inside any `BoolOp`, `bool(...)` or `not` in `project_structure`.
+- **Malformed *scalar* structure input must fail through the structure boundary, not as an
+  incidental `TypeError`.** Removing `value or ()` had a second, quieter consequence: that idiom
+  was also absorbing a malformed falsey scalar (`0`, `0.0`, `False`) into the empty path, so
+  without it a scalar reached `_finite_floats`, which iterates immediately, and escaped
+  `project_structure` as a raw `TypeError: 'int' object is not iterable`. `_finite_floats` now
+  answers `()` for a non-iterable argument — the same answer it already gave for a non-numeric
+  element, `NaN` or `inf` — so `times = 0` reports `no usable beat times` exactly as it did before
+  the ndarray fix. The guard is `try: for …`, **not** `if values`, so the container is still never
+  truth-tested. It also covers the *pre-existing* truthy-scalar case (`times = 7`), which `or ()`
+  never normalised either. `_finite_floats` has exactly two callers, both of them these two fields
+  inside `project_structure`, so this cannot reach unrelated planner behaviour. The anchor fields
+  were already covered by their own `try/except TypeError` (`rhythm anchors are not iterable`) and
+  were deliberately **not** widened.
 - **The impact percentile population is the WHOLE aligned beat array**; the bar-anchor mask is
   applied *after* the threshold. That is what the accepted calibration measured — restricting the
   population first silently shifts every threshold. The stdlib implementation reproduces

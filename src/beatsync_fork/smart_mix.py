@@ -546,15 +546,33 @@ class SmartMixPlan:
 
 
 def _finite_floats(values: Any) -> tuple:
+    """Every value as a finite float, or ``()`` if the input is unusable in any way.
+
+    "Unusable" already covered a non-numeric element, ``NaN`` and both infinities. It now also
+    covers an argument that is **not iterable at all**, which is the same kind of answer: there is
+    no usable sequence here, so the caller's existing structure check reports it.
+
+    [FORK] Digital-Union (Smart Mix V1 / E, runtime R1b): this is load-bearing because the ndarray
+    fix removed the ``value or ()`` idiom. That idiom had been quietly absorbing a malformed falsey
+    *scalar* — ``0``, ``0.0``, ``False`` — into the empty path, so dropping it let such a value
+    reach this loop and escape ``project_structure`` as a raw ``TypeError: 'int' object is not
+    iterable`` instead of ``SmartMixStructureError``. The same guard also converts the
+    *pre-existing* truthy-scalar case (``times = 7``), which ``or ()`` never normalised either.
+    Note that the container itself is still never truth-tested — the check is ``try: for …``,
+    not ``if values``.
+    """
     out = []
-    for value in values:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return ()
-        if number != number or number in (float("inf"), float("-inf")):
-            return ()
-        out.append(number)
+    try:
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return ()
+            if number != number or number in (float("inf"), float("-inf")):
+                return ()
+            out.append(number)
+    except TypeError:
+        return ()
     return tuple(out)
 
 

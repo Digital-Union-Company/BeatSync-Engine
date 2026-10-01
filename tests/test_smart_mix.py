@@ -1307,3 +1307,134 @@ def test_the_pure_module_still_imports_no_numpy():
     assert "numpy" not in imported
     assert imported <= {"__future__", "math", "collections", "dataclasses", "typing",
                         "beatsync_fork"}, imported
+
+
+# ===========================================================================
+# 14. MALFORMED SCALAR STRUCTURE INPUT (runtime R1b)
+# ===========================================================================
+#
+# Removing the `value or ()` idiom fixed the ndarray crash, but that idiom had also been quietly
+# absorbing a malformed FALSEY SCALAR into the empty path: `0 or ()` is `()`. Without it, `0`
+# reached `_finite_floats`, which iterates immediately, and escaped `project_structure` as a raw
+#
+#     TypeError: 'int' object is not iterable
+#
+# rather than the controlled `SmartMixStructureError`. Measured on the R0 head for `times` and
+# `impact_strength` with `0`, `0.0` and `False`.
+#
+# The same guard also covers the *pre-existing* truthy-scalar case (`times = 7`), which `or ()`
+# never normalised either - same failure class, same boundary.
+#
+# These assert the public `project_structure()` failure contract, not the private helper.
+
+
+def _scalar_beat_info(times=None, impact=None, bar=None, phrase=None, duration=30.0):
+    """Otherwise-valid `beat_info` with individual fields overridden by malformed values."""
+    good_times = [0.0, 1.0, 2.0, 3.0]
+    good_impact = [0.1, 0.2, 0.3, 0.4]
+    good_bar = [True, False, True, False]
+    good_phrase = [True, False, False, False]
+    return {
+        "times": good_times if times is None else times,
+        "rhythm_data": {
+            "impact_strength": good_impact if impact is None else impact,
+            "is_bar_anchor": good_bar if bar is None else bar,
+            "is_phrase_anchor": good_phrase if phrase is None else phrase,
+        },
+        "sections": [{"start": 0.0, "end": duration, "type": "verse"}],
+        "audio_duration": duration,
+    }
+
+
+#: Falsey scalars are the regression (`or ()` used to absorb them); the truthy one is the
+#: pre-existing member of the same class. One parametrisation covers both without duplication.
+MALFORMED_SCALARS = [0, 0.0, False, 7]
+
+
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_a_malformed_scalar_times_never_escapes_as_a_raw_typeerror(scalar):
+    with pytest.raises(sm.SmartMixStructureError, match="no usable beat times"):
+        sm.project_structure(_scalar_beat_info(times=scalar))
+
+
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_a_malformed_scalar_impact_never_escapes_as_a_raw_typeerror(scalar):
+    with pytest.raises(sm.SmartMixStructureError, match="misaligned"):
+        sm.project_structure(_scalar_beat_info(impact=scalar))
+
+
+@pytest.mark.parametrize("field", ["times", "impact"])
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_no_malformed_scalar_raises_a_bare_typeerror(field, scalar):
+    """The contract is the *type* of failure: never an incidental iteration error."""
+    info = _scalar_beat_info(**{field: scalar})
+    try:
+        sm.project_structure(info)
+    except sm.SmartMixStructureError:
+        pass
+    except TypeError as exc:                                  # pragma: no cover - the defect
+        pytest.fail(f"{field}={scalar!r} escaped as raw TypeError: {exc}")
+
+
+def test_the_anchor_fields_were_already_controlled_and_stay_that_way():
+    """`is_bar_anchor` / `is_phrase_anchor` already had a `try/except TypeError`. Not widened."""
+    for field in ("bar", "phrase"):
+        with pytest.raises(sm.SmartMixStructureError, match="not iterable"):
+            sm.project_structure(_scalar_beat_info(**{field: 0}))
+
+
+def test_an_empty_string_still_reaches_the_controlled_path():
+    """`''` iterates to nothing, so it was never a raw TypeError - pinned so it stays controlled."""
+    with pytest.raises(sm.SmartMixStructureError, match="no usable beat times"):
+        sm.project_structure(_scalar_beat_info(times=""))
+
+
+def test_finite_floats_answers_empty_for_a_non_iterable():
+    """The narrow helper change, stated directly: unusable input is `()`, like every other
+    unusable input it already handled."""
+    assert sm._finite_floats(0) == ()
+    assert sm._finite_floats(7) == ()
+    assert sm._finite_floats(False) == ()
+    assert sm._finite_floats(object()) == ()
+    # and nothing else moved
+    assert sm._finite_floats([1, 2.5, 3]) == (1.0, 2.5, 3.0)
+    assert sm._finite_floats([]) == ()
+    assert sm._finite_floats([1, "x"]) == ()
+    assert sm._finite_floats([1, float("nan")]) == ()
+    assert sm._finite_floats([1, float("inf")]) == ()
+
+
+def test_the_non_iterable_guard_does_not_truth_test_the_container():
+    """The fix must not have reintroduced container boolean coercion."""
+    array = AmbiguousArray([1.0, 2.0, 3.0])
+    assert sm._finite_floats(array) == (1.0, 2.0, 3.0)
+    assert array.bool_calls == 0
+
+
+def test_ambiguous_arrays_still_project_after_the_scalar_guard():
+    """Belt-and-braces: the R1a ndarray behaviour is untouched by the R1b guard."""
+    times, impact, bar, phrase = _simple_arrays()
+    info = _array_beat_info(times, impact, bar, phrase)
+    structure = sm.project_structure(info)
+    assert structure.beat_times == tuple(times)
+    for value in (info["times"], info["rhythm_data"]["impact_strength"],
+                  info["rhythm_data"]["is_bar_anchor"],
+                  info["rhythm_data"]["is_phrase_anchor"]):
+        assert value.bool_calls == 0
+
+
+def test_project_structure_only_ever_raises_its_own_error_type():
+    """A sweep over the malformed shapes this boundary can plausibly receive."""
+    shapes = [
+        {"times": 0}, {"times": 7}, {"times": None}, {"times": []}, {"times": ""},
+        {"impact": 0}, {"impact": 7}, {"impact": None}, {"impact": []},
+        {"bar": 0}, {"bar": None}, {"phrase": 0}, {"phrase": None},
+        {"times": [1.0, 2.0], "impact": [1.0]},
+    ]
+    for shape in shapes:
+        try:
+            sm.project_structure(_scalar_beat_info(**shape))
+        except sm.SmartMixStructureError:
+            pass
+        except Exception as exc:                              # noqa: BLE001 - that is the point
+            pytest.fail(f"{shape} escaped as {type(exc).__name__}: {exc}")

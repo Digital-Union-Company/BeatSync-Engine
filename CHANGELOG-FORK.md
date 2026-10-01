@@ -53,9 +53,24 @@ Stage 6, with `ValueError: The truth value of an array with more than one elemen
   structure — 25 → 15, **50 → 19** (3 riser / 5 impact / 6 transition / 3 vocal_shot /
   2 atmosphere), 75 → 24, 100 → 25, zero non-atmosphere overlaps, risers ending on
   53.267 / 88.143 / 204.266, and the 87.655 collision skip intact.
+- **Malformed scalar input also had to be caught (R1b).** Removing `value or ()` had a second,
+  quieter consequence: that idiom was absorbing a malformed *falsey scalar* (`0`, `0.0`, `False`)
+  into the empty path, so without it a scalar reached `_finite_floats` — which iterates its
+  argument immediately — and escaped `project_structure` as a raw
+  `TypeError: 'int' object is not iterable` instead of `SmartMixStructureError`. Reproduced
+  executably for both `times` and `impact_strength` before any further edit. `_finite_floats` now
+  answers `()` for a non-iterable argument, the same answer it already gave for a non-numeric
+  element, `NaN` or `inf`, so `times = 0` reports `no usable beat times` exactly as it did before
+  the ndarray fix. The guard is `try: for …`, **not** `if values`, so the container is still never
+  truth-tested — verified with the same `AmbiguousArray`, `bool_calls == 0`. It also covers the
+  *pre-existing* truthy-scalar case (`times = 7`), which `or ()` never normalised either; that one
+  is a long-standing defect of the same class rather than a regression. `_finite_floats` has
+  exactly two callers, both of them these two fields inside `project_structure`, so no unrelated
+  planner behaviour is reachable. The anchor fields were already covered by their own
+  `try/except TypeError` and were deliberately **not** widened.
 - Nothing else changed: the planner, percentile, Amount mapping, aliases, priority, occupancy,
   asset cursor, R1 library diagnostics, the single report formatter, the FFmpeg graph, D's voice
-  behaviour and the Stage-5 constants are all untouched. `python -m pytest`: **3337 passed,
+  behaviour and the Stage-5 constants are all untouched. `python -m pytest`: **3359 passed,
   2 skipped** (up from 3322).
 
 ### Fixed — 2026-10-02 (Smart Mix V1 — R1 correction)
