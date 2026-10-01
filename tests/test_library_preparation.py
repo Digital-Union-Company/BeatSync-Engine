@@ -988,10 +988,15 @@ def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
 #: layer onto. All of them are render-request state, not preparation state — which is the property
 #: the assertions below actually care about, and which is asserted directly as well so this list
 #: staying in step with the GUI never becomes the only thing being checked.
+#: The exact render request. Amended when Audio Layers (D) added five voice widgets and again when
+#: Smart Mix (E) added four SFX *config* widgets — the Smart Mix report is an output and is
+#: deliberately absent. The property these two tests protect is unchanged and still asserted
+#: directly below: **no preparation state reaches the render request.**
 _RENDER_CLICK_INPUTS = [
     "audio_input",
     "voice_files", "voice_start_delay", "voice_min_gap", "voice_avoid_drops",
     "music_under_voice",
+    "sfx_folder", "sfx_roles", "sfx_amount", "sfx_level",
     "source_mode", "source_folder", "source_recursive", "video_input",
     "output_filename", "processing_mode", "custom_fps", "variation_seed",
     "cut_density", "energy_response", "motion_bias", "source_diversity", "micro_cuts",

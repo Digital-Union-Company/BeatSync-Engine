@@ -60,6 +60,7 @@ never reaches this module.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import uuid
@@ -67,6 +68,7 @@ import uuid
 from ffmpeg_processing import FFMPEG_PATH, FFPROBE_PATH
 
 from beatsync_fork import audio_mix as fork_audio_mix
+from beatsync_fork import smart_mix as fork_smart_mix
 
 #: The mixed master's format — identical to what final assembly already encodes, so the mux has no
 #: new work to do and there is no lossy intermediate.
@@ -237,35 +239,71 @@ def escape_filter_expression(expression: str) -> str:
     return expression.replace(",", r"\,")
 
 
-def build_mix_command(music_path: str, plan, output_path: str) -> list:
+def build_mix_command(music_path: str, plan, output_path: str,
+                      sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT) -> list:
     """The complete argv for one mixdown. One list, no shell — the filtergraph never meets a shell.
 
-    Input 0 is always the music; voice inputs follow in plan order, so ``adelay`` on stream ``k``
-    always belongs to placement ``k - 1``.
+    Input order is fixed and positional, never derived from a dict: **0 is always the music**, voice
+    inputs follow in plan order, then Smart Mix SFX in resolved placement order. So ``adelay`` on
+    stream ``k`` always belongs to the ``k``-th entry of ``placements + sfx_placements``.
+
+    [FORK] Digital-Union (Smart Mix V1 / E): ``sfx_level_percent`` is an **execution argument**, not
+    plan data. :class:`SfxPlacement` is frozen and deliberately carries no gain, and ``AudioMixPlan``
+    gained only ``sfx_placements`` — so the one global linear SFX gain is threaded here instead. The
+    default exists for direct/test callers; the production path always passes the resolved value.
     """
     command = [FFMPEG_PATH, "-y", "-i", music_path]
     for placement in plan.placements:
         command += ["-i", placement.path]
+    sfx_placements = tuple(getattr(plan, "sfx_placements", ()) or ())
+    for placement in sfx_placements:
+        command += ["-i", placement.path]
 
-    envelope = escape_filter_expression(
-        build_duck_expression(plan.duck_events, plan.config.music_floor))
-    chain = [
-        # Per-sample envelope as its own stream, multiplied into the music. See the module
-        # docstring for why this is not `volume=eval=frame`.
-        f"aevalsrc='{envelope}':s={MASTER_SAMPLE_RATE}:c=stereo:"
-        f"d={plan.music_duration:.6f},"
-        f"aformat=sample_fmts=fltp:channel_layouts=stereo[env]",
-        f"[0:a]aresample={MASTER_SAMPLE_RATE},"
-        f"aformat=sample_fmts=fltp:channel_layouts=stereo[mus]",
-        "[mus][env]amultiply[music]",
-    ]
+    chain = []
+    if plan.duck_events:
+        envelope = escape_filter_expression(
+            build_duck_expression(plan.duck_events, plan.config.music_floor))
+        chain += [
+            # Per-sample envelope as its own stream, multiplied into the music. See the module
+            # docstring for why this is not `volume=eval=frame`.
+            f"aevalsrc='{envelope}':s={MASTER_SAMPLE_RATE}:c=stereo:"
+            f"d={plan.music_duration:.6f},"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[env]",
+            f"[0:a]aresample={MASTER_SAMPLE_RATE},"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[mus]",
+            "[mus][env]amultiply[music]",
+        ]
+    else:
+        # [FORK] Digital-Union (Smart Mix V1 / E): with no voice there is nothing to duck, so no
+        # unity envelope is synthesised. `build_duck_expression(())` would return the constant "1"
+        # and `amultiply` by it is an exact no-op — generating a full-length 48 kHz stereo stream to
+        # multiply by one is pure waste on an SFX-only or music-only mix.
+        chain.append(f"[0:a]aresample={MASTER_SAMPLE_RATE},"
+                     f"aformat=sample_fmts=fltp:channel_layouts=stereo[music]")
+
     labels = ["[music]"]
+    stream = 0
     for stream, placement in enumerate(plan.placements, start=1):
         chain.append(
             f"[{stream}:a]aresample={MASTER_SAMPLE_RATE},"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
             f"adelay={int(round(placement.start * 1000))}:all=1[v{stream}]")
         labels.append(f"[v{stream}]")
+
+    gain = fork_smart_mix.normalize_control(
+        sfx_level_percent, fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT) / 100.0
+    for offset, placement in enumerate(sfx_placements, start=1):
+        index = stream + offset
+        # `atrim` ONLY for a trimmed atmosphere bed — the one role whose semantics allow it. A
+        # non-atmosphere SFX is never shortened to make it fit; it is skipped at planning time.
+        trim = (f"atrim=end={placement.play_duration:.6f},"
+                if getattr(placement, "trimmed", False) else "")
+        chain.append(
+            f"[{index}:a]aresample={MASTER_SAMPLE_RATE},"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"{trim}volume={gain:.6f},"
+            f"adelay={int(round(placement.start * 1000))}:all=1[s{index}]")
+        labels.append(f"[s{index}]")
 
     chain.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:"
                  f"dropout_transition=0:normalize=0[mixed]")
@@ -295,9 +333,11 @@ def master_path_for(session_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_mixed_master(music_path: str, plan, output_path: str) -> str:
+def render_mixed_master(music_path: str, plan, output_path: str,
+                        sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT) -> str:
     """Produce the mixed master and verify it. Raises :class:`AudioMixError` on any failure."""
-    command = build_mix_command(music_path, plan, output_path)
+    command = build_mix_command(music_path, plan, output_path,
+                                sfx_level_percent=sfx_level_percent)
     try:
         result = _run(command, _MIX_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -333,12 +373,18 @@ def discard_master(path) -> None:
 
 
 def build_mixed_master(music_path: str, music_duration: float, beat_times, sections,
-                       voices, config, session_dir: str):
-    """Plan and render in one call. Returns ``(master_path, plan)``.
+                       voices, config, session_dir: str,
+                       sfx_placements=(),
+                       sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT):
+    """Plan voice, attach any Smart Mix SFX, render one master. Returns ``(master_path, plan)``.
 
     The master is written into ``session_dir`` — **never** ``get_processing_dir()``, which
     ``create_music_video`` clears at startup and would therefore delete this file moments after it
     was produced.
+
+    [FORK] Digital-Union (Smart Mix V1 / E): ``sfx_placements`` are already resolved by the pure
+    planner — this function never plans SFX, it only attaches them to the voice plan so one executor
+    produces one master. ``sfx_level_percent`` rides alongside as execution state.
     """
     plan = fork_audio_mix.plan_voice_placements(
         music_duration=music_duration,
@@ -350,13 +396,110 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     if isinstance(plan, fork_audio_mix.PlacementFailure):
         raise AudioMixError(plan.reason)
 
+    sfx_placements = tuple(sfx_placements or ())
+    if sfx_placements:
+        plan = dataclasses.replace(plan, sfx_placements=sfx_placements)
+
     output_path = master_path_for(session_dir)
     try:
-        render_mixed_master(music_path, plan, output_path)
+        render_mixed_master(music_path, plan, output_path,
+                            sfx_level_percent=sfx_level_percent)
     except AudioMixError:
         discard_master(output_path)
         raise
     return output_path, plan
+
+
+# ---------------------------------------------------------------------------
+# Smart Mix library preflight (E)
+# ---------------------------------------------------------------------------
+
+
+def _role_relative_component(root: str, path: str):
+    """The FIRST path component under the root, or ``None`` for a file sitting in the root."""
+    relative = os.path.relpath(path, root)
+    parts = relative.replace("\\", "/").split("/")
+    if len(parts) < 2:
+        return None
+    return parts[0]
+
+
+def prepare_sfx_inputs(root, enabled_roles):
+    """Enumerate, classify, order and probe the Smart Mix library. Returns ``(assets, scan)``.
+
+    Runs **before Stage 1** whenever Smart Mix is active, for the same reason D's voice preflight
+    does: resolving paths and probing durations is cheap, a full Stage 1-5 analysis is not, and a
+    broken library is a user-fixable input problem.
+
+    **Every enabled, recognised, supported asset is probed** — not merely the ones a later plan
+    happens to select. A corrupt file inside an enabled role is therefore fatal before any analysis,
+    which matches D's "the user's explicit inputs are honoured or the render fails" philosophy; a
+    musical rule finding no anchor is a different thing entirely and stays non-fatal.
+
+    Classification is the pure module's exact alias table on the **first** component under the root.
+    Unknown folders, root-level files, disabled roles and unsupported extensions are counted for the
+    report and **never probed**.
+    """
+    if not isinstance(root, str) or not root.strip():
+        raise AudioMixError("Smart Mix: no SFX library folder was given")
+    root = os.path.abspath(root)
+    if not os.path.exists(root):
+        raise AudioMixError(f"Smart Mix: SFX library folder does not exist: {root}")
+    if not os.path.isdir(root):
+        raise AudioMixError(f"Smart Mix: SFX library path is not a folder: {root}")
+
+    wanted = fork_smart_mix.normalize_roles(enabled_roles)
+    scan = {
+        "root": root, "unknown_folders": [], "root_level_files": 0,
+        "unsupported": 0, "skipped_disabled": 0, "per_role": {},
+    }
+
+    by_role = {}
+    try:
+        walker = os.walk(root, onerror=_walk_error)
+        for directory, _subdirs, filenames in walker:
+            for name in sorted(filenames):
+                full = os.path.join(directory, name)
+                component = _role_relative_component(root, full)
+                if component is None:
+                    scan["root_level_files"] += 1
+                    continue
+                role = fork_smart_mix.role_for_folder(component)
+                if role is None:
+                    if component not in scan["unknown_folders"]:
+                        scan["unknown_folders"].append(component)
+                    continue
+                if role not in wanted:
+                    scan["skipped_disabled"] += 1
+                    continue
+                if not fork_smart_mix.has_supported_sfx_extension(full):
+                    scan["unsupported"] += 1
+                    continue
+                by_role.setdefault(role, []).append(full)
+    except OSError as exc:
+        raise AudioMixError(f"Smart Mix: could not read the SFX library: {exc}")
+
+    assets = []
+    for role in fork_smart_mix.ROLE_ORDER:
+        ordered = fork_smart_mix.order_sfx_paths(by_role.get(role, ()))
+        scan["per_role"][role] = len(ordered)
+        for path in ordered:
+            if not os.path.isfile(path):
+                raise AudioMixError(f"Smart Mix: SFX asset is missing or unreadable: {path}")
+            assets.append(fork_smart_mix.SfxAsset(
+                role=role, path=path, duration=probe_duration(path)))
+
+    if not assets:
+        raise AudioMixError(
+            "Smart Mix: the SFX library has no usable audio in any enabled role "
+            f"({', '.join(sorted(wanted)) or 'none enabled'})")
+    return tuple(assets), scan
+
+
+def _walk_error(error):
+    """Never let `os.walk` silently skip an unreadable directory — a quietly smaller library is
+    exactly the failure the fork's input manager exists to prevent."""
+    raise error
 
 
 __all__ = [
@@ -373,6 +516,7 @@ __all__ = [
     "build_mixed_master",
     "discard_master",
     "master_path_for",
+    "prepare_sfx_inputs",
     "prepare_voice_inputs",
     "probe_duration",
     "render_mixed_master",

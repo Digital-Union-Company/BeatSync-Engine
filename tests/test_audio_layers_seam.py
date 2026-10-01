@@ -25,6 +25,7 @@ import os
 import pytest
 
 from beatsync_fork import audio_mix as fork_audio_mix
+from beatsync_fork import smart_mix as fork_smart_mix
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
@@ -145,24 +146,36 @@ def test_render_audio_path_starts_as_the_original_and_only_voice_changes_it():
 
 
 def test_every_audio_layer_step_is_behind_a_voice_guard():
-    """With no voice clips: no ordering, no probe, no planner, no mixdown, no temporary WAV."""
+    """With no voice clips: no ordering, no probe, no voice planner, no temporary WAV.
+
+    **Amended by Smart Mix V1 / E.** The mixdown guard widened from ``if prepared_voices:`` to
+    ``if prepared_voices or sfx_placements:``, because an SFX-only render legitimately needs a
+    master too. The property being protected is unchanged and is now asserted more precisely: the
+    *voice* work stays behind a voice-only guard, and the mixdown runs only when there is actually
+    something to mix.
+    """
     source = body_source("_process_video_impl")
     for guarded in ("audio_mixdown.prepare_voice_inputs(", "audio_mixdown.build_mixed_master("):
         assert guarded in source
     assert "if voice_files:" in source
-    assert "if prepared_voices:" in source
+    assert "if prepared_voices or sfx_placements:" in source
 
-    # the mixdown call must sit inside the `if prepared_voices:` block
     impl = func("_process_video_impl")
-    guarded_calls = []
+    voice_only_calls, mix_calls = [], []
     for node in ast.walk(impl):
-        if isinstance(node, ast.If) and ast.unparse(node.test) in ("voice_files",
-                                                                   "prepared_voices"):
-            guarded_calls.extend(
-                ast.unparse(inner.func) for inner in ast.walk(node)
-                if isinstance(inner, ast.Call))
-    assert any("build_mixed_master" in c for c in guarded_calls)
-    assert any("prepare_voice_inputs" in c for c in guarded_calls)
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.unparse(node.test)
+        calls = [ast.unparse(inner.func) for inner in ast.walk(node)
+                 if isinstance(inner, ast.Call)]
+        if test in ("voice_files", "prepared_voices"):
+            voice_only_calls.extend(calls)
+        elif test == "prepared_voices or sfx_placements":
+            mix_calls.extend(calls)
+    assert any("prepare_voice_inputs" in c for c in voice_only_calls)
+    assert any("build_mixed_master" in c for c in mix_calls)
+    # and the mixdown is NOT reachable outside that guard
+    assert source.count("audio_mixdown.build_mixed_master(") == 1
 
 
 def test_prepared_voices_defaults_to_empty():
@@ -170,8 +183,12 @@ def test_prepared_voices_defaults_to_empty():
 
 
 def test_the_success_panel_gains_nothing_without_voice():
+    """**Amended by Smart Mix V1 / E.** An SFX-only render now also produces an ``audio_plan`` (with
+    zero voice placements), so ``audio_plan is not None`` alone would print a voice summary for a
+    render that had no voice. The guard gained ``and prepared_voices``, which is strictly stronger.
+    """
     source = body_source("_process_video_impl")
-    assert "if audio_plan is not None:" in source
+    assert "if audio_plan is not None and prepared_voices:" in source
     assert "audio_plan = None" in source
 
 
@@ -187,19 +204,25 @@ def test_the_voice_preflight_runs_before_the_analysis():
         source.index("analyze_beats_auto(")
 
 
-def test_both_audio_failures_return_before_the_renderer():
+def test_every_audio_failure_returns_before_the_renderer():
+    """**Amended by Smart Mix V1 / E**: three handlers now, not two — the voice preflight, the Smart
+    Mix library preflight and the shared mixdown. The property is unchanged and still the point:
+    every one of them sits before ``create_music_video`` and returns instead of continuing."""
     source = body_source("_process_video_impl")
     render_at = source.index("create_music_video(")
     handlers = [i for i in range(len(source))
                 if source.startswith("except audio_mixdown.AudioMixError", i)]
-    assert len(handlers) == 2, "expected a preflight handler and a mixdown handler"
+    assert len(handlers) == 3, "expected two preflight handlers and a mixdown handler"
     for position in handlers:
         assert position < render_at
     # and each one returns rather than continuing (`ast.unparse` parenthesises the tuple)
+    labels = []
     for position in handlers:
         block = source[position:position + 400]
         assert "return (None," in block
-        assert "Audio Layers" in block
+        assert ("Audio Layers" in block) or ("Smart Mix" in block)
+        labels.append("Smart Mix" if "Smart Mix" in block else "Audio Layers")
+    assert labels.count("Smart Mix") == 1, "the SFX preflight must name Smart Mix, not Audio Layers"
 
 
 def test_no_silent_fallback_to_the_original_music_on_failure():
@@ -435,26 +458,30 @@ def _audio_region_statements() -> list:
                 and getattr(node.value, "value", None) == ""):
             picked.append(node)
         elif isinstance(node, ast.Assign) and ast.unparse(node) in (
-                "prepared_voices = ()", "render_audio_path = local_audio_path"):
+                "prepared_voices = ()", "render_audio_path = local_audio_path",
+                "sfx_placements = ()"):
             picked.append(node)
-        elif isinstance(node, ast.If) and getattr(node.test, "id", None) in (
-                "voice_files", "prepared_voices"):
+        elif isinstance(node, ast.If) and ast.unparse(node.test) in (
+                "voice_files", "prepared_voices or sfx_placements"):
             picked.append(node)
     picked.sort(key=lambda n: n.lineno)
-    # report-clear, prepared_voices = (), if voice_files, render_audio_path = …, if prepared_voices
-    assert len(picked) == 5, [ast.unparse(p)[:60] for p in picked]
+    # report-clear, prepared_voices = (), if voice_files, render_audio_path = …,
+    # sfx_placements = (), if prepared_voices or sfx_placements
+    assert len(picked) == 6, [ast.unparse(p)[:60] for p in picked]
     return picked
 
 
 _AUDIO_BLOCK_ARGS = ("voice_files", "session_state", "local_audio_path", "beat_info", "beat_times",
                      "audio_mix", "session_dir", "console_logger", "audio_mixdown",
-                     "fork_audio_mix", "AUDIO_LAYERS_REPORT_KEY")
+                     "fork_audio_mix", "AUDIO_LAYERS_REPORT_KEY", "smart_mix")
 
 
 def _compile_audio_block():
     """Wrap the extracted statements in a function so their real `return`s work."""
     statements = _audio_region_statements()
-    prologue = ast.parse("mixed_master_path = None\naudio_plan = None").body
+    prologue = ast.parse(
+        "mixed_master_path = None\naudio_plan = None\n"
+        "smart_mix_plan = None\nsmart_mix_active = False\nprepared_voices = ()").body
     epilogue = ast.parse(
         "return render_audio_path, session_state[AUDIO_LAYERS_REPORT_KEY], audio_plan").body
     fn = ast.FunctionDef(
@@ -511,6 +538,11 @@ def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None):
         audio_mixdown=FakeMixdown,
         fork_audio_mix=fork_audio_mix,
         AUDIO_LAYERS_REPORT_KEY="audio_layers_report",
+        # A real normalised config, exactly as `_process_video_impl` resolves before this region.
+        # Smart Mix is still inactive for these cases — no root is given, so `sfx_placements` stays
+        # `()` and the mixdown guard behaves exactly as D's did. This harness proves the *voice*
+        # report lifecycle.
+        smart_mix=fork_smart_mix.SmartMixConfig(),
     )
     if result[0] is None:                       # a real refusal: (None, '❌ …', session_state)
         return state, calls, result[1]
@@ -588,17 +620,25 @@ def test_a_refused_render_yields_a_blank_report():
                    and ast.unparse(node.test) == "not decision.allowed")
     yielded = next(n for n in ast.walk(refusal) if isinstance(n, ast.Yield))
     assert isinstance(yielded.value, ast.Tuple)
-    assert len(yielded.value.elts) == 4, ast.unparse(yielded)
-    assert isinstance(yielded.value.elts[3], ast.Constant)
-    assert yielded.value.elts[3].value == ""
+    # 5 since Smart Mix V1 / E: video, status, state, Audio Layers report, Smart Mix report
+    assert len(yielded.value.elts) == 5, ast.unparse(yielded)
+    for index in (3, 4):
+        assert isinstance(yielded.value.elts[index], ast.Constant)
+        assert yielded.value.elts[index].value == ""
 
 
-def test_the_guard_projects_the_three_value_stream_onto_four_outputs():
-    """`process_video` keeps its 3-value contract; only the outermost handler projects."""
+def test_the_guard_projects_the_three_value_stream_onto_five_outputs():
+    """`process_video` keeps its 3-value contract; only the outermost handler projects.
+
+    **Amended by Smart Mix V1 / E**: the projection gained the Smart Mix read-out. The invariant
+    the test exists for is untouched and is the stronger half — the *inner* generator's streaming
+    contract did not change, so the worker thread still carries nothing but `session_state`.
+    """
     guarded = body_source("process_video_guarded")
     assert "for video, status, state in process_video(" in guarded
-    assert "yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''))" in guarded
-    # the inner generator's 3-value contract is unchanged; only the outer handler is 4-valued
+    assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in guarded
+    # the inner generator's 3-value contract is unchanged; only the outer handler is 5-valued
     assert ast.unparse(func("process_video").returns) == "Iterator[StatusResult]"
     assert ast.unparse(func("process_video_guarded").returns) == "Iterator[GuardedResult]"
 
@@ -637,8 +677,10 @@ def test_the_report_is_an_output_only_and_never_a_render_input():
                  and ast.unparse(node.func) == "process_btn.click")
     kwargs = {kw.arg: kw.value for kw in click.keywords}
     assert "audio_layers_report" not in names_in(kwargs["inputs"])
+    assert "smart_mix_report" not in names_in(kwargs["inputs"])
     outputs = names_in(kwargs["outputs"])
-    assert outputs == ["video_output", "status_output", "session_state", "audio_layers_report"]
+    assert outputs == ["video_output", "status_output", "session_state",
+                       "audio_layers_report", "smart_mix_report"]
 
 
 def test_the_report_is_absent_from_the_live_source_declaration():
@@ -794,3 +836,308 @@ def test_the_help_text_states_the_order_and_the_percent_contract():
     floor = floor[:floor.index("\n)")]
     assert "Percent of the normal music level" in floor
     assert "dB" not in floor
+
+
+# ===========================================================================
+# SMART MIX V1 (E): the Smart Mix seam
+# ===========================================================================
+
+#: The four user-settable Smart Mix controls. Render-request inputs; never written back.
+SMART_MIX_CONFIG_WIDGETS = ("sfx_folder", "sfx_roles", "sfx_amount", "sfx_level")
+
+#: The read-only placement read-out. An output of the render event and of nothing else.
+SMART_MIX_REPORT_WIDGET = "smart_mix_report"
+
+
+def test_the_smart_mix_accordion_is_collapsed_and_declares_five_components():
+    root = tree()
+    accordion = None
+    for node in ast.walk(root):
+        if (isinstance(node, ast.withitem)
+                and isinstance(node.context_expr, ast.Call)
+                and ast.unparse(node.context_expr.func).endswith("Accordion")):
+            kwargs = {kw.arg: kw.value for kw in node.context_expr.keywords}
+            label = kwargs.get("label")
+            if label is not None and "SMART_MIX" in ast.unparse(label):
+                accordion = kwargs
+    assert accordion is not None, "the Smart Mix accordion was not found"
+    assert ast.literal_eval(accordion["open"]) is False, "it must start collapsed"
+
+
+def test_the_five_smart_mix_components_and_their_defaults():
+    root = tree()
+    found = {}
+    for node in ast.walk(root):
+        if not isinstance(node, ast.Assign):
+            continue
+        name = getattr(node.targets[0], "id", None)
+        if name in SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,):
+            assert isinstance(node.value, ast.Call)
+            found[name] = (ast.unparse(node.value.func),
+                           {kw.arg: kw.value for kw in node.value.keywords})
+    assert set(found) == set(SMART_MIX_CONFIG_WIDGETS) | {SMART_MIX_REPORT_WIDGET}
+
+    assert found["sfx_folder"][0] == "gr.Textbox"
+    assert found["sfx_roles"][0] == "gr.CheckboxGroup"
+    assert found["sfx_amount"][0] == "gr.Slider"
+    assert found["sfx_level"][0] == "gr.Slider"
+    assert found["smart_mix_report"][0] == "gr.Textbox"
+
+    for name in ("sfx_amount", "sfx_level"):
+        kwargs = found[name][1]
+        assert ast.literal_eval(kwargs["step"]) == 1
+        assert ast.unparse(kwargs["minimum"]).endswith("CONTROL_MIN")
+        assert ast.unparse(kwargs["maximum"]).endswith("CONTROL_MAX")
+    assert ast.unparse(found["sfx_amount"][1]["value"]).endswith("DEFAULT_AMOUNT")
+    assert ast.unparse(found["sfx_level"][1]["value"]).endswith("DEFAULT_SFX_LEVEL_PERCENT")
+
+    # all five roles ticked by default, taken from the frozen vocabulary rather than retyped
+    assert "ROLE_CHOICES" in ast.unparse(found["sfx_roles"][1]["choices"])
+    assert "ROLE_CHOICES" in ast.unparse(found["sfx_roles"][1]["value"])
+
+    report = found["smart_mix_report"][1]
+    assert ast.literal_eval(report["value"]) == ""
+    assert ast.literal_eval(report["interactive"]) is False
+
+
+def test_there_is_no_scan_button():
+    """V1 validates the library in the render preflight; a second scan path would drift from it."""
+    source = ast.unparse(tree())
+    for forbidden in ("sfx_scan_btn", "smart_mix_scan_btn", "sfx_scan_button"):
+        assert forbidden not in source
+
+
+def test_no_smart_mix_config_widget_is_ever_written():
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is None:
+                continue
+            for widget in SMART_MIX_CONFIG_WIDGETS:
+                assert widget not in names_in(outputs), (
+                    f"{ast.unparse(node.func)} writes {widget}")
+
+
+def test_the_smart_mix_report_has_exactly_one_writer():
+    writers = []
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is not None and SMART_MIX_REPORT_WIDGET in names_in(outputs):
+                writers.append(ast.unparse(node.func))
+    assert writers == ["process_btn.click"], writers
+
+
+def test_no_smart_mix_widget_registers_a_handler_of_its_own():
+    """Read at click time, exactly like every other audio control. No scan, no live validation."""
+    for node in ast.walk(tree()):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            owner = getattr(node.func.value, "id", None)
+            assert owner not in SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,), owner
+
+
+def test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring():
+    root = tree()
+    everything = SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,)
+    for assigned in ("source_outputs", "prep_outputs"):
+        assignment = next((n for n in ast.walk(root) if isinstance(n, ast.Assign)
+                           and getattr(n.targets[0], "id", None) == assigned), None)
+        if assignment is None:
+            continue
+        for widget in everything:
+            assert widget not in names_in(assignment.value), f"{widget} in {assigned}"
+
+    for button in ("source_mode", "source_folder", "source_recursive", "scan_btn", "video_input",
+                   "confirm_btn", "prep_folder", "prep_recursive", "prep_batch_size",
+                   "prep_scan_btn", "prep_analyze_btn", "creative_preset", "randomize_btn",
+                   "generate_variant_btn", "new_variant_btn"):
+        for node in ast.walk(root):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and getattr(node.func.value, "id", None) == button):
+                for kw in node.keywords:
+                    if kw.arg in ("inputs", "outputs"):
+                        for widget in everything:
+                            assert widget not in names_in(kw.value), f"{button}.{kw.arg}"
+
+
+def test_smart_mix_is_absent_from_the_live_source_declaration():
+    for node in ast.walk(tree()):
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("live_declaration"):
+            rendered = ast.unparse(node)
+            for widget in SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,):
+                assert widget not in rendered, widget
+
+
+def test_the_click_inputs_align_with_the_guard_parameters():
+    """Gradio passes positionally, so a silent reordering would be invisible."""
+    click = next(node for node in ast.walk(tree())
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and ast.unparse(node.func) == "process_btn.click")
+    kwargs = {kw.arg: kw.value for kw in click.keywords}
+    inputs = [getattr(n, "id", None) for n in kwargs["inputs"].elts]
+    params = [a.arg for a in func("process_video_guarded").args.args]
+    # audio_input -> audio_file is the one deliberate rename
+    assert params[0] == "audio_file"
+    assert inputs[1:] == params[1:]
+    for widget in SMART_MIX_CONFIG_WIDGETS:
+        assert widget in inputs
+    assert SMART_MIX_REPORT_WIDGET not in inputs, "the report is an output only"
+
+
+def test_the_guard_builds_one_normalised_config_after_the_gate():
+    guarded = body_source("process_video_guarded")
+    assert "fork_smart_mix.SmartMixConfig(" in guarded
+    assert (guarded.index("resolve_for_render(")
+            < guarded.index("fork_smart_mix.SmartMixConfig(")), (
+        "the config must be built only after the gate has allowed the render")
+    call = next(n for n in ast.walk(func("process_video_guarded"))
+                if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "fork_smart_mix.SmartMixConfig")
+    assert {kw.arg for kw in call.keywords} == {
+        "enabled_roles", "amount", "sfx_level_percent"}
+
+
+def test_the_sfx_root_stays_a_runtime_path_not_creative_state():
+    source = ast.unparse(tree())
+    for creative in ("CreativeProfile.from_widgets", "CreativeRecipe", "VariantLabConfig"):
+        for node in ast.walk(tree()):
+            if isinstance(node, ast.Call) and creative in ast.unparse(node.func):
+                rendered = ast.unparse(node)
+                for widget in SMART_MIX_CONFIG_WIDGETS:
+                    assert widget not in rendered, f"{widget} reached {creative}"
+    assert "sfx_root=sfx_folder" in source, "the root is threaded as a plain runtime argument"
+
+
+def test_both_reports_are_cleared_before_the_gate_and_before_the_attempt():
+    guarded = body_source("process_video_guarded")
+    impl = body_source("_process_video_impl")
+    for key in ("AUDIO_LAYERS_REPORT_KEY", "SMART_MIX_REPORT_KEY"):
+        assert f"session_state[{key}] = ''" in guarded
+        assert guarded.index(f"{key}] = ''") < guarded.index("resolve_for_render(")
+        assert f"session_state[{key}] = ''" in impl
+        assert impl.index(f"{key}] = ''") < impl.index("try:")
+
+
+def test_the_smart_mix_preflight_runs_before_the_analysis():
+    impl = body_source("_process_video_impl")
+    assert impl.index("prepare_sfx_inputs(") < impl.index("analyze_beats_auto(")
+
+
+def test_smart_mix_planning_runs_after_the_analysis():
+    impl = body_source("_process_video_impl")
+    assert impl.index("analyze_beats_auto(") < impl.index("fork_smart_mix.plan_sfx(")
+    assert impl.index("fork_smart_mix.project_structure(") > impl.index("analyze_beats_auto(")
+
+
+def test_the_analysis_never_sees_the_mixed_master_even_with_sfx():
+    impl = func("_process_video_impl")
+    call = next(n for n in ast.walk(impl) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "analyze_beats_auto")
+    assert ast.unparse(call.args[0]) == "local_audio_path"
+    rendered = ast.unparse(call)
+    for forbidden in ("mixed_master_path", "render_audio_path", "sfx", "smart_mix"):
+        assert forbidden not in rendered
+
+
+def test_smart_mix_is_active_only_with_a_root_an_amount_and_a_role():
+    impl = body_source("_process_video_impl")
+    assert "smart_mix_active = bool(sfx_root and str(sfx_root).strip()) and smart_mix.plans_anything" in impl
+    # and every SFX step is behind that flag
+    for node in ast.walk(func("_process_video_impl")):
+        if isinstance(node, ast.Call) and "prepare_sfx_inputs" in ast.unparse(node.func):
+            break
+    else:
+        raise AssertionError("prepare_sfx_inputs is not called")
+    guarded = [ast.unparse(n.test) for n in ast.walk(func("_process_video_impl"))
+               if isinstance(n, ast.If)
+               and "prepare_sfx_inputs" in ast.unparse(n)]
+    assert "smart_mix_active" in guarded
+
+
+def test_sfx_level_zero_does_not_disable_planning():
+    """Level is a mute, not a switch — only the root, the Amount and the roles decide activity."""
+    impl = body_source("_process_video_impl")
+    activity = impl[impl.index("smart_mix_active ="):impl.index("smart_mix_active =") + 160]
+    assert "sfx_level" not in activity
+    assert "sfx_level_percent" not in activity
+
+
+def test_the_success_panel_gains_a_smart_mix_line_only_when_sfx_were_used():
+    impl = body_source("_process_video_impl")
+    assert "if smart_mix_plan is not None and smart_mix_plan.total:" in impl
+    assert "smart_mix_plan.summary_line()" in impl
+
+
+def test_the_smart_mix_report_comes_from_the_plan_and_is_never_recomputed():
+    impl = body_source("_process_video_impl")
+    assert "'\\n'.join(smart_mix_plan.report_lines())" in impl
+    for forbidden in ("_place_impacts", "_place_risers", "_Occupancy", "amount_params("):
+        assert forbidden not in impl
+
+
+def test_a_zero_placement_smart_mix_builds_no_pointless_master():
+    impl = body_source("_process_video_impl")
+    assert "if prepared_voices or sfx_placements:" in impl
+    assert impl.count("audio_mixdown.build_mixed_master(") == 1
+
+
+def test_the_smart_mix_report_never_reaches_the_pipeline():
+    for callee in ("analyze_beats_auto", "create_music_video", "build_mixed_master",
+                   "prepare_sfx_inputs", "plan_sfx"):
+        for node in ast.walk(func("_process_video_impl")):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(callee):
+                rendered = ast.unparse(node)
+                assert "SMART_MIX_REPORT_KEY" not in rendered, callee
+                assert "smart_mix_report" not in rendered, callee
+
+
+def test_the_worker_thread_touches_no_smart_mix_component():
+    worker = next(n for n in ast.walk(func("process_video"))
+                  if isinstance(n, ast.FunctionDef) and n.name == "worker")
+    rendered = ast.unparse(worker)
+    assert "smart_mix_report" not in rendered
+    assert "gr." not in rendered
+
+
+def test_stage_five_and_creative_state_are_untouched_by_smart_mix():
+    """Structural isolation: no SFX concept may reach Stage 5, the cache or the creative profile."""
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    for relative in ("src/video_analysis.py", "src/auto_mode/stage5_qwen_scene_worker.py",
+                     "src/beatsync_fork/library_prep.py", "src/beatsync_fork/creative.py",
+                     "src/beatsync_fork/creative_recipe.py", "src/beatsync_fork/variant_lab.py",
+                     "src/beatsync_fork/presets.py", "src/beatsync_fork/variation.py"):
+        with open(_os.path.join(repo, relative), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        for token in ("smart_mix", "SmartMix", "sfx_", "SfxAsset", "SfxPlacement"):
+            assert token not in text, f"{token} leaked into {relative}"
+
+
+def test_the_cache_constants_are_unchanged():
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(repo, "src", "video_analysis.py"), "r", encoding="utf-8") as handle:
+        text = handle.read()
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in text
+    assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in text
+
+
+def test_no_cli_flag_was_added():
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(repo, "src", "video_processor.py"), "r", encoding="utf-8") as handle:
+        text = handle.read()
+    for flag in ("--sfx", "--smart-mix", "--sfx-root", "--sfx-level", "--sfx-amount"):
+        assert flag not in text
+
+
+def test_the_reserved_audio_rng_domain_stays_unused():
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(repo, "src", "gui.py"), "r", encoding="utf-8") as handle:
+        text = handle.read()
+    assert 'rng_for(' not in text
+    assert 'DOMAIN_AUDIO' not in text
