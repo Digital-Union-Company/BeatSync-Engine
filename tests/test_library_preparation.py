@@ -983,11 +983,16 @@ def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
     return {kw.arg: kw.value for kw in call.keywords}
 
 
-#: The render request, in order. Creative Controls Core added the three creative sliders alongside
-#: the variation seed; they are render-request creative state, not preparation state, which is what
-#: the assertions below actually care about.
+#: The render request, in order. Creative Controls Core added the creative sliders alongside the
+#: variation seed, and Audio Layers V1 added the five voice controls next to the audio input they
+#: layer onto. All of them are render-request state, not preparation state — which is the property
+#: the assertions below actually care about, and which is asserted directly as well so this list
+#: staying in step with the GUI never becomes the only thing being checked.
 _RENDER_CLICK_INPUTS = [
-    "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
+    "audio_input",
+    "voice_files", "voice_start_delay", "voice_min_gap", "voice_avoid_drops",
+    "music_under_voice",
+    "source_mode", "source_folder", "source_recursive", "video_input",
     "output_filename", "processing_mode", "custom_fps", "variation_seed",
     "cut_density", "energy_response", "motion_bias", "source_diversity", "micro_cuts",
     "semantic_emphasis",
