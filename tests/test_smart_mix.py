@@ -1057,3 +1057,384 @@ def test_the_nero_ladder_is_untouched_by_r1():
                                unknown_folders=("Impats",), root_level_files=3))
         assert plan.counts == {role: expected[role] for role in sm.ROLE_ORDER}
         assert plan.total == expected["_total"]
+
+
+# ===========================================================================
+# 13. ARRAY-LIKE STRUCTURE INPUTS (runtime R1)
+# ===========================================================================
+#
+# The runtime acceptance render died after Stage 5 with
+#
+#     ValueError: The truth value of an array with more than one element is ambiguous.
+#
+# because `project_structure` defaulted four `beat_info` fields with `value or ()`. At real
+# runtime all four are numpy `ndarray` of length 566, and `bool(ndarray)` raises for any length
+# above one. Every fixture in this suite fed lists and tuples — whose truth value is perfectly
+# well defined — so the whole suite passed while the feature could not run at all.
+#
+# These tests reproduce that hazard WITHOUT importing numpy: `beatsync_fork` is stdlib-only by
+# rule, and importing numpy to test it would break the very property that makes the planner
+# testable on a bare interpreter.
+
+
+class AmbiguousArray:
+    """A sequence that iterates normally but refuses to be truth-tested, exactly like ndarray.
+
+    Any boolean coercion — `bool(x)`, `if x`, `x or y`, `not x` — raises, so a single accidental
+    truthiness check anywhere in the projection path fails the test loudly instead of silently
+    working on the list fixtures.
+    """
+
+    def __init__(self, values):
+        self._values = list(values)
+        self.bool_calls = 0
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __bool__(self):
+        self.bool_calls += 1
+        raise ValueError(
+            "The truth value of an array with more than one element is ambiguous. "
+            "Use a.any() or a.all()")
+
+
+def test_the_fixture_itself_refuses_boolean_coercion():
+    """If this ever stopped raising, every test below would pass vacuously."""
+    array = AmbiguousArray([1.0, 2.0, 3.0])
+    assert list(array) == [1.0, 2.0, 3.0]
+    assert len(array) == 3
+    with pytest.raises(ValueError, match="ambiguous"):
+        bool(array)
+    with pytest.raises(ValueError, match="ambiguous"):
+        array or ()
+    with pytest.raises(ValueError, match="ambiguous"):
+        if array:
+            pass
+
+
+def _array_beat_info(times, impact, bar, phrase, sections=None, duration=30.0,
+                     wrap=("times", "impact_strength", "is_bar_anchor", "is_phrase_anchor")):
+    """`beat_info` with the chosen fields wrapped in `AmbiguousArray`."""
+    def maybe(name, values):
+        return AmbiguousArray(values) if name in wrap else list(values)
+
+    return {
+        "times": maybe("times", times),
+        "rhythm_data": {
+            "impact_strength": maybe("impact_strength", impact),
+            "is_bar_anchor": maybe("is_bar_anchor", bar),
+            "is_phrase_anchor": maybe("is_phrase_anchor", phrase),
+        },
+        "sections": sections if sections is not None else [
+            {"start": 0.0, "end": duration, "type": "verse"}],
+        "audio_duration": duration,
+    }
+
+
+def _simple_arrays(count=8):
+    times = [i * 1.0 for i in range(count)]
+    impact = [(i % 5) / 5.0 for i in range(count)]
+    bar = [i % 2 == 0 for i in range(count)]
+    phrase = [i % 4 == 0 for i in range(count)]
+    return times, impact, bar, phrase
+
+
+@pytest.mark.parametrize("field", [
+    "times", "impact_strength", "is_bar_anchor", "is_phrase_anchor",
+])
+def test_each_structure_field_survives_an_ambiguous_array_independently(field):
+    """`times` failed first at runtime, which would hide the other three. Each is pinned alone."""
+    times, impact, bar, phrase = _simple_arrays()
+    info = _array_beat_info(times, impact, bar, phrase, wrap=(field,))
+    structure = sm.project_structure(info)
+    assert structure.beat_times == tuple(times)
+    assert structure.impact_strength == tuple(impact)
+    assert structure.is_bar_anchor == tuple(bar)
+    assert structure.is_phrase_anchor == tuple(phrase)
+
+
+def test_all_four_fields_ambiguous_at_once():
+    times, impact, bar, phrase = _simple_arrays()
+    info = _array_beat_info(times, impact, bar, phrase)
+    structure = sm.project_structure(info)
+    assert len(structure.beat_times) == 8
+    assert structure.music_duration == 30.0
+    # and nothing tried to truth-test any of them
+    for value in (info["times"], info["rhythm_data"]["impact_strength"],
+                  info["rhythm_data"]["is_bar_anchor"],
+                  info["rhythm_data"]["is_phrase_anchor"]):
+        assert value.bool_calls == 0
+
+
+def test_the_whole_nero_structure_projects_from_ambiguous_arrays():
+    """End to end on the accepted calibration data, which is the shape production really has."""
+    import json
+    import os as _os
+    path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         "fixtures", "nero_structure.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    count = data["beats"]
+
+    def unbits(text):
+        value = int(text, 16)
+        return [bool(value >> i & 1) for i in range(count)]
+
+    info = _array_beat_info(
+        data["times"], data["impact_strength"],
+        unbits(data["is_bar_anchor_bits"]), unbits(data["is_phrase_anchor_bits"]),
+        sections=data["sections"], duration=data["audio_duration"])
+    structure = sm.project_structure(info)
+    assert len(structure.beat_times) == 566
+    assert len(structure.sections) == 13
+
+    # and the frozen ladder still resolves from it, unchanged
+    for amount, expected in NERO_LADDER.items():
+        plan = sm.plan_sfx(structure, nero_pools(), sm.SmartMixConfig(amount=amount))
+        assert plan.total == expected["_total"], amount
+        assert plan.counts == {role: expected[role] for role in sm.ROLE_ORDER}, amount
+
+
+def test_missing_fields_still_behave_as_empty():
+    """`None` means empty — the semantics the old `or ()` was reaching for, without the coercion."""
+    assert sm._missing_as_empty(None) == ()
+    with pytest.raises(sm.SmartMixStructureError, match="beat times"):
+        sm.project_structure({"times": None, "rhythm_data": {}, "audio_duration": 10.0})
+
+
+def test_a_non_none_value_passes_through_untouched():
+    """Critically: the helper must not inspect or coerce anything that is not `None`."""
+    array = AmbiguousArray([1.0])
+    assert sm._missing_as_empty(array) is array
+    assert array.bool_calls == 0
+    for value in ([], (), [0.0], "", 0):
+        assert sm._missing_as_empty(value) is value
+
+
+def test_an_empty_ambiguous_array_still_fails_clearly():
+    """A zero-length array-like is 'empty', not a crash, and reaches the existing error."""
+    info = _array_beat_info([], [], [], [])
+    with pytest.raises(sm.SmartMixStructureError, match="no usable beat times"):
+        sm.project_structure(info)
+
+
+def test_misaligned_ambiguous_arrays_still_raise_the_alignment_error():
+    times, impact, bar, phrase = _simple_arrays()
+    info = _array_beat_info(times, impact[:-1], bar, phrase)
+    with pytest.raises(sm.SmartMixStructureError, match="misaligned"):
+        sm.project_structure(info)
+
+
+# ---------------------------------------------------------------------------
+# structural guard: the four fields must never be truth-tested again
+# ---------------------------------------------------------------------------
+
+
+def _project_structure_ast():
+    import ast as _ast
+    import os as _os
+    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "src", "beatsync_fork", "smart_mix.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        tree = _ast.parse(handle.read())
+    return _ast, next(n for n in _ast.walk(tree)
+                      if isinstance(n, _ast.FunctionDef) and n.name == "project_structure")
+
+
+ARRAY_FIELDS = ("times", "impact_strength", "is_bar_anchor", "is_phrase_anchor")
+
+
+def test_no_array_field_is_defaulted_through_boolean_or():
+    """Narrow guard: no `.get(<array field>) or ...` may return to `project_structure`.
+
+    Deliberately not a module-wide ban on `or` — only these four musical-structure values are
+    array-like, and only they are forbidden from appearing in boolean context.
+    """
+    ast_mod, func = _project_structure_ast()
+    for node in ast_mod.walk(func):
+        if not isinstance(node, ast_mod.BoolOp):
+            continue
+        rendered = ast_mod.unparse(node)
+        for field in ARRAY_FIELDS:
+            assert f"'{field}'" not in rendered and f'"{field}"' not in rendered, (
+                f"{field} is truth-tested in: {rendered}")
+
+
+def test_no_array_field_is_passed_to_bool_or_not():
+    ast_mod, func = _project_structure_ast()
+    for node in ast_mod.walk(func):
+        rendered = None
+        if isinstance(node, ast_mod.Call) and getattr(node.func, "id", None) == "bool":
+            rendered = ast_mod.unparse(node)
+        elif isinstance(node, ast_mod.UnaryOp) and isinstance(node.op, ast_mod.Not):
+            rendered = ast_mod.unparse(node)
+        if rendered is None:
+            continue
+        for field in ARRAY_FIELDS:
+            assert f"'{field}'" not in rendered and f'"{field}"' not in rendered, (
+                f"{field} is coerced in: {rendered}")
+
+
+def test_the_four_fields_are_read_through_the_missing_helper():
+    ast_mod, func = _project_structure_ast()
+    body = ast_mod.unparse(func)
+    for field in ARRAY_FIELDS:
+        assert f"_missing_as_empty(" in body
+        assert f"get('{field}')" in body, field
+
+
+def test_the_pure_module_still_imports_no_numpy():
+    """The fix must not be 'import numpy and call .size'."""
+    import ast as _ast
+    import os as _os
+    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "src", "beatsync_fork", "smart_mix.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        tree = _ast.parse(handle.read())
+    imported = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, _ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "numpy" not in imported
+    assert imported <= {"__future__", "math", "collections", "dataclasses", "typing",
+                        "beatsync_fork"}, imported
+
+
+# ===========================================================================
+# 14. MALFORMED SCALAR STRUCTURE INPUT (runtime R1b)
+# ===========================================================================
+#
+# Removing the `value or ()` idiom fixed the ndarray crash, but that idiom had also been quietly
+# absorbing a malformed FALSEY SCALAR into the empty path: `0 or ()` is `()`. Without it, `0`
+# reached `_finite_floats`, which iterates immediately, and escaped `project_structure` as a raw
+#
+#     TypeError: 'int' object is not iterable
+#
+# rather than the controlled `SmartMixStructureError`. Measured on the R0 head for `times` and
+# `impact_strength` with `0`, `0.0` and `False`.
+#
+# The same guard also covers the *pre-existing* truthy-scalar case (`times = 7`), which `or ()`
+# never normalised either - same failure class, same boundary.
+#
+# These assert the public `project_structure()` failure contract, not the private helper.
+
+
+def _scalar_beat_info(times=None, impact=None, bar=None, phrase=None, duration=30.0):
+    """Otherwise-valid `beat_info` with individual fields overridden by malformed values."""
+    good_times = [0.0, 1.0, 2.0, 3.0]
+    good_impact = [0.1, 0.2, 0.3, 0.4]
+    good_bar = [True, False, True, False]
+    good_phrase = [True, False, False, False]
+    return {
+        "times": good_times if times is None else times,
+        "rhythm_data": {
+            "impact_strength": good_impact if impact is None else impact,
+            "is_bar_anchor": good_bar if bar is None else bar,
+            "is_phrase_anchor": good_phrase if phrase is None else phrase,
+        },
+        "sections": [{"start": 0.0, "end": duration, "type": "verse"}],
+        "audio_duration": duration,
+    }
+
+
+#: Falsey scalars are the regression (`or ()` used to absorb them); the truthy one is the
+#: pre-existing member of the same class. One parametrisation covers both without duplication.
+MALFORMED_SCALARS = [0, 0.0, False, 7]
+
+
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_a_malformed_scalar_times_never_escapes_as_a_raw_typeerror(scalar):
+    with pytest.raises(sm.SmartMixStructureError, match="no usable beat times"):
+        sm.project_structure(_scalar_beat_info(times=scalar))
+
+
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_a_malformed_scalar_impact_never_escapes_as_a_raw_typeerror(scalar):
+    with pytest.raises(sm.SmartMixStructureError, match="misaligned"):
+        sm.project_structure(_scalar_beat_info(impact=scalar))
+
+
+@pytest.mark.parametrize("field", ["times", "impact"])
+@pytest.mark.parametrize("scalar", MALFORMED_SCALARS)
+def test_no_malformed_scalar_raises_a_bare_typeerror(field, scalar):
+    """The contract is the *type* of failure: never an incidental iteration error."""
+    info = _scalar_beat_info(**{field: scalar})
+    try:
+        sm.project_structure(info)
+    except sm.SmartMixStructureError:
+        pass
+    except TypeError as exc:                                  # pragma: no cover - the defect
+        pytest.fail(f"{field}={scalar!r} escaped as raw TypeError: {exc}")
+
+
+def test_the_anchor_fields_were_already_controlled_and_stay_that_way():
+    """`is_bar_anchor` / `is_phrase_anchor` already had a `try/except TypeError`. Not widened."""
+    for field in ("bar", "phrase"):
+        with pytest.raises(sm.SmartMixStructureError, match="not iterable"):
+            sm.project_structure(_scalar_beat_info(**{field: 0}))
+
+
+def test_an_empty_string_still_reaches_the_controlled_path():
+    """`''` iterates to nothing, so it was never a raw TypeError - pinned so it stays controlled."""
+    with pytest.raises(sm.SmartMixStructureError, match="no usable beat times"):
+        sm.project_structure(_scalar_beat_info(times=""))
+
+
+def test_finite_floats_answers_empty_for_a_non_iterable():
+    """The narrow helper change, stated directly: unusable input is `()`, like every other
+    unusable input it already handled."""
+    assert sm._finite_floats(0) == ()
+    assert sm._finite_floats(7) == ()
+    assert sm._finite_floats(False) == ()
+    assert sm._finite_floats(object()) == ()
+    # and nothing else moved
+    assert sm._finite_floats([1, 2.5, 3]) == (1.0, 2.5, 3.0)
+    assert sm._finite_floats([]) == ()
+    assert sm._finite_floats([1, "x"]) == ()
+    assert sm._finite_floats([1, float("nan")]) == ()
+    assert sm._finite_floats([1, float("inf")]) == ()
+
+
+def test_the_non_iterable_guard_does_not_truth_test_the_container():
+    """The fix must not have reintroduced container boolean coercion."""
+    array = AmbiguousArray([1.0, 2.0, 3.0])
+    assert sm._finite_floats(array) == (1.0, 2.0, 3.0)
+    assert array.bool_calls == 0
+
+
+def test_ambiguous_arrays_still_project_after_the_scalar_guard():
+    """Belt-and-braces: the R1a ndarray behaviour is untouched by the R1b guard."""
+    times, impact, bar, phrase = _simple_arrays()
+    info = _array_beat_info(times, impact, bar, phrase)
+    structure = sm.project_structure(info)
+    assert structure.beat_times == tuple(times)
+    for value in (info["times"], info["rhythm_data"]["impact_strength"],
+                  info["rhythm_data"]["is_bar_anchor"],
+                  info["rhythm_data"]["is_phrase_anchor"]):
+        assert value.bool_calls == 0
+
+
+def test_project_structure_only_ever_raises_its_own_error_type():
+    """A sweep over the malformed shapes this boundary can plausibly receive."""
+    shapes = [
+        {"times": 0}, {"times": 7}, {"times": None}, {"times": []}, {"times": ""},
+        {"impact": 0}, {"impact": 7}, {"impact": None}, {"impact": []},
+        {"bar": 0}, {"bar": None}, {"phrase": 0}, {"phrase": None},
+        {"times": [1.0, 2.0], "impact": [1.0]},
+    ]
+    for shape in shapes:
+        try:
+            sm.project_structure(_scalar_beat_info(**shape))
+        except sm.SmartMixStructureError:
+            pass
+        except Exception as exc:                              # noqa: BLE001 - that is the point
+            pytest.fail(f"{shape} escaped as {type(exc).__name__}: {exc}")

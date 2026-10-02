@@ -1450,6 +1450,35 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
 - **The asset cursor advances on every candidate ATTEMPT, not every success.** Candidate `k` takes
   `pool[k % N]` whether or not it lands. Without that, one asset too long to fit would be retried at
   every later anchor and permanently block the rest of its pool.
+- **The four `beat_info` structure fields are numpy arrays and must NEVER be truth-tested.**
+  `times`, `rhythm_data["impact_strength"]`, `["is_bar_anchor"]` and `["is_phrase_anchor"]` arrive
+  as `ndarray` (566 long on the calibration track), and `bool(ndarray)` raises
+  `ValueError: The truth value of an array with more than one element is ambiguous` above length 1.
+  `project_structure` originally defaulted all four with `value or ()`, which **crashed every
+  active Smart Mix render after Stage 5** — and the entire suite passed anyway, because every
+  fixture fed lists and tuples, whose truth value is well defined. Missing-means-empty is now
+  expressed by `_missing_as_empty` (`None` → `()`, *anything else returned untouched*), and the
+  values are then consumed only by iteration and `len`. **Do not reintroduce `x or ()`, `if x` or
+  `bool(x)` on these four**, and do not "fix" a future variant by importing numpy and calling
+  `.size` — `beatsync_fork` is stdlib-only, which is exactly what makes the planner testable on a
+  bare interpreter. Zero-length and `None` both still reach the existing "no usable beat times" /
+  "misaligned" errors unchanged. The regression uses a stdlib `AmbiguousArray` whose `__bool__`
+  raises like `ndarray`'s, covers each field **independently** (the original failure hit `times`
+  first and would have masked the other three), and is backed by a structural guard that forbids
+  these four keys inside any `BoolOp`, `bool(...)` or `not` in `project_structure`.
+- **Malformed *scalar* structure input must fail through the structure boundary, not as an
+  incidental `TypeError`.** Removing `value or ()` had a second, quieter consequence: that idiom
+  was also absorbing a malformed falsey scalar (`0`, `0.0`, `False`) into the empty path, so
+  without it a scalar reached `_finite_floats`, which iterates immediately, and escaped
+  `project_structure` as a raw `TypeError: 'int' object is not iterable`. `_finite_floats` now
+  answers `()` for a non-iterable argument — the same answer it already gave for a non-numeric
+  element, `NaN` or `inf` — so `times = 0` reports `no usable beat times` exactly as it did before
+  the ndarray fix. The guard is `try: for …`, **not** `if values`, so the container is still never
+  truth-tested. It also covers the *pre-existing* truthy-scalar case (`times = 7`), which `or ()`
+  never normalised either. `_finite_floats` has exactly two callers, both of them these two fields
+  inside `project_structure`, so this cannot reach unrelated planner behaviour. The anchor fields
+  were already covered by their own `try/except TypeError` (`rhythm anchors are not iterable`) and
+  were deliberately **not** widened.
 - **The impact percentile population is the WHOLE aligned beat array**; the bar-anchor mask is
   applied *after* the threshold. That is what the accepted calibration measured — restricting the
   population first silently shifts every threshold. The stdlib implementation reproduces

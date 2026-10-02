@@ -546,16 +546,52 @@ class SmartMixPlan:
 
 
 def _finite_floats(values: Any) -> tuple:
+    """Every value as a finite float, or ``()`` if the input is unusable in any way.
+
+    "Unusable" already covered a non-numeric element, ``NaN`` and both infinities. It now also
+    covers an argument that is **not iterable at all**, which is the same kind of answer: there is
+    no usable sequence here, so the caller's existing structure check reports it.
+
+    [FORK] Digital-Union (Smart Mix V1 / E, runtime R1b): this is load-bearing because the ndarray
+    fix removed the ``value or ()`` idiom. That idiom had been quietly absorbing a malformed falsey
+    *scalar* — ``0``, ``0.0``, ``False`` — into the empty path, so dropping it let such a value
+    reach this loop and escape ``project_structure`` as a raw ``TypeError: 'int' object is not
+    iterable`` instead of ``SmartMixStructureError``. The same guard also converts the
+    *pre-existing* truthy-scalar case (``times = 7``), which ``or ()`` never normalised either.
+    Note that the container itself is still never truth-tested — the check is ``try: for …``,
+    not ``if values``.
+    """
     out = []
-    for value in values:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return ()
-        if number != number or number in (float("inf"), float("-inf")):
-            return ()
-        out.append(number)
+    try:
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return ()
+            if number != number or number in (float("inf"), float("-inf")):
+                return ()
+            out.append(number)
+    except TypeError:
+        return ()
     return tuple(out)
+
+
+def _missing_as_empty(value: Any) -> Any:
+    """``None`` becomes an empty tuple; **anything else is returned untouched**.
+
+    [FORK] Digital-Union (Smart Mix V1 / E, runtime R1): the four beat-synchronous fields on
+    ``beat_info`` are numpy ``ndarray`` at real runtime, and ``bool(ndarray)`` raises
+    ``ValueError: The truth value of an array with more than one element is ambiguous`` for any
+    length above one. The original ``value or ()`` idiom therefore crashed every active Smart Mix
+    render after Stage 5 — while the whole test suite passed, because every fixture fed lists and
+    tuples, whose truth value is perfectly well defined.
+
+    So this helper exists to make the "missing means empty" intent explicit **without ever putting
+    an array-like in boolean context**. It is deliberately not numpy-aware: any container whose
+    ``__bool__`` is ambiguous or forbidden passes through unharmed, and a genuinely empty one still
+    reaches the existing length checks and produces the same clear structure error as before.
+    """
+    return () if value is None else value
 
 
 def project_structure(beat_info: Mapping) -> MusicStructure:
@@ -565,11 +601,16 @@ def project_structure(beat_info: Mapping) -> MusicStructure:
     beat-synchronous arrays must align with ``times``; a mismatch raises instead of zipping to the
     shorter sequence, because a silently re-indexed impact array changes every threshold's meaning
     while still producing a plausible-looking plan.
+
+    **Never truth-test the array-like fields.** ``times``, ``impact_strength``, ``is_bar_anchor``
+    and ``is_phrase_anchor`` arrive as numpy arrays in production; they are passed through
+    :func:`_missing_as_empty` and then consumed by iteration and ``len`` only. See that helper for
+    the measured failure this prevents.
     """
     if not isinstance(beat_info, Mapping):
         raise SmartMixStructureError("beat_info is not a mapping")
 
-    times = _finite_floats(beat_info.get("times") or ())
+    times = _finite_floats(_missing_as_empty(beat_info.get("times")))
     if not times:
         raise SmartMixStructureError("no usable beat times")
 
@@ -577,9 +618,9 @@ def project_structure(beat_info: Mapping) -> MusicStructure:
     if not isinstance(rhythm, Mapping):
         raise SmartMixStructureError("beat_info has no rhythm_data mapping")
 
-    impact = _finite_floats(rhythm.get("impact_strength") or ())
-    bar_raw = rhythm.get("is_bar_anchor") or ()
-    phrase_raw = rhythm.get("is_phrase_anchor") or ()
+    impact = _finite_floats(_missing_as_empty(rhythm.get("impact_strength")))
+    bar_raw = _missing_as_empty(rhythm.get("is_bar_anchor"))
+    phrase_raw = _missing_as_empty(rhythm.get("is_phrase_anchor"))
     try:
         bar = tuple(bool(v) for v in bar_raw)
         phrase = tuple(bool(v) for v in phrase_raw)
