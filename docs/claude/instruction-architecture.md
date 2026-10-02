@@ -208,3 +208,68 @@ bare-CPython core, the upstream seams verified without importing the runtime, an
 portable-runtime/end-to-end verification (which remains outside the suite, apart from the opt-in
 `BEATSYNC_TEST_FFMPEG` tier). It does **not** claim the upstream runtime is importable or
 integration-tested.
+
+## R2 corrections (second review pass)
+
+Independent review of R1 found that R1's cross-reference pass was **incomplete**, and that the fix in
+R1 finding 1 had left its own documentation trail stale. R1's record above is accurate as written — it
+did fix three dangling references — but three more references, plus one stale map row, survived it.
+R2 is reference integrity only: no `paths:` frontmatter changed, no rule text changed, no scope
+redesign.
+
+### 1. The README subsystem map still described the pre-R1 scope
+
+R1 added `src/video_analysis.py` to `library-preparation.md`'s `paths:`, but
+`docs/claude/README.md`'s subsystem-rule map still listed that rule as covering only
+`src/beatsync_fork/library_prep.py` and its test. The map is deliberately abridged, but omitting the
+*one production path whose absence caused R0's scope defect* is exactly the wrong abridgement. The
+row now names it, with a note of why it is there.
+
+### 2. The first media-neutral reference in `stage5-cache-identity.md` was missed
+
+That file contains **two** references to the media-neutral section. R1 fixed the one at the bottom of
+the D2 contract and did not notice the earlier one next to the `stage5_cache_v2 → stage5_cache_v3`
+bump, which still read "See the media-neutral section for why there is no migration" — a
+same-document pointer to a section that lives in `.claude/rules/stage5-worker.md`. Now explicit.
+
+### 3. The D1 boundary reference in `library-preparation.md` pointed "above"
+
+The bounded-batch explanation said the shared-worker durability boundary was "already documented
+above". It is not in that file; its live authority is `.claude/rules/stage5-cache-durability.md`. The
+reference now names that file and the quoted invariant — "while the shared worker is still in flight
+its per-job results are not durable at all" — is preserved verbatim. The D1 contract is deliberately
+**not** duplicated into the preparation rule.
+
+### 4. The historical document pointed at authorities that had moved
+
+`docs/claude/stage5-cache-history.md` carried the D1 text's original "see the stored-consistency rule
+above" and "the D2 identity contract above". Neither is in that document. They now name
+`.claude/rules/stage5-cache-durability.md` and `.claude/rules/stage5-cache-identity.md`. The
+historical evidence itself — the 2192/2196 figures, the pre-D2 `int(st_mtime)` identity, the deferral
+rationale — is untouched. The file's own "The D1 figures above" is a genuine local reference and was
+left alone.
+
+### Bounded positional-reference sweep
+
+The full corpus (`CLAUDE.md`, `.claude/rules/**/*.md`, `docs/claude/**/*.md`) was swept for
+location-dependent phrasing — *section/policy/contract/rule/table below·above*, *documented
+below·above*, *see … below·above*, *immediately below·above*. **16 hits**, classified:
+
+| Classification | Count | Examples |
+|---|---|---|
+| `VALID_LOCAL_REFERENCE` | 8 | `creative-controls.md` → the Creative Profile section below (L61); `library-preparation.md` → the bounded-batch section below (L76); `stage5-cache-durability.md` → the candidate-less rule below (L107); `test-harness.md` → the three loading techniques below (L50–54); two local references inside `operating-policies.md`; `README.md` → the paragraph below; `stage5-cache-history.md` → "the D1 figures above" (its own figures) |
+| `INTENTIONAL_VERBATIM_HISTORICAL_QUOTE` | 5 | the two phrases inside the blockquoted removed paragraph in `removed-and-superseded.md`; that file's past-tense description of where the removed text *sat*; the old heading title quoted in this document's mapping table; this document's R1 narrative quoting the phrase it fixed |
+| `STALE_AFTER_EXTRACTION` | 3 | findings 3 and 4 above |
+
+Two of the four R2 findings carry **no** positional keyword — a stale table row and "the
+media-neutral section" — so the keyword sweep could not have found them. They came from reading each
+rule against the file it claims to govern. A keyword sweep is a backstop, not the audit.
+
+A second pass then checked every "the … section" phrase for a resolvable destination: all remaining
+instances either name a file, resolve to a heading in their own document, or are ordinary prose. The
+one cross-file prose reference — `platform-and-packaging.md` → "the README licence section" — was
+verified against `README.md` (`## 📄 License`).
+
+Verbatim historical quotations were deliberately **not** rewritten. A stale positional phrase inside
+explicitly-marked quoted evidence is a faithful record, not a live defect; rewriting it to look
+current would corrupt the evidence.

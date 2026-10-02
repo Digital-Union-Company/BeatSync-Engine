@@ -30,8 +30,8 @@ the key: a progress or performance-only worker edit must not invalidate semantic
 and neither D2 nor P2 touches it.
 
 **It has been bumped once, `stage5_cache_v2` → `stage5_cache_v3`, by P2** — the media-neutral prompt
-changed what a persisted semantic record *means*. See the media-neutral section for why there is no
-migration.
+changed what a persisted semantic record *means*. See the media-neutral section of
+`.claude/rules/stage5-worker.md` for why there is no migration.
 
 **Source identity** = `CACHE_CONTRACT_VERSION | ANALYSIS_VERSION | abspath | st_size | st_mtime_ns |
 bounded content fingerprint | backend token (or `no_ai`) | Qwen config token`. Pre-D2 it was

@@ -31,7 +31,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `progress-events.md` | `src/beatsync_fork/{progress,progress_view,qwen_progress}.py`, `tests/test_progress_*.py`, `tests/test_gui_progress_seam.py` |
 | `input-gate.md` | `src/beatsync_fork/{input_manager,input_report,input_confirmation,input_session}.py`, `tests/test_input_*.py`, `tests/test_gui_guard_seam.py` |
-| `library-preparation.md` | `src/beatsync_fork/library_prep.py`, `tests/test_library_preparation.py` |
+| `library-preparation.md` | `src/beatsync_fork/library_prep.py`, **`src/video_analysis.py`** (where `classify_library_sources` and the cache seams live), `tests/test_library_preparation.py` |
 | `scale-diagnostics.md` | `src/beatsync_fork/input_report.py`, `src/video_processor.py`, `src/video_analysis.py`, `tests/test_scale_diagnostics.py` |
 | `fork-package.md` | `src/beatsync_fork/**/*.py`, `tests/test_no_runtime_dependency.py`, `tests/test_fork_identity.py` |
 | `gui-integration.md` | `src/gui.py`, `src/ui_content.py` |

@@ -14,11 +14,14 @@ completed — but it must not be cited as current behaviour.
   `_path_signature_token`, `_qwen_backend_signature_token`, `_cache_path` or `ANALYSIS_VERSION`.
   `_video_signature` still used `int(stat.st_mtime)` at that point, so all pre-existing entries
   remained addressable, and 2192 of the 2196 real records remained reusable once the selective legacy
-  guard landed, with 4 intentionally rejected as self-contradictory (see the stored-consistency rule
-  above). Source/backend identity hardening was intentionally deferred *from* D1, because closing
+  guard landed, with 4 intentionally rejected as self-contradictory (the stored AI-record consistency
+  rule, `_stored_ai_cache_is_consistent`, is still live — its authority is
+  `.claude/rules/stage5-cache-durability.md`). Source/backend identity hardening was intentionally
+  deferred *from* D1, because closing
   `int(st_mtime)`'s same-second collision re-keys the whole cache.
 
-  **Current state:** the D2 identity contract above supersedes all of that. Identity now uses
+  **Current state:** the D2 identity contract — `.claude/rules/stage5-cache-identity.md` — supersedes
+  all of that. Identity now uses
   `st_mtime_ns` plus a bounded content fingerprint under `CACHE_CONTRACT_VERSION = "stage5_cache_v3"`,
   so pre-D2 records are naturally orphaned and are never reachable by a current lookup — including the
   two records whose completeness D1 could not prove, which that transition retires without a judgement

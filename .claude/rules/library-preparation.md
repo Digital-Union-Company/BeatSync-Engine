@@ -83,8 +83,9 @@ Analyze click submits is bounded by `library_prep.DEFAULT_ANALYZE_BATCH_SIZE` (*
 **The reason is a property of Stage 5's shared worker, not a deficiency of the cache.** Stage 5
 batches multiple videos into one Qwen worker process, and that worker writes its response JSON only
 after its **entire** job loop finishes — so the parent can checkpoint individual completed records
-only once the whole batch returns (this is the same D1 boundary already documented above: "while the
-shared worker is still in flight its per-job results are not durable at all"). Submitting a cold
+only once the whole batch returns. This is the same D1 boundary whose live authority is
+`.claude/rules/stage5-cache-durability.md`: "while the shared worker is still in flight its per-job
+results are not durable at all". Submitting a cold
 1107-source library therefore exposed all of it to a single all-or-nothing worker invocation.
 Bounding the submission bounds that exposure.
 
