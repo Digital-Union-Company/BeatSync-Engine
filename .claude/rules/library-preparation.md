@@ -1,6 +1,7 @@
 ---
 paths:
   - "src/beatsync_fork/library_prep.py"
+  - "src/video_analysis.py"
   - "tests/test_library_preparation.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in

@@ -18,16 +18,30 @@ root CLAUDE.md                     always loaded   constitution: identity, comma
                                                    map, global invariants, hard safety floor
 .claude/rules/operating-policies.md  always loaded  DU-REPO-WORKFLOW-v1, PCBUS-HK-v1,
                                                    PCBUS-WATCHDOG-v1 - they govern every task
-.claude/rules/<subsystem>.md       path-scoped     loaded only when the matching files are touched
+.claude/rules/<subsystem>.md       path-scoped     conditional on Read/Write/Edit of a matching file
 docs/claude/*.md                   on demand       history, superseded text, this document
 ```
+
+### What triggers a path-scoped rule
+
+A `paths:` rule is conditional, and the condition is narrower than "touching" a file. It enters
+context when Claude works with a matching file through the file operations that trigger rule
+matching — currently documented as **Read, Write and Edit**. Reaching a path any other way does not
+activate its rule: `grep`, `git show`, a build command, a test run or a shell script that merely
+mentions a matching path loads nothing.
+
+That has one practical consequence worth stating as a rule rather than a footnote, and the root
+`CLAUDE.md` does state it: **a file about to be modified through Bash, a script, `git apply` or a
+patch must be Read first with the Read tool, or its `.claude/rules/…` file Read explicitly**, so the
+path-scoped contract is in context before the mutation. Nothing here claims that Bash itself
+activates a `paths:` rule — it does not, which is exactly why the guard exists.
 
 Three decisions are worth recording:
 
 1. **Path scoping, not root `@imports`.** A short root that `@import`s every extracted document
    would fix the file-length warning while still injecting the same context. The saving here comes
-   from `paths:` frontmatter: a session that never opens `src/beatsync_fork/smart_mix.py` never loads
-   the Smart Mix contract.
+   from `paths:` frontmatter: a session that never Reads or Edits `src/beatsync_fork/smart_mix.py`
+   never loads the Smart Mix contract.
 
 2. **Exactly one unscoped rule, and it is the policy file.** The repository workflow, housekeeping
    and monitoring policies are not subsystem knowledge — they apply to every task, including tasks
@@ -142,3 +156,55 @@ Every H1/H2/H3/H4 block of the pre-refactor root file (59 headings, measured on
 `PCBUS-HK-v1` remains a synchronisation marker, not a version number - it is not bumped for wording
 changes. The repository-local policy copy is still durable: it is tracked, it is unscoped so it loads
 every session, and it travels with the repository across machines.
+
+## R1 corrections (post-review)
+
+The first cut of this layout (R0) had three defects, all found by reviewing the *scope* of each rule
+against the production code it actually constrains rather than against the file it was named after.
+
+### 1. Scope hole: `library-preparation.md` did not match `src/video_analysis.py`
+
+The rule's `paths:` covered `src/beatsync_fork/library_prep.py` and its test — but Media Library
+Preparation's production entry point, `classify_library_sources()`, is **defined in
+`src/video_analysis.py`**, and so is every seam the rule constrains: `_cache_path`,
+`_video_signature`, `_load_cache`, `analyze_video_sources`, `_checkpoint_cache`, `_save_cache`,
+`_analyze_single_video`. `library_prep.py` is deliberately identity-agnostic, so the rule's live
+instructions — "reuses the production primitives and adds no key formula", "mirrors the
+orchestrator's once-per-invocation identity block rather than extracting it", "unprovable backend
+identity blocks preparation entirely", "scan is read-only with respect to cache *records*", the
+three-way miss classification, `declaration_refusal`, the `library_classify` progress phase, the
+bounded-batch contract — all govern code in a file the rule could not reach.
+
+Measured: **15 of 16** probed prep invariants appear *only* in `library-preparation.md`. The four
+Stage-5 rules that do match `video_analysis.py` cover none of them. Fixed by adding
+`src/video_analysis.py` to the rule's `paths:`. That raises `video_analysis.py`'s conditional
+context, which is the correct trade: the rule genuinely constrains that file.
+
+`src/gui.py` was deliberately **not** added — the preparation widgets are routed through
+`gui-integration.md`, and the GUI rule stays lightweight by design.
+
+### 2. Rule-loading semantics were described too loosely
+
+R0 said path-scoped rules load "when you touch the matching files". A `paths:` rule is conditional on
+Claude working with a matching file through the file operations that trigger rule matching —
+currently **Read, Write and Edit**. A `grep`, `git show`, build command or shell script that merely
+mentions a matching path activates nothing. Corrected in the root `CLAUDE.md`, `README.md` and above,
+together with a new root rule requiring a file to be Read (or its rule Read explicitly) before being
+modified through Bash, a script, `git apply` or a patch.
+
+### 3. Three cross-references dangled after extraction
+
+Sections split across files kept "see the section below" pointers aimed at text that had moved:
+`creative-controls.md` → the presets section, `platform-and-packaging.md` → the housekeeping policy,
+`stage5-cache-identity.md` → the media-neutral section. All three now name the destination file.
+
+### Also corrected: the test-suite description
+
+R0 carried the pre-existing claim that the suite "covers `src/beatsync_fork/` only" and that "the
+upstream pipeline modules have no tests". Both are false: **31 of 51** test files reach upstream
+modules through `ast` inspection, path-based `importlib` loading, or AST-extracted bodies executed
+against a synthesised parent package. The description now separates the directly-importable
+bare-CPython core, the upstream seams verified without importing the runtime, and real
+portable-runtime/end-to-end verification (which remains outside the suite, apart from the opt-in
+`BEATSYNC_TEST_FFMPEG` tier). It does **not** claim the upstream runtime is importable or
+integration-tested.

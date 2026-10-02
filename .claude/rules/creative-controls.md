@@ -81,7 +81,7 @@ Stages 1–3 read **none** of it; Stage 5 reads **none** of it. Stage 4 reads Cu
 Cuts; Stage 6 reads the seed, Semantic Emphasis, Energy Response, Motion Bias and Source Diversity.
 
 **Creative Presets (PR3) are not an eighth control.** They are named sets of values for the six
-0–100 sliders, resolved entirely in the UI — see the presets section below. Nothing in this table
+0–100 sliders, resolved entirely in the UI — see `.claude/rules/creative-presets.md`. Nothing in this table
 changes because a preset was selected; only the slider values do.
 
 **Stage 6 has two halves and the split is load-bearing.** Semantic Emphasis, Energy Response and

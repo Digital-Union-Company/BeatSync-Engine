@@ -84,7 +84,8 @@ identically (unset == explicit default; a malformed value == the default the wor
 
 There was a fourth, `audio_profile["smart_preset"]`, because the worker interpolated it into the
 prompt. **P2 retired it**, along with `_qwen_prompt_style_hint` and the whole notion of an edit style
-in persisted semantics; that is the media-neutral section below, and the D2 R2 tests asserting the
+in persisted semantics; that is the media-neutral section of `.claude/rules/stage5-worker.md`, and
+the D2 R2 tests asserting the
 opposite were deliberately replaced. Runtime-only knobs stay **excluded**: slots, device, timeouts,
 batching, ctx, prefetch. A `no_ai` run gets a canonical no-AI config token, so Qwen settings never
 perturb a deterministic key.

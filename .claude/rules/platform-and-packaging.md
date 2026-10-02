@@ -19,7 +19,7 @@ transport to swallow benign `WinError 10054` pipe resets — that filter is inte
 
 Runtime folders are created inside the repo root, so `.gitignore` covers `bin/`, `input/`, `output/`
 and Python caches. Ignoring is not deleting: `output/` and `input/video_analysis_cache/` are still
-retained on disk by the housekeeping policy below.
+retained on disk by the housekeeping policy in `.claude/rules/operating-policies.md`.
 
 Licensed AGPL-3.0. This repository is a **modified fork** — see `CHANGELOG-FORK.md` for the
 modification record required by AGPL-3.0 §5(a), and the README licence section for the §13

@@ -1,9 +1,22 @@
 # CLAUDE.md
 
 Always-loaded constitution for Claude Code (claude.ai/code) in this repository. It is deliberately
-short. **Subsystem detail lives in path-scoped rules under `.claude/rules/`**, which load only when
-you touch the matching files; durable history and acceptance evidence live in `docs/claude/`. See
+short. **Subsystem detail lives in path-scoped rules under `.claude/rules/`**, declared with YAML
+`paths:` frontmatter; durable history and acceptance evidence live in `docs/claude/`. See
 `docs/claude/README.md` for the map, and `docs/claude/instruction-architecture.md` for why.
+
+**How a path-scoped rule actually loads.** A `paths:` rule is conditional: it enters context when
+Claude works with a matching file through the file operations that trigger rule matching — currently
+documented as **Read, Write and Edit**. It is *not* triggered by every way a file can be reached. A
+`grep`, a `git show`, a build command or a one-off script that happens to mention a matching path does
+**not** activate its rule.
+
+**So: before changing a repository file through Bash, a script, `git apply`, a patch or any other
+non-Read/Write/Edit path, first Read the target file with the Read tool, or Read the applicable
+`.claude/rules/…` file explicitly, so that file's path-scoped contract is in context before you
+mutate it.** The rules in this repository are load-bearing contracts, not style notes — editing
+`smart_mix.py` or `video_analysis.py` with an unreviewed shell patch is how a documented invariant
+gets silently broken.
 
 ## What this is
 
@@ -50,12 +63,26 @@ python -m pip install -r requirements-dev.txt    :: pytest only; NOT installed i
 python -m pytest                                 :: whole suite
 ```
 
-The suite covers `src/beatsync_fork/` only and runs on **any** recent CPython — no portable runtime,
-no CUDA, no FFmpeg, no models. The upstream pipeline modules have no tests and cannot be imported
-without the portable runtime; verification there is end-to-end (run the CLI on a short audio file plus
-one source video and check the stage timings and the output file). There is no linter or formatter
-config. Harness conventions and the deliberate AST/importlib loading tricks:
-`.claude/rules/test-harness.md`.
+The whole suite runs on **any** recent CPython — no portable runtime, no CUDA, no FFmpeg, no models —
+but it is not limited to the fork package. Three distinct tiers, and conflating them is how a false
+claim gets made in either direction:
+
+1. **Directly importable, bare-CPython core** — `src/beatsync_fork/*`. Imported normally and tested
+   as ordinary code, which is exactly what the stdlib-only hard rule buys.
+2. **Upstream seams verified without importing the runtime** — `video_analysis.py`, `gui.py`,
+   `stage5_qwen_scene_worker.py`, `stage6_av_planner.py`, `stage4_select.py` and others are reached
+   by `ast` inspection, by path-based `importlib` loading, and by AST-extracting real function or
+   class bodies and executing them against a synthesised parent package. These are **real
+   assertions about real upstream source**, not mocks — but they are seam and structure assertions,
+   not integration runs.
+3. **Real portable-runtime / end-to-end verification** — not in the suite. Run the CLI on a short
+   audio file plus one source video and check the stage timings and the output file. A small
+   opt-in tier sits between 2 and 3: `tests/test_audio_mixdown.py` exercises real FFmpeg when
+   `BEATSYNC_TEST_FFMPEG` points at the portable build, and skips otherwise.
+
+So: the upstream pipeline modules **cannot be imported** on a bare interpreter, and they are
+nevertheless **not untested**. There is no linter or formatter config. Harness conventions and the
+deliberate loading tricks: `.claude/rules/test-harness.md`.
 
 ## Architecture map
 

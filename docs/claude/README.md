@@ -6,8 +6,15 @@ Three layers, by how often Claude needs them:
 |---|---|---|
 | Constitution | root `CLAUDE.md` | always |
 | Operating policies | `.claude/rules/operating-policies.md` | always (deliberately unscoped) |
-| Subsystem rules | `.claude/rules/*.md` with `paths:` frontmatter | only when you touch matching files |
+| Subsystem rules | `.claude/rules/*.md` with `paths:` frontmatter | conditionally — see below |
 | Reference / history | `docs/claude/*.md` | on demand, never injected |
+
+**What "conditionally" means.** A `paths:` rule enters context when Claude works with a matching file
+through the file operations that trigger rule matching — currently documented as **Read, Write and
+Edit**. Reaching a path some other way does not activate its rule: a `grep`, a `git show`, a build
+command or a shell script that merely mentions a matching path loads nothing. The root `CLAUDE.md`
+therefore instructs that a file about to be changed through Bash, a script or `git apply` is Read
+first (or its rule Read explicitly), so the contract is in context before the mutation.
 
 ## Subsystem rules
 
