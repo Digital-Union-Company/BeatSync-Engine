@@ -52,13 +52,21 @@ music_under_voice_percent    sfx_amount    sfx_level_percent
   `voice_min_gap` are deferred fractional-seconds placement controls whose draws can legitimately make
   a render refuse. None of them needs a seconds-range model or boolean-randomization semantics, and
   none was added.
-- **Nothing in the audio engine changed.** `audio_mix.py` and `smart_mix.py` were **not modified**, and
-  `tests/test_audio_mix.py` / `tests/test_smart_mix.py` are unchanged — independent regression controls
-  for voice placement, the duck model, the frozen Nero ladder and the occupancy policy.
+- **No audio-engine executable behaviour changed.** `smart_mix.py` is **completely unmodified**;
+  `audio_mix.py` is unmodified **below its module docstring** — the `AudioMixConfig` definition, the
+  placement rules and the duck model are byte-identical, and a later review-only R2 rewrote only that
+  docstring, which had still described E2 as future work. `tests/test_audio_mix.py` /
+  `tests/test_smart_mix.py` are unchanged — independent regression controls for voice placement, the
+  duck model, the frozen Nero ladder and the occupancy policy.
   `process_video_guarded` still builds `AudioMixConfig`/`SmartMixConfig` from the live widgets at render
   click time, so the three visible sliders remain execution truth and no `AudioRecipe`,
   `AudioVariantConfig`, master seed or lab range reaches the planner, the renderer, `CreativeProfile`,
   `beat_info["creative"]`, `AudioMixPlan` or `SmartMixPlan`.
+- **`creative_recipe.py` received the same current-truth correction in R2**, also module-docstring only:
+  the seven-field `CreativeRecipe` implementation, its validation and the `CreativeRecipe` →
+  `CreativeProfile` bridge are unchanged, and the prose now scopes "the exact execution configuration"
+  to the *visual* creative contract rather than to the whole render. Proven docstring-only by comparing
+  the complete module below the docstring: AST-equal, byte-identical, no import change — for both files.
 - **GUI: seven new configuration components** inside the *existing* Variant Lab accordion — one
   `CheckboxGroup` with explicit `(label, value)` choices (the value *is* the frozen stream name) and
   three min/max `gr.Number` pairs. Variant Lab may write exactly `music_under_voice`, `sfx_amount` and

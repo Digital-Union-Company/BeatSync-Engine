@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """[FORK] Digital-Union: the resolved Creative Recipe (Variant Lab C2 V1).
 
-A **recipe is the exact execution configuration for one render** — seven integers and nothing
-else::
+A **recipe is the exact resolved VISUAL creative configuration for one render** — seven integers
+and nothing else::
 
     seed                     1..999999, POSITIVE
     cut_density              0..100
@@ -12,10 +12,25 @@ else::
     motion_bias              0..100
     source_diversity         0..100
 
-That is already the whole of today's execution truth, which is the point: a recipe is a *name for
-what will be rendered*, not a new interpretation of it. :meth:`CreativeRecipe.to_profile` hands it
-straight to the existing :class:`~beatsync_fork.creative.CreativeProfile`, so no stage learns that
-recipes exist and there is no second planner path.
+Those seven are complete and durable *for the creative interpretation they stand for*, which is the
+point: a recipe is a *name for how the edit will be made*, not a new interpretation of it.
+:meth:`CreativeRecipe.to_profile` hands it straight to the existing
+:class:`~beatsync_fork.creative.CreativeProfile`, so no stage learns that recipes exist and there is
+no second planner path. That central architecture is unchanged and is the whole design::
+
+    CreativeRecipe  ->  CreativeProfile  ->  the existing planner
+
+They are **not**, however, a complete description of the physical render, and since E2 V1 that
+distinction is load-bearing rather than pedantic. Variant Lab's audio half resolves a **sibling**
+artifact — ``AudioRecipe``, three generated 0..100 levels — which is deliberately *not* a field of
+this class, is deliberately *not* imported here, and reaches a render through its own existing
+widgets rather than through ``CreativeProfile``. This module must keep depending on nothing but
+:mod:`beatsync_fork.creative`; the sibling contract lives next to the generator that produces it.
+
+Plenty of render intent sits outside **both** recipes and is never generated at all: the source
+media, the voice clips, their timing and ``avoid_drops``, the SFX folder and the enabled roles, and
+the output / encoder settings. So replaying a recipe reproduces the edit's creative configuration —
+not, on its own, a byte-identical render.
 
 ===============================================================================
 Why this is a separate object from the generator that produced it
