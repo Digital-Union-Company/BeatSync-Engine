@@ -20,6 +20,65 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-03 (Variant Lab Audio Integration — E2 V1)
+
+Variant Lab can now vary audio, which the two entries below deliberately left to E2. It varies
+**exactly three** values, all of them already plain `0..100` integers:
+
+```
+music_under_voice_percent    sfx_amount    sfx_level_percent
+```
+
+- **A parallel resolver, so C2 is preserved structurally.** `variant_lab.resolve_audio()` is a
+  sibling of `resolve()`; `_resolve_v1` and `resolve` were **not modified**, so no visual golden
+  vector can move. `_resolve_control` gained a `domain` parameter defaulting to `DOMAIN_CONTROLS`,
+  which keeps the C2 call site and every C2 key byte-identical while letting E2 reuse the one spread
+  formula rather than copying it. The reserved `"audio"` RNG domain is now **used**:
+  `rng_for(master, "audio", <field name>)`, one named stream per control, so adding a fourth audio
+  control later cannot shift these three.
+- **One master seed and one Spread drive both halves.** No second audio seed, no second audio Spread.
+- **The default ticked selection is EMPTY**, deliberately unlike the visual side's all-six: opening an
+  existing Variant Lab and pressing Generate must leave the audio levels exactly where they were.
+  Audio variation is opt-in, and **Spread 0 varies nothing** here because there is no audio analogue
+  of the clip Variation Seed.
+- **Each base is normalised by the module that owns the control.** `music_under_voice_percent` falls
+  back to 35 (Audio Layers) while both Smart Mix controls fall back to 50, so a single shared 0..100
+  normaliser would quietly raise the music floor on a malformed value. `variant_lab` delegates to
+  `audio_mix.normalize_music_under_voice` and `smart_mix.normalize_control` instead of restating them.
+- **Deliberately excluded, as product decisions rather than omissions.** Voice clips and the SFX
+  folder are resource identity; `avoid_drops` is a *protective* rule with measured evidence behind it
+  (a clip starting 0.44 s before a drop puts 96 % of its speech inside it); enabled SFX roles are
+  structural intent whose toggling perturbs the frozen cross-role occupancy; and `voice_start_delay` /
+  `voice_min_gap` are deferred fractional-seconds placement controls whose draws can legitimately make
+  a render refuse. None of them needs a seconds-range model or boolean-randomization semantics, and
+  none was added.
+- **Nothing in the audio engine changed.** `audio_mix.py` and `smart_mix.py` were **not modified**, and
+  `tests/test_audio_mix.py` / `tests/test_smart_mix.py` are unchanged — independent regression controls
+  for voice placement, the duck model, the frozen Nero ladder and the occupancy policy.
+  `process_video_guarded` still builds `AudioMixConfig`/`SmartMixConfig` from the live widgets at render
+  click time, so the three visible sliders remain execution truth and no `AudioRecipe`,
+  `AudioVariantConfig`, master seed or lab range reaches the planner, the renderer, `CreativeProfile`,
+  `beat_info["creative"]`, `AudioMixPlan` or `SmartMixPlan`.
+- **GUI: seven new configuration components** inside the *existing* Variant Lab accordion — one
+  `CheckboxGroup` with explicit `(label, value)` choices (the value *is* the frozen stream name) and
+  three min/max `gr.Number` pairs. Variant Lab may write exactly `music_under_voice`, `sfx_amount` and
+  `sfx_level`, from its own two buttons only; `gui.py` contains no `rng_for` and no `DOMAIN_AUDIO` and
+  delegates every draw to the pure resolver. Generate and New Variant still render nothing.
+- **The writer guards were split, never weakened.** The excluded audio controls keep **zero** writers
+  and the report panels keep `process_btn.click` alone; two new tests pin the permitted three to their
+  exact two-writer list. The split guards resolve list indirection (`expanded_names_in`) because
+  `variant_lab_outputs` reaches its widgets through a named sub-list — without that, every
+  "is this widget ever written?" assertion would have passed vacuously.
+- **Isolation unchanged.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`; `video_analysis.py`, `stage5_qwen_scene_worker.py`,
+  `video_processor.py`, `ffmpeg_processing.py`, `library_prep.py` and `src/auto_mode/*` are untouched;
+  the source confirmation gate and Media Library Preparation are unaffected. **No CLI flag.**
+- Verification: **3430 passed, 2 skipped** (from 3359/2), +71 tests. Audio golden vectors were computed
+  by an independent reimplementation that imports nothing from the repository. Load-bearing proof:
+  reverting the three production files makes the E2 suite fail to collect; reverting only `gui.py`
+  fails 31 tests; drawing from `controls` instead of `audio` fails all 12 golden recipes; defaulting
+  the selection to all-three fails exactly the two backward-compatibility tests.
+
 ### Fixed — 2026-10-02 (Smart Mix V1 — numpy-safe structure projection)
 
 **Smart Mix could not run at all.** The runtime acceptance render aborted after Stage 5, before

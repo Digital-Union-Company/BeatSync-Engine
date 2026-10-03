@@ -33,7 +33,7 @@ rather than by position in a sequence::
 
     rng_for(master, "clips")                        -> the clip Variation Seed
     rng_for(master, "controls", "cut_density")      -> one control, forever
-    rng_for(master, "audio", <name>)                -> reserved for E2, unused today
+    rng_for(master, "audio", "sfx_amount")          -> one audio control, forever (E2)
 
 A single ``random.Random(master)`` consumed in declaration order would be far simpler and is exactly
 what this must not be: adding one control in a future release would shift every later draw, so every
@@ -68,6 +68,33 @@ candidate repeats, and an unchanged minimum cut gap. At spread 100 over 200 mast
 recipes moved controls in *mixed* directions and only 2 in 200 moved all six the same way — "crazy"
 is not "everything at maximum".
 
+===============================================================================
+Audio variation (E2 V1) is a parallel path, never a wider recipe
+===============================================================================
+
+E2 varies exactly three audio values — :data:`AUDIO_CONTROL_FIELDS` — through
+:func:`resolve_audio`, which is a **sibling** of :func:`resolve` rather than an extension of it.
+:func:`_resolve_v1` is deliberately untouched, so every C2 golden vector is preserved structurally
+and not merely by test.
+
+The three were chosen because they are the audio settings that are already plain ``0..100``
+integers, which lets them reuse :class:`ControlRange`, :func:`_resolve_control` and :func:`_half_up`
+verbatim — no second range implementation, no fractional-seconds model, no boolean randomization.
+Everything else in Audio Layers / Smart Mix is deliberately excluded and stays a user decision:
+voice clips and the SFX folder are **resource identity**; ``avoid_drops`` is a *protective* rule
+with measured evidence behind it (a clip starting 0.44 s before a drop puts 96% of its speech
+inside that drop); enabled SFX roles are **structural intent** whose toggling would perturb the
+frozen cross-role occupancy; and the two fractional-seconds controls are deferred because they are
+placement controls whose draws can legitimately make a render *refuse*.
+
+Two invariants worth stating plainly:
+
+* **The master seed and Spread are shared with the visual side.** There is no second audio seed and
+  no second audio Spread — one master, one wildness dial.
+* **The default audio randomize selection is EMPTY**, deliberately unlike the visual side's
+  all-six. Opening an existing C2 Variant Lab and pressing Generate must not silently move a mix
+  level, so audio variation is opt-in.
+
 Kept in ``beatsync_fork`` and stdlib-only (CLAUDE.md's hard rule): arithmetic over small integers
 plus a hash, testable on a bare interpreter with no Gradio, numpy, CUDA or FFmpeg.
 """
@@ -81,9 +108,11 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from beatsync_fork import audio_mix as fork_audio_mix
 from beatsync_fork import creative as fork_creative
 from beatsync_fork import creative_recipe as fork_recipe
 from beatsync_fork import presets as fork_presets
+from beatsync_fork import smart_mix as fork_smart_mix
 from beatsync_fork import variation as fork_variation
 
 #: Namespace of every Variant Lab RNG derivation. Distinct from the planner's own `_stable_rng`
@@ -101,8 +130,9 @@ NAMESPACE = "variant_lab"
 VARIANT_LAB_ALGORITHM_VERSION = 1
 
 #: RNG domains. `clips` yields the recipe's clip Variation Seed; `controls` yields one stream per
-#: creative control. `audio` is reserved for E2's future audio controls and is named here only so
-#: the namespace design is testable today — nothing uses it.
+#: creative control; `audio` yields one stream per E2 audio control (`resolve_audio`). The three are
+#: distinct key components, so a draw in one can never shift a draw in another — which is what lets
+#: E2 land without re-keying a single master seed a user has written down.
 DOMAIN_CLIPS = "clips"
 DOMAIN_CONTROLS = "controls"
 DOMAIN_AUDIO = "audio"
@@ -341,14 +371,20 @@ def _half_up(value: float) -> int:
 
 
 def _resolve_control(master_seed: int, name: str, base: int,
-                     control_range: ControlRange, spread01: float) -> int:
+                     control_range: ControlRange, spread01: float,
+                     domain: str = DOMAIN_CONTROLS) -> int:
     """One randomized control under the frozen V1 formula.
 
     ``u`` is drawn from this control's **own** named stream, so the value depends on nothing but
-    ``(master seed, this control's name, this control's range, the base, the spread)``.
+    ``(master seed, this domain, this control's name, this control's range, the base, the spread)``.
+
+    ``domain`` defaults to :data:`DOMAIN_CONTROLS`, so the C2 call site in :func:`_resolve_v1` is
+    unchanged and every visual golden vector keys exactly as before. E2 passes
+    :data:`DOMAIN_AUDIO` instead, which is why the audio and visual streams for a shared name can
+    never collide — and why this parameter exists rather than a second copy of the formula.
     """
     anchor = control_range.anchor_for(base)
-    u = rng_for(master_seed, DOMAIN_CONTROLS, name).uniform(-1.0, 1.0)
+    u = rng_for(master_seed, domain, name).uniform(-1.0, 1.0)
     if u < 0:
         raw = anchor + spread01 * u * (anchor - control_range.lo)
     else:
@@ -401,7 +437,255 @@ def resolve(config: VariantLabConfig, base: Mapping[str, int]) -> VariantLabReso
     return _resolve_v1(config, base)
 
 
+# ---------------------------------------------------------------------------
+# E2: audio variation. A parallel path — `resolve` and `_resolve_v1` are deliberately untouched,
+# so every C2 golden vector is preserved structurally rather than merely by assertion.
+# ---------------------------------------------------------------------------
+
+#: The three E2 V1 audio controls, in report and widget-output order. Each string is **also** its
+#: RNG stream name under :data:`DOMAIN_AUDIO`, so these spellings are frozen forever: renaming one
+#: would silently re-key that control for every master seed a user has written down. They are the
+#: `AudioMixConfig` / `SmartMixConfig` field names rather than the GUI's widget variable names, so
+#: they cannot drift from the thing they actually control.
+AUDIO_CONTROL_FIELDS = (
+    "music_under_voice_percent",
+    "sfx_amount",
+    "sfx_level_percent",
+)
+
+
+def _is_plain_int(value: Any) -> bool:
+    """A real ``int``, never a ``bool``.
+
+    Same rule and same reason as ``creative_recipe``'s own predicate: ``bool`` subclasses ``int``,
+    so ``True`` would otherwise be accepted as the control value 1. Restated here rather than
+    imported because that one is private to its module — a three-line predicate is a smaller cost
+    than reaching across a module boundary for a name that is deliberately not exported.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+#: Each audio control's authoritative normaliser, owned by the module that owns the control.
+#: Delegated, never reimplemented — and the delegation is load-bearing rather than tidy:
+#: ``music_under_voice_percent``'s malformed fallback is **35** (Audio Layers) while both Smart Mix
+#: controls fall back to **50**, so routing all three through ``creative.normalize_control`` (whose
+#: fallback is 50) would quietly change the music floor the user gets from a malformed widget value.
+_AUDIO_BASE_NORMALISERS = {
+    "music_under_voice_percent": fork_audio_mix.normalize_music_under_voice,
+    "sfx_amount": lambda value: fork_smart_mix.normalize_control(
+        value, fork_smart_mix.DEFAULT_AMOUNT),
+    "sfx_level_percent": lambda value: fork_smart_mix.normalize_control(
+        value, fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT),
+}
+
+
+def normalize_audio_base_value(name: str, value: Any) -> int:
+    """One audio base value, through the normaliser that **owns** that control.
+
+    Delegated for exactly the reason :func:`normalize_master_seed` delegates to
+    ``variation.normalize_seed``: the fork already has one answer per control, and here the three
+    answers genuinely differ. The GUI normalises with these same functions before calling, so the
+    two cannot disagree; doing it here as well means a future call site that forgets still gets the
+    control's real default instead of a crash or an invented number.
+
+    An unknown name is not an audio control and has no owning default, so it resolves to the
+    neutral 50 rather than raising inside a UI callback.
+    """
+    normaliser = _AUDIO_BASE_NORMALISERS.get(name)
+    if normaliser is None:
+        return fork_creative.DEFAULT_CONTROL
+    return normaliser(value)
+
+
+def normalize_audio_randomized(fields: Any) -> frozenset:
+    """The set of audio control names that may vary, filtered to the three that exist.
+
+    Same total, never-raising contract as :func:`normalize_randomized`, and separate from it
+    deliberately: the two read different name vocabularies, and one shared helper taking a
+    vocabulary argument would make passing the wrong vocabulary possible at a call site. An unknown
+    name is dropped — there is no stream for it and no widget to write it to.
+    """
+    if isinstance(fields, (str, bytes)) or not isinstance(fields, Iterable):
+        return frozenset()
+    return frozenset(name for name in fields if name in AUDIO_CONTROL_FIELDS)
+
+
+def default_audio_ranges() -> dict:
+    """First-open audio ranges: the whole 0..100 control for each of the three."""
+    return {name: FULL_RANGE for name in AUDIO_CONTROL_FIELDS}
+
+
+def default_audio_randomized() -> frozenset:
+    """First-open audio randomize selection: **none**.
+
+    Deliberately not the visual side's all-six default, and this is the load-bearing half of E2's
+    backward compatibility: a user who opens an existing C2 Variant Lab and presses Generate must
+    get their mix levels back untouched. Audio variation is opt-in. A test pins it.
+    """
+    return frozenset()
+
+
+@dataclass(frozen=True)
+class AudioVariantConfig:
+    """What audio *may* vary, and within what bounds. Normalised on construction.
+
+    Deliberately absent: the master seed, the Spread and the base values. The first two are the
+    existing **shared** Variant Lab controls — there is no second audio seed and no second audio
+    Spread — and the third is the live widgets, so holding any of them here would create exactly the
+    stale snapshot C2 refuses to keep.
+    """
+
+    randomized: frozenset = frozenset()
+    ranges: Mapping[str, ControlRange] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "randomized", normalize_audio_randomized(self.randomized))
+        ranges = {}
+        supplied = self.ranges if isinstance(self.ranges, Mapping) else {}
+        for name in AUDIO_CONTROL_FIELDS:
+            value = supplied.get(name)
+            if isinstance(value, ControlRange):
+                ranges[name] = value
+            elif isinstance(value, (tuple, list)) and len(value) == 2:
+                ranges[name] = ControlRange(value[0], value[1])
+            else:
+                ranges[name] = FULL_RANGE
+        object.__setattr__(self, "ranges", MappingProxyType(ranges))
+
+    @property
+    def varies_anything(self) -> bool:
+        """False for the default empty selection, i.e. audio variation is switched off."""
+        return bool(self.randomized)
+
+    def range_for(self, name: str) -> ControlRange:
+        return self.ranges.get(name, FULL_RANGE)
+
+    def is_randomized(self, name: str) -> bool:
+        return name in self.randomized
+
+
+@dataclass(frozen=True)
+class AudioRecipe:
+    """One render's exact resolved audio values. Immutable and always valid.
+
+    Mirrors :class:`~beatsync_fork.creative_recipe.CreativeRecipe`'s trust contract: validation
+    **raises**, nothing is clamped and nothing falls back, because an instance that exists must be
+    an instance that is valid. Clamping here would quietly turn a generator's mistake into a
+    plausible-looking render — and normalisation has already happened upstream, in the authoritative
+    Audio Layers / Smart Mix normalisers.
+
+    It is **not** a field of ``CreativeRecipe`` and must never become one. It carries no path, no
+    SFX role, no voice clip, no master seed, no Spread and no range: those are resource identity,
+    structural intent or generator provenance, and none of them is a statement about the audio a
+    render will produce.
+    """
+
+    music_under_voice_percent: int
+    sfx_amount: int
+    sfx_level_percent: int
+
+    def __post_init__(self) -> None:
+        for name in AUDIO_CONTROL_FIELDS:
+            value = getattr(self, name)
+            if not _is_plain_int(value) or not (
+                    fork_creative.CONTROL_MIN <= value <= fork_creative.CONTROL_MAX):
+                raise ValueError(
+                    f"audio recipe {name} must be a plain int in "
+                    f"{fork_creative.CONTROL_MIN}..{fork_creative.CONTROL_MAX}, got {value!r}")
+
+    def as_mapping(self) -> dict:
+        """A **fresh** plain dict of plain ints, so a caller may mutate it without reaching here."""
+        return {name: getattr(self, name) for name in AUDIO_CONTROL_FIELDS}
+
+    def describe(self) -> str:
+        """One compact line. Diagnostic, never execution-authoritative."""
+        return " · ".join([
+            f"Music under voice {self.music_under_voice_percent}",
+            f"SFX Amount {self.sfx_amount}",
+            f"SFX Level {self.sfx_level_percent}",
+        ])
+
+
+@dataclass(frozen=True)
+class AudioVariantResolution:
+    """One audio resolution: the provenance that produced it, and the values it produced.
+
+    Provenance lives here and never on :class:`AudioRecipe`, exactly as
+    :class:`VariantLabResolution` carries it for the visual side. The three visible audio widgets
+    remain the render's execution truth; this object is a read-out.
+    """
+
+    master_seed: int
+    algorithm_version: int
+    spread: int
+    config: AudioVariantConfig
+    recipe: AudioRecipe
+
+    @property
+    def fixed_fields(self) -> frozenset:
+        return frozenset(AUDIO_CONTROL_FIELDS) - self.config.randomized
+
+    def describe(self) -> str:
+        """The audio half of the Variant Lab read-out, and the **one** formatter for this text.
+
+        ``gui.py`` joins this with the visual ``describe()`` and formats nothing itself, so each
+        half of the report has exactly one writer. The qualifier lines matter: with nothing selected
+        or at spread 0 the audio values are simply the base, and a read-out that did not say so
+        would read as though a variation had been applied.
+        """
+        randomized = len(self.config.randomized)
+        total = len(AUDIO_CONTROL_FIELDS)
+        headline = f"Audio · {randomized} randomized / {total - randomized} fixed"
+        if not randomized:
+            headline += " (audio variation off)"
+        elif self.spread == 0:
+            headline += " (spread 0 — held at base)"
+        return "\n".join([headline, self.recipe.describe()])
+
+
+def resolve_audio(master_seed: int, config: AudioVariantConfig, spread: Any,
+                  base: Mapping[str, Any]) -> AudioVariantResolution:
+    """Resolve exactly one audio recipe from the **shared** master seed and Spread plus the live
+    audio widget values.
+
+    Pure: no ``SystemRandom``, no clock, no filesystem, no GUI, no Stage 5, no FFmpeg, no hidden
+    state. The same ``(master, config, spread, base)`` reproduces exactly.
+
+    Each randomized field draws ``u`` from ``rng_for(master, DOMAIN_AUDIO, field_name)`` and goes
+    through the *same* 0..100 range/spread formula as a visual control, so there is one spread rule
+    in this module rather than two. **Spread 0 leaves all three at their base values** — there is no
+    audio analogue of C2's clip Variation Seed, so unlike the visual side nothing else varies.
+
+    Randomize OFF means *leave this control alone*: the exact normalised live value, with its
+    configured range ignored entirely rather than used to clamp — clamping an excluded control would
+    make the checkbox mean something weaker than off.
+    """
+    master = normalize_master_seed(master_seed)
+    if master <= 0:
+        raise ValueError("Variant Lab requires a positive master seed; got "
+                         f"{master_seed!r}")
+    resolved_spread = normalize_spread(spread)
+    spread01 = resolved_spread / 100.0
+    supplied = base if isinstance(base, Mapping) else {}
+    values = {}
+    for name in AUDIO_CONTROL_FIELDS:
+        live = normalize_audio_base_value(name, supplied.get(name))
+        if not config.is_randomized(name):
+            values[name] = live
+            continue
+        values[name] = _resolve_control(
+            master, name, live, config.range_for(name), spread01, DOMAIN_AUDIO)
+    return AudioVariantResolution(
+        master_seed=master,
+        algorithm_version=VARIANT_LAB_ALGORITHM_VERSION,
+        spread=resolved_spread,
+        config=config,
+        recipe=AudioRecipe(**values),
+    )
+
+
 __all__ = [
+    "AUDIO_CONTROL_FIELDS",
     "DEFAULT_RANGE_HI",
     "DEFAULT_RANGE_LO",
     "DEFAULT_VARIATION_SPREAD",
@@ -413,15 +697,23 @@ __all__ = [
     "SPREAD_MAX",
     "SPREAD_MIN",
     "VARIANT_LAB_ALGORITHM_VERSION",
+    "AudioRecipe",
+    "AudioVariantConfig",
+    "AudioVariantResolution",
     "ControlRange",
     "VariantLabConfig",
     "VariantLabResolution",
+    "default_audio_randomized",
+    "default_audio_ranges",
     "default_randomized",
     "default_ranges",
+    "normalize_audio_base_value",
+    "normalize_audio_randomized",
     "normalize_master_seed",
     "normalize_randomized",
     "normalize_spread",
     "resolve",
+    "resolve_audio",
     "resolve_clip_seed",
     "rng_for",
 ]
