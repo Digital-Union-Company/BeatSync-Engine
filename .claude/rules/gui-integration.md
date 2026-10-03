@@ -39,7 +39,19 @@ automatically.
   and refuse cleanly when it is held — `create_music_video` clears one process-global processing
   dir per render, so two overlapping renders would delete each other's in-flight clips. Both
   events also share one `concurrency_id` with `concurrency_limit=1`, but that is cooperative: the
-  lock is the authority, because it is provable without Gradio. The lock is a plain non-reentrant
+  lock is the authority, because it is provable without Gradio.
+
+  **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
+  `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
+  event, an exception while draining — the frame unwinds immediately. Without a finalizer the
+  worker kept running, the wrapper's `finally: _RENDER_LOCK.release()` ran anyway, and a second
+  render could clear the processing dir out from under the first. So the chain is explicit and
+  ordered: closing a wrapper closes the nested stream it **owns**, which closes `process_video`,
+  whose finalizer **joins** the worker — and only then does the mutex release. Both wrappers own
+  their nested stream (`render_stream` / `candidate_stream`) and close it in a `finally` nested
+  *inside* the lock-holding `try`, so the ordering is structural rather than incidental. No
+  worker is ever terminated and there is no timeout: with no cancellation, abandoning a stream
+  means waiting for the render in flight. The lock is a plain non-reentrant
   `Lock` on purpose — a batch that re-entered the single-render wrapper would refuse itself on its
   own first candidate, and an `RLock` would hide that instead of exposing it. Never wire an event
   directly to the core, and never let a wrapper rebuild the gate.

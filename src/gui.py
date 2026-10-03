@@ -1016,29 +1016,51 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    last_status = "Starting\u2026"
-    yield None, last_status, session_state
+    # [FORK] Digital-Union (C3-R0 R1): this generator OWNS the render worker, so its lifetime is
+    # the worker's lifetime \u2014 not merely the frame's.
+    #
+    # Everything after `thread.start()` is inside `try/finally` because a consumer may abandon the
+    # generator: `gen.close()`, a dropped Gradio event, or an exception while draining all unwind
+    # this frame without the `while` loop ever finishing. Before R1 that returned immediately
+    # while the daemon worker kept running, so the caller's `finally: _RENDER_LOCK.release()` ran
+    # with a render still in flight \u2014 and `create_music_video` clears one *process-global*
+    # processing dir at the start of every render, so the next one would delete the live
+    # one's clips. The mutex was protecting the frame, not the render.
+    #
+    # The finalizer therefore **joins**. It does not terminate the worker, there is no timeout and
+    # no cancel flag: C3-R0 ships no cancellation, so abandoning the stream means waiting for the
+    # render in progress, which is exactly what the mutex contract already promises.
+    try:
+        last_status = "Starting\u2026"
+        yield None, last_status, session_state
 
-    while True:
-        item = status_queue.get()
-        if item is None:
-            break
-        if isinstance(item, ProgressEvent):
-            view.apply(item)
-            console_logger.apply_event(item)
-            rendered = view.render()
-        else:
-            # Legacy string status: shown only when no structured event has arrived yet, so the old
-            # "Stage N is processing" sentences cannot overwrite richer structured output.
-            if view.active_stage() is not None:
-                continue
-            rendered = str(item)
-        if rendered != last_status:
-            last_status = rendered
-            yield None, rendered, session_state
+        while True:
+            item = status_queue.get()
+            if item is None:
+                break
+            if isinstance(item, ProgressEvent):
+                view.apply(item)
+                console_logger.apply_event(item)
+                rendered = view.render()
+            else:
+                # Legacy string status: shown only when no structured event has arrived yet, so
+                # the old "Stage N is processing" sentences cannot overwrite richer structured
+                # output.
+                if view.active_stage() is not None:
+                    continue
+                rendered = str(item)
+            if rendered != last_status:
+                last_status = rendered
+                yield None, rendered, session_state
 
-    thread.join()
-    yield result_queue.get()
+        thread.join()
+        yield result_queue.get()
+    finally:
+        # Normal completion already joined above; this is the abandonment path. `is_alive()`
+        # keeps the ordinary case free and makes the intent explicit: never return while the
+        # render worker we started is still running.
+        if thread.is_alive():
+            thread.join()
 
 
 # [FORK] Digital-Union: source-confirmation UI glue.
@@ -1718,7 +1740,16 @@ def _process_video_guarded_unlocked(audio_file: str,
     # each yield onto the five Gradio outputs by appending the two read-outs that
     # `_process_video_impl` has recorded on `session_state`. Two extra outputs, no second placement
     # computation, no new state object, and still nothing but `queue.put` on the worker thread.
-    for video, status, state in process_video(
+    # [FORK] Digital-Union (C3-R0 R1): the stream is OWNED, not anonymous.
+    #
+    # `yield from` or an anonymous `for` would propagate a close eventually, but *when*
+    # depends on when the generator object is collected — and here the close chain is a
+    # safety contract, not a convenience: it has to run before the caller's
+    # `finally: _RENDER_LOCK.release()`. An owned stream closed in a finalizer makes that
+    # ordering explicit, synchronous and visible to a structural test. `process_video`'s own
+    # finalizer then joins the worker, so by the time this `finally` returns the render has
+    # actually stopped rather than merely been let go of.
+    render_stream = process_video(
         audio_file=audio_file,
         video_files=list(decision.paths),
         output_filename=output_filename,
@@ -1732,10 +1763,14 @@ def _process_video_guarded_unlocked(audio_file: str,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
         refuse_existing_output=refuse_existing_output,
-    ):
-        yield (video, status, state,
-               (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
-               (state or {}).get(SMART_MIX_REPORT_KEY, ''))
+    )
+    try:
+        for video, status, state in render_stream:
+            yield (video, status, state,
+                   (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
+                   (state or {}).get(SMART_MIX_REPORT_KEY, ''))
+    finally:
+        render_stream.close()
 
 
 # [FORK] Digital-Union (C3-R0): one process-global render mutex, and it is the authority.
@@ -1873,8 +1908,12 @@ def render_selected_variants_guarded(
             # The whole live source gate runs again for this candidate, through the same core the
             # single render uses — so filesystem identity is freshly verified before each one and
             # there is no second gate implementation anywhere.
-            for video, status, state, _audio_report, _smart_report in \
-                    _process_video_guarded_unlocked(
+            # Owned for the same reason, one level up: if the batch generator is abandoned
+            # mid-candidate this finalizer closes the candidate's core stream, which closes
+            # `process_video`, which joins the worker — all before the batch's own
+            # `finally: _RENDER_LOCK.release()` below. The lock cannot reach a second render
+            # while this candidate is still rendering.
+            candidate_stream = _process_video_guarded_unlocked(
                         audio_file,
                         voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
                         audio.music_under_voice_percent,
@@ -1885,16 +1924,20 @@ def render_selected_variants_guarded(
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
                         session_state, source_state,
-                        refuse_existing_output=True):
-                last_status = status or ''
-                if video is not None:
-                    last_video = video
-                # Prefix only. The inner ProgressView text is passed through untouched — no new
-                # stage, no new phase, no second progress protocol, and nothing parsed out of it.
-                yield (gr.skip() if video is None else video,
-                       f"{prefix}\n\n{last_status}",
-                       state,
-                       gr.skip())
+                        refuse_existing_output=True)
+            try:
+                for video, status, state, _a_report, _s_report in candidate_stream:
+                    last_status = status or ''
+                    if video is not None:
+                        last_video = video
+                    # Prefix only. The inner ProgressView text is passed through untouched — no new
+                    # stage, no new phase, no second progress protocol, and nothing parsed out of it.
+                    yield (gr.skip() if video is None else video,
+                           f"{prefix}\n\n{last_status}",
+                           state,
+                           gr.skip())
+            finally:
+                candidate_stream.close()
 
             # Durable output is the success authority, not the preview and not the prose. A ProRes
             # render that finished and then hit trouble generating its display preview has still

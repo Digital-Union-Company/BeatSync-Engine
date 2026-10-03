@@ -775,7 +775,11 @@ def test_the_guard_projects_the_three_value_stream_onto_five_outputs():
     contract did not change, so the worker thread still carries nothing but `session_state`.
     """
     guarded = body_source(GATE_CORE)
-    assert "for video, status, state in process_video(" in guarded
+    # **C3-R0 R1**: the stream is owned so it can be closed deterministically — the worker
+    # lifetime chain depends on it. The 3-value contract this test exists for is unchanged.
+    assert "render_stream = process_video(" in guarded
+    assert "for video, status, state in render_stream:" in guarded
+    assert "render_stream.close()" in guarded
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
             "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in guarded
     # the inner generator's 3-value contract is unchanged; only the outer handler is 5-valued

@@ -99,6 +99,13 @@ _RENDER_LOCK            a process-global, non-reentrant threading.Lock in gui.py
 concurrency_id          one shared Gradio group on both events; cooperative only
 ```
 
+**And the bar is worker termination, not generator exhaustion.** No new render may begin until
+the previous `create_music_video` worker has actually *terminated* — a returned generator proves
+nothing, because `process_video` runs its render on a daemon thread. `process_video` therefore
+joins that thread in a `finally`, and each wrapper closes the nested stream it owns before
+releasing the mutex. Never weaken that join to a timeout, and never release the lock on a path
+that has not closed its nested stream.
+
 Any future render entry point **must** join both. Do not relax the lock to an `RLock`: a wrapper
 re-entering it is exactly the bug the shared gate core exists to prevent, and a reentrant lock
 would hide it. Do not clear the processing directory from anywhere else, and do not make it

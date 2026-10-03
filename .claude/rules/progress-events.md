@@ -70,6 +70,14 @@ Rules that are load-bearing:
 - **No invented ETAs.** Stages 1-4 are seconds long; Stage 5's per-video cost varies with clip
   duration. Rendering publishes a *measured* rate, which is not a prediction.
 
+**`process_video` owns its worker thread, and its generator lifetime IS that worker's lifetime.**
+Everything after `thread.start()` is inside a `try/finally` whose finalizer joins the thread, so
+closing the generator early does not return until the render has actually stopped. A UI or event
+cancellation may stop *consumption*; it may not orphan a render worker behind a returned
+generator, because the caller's render mutex is released the moment that generator returns. This
+changes no `ProgressEvent`, no stage, no phase and no schema — it is purely about who is still
+running when the stream ends.
+
 **C3-R0 prefixes; it never replaces.** The two-candidate batch wrapper emits no `ProgressEvent`
 of its own, adds no stage, no phase, no counter and no ETA, and parses nothing out of the rendered
 text. It yields `f"Rendering candidate {n} / 2"`, a blank line, and then today's `ProgressView`
