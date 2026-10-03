@@ -515,7 +515,15 @@ def test_presets_module_knows_nothing_about_generators_or_future_modes():
 #: are the *rendered* comparison this milestone deliberately refused — a gallery implies rendered
 #: thumbnails, which is batch rendering wearing a different hat.
 _C3_STILL_SPECULATIVE = ("num_variants", "variant_count", "compare_variants", "variant_gallery",
-                         "render_batch", "batch_render", "variant_preview", "thumbnail")
+                         "variant_preview", "thumbnail")
+
+#: **Split again by C3-R0.** `render_batch` and `batch_render` left the ban list because C3-R0
+#: implements exactly one of them — rendering two explicitly selected candidates, sequentially,
+#: through the existing pipeline. What stayed banned is what C3-R0 deliberately did *not* build: a
+#: rendered gallery, thumbnails, a second count, and automatic rendering of a whole comparison.
+#: The token list is the weak half of this guard either way; the structural assertion below is the
+#: one a rename cannot evade.
+_C3_R0_ACCEPTED_IN_GUI = ("render_batch", "render_selected_variants")
 
 #: What C3 V1 legitimately added, by name. Listed explicitly rather than simply removed from the
 #: ban, so the accepted surface is a reviewed allow-list and a *fourth* multi-variant concept
@@ -550,6 +558,8 @@ def test_the_gui_added_no_speculative_mode_machinery():
     # the allow-list is a statement about what C3 *is*, so it has to actually be there
     for word in _C3_ACCEPTED_IN_GUI:
         assert word in source, f"gui.py lost C3's {word!r}"
+    for word in _C3_R0_ACCEPTED_IN_GUI:
+        assert word in source, f"gui.py lost C3-R0's {word!r}"
 
 
 def test_the_accepted_c3_machinery_is_not_rendering_machinery():
@@ -565,6 +575,9 @@ def test_the_accepted_c3_machinery_is_not_rendering_machinery():
                            "analyze_beats_auto", "create_music_video"}
 
     for entry in ("_on_generate_variants", "_on_apply_selected_variant"):
+        # C3-R0's render wrapper is deliberately absent from this list: rendering is exactly what
+        # it is for. Its boundary — one mutex, one shared gate core, no cancellation — is pinned
+        # in `tests/test_gui_guard_seam.py`.
         assert entry in defined, f"{entry} is missing"
         seen, pending = set(), [entry]
         while pending:

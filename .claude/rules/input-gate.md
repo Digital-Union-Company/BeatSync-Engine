@@ -48,8 +48,26 @@ Any source change clears the confirmation (mode switch, folder path, recursive t
 list change). Non-source settings — FPS, encoder, output filename, audio — must **not**: they are not
 wired to these transitions, and a test asserts the confirmation survives them.
 
-**`process_video_guarded()` in `gui.py` is the real gate**, and it validates the **live** source
-controls — `source_mode`, `source_folder`, `source_recursive`, `video_input` are render-request inputs,
+**One gate core, two mutex-owning wrappers (C3-R0).** The authoritative gate is
+`_process_video_guarded_unlocked()` in `gui.py`; `process_video_guarded()` is the single-render
+wrapper that `process_btn.click` calls and `render_selected_variants_guarded()` is the C3-R0
+two-candidate batch wrapper. Both take the process-global render mutex and then reach the **same**
+core — the batch once per candidate, so every candidate is freshly re-verified:
+
+```
+_process_video_guarded_unlocked   = the ONE live source gate + render core
+process_video_guarded             = single-render mutex wrapper   -> core
+render_selected_variants_guarded  = batch mutex wrapper           -> core, per candidate
+```
+
+**Never create a second source-gate implementation.** The core was extracted precisely so the batch
+could reuse the gate instead of copying it; a wrapper that rebuilt `resolve_for_render`,
+`live_declaration` or the config normalisation would be two gates one refactor from disagreeing. A
+seam test asserts exactly one `resolve_for_render` exists in the module, and that neither wrapper
+contains it. The core is **not** a public entry point: only those two wrappers may call it, and no
+Gradio event may name it as its `fn`.
+
+**The gate validates the **live** source controls** — `source_mode`, `source_folder`, `source_recursive`, `video_input` are render-request inputs,
 not just `gr.State`. That is load-bearing, not defensive padding: Gradio delivers widget changes as
 separate queued events, so at click time the state can lag behind the widgets (a late upload, a retyped
 folder). Trusting the state alone allowed a render for a source set the user was no longer declaring.

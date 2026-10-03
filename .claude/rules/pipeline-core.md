@@ -84,6 +84,35 @@ Legacy portable `bin/CUDA/v13.3` support is still present but the installer remo
 tuning constants) plus shared numeric helpers. Stages import upward from it (`from . import _normalize`),
 so the stage imports at the bottom of `__init__.py` must stay *after* the helper definitions.
 
+## The processing directory is process-global, so renders are mutually exclusive
+
+`create_music_video` **clears `get_processing_dir()` at the start of every render** — and
+`paths.PROCESSING_DIR` is one module-level constant, not a per-session path. Two renders running
+at once would therefore delete each other's in-flight clips.
+
+Until C3-R0 this was latent: `process_btn.click` was the only render event. C3-R0 added a second
+one, so the invariant is now enforced rather than merely true by accident:
+
+```
+_RENDER_LOCK            a process-global, non-reentrant threading.Lock in gui.py
+                        acquired non-blockingly by BOTH render wrappers; the authority
+concurrency_id          one shared Gradio group on both events; cooperative only
+```
+
+Any future render entry point **must** join both. Do not relax the lock to an `RLock`: a wrapper
+re-entering it is exactly the bug the shared gate core exists to prevent, and a reentrant lock
+would hide it. Do not clear the processing directory from anywhere else, and do not make it
+per-session to "allow" parallel renders — the NVENC clip-extraction cap
+(`_effective_clip_workers`) exists because one hardware encoder is already saturated by a single
+render, so parallelism would buy nothing it did not also cost.
+
+**C3-R0 changed no pipeline file.** It renders two candidates by calling the existing path twice,
+sequentially; `video_processor.py`, `ffmpeg_processing.py`, `video_analysis.py` and
+`src/auto_mode/*` are untouched, and no stage cache was invented. Stages 1–3 and a warm Stage-5
+cache scan are legitimately repeated per candidate — Stage 4 and Stage 6 must re-run anyway
+because Cut Density and Micro Cuts vary — and hoisting them would mean splitting
+`analyze_beats_auto`, which is not worth a constant saving against render minutes.
+
 ## The frame-lock invariant
 
 The whole sync story rests on `video_processor.build_frame_aligned_cut_timeline()`: **absolute** cut

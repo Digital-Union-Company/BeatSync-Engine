@@ -574,12 +574,32 @@ def test_stage6_summary_reports_planner_cost_even_when_the_plan_was_empty(gui):
 # ======================================================================================
 
 
+#: [FORK] Digital-Union (C3-R0): the shared live-source-gate + render core, which owns the ONE
+#: authoritative `resolve_for_render` call and times it. `process_video_guarded` is the
+#: single-render mutex wrapper and `render_selected_variants_guarded` the batch one; both reach
+#: this same timed gate, so each batch candidate is re-verified independently.
+GATE_CORE = "_process_video_guarded_unlocked"
+
+
 def test_h_verification_is_timed_around_the_existing_gate_call():
+    """**Re-pointed by C3-R0.** Gate timing is a property of the gate, not of the wrapper's name.
+
+    C3-R0 moved the source gate into one shared core that both the single-render wrapper and the
+    two-candidate batch wrapper call, so the timer moved with it. That makes this assertion
+    stronger rather than weaker: every batch candidate is independently re-verified and gets its
+    own `verification_seconds`, measured by this one timed call.
+    """
     tree = _tree(_GUI)
-    fn = _func(tree, "process_video_guarded")
+    fn = _func(tree, GATE_CORE)
     code = _body_code(fn)
 
     assert len(_calls(fn, "resolve_for_render")) == 1, "one gate call, as before"
+    # ...and it is the only one in the module: the wrappers delegate, they do not re-gate
+    assert open(_GUI, encoding="utf-8").read().count("resolve_for_render(") == 1
+    wrapper = _body_code(_func(tree, "process_video_guarded"))
+    for duplicated in ("resolve_for_render(", "live_declaration(",
+                       "verification_started = time.perf_counter()"):
+        assert duplicated not in wrapper, f"the mutex wrapper duplicates {duplicated}"
     assert "verification_started = time.perf_counter()" in code
     assert "verification_seconds = time.perf_counter() - verification_started" in code
 
@@ -592,7 +612,7 @@ def test_h_verification_is_timed_around_the_existing_gate_call():
 
 
 def test_h_the_gate_decision_and_the_verified_list_are_unchanged():
-    code = _body_code(_func(_tree(_GUI), "process_video_guarded"))
+    code = _body_code(_func(_tree(_GUI), GATE_CORE))
 
     assert "live_declaration(source_mode, source_folder, source_recursive, video_input)" in code
     assert "if not decision.allowed:" in code
@@ -836,8 +856,8 @@ def test_l01_pipeline_cache_and_planner_semantics_are_untouched():
     assert [kw.arg for kw in calls[0].keywords] == [
         "cut_times", "segment_durations", "beat_info", "video_files"]
 
-    # the gate still resolves exactly once, in the handler, before any delegation
-    guard = _body_code(_func(_tree(_GUI), "process_video_guarded"))
+    # the gate still resolves exactly once, in the shared core, before any delegation
+    guard = _body_code(_func(_tree(_GUI), GATE_CORE))
     assert guard.count("resolve_for_render(") == 1
     assert "if not decision.allowed:" in guard
 

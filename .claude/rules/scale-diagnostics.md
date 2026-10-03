@@ -18,11 +18,28 @@ number that would be a gate is out of scope by design.
 - **Folder scan** — `InputReport.render_text()` shows the `scan_seconds` the scan already recorded
   (`Scan time:   4.1s`). `format_seconds` is total: non-numeric, `NaN`, `inf` and negatives all render
   `0.0s`, because a report must never raise inside a UI callback.
-- **Render-time source verification** — `process_video_guarded` times its existing
-  `resolve_for_render` call and hands the figure to `process_video`, which reports it as a completed
-  **Stage 0** (`Stage.INPUT` already existed for pre-Stage-1 source work; L0 is its first producer).
+- **Render-time source verification** — `_process_video_guarded_unlocked` owns the **one**
+  authoritative `resolve_for_render` call and times it, handing the figure to `process_video`,
+  which reports it as a completed **Stage 0** (`Stage.INPUT` already existed for pre-Stage-1 source work; L0 is its first producer).
   The gate is timed, never changed: same call, same live declaration, same allow/deny, and no
-  verification result is ever reused between renders. `StageConsoleLogger.end_stage` gained an
+  verification result is ever reused between renders.
+
+  **C3-R0 moved where that call lives, not what it does.** Rendering became mutually exclusive and
+  gained a second entry point, so the gate (and its timer) sit in one shared core that both
+  mutex-owning wrappers reach:
+
+  ```
+  _process_video_guarded_unlocked   = the ONE timed live source gate + render core
+  process_video_guarded             = single-render mutex wrapper      -> core
+  render_selected_variants_guarded  = C3-R0 batch mutex wrapper        -> core, per candidate
+  ```
+
+  Because the batch calls the core **once per candidate**, each candidate is independently
+  re-verified and carries its **own** `verification_seconds` — there is deliberately no
+  batch-level gate and no cached decision shared between the two renders. Neither wrapper may
+  rebuild a second gate or a second timer; a seam test asserts exactly one `resolve_for_render`
+  exists in `gui.py`. The diagnostic output format is unchanged: C3-R0 added no metric, no
+  threshold and no ETA. `StageConsoleLogger.end_stage` gained an
   optional elapsed override used only for a stage whose END is the first event the logger sees —
   otherwise Stage 0 would print "ended in 0 seconds" for work that already happened.
 - **Stage 5 cache scan** — `cache_identity_seconds` (the `_cache_path`/`_video_signature` side,

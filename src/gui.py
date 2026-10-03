@@ -141,6 +141,12 @@ from beatsync_fork import variant_lab as fork_lab
 # vector can move. Stdlib-only and Gradio-free like the rest of the package; this module only wires
 # it to widgets. It renders nothing and knows nothing about rendering.
 from beatsync_fork import variant_batch as fork_batch
+# [FORK] Digital-Union (C3-R0): rendering exactly two compared candidates. The selection contract,
+# the candidate output identity and the batch summary all live in
+# src/beatsync_fork/render_batch.py (stdlib-only, Gradio-free, renders nothing); this module
+# supplies the request tag and performs every side effect. `variant_batch` stays generation and
+# comparison state and knows nothing about rendering — its own guard enforces that.
+from beatsync_fork import render_batch as fork_render_batch
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
 # src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
@@ -157,6 +163,17 @@ import audio_mixdown
 #: worker and the generator. It lives in `session_state` as ordinary render bookkeeping — the
 #: worker thread must never touch a Gradio component, so the value is carried on the dict the
 #: generator already yields and projected onto the widget there.
+#: [FORK] Digital-Union (C3-R0): where the finished render records its **durable** output file.
+#: Same lifecycle as the two report keys below — cleared at the start of every attempt, written
+#: only after the move into `output/` succeeds.
+#:
+#: It exists because the value the handler *returns* is not the durable artifact in every mode: a
+#: ProRes render moves the real `.mov` into `output/` and then hands back a session-temp
+#: `_preview.mp4` for display. A batch that treated the returned path as its result would record a
+#: temporary file as candidate output. Nothing parses the status prose and nothing reconstructs the
+#: timestamp; the producer states the path it actually wrote.
+LAST_OUTPUT_PATH_KEY = 'last_output_path'
+
 AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 
 #: [FORK] Digital-Union (Smart Mix V1 / E): the same bookkeeping seam as the Audio Layers report —
@@ -576,7 +593,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        voice_files: VideoFilesInput = None,
                        audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                        sfx_root: str | None = None,
-                       smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> StatusResult:
+                       smart_mix: fork_smart_mix.SmartMixConfig | None = None,
+                       refuse_existing_output: bool = False) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
     # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
@@ -715,6 +733,21 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
+        # [FORK] Digital-Union (C3-R0): batch-only hard no-overwrite, checked BEFORE any analysis.
+        #
+        # `shutil.move` silently overwrites an existing destination on this platform (measured), and
+        # the name above is only distinct per second per Variation Seed. C3 guarantees candidate
+        # *master* uniqueness but says nothing about `CreativeRecipe.seed`, so two candidates of one
+        # batch really can compute the same `_seedNNN` — a batch must never destroy the render it
+        # just produced. Refusing here costs nothing; refusing after Stage 5 would waste the run.
+        #
+        # Default `False`, so ordinary Create Music Video keeps its shipped behaviour exactly. The
+        # pre-existing single-render overwrite is a separate latent defect, reported rather than
+        # changed inside this feature.
+        if refuse_existing_output and os.path.exists(output_path):
+            return None, (f"❌ Output already exists and would be overwritten: {output_path}"), \
+                session_state
+
         selected_beats, beat_info = analyze_beats_auto(
             local_audio_path,
             use_gpu=use_gpu,
@@ -804,8 +837,20 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             event_callback=event_callback
         )
 
+        # [FORK] Digital-Union (C3-R0): second collision check, immediately before the move.
+        # The first one ran before Stage 1; a render takes minutes, and another process or an
+        # earlier candidate of this same batch could have produced this exact path meanwhile.
+        # Preserve what is already on disk and fail this candidate rather than overwrite it.
+        if refuse_existing_output and os.path.exists(output_path):
+            return None, (f"❌ Output appeared while rendering and was not overwritten: "
+                          f"{output_path}"), session_state
+
         # Move to output folder
         shutil.move(result_path, output_path)
+        # [FORK] Digital-Union (C3-R0): the durable artifact is now on disk, so record it. Set
+        # only here — after the move succeeded — and never from the returned display path, which
+        # for ProRes is a session-temp preview rather than the real `.mov`.
+        session_state[LAST_OUTPUT_PATH_KEY] = output_path
 
         # Create preview for ProRes if needed
         preview_path = output_path
@@ -896,7 +941,8 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  voice_files: VideoFilesInput = None,
                  audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                  sfx_root: str | None = None,
-                 smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> Iterator[StatusResult]:
+                 smart_mix: fork_smart_mix.SmartMixConfig | None = None,
+                 refuse_existing_output: bool = False) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -942,6 +988,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     audio_mix=audio_mix,
                     sfx_root=sfx_root,
                     smart_mix=smart_mix,
+                    refuse_existing_output=refuse_existing_output,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
@@ -1371,6 +1418,13 @@ def _variant_batch_skips() -> Tuple:
     return tuple(gr.skip() for _ in range(_VARIANT_APPLY_OUTPUT_COUNT))
 
 
+#: [FORK] Digital-Union (C3-R0): clearing BOTH selectors, used wherever Apply consumes the batch.
+#: The render choices describe candidates of a specific batch, so leaving them on screen after the
+#: batch is gone would offer the user a render of something that no longer exists.
+def _cleared_candidate_selectors() -> Tuple:
+    return gr.update(choices=[], value=None), gr.update(choices=[], value=[])
+
+
 def _on_generate_variants(variant_candidate_count,
                           variant_master_seed, variation_spread, variant_randomize,
                           range_cut_density_min, range_cut_density_max,
@@ -1423,11 +1477,14 @@ def _on_generate_variants(variant_candidate_count,
     status = (f"{len(batch.candidates)} candidates generated from master "
               f"{declaration.root_master_seed}. Pick one and press "
               f"{LABEL_APPLY_VARIANT}. Nothing has been rendered or changed yet.")
+    # [FORK] Digital-Union (C3-R0): both selectors are refreshed from the same candidate list —
+    # the Apply Radio and the Render CheckboxGroup. Still no execution widget is written.
     return (
         master_seed,
         batch,
         batch.table_text(),
         gr.update(choices=batch.choices(), value=None),
+        gr.update(choices=batch.choices(), value=[]),
         status,
     )
 
@@ -1486,7 +1543,7 @@ def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
     batch = variant_batch_state
     if not isinstance(batch, fork_batch.VariantBatch) or not batch.candidates:
         return _variant_batch_skips() + (
-            gr.skip(), gr.skip(),
+            gr.skip(), gr.skip(), gr.skip(),
             "No candidate list. Press Generate Variants first.")
 
     candidate = batch.candidate(variant_candidate_selector)
@@ -1494,7 +1551,7 @@ def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
         # Not stale — the list is still perfectly valid, the user simply has not chosen. Keeping
         # the batch here is the difference between a prompt and a punishment.
         return _variant_batch_skips() + (
-            gr.skip(), gr.skip(),
+            gr.skip(), gr.skip(), gr.skip(),
             "Select a candidate above, then press Apply Selected Variant.")
 
     _master_seed, config, base, audio_config, audio_base = _build_variant_resolution_context(
@@ -1521,32 +1578,36 @@ def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
     if not live_declaration.matches(batch.declaration):
         return _variant_batch_skips() + (
             None,
-            gr.update(choices=[], value=None),
+        ) + _cleared_candidate_selectors() + (
             "These candidates were generated from different settings and no longer describe this "
-            "screen, so nothing was applied. Press Generate Variants to make a new list.")
+            "screen, so nothing was applied. Press Generate Variants to make a new list.",)
 
     resolution, audio_resolution = fork_batch.rehydrate(batch.declaration, candidate)
     applied = _variant_apply_outputs(candidate.master_seed, resolution, audio_resolution)
     return applied + (
         None,
-        gr.update(choices=[], value=None),
+    ) + _cleared_candidate_selectors() + (
         f"Applied candidate {candidate.index + 1} (master {candidate.master_seed}) from batch "
-        f"root {batch.declaration.root_master_seed}. Press Create Music Video when ready.")
+        f"root {batch.declaration.root_master_seed}. Press Create Music Video when ready.",)
 
 
-def process_video_guarded(audio_file: str,
-                          voice_files: VideoFilesInput, voice_start_delay: float,
-                          voice_min_gap: float, voice_avoid_drops: bool,
-                          music_under_voice: int,
-                          sfx_folder: str, sfx_roles, sfx_amount: int, sfx_level: int,
-                          source_mode: str, source_folder: str,
-                          source_recursive: bool, video_input: VideoFilesInput,
-                          output_filename: str, processing_mode: str,
-                          custom_fps: float, variation_seed: int,
-                          cut_density: int, energy_response: int, motion_bias: int,
-                          source_diversity: int, micro_cuts: int, semantic_emphasis: int,
-                          session_state: dict,
-                          source_state) -> Iterator[GuardedResult]:
+def _process_video_guarded_unlocked(audio_file: str,
+                                    voice_files: VideoFilesInput, voice_start_delay: float,
+                                    voice_min_gap: float, voice_avoid_drops: bool,
+                                    music_under_voice: int,
+                                    sfx_folder: str, sfx_roles, sfx_amount: int, sfx_level: int,
+                                    source_mode: str, source_folder: str,
+                                    source_recursive: bool, video_input: VideoFilesInput,
+                                    output_filename: str, processing_mode: str,
+                                    custom_fps: float, variation_seed: int,
+                                    cut_density: int, energy_response: int, motion_bias: int,
+                                    source_diversity: int, micro_cuts: int,
+                                    semantic_emphasis: int,
+                                    session_state: dict,
+                                    source_state,
+                                    *,
+                                    refuse_existing_output: bool = False
+                                    ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
@@ -1562,6 +1623,18 @@ def process_video_guarded(audio_file: str,
     On success the freshly verified paths are handed to the existing `process_video` generator as the
     same `List[str]` it already consumed, so Auto Mode and the renderer are entirely unaware of input
     modes.
+
+    [FORK] Digital-Union (C3-R0): this is the **unlocked core** — the one authoritative live
+    source-gate-plus-render body — and it is **not** a public render entry point. Exactly two
+    mutex-owning wrappers may call it in production: `process_video_guarded` (single render) and
+    `render_selected_variants_guarded` (the two-candidate batch). The batch must reach *this*
+    rather than the single-render wrapper, because it already holds the render mutex for the whole
+    batch and calling a wrapper that acquires the same non-reentrant lock would make the batch
+    refuse itself on its own first candidate.
+
+    `refuse_existing_output` is keyword-only and batch-only: the ordinary positional widget list
+    cannot supply it, so Create Music Video keeps today's behaviour exactly. See
+    `_resolve_output_path`.
     """
     # Parameter names deliberately mirror the widget names in process_btn.click(inputs=...):
     # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
@@ -1583,6 +1656,10 @@ def process_video_guarded(audio_file: str,
     # handler can leave the previous attempt's reports on screen.
     session_state[AUDIO_LAYERS_REPORT_KEY] = ''
     session_state[SMART_MIX_REPORT_KEY] = ''
+    # [FORK] Digital-Union (C3-R0): the durable-output bookkeeping key follows the same lifecycle
+    # as the two read-outs above — cleared before the gate, so a refused render cannot leave the
+    # previous attempt's output path behind for a batch to read as this candidate's result.
+    session_state[LAST_OUTPUT_PATH_KEY] = ''
 
     verification_started = time.perf_counter()
     decision = resolve_for_render(
@@ -1654,10 +1731,203 @@ def process_video_guarded(audio_file: str,
         audio_mix=audio_mix,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
+        refuse_existing_output=refuse_existing_output,
     ):
         yield (video, status, state,
                (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
                (state or {}).get(SMART_MIX_REPORT_KEY, ''))
+
+
+# [FORK] Digital-Union (C3-R0): one process-global render mutex, and it is the authority.
+#
+# `create_music_video` clears `get_processing_dir()` — a single module-level path, process-global
+# and NOT per session — at the start of every render. Two overlapping renders would therefore
+# delete each other's in-flight clips. Until C3-R0 there was exactly one render event, so the
+# hazard was latent; adding a second one creates it.
+#
+# Gradio's own `concurrency_id` is wired below as well, but it is cooperative: separate listeners
+# get separate queues unless grouped, and this repository cannot verify the installed library's
+# behaviour (the portable runtime is not present on every machine). A plain non-reentrant
+# `threading.Lock`, acquired non-blockingly, is provable by a unit test with no Gradio at all — so
+# that is what guarantees the invariant, and the concurrency group is the courtesy on top.
+#
+# Deliberately a `Lock`, never an `RLock`: re-entrancy is exactly the bug (a batch calling the
+# single-render wrapper) that the unlocked core exists to prevent, and a reentrant lock would hide
+# it instead of refusing.
+_RENDER_LOCK = threading.Lock()
+
+#: Both render events join one Gradio concurrency group. The string itself carries no meaning; one
+#: shared value is the whole contract.
+RENDER_CONCURRENCY_ID = 'beatsync-render'
+
+RENDER_BUSY_MESSAGE = (
+    "⏳ A render is already running. Wait for it to finish before starting another — "
+    "BeatSync renders one video at a time."
+)
+
+
+def process_video_guarded(audio_file: str,
+                          voice_files: VideoFilesInput, voice_start_delay: float,
+                          voice_min_gap: float, voice_avoid_drops: bool,
+                          music_under_voice: int,
+                          sfx_folder: str, sfx_roles, sfx_amount: int, sfx_level: int,
+                          source_mode: str, source_folder: str,
+                          source_recursive: bool, video_input: VideoFilesInput,
+                          output_filename: str, processing_mode: str,
+                          custom_fps: float, variation_seed: int,
+                          cut_density: int, energy_response: int, motion_bias: int,
+                          source_diversity: int, micro_cuts: int, semantic_emphasis: int,
+                          session_state: dict,
+                          source_state) -> Iterator[GuardedResult]:
+    """The single-render entry point: take the render mutex, then run the shared gated core.
+
+    [FORK] Digital-Union (C3-R0): the gate logic itself did not move or change — it is
+    `_process_video_guarded_unlocked`, and this wrapper adds only mutual exclusion. The parameter
+    list is byte-identical to before, because it is half of the positional contract with
+    `process_btn.click(inputs=...)` that a seam test pins name-for-name.
+
+    If another render holds the lock this refuses immediately and **touches nothing**: no source
+    state, no report widgets, and `gr.skip()` for the video so the previous preview survives. A
+    user who clicks twice loses nothing.
+    """
+    if not _RENDER_LOCK.acquire(blocking=False):
+        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip()
+        return
+    try:
+        yield from _process_video_guarded_unlocked(
+            audio_file, voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
+            music_under_voice, sfx_folder, sfx_roles, sfx_amount, sfx_level,
+            source_mode, source_folder, source_recursive, video_input,
+            output_filename, processing_mode, custom_fps, variation_seed,
+            cut_density, energy_response, motion_bias, source_diversity,
+            micro_cuts, semantic_emphasis, session_state, source_state,
+        )
+    finally:
+        _RENDER_LOCK.release()
+
+
+def _render_batch_request_tag() -> str:
+    """One visible, sortable tag per Render Selected click. Microseconds, no randomness."""
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def render_selected_variants_guarded(
+        variant_batch_state, variant_render_selection,
+        audio_file: str,
+        voice_files: VideoFilesInput, voice_start_delay: float,
+        voice_min_gap: float, voice_avoid_drops: bool,
+        sfx_folder: str, sfx_roles,
+        source_mode: str, source_folder: str,
+        source_recursive: bool, video_input: VideoFilesInput,
+        output_filename: str, processing_mode: str, custom_fps: float,
+        session_state: dict, source_state) -> Iterator[Tuple]:
+    """Render exactly two selected candidates, one after the other. C3-R0.
+
+    [FORK] Digital-Union (C3-R0). Three things make this safe, and all three are deliberate:
+
+    **It takes the mutex once, for the whole batch**, and reaches
+    `_process_video_guarded_unlocked` directly rather than `process_video_guarded`. Calling the
+    single-render wrapper would try to re-acquire a non-reentrant lock this function already holds
+    and the batch would refuse itself on candidate 1.
+
+    **The candidate-specific values come from the stored recipes, never from the screen.** Two
+    candidates are never simultaneously visible, so the live widgets cannot be execution authority
+    for a batch. `variation_seed`, the six creative controls and the three audio levels are read
+    off `creative_recipe` / `audio_recipe`; nothing is re-resolved. Everything else — audio, voice,
+    SFX, source, output, encoder, FPS — is frozen from this handler's own submitted arguments, so
+    edits made while the batch runs cannot reach it.
+
+    **It does not require Apply's stale-declaration gate.** That gate exists because Apply writes a
+    historical candidate into the *current* screen. Rendering reads already-resolved artifacts and
+    writes no widget, so a user who nudged a slider after generating may still render the pair.
+
+    Fail-fast: a failed candidate stops the batch and the earlier candidate's file is kept. The
+    `VariantBatch` is **not** consumed — the comparison survives, so the pair can be rendered again
+    or one of them applied.
+    """
+    batch = variant_batch_state
+    summary_only = (gr.skip(), gr.skip(), gr.skip())
+
+    request, refusal = fork_render_batch.build_request(
+        batch, variant_render_selection,
+        user_base=output_filename or 'music_video',
+        request_tag=_render_batch_request_tag(),
+    )
+    if request is None:
+        yield summary_only[0], f"❌ {refusal}", session_state, refusal
+        return
+
+    if not _RENDER_LOCK.acquire(blocking=False):
+        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE
+        return
+
+    outcomes: list = []
+    stopped = False
+    try:
+        for position, candidate in enumerate(request.candidates, start=1):
+            prefix = f"Rendering candidate {position} / {request.count}"
+            recipe = candidate.creative_recipe
+            audio = candidate.audio_recipe
+            last_status, last_video = '', None
+
+            # The whole live source gate runs again for this candidate, through the same core the
+            # single render uses — so filesystem identity is freshly verified before each one and
+            # there is no second gate implementation anywhere.
+            for video, status, state, _audio_report, _smart_report in \
+                    _process_video_guarded_unlocked(
+                        audio_file,
+                        voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
+                        audio.music_under_voice_percent,
+                        sfx_folder, sfx_roles, audio.sfx_amount, audio.sfx_level_percent,
+                        source_mode, source_folder, source_recursive, video_input,
+                        candidate.output_stem, processing_mode, custom_fps,
+                        recipe.seed,
+                        recipe.cut_density, recipe.energy_response, recipe.motion_bias,
+                        recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
+                        session_state, source_state,
+                        refuse_existing_output=True):
+                last_status = status or ''
+                if video is not None:
+                    last_video = video
+                # Prefix only. The inner ProgressView text is passed through untouched — no new
+                # stage, no new phase, no second progress protocol, and nothing parsed out of it.
+                yield (gr.skip() if video is None else video,
+                       f"{prefix}\n\n{last_status}",
+                       state,
+                       gr.skip())
+
+            # Durable output is the success authority, not the preview and not the prose. A ProRes
+            # render that finished and then hit trouble generating its display preview has still
+            # produced a `.mov` the user owns.
+            durable = (session_state or {}).get(LAST_OUTPUT_PATH_KEY, '') or ''
+            outcomes.append(fork_render_batch.RenderCandidateOutcome(
+                candidate_index=candidate.candidate_index,
+                candidate_master_seed=candidate.candidate_master_seed,
+                variation_seed=candidate.variation_seed(),
+                success=bool(durable),
+                durable_output_path=durable,
+                preview_path=last_video or '',
+                status_text=last_status,
+                audio_layers_report=(session_state or {}).get(AUDIO_LAYERS_REPORT_KEY, '') or '',
+                smart_mix_report=(session_state or {}).get(SMART_MIX_REPORT_KEY, '') or '',
+            ))
+            if not durable:
+                stopped = True
+                break
+    finally:
+        _RENDER_LOCK.release()
+
+    outcome = fork_render_batch.RenderBatchOutcome(
+        requested_count=request.count,
+        outcomes=tuple(outcomes),
+        stopped_on_failure=stopped,
+    )
+    # The newest successful preview wins, and a later failure never blanks an earlier success.
+    preview = outcome.latest_successful_preview()
+    yield (preview if preview else gr.skip(),
+           outcome.headline(),
+           session_state,
+           outcome.summary_text())
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -2438,6 +2708,37 @@ def create_ui() -> gr.Blocks:
                             elem_id='variant-batch-status',
                         )
                         gr.Markdown(INFO_VARIANT_APPLY)
+                        # [FORK] Digital-Union (C3-R0): render exactly two of the compared
+                        # candidates. A SEPARATE selector from the Apply Radio above — one control
+                        # cannot honestly mean both "apply this one" and "render these two", and
+                        # overloading it is how a user ends up rendering what they meant to apply.
+                        # Like every other lab widget it registers nothing; the selection is read
+                        # and validated at click time.
+                        gr.Markdown(INFO_RENDER_SELECTED)
+                        variant_render_selector = gr.CheckboxGroup(
+                            choices=[],
+                            # Empty by default and never pre-filled: committing two uninterruptible
+                            # renders has to be something the user actively chose.
+                            value=[],
+                            label=LABEL_RENDER_CANDIDATES,
+                            info=INFO_RENDER_CANDIDATES,
+                            elem_id='variant-render-selector',
+                        )
+                        render_selected_variants_btn = gr.Button(
+                            LABEL_RENDER_SELECTED, variant='secondary',
+                            elem_id='render-selected-variants-button')
+                        # Its own panel. `variant_batch_table` and `variant_batch_status` describe
+                        # generation and comparison; making them carry render results too would
+                        # leave the user unable to tell which statement was about which thing.
+                        render_batch_summary = gr.Textbox(
+                            label=LABEL_RENDER_BATCH_SUMMARY,
+                            value='',
+                            placeholder=PLACEHOLDER_RENDER_BATCH_SUMMARY,
+                            lines=10,
+                            max_lines=20,
+                            interactive=False,
+                            elem_id='render-batch-summary',
+                        )
 
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
@@ -2681,7 +2982,7 @@ def create_ui() -> gr.Blocks:
         # makes candidate chaining structurally impossible, not merely avoided.
         variant_batch_outputs = [
             variant_master_seed, variant_batch_state, variant_batch_table,
-            variant_candidate_selector, variant_batch_status,
+            variant_candidate_selector, variant_render_selector, variant_batch_status,
         ]
 
         generate_variants_btn.click(
@@ -2697,7 +2998,37 @@ def create_ui() -> gr.Blocks:
             fn=_on_apply_selected_variant,
             inputs=[variant_batch_state, variant_candidate_selector] + variant_batch_inputs,
             outputs=variant_lab_outputs + [
-                variant_batch_state, variant_candidate_selector, variant_batch_status],
+                variant_batch_state, variant_candidate_selector, variant_render_selector,
+                variant_batch_status],
+        )
+
+        # [FORK] Digital-Union (C3-R0): render exactly two compared candidates, sequentially.
+        #
+        # Its `inputs` are deliberately the batch state, the render selection and the
+        # NON-candidate render intent only. The six creative sliders and the three audio levels
+        # are absent on purpose: a batch's candidate values come from the stored recipes, and
+        # reading them from the screen would mean rendering whichever candidate happened to be
+        # applied rather than the two that were ticked.
+        #
+        # It shares `process_btn.click`'s concurrency group, and both are additionally serialized
+        # by the process-global `_RENDER_LOCK`, which is the authority — `create_music_video`
+        # clears one process-global processing dir per render, so two renders may never
+        # overlap.
+        render_selected_variants_btn.click(
+            fn=render_selected_variants_guarded,
+            inputs=[
+                variant_batch_state, variant_render_selector,
+                audio_input,
+                voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
+                sfx_folder, sfx_roles,
+                source_mode, source_folder, source_recursive, video_input,
+                output_filename, processing_mode, custom_fps,
+                session_state, source_state,
+            ],
+            outputs=[video_output, status_output, session_state, render_batch_summary],
+            show_progress='hidden',
+            concurrency_id=RENDER_CONCURRENCY_ID,
+            concurrency_limit=1,
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.
@@ -2774,7 +3105,12 @@ def create_ui() -> gr.Blocks:
             # preparation state, and never consulted by the pipeline.
             outputs=[video_output, status_output, session_state,
                      audio_layers_report, smart_mix_report],
-            show_progress='hidden'
+            show_progress='hidden',
+            # [FORK] Digital-Union (C3-R0): the same concurrency group as the batch render event,
+            # so Gradio queues them together instead of giving each listener its own lane. The
+            # process-global `_RENDER_LOCK` remains the authority; this is cooperative UX.
+            concurrency_id=RENDER_CONCURRENCY_ID,
+            concurrency_limit=1,
         )
 
     return app

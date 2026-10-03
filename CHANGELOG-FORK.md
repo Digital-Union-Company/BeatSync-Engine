@@ -20,6 +20,91 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-03 (Variant Lab Render Two Compared Candidates — C3-R0)
+
+C3 V1 let the user generate N candidate settings, compare them and apply **one**. The payoff of a
+comparison is watching the videos, though — and getting two meant two manual round-trips, with the
+batch consumed by the first Apply and the base moved out from under the rest. C3-R0 closes that
+loop: tick exactly two candidates, press Render Selected Variants, get two real videos.
+
+- **Exactly two, sequential, and no cancellation — one decision rather than three.** There is no
+  safe stop channel in this architecture today: a cancelled Gradio event can return its slot while
+  the daemon render worker is still alive, and the next render would clear the live one's
+  process-global processing directory. Rather than ship a Stop button that cannot actually stop
+  FFmpeg, C3-R0 ships none and bounds the commitment to two renders. Three or more,
+  continue-after-failure and real cancellation are **C3-R1**, behind an explicit worker lifecycle.
+  The selection bound is deliberately unrelated to the comparison bound of 12: that one is
+  legibility and costs a millisecond, this one is uninterruptible render minutes.
+- **Renders are now mutually exclusive, and that was a latent hazard rather than a new one.**
+  `create_music_video` clears `get_processing_dir()` at the start of every render, and
+  `PROCESSING_DIR` is one module-level constant — not per session. Until now `process_btn.click`
+  was the only render event, so nothing could overlap. Adding a second one created the hazard, so
+  both wrappers take a process-global non-reentrant `threading.Lock` non-blockingly and refuse
+  cleanly when it is held, and both events share one Gradio `concurrency_id` with
+  `concurrency_limit=1`. The lock is the authority because it is provable without Gradio; the
+  concurrency group is cooperative serialisation on top.
+- **One gate core, two mutex-owning wrappers.** The live source gate, the config normalisation and
+  the render delegation moved out of `process_video_guarded` into
+  `_process_video_guarded_unlocked`, which both the single-render wrapper and the batch wrapper
+  call — the batch once per candidate, so **every candidate is independently re-verified** and
+  carries its own `verification_seconds`. The batch deliberately reaches the core and not the
+  wrapper: re-entering a non-reentrant lock it already holds would make a batch refuse itself on
+  its own first candidate. `process_video_guarded`'s signature and its `process_btn.click`
+  registration are byte-identical, because they are half of a positional Gradio contract.
+- **Candidate output identity cannot rest on the Variation Seed.** C3 deduplicates candidate
+  *masters* deliberately; `CreativeRecipe.seed` is an independent draw and is deduplicated
+  nowhere. Measured: root 5484 yields masters 945730 and 862920 that **both** resolve Variation
+  Seed 536635. Since the render path names its file `_seed<VariationSeed>` and `shutil.move`
+  overwrites silently (also measured), each candidate gets a stem carrying the request tag, the
+  candidate index and the candidate master — `music_video_batch<tag>_c01_m609591` — and the
+  existing suffix follows unchanged.
+- **Batch-only hard no-overwrite.** `refuse_existing_output` is keyword-only so the positional
+  widget list can never supply it, defaults to `False` so ordinary Create Music Video keeps its
+  shipped behaviour exactly, and the batch passes `True`: the destination is checked before Stage
+  1 *and* again immediately before the move, preserving whatever is already on disk. The
+  pre-existing single-render overwrite is a separate latent defect, reported rather than changed
+  inside this feature.
+- **Durable output is the success authority**, not the preview and not the status prose. A ProRes
+  render moves the real `.mov` into `output/` and then returns a session-temp `_preview.mp4`, so a
+  preview step failing afterwards must not retroactively fail a finished render. A new
+  `LAST_OUTPUT_PATH_KEY` on `session_state` records it, with the same lifecycle as the two report
+  keys: cleared before every attempt, set only after the move succeeds. Nothing parses a path out
+  of status text.
+- **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
+  The render boundary exposes no typed failure classification, so a batch cannot tell a
+  shared-input failure — which would simply repeat — from a candidate-local one.
+- **The candidate values come from the stored recipes, never from the screen.** Two candidates are
+  never simultaneously visible, so live widgets cannot be a batch's execution authority. The
+  non-candidate intent (audio, voice, SFX, source, output, encoder, FPS) is frozen from the
+  submitted event arguments, so edits made while the batch runs cannot reach it.
+- **Rendering does not use Apply's stale-declaration gate, and does not consume the batch.** Apply
+  has that gate because it writes a historical candidate into the *current* screen; rendering
+  reads already-resolved artifacts and writes no widget. The comparison survives a render, so the
+  pair can be rendered again or one of them applied. `variant_batch_state` now has exactly two
+  readers, pinned as an exact list.
+- **Report ownership is unchanged.** `audio_layers_report` and `smart_mix_report` keep
+  `process_btn.click` as their only writer; the batch reads them from `session_state` and a
+  dedicated summary owns multi-render diagnostics, so no panel can describe a candidate the user
+  is not looking at. Progress is the existing stream with one ordinal line prefixed — no new
+  `ProgressEvent`, stage, phase, counter or ETA, and nothing parsed back out of the text.
+- **New pure module** `beatsync_fork/render_batch.py` (stdlib-only): the selection contract, the
+  candidate output identity and the summary formatter. It decides; `gui.py` performs every side
+  effect. `variant_batch.py` is untouched and keeps its own batch-render ban at full strength,
+  which is what holds the generation/render split honest.
+- **Nothing in the pipeline changed.** `video_processor.py`, `ffmpeg_processing.py`,
+  `video_analysis.py`, `audio_mix.py`, `smart_mix.py` and `src/auto_mode/*` are untouched;
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`. No stage cache was invented: Stages 1–3 and a warm
+  Stage-5 cache scan are simply repeated per candidate, because Stage 4 and Stage 6 must re-run
+  anyway once Cut Density and Micro Cuts vary.
+- **Six seam suites were re-pointed, not weakened.** `test_audio_layers_seam.py`,
+  `test_creative_controls_seam.py`, `test_creative_seed.py` and `test_scale_diagnostics.py`
+  asserted gate/config/timing properties against `process_video_guarded`'s body; those properties
+  moved into the shared core and now hold for *both* render paths. Every wrapper-level assertion —
+  the positional signature, the `fn=` registration, the report writer matrices — stayed exactly
+  where it was, and new structural guards assert that the wrapper owns the mutex and duplicates no
+  gate logic.
+
 ### Added — 2026-10-03 (Variant Lab Multi-Variant Generation + Comparison — C3 V1)
 
 Variant Lab could generate one recipe per click and wrote it straight back, which is a good way to

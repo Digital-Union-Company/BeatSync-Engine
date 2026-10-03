@@ -287,3 +287,69 @@ def test_gui_does_not_touch_gradio_components_from_the_worker_thread():
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
     }
     assert calls == {"put"}, f"event_callback must only enqueue, found {calls}"
+
+
+# ===========================================================================
+# C3-R0: the batch prefixes, it never replaces
+# ===========================================================================
+
+
+def _gui_tree() -> ast.Module:
+    with open(_GUI_PATH, encoding="utf-8") as handle:
+        return ast.parse(handle.read())
+
+
+def _gui_body(name: str) -> str:
+    node = next(n for n in ast.walk(_gui_tree())
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+    return "\n".join(
+        ast.unparse(stmt) for stmt in node.body
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str))
+    )
+
+
+def test_the_batch_adds_no_new_progress_protocol():
+    """C3-R0 wraps; it does not invent a second progress channel.
+
+    The inner `process_video` stream stays authoritative — same stages, same phases, same
+    counters, same `ProgressView`. A batch is two of today's renders in sequence, and the user's
+    status panel should read exactly as it always has, with one line of context above it.
+    """
+    body = _gui_body("render_selected_variants_guarded")
+    for forbidden in ("ProgressEvent(", "ProgressView(", "StageCounter(", "emit(",
+                      "event_callback", "progress_callback", "stage=", "phase=",
+                      "ETA", "eta", "estimated"):
+        assert forbidden not in body, f"the batch introduces {forbidden}"
+
+
+def test_the_batch_prefixes_the_existing_status_text_without_parsing_it():
+    body = _gui_body("render_selected_variants_guarded")
+    # the ordinal line, then the untouched inner text
+    # `ast.unparse` normalises f-strings to single quotes, hence the spelling here.
+    assert "f'Rendering candidate {position} / {request.count}'" in body
+    assert "f'{prefix}" + chr(92) + "n" + chr(92) + "n{last_status}'" in body
+    # nothing reads stage identity back out of prose — the mistake Phase 2A deleted
+    for forbidden in ("re.search", "re.match", "Stage (", "\\d+", ".index('Stage",
+                      'split("Stage"'):
+        assert forbidden not in body, f"the batch parses status text: {forbidden}"
+
+
+def test_the_batch_never_blanks_a_preview_on_a_status_only_yield():
+    """A later candidate's progress must not wipe an earlier candidate's finished video."""
+    body = _gui_body("render_selected_variants_guarded")
+    assert "gr.skip() if video is None else video" in body, \
+        "status-only yields must skip the video output, not clear it"
+    # and the closing yield prefers the newest success, falling back to skip
+    assert "outcome.latest_successful_preview()" in body
+    assert "preview if preview else gr.skip()" in body
+
+
+def test_the_inner_render_stream_is_unchanged():
+    """`process_video` keeps its 3-value contract and the core keeps the 5-value projection."""
+    source = open(_GUI_PATH, encoding="utf-8").read()
+    assert source.count("def process_video(") == 1
+    core = _gui_body("_process_video_guarded_unlocked")
+    assert "for video, status, state in process_video(" in core
+    assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in core

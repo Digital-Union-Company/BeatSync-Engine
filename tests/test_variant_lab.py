@@ -700,7 +700,10 @@ def test_the_gui_carries_only_the_accepted_c3_machinery():
     alongside the accepted ones.
     """
     source = _executable_source(_GUI).lower()
-    for word in ("variant_gallery", "render_batch", "batch_render", "stage_cache", "shortlist",
+    # **Split again by C3-R0**, which implements render_batch deliberately. What stays banned is
+    # what C3-R0 refused to build; the structural render-boundary proofs live in
+    # `tests/test_gui_guard_seam.py`, because a token list never survives a rename.
+    for word in ("variant_gallery", "stage_cache", "shortlist",
                  "freestyle", "director", "thumbnail", "variant_preview"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
 
@@ -1943,8 +1946,8 @@ def test_the_projection_helper_formats_no_text_of_its_own():
 #: anything *else* would be mocking the code under test rather than its environment. The
 #: declaration gate, the staleness refusal and the Apply projection are all genuinely executed here.
 _C3_HANDLER_NAMES = ("_variant_apply_outputs", "_build_variant_resolution_context",
-                     "_variant_batch_skips", "_on_generate_variants",
-                     "_on_apply_selected_variant")
+                     "_variant_batch_skips", "_cleared_candidate_selectors",
+                     "_on_generate_variants", "_on_apply_selected_variant")
 
 
 class _FakeUpdate:
@@ -2121,7 +2124,8 @@ def test_generate_variants_writes_no_execution_widget():
 
     outputs = _expanded_list(tree, "variant_batch_outputs")
     assert outputs == ["variant_master_seed", "variant_batch_state", "variant_batch_table",
-                       "variant_candidate_selector", "variant_batch_status"]
+                       "variant_candidate_selector", "variant_render_selector",
+                       "variant_batch_status"]
     for forbidden in (["variation_seed", "creative_preset", "variant_report"] + list(FIELDS)
                       + list(AUDIO_BASE_WIDGETS)):
         assert forbidden not in outputs, f"generating candidates writes {forbidden}"
@@ -2129,7 +2133,7 @@ def test_generate_variants_writes_no_execution_widget():
 
 def test_generating_candidates_renders_nothing_and_returns_a_real_batch():
     handlers = _c3_handlers()
-    master, batch, table, selector, status = _generate_batch(handlers=handlers)
+    master, batch, table, selector, render_selector, status = _generate_batch(handlers=handlers)
     assert master == 582913
     assert isinstance(batch, fork_batch.VariantBatch)
     assert len(batch.candidates) == 5
@@ -2142,7 +2146,7 @@ def test_generating_candidates_renders_nothing_and_returns_a_real_batch():
 
 @pytest.mark.parametrize("unusable", [0, None, "", -5, 7.9, True])
 def test_an_unusable_root_master_is_minted_and_surfaced(unusable):
-    master, batch, _table, _selector, _status = _generate_batch(master=unusable)
+    master, batch, _table, _selector, _render, _status = _generate_batch(master=unusable)
     assert isinstance(master, int) and master > 0
     assert batch.declaration.root_master_seed == master, \
         "the batch must be built from the seed the user can actually see"
@@ -2150,7 +2154,7 @@ def test_an_unusable_root_master_is_minted_and_surfaced(unusable):
 
 def test_the_generated_batch_is_exactly_what_the_pure_resolver_produces():
     """The handler normalises and delegates; it must not become a second resolution path."""
-    _master, batch, table, _selector, _status = _generate_batch(count=7, spread=70)
+    _master, batch, table, _selector, _render_selector, _status = _generate_batch(count=7, spread=70)
     config = fork_lab.VariantLabConfig(
         master_seed=582913, spread=70, randomized=frozenset(FIELDS),
         ranges={f: (0, 100) for f in FIELDS})
@@ -2165,12 +2169,12 @@ def test_the_generated_batch_is_exactly_what_the_pure_resolver_produces():
 def test_the_batch_handed_to_state_survives_a_deep_copy():
     """Gradio deep-copies `State`; a config or resolution in here would fail at runtime."""
     import copy
-    _master, batch, _table, _selector, _status = _generate_batch(count=12)
+    _master, batch, _table, _selector, _render_selector, _status = _generate_batch(count=12)
     assert copy.deepcopy(batch) == batch
 
 
 def test_every_candidate_in_the_handler_output_shares_one_frozen_base():
-    _master, batch, _t, _s, _st = _generate_batch(count=6, base=CINEMATIC, spread=100)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(count=6, base=CINEMATIC, spread=100)
     assert batch.declaration.visual_base == tuple(CINEMATIC[f] for f in FIELDS)
     assert batch.declaration.audio_base == (35, 50, 50)
 
@@ -2196,12 +2200,12 @@ def test_apply_writes_the_ordinary_variant_lab_output_set_plus_its_own_three():
     calls = _registration(_tree(_GUI), "apply_variant_btn", attrs=("click",))
     assert _ordered_names(_kwargs(calls[0])["outputs"]) == [
         "variant_lab_outputs", "variant_batch_state", "variant_candidate_selector",
-        "variant_batch_status"]
+        "variant_render_selector", "variant_batch_status"]
 
 
 def test_applying_a_candidate_writes_exactly_that_candidate():
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(count=5, handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(count=5, handlers=handlers)
     for index, candidate in enumerate(batch.candidates):
         applied = _apply(batch, index, handlers=handlers)
         assert applied[0] == candidate.master_seed, "the Master Seed box shows the CANDIDATE"
@@ -2215,7 +2219,7 @@ def test_applying_a_candidate_writes_exactly_that_candidate():
 def test_apply_recomputes_the_preset_label_through_the_existing_projection():
     """Programmatic writes do not fire `.input()`, so the label must be computed explicitly."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(
+    _master, batch, _t, _s, _rs, _st = _generate_batch(
         count=3, spread=0, base=CINEMATIC, handlers=handlers)
     applied = _apply(batch, 0, count=3, spread=0, base=CINEMATIC, handlers=handlers)
     assert tuple(applied[2:8]) == tuple(CINEMATIC[f] for f in FIELDS)
@@ -2224,17 +2228,17 @@ def test_apply_recomputes_the_preset_label_through_the_existing_projection():
 
 def test_a_successful_apply_consumes_the_batch_and_clears_the_selector():
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     applied = _apply(batch, 2, handlers=handlers)
     assert applied[13] is None, "the batch is consumed"
     assert applied[14] == _FakeUpdate(choices=[], value=None)
-    assert "applied candidate 3" in applied[15].lower()
+    assert "applied candidate 3" in applied[16].lower()
 
 
 def test_an_unchanged_screen_applies_successfully():
     """The gate must be a gate, not a wall: the untouched case has to work."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     applied = _apply(batch, 1, handlers=handlers)
     assert not any(isinstance(v, _FakeSkip) for v in applied[:13])
 
@@ -2258,19 +2262,19 @@ _STALE_EDITS = {
 def test_a_stale_apply_changes_no_execution_widget_and_consumes_the_batch(label):
     """The live declaration is the authority — the whole reason the gate exists."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     applied = _apply(batch, 0, handlers=handlers, **_STALE_EDITS[label])
 
     for value in applied[:13]:
         assert isinstance(value, _FakeSkip), f"{label}: an execution widget was written"
     assert applied[13] is None, f"{label}: the stale batch must be consumed"
     assert applied[14] == _FakeUpdate(choices=[], value=None)
-    assert "no longer describe" in applied[15].lower()
+    assert "no longer describe" in applied[16].lower()
 
 
 def test_a_changed_candidate_count_is_also_stale():
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(count=5, handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(count=5, handlers=handlers)
     applied = _apply(batch, 0, count=8, handlers=handlers)
     for value in applied[:13]:
         assert isinstance(value, _FakeSkip)
@@ -2279,27 +2283,27 @@ def test_a_changed_candidate_count_is_also_stale():
 
 def test_a_stale_apply_cannot_be_retried():
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     first = _apply(batch, 0, handlers=handlers, spread=51)
     assert first[13] is None
     # the GUI now holds None, so a second press refuses earlier and still writes nothing
     second = _apply(first[13], 0, handlers=handlers, spread=51)
     for value in second[:13]:
         assert isinstance(value, _FakeSkip)
-    assert "generate variants" in second[15].lower()
+    assert "generate variants" in second[16].lower()
 
 
 @pytest.mark.parametrize("selection", [None, -1, 99, "0", 1.5, True])
 def test_apply_without_a_usable_selection_keeps_the_batch_and_writes_nothing(selection):
     """Not stale — the list is still valid, the user simply has not chosen. Prompt, not punish."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     applied = _apply(batch, selection, handlers=handlers)
     for value in applied[:13]:
         assert isinstance(value, _FakeSkip)
     assert isinstance(applied[13], _FakeSkip), "a valid list must survive a missed selection"
     assert isinstance(applied[14], _FakeSkip)
-    assert "select a candidate" in applied[15].lower()
+    assert "select a candidate" in applied[16].lower()
 
 
 @pytest.mark.parametrize("empty", [None, "", 0, [], {}])
@@ -2308,13 +2312,13 @@ def test_apply_with_no_batch_at_all_refuses_and_writes_nothing(empty):
     applied = _apply(empty, 0, handlers=handlers)
     for value in applied[:13]:
         assert isinstance(value, _FakeSkip)
-    assert "generate variants" in applied[15].lower()
+    assert "generate variants" in applied[16].lower()
 
 
 def test_apply_produces_exactly_what_a_single_generate_from_that_master_would():
     """Apply must land on the ordinary Generate output, not on something adjacent to it."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(handlers=handlers)
     candidate = batch.candidates[3]
     applied = _apply(batch, 3, handlers=handlers)
     direct = _generate(candidate.master_seed, CINEMATIC,
@@ -2356,7 +2360,10 @@ def test_only_apply_reads_the_batch_state():
                     reachable.update(_expanded_list(tree, alias))
             if "variant_batch_state" in reachable:
                 readers.append(ast.unparse(node.func))
-    assert readers == ["apply_variant_btn.click"], readers
+    # **C3-R0 makes this exactly TWO readers.** Rendering legitimately needs the stored
+    # candidates; nothing else may. Still an exact list, never a containment check.
+    assert readers == ["apply_variant_btn.click",
+                       "render_selected_variants_btn.click"], readers
 
 
 def test_the_c3_handlers_touch_no_gradio_component_directly():
@@ -2421,7 +2428,7 @@ def test_apply_never_mints_a_master_while_validating(unusable, monkeypatch):
     """
     handlers = _c3_handlers()
     root = 582913
-    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(master=root, handlers=handlers)
     assert batch.declaration.root_master_seed == root
 
     spy = _CountingRandomSeed(root)
@@ -2434,14 +2441,14 @@ def test_apply_never_mints_a_master_while_validating(unusable, monkeypatch):
         assert isinstance(value, _FakeSkip), "a refusal must change no execution widget"
     assert applied[13] is None, "the stale batch must be consumed"
     assert applied[14] == _FakeUpdate(choices=[], value=None)
-    assert "no longer describe" in applied[15].lower()
+    assert "no longer describe" in applied[16].lower()
 
 
 def test_an_unusable_live_master_is_stale_deterministically_every_time(monkeypatch):
     """Not "usually stale": the same refusal a hundred times, with the draw rigged against us."""
     handlers = _c3_handlers()
     root = 582913
-    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(master=root, handlers=handlers)
     spy = _CountingRandomSeed(root)
     monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
 
@@ -2458,7 +2465,7 @@ def test_the_two_generate_handlers_still_mint_and_surface(monkeypatch):
 
     spy = _CountingRandomSeed(minted)
     monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
-    master, batch, _t, _s, _st = _generate_batch(master=0, handlers=handlers)
+    master, batch, _t, _s, _rs, _st = _generate_batch(master=0, handlers=handlers)
     assert spy.calls == 1, "Generate Variants mints exactly once"
     assert master == minted, "and returns it to variant_master_seed"
     assert batch.declaration.root_master_seed == minted
@@ -2475,7 +2482,7 @@ def test_a_numeric_string_master_is_the_same_declaration_not_a_stale_one():
     root and Apply must succeed. The gate refuses values that are *unusable*, not values that are
     merely typed differently — a stale check that fired on re-typing would be a bug of its own."""
     handlers = _c3_handlers()
-    _master, batch, _t, _s, _st = _generate_batch(master=582913, handlers=handlers)
+    _master, batch, _t, _s, _rs, _st = _generate_batch(master=582913, handlers=handlers)
     applied = _apply(batch, 0, handlers=handlers, master="582913")
     assert not any(isinstance(v, _FakeSkip) for v in applied[:13])
     assert applied[0] == batch.candidates[0].master_seed
