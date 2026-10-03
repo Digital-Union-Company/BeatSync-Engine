@@ -405,21 +405,33 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
 - **Output identity cannot rest on the Variation Seed.** C3 deduplicates candidate *masters*
   deliberately; `CreativeRecipe.seed` is an independent draw and is not deduplicated anywhere —
   measured: root 5484 gives masters 945730 and 862920 that **both** resolve Variation Seed 536635.
-  Since the render path names its file `_seed<VariationSeed>` and `shutil.move` overwrites
-  silently, the batch derives a stem carrying the request tag, the candidate index and the
-  candidate master (`music_video_batch<tag>_c01_m609591`) and lets the existing suffix follow
-  unchanged.
-- **Batch-only hard no-overwrite.** `refuse_existing_output` is keyword-only (so the positional
-  widget list can never set it), defaults `False` so ordinary Create Music Video keeps its shipped
-  behaviour, and C3-R0 passes `True`: the exact destination is checked before Stage 1 *and* again
-  immediately before the move, and an existing file is preserved rather than replaced. The
-  pre-existing single-render overwrite is a separate latent defect, reported rather than changed
-  here.
+  Since the render path names its file `_seed<VariationSeed>`, the batch derives a stem carrying
+  the request tag, the candidate index and the candidate master
+  (`music_video_batch<tag>_c01_m609591`) and lets the existing suffix follow unchanged. **Still
+  required after H1**, for the other half of the reason: destructive replacement is now impossible,
+  so two candidates on one name would make the second *refuse*, and a batch asked for two videos
+  would deliver one. Identity is what lets both succeed; the promotion is what makes neither
+  overwritable.
+- **No special batch overwrite mode — C3-R0 inherits the universal GUI policy (H1).** C3-R0 owned
+  a keyword-only `refuse_existing_output` that defaulted `False`, so the batch checked the
+  destination before Stage 1 and again immediately before the move. That flag is **gone**, and the
+  description it carried was too strong: two `os.path.exists` checks around a `shutil.move` are a
+  TOCTOU pair — real protection against this batch's own second candidate, best-effort only
+  against another process, and never "hard". H1 replaced the promotion itself with a single
+  atomic no-replace `os.rename` shared by every GUI render, so the guarantee is now genuinely hard
+  **and** no longer batch-only. Do not reintroduce a per-caller overwrite policy: a flag
+  defaulting to the unsafe value is exactly how the ordinary single render stayed destructive
+  while the batch was safe. See `.claude/rules/gui-integration.md` and
+  `.claude/rules/pipeline-core.md`.
 - **Durable output is the success authority**, not the preview and not the status prose. A ProRes
   render moves the real `.mov` into `output/` and then returns a session-temp `_preview.mp4`, so a
   preview step failing afterwards must not retroactively fail a finished render.
   `session_state[LAST_OUTPUT_PATH_KEY]` carries it: cleared before every attempt, set only after
-  the move succeeds. Nothing parses `Output: …` out of a status string.
+  the promotion succeeds. Nothing parses `Output: …` out of a status string. Since H1 the clear
+  happens in **both** places with the same lifecycle — the gate core clears it before the gate
+  (a gate refusal never reaches the pipeline function) and `_process_video_impl` clears it for
+  itself, so "empty unless a promotion succeeded" is a local property rather than one inherited
+  from whichever caller happened to run.
 - **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
   The render boundary exposes no typed failure classification, so a batch cannot tell a
   shared-input failure (which would simply repeat) from a candidate-local one. Continue-on-failure

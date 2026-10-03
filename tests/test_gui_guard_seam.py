@@ -18,7 +18,9 @@ reading the source in ``test_gui_click_inputs_include_live_source_controls``.
 from __future__ import annotations
 
 import ast
+import errno
 import os
+import sys
 
 import pytest
 from conftest import write_file
@@ -507,32 +509,35 @@ def test_no_third_render_event_exists_outside_the_group():
     ], renderers
 
 
-def test_the_batch_only_no_overwrite_flag_cannot_arrive_positionally():
-    """`refuse_existing_output` is keyword-only on the core, so the ordinary widget list — which
-    Gradio supplies positionally — can never set it. Single render keeps today's behaviour."""
-    core = _gui_func(GATE_CORE)
-    assert [a.arg for a in core.args.kwonlyargs] == ["refuse_existing_output"]
-    default = core.args.kw_defaults[0]
-    assert isinstance(default, ast.Constant) and default.value is False
+def test_the_durable_output_key_is_cleared_before_the_gate_and_set_after_promotion():
+    """The batch reads this, so a refused render must not leave the previous path behind.
 
-    wrapper_params = [a.arg for a in _gui_func("process_video_guarded").args.args]
-    assert "refuse_existing_output" not in wrapper_params
-    assert "refuse_existing_output" not in _gui_body("process_video_guarded"), \
-        "the single render must not opt in"
-    assert "refuse_existing_output=True" in _gui_body("render_selected_variants_guarded")
-
-
-def test_the_durable_output_key_is_cleared_before_the_gate_and_set_after_the_move():
-    """The batch reads this, so a refused render must not leave the previous path behind."""
+    **Re-pointed by H1**: the authority is no longer `shutil.move` but the atomic no-replace
+    promotion helper. The lifecycle property is unchanged and now covers the single render too.
+    """
     core = _gui_body(GATE_CORE)
     impl = _gui_body("_process_video_impl")
     assert "session_state[LAST_OUTPUT_PATH_KEY] = ''" in core
     assert core.index("LAST_OUTPUT_PATH_KEY] = ''") < core.index("resolve_for_render(")
+
+    # H1: the pipeline function clears it for itself too, so "empty unless a promotion succeeded"
+    # is a local property rather than one inherited from whoever called it. The core's clear still
+    # has to exist: a gate refusal never reaches `_process_video_impl` at all.
+    assert "session_state[LAST_OUTPUT_PATH_KEY] = ''" in impl
+    assert impl.index("LAST_OUTPUT_PATH_KEY] = ''") < impl.index("os.path.exists(output_path)")
+
     assert "session_state[LAST_OUTPUT_PATH_KEY] = output_path" in impl
-    assert impl.index("shutil.move(result_path, output_path)") < \
+    assert impl.index(f"{PROMOTION_HELPER}(result_path, output_path)") < \
         impl.index("session_state[LAST_OUTPUT_PATH_KEY] = output_path")
     # and it is never the preview
     assert "LAST_OUTPUT_PATH_KEY] = preview_path" not in impl
+
+    # exactly one assignment of a real path, and it is after the promotion
+    assigns = [ast.unparse(n) for n in ast.walk(_gui_func("_process_video_impl"))
+               if isinstance(n, ast.Assign)
+               and ast.unparse(n.targets[0]) == "session_state[LAST_OUTPUT_PATH_KEY]"]
+    assert assigns == ["session_state[LAST_OUTPUT_PATH_KEY] = ''",
+                       "session_state[LAST_OUTPUT_PATH_KEY] = output_path"], assigns
 
 
 def test_the_batch_reads_candidate_values_from_recipes_not_from_the_screen():
@@ -556,47 +561,6 @@ def test_the_batch_renders_nothing_of_its_own_and_adds_no_cancellation():
     for forbidden in ("create_music_video", "analyze_beats_auto", "_process_video_impl(",
                       "cancels", "threading.Event", "stop_flag", "terminate("):
         assert forbidden not in body, f"the batch references {forbidden}"
-
-
-def test_the_batch_only_no_overwrite_is_checked_twice_and_never_overwrites():
-    """**§38 load-bearing.** `shutil.move` silently overwrites an existing destination (measured),
-    and a batch's two candidates can compute the same name — C3 guarantees unique candidate
-    *masters* but not unique `CreativeRecipe.seed`, and the render path names its file
-    `_seed<VariationSeed>`. So a batch must refuse rather than destroy what it just produced.
-
-    Two checks, deliberately: one before Stage 1 so a doomed candidate costs nothing, and one
-    immediately before the move because a render takes minutes and the file can appear meanwhile.
-    """
-    impl = _gui_body("_process_video_impl")
-    guard = "if refuse_existing_output and os.path.exists(output_path):"
-    assert impl.count(guard) == 2, "both collision checks must be present and gated by the flag"
-
-    # the first is before any analysis; the second is immediately before the move
-    first = impl.index(guard)
-    second = impl.index(guard, first + 1)
-    analysis = impl.index("analyze_beats_auto(")
-    move = impl.index("shutil.move(result_path, output_path)")
-    assert first < analysis, "refuse before Stage 1, not after paying for it"
-    assert analysis < second < move, "re-check immediately before the move"
-
-    # Neither branch deletes or replaces anything. Scoped to the `If` node rather than a text
-    # window: the second check sits immediately before `shutil.move`, so any window wide enough
-    # to hold the branch also catches the move that legitimately follows it.
-    refusals = [n for n in ast.walk(_gui_func("_process_video_impl"))
-                if isinstance(n, ast.If)
-                and ast.unparse(n.test) == "refuse_existing_output and os.path.exists(output_path)"]
-    assert len(refusals) == 2
-    for node in refusals:
-        branch = chr(10).join(ast.unparse(stmt) for stmt in node.body)
-        assert "return (None," in branch, "a collision must refuse, not continue"
-        for destructive in ("os.remove(", "shutil.rmtree(", "os.unlink(", "shutil.move("):
-            assert destructive not in branch, f"the refusal {destructive}"
-        assert not node.orelse, "no silent fallback path"
-
-    # and the ordinary single render is NOT opted in
-    core = _gui_func(GATE_CORE)
-    assert core.args.kw_defaults[0].value is False
-    assert "refuse_existing_output" not in _gui_body("process_video_guarded")
 
 
 def test_the_batch_stops_on_the_first_failed_candidate():
@@ -624,3 +588,512 @@ def test_the_batch_stops_on_the_first_failed_candidate():
     # nothing deletes an earlier candidate's output
     for destructive in ("os.remove(", "shutil.rmtree(", "os.unlink("):
         assert destructive not in body, f"the batch {destructive}"
+
+
+# ===========================================================================
+# H1: one universal GUI output policy — atomic no-replace durable promotion
+# ===========================================================================
+#
+# OLD   ordinary Create Music Video  ->  `shutil.move`, destructive, measured
+#       C3-R0 batch                  ->  two `os.path.exists` checks around the same move
+# NEW   every GUI render             ->  one atomic no-replace `os.rename`
+#
+# The two `exists()` checks were a TOCTOU pair: real protection against this app's own second
+# candidate, best-effort only against another process. H1 does not extend them — it replaces the
+# promotion primitive, so the check and the act become one operation, and it removes the opt-in
+# flag because no GUI caller ever wanted destructive replacement.
+
+#: The single GUI-owned durable promotion. Nothing else may move a render into `output/`.
+PROMOTION_HELPER = "_promote_output_no_replace"
+
+#: Every function in the GUI render chain. No overwrite-policy parameter may appear in any of them.
+RENDER_CHAIN = ("_process_video_impl", "process_video", GATE_CORE,
+                "process_video_guarded", "render_selected_variants_guarded")
+
+
+def test_no_overwrite_policy_flag_exists_anywhere_in_the_gui_render_chain():
+    """**H1 load-bearing.** Safety is not opt-in, so there is nothing to opt into.
+
+    C3-R0's `refuse_existing_output` defaulted to `False`, which is precisely how the ordinary
+    single render kept a destructive promotion while the batch was safe. With an atomic no-replace
+    primitive, overwriting is *impossible* rather than *disabled* — a boolean that re-enabled it
+    would have no implementation to switch to, and a flag defaulting to the unsafe value is a trap
+    for the next caller. Pin the absence, not a default.
+    """
+    for name in RENDER_CHAIN:
+        node = _gui_func(name)
+        assert not node.args.kwonlyargs, \
+            f"{name} grew a keyword-only argument; H1 removed the only one that existed"
+        params = [a.arg for a in node.args.args]
+        for suspicious in ("refuse_existing_output", "overwrite", "allow_overwrite",
+                           "force", "replace_existing", "no_overwrite"):
+            assert suspicious not in params, f"{name} took an overwrite-policy parameter"
+        # Docstring-stripped: the core's prose names the retired flag deliberately, to say it is
+        # gone and must not come back. Prose must not read as implementation.
+        assert "refuse_existing_output" not in _gui_body(name), \
+            f"{name} still threads the retired policy flag"
+
+    # and no call anywhere in the module passes it on
+    for call in ast.walk(_gui_tree()):
+        if isinstance(call, ast.Call):
+            assert "refuse_existing_output" not in [kw.arg for kw in call.keywords], \
+                f"{ast.unparse(call.func)} still passes the retired policy flag"
+
+
+def test_the_exact_output_path_is_checked_before_any_analysis():
+    """Refusing before Stage 1 costs nothing; refusing after Stage 5 wastes the whole run.
+
+    The check is unconditional — both wrappers reach it through the one shared core — and it must
+    sit after the final path is computed but before `analyze_beats_auto`.
+    """
+    impl = _gui_body("_process_video_impl")
+    guard = "if os.path.exists(output_path):"
+    assert guard in impl, "the universal early collision check is missing"
+
+    naming = impl.index("output_path = os.path.join(output_folder, filename)")
+    early = impl.index(guard)
+    analysis = impl.index("analyze_beats_auto(")
+    render = impl.index("create_music_video(")
+    assert naming < early < analysis < render, \
+        "check the exact final path, before Stage 1, before the renderer"
+
+    node = next(n for n in ast.walk(_gui_func("_process_video_impl"))
+                if isinstance(n, ast.If) and ast.unparse(n.test) == "os.path.exists(output_path)")
+    branch = chr(10).join(ast.unparse(stmt) for stmt in node.body)
+    assert "return (None," in branch, "a collision must refuse, not continue"
+    assert not node.orelse, "no silent fallback path"
+    for destructive in ("os.remove(", "shutil.rmtree(", "os.unlink(", "shutil.move(",
+                        "os.replace(", "os.rename("):
+        assert destructive not in branch, f"the early refusal {destructive}"
+
+
+def test_the_final_promotion_is_one_owned_no_replace_helper():
+    """One helper owns durable promotion, and the destructive primitives are gone from gui.py."""
+    impl = _gui_body("_process_video_impl")
+    assert f"promotion_error = {PROMOTION_HELPER}(result_path, output_path)" in impl
+
+    # exactly one promotion call site, and exactly one helper definition
+    source = _gui_source()
+    assert source.count(f"def {PROMOTION_HELPER}(") == 1
+    assert sum(1 for n in ast.walk(_gui_tree())
+               if isinstance(n, ast.Call) and getattr(n.func, "id", None) == PROMOTION_HELPER) == 1
+
+    # the old destructive promotion is gone from the module entirely
+    assert "shutil.move(" not in source, "shutil.move silently replaces; it must not return"
+    assert "os.replace(" not in source, "os.replace silently replaces"
+
+    # nothing else renames into the output folder
+    renames = [ast.unparse(n) for n in ast.walk(_gui_tree())
+               if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.rename"]
+    assert renames == ["os.rename(temp_output, output_path)"], renames
+
+    # a promotion failure returns a failure; it never falls through into the success path
+    failure = next(n for n in ast.walk(_gui_func("_process_video_impl"))
+                   if isinstance(n, ast.If) and ast.unparse(n.test) == "promotion_error")
+    assert "return (None, promotion_error, session_state)" in ast.unparse(failure)
+    assert not failure.orelse
+
+
+def test_the_promotion_helper_removes_nothing_and_has_no_copy_fallback():
+    """**Fail closed.** No destination is ever deleted to make room, and a cross-volume
+    destination is refused rather than copied: a copy is not atomic, and an interrupted one would
+    leave a partial video at the final path, which reads as a finished render."""
+    body = _gui_body(PROMOTION_HELPER)
+    for forbidden in ("os.remove(", "os.unlink(", "shutil.rmtree(", "shutil.move(",
+                      "shutil.copy", "shutil.copyfile", "os.replace(", "open(",
+                      "subprocess"):
+        assert forbidden not in body, f"the promotion helper uses {forbidden}"
+    calls = [ast.unparse(n.func) for n in ast.walk(_gui_func(PROMOTION_HELPER))
+             if isinstance(n, ast.Call)]
+    assert "os.rename" in calls, "the helper must promote with the no-replace primitive"
+    assert "os.path.exists" not in calls, \
+        "a pre-check inside the helper would re-open the race the rename closes"
+
+
+def test_the_promotion_is_not_preceded_by_an_exists_check():
+    """The rename IS the authority. `exists()` then `rename()` would be the old TOCTOU pair with
+    a new primitive — correct-looking and still racy."""
+    body = _gui_body("_process_video_impl")
+    between = body[body.index("create_music_video("):body.index("promotion_error = ")]
+    assert "os.path.exists(output_path)" not in between, \
+        "a second exists() check reappeared immediately before the promotion"
+    # exactly one exists() check against the final path survives: the early one
+    assert body.count("os.path.exists(output_path)") == 1
+
+
+def test_prores_preview_is_generated_only_after_a_successful_promotion():
+    """A ProRes render's durable artifact is the `.mov`; the `_preview.mp4` is a session temp.
+
+    Order is the contract: promote, record the durable path, *then* build the preview. A refused
+    or failed promotion must produce no preview at all — there is no durable file to preview, and
+    the one already on disk belongs to a render the user owns.
+    """
+    impl = _gui_body("_process_video_impl")
+    promotion = impl.index(f"{PROMOTION_HELPER}(result_path, output_path)")
+    refusal = impl.index("return (None, promotion_error, session_state)")
+    durable = impl.index("session_state[LAST_OUTPUT_PATH_KEY] = output_path")
+    preview_branch = impl.index("if is_prores:")
+    preview_run = impl.index("subprocess.run(preview_cmd")
+    assert promotion < refusal < durable < preview_branch < preview_run
+
+    # and the preview filename semantics are untouched
+    assert "preview_filename = f'{name}_{timestamp}_preview.mp4'" in impl
+    assert "preview_path = os.path.join(session_dir, preview_filename)" in impl
+
+
+def test_the_ordinary_filename_contract_is_unchanged():
+    """H1 changes *where a file may land*, never *what it is called*. No auto-rename, no counter.
+
+    Scoped to the statements that actually build the name — a substring sweep over the whole
+    function matches innocent things like `time.perf_counter()`.
+    """
+    impl = _gui_body("_process_video_impl")
+    assert "filename = f'{name}_{timestamp}{creative.filename_suffix()}{ext}'" in impl
+    assert "ext = '.mov' if is_prores else '.mp4'" in impl
+
+    node = _gui_func("_process_video_impl")
+    naming = [ast.unparse(n) for n in ast.walk(node)
+              if isinstance(n, ast.Assign)
+              and ast.unparse(n.targets[0]) in ("filename", "ext", "output_path", "timestamp")]
+    assert naming == [
+        "ext = '.mov' if is_prores else '.mp4'",
+        "timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')",
+        "filename = f'{name}_{timestamp}{creative.filename_suffix()}{ext}'",
+        "output_path = os.path.join(output_folder, filename)",
+    ], naming
+    for invented in ("uuid", "itertools.count", "counter", "random", "_2", "_3"):
+        assert not any(invented in stmt for stmt in naming), f"the output name gained {invented}"
+
+    # and nothing searches for a free name
+    assert not [n for n in ast.walk(node) if isinstance(n, ast.While)], \
+        "a retry loop around the output name is auto-rename by another name"
+
+
+# ---------------------------------------------------------------------------
+# The REAL promotion helper, executed against controlled OS behaviour
+# ---------------------------------------------------------------------------
+#
+# Portability (CLAUDE.md's hard rule, and §20 of the H1 authorization): Windows `os.rename` refuses
+# an existing destination, POSIX `rename(2)` replaces it silently. Asserting the real platform's
+# semantics unconditionally would make this suite Windows-only. So these cases stub `os.rename` and
+# prove the helper's *handling* of each outcome; the real Windows primitive is measured separately
+# at the end, behind a skip.
+
+
+class _OsShim:
+    """The real `os`, with `rename` replaced. Everything else passes straight through."""
+
+    def __init__(self, rename):
+        self.rename = rename
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+def _load_promotion_helper(rename):
+    """Execute the REAL `_promote_output_no_replace` body from `gui.py` over a controlled `os`."""
+    node = _gui_func(PROMOTION_HELPER)
+    namespace = {"os": _OsShim(rename), "errno": errno}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<gui>", "exec"), namespace)
+    return namespace[PROMOTION_HELPER]
+
+
+def _no_replace_rename(src, dst):
+    """A portable stand-in for the Windows no-replace rename the app depends on.
+
+    Itself a check-then-act, which is exactly why it is only ever a *test* stand-in: what these
+    cases verify is the helper's handling of each outcome, not the primitive's atomicity. The real
+    primitive is measured on Windows below, and in task scratch during acceptance.
+    """
+    if os.path.exists(dst):
+        raise FileExistsError(errno.EEXIST, "File exists")
+    os.rename(src, dst)
+
+
+def _exdev_rename(src, dst):
+    raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+
+def test_the_helper_promotes_and_reports_success_when_the_destination_is_free(tmp_path):
+    promote = _load_promotion_helper(_no_replace_rename)
+    temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
+    dest = str(tmp_path / "out" / "clip.mp4")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+    assert promote(temp, dest) == "", "success is the empty string, never prose"
+    assert open(dest, "rb").read() == b"NEW"
+    assert not os.path.exists(temp), "a successful promotion consumes the temp"
+
+
+def test_the_helper_refuses_a_collision_and_preserves_both_files(tmp_path):
+    promote = _load_promotion_helper(_no_replace_rename)
+    temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
+    dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
+
+    message = promote(temp, dest)
+    assert message, "a collision must report failure"
+    assert open(dest, "rb").read() == b"OLD", "the existing durable output was replaced"
+    assert open(temp, "rb").read() == b"NEW", "the new render was discarded"
+    assert dest in message and temp in message, \
+        "the message must name both the occupied destination and the retained render"
+    assert "preserved" in message.lower()
+
+
+def test_the_helper_fails_closed_on_a_cross_volume_destination(tmp_path):
+    """**No copy fallback.** EXDEV is a refusal, not a slower route to the same place."""
+    promote = _load_promotion_helper(_exdev_rename)
+    temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
+    dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
+
+    message = promote(temp, dest)
+    assert message
+    assert open(dest, "rb").read() == b"OLD", "the destination was touched"
+    assert open(temp, "rb").read() == b"NEW", "the temp render must be retained"
+    assert temp in message and dest in message
+    assert "volume" in message.lower()
+
+
+def test_the_helper_fails_closed_on_any_other_os_error(tmp_path):
+    """A permission error is still a failure, never an apparent success."""
+    def denied(src, dst):
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    promote = _load_promotion_helper(denied)
+    temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
+    dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
+
+    message = promote(temp, dest)
+    assert message
+    assert open(dest, "rb").read() == b"OLD"
+    assert open(temp, "rb").read() == b"NEW"
+    assert temp in message
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="no-replace rename is a Windows guarantee; POSIX rename(2) replaces")
+def test_the_real_windows_rename_refuses_an_existing_destination(tmp_path):
+    """The platform primitive the whole guarantee rests on, measured rather than assumed.
+
+    This is the one case that cannot be portable: it asserts that *this* OS refuses. It skips
+    cleanly elsewhere, so the bare-CPython suite contract survives.
+    """
+    promote = _load_promotion_helper(os.rename)
+
+    free_temp = write_file(str(tmp_path / "s" / "a.mp4"), b"NEW")
+    free_dest = str(tmp_path / "o" / "a.mp4")
+    os.makedirs(os.path.dirname(free_dest), exist_ok=True)
+    assert promote(free_temp, free_dest) == ""
+    assert open(free_dest, "rb").read() == b"NEW"
+    assert not os.path.exists(free_temp)
+
+    occupied_temp = write_file(str(tmp_path / "s" / "b.mp4"), b"NEW")
+    occupied_dest = write_file(str(tmp_path / "o" / "b.mp4"), b"OLD")
+    message = promote(occupied_temp, occupied_dest)
+    assert message, "real Windows os.rename did not refuse an existing destination"
+    assert open(occupied_dest, "rb").read() == b"OLD"
+    assert open(occupied_temp, "rb").read() == b"NEW"
+
+
+# ---------------------------------------------------------------------------
+# The REAL `_process_video_impl`, executed end to end over a scratch filesystem
+# ---------------------------------------------------------------------------
+#
+# The structural tests above pin where the check and the promotion sit. These prove what actually
+# happens to real bytes on disk — collision before the render, collision that appears *during* the
+# render, a clean promotion, and a cross-volume failure — by AST-extracting the real function and
+# executing it against a synthesised module namespace. Nothing about the collision policy is
+# reimplemented here; only the 30-odd runtime globals `gui.py` would have supplied are stubbed, and
+# `analyze_beats_auto` / `create_music_video` are instrumented so "no expensive work began" is a
+# measured call count rather than an inference.
+
+
+class _StubAudioMixdown:
+    AudioMixError = type("AudioMixError", (Exception,), {})
+
+    @staticmethod
+    def discard_master(path):
+        return None
+
+
+def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
+    """The real module globals `_process_video_impl` closes over, stubbed at the runtime edge."""
+    import beatsync_fork.audio_mix as fork_audio_mix
+    import beatsync_fork.creative as fork_creative
+    import beatsync_fork.smart_mix as fork_smart_mix
+
+    out_dir = str(tmp_path / "output")
+    os.makedirs(out_dir, exist_ok=True)
+
+    def analyze_beats_auto(*args, **kwargs):
+        calls.append("analyze_beats_auto")
+        return [0.0, 1.0, 2.0], {
+            "times": [0.0, 1.0, 2.0], "audio_duration": 2.0, "tempo": 120.0,
+            "selection_info": [], "video_analysis": None, "sections": None,
+        }
+
+    def create_music_video(*args, output_file, **kwargs):
+        calls.append("create_music_video")
+        with open(output_file, "wb") as handle:
+            handle.write(b"NEW")
+        if dest_appears_during_render:
+            # Another process (or a second candidate of this batch) takes the destination while
+            # this render is in flight — the whole reason the promotion must decide atomically.
+            with open(os.path.join(out_dir, os.path.basename(output_file)), "wb") as handle:
+                handle.write(b"OLD")
+        return output_file
+
+    return {
+        "os": _OsShim(rename), "errno": errno,
+        "datetime": __import__("datetime"), "time": __import__("time"),
+        "tempfile": __import__("tempfile"), "subprocess": __import__("subprocess"),
+        "fork_creative": fork_creative, "fork_audio_mix": fork_audio_mix,
+        "fork_smart_mix": fork_smart_mix, "audio_mixdown": _StubAudioMixdown,
+        "analyze_beats_auto": analyze_beats_auto, "create_music_video": create_music_video,
+        "get_output_dir": lambda: out_dir,
+        "get_video_fps": lambda path: 30.0,
+        "get_success_message_auto": lambda *a, **k: "✅ rendered",
+        "_scale_diagnostics_block": lambda *a, **k: "",
+        "_stage5_summary": lambda *a, **k: None,
+        "_stage6_summary": lambda *a, **k: None,
+        "_stage_status": lambda stage: f"Stage {stage}",
+        "set_gpu_mode": lambda enabled: None,
+        "GRADIO_TEMP_DIR": str(tmp_path / "gradio_uploads"),
+        "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
+        "SMART_MIX_REPORT_KEY": "smart_mix_report",
+        "LAST_OUTPUT_PATH_KEY": "last_output_path",
+        "PARALLEL_WORKERS": 1, "CPU_COUNT": 1, "MAX_THREADS": 1,
+        "GPU_AVAILABLE": False, "NVENC_AVAILABLE": False, "GPU_INFO": {"name": "cpu"},
+        "USING_PORTABLE_PYTHON": False, "USING_PORTABLE_CUDA": False, "USING_CUPY_CTK": False,
+        "FFMPEG_PATH": "ffmpeg",
+    }
+
+
+def _run_real_impl(tmp_path, *, existing_dest=None, rename=None,
+                   dest_appears_during_render=False):
+    """Run the REAL `_process_video_impl` over scratch files; return its result plus a call log."""
+    calls = []
+    namespace = _impl_namespace(tmp_path, calls, rename=rename or _no_replace_rename,
+                                dest_appears_during_render=dest_appears_during_render)
+    nodes = [n for n in _gui_tree().body
+             if isinstance(n, ast.FunctionDef)
+             and n.name in {"_as_existing_source_path", "_as_existing_source_paths",
+                            PROMOTION_HELPER, "_process_video_impl"}]
+    assert len(nodes) == 4, [n.name for n in nodes]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<gui>", "exec"), namespace)
+
+    session_dir = str(tmp_path / "session")
+    os.makedirs(session_dir, exist_ok=True)
+    out_dir = str(tmp_path / "output")
+    audio = write_file(str(tmp_path / "src" / "track.wav"), b"audio")
+    clip = write_file(str(tmp_path / "src" / "a.mp4"), b"clip")
+
+    if existing_dest is not None:
+        # The exact name the impl will compute, so this is a real collision rather than a guess.
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+        write_file(os.path.join(out_dir, f"music_video_{stamp}.mp4"), existing_dest)
+
+    state = {"session_dir": session_dir}
+    result = namespace["_process_video_impl"](
+        audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
+        processing_mode="cpu", custom_fps=30.0, creative=None, session_state=state,
+    )
+    produced = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+    return result, calls, produced, session_dir, out_dir
+
+
+def test_an_existing_output_is_refused_before_any_expensive_work(tmp_path):
+    """**§23.** The destination is occupied, so Stage 1 must never start and OLD must survive."""
+    (preview, status, state), calls, produced, _session, out_dir = _run_real_impl(
+        tmp_path, existing_dest=b"OLD")
+
+    assert calls == [], f"expensive work began despite an occupied destination: {calls}"
+    assert preview is None
+    assert "already exists" in status and "preserved" in status
+    assert len(produced) == 1, produced
+    assert open(os.path.join(out_dir, produced[0]), "rb").read() == b"OLD", \
+        "the user's existing output was replaced"
+    assert state["last_output_path"] == "", "a refusal must not record a durable output"
+
+
+def test_a_destination_that_appears_during_the_render_is_not_overwritten(tmp_path):
+    """**§23 / §13.** Free before Stage 1, occupied by promotion time: preserve OLD, keep NEW."""
+    (preview, status, state), calls, produced, session_dir, out_dir = _run_real_impl(
+        tmp_path, dest_appears_during_render=True)
+
+    assert calls == ["analyze_beats_auto", "create_music_video"], calls
+    assert preview is None
+    assert len(produced) == 1, produced
+    destination = os.path.join(out_dir, produced[0])
+    assert open(destination, "rb").read() == b"OLD", "the file that appeared was overwritten"
+
+    retained = [f for f in os.listdir(session_dir) if f.endswith(".mp4")]
+    assert len(retained) == 1, f"the new render was not retained: {os.listdir(session_dir)}"
+    assert open(os.path.join(session_dir, retained[0]), "rb").read() == b"NEW"
+
+    assert destination in status and os.path.join(session_dir, retained[0]) in status, \
+        "the failure must name both the occupied destination and the retained render"
+    assert state["last_output_path"] == ""
+
+
+def test_a_clean_promotion_moves_the_render_and_records_it(tmp_path):
+    """The ordinary success path still works, and the temp is consumed rather than duplicated."""
+    (preview, status, state), calls, produced, session_dir, out_dir = _run_real_impl(tmp_path)
+
+    assert calls == ["analyze_beats_auto", "create_music_video"]
+    assert len(produced) == 1, produced
+    destination = os.path.join(out_dir, produced[0])
+    assert open(destination, "rb").read() == b"NEW"
+    assert not [f for f in os.listdir(session_dir) if f.endswith(".mp4")], \
+        "a successful promotion must consume the temp, not copy it"
+    assert state["last_output_path"] == destination
+    assert preview == destination
+    assert status.startswith("✅")
+    # the shipped filename contract, unchanged
+    assert produced[0].startswith("music_video_") and produced[0].endswith(".mp4")
+    assert "_seed" not in produced[0], "seed 0 keeps today's name exactly"
+
+
+def test_a_cross_volume_destination_fails_closed_without_copying(tmp_path):
+    """**§11.** No copy fallback: an interrupted copy would leave a partial video at the final
+    path, which looks like a finished render. Refuse, retain, report."""
+    (preview, status, state), calls, produced, session_dir, _out = _run_real_impl(
+        tmp_path, rename=_exdev_rename)
+
+    assert calls == ["analyze_beats_auto", "create_music_video"]
+    assert preview is None
+    assert produced == [], f"a copy fallback wrote to the output folder: {produced}"
+    retained = [f for f in os.listdir(session_dir) if f.endswith(".mp4")]
+    assert len(retained) == 1 and \
+        open(os.path.join(session_dir, retained[0]), "rb").read() == b"NEW"
+    assert "volume" in status.lower()
+    assert state["last_output_path"] == ""
+
+
+def test_a_variation_seed_still_names_its_own_file(tmp_path):
+    """Sanity that the collision work did not disturb the Phase A suffix contract."""
+    import beatsync_fork.creative as fork_creative
+
+    calls = []
+    namespace = _impl_namespace(tmp_path, calls, rename=_no_replace_rename,
+                                dest_appears_during_render=False)
+    nodes = [n for n in _gui_tree().body
+             if isinstance(n, ast.FunctionDef)
+             and n.name in {"_as_existing_source_path", "_as_existing_source_paths",
+                            PROMOTION_HELPER, "_process_video_impl"}]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<gui>", "exec"), namespace)
+
+    session_dir = str(tmp_path / "session")
+    os.makedirs(session_dir, exist_ok=True)
+    audio = write_file(str(tmp_path / "src" / "track.wav"), b"audio")
+    clip = write_file(str(tmp_path / "src" / "a.mp4"), b"clip")
+    profile = fork_creative.CreativeProfile.from_widgets(
+        seed=381944, cut_density=50, energy_response=50, motion_bias=50,
+        source_diversity=50, micro_cuts=50, semantic_emphasis=50)
+
+    namespace["_process_video_impl"](
+        audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
+        processing_mode="cpu", custom_fps=30.0, creative=profile,
+        session_state={"session_dir": session_dir})
+
+    produced = os.listdir(str(tmp_path / "output"))
+    assert len(produced) == 1 and produced[0].endswith("_seed381944.mp4"), produced

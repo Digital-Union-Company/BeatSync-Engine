@@ -172,8 +172,15 @@ def test_identical_variation_seeds_still_produce_distinct_stems():
     C3 deduplicates candidate *masters* deliberately; `CreativeRecipe.seed` is an independent draw
     per master and is not deduplicated anywhere. Scanning real batches found root 5484, where
     masters 945730 and 862920 both resolve Variation Seed 536635. The existing render path names
-    its file `_seed<VariationSeed>`, and `shutil.move` overwrites silently — so two such candidates
-    rendered in the same second would destroy one another's output if identity rested on that seed.
+    its file `_seed<VariationSeed>`, so two such candidates rendered in the same second would
+    compute one identical destination if identity rested on that seed.
+
+    **Re-stated after H1, and still required.** Under C3-R0 the render promoted with `shutil.move`
+    and a collision meant one candidate silently *destroying* the other's video. H1 made GUI
+    promotion an atomic no-replace `os.rename`, so that destruction can no longer happen — but a
+    collision now makes the second candidate legitimately *refuse*, and a batch asked for two
+    videos would deliver one. Equal Variation Seeds must therefore still yield distinct candidate
+    stems, so both selected renders can coexist and succeed.
     """
     stems = {
         rb.candidate_output_stem("music_video", TAG, index, master)

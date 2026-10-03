@@ -120,6 +120,35 @@ cache scan are legitimately repeated per candidate — Stage 4 and Stage 6 must 
 because Cut Density and Micro Cuts vary — and hoisting them would mean splitting
 `analyze_beats_auto`, which is not worth a constant saving against render minutes.
 
+## Durable output promotion depends on Windows `os.rename` semantics (H1)
+
+A GUI render writes into `session_dir` and is only durable once it reaches `output/`. That final
+step is `gui._promote_output_no_replace()`, and it is **one** `os.rename` — deliberately the whole
+mechanism, not a check wrapped around a move:
+
+```
+os.rename, destination free       -> promotes
+os.rename, destination exists     -> FileExistsError (WinError 183), BOTH files intact   [measured]
+os.rename, different volume       -> OSError errno 18 / WinError 17, nothing written     [measured]
+shutil.move, destination exists   -> REPLACES it silently                                [measured]
+```
+
+**This is a Windows guarantee and nothing else.** POSIX `rename(2)` replaces the destination
+silently, so the same code on Linux would have the defect it was written to fix. That is acceptable
+here only because the app is Windows-only by construction (`.claude/rules/platform-and-packaging.md`
+— `.exe` paths, `CREATE_NO_WINDOW`, `chcp 65001`, the PowerShell installer, the patched embedded
+`._pth`). Record the dependency rather than pretending it is portable, and if this project ever
+grows a non-Windows target, this promotion is one of the first things that must be revisited.
+
+The portable test suite therefore **stubs `os.rename`** and asserts how the helper *handles* each
+outcome; one Windows-only case asserts the real primitive and skips cleanly elsewhere, so
+CLAUDE.md's bare-CPython contract survives.
+
+Do not "improve" this into `os.replace`, `shutil.move`, a delete-then-rename, or an EXDEV copy
+fallback. The first three replace silently, and a copy is not atomic — an interrupted one leaves a
+partial video at the final path, which reads as a finished render. Cross-volume **fails closed**:
+destination untouched, temp retained and named in the message, `LAST_OUTPUT_PATH_KEY` empty.
+
 ## The frame-lock invariant
 
 The whole sync story rests on `video_processor.build_frame_aligned_cut_timeline()`: **absolute** cut

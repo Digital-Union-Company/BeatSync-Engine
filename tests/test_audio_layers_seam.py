@@ -1583,9 +1583,18 @@ def test_the_public_wrapper_keeps_its_positional_gradio_contract():
     assert params[0] == "audio_file"
     assert inputs[1:] == params[1:], "Gradio passes positionally; the two are one contract"
 
-    # the batch-only flag can never arrive from that positional list
-    assert [a.arg for a in func(GATE_CORE).args.kwonlyargs] == ["refuse_existing_output"]
+    # [H1] The core takes no overwrite-policy argument at all, from this list or anywhere else.
+    #
+    # C3-R0 pinned the weaker property: `refuse_existing_output` existed but was keyword-only, so
+    # the positional widget list could not reach it. That left ordinary Create Music Video on the
+    # destructive default. H1 removed the flag and gave both wrappers one universal non-overwrite
+    # promotion, so the thing to pin now is the *absence* — a keyword-only argument reappearing on
+    # the core is the shape a per-caller overwrite policy would take.
+    assert func(GATE_CORE).args.kwonlyargs == []
     assert "refuse_existing_output" not in params
+    for name in ("process_video_guarded", "render_selected_variants_guarded", GATE_CORE):
+        assert "refuse_existing_output" not in body_source(name), \
+            f"{name} still threads a per-caller overwrite policy"
 
 
 def test_the_batch_event_writes_neither_diagnostic_panel():
