@@ -63,6 +63,10 @@ _install_windows_asyncio_connection_reset_filter()
 
 from logger import (
     setup_environment,
+    # [FORK] Digital-Union (AI Director V1): the one general root-path constant. The Director's
+    # llama.cpp binary and GGUF live under it, resolved HERE in the GUI — the pure Director module
+    # owns no filesystem path, and the Stage-5 worker is deliberately not imported for its paths.
+    ROOT_DIR,
     USING_PORTABLE_PYTHON, USING_PORTABLE_CUDA, USING_CUPY_CTK, FFMPEG_FOUND
 )
 
@@ -149,6 +153,14 @@ from beatsync_fork import variant_batch as fork_batch
 # supplies the request tag and performs every side effect. `variant_batch` stays generation and
 # comparison state and knows nothing about rendering — its own guard enforces that.
 from beatsync_fork import render_batch as fork_render_batch
+# [FORK] Digital-Union (AI Director V1): a SECOND producer of the existing visual `CreativeRecipe`,
+# not a new render pipeline. The schema, both prompts, the strict machine-response parser, the
+# explanation policy, the `DirectorProposal` record and its read-out all live in
+# src/beatsync_fork/director.py (stdlib-only, Gradio-free, no subprocess, no model path, no clock,
+# no randomness). This module performs the one bounded text-only llama.cpp invocation, mints the
+# Variation Seed through the existing `variation.random_seed()`, and writes the proposal into the
+# visible execution controls only when the user presses Apply. It renders nothing.
+from beatsync_fork import director as fork_director
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
 # src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
@@ -182,6 +194,33 @@ AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 #: the worker thread must never touch a Gradio component, so the text rides on `session_state` and
 #: the generator projects it onto the widget. Pure diagnostics: nothing downstream reads it.
 SMART_MIX_REPORT_KEY = 'smart_mix_report'
+
+# [FORK] Digital-Union (AI Director V1): the Director's runtime assets.
+#
+# The SAME installed GGUF Stage 5 uses, invoked **text-only** — no `mmproj` is loaded and no image
+# argument is passed, because the Director V1 is media-blind by design. Stage 5's worker is
+# deliberately NOT reused: it exists to batch frames through a persistent `llama-server` and to
+# write a semantic response file, which is a different contract from one bounded 320-token JSON
+# answer. Reusing it would have meant teaching a media-semantics worker about creative intent —
+# exactly the leak `.claude/rules/stage5-worker.md` forbids.
+#
+# Resolved from the one general `ROOT_DIR` constant rather than from `video_analysis` or the
+# worker's own module constants, so obtaining a path costs no import of either: the Director has no
+# business reaching into Stage 5, in any direction. No environment override, for the reason the
+# Stage-5 recovery constants are hard-coded too — a result-affecting knob belongs under contract.
+DIRECTOR_LLAMA_DIR = os.path.join(ROOT_DIR, 'bin', 'llama-bin-win-vulkan-x64')
+#: **`llama-completion.exe`, not `llama-cli.exe`, and that is measured rather than preferred.** On
+#: the installed llama.cpp build (`b9842-6f4f53f2b`) `llama-cli` is the interactive chat front end:
+#: it *rejects* `-no-cnv` outright ("--no-conversation is not supported by llama-cli / please use
+#: llama-completion instead"), ignores `--no-display-prompt`, and prints its banner, its command
+#: list, the echoed prompt and a timings line **into stdout** alongside the answer. Parsing that
+#: would mean fishing a `{...}` out of tool prose with a regex, which is exactly what the Director's
+#: strict parser exists to refuse. `llama-completion.exe` ships in the same `bin` layout, is the
+#: binary llama-cli itself names, takes every argument below, and emits the JSON object alone on
+#: stdout with the banner, the logs and the timings on stderr. Same build, same model asset, same
+#: one-shot process — only a correctly-chosen entry point.
+DIRECTOR_LLAMA_EXE = os.path.join(DIRECTOR_LLAMA_DIR, 'llama-completion.exe')
+DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'Qwen3VL-2B-Instruct-Q8_0.gguf')
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -1219,6 +1258,188 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
     """
     return fork_presets.matching_preset((cut_density, micro_cuts, semantic_emphasis,
                                          energy_response, motion_bias, source_diversity))
+
+
+# [FORK] Digital-Union (AI Director V1): two thin handlers, and the asymmetry between them IS the
+# product.
+#
+#   Generate Proposal  runs one bounded text-only model invocation and writes **no execution
+#                      widget at all** — only the proposal state, the read-out and the status. So
+#                      generating cannot change the render, and a user who dislikes a proposal
+#                      simply never applies it. `GENERATING_IS_NOT_APPLYING` is structural here,
+#                      exactly as it is for `generate_variants_btn`.
+#
+#   Apply Proposal     writes the existing Variation Seed, the six creative sliders and the preset
+#                      label — and nothing else. No audio widget, no source widget, no Variant Lab
+#                      master seed, no batch state, no render.
+#
+# Neither renders, neither reads the current sliders, and neither touches a source, preparation or
+# render widget. `director_proposal_state` has exactly one reader: `apply_director_btn.click`.
+
+#: How many execution widgets Apply writes: the Variation Seed, the six sliders, the preset label.
+#: Deliberately a derived count rather than a literal 8, so adding a creative control moves it.
+_DIRECTOR_APPLY_OUTPUT_COUNT = 2 + len(fork_presets.CREATIVE_CONTROL_FIELDS)
+
+
+def _director_apply_skips() -> Tuple:
+    """`gr.skip()` for every execution widget — a refusal changes none of them."""
+    return tuple(gr.skip() for _ in range(_DIRECTOR_APPLY_OUTPUT_COUNT))
+
+
+def _director_apply_outputs(proposal) -> Tuple:
+    """Project one proposal onto the widgets the Director is allowed to write.
+
+    Ordered to match the `outputs` list: the Variation Seed, the six sliders in
+    `CREATIVE_CONTROL_FIELDS` order, then the preset label.
+
+    `_variant_apply_outputs` is deliberately **not** reused. It is the right projection for Variant
+    Lab and the wrong one here: it also writes the Variant Lab Master Seed (generator provenance
+    the Director never had), the three `AudioRecipe` levels (which Director V1 does not generate)
+    and the lab's own report. Reusing it would have made the Director claim audio values it never
+    produced. What *is* shared is the semantic helper that matters —
+    `fork_presets.matching_preset` — so there is still exactly one preset-label path.
+
+    The label is computed explicitly because programmatic slider writes do not fire the sliders'
+    `.input()` handlers; without it the selector would keep claiming whatever preset the user was
+    on before. The Director never emits a preset name of its own: a label is a read-out of six
+    numbers, so it is derived from them here rather than guessed by a model.
+    """
+    recipe = proposal.recipe
+    values = tuple(getattr(recipe, field)
+                   for field in fork_presets.CREATIVE_CONTROL_FIELDS)
+    return (recipe.seed,) + values + (fork_presets.matching_preset(values),)
+
+
+def _run_director_model(instruction: str) -> Tuple[str, str]:
+    """One bounded, one-shot, text-only `llama-completion` invocation. Returns `(stdout, failure)`.
+
+    Exactly one of the two is non-empty. Every failure path produces a Director status message and
+    leaves the caller with nothing to apply.
+
+    **One process per proposal, and no server lifecycle.** No `llama-server`, no port, no readiness
+    polling, no persistent model process and no session — a proposal is a single `subprocess.run`
+    that exits, which is dramatically less new runtime architecture than managing a server for an
+    interactive one-shot answer. There is no chat history either, and that is structural: the
+    process dies after one turn, so there is nothing to carry.
+
+    **`-cnv -st` rather than `-no-cnv`, and this is measured.** `-cnv` is what applies the model's
+    own chat template; `-st` runs exactly one turn and exits (non-interactively, because the turn
+    is predefined by `-p`). Raw completion mode skips the template, and on an *Instruct* model that
+    is not a small difference: measured over five intents, `-no-cnv` collapsed every control to 0
+    or 1 and rambled past the token budget, while `-cnv -st` produced coherent, well-separated
+    recipes — e.g. `20/10/70/60/30/50` for a cinematic intention against `100/100/50/100/50/50` for
+    an aggressive one. The retained P0 probes could not distinguish the two: the server probe went
+    through `/v1/chat/completions` (template applied) and the `llama-cli` probe's `-no-cnv` was
+    silently rejected by the binary, so both measured template-applied output while one of them
+    *looked* like a raw-completion result. Do not "simplify" this back to `-no-cnv`.
+
+    `--no-display-prompt` keeps the echoed prompt out of stdout, `--no-perf` and `-co off` keep
+    timings and ANSI colour out of it, and `--json-schema` is defence in depth behind
+    `director.parse_model_payload`, which remains the authority. No image argument and no `mmproj`:
+    the Director is media-blind.
+    """
+    env = dict(os.environ)
+    env['PATH'] = DIRECTOR_LLAMA_DIR + os.pathsep + env.get('PATH', '')
+    command = [
+        DIRECTOR_LLAMA_EXE,
+        '-m', DIRECTOR_MODEL,
+        '-ngl', '99',
+        '-c', str(fork_director.CONTEXT_TOKENS),
+        '-n', str(fork_director.MAX_NEW_TOKENS),
+        '-cnv',
+        '-st',
+        '--no-display-prompt',
+        '--no-perf',
+        '-co', 'off',
+        '--temp', str(fork_director.TEMPERATURE),
+        '--top-k', str(fork_director.TOP_K),
+        '-sys', fork_director.system_prompt(),
+        '-p', fork_director.user_prompt(instruction),
+        '--json-schema', fork_director.model_schema_json(),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=DIRECTOR_LLAMA_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            # Bounded, always. `subprocess.run` kills the child and reaps it before raising, so a
+            # timeout leaves no model process behind — which is why this is `run` with a timeout
+            # rather than a `Popen` the handler would have to police itself.
+            timeout=fork_director.TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    except subprocess.TimeoutExpired:
+        return '', fork_director.STATUS_TIMEOUT
+    except OSError as exc:
+        return '', fork_director.launch_failure_status(exc)
+    if completed.returncode != 0:
+        return '', fork_director.exit_failure_status(completed.returncode, completed.stderr)
+    return completed.stdout or '', ''
+
+
+def _on_generate_director_proposal(director_instruction) -> Tuple:
+    """Turn one instruction into a reviewable proposal. Writes no execution widget.
+
+    Its only input is the instruction: the Director deliberately does not read the Variation Seed,
+    the six sliders, the preset, the Variant Lab state or anything else on screen, so the sentence
+    is interpreted as an absolute editing intention rather than as a transformation of the current
+    settings. There is no cache and no history either — every press is independent.
+
+    **The seed is minted last, and only for a valid payload (the ordering is the contract).**
+    Strict six-control validation happens first, and the mint is the existing
+    `fork_variation.random_seed()` — the one implementation every seed in this application comes
+    from, called here in the GUI because the pure Director owns no randomness. Minting before
+    validation would have turned a malformed response into a plausible-looking half proposal,
+    which is the exact outcome `CreativeRecipe`'s all-or-nothing boundary exists to prevent.
+
+    Outputs: the proposal state, the read-out, the status. A failure clears the state rather than
+    leaving the previous proposal behind a status line that contradicts it.
+    """
+    instruction = fork_director.normalize_instruction(director_instruction)
+    if not instruction:
+        return None, '', fork_director.STATUS_NO_INSTRUCTION
+
+    for required in (DIRECTOR_LLAMA_EXE, DIRECTOR_MODEL):
+        if not os.path.isfile(required):
+            return None, '', fork_director.missing_runtime_status(required)
+
+    stdout, failure = _run_director_model(instruction)
+    if failure:
+        return None, '', failure
+
+    payload = fork_director.parse_model_payload(stdout)
+    if payload is None:
+        return None, '', fork_director.STATUS_INVALID_PAYLOAD
+
+    proposal = fork_director.build_proposal(
+        instruction, payload, fork_variation.random_seed())
+    if proposal is None:
+        return None, '', fork_director.STATUS_INVALID_PAYLOAD
+
+    return proposal, proposal.display_text(), fork_director.ready_status(proposal)
+
+
+def _on_apply_director_proposal(director_proposal_state) -> Tuple:
+    """Write the reviewed proposal into the existing execution controls — or change nothing.
+
+    Reads **only** the proposal state. There is deliberately no stale-declaration gate here, and
+    that is a difference from Variant Lab's Apply rather than an omission: that gate exists because
+    a candidate describes a *base* the screen may have moved away from, whereas a Director proposal
+    is an absolute set of seven values that is as valid now as when it was generated. So the state
+    survives an apply and the same explicit proposal may be re-applied after manual experiments.
+    Do not add Apply-staleness semantics here, and do not weaken Variant Lab's.
+
+    Nothing is rendered, and no audio widget, source widget, preparation widget, Variant Lab master
+    seed, batch state or report is written.
+    """
+    proposal = director_proposal_state
+    if not isinstance(proposal, fork_director.DirectorProposal):
+        return _director_apply_skips() + (fork_director.STATUS_NOTHING_TO_APPLY,)
+    return _director_apply_outputs(proposal) + (fork_director.applied_status(proposal),)
 
 
 # [FORK] Digital-Union (Variant Lab V1 / C2; audio half added by Variant Lab Audio / E2 V1): the
@@ -2371,6 +2592,14 @@ def create_ui() -> gr.Blocks:
         # `VariantBatch` of plain ints, strings and tuples — Gradio deep-copies state, so a config
         # or resolution object (which carry `MappingProxyType`) could not live here.
         variant_batch_state = gr.State(None)
+        # [FORK] Digital-Union (AI Director V1): the last generated proposal awaiting an explicit
+        # Apply, and nothing else. Exactly ONE reader — `apply_director_btn.click` — and it is
+        # absent from `process_btn.click`, `source_outputs`, `prep_outputs`, `live_declaration`,
+        # `CreativeProfile`, `beat_info["creative"]` and both mix configs. Its value is a frozen
+        # `DirectorProposal` of a seven-integer `CreativeRecipe` plus two strings: Gradio
+        # deep-copies state, so a model object, a process handle or anything carrying
+        # `MappingProxyType` could not live here.
+        director_proposal_state = gr.State(None)
 
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
@@ -2550,6 +2779,63 @@ def create_ui() -> gr.Blocks:
                 # render-request creative state: they re-plan, they never re-analyse.
                 with gr.Group():
                     gr.Markdown('### 🎨 Creative Direction')
+                    # [FORK] Digital-Union (AI Director V1): a compact group at the TOP of this
+                    # block, because the order is the explanation — describe the edit, review a
+                    # proposal, then the existing Creative Controls below are what actually gets
+                    # rendered:
+                    #
+                    #     AI Director  ->  Creative Controls  ->  Variant Lab  ->  Render
+                    #
+                    # Five components and one hidden state object. No gallery, no chat UI, no
+                    # conversation history, and deliberately not a new top-level workflow: the
+                    # Director is a second way to fill in controls this app already had.
+                    #
+                    # The instruction box registers NOTHING — it is read at click time, exactly
+                    # like every Variant Lab configuration widget — so typing an instruction
+                    # cannot move a slider, clear a confirmation or start anything.
+                    with gr.Accordion(label=LABEL_AI_DIRECTOR, open=False):
+                        gr.Markdown(INFO_AI_DIRECTOR)
+                        director_instruction = gr.Textbox(
+                            label=LABEL_DIRECTOR_INSTRUCTION,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_INSTRUCTION,
+                            info=INFO_DIRECTOR_INSTRUCTION,
+                            lines=3,
+                            max_lines=6,
+                            elem_id='director-instruction-input',
+                        )
+                        with gr.Row():
+                            generate_director_btn = gr.Button(
+                                LABEL_GENERATE_PROPOSAL, variant='secondary',
+                                elem_id='generate-director-proposal-button')
+                            apply_director_btn = gr.Button(
+                                LABEL_APPLY_PROPOSAL, variant='secondary',
+                                elem_id='apply-director-proposal-button')
+                        # Read-only, and formatted entirely by `DirectorProposal.display_text()` —
+                        # one formatter per read-out, exactly as the Variant Lab and mix reports
+                        # work. Four lines of content plus room for a bounded explanation.
+                        director_proposal = gr.Textbox(
+                            label=LABEL_DIRECTOR_PROPOSAL,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_PROPOSAL,
+                            lines=6,
+                            max_lines=10,
+                            interactive=False,
+                            elem_id='director-proposal-box',
+                        )
+                        # Its own panel. The Director never borrows `variant_report`,
+                        # `variant_batch_status`, `audio_layers_report` or `smart_mix_report`:
+                        # a panel that described two different things would leave the user unable
+                        # to tell which statement was about which.
+                        director_status = gr.Textbox(
+                            label=LABEL_DIRECTOR_STATUS,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_STATUS,
+                            lines=3,
+                            max_lines=5,
+                            interactive=False,
+                            elem_id='director-status-box',
+                        )
                     variation_seed = gr.Number(
                         label=LABEL_VARIATION_SEED,
                         value=0,
@@ -3002,6 +3288,40 @@ def create_ui() -> gr.Blocks:
             fn=_on_creative_control_input,
             inputs=creative_control_sliders,
             outputs=[creative_preset],
+        )
+
+        # [FORK] Digital-Union (AI Director V1): the Director's entire wiring — two button clicks.
+        #
+        # Note what Generate's `outputs` does NOT contain: `variation_seed`, the six sliders,
+        # `creative_preset`, any audio widget, `variant_master_seed`, `variant_batch_state`, any
+        # Variant Lab or C3 widget, `source_outputs`, `prep_outputs` and `process_btn`. Generating
+        # a proposal writes the proposal and the two read-outs, and that absence is what makes
+        # "generating is not applying" structural rather than careful.
+        #
+        # Note also what Generate's `inputs` does not contain: everything except the instruction.
+        # There is no hidden creative base, so the Director cannot drift from its own last answer
+        # the way a transform-the-current-settings mode would.
+        generate_director_btn.click(
+            fn=_on_generate_director_proposal,
+            inputs=[director_instruction],
+            outputs=[director_proposal_state, director_proposal, director_status],
+        )
+
+        # Apply is the ONE Director writer of execution widgets, and the exact set is the
+        # Variation Seed, the six sliders and the preset label — the same three things the preset
+        # selector and Variant Lab already write between them, and nothing new. It reuses
+        # `creative_control_sliders` rather than restating the six, so the positional contract with
+        # `CREATIVE_CONTROL_FIELDS` has one definition. `_director_apply_outputs` is a small
+        # Director-specific projection: `_variant_apply_outputs` also writes the lab's master seed,
+        # the three audio levels and the lab report, none of which the Director generates.
+        director_apply_outputs = [variation_seed] + creative_control_sliders + [
+            creative_preset, director_status,
+        ]
+
+        apply_director_btn.click(
+            fn=_on_apply_director_proposal,
+            inputs=[director_proposal_state],
+            outputs=director_apply_outputs,
         )
 
         # [FORK] Digital-Union (Variant Lab V1 / C2): the lab's entire wiring — two button clicks.

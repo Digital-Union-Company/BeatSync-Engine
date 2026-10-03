@@ -55,19 +55,39 @@ old render reproduces from *its recorded values* instead of from a historical la
   USER HANDLER (each slider registers exactly one, and it must be .input()):
       <slider>.input()  ->  creative_preset
 
-  PERMITTED PROGRAMMATIC WRITERS of a slider, exactly these four:
+  PERMITTED PROGRAMMATIC WRITERS of a slider, exactly these five:
       creative_preset.input
       generate_variant_btn.click
       new_variant_btn.click
       apply_variant_btn.click      (Variant Lab C3 V1 — Apply Selected Variant)
+      apply_director_btn.click     (AI Director V1 — Apply Proposal)
+
+  PERMITTED WRITERS of `creative_preset`, exactly these ten:
+      the six <slider>.input handlers
+      generate_variant_btn.click
+      new_variant_btn.click
+      apply_variant_btn.click
+      apply_director_btn.click
   ```
 
-  `generate_variants_btn.click` is deliberately **not** one of them: generating candidates for
-  comparison writes no execution widget. `test_creative_controls_seam.py` pins the writer list
-  exactly and resolves list indirection, so neither a fifth writer nor one hidden behind an
-  intermediate list can arrive unreviewed. Preset *semantics* are unchanged by any of this: the
+  `generate_variants_btn.click` and `generate_director_btn.click` are deliberately **not** writers
+  of either: generating candidates for comparison, and generating a proposal for review, both
+  write no execution widget. `test_creative_controls_seam.py` and `test_creative_presets.py` pin
+  both lists exactly and resolve list indirection, so neither an extra writer nor one hidden behind
+  an intermediate list can arrive unreviewed. Preset *semantics* are unchanged by any of this: the
   label is still recomputed from all six values, and a programmatic write still does not fire
-  `.input()`, which is why the Variant Lab projection helper computes `matching_preset` itself.
+  `.input()`, which is why both projection helpers compute `matching_preset` themselves.
+
+- **A Director never outputs a preset label (AI Director V1).** Which named recipe six numbers
+  happen to match is a GUI read-out, not something a model may assert — so the Director's JSON
+  schema has no preset property, `director.py` contains no label concept at all, and Apply
+  recomputes `presets.matching_preset(...)` from the proposal's six numbers and returns it
+  explicitly (`50×6 -> Balanced`, anything unmatched `-> Custom`). `director.py` does import
+  `presets`, but only for `CREATIVE_CONTROL_FIELDS`, which is the one six-field registry its schema
+  is derived from; a test pins that as the module's *only* use of it. The Director does not reuse
+  `_variant_apply_outputs` — that helper also writes the lab's Master Seed, the three audio levels
+  and the lab report — but it does reuse `matching_preset`, so there is still exactly one
+  preset-label path. See `.claude/rules/director.md`.
 - **`creative_control_sliders` order *is* a contract.** It is the preset handler's `outputs` and
   every slider handler's `inputs`, and Gradio matches those positionally, so it must stay in
   `CREATIVE_CONTROL_FIELDS` order (which is **not** the widget declaration order). A test pins it.
@@ -140,13 +160,27 @@ nothing about either (a preset remains a named set of slider values with no gene
 while `gui.py` may wire the lab up. The pre-existing prohibition on a preset *button*, randomiser or
 reset for the six controls is unchanged.
 
-## Future Freestyle / Director boundary
+## The Director boundary — implemented; Freestyle still is not
 
-Not implemented, and no speculative abstraction was added for it (a test asserts no
-director/freestyle/shortlist/stage-cache machinery exists). C2's `CreativeRecipe` is the contract a
-future AI Director should *produce* — which is why it carries no master seed, ranges or spread, so a
-non-random generator need not pretend to have had them. The accepted direction is
-preserved: **persistent media truth + ephemeral Creative Profile.** A future Freestyle mode may vary
-these controls per section; a future Director may interpret the same Stage-5 library differently.
-Neither may require Stage-5 re-analysis, creative state may never enter Stage-5 cache identity, and no
-per-render interpretation may overwrite persistent semantics.
+**AI Director V1 shipped, and it landed exactly where C2 said it would.** `CreativeRecipe` was
+written as the contract a future AI Director should *produce*, which is why it carries no master
+seed, ranges or spread — so the Director emits one without pretending to have had them, and
+`creative_recipe.py` needed no change at all. The guard here was therefore **split rather than
+weakened**: `presets.py` still knows nothing about a Director (a preset remains a named set of
+slider values with no generator concept), while `gui.py` may wire one up, and the accepted GUI
+surface is an explicit allow-list so a *second* director concept cannot drift in beside it.
+
+The accepted direction is preserved and was not spent: **persistent media truth + ephemeral
+Creative Profile.** Director V1 is media-blind, has no cache, requires no Stage-5 re-analysis,
+leaves `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` untouched, and overwrites no persistent
+semantics — it proposes seven integers for the controls that already existed. Full contract:
+`.claude/rules/director.md`.
+
+Still not implemented, and no speculative abstraction was added for any of it: **Freestyle**
+(per-section variation of these controls), L2 stage caching, source groups, per-section profiles, a
+second style-aware Qwen pass over a shortlisted candidate set, and a **content-aware Director** that
+reads the Stage-5 library. Tests assert the absence of freestyle/shortlist/stage-cache machinery,
+and of `director_cache` / `director_history` / `director_media` / `director_render` /
+`director_transform`. The permanent constraints are unchanged: creative state never enters Stage-5
+cache identity, no per-render interpretation overwrites persistent semantics, and a future second
+pass stays run-scoped rather than becoming the library's durable truth.

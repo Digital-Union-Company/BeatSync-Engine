@@ -510,6 +510,49 @@ INFO_MICRO_CUTS = (
 )
 
 # ============================================================================
+# [FORK] Digital-Union: AI Director V1
+# See src/beatsync_fork/director.py. Two claims this copy must never make: that the instruction
+# reproduces a result (a prompt is not a recipe identifier, and the Variation Seed is minted fresh
+# every time), and that the Director has looked at the user's footage (V1 is media-blind — it reads
+# the sentence and nothing else). Applying moves the existing Creative Controls below; Create Music
+# Video is still the only thing that renders.
+# ============================================================================
+
+LABEL_AI_DIRECTOR = "🎬 AI Director"
+INFO_AI_DIRECTOR = (
+    "**Describe the edit you want and get a proposal for the controls below.** Review it, then "
+    "apply it if you like it — applying writes the Variation Seed and the six Creative Controls, "
+    "and nothing else. It never renders automatically, never re-analyses your videos and never "
+    "touches your confirmed source files. Afterwards you can edit any control by hand, explore "
+    "from there with Variant Lab, or press Create Music Video.\n\n"
+    "The Director reads your words only: it has not watched your footage, it does not know the "
+    "track, and it does not look at the settings currently on screen — each instruction is read as "
+    "a fresh description of the edit you want."
+)
+
+LABEL_DIRECTOR_INSTRUCTION = "📝 Instruction"
+PLACEHOLDER_DIRECTOR_INSTRUCTION = "Describe the editing style you want…"
+INFO_DIRECTOR_INSTRUCTION = (
+    "One or two sentences about pacing, energy, calm or movement, and how much the edit should "
+    "spread across your source videos. Nothing happens until you press Generate Proposal."
+)
+
+LABEL_GENERATE_PROPOSAL = "🧠 Generate Proposal"
+LABEL_APPLY_PROPOSAL = "⬅️ Apply Proposal"
+
+LABEL_DIRECTOR_PROPOSAL = "Director proposal"
+PLACEHOLDER_DIRECTOR_PROPOSAL = (
+    "No proposal yet. Describe the edit you want above and press Generate Proposal. "
+    "A proposal changes nothing until you apply it."
+)
+
+LABEL_DIRECTOR_STATUS = "Director status"
+PLACEHOLDER_DIRECTOR_STATUS = (
+    "Generate Proposal asks the local model for a set of controls. Apply Proposal writes them into "
+    "the Creative Controls below. Create Music Video is still the only thing that renders."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: creative presets (Creative Controls Extra PR3)
 # See src/beatsync_fork/presets.py for the four recipes this label describes. A preset is only a
 # named set of values for the six sliders below — the sliders stay the one thing that is rendered.

@@ -491,6 +491,128 @@ def test_both_render_events_share_one_concurrency_group():
     assert _gui_source().count("RENDER_CONCURRENCY_ID = ") == 1
 
 
+def test_the_ai_director_added_no_render_event():
+    """**AI Director V1.** Two new button events, and neither is a render.
+
+    Asserted positively rather than by omission: the Director's registrations exist, their `fn=`
+    is a Director handler, and neither carries a `concurrency_id` — because joining the render
+    group would claim it competes for the renderer, which it must not.
+    """
+    tree = _gui_tree()
+    found = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "click"):
+            owner = getattr(node.func.value, "id", None)
+            if owner in ("generate_director_btn", "apply_director_btn"):
+                found[owner] = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+
+    assert set(found) == {"generate_director_btn", "apply_director_btn"}, found
+    assert found["generate_director_btn"]["fn"] == "_on_generate_director_proposal"
+    assert found["apply_director_btn"]["fn"] == "_on_apply_director_proposal"
+    for owner, kwargs in found.items():
+        assert "concurrency_id" not in kwargs, owner
+        assert "every" not in kwargs, owner
+
+
+def test_no_director_handler_can_reach_the_render_chain_or_the_gate():
+    """`DIRECTOR_AUTO_RENDER = NO`, walked from both buttons rather than banned by token.
+
+    The forbidden set is deliberately wider than the renderer: the shared gate core,
+    `resolve_for_render`, `live_declaration` and the durable promotion are all in it, because a
+    Director that could reach the *gate* would be able to invalidate or approve a source set.
+
+    **References, not just calls**, and that is a correction rather than a flourish: a mutation
+    proof showed `_ = create_music_video` reaching the renderer while appearing in no `ast.Call`
+    node, so a call-only walker reported a clean boundary on a leaking handler. Attribute leaves
+    count too, so a module alias is no hiding place.
+    """
+    tree = _gui_tree()
+    defined = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    forbidden = {"process_video_guarded", GATE_CORE, "process_video", "_process_video_impl",
+                 "analyze_beats_auto", "create_music_video",
+                 "render_selected_variants_guarded", PROMOTION_HELPER,
+                 "resolve_for_render", "live_declaration", "confirm_action",
+                 "scan_folder_action", "build_mixed_master"}
+
+    for entry in ("_on_generate_director_proposal", "_on_apply_director_proposal"):
+        assert entry in defined, entry
+        referenced, seen, pending = set(), set(), [entry]
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            node = defined.get(name)
+            if node is None:
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name):
+                    leaf = inner.id
+                elif isinstance(inner, ast.Attribute):
+                    leaf = inner.attr
+                elif isinstance(inner, ast.Call):
+                    leaf = ast.unparse(inner.func).rsplit(".", 1)[-1]
+                else:
+                    continue
+                referenced.add(leaf)
+                if leaf in defined:
+                    pending.append(leaf)
+        leaked = sorted(referenced & forbidden)
+        assert not leaked, f"{entry} reaches {leaked}"
+        assert len(seen) > 1, f"{entry} resolved no call graph at all"
+
+
+def test_the_director_never_touches_the_render_mutex_or_the_processing_dir():
+    """One render at a time is a property of the two render wrappers. A proposal is not a render,
+    so it must neither take the mutex nor clear the process-global processing directory."""
+    for name in ("_on_generate_director_proposal", "_on_apply_director_proposal",
+                 "_run_director_model", "_director_apply_outputs", "_director_apply_skips"):
+        body = _gui_body(name)
+        for forbidden in ("_RENDER_LOCK", "RENDER_CONCURRENCY_ID", "RENDER_BUSY_MESSAGE",
+                          "get_processing_dir", "LAST_OUTPUT_PATH_KEY", "session_state",
+                          "source_state", "prep_state"):
+            assert forbidden not in body, f"{name} references {forbidden}"
+
+
+def test_the_render_wrappers_never_learned_about_the_director():
+    """The other direction: no render or pipeline handler writes a Director surface or reads one.
+
+    Including the two report panels — the Director owns its own read-outs, so no render handler may
+    describe a proposal and no proposal may describe a render.
+    """
+    for name in RENDER_CHAIN:
+        node = _gui_func(name)
+        params = [a.arg for a in node.args.args]
+        body = _gui_body(name)
+        for word in ("director_proposal_state", "director_proposal", "director_status",
+                     "director_instruction", "fork_director", "DirectorProposal",
+                     "DIRECTOR_LLAMA_EXE", "DIRECTOR_LLAMA_DIR", "DIRECTOR_MODEL"):
+            assert word not in params, f"{name} takes {word}"
+            assert word not in body, f"{name} references {word}"
+
+
+def test_the_director_runner_is_the_only_new_subprocess_in_the_gui():
+    """A bounded one-shot, and the only one the Director owns. Pinned so a second invocation —
+    a warm-up call, a version probe, a retry — cannot arrive unreviewed."""
+    tree = _gui_tree()
+    runs = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.run":
+            kwargs = {kw.arg for kw in node.keywords}
+            runs.append(kwargs)
+    # the pre-existing ProRes preview call plus the Director's one invocation
+    assert len(runs) == 2, f"{len(runs)} subprocess.run call sites in gui.py"
+
+    director = _gui_body("_run_director_model")
+    assert director.count("subprocess.run(") == 1
+    assert "timeout=fork_director.TIMEOUT_SECONDS" in director
+    assert "creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)" in director
+    assert "capture_output=True" in director
+    for forbidden in ("Popen", "shell=True", "check=True"):
+        assert forbidden not in director, f"the Director runner uses {forbidden}"
+
+
 def test_no_third_render_event_exists_outside_the_group():
     """Any future render entry point must join the group deliberately, not by accident."""
     tree = _gui_tree()

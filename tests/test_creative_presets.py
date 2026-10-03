@@ -22,6 +22,7 @@ The six sliders remain the sole execution truth; `tests/test_creative_controls_s
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 from typing import Any
@@ -117,6 +118,35 @@ def _widget_call(tree, name: str) -> ast.Call:
                 and isinstance(node.value, ast.Call)):
             return node.value
     raise AssertionError(f"no widget assignment for {name}")
+
+
+def _writers_of(tree, widget: str) -> list:
+    """Every registration whose `outputs` can reach `widget`, with list indirection resolved.
+
+    Resolving the indirection transitively is the load-bearing half: `creative_preset` is written
+    through `variant_lab_outputs` and `director_apply_outputs`, so a name-only scan would report
+    the six slider handlers and miss every programmatic writer.
+    """
+    aliases = {widget}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id not in aliases
+                    and aliases & set(_names(node.value))):
+                aliases.add(node.targets[0].id)
+                changed = True
+
+    writers = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is not None and aliases & set(_names(outputs)):
+                writers.append(ast.unparse(node.func))
+    return writers
 
 
 # ===========================================================================
@@ -484,10 +514,32 @@ def test_the_preset_module_names_no_pipeline_or_ui_machinery():
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
 
 
-#: Still speculative everywhere, including the GUI: Freestyle, an AI Director, L2 stage caching,
-#: source groups, per-section profiles, and any remembered preset state.
-_STILL_SPECULATIVE = ("freestyle", "director", "shortlist", "stage_cache", "source_group",
+#: Still speculative everywhere, including the GUI: Freestyle, L2 stage caching, source groups,
+#: per-section profiles, and any remembered preset state.
+#:
+#: **`director` left this tuple with AI Director V1**, which implements it in `gui.py` — see
+#: `_DIRECTOR_ACCEPTED_IN_GUI` below for the split. `presets.py` keeps the full prohibition
+#: through `_PRESETS_ONLY_SPECULATIVE`.
+_STILL_SPECULATIVE = ("freestyle", "shortlist", "stage_cache", "source_group",
                       "per_section_profile", "preset_history", "last_preset", "preset_state")
+
+#: Forbidden in `presets.py` specifically. A preset stays a named set of slider values with no
+#: generator concept at all, so the module must know nothing about a Director either — the same
+#: split C2 applied for Variant Lab vocabulary, applied again.
+_PRESETS_ONLY_SPECULATIVE = ("director", "proposal", "instruction")
+
+#: What AI Director V1 legitimately added to the GUI, by name. Listed explicitly rather than simply
+#: removed from the ban, so the accepted surface is a reviewed allow-list and a *second* director
+#: concept cannot arrive unnoticed.
+_DIRECTOR_ACCEPTED_IN_GUI = ("director_proposal_state", "apply_director_btn",
+                             "generate_director_btn", "fork_director")
+
+#: What AI Director V1 deliberately did **not** build, banned by name rather than incidentally: a
+#: content-aware Director, a cached or remembered proposal, a conversation, a Director-driven
+#: render, and a mode that rewrites the settings currently on screen.
+_DIRECTOR_STILL_SPECULATIVE = ("director_cache", "director_history", "director_session",
+                               "director_chat", "director_media", "director_frames",
+                               "director_render", "director_transform", "director_preset")
 
 #: Variant Lab's own vocabulary. `presets.py` must still know none of it — a preset stays a named
 #: set of slider values with no generator concept — but `gui.py` legitimately wires the lab up.
@@ -504,7 +556,7 @@ def test_presets_module_knows_nothing_about_generators_or_future_modes():
     says so out loud.
     """
     source = _executable_source(_PRESETS).lower()
-    for word in _STILL_SPECULATIVE + _VARIANT_LAB_VOCABULARY:
+    for word in _STILL_SPECULATIVE + _VARIANT_LAB_VOCABULARY + _PRESETS_ONLY_SPECULATIVE:
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
 
 
@@ -548,18 +600,29 @@ def test_the_gui_added_no_speculative_mode_machinery():
     `_STILL_SPECULATIVE` is untouched and still applies at full strength. What C3 added is an
     allow-list, and everything multi-variant that C3 deliberately did *not* build — a rendered
     gallery, a second count, batch rendering — is now banned by name here rather than incidentally.
+
+    **Split again by AI Director V1, by the same rule.** `director` was in `_STILL_SPECULATIVE`;
+    V1 implements a Director in `gui.py`, so the blanket form became false and the honest fix is
+    to say so rather than rename the handlers around the guard. `presets.py` keeps the full
+    prohibition (above), the accepted GUI surface is an explicit allow-list, and everything the
+    Director deliberately did *not* build — media inspection, a cache, a conversation, an
+    automatic render, a transform-current-settings mode — is banned by name.
     """
     source = _executable_source(_GUI).lower()
     for word in _STILL_SPECULATIVE:
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
     for word in _C3_STILL_SPECULATIVE:
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+    for word in _DIRECTOR_STILL_SPECULATIVE:
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
 
-    # the allow-list is a statement about what C3 *is*, so it has to actually be there
+    # the allow-list is a statement about what each milestone *is*, so it has to actually be there
     for word in _C3_ACCEPTED_IN_GUI:
         assert word in source, f"gui.py lost C3's {word!r}"
     for word in _C3_R0_ACCEPTED_IN_GUI:
         assert word in source, f"gui.py lost C3-R0's {word!r}"
+    for word in _DIRECTOR_ACCEPTED_IN_GUI:
+        assert word in source, f"gui.py lost the Director's {word!r}"
 
 
 def test_the_accepted_c3_machinery_is_not_rendering_machinery():
@@ -816,6 +879,84 @@ def test_the_selector_is_absent_from_the_source_and_preparation_wiring():
             for key in ("inputs", "outputs"):
                 if key in kwargs:
                     assert "creative_preset" not in _names(kwargs[key]), f"{widget}.{key}"
+
+
+def test_the_creative_preset_writer_matrix_is_exactly_ten_registrations():
+    """**Measured from main and extended by exactly one (AI Director V1).**
+
+    The selector is an honest read-out of six numbers, so everything that writes those six must
+    also write the label. Before the Director that was nine registrations: one `.input()` per
+    slider, plus the three Variant Lab clicks that write it through `variant_lab_outputs`. Director
+    Apply is a tenth, because it recomputes `matching_preset` from the proposal's numbers.
+
+    An exact sorted list, never relaxed to containment, with the list indirection resolved.
+    `generate_director_btn.click` is deliberately absent: a proposal is not an application, so it
+    cannot relabel the selector.
+    """
+    tree = _gui_tree()
+    writers = sorted(_writers_of(tree, "creative_preset"))
+
+    assert writers == ["apply_director_btn.click",
+                       "apply_variant_btn.click",
+                       "cut_density.input",
+                       "energy_response.input",
+                       "generate_variant_btn.click",
+                       "micro_cuts.input",
+                       "motion_bias.input",
+                       "new_variant_btn.click",
+                       "semantic_emphasis.input",
+                       "source_diversity.input"], writers
+    assert "generate_director_btn.click" not in writers
+    assert "generate_variants_btn.click" not in writers
+
+
+def test_the_director_never_outputs_a_preset_label_and_apply_recomputes_it():
+    """**§27 / §45.** The model emits six numbers and no name: which named recipe a tuple happens
+    to match is a GUI read-out, not something a model may assert. And because programmatic slider
+    writes do not fire `.input()`, Apply has to return the label explicitly — through the *shared*
+    `matching_preset`, so there is exactly one preset path in the application.
+    """
+    director = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "director.py")
+    source = _executable_source(director).lower()
+    # The preset *label* API, not the words, and not the module. Two deliberate exclusions:
+    # "Dynamic" is a legitimate English description of Motion Bias in the system prompt, so
+    # banning the preset names would assert something false (the same care `_PRESET_TOKENS` takes
+    # over Stage 4's unrelated `smart_preset`); and `beatsync_fork.presets` is legitimately
+    # imported, because `CREATIVE_CONTROL_FIELDS` is the one six-field registry the Director
+    # derives its schema from. What must be absent is every way a *label* could be produced.
+    for word in ("preset", "matching_preset", "preset_values", "resolve_preset", "preset_names",
+                 "balanced_preset", "custom_preset", "preset_label"):
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"director.py mentions {word!r}"
+
+    # ...and the only thing it takes from the preset module is that registry
+    used = sorted(set(re.findall(r"fork_presets\.(\w+)", source)))
+    assert used == ["creative_control_fields"], used
+
+    # ...and the schema the model answers against has no preset property at all
+    from beatsync_fork import director as fork_director
+    assert "preset" not in json.dumps(fork_director.model_schema()).lower()
+
+    # the GUI projection is where the label is derived, from the numbers
+    body = ast.unparse(_strip_docstrings(_func(_gui_tree(), "_director_apply_outputs")))
+    assert "fork_presets.matching_preset(values)" in body
+    assert "fork_presets.CREATIVE_CONTROL_FIELDS" in body
+
+
+@pytest.mark.parametrize("name", list(_ACCEPTED) + ["Custom"])
+def test_the_director_projection_reports_the_same_label_the_selector_would(name):
+    """Executable: `matching_preset` is total and the Director adds no second answer."""
+    from beatsync_fork import director as fork_director
+
+    controls = (dict(_ACCEPTED[name]) if name in _ACCEPTED
+                else dict(zip(_FIELDS, (30, 10, 70, 60, 25, 55))))
+    values = tuple(controls[field] for field in _FIELDS)
+    proposal = fork_director.build_proposal("x", {**controls, "explanation": ""}, 7)
+
+    assert proposal is not None
+    assert proposal.recipe.as_mapping() == {"seed": 7, **controls}
+    expected = name if name in _ACCEPTED else fork_presets.CUSTOM_PRESET
+    assert fork_presets.matching_preset(values) == expected
+    assert tuple(getattr(proposal.recipe, field) for field in _FIELDS) == values
 
 
 def test_no_preset_handler_writes_a_gate_or_preparation_widget():
