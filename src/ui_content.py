@@ -610,6 +610,58 @@ PLACEHOLDER_VARIANT_REPORT = (
 )
 
 # ============================================================================
+# [FORK] Digital-Union: Variant Lab C3 V1 — compare several candidates, apply one
+# See src/beatsync_fork/variant_batch.py. Generating candidates produces *settings*, never videos:
+# the copy below has to make that unmistakable, because "Generate Variants" is exactly the phrase a
+# user would expect to produce several clips. Create Music Video remains the only render action.
+# ============================================================================
+
+INFO_VARIANT_COMPARE = (
+    "**Compare several candidates** — generate a few complete settings at once, look at them side "
+    "by side, then write one into the controls above. These are *settings*, not videos: nothing "
+    "here renders, analyses or touches your source files. Every candidate starts from the same "
+    "current values, so they are alternatives to each other rather than a drift in one direction."
+)
+
+LABEL_CANDIDATE_COUNT = "🔢 Candidates"
+INFO_CANDIDATE_COUNT = (
+    "How many candidates one press generates, from 2 to 12. They are free to make — the limit is "
+    "just how many you can usefully read at once."
+)
+
+LABEL_GENERATE_VARIANTS = "🧮 Generate Variants"
+LABEL_APPLY_VARIANT = "⬅️ Apply Selected Variant"
+
+LABEL_VARIANT_BATCH_TABLE = "Last generated batch"
+PLACEHOLDER_VARIANT_BATCH_TABLE = (
+    "No candidates yet. Press Generate Variants to create several at once and compare them here."
+)
+
+LABEL_VARIANT_CANDIDATE = "🎯 Selected candidate"
+INFO_VARIANT_CANDIDATE = (
+    "Pick a row from the table above. Nothing changes until you press Apply Selected Variant."
+)
+
+LABEL_VARIANT_BATCH_STATUS = "Batch status"
+PLACEHOLDER_VARIANT_BATCH_STATUS = (
+    "Generate Variants creates candidates. Apply Selected Variant writes one into the controls. "
+    "Create Music Video is still the only thing that renders."
+)
+
+INFO_VARIANT_APPLY = (
+    "**Apply Selected Variant** writes that candidate's Variation Seed, six sliders and three "
+    "audio levels into the controls above, exactly as a single Generate Variant would — then you "
+    "press Create Music Video yourself. Applying uses up the list, because it moves the starting "
+    "values the candidates were measured against; generate again to explore from where you landed. "
+    "If you edit any setting after generating, Apply refuses rather than writing a candidate that "
+    "no longer describes your screen.\n\n"
+    "During generation the Master Seed acts as the **batch root**, and each candidate gets its own "
+    "derived master, shown in the table. Applying puts the chosen candidate's master in the box. "
+    "Neither number on its own brings a candidate back: you need the same starting values, ranges, "
+    "ticked controls and Spread as well."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: video-source mode + confirmation gate labels
 # See src/beatsync_fork/input_session.py for the behaviour these labels describe.
 # ============================================================================

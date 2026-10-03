@@ -508,15 +508,79 @@ def test_presets_module_knows_nothing_about_generators_or_future_modes():
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
 
 
+#: Multi-variant vocabulary that C3 V1 **did not** implement and that must not drift in beside the
+#: part it did. `num_variants` and `variant_count` are banned as spellings, not as ideas: C3's own
+#: control is the explicit `variant_candidate_count`, and keeping the shorter names out stops a
+#: second, differently-bounded count appearing next to it. `compare_variants` and `variant_gallery`
+#: are the *rendered* comparison this milestone deliberately refused — a gallery implies rendered
+#: thumbnails, which is batch rendering wearing a different hat.
+_C3_STILL_SPECULATIVE = ("num_variants", "variant_count", "compare_variants", "variant_gallery",
+                         "render_batch", "batch_render", "variant_preview", "thumbnail")
+
+#: What C3 V1 legitimately added, by name. Listed explicitly rather than simply removed from the
+#: ban, so the accepted surface is a reviewed allow-list and a *fourth* multi-variant concept
+#: cannot arrive unnoticed.
+_C3_ACCEPTED_IN_GUI = ("generate_variants", "variant_batch")
+
+
 def test_the_gui_added_no_speculative_mode_machinery():
-    """C3 multi-variant rendering, Freestyle, an AI Director and the rest stay out of the GUI."""
+    """Freestyle, an AI Director, source groups, preset history and the rest stay out of the GUI.
+
+    **Split by Variant Lab C3 V1, not deleted** — the same reconciliation C2 applied to this
+    file's `presets.py`/`gui.py` pair, and the same one C3 applied to
+    `test_variant_lab.py::test_no_multi_variant_or_c3_machinery_was_added`.
+
+    This test used to forbid *all* multi-variant vocabulary in `gui.py`, including
+    `generate_variants` and `variant_batch`. C3 V1 shipped exactly those two concepts — N
+    deterministic candidates, compared and applied one at a time, rendering nothing — so the
+    blanket form became false. It was split rather than dropped, and rather than evaded: renaming
+    C3's handler and state purely to slip past a boundary guard would be the dishonest fix, and
+    the names are kept.
+
+    `_STILL_SPECULATIVE` is untouched and still applies at full strength. What C3 added is an
+    allow-list, and everything multi-variant that C3 deliberately did *not* build — a rendered
+    gallery, a second count, batch rendering — is now banned by name here rather than incidentally.
+    """
     source = _executable_source(_GUI).lower()
     for word in _STILL_SPECULATIVE:
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
-    # and specifically no multi-variant / batch machinery crept in with the lab
-    for word in ("generate_variants", "variant_batch", "variant_count", "num_variants",
-                 "compare_variants", "variant_gallery"):
-        assert word not in source, f"gui.py mentions {word!r}"
+    for word in _C3_STILL_SPECULATIVE:
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+
+    # the allow-list is a statement about what C3 *is*, so it has to actually be there
+    for word in _C3_ACCEPTED_IN_GUI:
+        assert word in source, f"gui.py lost C3's {word!r}"
+
+
+def test_the_accepted_c3_machinery_is_not_rendering_machinery():
+    """The structural half, because a shrinking token ban is the weak half of any boundary guard.
+
+    `test_variant_lab.py` owns C3's full structural contract; this is the narrow property *this*
+    file is responsible for, since it is where the "no speculative mode machinery" prohibition
+    lives: the two concepts C3 was allowed to add must not have arrived as a way to render.
+    """
+    tree = _gui_tree()
+    defined = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    render_entry_points = {"process_video_guarded", "process_video", "_process_video_impl",
+                           "analyze_beats_auto", "create_music_video"}
+
+    for entry in ("_on_generate_variants", "_on_apply_selected_variant"):
+        assert entry in defined, f"{entry} is missing"
+        seen, pending = set(), [entry]
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            node = defined.get(name)
+            if node is None:
+                continue
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call):
+                    leaf = ast.unparse(call.func).rsplit(".", 1)[-1]
+                    assert leaf not in render_entry_points, f"{entry} reaches {leaf}"
+                    if leaf in defined:
+                        pending.append(leaf)
 
 
 # ===========================================================================

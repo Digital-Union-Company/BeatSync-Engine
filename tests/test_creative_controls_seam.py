@@ -534,6 +534,13 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
     the lab's two buttons joined the allow-list. The *detection* was strengthened at the same time —
     it now resolves list variables transitively, so wrapping the sliders in one more intermediate
     list cannot hide a writer from this test the way `variant_lab_outputs` otherwise would have.
+
+    **Amended again by Variant Lab C3 V1:** applying a compared candidate writes the same six
+    sliders through the same projection helper, so `apply_variant_btn.click` is a fourth exact
+    writer. Note what did *not* change — `generate_variants_btn.click` is absent, because
+    generating candidates deliberately writes no execution widget at all. This stays an exact
+    sorted list rather than a containment check: "the writers include the ones we expect" would
+    have let C3 add a fifth writer nobody reviewed.
     """
     tree = _gui_tree()
 
@@ -558,9 +565,12 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
             if outputs is not None and aliases & set(_names(outputs)):
                 writers.append(ast.unparse(node.func))
 
-    assert sorted(writers) == ["creative_preset.input",
+    assert sorted(writers) == ["apply_variant_btn.click",
+                               "creative_preset.input",
                                "generate_variant_btn.click",
                                "new_variant_btn.click"], f"{widget} is written by {writers}"
+    assert "generate_variants_btn.click" not in writers, (
+        "generating candidates must write no execution widget")
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():

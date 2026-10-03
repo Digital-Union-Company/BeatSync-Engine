@@ -65,8 +65,14 @@ AUDIO_VARIANT_WRITABLE = ("music_under_voice",)
 AUDIO_NEVER_WRITTEN = tuple(w for w in AUDIO_CONFIG_WIDGETS
                             if w not in AUDIO_VARIANT_WRITABLE)
 
-#: The only two events permitted to write any Variant Lab audio output.
-VARIANT_LAB_WRITERS = ["generate_variant_btn.click", "new_variant_btn.click"]
+#: The only events permitted to write any Variant Lab audio output. Two since E2 V1; **three since
+#: C3 V1**, which added Apply Selected Variant — it writes the same three levels through the same
+#: projection helper an ordinary Generate uses. Note what is deliberately *not* here:
+#: `generate_variants_btn.click`, because generating candidates writes no execution widget at all.
+#: This is an exact ordered list on purpose — extended under review, never relaxed to a subset
+#: check that would wave through a writer nobody looked at.
+VARIANT_LAB_WRITERS = ["generate_variant_btn.click", "new_variant_btn.click",
+                       "apply_variant_btn.click"]
 
 
 def tree() -> ast.Module:

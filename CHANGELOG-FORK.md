@@ -20,6 +20,105 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-03 (Variant Lab Multi-Variant Generation + Comparison — C3 V1)
+
+Variant Lab could generate one recipe per click and wrote it straight back, which is a good way to
+wander and a poor way to **choose**: comparing two directions meant generating one, reading it,
+generating another and having already lost the first. C3 resolves N candidates at once from one
+frozen starting point, shows them side by side, and applies exactly one.
+
+```
+GENERATE N  ->  COMPARE N  ->  APPLY ONE  ->  (the user presses Create Music Video)
+```
+
+- **C3 V1 renders nothing, and that is the scope decision rather than an omission.** A render is
+  ~150 FFmpeg clip extractions through the one hardware encoder a *single* render already saturates
+  (`_effective_clip_workers()` exists for exactly that contention); a candidate costs tens of
+  microseconds. Batch rendering is deferred to a separate milestone (**C3-R**) along with its own
+  failure policy, output naming, cancellation and per-variant report ownership — none of which
+  exists today, and none of which was speculatively added.
+- **A new pure module, `beatsync_fork/variant_batch.py`**, stdlib-only like the rest of the package.
+  It **orchestrates the frozen resolvers and never re-implements them**: every candidate is
+  `variant_lab.resolve(...)` + `variant_lab.resolve_audio(...)` unchanged, so no C2 or E2 golden
+  vector can move. A test forbids `uniform(`, `_half_up`, `anchor_for` and `hashlib` inside it. The
+  dependency is one-way — `variant_batch → variant_lab`, never the reverse — and `variant_lab.py`
+  gained exactly one constant plus its `__all__` entry and docstring prose.
+- **One candidate master per index, under the new `batch` RNG domain**:
+  `variant_lab|1|<root>|batch|<i>` → SHA-1 → a six-digit master in 1..999999, the same range every
+  other seed the user sees lives in. Index-keyed rather than drawn from one sequential stream, and
+  that is the load-bearing choice: **asking for 8 candidates instead of 5 leaves the first 5
+  identical.** The three existing domains are untouched, so adding C3 shifts no value any master
+  seed already resolves to.
+- **Candidate masters are unique as a contract, not a probability.** Twelve six-digit draws collide
+  about once in 14,000 batches and two identical rows read as a bug, so a collision steps
+  deterministically forward (wrapping at the top) against the masters already fixed at *lower*
+  indices only — prefix stability survives, the scan is bounded, and it is never a redraw. Same
+  reasoning as C2 R1-B's `_fresh_variant_master_seed`; the forced-collision test is monkeypatched
+  rather than hoped for.
+- **One click freezes the screen once.** All N candidates resolve from the *same* original visual
+  and audio base — candidate 2 is never resolved from candidate 1. That is structural rather than
+  careful: **generating writes no execution widget at all**, so no result can feed the next draw.
+  Looping today's single Generate would chain, because *that* handler writes back.
+- **`VariantBatchDeclaration` is a declaration record, not the cached base snapshot C2 rejected.**
+  It is never read as a substitute for the live widgets at resolve time, only compared against
+  them — the same family as `SourceSnapshot` and `PrepScanResult`. Canonical by construction, so
+  staleness is plain structural equality rather than a digest with a serialisation contract to keep
+  in step.
+- **Apply is live-gated and fail-closed.** It re-reads the whole screen through the shared
+  normalisation helper at click time and refuses unless it equals the declaration its batch was
+  built from — the same reason `process_btn` validates the live source controls and
+  `prep_analyze_btn` takes the live preparation controls. A refusal writes `gr.skip()` to every
+  execution widget; a *stale* refusal also consumes the batch so it cannot be retried, while a
+  missing selection does not, because that list is still valid. There are deliberately **no**
+  `.change()` invalidation handlers: adding one per slider would put a second binding on widgets
+  whose single `.input()` is itself a load-bearing contract.
+- **Apply is terminal for one batch** — it moves the live base, so the remaining candidates now
+  describe a starting point that no longer exists — and it writes the **candidate's own** master
+  into the Master Seed box, because that field means provenance for the recipe now on the sliders.
+  The batch root stays visible in the comparison text. Neither seed alone reproduces anything:
+  R1-A's rule applies to both, and two tests pin it.
+- **One projection helper, one preset path.** Apply calls the existing `_variant_apply_outputs`
+  with temporarily rehydrated resolution objects, so it writes the identical thirteen-widget tuple
+  an ordinary Generate writes and recomputes `matching_preset` explicitly. A test asserts Apply's
+  output equals a single Generate from that candidate master.
+- **The batch is deepcopy-safe, which is a real Gradio `State` requirement rather than a style
+  note.** `VariantLabConfig` / `AudioVariantConfig` hold `MappingProxyType` and the resolutions hold
+  those configs, so none of them may enter session state. `VariantBatch` stores plain ints, strings,
+  tuples and the two frozen recipe dataclasses; `rehydrate()` builds temporary resolutions inside
+  one handler and never returns them. Tests assert `copy.deepcopy(batch) == batch` and walk every
+  reachable object for a forbidden type.
+- **Count 2 / 12 / default 5.** The cap is comparison legibility and a typo guard, not a resource
+  bound — twelve candidates cost about a millisecond — and it must not be reused as a future
+  batch-render limit.
+- **GUI: six components** inside the *existing* Variant Lab accordion — count, Generate Variants,
+  a read-only comparison table, a `gr.Radio` selector whose `(label, value)` value *is* the
+  candidate index, Apply Selected Variant, and a read-only status. No `gr.Dataframe` dependency.
+  `VariantBatch.table_text()` is the one formatter; `gui.py` formats none of it. The selector
+  registers no handler.
+- **Shared normalisation.** The config/base construction `_on_generate_variant` used to inline was
+  lifted into `_build_variant_resolution_context`, now used by all three Variant Lab handlers — the
+  declaration Apply compares against is only trustworthy if it is built by the same code that built
+  the batch. Single Generate is value-identical and `_on_new_variant → _on_generate_variant` is
+  unchanged.
+- **Writer matrices extended by exact list, never relaxed.** The six creative sliders now have
+  exactly `creative_preset.input`, `generate_variant_btn.click`, `new_variant_btn.click` and
+  `apply_variant_btn.click`; the three audio levels exactly the latter three. Absent from both:
+  `generate_variants_btn.click`. The excluded audio controls keep **zero** writers and both report
+  panels keep `process_btn.click` alone.
+- **Two pre-C3 negative guards were split, not deleted** — in `test_variant_lab.py` and in
+  `test_creative_presets.py`, which carried a second independent copy. `variant_lab.py`,
+  `creative_recipe.py` and `presets.py` still know nothing about C3. The load-bearing replacement
+  is **structural** rather than a token list: the call graph is walked from both C3 buttons and may
+  not reach `process_video_guarded`, `process_video`, `analyze_beats_auto` or `create_music_video`,
+  which a rename cannot evade. Freestyle, an AI Director, a rendered variant gallery, a stage cache
+  and shortlist machinery all remain forbidden.
+- **Isolation unchanged.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION`
+  stays `auto_av_analysis_v8_llama_vulkan_batched`; `video_analysis.py`,
+  `stage5_qwen_scene_worker.py`, `video_processor.py`, `ffmpeg_processing.py`, `library_prep.py`,
+  `audio_mix.py`, `smart_mix.py` and `src/auto_mode/*` are untouched; the source confirmation gate
+  and Media Library Preparation are unaffected. `variant_batch_state` reaches no planner, renderer,
+  profile or cache — `apply_variant_btn.click` is its only reader. **No CLI flag.**
+
 ### Added — 2026-10-03 (Variant Lab Audio Integration — E2 V1)
 
 Variant Lab can now vary audio, which the two entries below deliberately left to E2. It varies

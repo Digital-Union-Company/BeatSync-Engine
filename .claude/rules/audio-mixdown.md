@@ -253,13 +253,23 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
 
 ## What Variant Lab may touch here (E2 V1)
 
-**Variant Lab writes exactly three audio widgets, and only from its own two buttons:**
+**Variant Lab writes exactly three audio widgets, and only from its own buttons:**
 
 ```
-music_under_voice   <-  generate_variant_btn.click, new_variant_btn.click
-sfx_amount          <-  generate_variant_btn.click, new_variant_btn.click
-sfx_level           <-  generate_variant_btn.click, new_variant_btn.click
+music_under_voice   <-  generate_variant_btn.click, new_variant_btn.click,
+                        apply_variant_btn.click
+sfx_amount          <-  generate_variant_btn.click, new_variant_btn.click,
+                        apply_variant_btn.click
+sfx_level           <-  generate_variant_btn.click, new_variant_btn.click,
+                        apply_variant_btn.click
 ```
+
+Two writers at E2 V1; **three since C3 V1**, which added Apply Selected Variant — it writes the
+same three levels through the same `_variant_apply_outputs` projection an ordinary Generate uses,
+so there is still one place that decides what a resolved audio value does to a widget. Note what
+is **absent**: `generate_variants_btn.click`. Generating candidates for comparison writes no
+execution widget at all, which is what makes candidate chaining structurally impossible rather
+than merely avoided. See `.claude/rules/variant-lab.md`.
 
 **It writes nothing else.** `voice_files`, `voice_start_delay`, `voice_min_gap`,
 `voice_avoid_drops`, `sfx_folder` and `sfx_roles` remain **zero-writer** configuration values that
@@ -275,9 +285,11 @@ rule first.**
 Load-bearing test detail, because this is where a future change would go wrong quietly:
 
 - **The writer guards were split, never weakened.** `test_no_audio_configuration_widget_is_ever_written`
-  and `test_no_smart_mix_config_widget_is_ever_written` now assert **zero** writers for the excluded
-  controls, and two new tests assert the permitted three have **exactly** the two Variant Lab writers
-  — the writer *list* is pinned, so wiring one of them into any other event fails.
+  and `test_no_smart_mix_config_widget_is_ever_written` assert **zero** writers for the excluded
+  controls, and two tests assert the permitted three have **exactly** the Variant Lab writer list
+  (`VARIANT_LAB_WRITERS`) — the *list* is pinned, so wiring one of them into any other event fails.
+  C3 extended that list to three by review; it has never been relaxed to a containment check, which
+  would have waved through a writer nobody looked at.
 - **Those guards must resolve list indirection.** `variant_lab_outputs` reaches its widgets through a
   named sub-list (`variant_lab_audio_bases`), so a plain `names_in` sees the sub-list name and never
   `music_under_voice`. `expanded_names_in` exists for exactly this reason: without it every
