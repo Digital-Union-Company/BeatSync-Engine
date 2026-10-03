@@ -1283,9 +1283,24 @@ def test_replay_also_requires_the_same_lab_configuration(changed: str):
 
 
 def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
-    """**R1-A structural guard.** The help text said "Type a master seed you used before and
-    Generate to get that exact recipe back", which is false on its own: Generate overwrites the
-    sliders it generated from. This stops that claim returning."""
+    """**R1-A structural guard, extended for E2 V1.** Two failures are pinned here, not one.
+
+    *R1-A's.* The copy said "Type a master seed you used before and Generate to get that exact
+    recipe back", which is false on its own: Generate overwrites the sliders it generated from.
+    That half is unchanged — Master Seed alone is **not** a recipe identifier.
+
+    *E2's.* The sentence that replaced it — "the exact render settings are always the Variation
+    Seed plus the six sliders" — was true of C2's visual-only generator and became **incomplete**
+    the moment Variant Lab could also write `music_under_voice`, `sfx_amount` and `sfx_level`. The
+    guard below required only "variation seed" and "six sliders", so it went on passing. It now
+    also requires the audio levels to be named.
+
+    And it must not over-correct in the other direction. Those ten numbers are what the *lab*
+    generates, not a complete description of the physical render: voice clips, voice timing, Avoid
+    drops, the SFX folder, the enabled roles and the source media are render intent the lab never
+    touches, and a replay needs them back too. The copy has to say so. Semantic facts are pinned
+    here; the prose is free to change.
+    """
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
     start = source.index("INFO_MASTER_SEED")
     info = source[start:source.index("\n)", start)]
@@ -1295,12 +1310,25 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
     assert "starting slider" in lowered or "starting preset" in lowered or "starting value" in lowered
     assert "spread" in lowered
     assert "overwrites the sliders" in lowered or "generate overwrites" in lowered
-    # and it must say where the real render contract lives
-    assert "variation seed" in lowered and "six sliders" in lowered
 
-    # and it must not make the old unconditional promise
+    # it must name every value a draw actually writes — the visual two since C2...
+    assert "variation seed" in lowered and "six sliders" in lowered
+    # ...and the three audio levels since E2 V1, including the opt-in that produces them
+    assert "audio level" in lowered, "E2 V1 also generates the three audio levels"
+    assert "audio variation" in lowered, "and the copy must name the opt-in they come from"
+
+    # it must keep saying the seed is provenance and the widgets are what is read
+    assert "never the master seed" in lowered or "not the master seed" in lowered
+
+    # it must not claim the generated values are the whole render: at least one piece of
+    # pre-existing render/resource intent has to be named as staying the user's
+    assert any(token in lowered for token in ("voice clip", "sfx folder", "source video")), \
+        "INFO_MASTER_SEED must not imply the generated values describe the entire render"
+
+    # and it must not make the old unconditional promise, nor the C2-era exhaustiveness claim
     for overclaim in ("that exact recipe back", "get the same recipe back",
-                      "reproduces the recipe", "always reproduces"):
+                      "reproduces the recipe", "always reproduces",
+                      "exact render settings are always"):
         assert overclaim not in lowered, f"INFO_MASTER_SEED claims {overclaim!r}"
 
 

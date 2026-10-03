@@ -547,8 +547,12 @@ INFO_MASTER_SEED = (
     "Variant Lab fills in for you. A Master Seed repeats a draw only when the starting slider "
     "values and the Lab settings below (ranges, ticked controls, Spread) are the same. Because "
     "Generate overwrites the sliders, pressing it twice in a row gives two different recipes: to "
-    "replay an old Master Seed, set the starting preset or values back first. The exact render "
-    "settings are always the Variation Seed plus the six sliders, not the Master Seed. "
+    "replay an old Master Seed, set the starting preset or values back first, and put the Lab "
+    "settings back the way they were. What a draw produces is written into widgets you can see — "
+    "the Variation Seed, the six sliders, and the three audio levels when you tick them under "
+    "Audio variation — and it is those widgets, never the Master Seed, that the render reads. "
+    "Everything else is still yours and is never generated: your source videos, voice clips, "
+    "voice timing, Avoid drops, the SFX folder and the enabled SFX roles. "
     "Leave this at 0 and a fresh one is created and shown here."
 )
 

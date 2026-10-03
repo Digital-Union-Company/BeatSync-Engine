@@ -462,7 +462,8 @@ def test_audio_widgets_are_absent_from_source_and_preparation_wiring():
                 for kw in node.keywords:
                     if kw.arg in ("inputs", "outputs"):
                         for widget in AUDIO_WIDGETS:
-                            assert widget not in names_in(kw.value), f"{button}.{kw.arg}"
+                            assert widget not in expanded_names_in(root, kw.value), \
+                                f"{button}.{kw.arg}"
 
 
 def test_no_audio_configuration_widget_is_ever_written():
@@ -505,28 +506,30 @@ def test_music_under_voice_is_written_only_by_the_two_variant_lab_buttons():
 
 
 def test_the_report_has_exactly_one_writer_and_it_is_the_render_event():
-    """R1-B: the report must have a real writer, and only one."""
-    writers = []
-    for node in ast.walk(tree()):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"click", "change", "input", "submit", "release"}):
-            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is not None and "audio_layers_report" in names_in(outputs):
-                writers.append(ast.unparse(node.func))
-    assert writers == ["process_btn.click"], writers
+    """R1-B: the report must have a real writer, and only one.
+
+    **R1 (E2) note.** `_writers_of` rather than a hand-rolled `names_in` scan, so this cannot be
+    evaded by routing the report through a named sub-list the way `variant_lab_outputs` reaches
+    its widgets. The assertion is unchanged; only its blind spot is gone.
+    """
+    assert _writers_of(tree(), "audio_layers_report") == ["process_btn.click"]
 
 
 def test_no_source_preparation_preset_or_variant_handler_writes_the_report():
+    root = tree()
     for button in ("source_mode", "source_folder", "source_recursive", "scan_btn", "video_input",
                    "confirm_btn", "prep_folder", "prep_recursive", "prep_batch_size",
                    "prep_scan_btn", "prep_analyze_btn", "creative_preset", "randomize_btn",
                    "generate_variant_btn", "new_variant_btn"):
-        for node in ast.walk(tree()):
+        for node in ast.walk(root):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and getattr(node.func.value, "id", None) == button):
                 for kw in node.keywords:
                     if kw.arg in ("inputs", "outputs"):
-                        assert "audio_layers_report" not in names_in(kw.value), button
+                        # expanded: the two Variant Lab buttons really do pass their widgets
+                        # through named sub-lists, so the plain form would assert nothing here
+                        assert "audio_layers_report" not in expanded_names_in(root, kw.value), \
+                            button
 
 
 # ===========================================================================
@@ -1097,14 +1100,7 @@ def test_the_two_smart_mix_levels_are_written_only_by_the_variant_lab_buttons():
 
 
 def test_the_smart_mix_report_has_exactly_one_writer():
-    writers = []
-    for node in ast.walk(tree()):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"click", "change", "input", "submit", "release"}):
-            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is not None and SMART_MIX_REPORT_WIDGET in names_in(outputs):
-                writers.append(ast.unparse(node.func))
-    assert writers == ["process_btn.click"], writers
+    assert _writers_of(tree(), SMART_MIX_REPORT_WIDGET) == ["process_btn.click"]
 
 
 def test_no_smart_mix_widget_registers_a_handler_of_its_own():
@@ -1116,7 +1112,31 @@ def test_no_smart_mix_widget_registers_a_handler_of_its_own():
             assert owner not in SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,), owner
 
 
+#: Events that have no legitimate business touching any Smart Mix widget: the source gate, the
+#: preparation block, and the two creative-side handlers. **Not** the Variant Lab buttons — since
+#: E2 V1 those genuinely carry two of these widgets, which is why they are asserted separately and
+#: exactly rather than lumped in here.
+SMART_MIX_FREE_EVENTS = ("source_mode", "source_folder", "source_recursive", "scan_btn",
+                         "video_input", "confirm_btn", "prep_folder", "prep_recursive",
+                         "prep_batch_size", "prep_scan_btn", "prep_analyze_btn",
+                         "creative_preset", "randomize_btn")
+
+
 def test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring():
+    """**Corrected in R1.** The isolation is kept and split truthfully; it was not removed.
+
+    The R0 form looped over `generate_variant_btn` and `new_variant_btn` as well and asserted that
+    *every* Smart Mix widget was absent from them. E2 V1 made that statement **false** for
+    `sfx_amount` and `sfx_level`, which are deliberately inputs *and* outputs of both buttons — and
+    it kept passing anyway, because `outputs=variant_lab_outputs` is a bare `ast.Name` and
+    `names_in` saw only the list variable's own name. That is exactly the list-indirection vacuous
+    pass this suite claims elsewhere to have closed, so the guard was asserting nothing about the
+    two events it most needed to constrain.
+
+    Split: the genuinely unrelated events keep the full absence rule — now under
+    `expanded_names_in`, so no sub-list can hide a widget from them either — and the Variant Lab
+    buttons get the exact positive/negative assertion below.
+    """
     root = tree()
     everything = SMART_MIX_CONFIG_WIDGETS + (SMART_MIX_REPORT_WIDGET,)
     for assigned in ("source_outputs", "prep_outputs"):
@@ -1125,19 +1145,51 @@ def test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring():
         if assignment is None:
             continue
         for widget in everything:
-            assert widget not in names_in(assignment.value), f"{widget} in {assigned}"
+            assert widget not in expanded_names_in(root, assignment.value), \
+                f"{widget} in {assigned}"
 
-    for button in ("source_mode", "source_folder", "source_recursive", "scan_btn", "video_input",
-                   "confirm_btn", "prep_folder", "prep_recursive", "prep_batch_size",
-                   "prep_scan_btn", "prep_analyze_btn", "creative_preset", "randomize_btn",
-                   "generate_variant_btn", "new_variant_btn"):
+    for button in SMART_MIX_FREE_EVENTS:
         for node in ast.walk(root):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and getattr(node.func.value, "id", None) == button):
                 for kw in node.keywords:
                     if kw.arg in ("inputs", "outputs"):
                         for widget in everything:
-                            assert widget not in names_in(kw.value), f"{button}.{kw.arg}"
+                            assert widget not in expanded_names_in(root, kw.value), \
+                                f"{button}.{kw.arg}"
+
+
+def test_the_variant_lab_buttons_carry_exactly_the_two_smart_mix_levels():
+    """R1's replacement for the half of the old guard that E2 made false — stated truthfully.
+
+    `sfx_amount` and `sfx_level` must be **present** in both the `inputs` and the `outputs` of both
+    Variant Lab buttons: they are live bases on the way in and resolved levels on the way out, and
+    losing either direction would silently turn E2 into a no-op that still looked wired. The
+    structural controls must stay **absent**: `sfx_folder` is resource identity, `sfx_roles` is
+    structural intent, and `smart_mix_report` is render diagnostics — none is a value to vary.
+
+    Everything is read through `expanded_names_in`, so both halves are measured against the widgets
+    the event actually carries rather than against the name of the list it carries them in.
+    """
+    root = tree()
+    for button in ("generate_variant_btn", "new_variant_btn"):
+        for keyword in ("inputs", "outputs"):
+            value = next((kw.value for node in ast.walk(root)
+                          if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                          and node.func.attr == "click"
+                          and getattr(node.func.value, "id", None) == button
+                          for kw in node.keywords if kw.arg == keyword), None)
+            assert value is not None, f"{button}.click has no {keyword}"
+            present = set(expanded_names_in(root, value))
+
+            for widget in SMART_MIX_VARIANT_WRITABLE:
+                assert widget in present, f"{button}.{keyword} lost {widget}"
+            for widget in SMART_MIX_NEVER_WRITTEN + (SMART_MIX_REPORT_WIDGET,):
+                assert widget not in present, f"{widget} in {button}.{keyword}"
+
+            # and the expansion is load-bearing rather than decorative: the widgets really are
+            # reached through a named sub-list, so the non-expanding form sees none of them
+            assert not set(SMART_MIX_VARIANT_WRITABLE) & set(names_in(value))
 
 
 def test_smart_mix_is_absent_from_the_live_source_declaration():
@@ -1318,7 +1370,16 @@ def test_no_cli_flag_was_added():
         assert flag not in text
 
 
-def test_the_reserved_audio_rng_domain_stays_unused():
+def test_the_gui_names_no_rng_domain_and_draws_nothing_itself():
+    """**Renamed in R1**, because the old name — `…the_reserved_audio_rng_domain_stays_unused` —
+    stopped being true when E2 V1 landed: the `audio` domain is now *used*, by `variant_lab.py`.
+
+    The assertion was always the useful half and is kept verbatim: `gui.py` owns no RNG derivation
+    and names no domain, so there is exactly one implementation of the audio draw and it is the
+    stdlib-only testable one. Kept as an independent control beside
+    `test_the_gui_delegates_audio_variation_and_implements_none_of_it`, which adds the positive
+    half (the delegation call, and the resolver really consuming the domain).
+    """
     import os as _os
     repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     with open(_os.path.join(repo, "src", "gui.py"), "r", encoding="utf-8") as handle:
@@ -1355,14 +1416,8 @@ def test_the_gui_invents_no_diagnostic_text_of_its_own():
 
 
 def test_the_report_still_has_exactly_one_writer_after_r1():
-    writers = []
-    for node in ast.walk(tree()):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"click", "change", "input", "submit", "release"}):
-            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is not None and SMART_MIX_REPORT_WIDGET in names_in(outputs):
-                writers.append(ast.unparse(node.func))
-    assert writers == ["process_btn.click"]
+    """Smart Mix R1's own guard, kept as an independent control alongside the one above."""
+    assert _writers_of(tree(), SMART_MIX_REPORT_WIDGET) == ["process_btn.click"]
 
 
 def test_r1_added_no_gradio_event():

@@ -130,8 +130,9 @@ from beatsync_fork import presets as fork_presets
 # sub-streams, the spread formula and every normalisation live in src/beatsync_fork/variant_lab.py,
 # and the resolved seven-integer recipe it returns is src/beatsync_fork/creative_recipe.py (both
 # stdlib-only, Gradio-free). This module only wires them to widgets: a resolved recipe is written
-# into the existing Variation Seed and six sliders, and nothing downstream of them learns that
-# Variant Lab exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
+# into the existing Variation Seed and six sliders — and, since E2 V1, a sibling audio recipe into
+# the three existing audio level widgets — and nothing downstream of them learns that Variant Lab
+# exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
 # handles the resolution object, so it has no reason to name the recipe type.
 from beatsync_fork import variant_lab as fork_lab
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
@@ -1091,17 +1092,20 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
                                          energy_response, motion_bias, source_diversity))
 
 
-# [FORK] Digital-Union (Variant Lab V1 / C2): the two Variant Lab handlers.
+# [FORK] Digital-Union (Variant Lab V1 / C2; audio half added by Variant Lab Audio / E2 V1): the
+# two Variant Lab handlers.
 #
-# Both read the six LIVE slider values as inputs — there is no cached base profile anywhere, so a
-# preset change or a manual edit is picked up by the next Generate automatically. Neither handler
-# registers anything on a slider: the existing preset `.input()` graph is untouched, and these run
-# only on their own button clicks.
+# Both read the LIVE widget values as inputs — the six creative sliders, and since E2 V1 the three
+# audio levels as well — so there is no cached base profile anywhere and a preset change or a
+# manual edit is picked up by the next Generate automatically. Neither handler registers anything
+# on a slider: the existing preset `.input()` graph is untouched, and these run only on their own
+# button clicks.
 #
 # What they write is deliberately the whole story: the master seed (so a freshly minted one is
-# always visible), the existing Variation Seed, the six sliders, the preset label and the report.
-# No source widget, no preparation widget, no `process_btn` — generating a variant cannot clear a
-# confirmation or start a render.
+# always visible), the existing Variation Seed, the six sliders, the preset label, the three audio
+# levels (`music_under_voice`, `sfx_amount`, `sfx_level` — E2 V1) and the report. No source widget,
+# no preparation widget, no `process_btn` — generating a variant cannot clear a confirmation or
+# start a render.
 
 
 #: Display label for each creative control inside the Variant Lab checkbox group. An explicit
