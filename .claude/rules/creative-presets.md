@@ -46,6 +46,28 @@ old render reproduces from *its recorded values* instead of from a historical la
   slider bindings are written out **explicitly per widget**, not in a loop and not through `gr.on`:
   either of those hides the binding from the per-widget seam assertions, which is evasion rather
   than compliance.
+- **One user handler per slider; four permitted programmatic writers.** These are two different
+  statements and conflating them is how this rule went stale. The older wording — "the only
+  permitted writer of a slider is `creative_preset.input`" — stopped being true the moment C2
+  shipped, and C3 added a fourth. Current truth:
+
+  ```
+  USER HANDLER (each slider registers exactly one, and it must be .input()):
+      <slider>.input()  ->  creative_preset
+
+  PERMITTED PROGRAMMATIC WRITERS of a slider, exactly these four:
+      creative_preset.input
+      generate_variant_btn.click
+      new_variant_btn.click
+      apply_variant_btn.click      (Variant Lab C3 V1 — Apply Selected Variant)
+  ```
+
+  `generate_variants_btn.click` is deliberately **not** one of them: generating candidates for
+  comparison writes no execution widget. `test_creative_controls_seam.py` pins the writer list
+  exactly and resolves list indirection, so neither a fifth writer nor one hidden behind an
+  intermediate list can arrive unreviewed. Preset *semantics* are unchanged by any of this: the
+  label is still recomputed from all six values, and a programmatic write still does not fire
+  `.input()`, which is why the Variant Lab projection helper computes `matching_preset` itself.
 - **`creative_control_sliders` order *is* a contract.** It is the preset handler's `outputs` and
   every slider handler's `inputs`, and Gradio matches those positionally, so it must stay in
   `CREATIVE_CONTROL_FIELDS` order (which is **not** the widget declaration order). A test pins it.
@@ -94,8 +116,7 @@ old render reproduces from *its recorded values* instead of from a historical la
 - **Two existing seam tests were amended, not weakened.** They asserted that a creative slider
   registers *no* handler and that *nothing* writes one. Each now registers exactly one, so the
   assertions moved to the stronger properties the originals protected: exactly one handler, it must
-  be `.input()`, its only output is `creative_preset`, and the only permitted writer of a slider is
-  `creative_preset.input`. Keep
+  be `.input()`, and its only output is `creative_preset`. Keep
   `test_creative_profile.py::test_no_preset_or_director_field_was_added` — it is now the
   load-bearing proof that presets stayed a UI layer.
 

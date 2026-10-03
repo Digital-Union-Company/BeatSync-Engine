@@ -1,8 +1,10 @@
 ---
 paths:
   - "src/beatsync_fork/variant_lab.py"
+  - "src/beatsync_fork/variant_batch.py"
   - "src/beatsync_fork/creative_recipe.py"
   - "tests/test_variant_lab.py"
+  - "tests/test_variant_batch.py"
   - "tests/test_creative_recipe.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -29,6 +31,11 @@ GENERATE =  one visual recipe  (CreativeRecipe: Variation Seed + the six creativ
          written into the visible execution widgets — and it renders nothing.
 ```
 
+**C3 V1 then added a second button beside Generate, not a second lab**: Generate Variants resolves
+N candidates from one frozen reading of the screen, a table compares them, and Apply Selected
+writes exactly one into those same execution widgets. It still renders nothing. The full contract
+is the C3 section at the bottom of this file.
+
 `AudioRecipe` is a **sibling** of `CreativeRecipe`, never a field of it, and no audio value enters
 `CreativeProfile` or `beat_info["creative"]`. The visual contract below is therefore unchanged by
 E2: the pipeline still receives exactly the same seven values it always has, because the three
@@ -40,8 +47,8 @@ Generating writes the **existing** Variation Seed, the six sliders and — only 
 something under Audio variation — the three audio level widgets. Nothing else. No Variant Lab state
 reaches `CreativeProfile`, `beat_info["creative"]`, `process_video_guarded`, `render_info`, the
 filename or any stage — the planner has never heard of recipes. **It renders nothing**; the user
-still presses Create Music Video. Multi-variant generation, batch rendering and variant comparison
-are **C3** and a test asserts none of that machinery exists.
+still presses Create Music Video. **Multi-variant generation and comparison shipped as C3 V1** (bottom of this file);
+**batch rendering is still deferred** and a split guard asserts none of that machinery exists.
 
 - **The base is always the live sliders.** No base control inside the lab and no cached snapshot:
   the six current values are read at click time, so Balanced explores around Balanced and a
@@ -50,7 +57,10 @@ are **C3** and a test asserts none of that machinery exists.
   to the nearest edge (`anchor = clamp(base, lo, hi)`) rather than raising.
 - **Named RNG sub-streams, and this is the load-bearing part.** Key format, pinned by golden-vector
   tests: `"variant_lab|1|<master>|<domain>|<name>"` → SHA-1 → first 12 hex digits → `random.Random`.
-  Domains are `clips`, `controls` and `audio` — all three are **used** since E2 V1. A single sequential
+  Domains are `clips`, `controls`, `audio` and — since C3 V1 — `batch`; all four are **used**.
+  The registry lives in `variant_lab.py` even though C3's orchestration lives in
+  `variant_batch.py`, because a domain list split across two modules is how two domains
+  eventually collide. A single sequential
   `random.Random(master)` would be simpler and is exactly what this must not be: adding one control
   later would shift every subsequent draw and silently invalidate every master seed a user wrote
   down. Five properties each have a test — enabling/disabling another control, re-ranging another
@@ -211,3 +221,140 @@ AUDIO_CONTROL_FIELDS = ("music_under_voice_percent", "sfx_amount", "sfx_level_pe
   `DOMAIN_AUDIO`; it calls `fork_lab.resolve_audio(...)`, and the pure resolver is the only consumer
   of the `audio` domain. The writer matrix is pinned by **split** seam guards in
   `.claude/rules/audio-mixdown.md`'s suite — see that rule before touching an audio widget.
+
+## Variant Lab multi-variant generation and comparison (C3 V1)
+
+C2 and E2 resolve **one** recipe per click and write it straight back. That is a good way to wander
+and a poor way to *choose*. C3 adds the choosing:
+
+```
+GENERATE N  ->  COMPARE N  ->  APPLY ONE  ->  (the user presses Create Music Video)
+```
+
+**C3 V1 renders nothing, and batch rendering is deliberately deferred.** A render is ~150 FFmpeg
+clip extractions through the one hardware encoder a *single* render already saturates
+(`_effective_clip_workers()` exists for exactly that contention); a candidate costs tens of
+microseconds. Those two do not belong in one feature, and the deferred milestone is **C3-R**.
+
+- **`beatsync_fork/variant_batch.py` orchestrates the frozen resolvers — it never re-implements
+  them.** Every candidate is `variant_lab.resolve(...)` + `variant_lab.resolve_audio(...)`
+  **unchanged**, with a derived candidate master. No second spread formula, no second range model,
+  no second half-up rounding; a test forbids `uniform(`, `_half_up`, `anchor_for` and `hashlib` in
+  the module. The dependency is one-way — `variant_batch → variant_lab`, never the reverse — and
+  `variant_lab.py` gained exactly one constant (`DOMAIN_BATCH`) and nothing else, which is why
+  every C2 and E2 golden vector is preserved *structurally* rather than by assertion.
+- **One candidate master per index, keyed `variant_lab|1|<root>|batch|<i>`**, drawn into
+  1..999999 — the same six-digit range every other seed the user sees lives in, so a candidate
+  master can be read off the table and typed into the Master Seed box. Index-keyed rather than
+  sequential, and that is the load-bearing choice: **asking for 8 candidates instead of 5 leaves
+  the first 5 identical**, which one `Random(root)` stream could not promise.
+- **Candidate masters are unique as a contract, not a probability.** Twelve six-digit draws collide
+  about once in 14,000 batches, and two identical rows read as a bug. A collision steps
+  deterministically forward (wrapping at the top) against the masters already fixed at **lower**
+  indices only — so prefix stability survives, the scan is bounded by the count cap, and it is
+  never a redraw (a test asserts no RNG call inside that loop). Same reasoning as C2 R1-B's
+  `_fresh_variant_master_seed`, and the forced-collision test is monkeypatched rather than hoped for.
+- **A candidate master alone is still not a recipe identifier.** R1-A's rule is unchanged and
+  applies to both seeds: *candidate master + the same base, ranges, randomize selections, Spread
+  and algorithm version → the same candidate*; the master alone is not enough. Two tests pin both
+  halves, and no UI copy may claim master-only replay.
+- **One Generate Variants click freezes the screen once.** All N candidates resolve from the *same*
+  original visual and audio base — candidate 2 is never resolved from candidate 1. That is
+  structural rather than careful: **generation writes no execution widget at all**, so there is no
+  path by which a result could feed the next draw. Looping today's single Generate would chain,
+  because *that* handler writes back; this one does not.
+- **`VariantBatchDeclaration` is a declaration record, not the cached base snapshot C2 rejected.**
+  It is never read as a substitute for the live widgets at resolve time — only compared against
+  them. Same family as `SourceSnapshot` and `PrepScanResult`. Canonical by construction: explicit
+  stable field order, plain int/str/tuple members, both ordered collections in their owning
+  module's field order, and every base normalised by the normaliser that **owns** it (the 35/50/50
+  audio split is not interchangeable), so `50` and `50.0` are one declaration rather than two.
+- **Staleness is answered by equality, not a digest.** `live_declaration.matches(batch.declaration)`
+  is plain structural equality between two small frozen records — no canonical-serialisation
+  contract to keep in step, and **no digest, fingerprint or display tag exists beside it**. An R0
+  draft carried a `short_digest()` that nothing consumed and that reached `rng_for` with a
+  `"display"` domain string, inventing a **fifth** RNG domain to decorate a status line; R1 removed
+  the method rather than registering the domain. A test now forbids `digest` / `hashlib` /
+  `__hash__` in the module outright, so there is no second answer to "is this batch current", not
+  even an unused one.
+- **Apply validation never mints a master seed (R1), and that is a correctness rule rather than
+  tidiness.** The three handlers share one normalisation helper, which takes a keyword-only
+  `mint_unset_master`:
+
+  ```
+  Generate Variant / Generate Variants  ->  may mint an unset master, and SURFACE what they minted
+  Apply Selected   (validation)         ->  NEVER mints; an unusable live master stays 0,
+                                            so the declaration is deterministically stale
+  ```
+
+  R0 reused the Generate normalisation wholesale, so rebuilding the live declaration minted
+  whenever the box was unusable. With the Master Seed blanked, a `random_seed()` that happened to
+  return the batch's own root made the reconstructed declaration compare **equal**, and Apply wrote
+  a candidate for a screen that no longer declared that root — an unsurfaced draw deciding a gate,
+  the exact class C2 R1-B already rejected for `_fresh_variant_master_seed`. A forced-draw
+  regression test pins it: `random_seed` is patched to return the batch root, and Apply must still
+  refuse with **zero** invocations. Note the boundary is *usability*, not spelling —
+  `normalize_seed` accepts `"582913"`, so the string form is the same declaration and Apply
+  correctly succeeds.
+- **The gate is live and fail-closed, and there are deliberately NO `.change()` invalidation
+  handlers.** Apply re-reads the whole screen through the shared normalisation helper at click time
+  and refuses unless it equals the stored declaration — the same reason `process_btn` validates the
+  live source controls and `prep_analyze_btn` takes the live preparation controls: Gradio delivers
+  widget changes as separate queued events, so state can lag the widgets. Adding a clearing handler
+  to every slider would put a *second* binding on widgets whose single `.input()` is itself a
+  load-bearing contract. The table is labelled **Last generated batch**, so its presence claims
+  history, not currency.
+- **A refusal changes nothing.** Every execution widget gets `gr.skip()`. A *stale* refusal also
+  consumes the batch and clears the selector, so a stale list cannot be retried; a missing
+  selection does **not** consume it, because the list is still perfectly valid and the user simply
+  has not chosen one yet.
+- **Apply is terminal for one batch.** A successful apply moves the live base, so every remaining
+  candidate now describes a starting point that no longer exists. The batch is consumed and the
+  selector cleared; generate again to explore from where you landed.
+- **Apply writes the candidate's own master into the Master Seed box.** That field means
+  *provenance for the recipe now on the sliders* — leaving the batch root there would make the
+  visible seed disagree with `VariantLabResolution.describe()` in the report beside it. The batch
+  root stays visible in the Last generated batch text. Two provenance levels, neither of them an
+  identifier on its own.
+- **One projection helper, one preset path.** Apply calls the existing `_variant_apply_outputs`
+  with temporarily rehydrated resolution objects, so it writes the identical thirteen-widget tuple
+  an ordinary Generate writes and recomputes `matching_preset` explicitly (programmatic writes do
+  not fire `.input()`). A test asserts Apply's output equals a single Generate from that candidate
+  master.
+- **`gr.State` deep-copies its value, and that is a real constraint rather than a style note.**
+  `VariantLabConfig` / `AudioVariantConfig` hold `MappingProxyType` and the resolutions hold those
+  configs, so none of them may enter the batch. `VariantBatch` stores plain ints, strings, tuples
+  and the two frozen recipe dataclasses; `rehydrate()` builds temporary resolutions inside one
+  handler and never returns them into state. Tests assert `copy.deepcopy(batch) == batch` and walk
+  every reachable object for a forbidden type.
+- **Count: min 2, max 12, default 5.** The cap is **comparison legibility and a typo guard**, not a
+  resource bound — twelve candidates cost about a millisecond. **Do not reuse this number as a
+  future batch-render limit**; generating and rendering differ by roughly six orders of magnitude.
+  Normalisation mirrors `_normalize_endpoint`: `bool` rejected first, whole floats accepted,
+  fractional / `NaN` / `inf` / string → default, out of range clamped.
+- **GUI: six components** inside the *existing* Variant Lab accordion — a count `gr.Number`, a
+  Generate Variants button, a read-only table `gr.Textbox`, a `gr.Radio` selector whose
+  `(label, value)` value **is** the candidate index, an Apply button and a read-only status
+  `gr.Textbox`. No `gr.Dataframe` dependency. The selector registers no handler; Apply reads it at
+  click time. `VariantBatch.table_text()` is the one formatter — `gui.py` formats none of it.
+- **Isolation.** `variant_batch_state` is comparison/selection state: `apply_variant_btn.click` is
+  its only reader, and it is absent from `process_btn.click`, `source_outputs`, `prep_outputs`,
+  `live_declaration`, `CreativeProfile`, `beat_info["creative"]` and both mix configs.
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `video_analysis.py`, `video_processor.py`,
+  `ffmpeg_processing.py`, `audio_mix.py`, `smart_mix.py`, `library_prep.py` and `src/auto_mode/*`
+  are untouched. **No CLI flag** — C3 is a GUI comparison workflow, and the CLI already takes the
+  resolved values directly.
+- **The writer matrices were extended by exact list, never relaxed.** The six creative sliders now
+  have exactly `creative_preset.input`, `generate_variant_btn.click`, `new_variant_btn.click` and
+  `apply_variant_btn.click`; the three audio levels exactly the latter three. Note what is absent
+  from both: `generate_variants_btn.click`, because generating candidates writes no execution
+  widget. See `.claude/rules/audio-mixdown.md` and `.claude/rules/creative-presets.md`.
+- **Two pre-C3 negative guards were split, not deleted** —
+  `test_variant_lab.py::test_no_multi_variant_or_c3_machinery_was_added` and
+  `test_creative_presets.py::test_the_gui_added_no_speculative_mode_machinery`. `variant_lab.py`,
+  `creative_recipe.py` and `presets.py` still know nothing about C3; `gui.py` may carry only the
+  accepted names. The load-bearing replacement is **structural**, not a token list: the call graph
+  is walked from both C3 buttons and may not reach `process_video_guarded`, `process_video`,
+  `analyze_beats_auto` or `create_music_video`. A rename cannot evade that the way a word list
+  would.

@@ -30,6 +30,7 @@ import pytest
 from beatsync_fork import creative as fork_creative
 from beatsync_fork import creative_recipe as fork_recipe
 from beatsync_fork import presets as fork_presets
+from beatsync_fork import variant_batch as fork_batch
 from beatsync_fork import variant_lab as fork_lab
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -674,14 +675,82 @@ def test_the_core_modules_name_no_runtime_or_pipeline_machinery(path: str):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"{path} mentions {word!r}"
 
 
-def test_no_multi_variant_or_c3_machinery_was_added():
-    """C2 is one recipe at a time. Batch generation, comparison and reuse are C3."""
-    for path in (_LAB, _RECIPE, _GUI):
+def test_the_frozen_resolvers_know_nothing_about_multi_variant_generation():
+    """**Split by C3 V1, not deleted.** This was one blanket ban on every C3 term anywhere.
+
+    C3 shipped generation and comparison, so the ban had to change — and the half that was always
+    load-bearing is kept at *full* strength here: `variant_lab.py` and `creative_recipe.py` still
+    contain no batch concept at all. C3 lives in a sibling module that imports them; they do not
+    import it, and they did not learn a thing. `DOMAIN_BATCH` is the one deliberate exception —
+    the domain registry stays in one place — and it is a bare string constant, not machinery.
+    """
+    for path in (_LAB, _RECIPE):
         source = _executable_source(path).lower()
         for word in ("generate_variants", "variant_batch", "variant_count", "num_variants",
-                     "compare_variants", "variant_gallery", "freestyle", "director",
-                     "stage_cache", "shortlist"):
+                     "compare_variants", "variant_gallery", "resolve_batch", "candidate",
+                     "freestyle", "director", "stage_cache", "shortlist"):
             assert not re.search(rf"\b{re.escape(word)}\b", source), f"{path} mentions {word!r}"
+
+
+def test_the_gui_carries_only_the_accepted_c3_machinery():
+    """The positive half: C3's names are legitimate in `gui.py` now, and only these.
+
+    A term ban is the weak half of this guard — a rename defeats it — so the structural assertion
+    below is the one that matters. This exists to stop the *other* deferred ideas drifting in
+    alongside the accepted ones.
+    """
+    source = _executable_source(_GUI).lower()
+    for word in ("variant_gallery", "render_batch", "batch_render", "stage_cache", "shortlist",
+                 "freestyle", "director", "thumbnail", "variant_preview"):
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+
+
+def test_no_c3_handler_can_reach_a_render_entry_point():
+    """The load-bearing C3 boundary, asserted structurally rather than by banned token.
+
+    C3 V1 generates, compares and applies settings. Neither of its buttons may reach the render
+    path — not directly, and not through anything either handler calls. The call graph is walked
+    from each entry point, so renaming a handler cannot slip past this the way a word list could.
+    """
+    tree = _tree(_GUI)
+    defined = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+    forbidden = {"process_video_guarded", "process_video", "_process_video_impl",
+                 "analyze_beats_auto", "create_music_video", "build_mixed_master",
+                 "prepare_voice_inputs", "prepare_sfx_inputs", "resolve_for_render"}
+
+    for entry in ("_on_generate_variants", "_on_apply_selected_variant"):
+        assert entry in defined, entry
+        seen, pending = set(), [entry]
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            node = defined.get(name)
+            if node is None:
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                rendered = ast.unparse(call.func)
+                leaf = rendered.rsplit(".", 1)[-1]
+                assert leaf not in forbidden, f"{entry} reaches {rendered} (via {name})"
+                if leaf in defined:
+                    pending.append(leaf)
+        assert len(seen) > 1, f"{entry} resolved no call graph at all"
+
+
+def test_c3_generation_and_apply_write_no_render_or_gate_widget():
+    tree = _tree(_GUI)
+    for list_name in ("variant_batch_inputs", "variant_batch_outputs"):
+        names = _expanded_list(tree, list_name)
+        for forbidden in ("video_output", "status_output", "session_state", "process_btn",
+                          "source_outputs", "source_state", "source_report", "confirm_btn",
+                          "prep_outputs", "prep_state", "prep_report", "prep_analyze_btn",
+                          "audio_input", "output_filename", "processing_mode", "custom_fps",
+                          "audio_layers_report", "smart_mix_report"):
+            assert forbidden not in names, f"{forbidden} in {list_name}"
 
 
 def test_stage_five_and_the_planner_know_nothing_about_variant_lab():
@@ -935,9 +1004,20 @@ def test_new_variant_delegates_to_the_one_generate_path():
 
 
 def test_the_generate_handler_mints_a_visible_master_seed_when_unset():
-    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_generate_variant")))
-    assert "fork_lab.normalize_master_seed(variant_master_seed)" in body
-    assert "fork_variation.random_seed()" in body
+    """**Structurally updated by C3**: the minting moved into the shared normalisation helper.
+
+    The property is unchanged and is now asserted where it actually lives — and it is *stronger*
+    for having moved, because all three handlers that read the Variant Lab screen now mint through
+    the same code instead of two of them growing their own copy.
+    """
+    tree = _tree(_GUI)
+    context = ast.unparse(_strip_docstrings(
+        _func(tree, "_build_variant_resolution_context")))
+    assert "fork_lab.normalize_master_seed(variant_master_seed)" in context
+    assert "fork_variation.random_seed()" in context
+
+    body = ast.unparse(_strip_docstrings(_func(tree, "_on_generate_variant")))
+    assert "_build_variant_resolution_context(" in body
     assert "fork_lab.resolve(config, base)" in body
     # the minted seed is returned as an output rather than used invisibly
     outputs = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_variant_apply_outputs")))
@@ -1049,8 +1129,12 @@ def test_a_generated_variant_almost_always_reads_custom():
 # dependency outside it fails here with NameError rather than silently going untested.
 # ---------------------------------------------------------------------------
 
-_HANDLER_NAMES = ("_variant_apply_outputs", "_on_generate_variant",
-                  "_fresh_variant_master_seed", "_on_new_variant")
+#: `_build_variant_resolution_context` joined the set with C3: the normalisation `_on_generate_variant`
+#: used to inline was lifted into it so Generate Variants and Apply Selected read the screen through
+#: exactly the same code. Extracting the handler without it would fail with `NameError`, which is
+#: itself the proof that the helper is on the real call path rather than a parallel copy.
+_HANDLER_NAMES = ("_variant_apply_outputs", "_build_variant_resolution_context",
+                  "_on_generate_variant", "_fresh_variant_master_seed", "_on_new_variant")
 
 
 def _gui_handlers():
@@ -1764,21 +1848,34 @@ def test_the_audio_randomize_choices_are_explicit_label_value_pairs():
 
 def test_the_handler_resolves_audio_from_the_same_master_seed_and_spread():
     """One visible seed, one visible Spread, both halves. No hidden second source of randomness."""
-    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_generate_variant")))
+    tree = _tree(_GUI)
+    body = ast.unparse(_strip_docstrings(_func(tree, "_on_generate_variant")))
 
-    assert "fork_lab.resolve_audio(master_seed, audio_config, variation_spread, audio_base)" \
-        in body
+    # `config.spread` since C3 rather than the raw widget: `resolve_audio` normalises its own
+    # `spread` argument and `normalize_spread` is idempotent, so the value is identical — and the
+    # normalised one is what a batch declaration records.
+    assert "fork_lab.resolve_audio(master_seed, audio_config, config.spread, audio_base)" in body
     assert "fork_lab.resolve(config, base)" in body
-    # the only non-deterministic call stays the visible master-seed mint
-    assert body.count("fork_variation.random_seed()") == 1
-    for forbidden in ("rng_for", "DOMAIN_AUDIO", "SystemRandom", "audio_spread",
+    # the only non-deterministic call stays the visible master-seed mint, now in the shared helper
+    context = ast.unparse(_strip_docstrings(
+        _func(tree, "_build_variant_resolution_context")))
+    assert context.count("fork_variation.random_seed()") == 1
+    assert "fork_variation.random_seed()" not in body
+    for forbidden in ("rng_for", "DOMAIN_AUDIO", "DOMAIN_BATCH", "SystemRandom", "audio_spread",
                       "audio_master_seed"):
         assert forbidden not in body, forbidden
+        assert forbidden not in context, forbidden
 
 
 def test_the_live_audio_widgets_are_the_audio_bases():
-    """The base is the live widget value, read at click time — no cached audio snapshot."""
-    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_generate_variant")))
+    """The base is the live widget value, read at click time — no cached audio snapshot.
+
+    **Structurally updated by C3**: this construction moved into the shared normalisation helper,
+    so all three Variant Lab handlers derive each audio base through the normaliser that *owns*
+    that control. One place, three callers — the 35/50/50 split cannot drift between them.
+    """
+    body = ast.unparse(_strip_docstrings(
+        _func(_tree(_GUI), "_build_variant_resolution_context")))
     for expected in (
             "'music_under_voice_percent': fork_audio_mix.normalize_music_under_voice("
             "music_under_voice)",
@@ -1834,3 +1931,586 @@ def test_the_projection_helper_formats_no_text_of_its_own():
     assert "audio_resolution.describe()" in body
     assert "Audio ·" not in body and "Music under voice" not in body
     assert "SFX Amount" not in body and "SFX Level" not in body
+
+
+# ===========================================================================
+# 14. VARIANT LAB C3 V1 — generate N, compare N, apply exactly one
+# ===========================================================================
+
+#: The C3 handlers, extracted and executed the same way the C2/E2 ones are. `gr` is stubbed because
+#: the real handlers legitimately return `gr.update(...)` / `gr.skip()` sentinels, and `fork_batch`
+#: is the pure module they orchestrate — both belong to the real dependency set, so stubbing
+#: anything *else* would be mocking the code under test rather than its environment. The
+#: declaration gate, the staleness refusal and the Apply projection are all genuinely executed here.
+_C3_HANDLER_NAMES = ("_variant_apply_outputs", "_build_variant_resolution_context",
+                     "_variant_batch_skips", "_on_generate_variants",
+                     "_on_apply_selected_variant")
+
+
+class _FakeUpdate:
+    """Stands in for `gr.update(...)`, recording what the handler asked the widget to become."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __eq__(self, other):
+        return isinstance(other, _FakeUpdate) and self.kwargs == other.kwargs
+
+    def __repr__(self):
+        return f"update({self.kwargs})"
+
+
+class _FakeSkip:
+    """Stands in for `gr.skip()` — "leave this widget exactly as it is"."""
+
+    def __eq__(self, other):
+        return isinstance(other, _FakeSkip)
+
+    def __repr__(self):
+        return "skip"
+
+
+class _FakeGradio:
+    update = staticmethod(lambda **kwargs: _FakeUpdate(**kwargs))
+    skip = staticmethod(_FakeSkip)
+
+
+def _c3_handlers():
+    from beatsync_fork import audio_mix as fork_audio_mix
+    from beatsync_fork import smart_mix as fork_smart_mix
+    from beatsync_fork import variation as fork_variation
+    from typing import Tuple
+
+    tree = _tree(_GUI)
+    wanted = {name: None for name in _C3_HANDLER_NAMES}
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            wanted[node.name] = node
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", "").startswith("_VARIANT_APPLY")):
+            constants[node.targets[0].id] = ast.literal_eval(node.value)
+    missing = [name for name, node in wanted.items() if node is None]
+    assert not missing, f"C3 handlers not found at module level: {missing}"
+
+    namespace = {"fork_presets": fork_presets, "fork_lab": fork_lab, "fork_batch": fork_batch,
+                 "fork_variation": fork_variation, "fork_audio_mix": fork_audio_mix,
+                 "fork_smart_mix": fork_smart_mix, "Tuple": Tuple, "gr": _FakeGradio,
+                 "LABEL_APPLY_VARIANT": "Apply Selected Variant", **constants}
+    exec(compile(ast.Module(body=list(wanted.values()), type_ignores=[]),
+                 filename=_GUI, mode="exec"), namespace)
+    return namespace
+
+
+def _lab_args(master=582913, base=None, spread=50, randomized=None, ranges=None,
+              audio_randomized=None, audio_ranges=None, audio_base=None):
+    """The thirty positional Variant Lab arguments, in `variant_lab_inputs` order."""
+    base = CINEMATIC if base is None else base
+    randomized = list(FIELDS) if randomized is None else randomized
+    ranges = {f: (0, 100) for f in FIELDS} if ranges is None else ranges
+    audio_randomized = list(AUDIO_FIELDS) if audio_randomized is None else audio_randomized
+    audio_ranges = ({f: (0, 100) for f in AUDIO_FIELDS}
+                    if audio_ranges is None else audio_ranges)
+    audio_base = dict(AUDIO_BASE_DEFAULTS) if audio_base is None else audio_base
+    return ([master, spread, randomized]
+            + [v for f in FIELDS for v in ranges[f]]
+            + [audio_randomized]
+            + [v for f in AUDIO_FIELDS for v in audio_ranges[f]]
+            + [base[f] for f in FIELDS]
+            + [audio_base[f] for f in AUDIO_FIELDS])
+
+
+def _generate_batch(count=5, handlers=None, **kwargs):
+    handlers = _c3_handlers() if handlers is None else handlers
+    return handlers["_on_generate_variants"](count, *_lab_args(**kwargs))
+
+
+def _apply(batch, selection, count=5, handlers=None, **kwargs):
+    handlers = _c3_handlers() if handlers is None else handlers
+    return handlers["_on_apply_selected_variant"](
+        batch, selection, count, *_lab_args(**kwargs))
+
+
+# --- the widgets -----------------------------------------------------------
+
+C3_ELEM_IDS = ("variant-candidate-count", "generate-variants-button", "variant-batch-table",
+               "variant-candidate-selector", "apply-variant-button", "variant-batch-status")
+
+
+def test_the_c3_components_exist_exactly_once_each():
+    source = _executable_source(_GUI)
+    widgets = _widget_calls(_tree(_GUI))
+    for elem in C3_ELEM_IDS:
+        assert elem in widgets, elem
+        assert source.count(f"'{elem}'") == 1, f"{elem} is declared more than once"
+
+
+def test_the_candidate_count_widget_carries_the_shipped_bounds():
+    kwargs = {kw.arg: ast.unparse(kw.value)
+              for kw in _widget_calls(_tree(_GUI))["variant-candidate-count"].keywords}
+    assert kwargs["value"].endswith("CANDIDATE_COUNT_DEFAULT")
+    assert kwargs["minimum"].endswith("CANDIDATE_COUNT_MIN")
+    assert kwargs["maximum"].endswith("CANDIDATE_COUNT_MAX")
+    assert kwargs["precision"] == "0"
+    assert (fork_batch.CANDIDATE_COUNT_MIN, fork_batch.CANDIDATE_COUNT_DEFAULT,
+            fork_batch.CANDIDATE_COUNT_MAX) == (2, 5, 12)
+
+
+def test_the_comparison_table_and_status_are_read_only():
+    widgets = _widget_calls(_tree(_GUI))
+    for elem in ("variant-batch-table", "variant-batch-status"):
+        kwargs = {kw.arg: ast.unparse(kw.value) for kw in widgets[elem].keywords}
+        assert ast.unparse(widgets[elem].func).endswith("Textbox")
+        assert kwargs["interactive"] == "False"
+        assert kwargs["value"] == "''"
+
+
+def test_the_candidate_selector_is_a_radio_that_registers_no_handler():
+    """Selection is read by Apply at click time; a `.change()` writer would be a second path."""
+    tree = _tree(_GUI)
+    assert ast.unparse(_widget_calls(tree)["variant-candidate-selector"].func).endswith("Radio")
+    for widget in ("variant_candidate_selector", "variant_candidate_count",
+                   "variant_batch_table", "variant_batch_status"):
+        assert _registration(tree, widget) == [], f"{widget} registers a handler of its own"
+
+
+def test_the_c3_state_starts_empty():
+    assert "variant_batch_state = gr.State(None)" in _executable_source(_GUI)
+
+
+def test_c3_added_no_handler_to_any_declaration_widget():
+    """**Deliberately no eager invalidation.** The creative sliders keep exactly one `.input()`
+    binding each, and the audio controls keep none — the live Apply gate is the authority, so a
+    second handler per widget would be machinery bought for nothing and a cycle risk besides."""
+    tree = _tree(_GUI)
+    for widget in list(FIELDS) + AUDIO_BASE_WIDGETS + list(AUDIO_CONFIG_WIDGETS) + [
+            "variant_master_seed", "variation_spread", "variant_randomize"]:
+        registrations = _registration(tree, widget)
+        if widget in FIELDS:
+            assert len(registrations) == 1, f"{widget} must keep exactly one handler"
+            assert registrations[0].func.attr == "input"
+            assert _names(_kwargs(registrations[0])["outputs"]) == ["creative_preset"]
+        else:
+            assert registrations == [], f"{widget} gained a handler"
+
+
+# --- Generate Variants -----------------------------------------------------
+
+
+def test_generate_variants_reads_every_declaration_value_in_order():
+    """Its inputs are the count plus `variant_lab_inputs` verbatim — one list, one alignment."""
+    tree = _tree(_GUI)
+    assert len(_registration(tree, "generate_variants_btn", attrs=("click",))) == 1
+    inputs = _expanded_list(tree, "variant_batch_inputs")
+    assert inputs == ["variant_candidate_count"] + _expanded_list(tree, "variant_lab_inputs")
+
+    parameters = [a.arg for a in _func(tree, "_on_generate_variants").args.args]
+    assert parameters == inputs, "Gradio passes positionally; the two are one contract"
+
+
+def test_generate_variants_writes_no_execution_widget():
+    """The structural reason candidate chaining is impossible rather than merely avoided.
+
+    Read off the **registration**, not off the named list: `outputs=variant_batch_outputs + [x]`
+    would satisfy a list-only check while writing `x` on every press.
+    """
+    tree = _tree(_GUI)
+    call = _registration(tree, "generate_variants_btn", attrs=("click",))[0]
+    declared = _ordered_names(_kwargs(call)["outputs"])
+    assert declared == ["variant_batch_outputs"], "no widget may be appended at the call site"
+
+    outputs = _expanded_list(tree, "variant_batch_outputs")
+    assert outputs == ["variant_master_seed", "variant_batch_state", "variant_batch_table",
+                       "variant_candidate_selector", "variant_batch_status"]
+    for forbidden in (["variation_seed", "creative_preset", "variant_report"] + list(FIELDS)
+                      + list(AUDIO_BASE_WIDGETS)):
+        assert forbidden not in outputs, f"generating candidates writes {forbidden}"
+
+
+def test_generating_candidates_renders_nothing_and_returns_a_real_batch():
+    handlers = _c3_handlers()
+    master, batch, table, selector, status = _generate_batch(handlers=handlers)
+    assert master == 582913
+    assert isinstance(batch, fork_batch.VariantBatch)
+    assert len(batch.candidates) == 5
+    assert "root master 582913" in table
+    assert isinstance(selector, _FakeUpdate)
+    assert selector.kwargs["value"] is None
+    assert [v for _l, v in selector.kwargs["choices"]] == [0, 1, 2, 3, 4]
+    assert "generated" in status.lower()
+
+
+@pytest.mark.parametrize("unusable", [0, None, "", -5, 7.9, True])
+def test_an_unusable_root_master_is_minted_and_surfaced(unusable):
+    master, batch, _table, _selector, _status = _generate_batch(master=unusable)
+    assert isinstance(master, int) and master > 0
+    assert batch.declaration.root_master_seed == master, \
+        "the batch must be built from the seed the user can actually see"
+
+
+def test_the_generated_batch_is_exactly_what_the_pure_resolver_produces():
+    """The handler normalises and delegates; it must not become a second resolution path."""
+    _master, batch, table, _selector, _status = _generate_batch(count=7, spread=70)
+    config = fork_lab.VariantLabConfig(
+        master_seed=582913, spread=70, randomized=frozenset(FIELDS),
+        ranges={f: (0, 100) for f in FIELDS})
+    audio_config = fork_lab.AudioVariantConfig(
+        randomized=frozenset(AUDIO_FIELDS), ranges={f: (0, 100) for f in AUDIO_FIELDS})
+    expected = fork_batch.resolve_batch(fork_batch.declaration_from(
+        config, CINEMATIC, audio_config, AUDIO_BASE_DEFAULTS, 7))
+    assert batch == expected
+    assert table == expected.table_text()
+
+
+def test_the_batch_handed_to_state_survives_a_deep_copy():
+    """Gradio deep-copies `State`; a config or resolution in here would fail at runtime."""
+    import copy
+    _master, batch, _table, _selector, _status = _generate_batch(count=12)
+    assert copy.deepcopy(batch) == batch
+
+
+def test_every_candidate_in_the_handler_output_shares_one_frozen_base():
+    _master, batch, _t, _s, _st = _generate_batch(count=6, base=CINEMATIC, spread=100)
+    assert batch.declaration.visual_base == tuple(CINEMATIC[f] for f in FIELDS)
+    assert batch.declaration.audio_base == (35, 50, 50)
+
+
+# --- Apply Selected --------------------------------------------------------
+
+
+def test_apply_reads_the_live_declaration_inputs():
+    tree = _tree(_GUI)
+    calls = _registration(tree, "apply_variant_btn", attrs=("click",))
+    assert len(calls) == 1
+    # source order, not `ast.walk` order: this list is a positional contract with the signature
+    assert _ordered_names(_kwargs(calls[0])["inputs"]) == [
+        "variant_batch_state", "variant_candidate_selector", "variant_batch_inputs"]
+
+    expected = (["variant_batch_state", "variant_candidate_selector"]
+                + _expanded_list(tree, "variant_batch_inputs"))
+    parameters = [a.arg for a in _func(tree, "_on_apply_selected_variant").args.args]
+    assert parameters == expected, "Gradio passes positionally; the two are one contract"
+
+
+def test_apply_writes_the_ordinary_variant_lab_output_set_plus_its_own_three():
+    calls = _registration(_tree(_GUI), "apply_variant_btn", attrs=("click",))
+    assert _ordered_names(_kwargs(calls[0])["outputs"]) == [
+        "variant_lab_outputs", "variant_batch_state", "variant_candidate_selector",
+        "variant_batch_status"]
+
+
+def test_applying_a_candidate_writes_exactly_that_candidate():
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(count=5, handlers=handlers)
+    for index, candidate in enumerate(batch.candidates):
+        applied = _apply(batch, index, handlers=handlers)
+        assert applied[0] == candidate.master_seed, "the Master Seed box shows the CANDIDATE"
+        assert applied[1] == candidate.creative_recipe.seed
+        assert tuple(applied[2:8]) == candidate.visual_values()
+        assert applied[8] == candidate.preset_label
+        assert tuple(applied[9:12]) == candidate.audio_values()
+        assert str(candidate.master_seed) in applied[12], "the report quotes the same provenance"
+
+
+def test_apply_recomputes_the_preset_label_through_the_existing_projection():
+    """Programmatic writes do not fire `.input()`, so the label must be computed explicitly."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(
+        count=3, spread=0, base=CINEMATIC, handlers=handlers)
+    applied = _apply(batch, 0, count=3, spread=0, base=CINEMATIC, handlers=handlers)
+    assert tuple(applied[2:8]) == tuple(CINEMATIC[f] for f in FIELDS)
+    assert applied[8] == "Cinematic", "spread 0 holds the base, so the base preset still matches"
+
+
+def test_a_successful_apply_consumes_the_batch_and_clears_the_selector():
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    applied = _apply(batch, 2, handlers=handlers)
+    assert applied[13] is None, "the batch is consumed"
+    assert applied[14] == _FakeUpdate(choices=[], value=None)
+    assert "applied candidate 3" in applied[15].lower()
+
+
+def test_an_unchanged_screen_applies_successfully():
+    """The gate must be a gate, not a wall: the untouched case has to work."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    applied = _apply(batch, 1, handlers=handlers)
+    assert not any(isinstance(v, _FakeSkip) for v in applied[:13])
+
+
+_STALE_EDITS = {
+    "visual base moved": dict(base=dict(CINEMATIC, motion_bias=31)),
+    "spread moved": dict(spread=51),
+    "root master retyped": dict(master=582914),
+    "randomize changed": dict(randomized=["cut_density"]),
+    "range narrowed": dict(ranges={**{f: (0, 100) for f in FIELDS},
+                                   "cut_density": (10, 40)}),
+    "audio randomize changed": dict(audio_randomized=[]),
+    "audio range narrowed": dict(audio_ranges={**{f: (0, 100) for f in AUDIO_FIELDS},
+                                               "sfx_amount": (20, 30)}),
+    "audio base moved": dict(audio_base={"music_under_voice_percent": 40,
+                                         "sfx_amount": 50, "sfx_level_percent": 50}),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_STALE_EDITS))
+def test_a_stale_apply_changes_no_execution_widget_and_consumes_the_batch(label):
+    """The live declaration is the authority — the whole reason the gate exists."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    applied = _apply(batch, 0, handlers=handlers, **_STALE_EDITS[label])
+
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip), f"{label}: an execution widget was written"
+    assert applied[13] is None, f"{label}: the stale batch must be consumed"
+    assert applied[14] == _FakeUpdate(choices=[], value=None)
+    assert "no longer describe" in applied[15].lower()
+
+
+def test_a_changed_candidate_count_is_also_stale():
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(count=5, handlers=handlers)
+    applied = _apply(batch, 0, count=8, handlers=handlers)
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip)
+    assert applied[13] is None
+
+
+def test_a_stale_apply_cannot_be_retried():
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    first = _apply(batch, 0, handlers=handlers, spread=51)
+    assert first[13] is None
+    # the GUI now holds None, so a second press refuses earlier and still writes nothing
+    second = _apply(first[13], 0, handlers=handlers, spread=51)
+    for value in second[:13]:
+        assert isinstance(value, _FakeSkip)
+    assert "generate variants" in second[15].lower()
+
+
+@pytest.mark.parametrize("selection", [None, -1, 99, "0", 1.5, True])
+def test_apply_without_a_usable_selection_keeps_the_batch_and_writes_nothing(selection):
+    """Not stale — the list is still valid, the user simply has not chosen. Prompt, not punish."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    applied = _apply(batch, selection, handlers=handlers)
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip)
+    assert isinstance(applied[13], _FakeSkip), "a valid list must survive a missed selection"
+    assert isinstance(applied[14], _FakeSkip)
+    assert "select a candidate" in applied[15].lower()
+
+
+@pytest.mark.parametrize("empty", [None, "", 0, [], {}])
+def test_apply_with_no_batch_at_all_refuses_and_writes_nothing(empty):
+    handlers = _c3_handlers()
+    applied = _apply(empty, 0, handlers=handlers)
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip)
+    assert "generate variants" in applied[15].lower()
+
+
+def test_apply_produces_exactly_what_a_single_generate_from_that_master_would():
+    """Apply must land on the ordinary Generate output, not on something adjacent to it."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(handlers=handlers)
+    candidate = batch.candidates[3]
+    applied = _apply(batch, 3, handlers=handlers)
+    direct = _generate(candidate.master_seed, CINEMATIC,
+                       audio_randomized=list(AUDIO_FIELDS))
+    assert applied[:13] == direct
+
+
+# --- isolation -------------------------------------------------------------
+
+
+def test_the_batch_state_never_reaches_the_render_or_gate_paths():
+    tree = _tree(_GUI)
+    process = _registration(tree, "process_btn", attrs=("click",))[0]
+    assert "variant_batch_state" not in _names(_kwargs(process)["inputs"])
+    assert "variant_batch_state" not in _names(_kwargs(process)["outputs"])
+
+    for list_name in ("source_outputs", "prep_outputs", "variant_lab_inputs",
+                      "variant_lab_outputs"):
+        assert "variant_batch_state" not in _expanded_list(tree, list_name), list_name
+
+    for name in ("process_video_guarded", "process_video", "_process_video_impl"):
+        body = ast.unparse(_strip_docstrings(_func(tree, name)))
+        for word in ("variant_batch", "fork_batch", "VariantBatch", "candidate"):
+            assert word not in body, f"{name} references {word}"
+
+
+def test_only_apply_reads_the_batch_state():
+    tree = _tree(_GUI)
+    readers = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            inputs = next((kw.value for kw in node.keywords if kw.arg == "inputs"), None)
+            if inputs is None:
+                continue
+            reachable = set(_names(inputs))
+            for alias in list(reachable):
+                if _list_valued_assign(tree, alias) is not None:
+                    reachable.update(_expanded_list(tree, alias))
+            if "variant_batch_state" in reachable:
+                readers.append(ast.unparse(node.func))
+    assert readers == ["apply_variant_btn.click"], readers
+
+
+def test_the_c3_handlers_touch_no_gradio_component_directly():
+    """They return update/skip sentinels; they never reach into a component or a global."""
+    tree = _tree(_GUI)
+    for name in ("_on_generate_variants", "_on_apply_selected_variant"):
+        body = ast.unparse(_strip_docstrings(_func(tree, name)))
+        for forbidden in ("gr.Textbox", "gr.Radio", "gr.Number", "gr.Button", "gr.State",
+                          "session_state", "global "):
+            assert forbidden not in body, f"{name} references {forbidden}"
+
+
+def test_c3_introduced_no_hidden_execution_state():
+    source = _executable_source(_GUI)
+    for forbidden in ("_VARIANT_BATCH_CACHE", "_LAST_BATCH", "_candidate_snapshot",
+                      "VARIANT_BATCH_STATE_KEY", "_batch_base_snapshot"):
+        assert forbidden not in source, forbidden
+
+
+def test_new_variant_still_delegates_to_the_one_single_variant_path():
+    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_new_variant")))
+    assert "_on_generate_variant(" in body
+    assert "_on_generate_variants(" not in body, "New Variant stays single-variant"
+    assert "fork_batch" not in body
+
+
+# --- R1: Apply validation is deterministic and never mints -----------------
+
+
+class _CountingRandomSeed:
+    """A `random_seed` stand-in that both counts calls and returns the worst possible value."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.value
+
+
+#: Every spelling of "the Master Seed box no longer holds a usable value". `normalize_seed`
+#: refuses each of them, which is exactly why R0's mint branch fired on all of them. Note what is
+#: deliberately absent: a numeric *string*. `variation.normalize_seed` accepts `"582913"` as 582913,
+#: so that box is still declaring the same root and Apply must succeed — a test below pins it, and
+#: listing it here would have asserted the opposite of the truth.
+_UNUSABLE_MASTERS = [0, None, "", -5, 7.9, True, float("nan"), float("inf")]
+
+
+@pytest.mark.parametrize("unusable", _UNUSABLE_MASTERS)
+def test_apply_never_mints_a_master_while_validating(unusable, monkeypatch):
+    """**R1 — the load-bearing regression.** Apply's gate must not depend on a draw.
+
+    R0 reused the Generate normalisation wholesale, so rebuilding the live declaration minted a
+    master whenever the box was unusable. With the box blanked, a `random_seed()` that happened to
+    return the batch's own root made the reconstructed declaration compare **equal**, and Apply
+    wrote a candidate for a screen that no longer declared that root — a correctness decision
+    resolved by a one-in-a-million draw, and an unsurfaced one at that.
+
+    This forces the unlucky draw rather than waiting for it: `random_seed` is patched to return
+    exactly the batch root. Apply must still refuse, and must not have called it at all.
+    """
+    handlers = _c3_handlers()
+    root = 582913
+    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    assert batch.declaration.root_master_seed == root
+
+    spy = _CountingRandomSeed(root)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+
+    applied = _apply(batch, 0, handlers=handlers, master=unusable)
+
+    assert spy.calls == 0, "Apply must not draw while validating a candidate list"
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip), "a refusal must change no execution widget"
+    assert applied[13] is None, "the stale batch must be consumed"
+    assert applied[14] == _FakeUpdate(choices=[], value=None)
+    assert "no longer describe" in applied[15].lower()
+
+
+def test_an_unusable_live_master_is_stale_deterministically_every_time(monkeypatch):
+    """Not "usually stale": the same refusal a hundred times, with the draw rigged against us."""
+    handlers = _c3_handlers()
+    root = 582913
+    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    spy = _CountingRandomSeed(root)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+
+    for _ in range(100):
+        applied = _apply(batch, 0, handlers=handlers, master=0)
+        assert all(isinstance(v, _FakeSkip) for v in applied[:13])
+    assert spy.calls == 0
+
+
+def test_the_two_generate_handlers_still_mint_and_surface(monkeypatch):
+    """The other half of the split: generating is an action, so it may mint — and must show it."""
+    handlers = _c3_handlers()
+    minted = 424242
+
+    spy = _CountingRandomSeed(minted)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+    master, batch, _t, _s, _st = _generate_batch(master=0, handlers=handlers)
+    assert spy.calls == 1, "Generate Variants mints exactly once"
+    assert master == minted, "and returns it to variant_master_seed"
+    assert batch.declaration.root_master_seed == minted
+
+    spy = _CountingRandomSeed(minted)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+    single = _gui_handlers()["_on_generate_variant"](*_lab_args(master=0))
+    assert spy.calls == 1
+    assert single[0] == minted, "single Generate also surfaces what it minted"
+
+
+def test_a_numeric_string_master_is_the_same_declaration_not_a_stale_one():
+    """`variation.normalize_seed` accepts `"582913"` as 582913, so the box still declares the same
+    root and Apply must succeed. The gate refuses values that are *unusable*, not values that are
+    merely typed differently — a stale check that fired on re-typing would be a bug of its own."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(master=582913, handlers=handlers)
+    applied = _apply(batch, 0, handlers=handlers, master="582913")
+    assert not any(isinstance(v, _FakeSkip) for v in applied[:13])
+    assert applied[0] == batch.candidates[0].master_seed
+
+
+def test_the_mint_switch_is_keyword_only_and_apply_passes_false():
+    """Structural: the positional `inputs` list must never be able to supply this flag."""
+    tree = _tree(_GUI)
+    helper = _func(tree, "_build_variant_resolution_context")
+    assert [a.arg for a in helper.args.kwonlyargs] == ["mint_unset_master"]
+    assert helper.args.args[-1].arg == "sfx_level", "the 30 positional widget args are unchanged"
+    default = helper.args.kw_defaults[0]
+    assert isinstance(default, ast.Constant) and default.value is True
+
+    body = ast.unparse(_strip_docstrings(helper))
+    assert "if master_seed <= 0 and mint_unset_master:" in body
+    assert body.count("fork_variation.random_seed()") == 1
+
+    apply_body = ast.unparse(_strip_docstrings(_func(tree, "_on_apply_selected_variant")))
+    assert "mint_unset_master=False" in apply_body
+    assert "fork_variation" not in apply_body, "Apply owns no randomness of its own"
+    assert "random_seed" not in apply_body
+
+    for generator in ("_on_generate_variant", "_on_generate_variants"):
+        generated = ast.unparse(_strip_docstrings(_func(tree, generator)))
+        assert "mint_unset_master" not in generated, f"{generator} keeps the minting default"
+
+
+def test_only_the_shared_helper_owns_the_draw():
+    """One `random_seed()` call site for the whole lab, plus Randomize and New Variant's own."""
+    tree = _tree(_GUI)
+    owners = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.FunctionDef)
+                and "fork_variation.random_seed()" in ast.unparse(_strip_docstrings(node))):
+            owners.append(node.name)
+    assert sorted(owners) == ["_build_variant_resolution_context",
+                              "_fresh_variant_master_seed"], owners

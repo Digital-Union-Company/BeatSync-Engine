@@ -9,8 +9,14 @@ exactly **one** reproducible :class:`~beatsync_fork.creative_recipe.CreativeReci
     CREATIVE RECIPE    = what WILL be rendered  (seven integers, the execution artifact)
     THE SIX SLIDERS    = where the recipe lands (unchanged execution truth)
 
-V1 generates one recipe at a time and renders nothing. Multi-variant generation, batch rendering
-and variant comparison are C3 and are deliberately absent.
+V1 generates one recipe at a time and renders nothing.
+
+**Multi-variant generation and comparison shipped as C3 V1**, in the sibling module
+:mod:`beatsync_fork.variant_batch`, which derives one candidate master per index under
+:data:`DOMAIN_BATCH` and then calls :func:`resolve` / :func:`resolve_audio` here **unchanged** —
+this module gained one domain constant and nothing else. **Batch rendering remains deliberately
+absent**: C3 generates, compares and applies exactly one candidate, and Create Music Video is still
+the only thing that renders.
 
 ===============================================================================
 The base is always the live sliders
@@ -130,12 +136,19 @@ NAMESPACE = "variant_lab"
 VARIANT_LAB_ALGORITHM_VERSION = 1
 
 #: RNG domains. `clips` yields the recipe's clip Variation Seed; `controls` yields one stream per
-#: creative control; `audio` yields one stream per E2 audio control (`resolve_audio`). The three are
-#: distinct key components, so a draw in one can never shift a draw in another — which is what lets
-#: E2 land without re-keying a single master seed a user has written down.
+#: creative control; `audio` yields one stream per E2 audio control (`resolve_audio`); `batch`
+#: yields one candidate master seed per index for C3 multi-variant generation
+#: (`variant_batch.candidate_master_seed`). They are distinct key components, so a draw in one can
+#: never shift a draw in another — which is what let E2 and then C3 land without re-keying a single
+#: master seed a user has written down.
+#:
+#: The registry lives here, in one place, even though C3's *orchestration* lives in
+#: `variant_batch.py`: a domain list split across two modules is how two domains eventually collide.
+#: The dependency stays one-way — `variant_batch` imports this module, never the reverse.
 DOMAIN_CLIPS = "clips"
 DOMAIN_CONTROLS = "controls"
 DOMAIN_AUDIO = "audio"
+DOMAIN_BATCH = "batch"
 
 #: Variation Spread: 0..100, neutral-by-default at 50 like every other creative control. Measured:
 #: at 50 a variant moves five of six controls by >= 5 points and shifts the real cut count by a
@@ -690,6 +703,7 @@ __all__ = [
     "DEFAULT_RANGE_LO",
     "DEFAULT_VARIATION_SPREAD",
     "DOMAIN_AUDIO",
+    "DOMAIN_BATCH",
     "DOMAIN_CLIPS",
     "DOMAIN_CONTROLS",
     "FULL_RANGE",

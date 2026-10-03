@@ -50,10 +50,17 @@ automatically.
   start of every attempt and before the gate — so no voice, a refused render, a preflight failure and
   a mixdown failure all leave them blank rather than showing the previous render's result.
 - **Configuration widgets are unwritable, with exactly three audited exceptions.** Since E2 V1,
-  `music_under_voice`, `sfx_amount` and `sfx_level` may be written — by `generate_variant_btn.click`
-  and `new_variant_btn.click` and by nothing else. Every other audio/SFX configuration widget, and
-  every creative-control configuration widget, still has **zero** writers. Split seam guards pin the
-  whole matrix by exact writer list; do not relax one to make a new handler fit.
+  `music_under_voice`, `sfx_amount` and `sfx_level` may be written — and since C3 V1 the permitted
+  writer list is `generate_variant_btn.click`, `new_variant_btn.click` and
+  `apply_variant_btn.click`, and nothing else. The six creative sliders add `creative_preset.input`
+  to those three. Every other audio/SFX configuration widget still has **zero** writers. Split seam
+  guards pin the whole matrix by exact writer list; extend it under review, never relax one to make
+  a new handler fit.
+- **Generating is not applying.** `generate_variants_btn.click` (C3 V1) writes **no** execution
+  widget — only the batch state, the comparison table, the selector, the status and the root master
+  seed. That absence is load-bearing: it is what makes candidate chaining structurally impossible.
+  Only `apply_variant_btn.click` writes execution widgets, and only after re-deriving the live
+  declaration and requiring it to equal the one its batch was generated from.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -67,6 +74,7 @@ automatically.
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |
 | Variant Lab **visual** widgets, master seed, Spread, Generate handlers | `.claude/rules/variant-lab.md` |
 | Variant Lab **audio** subsection, or any of its three audio outputs (E2) | `.claude/rules/variant-lab.md` **+** `.claude/rules/audio-mixdown.md` |
+| Variant Lab **comparison / Apply Selected** seam, candidate count, batch state (C3) | `.claude/rules/variant-lab.md` **+** `.claude/rules/creative-presets.md` **+** `.claude/rules/audio-mixdown.md` — Apply writes both creative and audio widgets, so all three writer matrices apply |
 | voice clips, Smart Mix folder/roles/Amount/Level, the report panels | `.claude/rules/audio-mixdown.md` |
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |

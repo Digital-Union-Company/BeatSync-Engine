@@ -135,6 +135,12 @@ from beatsync_fork import presets as fork_presets
 # exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
 # handles the resolution object, so it has no reason to name the recipe type.
 from beatsync_fork import variant_lab as fork_lab
+# [FORK] Digital-Union (Variant Lab C3 V1): multi-variant generation and comparison. A sibling of
+# variant_lab that orchestrates its frozen resolvers — it derives one candidate master per index
+# under the `batch` RNG domain and calls `resolve`/`resolve_audio` unchanged, so no C2 or E2 golden
+# vector can move. Stdlib-only and Gradio-free like the rest of the package; this module only wires
+# it to widgets. It renders nothing and knows nothing about rendering.
+from beatsync_fork import variant_batch as fork_batch
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
 # src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
@@ -1152,32 +1158,55 @@ def _variant_apply_outputs(master_seed: int, resolution, audio_resolution) -> Tu
     )
 
 
-def _on_generate_variant(variant_master_seed, variation_spread, variant_randomize,
-                         range_cut_density_min, range_cut_density_max,
-                         range_micro_cuts_min, range_micro_cuts_max,
-                         range_semantic_emphasis_min, range_semantic_emphasis_max,
-                         range_energy_response_min, range_energy_response_max,
-                         range_motion_bias_min, range_motion_bias_max,
-                         range_source_diversity_min, range_source_diversity_max,
-                         variant_audio_randomize,
-                         range_music_under_voice_min, range_music_under_voice_max,
-                         range_sfx_amount_min, range_sfx_amount_max,
-                         range_sfx_level_min, range_sfx_level_max,
-                         cut_density, micro_cuts, semantic_emphasis,
-                         energy_response, motion_bias, source_diversity,
-                         music_under_voice, sfx_amount, sfx_level) -> Tuple:
-    """Resolve and apply exactly one recipe from the live base and the lab configuration.
+def _build_variant_resolution_context(
+        variant_master_seed, variation_spread, variant_randomize,
+        range_cut_density_min, range_cut_density_max,
+        range_micro_cuts_min, range_micro_cuts_max,
+        range_semantic_emphasis_min, range_semantic_emphasis_max,
+        range_energy_response_min, range_energy_response_max,
+        range_motion_bias_min, range_motion_bias_max,
+        range_source_diversity_min, range_source_diversity_max,
+        variant_audio_randomize,
+        range_music_under_voice_min, range_music_under_voice_max,
+        range_sfx_amount_min, range_sfx_amount_max,
+        range_sfx_level_min, range_sfx_level_max,
+        cut_density, micro_cuts, semantic_emphasis,
+        energy_response, motion_bias, source_diversity,
+        music_under_voice, sfx_amount, sfx_level,
+        *, mint_unset_master: bool = True) -> Tuple:
+    """Normalise the whole Variant Lab screen into `(master_seed, config, base, audio_config,
+    audio_base)` — the **one** place that construction happens.
 
-    An unusable master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh
-    positive one **which is returned as the first output**, so it is on screen before it is used.
-    That is the whole rule about hidden randomness: `fork_variation.random_seed()` is the only
-    non-deterministic call here, it happens in the GUI rather than in the pure resolver, and its
-    result is always surfaced. Everything after it is a pure function of visible values.
+    [FORK] Digital-Union (Variant Lab C3 V1): extracted verbatim from `_on_generate_variant`, which
+    was the only caller until C3 added two more. Three handlers now resolve from the same screen —
+    Generate, Generate Variants and Apply Selected — and the live declaration Apply compares
+    against is only trustworthy if it is built by the *same* code that built the batch. A second
+    copy of this would be a second opinion about what the screen says.
+
+    **`mint_unset_master` is the one place the three callers legitimately differ, and getting it
+    wrong is a correctness bug rather than a nuisance (R1).** Generating is an *action*: an unusable
+    master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh positive
+    one, and both Generate handlers return it to `variant_master_seed`, so it is on screen before it
+    is used — `fork_variation.random_seed()` is the only non-deterministic call in the lab, it
+    happens here in the GUI rather than in the pure resolvers, and its result is always surfaced.
+
+    Apply is **not** an action until its gate passes; it is rebuilding the live declaration in order
+    to *compare* it. Minting there would make a correctness decision depend on a draw: with the
+    Master Seed box blanked, a one-in-a-million `random_seed()` landing on the batch's original root
+    would make the reconstructed declaration compare **equal**, and Apply would write a candidate
+    for a screen that no longer declares that root — unsurfaced randomness deciding a gate. So Apply
+    passes `mint_unset_master=False`: an unusable live master normalises to `0`, stays unusable, and
+    the declaration is therefore *deterministically* stale. Exactly the reasoning that made
+    `_fresh_variant_master_seed` a guarantee rather than a probability.
+
+        Generate Variant / Generate Variants  ->  may mint, and surfaces what it minted
+        Apply Selected (validation)           ->  NEVER mints; unset master => stale, always
 
     Parameter names and order mirror the `inputs` list, because Gradio passes them positionally.
+    `mint_unset_master` is keyword-only so it can never be supplied by that positional list.
     """
     master_seed = fork_lab.normalize_master_seed(variant_master_seed)
-    if master_seed <= 0:
+    if master_seed <= 0 and mint_unset_master:
         master_seed = fork_variation.random_seed()
 
     config = fork_lab.VariantLabConfig(
@@ -1229,10 +1258,56 @@ def _on_generate_variant(variant_master_seed, variation_spread, variant_randomiz
             fork_smart_mix.normalize_control(sfx_level,
                                              fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT),
     }
+    return master_seed, config, base, audio_config, audio_base
+
+
+def _on_generate_variant(variant_master_seed, variation_spread, variant_randomize,
+                         range_cut_density_min, range_cut_density_max,
+                         range_micro_cuts_min, range_micro_cuts_max,
+                         range_semantic_emphasis_min, range_semantic_emphasis_max,
+                         range_energy_response_min, range_energy_response_max,
+                         range_motion_bias_min, range_motion_bias_max,
+                         range_source_diversity_min, range_source_diversity_max,
+                         variant_audio_randomize,
+                         range_music_under_voice_min, range_music_under_voice_max,
+                         range_sfx_amount_min, range_sfx_amount_max,
+                         range_sfx_level_min, range_sfx_level_max,
+                         cut_density, micro_cuts, semantic_emphasis,
+                         energy_response, motion_bias, source_diversity,
+                         music_under_voice, sfx_amount, sfx_level) -> Tuple:
+    """Resolve and apply exactly one recipe from the live base and the lab configuration.
+
+    Unchanged by C3 in every observable way: the same inputs in the same order, the same two
+    resolver calls, the same output tuple. Only the normalisation was lifted into
+    `_build_variant_resolution_context`, so Generate Variants and Apply Selected cannot build a
+    *differently* normalised view of the same screen. The explicit signature is kept rather than
+    collapsed into `*args` because it is half of the positional contract a seam test pins against
+    `variant_lab_inputs`.
+
+    `config.spread` rather than the raw widget value reaches `resolve_audio`, which normalises its
+    `spread` argument itself — `normalize_spread` is idempotent, so the resolved value is identical
+    either way, and passing the normalised one is what lets a C3 batch declaration record exactly
+    the number that was used.
+    """
+    master_seed, config, base, audio_config, audio_base = _build_variant_resolution_context(
+        variant_master_seed, variation_spread, variant_randomize,
+        range_cut_density_min, range_cut_density_max,
+        range_micro_cuts_min, range_micro_cuts_max,
+        range_semantic_emphasis_min, range_semantic_emphasis_max,
+        range_energy_response_min, range_energy_response_max,
+        range_motion_bias_min, range_motion_bias_max,
+        range_source_diversity_min, range_source_diversity_max,
+        variant_audio_randomize,
+        range_music_under_voice_min, range_music_under_voice_max,
+        range_sfx_amount_min, range_sfx_amount_max,
+        range_sfx_level_min, range_sfx_level_max,
+        cut_density, micro_cuts, semantic_emphasis,
+        energy_response, motion_bias, source_diversity,
+        music_under_voice, sfx_amount, sfx_level)
     return _variant_apply_outputs(
         master_seed,
         fork_lab.resolve(config, base),
-        fork_lab.resolve_audio(master_seed, audio_config, variation_spread, audio_base),
+        fork_lab.resolve_audio(master_seed, audio_config, config.spread, audio_base),
     )
 
 
@@ -1267,6 +1342,196 @@ def _on_new_variant(variant_master_seed, *lab_and_base) -> Tuple:
     is exactly one resolver call site and no second implementation that could drift from it.
     """
     return _on_generate_variant(_fresh_variant_master_seed(variant_master_seed), *lab_and_base)
+
+
+# [FORK] Digital-Union (Variant Lab C3 V1): multi-variant generation, comparison and Apply.
+#
+# Two handlers, and the asymmetry between them is the whole design:
+#
+#   Generate Variants  writes NO execution widget. It produces a candidate list and nothing else,
+#                      so there is structurally no path by which candidate 2 could resolve from
+#                      candidate 1 — the chaining bug that makes looping `_on_generate_variant`
+#                      wrong exists only because *that* handler writes its result back.
+#
+#   Apply Selected     writes exactly one candidate through the SAME `_variant_apply_outputs`
+#                      projection an ordinary Generate uses, after re-deriving the live declaration
+#                      and requiring it to equal the one the batch was built from.
+#
+# Neither renders. Neither touches a source, preparation or render widget. `variant_batch_state` is
+# comparison/selection state: only Apply ever reads it, and nothing downstream of the Variant Lab
+# has heard of it.
+
+#: How many blank-but-present outputs Apply must produce when it refuses. Exactly the length of
+#: `variant_lab_outputs`, because a refusal returns `gr.skip()` for every execution widget.
+_VARIANT_APPLY_OUTPUT_COUNT = 13
+
+
+def _variant_batch_skips() -> Tuple:
+    """`gr.skip()` for every execution widget — a refusal changes none of them."""
+    return tuple(gr.skip() for _ in range(_VARIANT_APPLY_OUTPUT_COUNT))
+
+
+def _on_generate_variants(variant_candidate_count,
+                          variant_master_seed, variation_spread, variant_randomize,
+                          range_cut_density_min, range_cut_density_max,
+                          range_micro_cuts_min, range_micro_cuts_max,
+                          range_semantic_emphasis_min, range_semantic_emphasis_max,
+                          range_energy_response_min, range_energy_response_max,
+                          range_motion_bias_min, range_motion_bias_max,
+                          range_source_diversity_min, range_source_diversity_max,
+                          variant_audio_randomize,
+                          range_music_under_voice_min, range_music_under_voice_max,
+                          range_sfx_amount_min, range_sfx_amount_max,
+                          range_sfx_level_min, range_sfx_level_max,
+                          cut_density, micro_cuts, semantic_emphasis,
+                          energy_response, motion_bias, source_diversity,
+                          music_under_voice, sfx_amount, sfx_level) -> Tuple:
+    """Resolve N candidates from one frozen reading of the screen. Writes no execution widget.
+
+    The count leads the parameter list so everything after it is `variant_lab_inputs` element for
+    element — one list concatenation at the registration, and one alignment for a seam test to pin.
+
+    The Master Seed box becomes the **batch root**: an unusable value is replaced by a fresh
+    positive one and returned, exactly as ordinary Generate does, so the root is visible before it
+    is used. Every candidate's own master is derived from it under the `batch` domain and shown in
+    the comparison table.
+
+    Outputs, in order: the root master seed, the batch state, the comparison table, the candidate
+    selector and the status line. Deliberately **not** the Variation Seed, the six sliders, the
+    preset label, the three audio levels or the Variant Lab report — generating candidates is not
+    applying one, and it renders nothing.
+    """
+    master_seed, config, base, audio_config, audio_base = _build_variant_resolution_context(
+        variant_master_seed, variation_spread, variant_randomize,
+        range_cut_density_min, range_cut_density_max,
+        range_micro_cuts_min, range_micro_cuts_max,
+        range_semantic_emphasis_min, range_semantic_emphasis_max,
+        range_energy_response_min, range_energy_response_max,
+        range_motion_bias_min, range_motion_bias_max,
+        range_source_diversity_min, range_source_diversity_max,
+        variant_audio_randomize,
+        range_music_under_voice_min, range_music_under_voice_max,
+        range_sfx_amount_min, range_sfx_amount_max,
+        range_sfx_level_min, range_sfx_level_max,
+        cut_density, micro_cuts, semantic_emphasis,
+        energy_response, motion_bias, source_diversity,
+        music_under_voice, sfx_amount, sfx_level)
+
+    declaration = fork_batch.declaration_from(
+        config, base, audio_config, audio_base, variant_candidate_count)
+    batch = fork_batch.resolve_batch(declaration)
+    status = (f"{len(batch.candidates)} candidates generated from master "
+              f"{declaration.root_master_seed}. Pick one and press "
+              f"{LABEL_APPLY_VARIANT}. Nothing has been rendered or changed yet.")
+    return (
+        master_seed,
+        batch,
+        batch.table_text(),
+        gr.update(choices=batch.choices(), value=None),
+        status,
+    )
+
+
+def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
+                               variant_candidate_count,
+                               variant_master_seed, variation_spread, variant_randomize,
+                               range_cut_density_min, range_cut_density_max,
+                               range_micro_cuts_min, range_micro_cuts_max,
+                               range_semantic_emphasis_min, range_semantic_emphasis_max,
+                               range_energy_response_min, range_energy_response_max,
+                               range_motion_bias_min, range_motion_bias_max,
+                               range_source_diversity_min, range_source_diversity_max,
+                               variant_audio_randomize,
+                               range_music_under_voice_min, range_music_under_voice_max,
+                               range_sfx_amount_min, range_sfx_amount_max,
+                               range_sfx_level_min, range_sfx_level_max,
+                               cut_density, micro_cuts, semantic_emphasis,
+                               energy_response, motion_bias, source_diversity,
+                               music_under_voice, sfx_amount, sfx_level) -> Tuple:
+    """Write exactly one candidate into the execution widgets — or refuse and change nothing.
+
+    **The live declaration is the authority, not the stored one.** The whole screen is re-read and
+    re-normalised through the shared helper at click time and must equal the declaration the batch
+    was generated from. That is the same reason `process_btn` validates the live source controls
+    and `prep_analyze_btn` takes the live preparation controls: Gradio delivers widget changes as
+    separate queued events, so at click time the state can lag behind the widgets, and applying a
+    candidate that describes a base the user has since moved away from must be impossible rather
+    than merely unlikely.
+
+    **The rebuild never mints a master seed (R1).** It passes `mint_unset_master=False`, so a
+    blanked or malformed Master Seed box normalises to `0`, stays unusable, and makes the live
+    declaration *deterministically* unequal to any real batch's. Minting here would have put a
+    `random_seed()` draw inside a correctness decision — and on the draw that happened to equal the
+    batch's own root, Apply would have written a candidate for a screen no longer declaring it.
+
+    There is deliberately **no** `.change()` invalidation on the declaration widgets. Adding one to
+    every slider would put a second handler on widgets whose single `.input()` binding is itself a
+    load-bearing contract (see `.claude/rules/creative-presets.md`). The table is labelled *Last
+    generated batch*, so its continued presence claims history, not currency — and this gate, not
+    the table, decides what may be applied.
+
+    A refusal returns `gr.skip()` for every execution widget, so nothing moves. A **stale** refusal
+    also consumes the batch and clears the selector, so pressing Apply again cannot keep retrying a
+    list that can never become valid again.
+
+    On success the candidate's own master seed goes into the Master Seed box, because that field
+    means *provenance for the recipe now on the sliders* — leaving the batch root there would make
+    the visible seed disagree with `VariantLabResolution.describe()` in the report beside it. The
+    batch root stays visible in the Last generated batch text. Neither seed alone reproduces a
+    candidate: the same base, ranges, randomize selections and Spread are required too.
+
+    Apply is terminal for one batch: a successful apply moves the live base, so every remaining
+    candidate now describes a starting point that no longer exists. Generate Variants again.
+    """
+    batch = variant_batch_state
+    if not isinstance(batch, fork_batch.VariantBatch) or not batch.candidates:
+        return _variant_batch_skips() + (
+            gr.skip(), gr.skip(),
+            "No candidate list. Press Generate Variants first.")
+
+    candidate = batch.candidate(variant_candidate_selector)
+    if candidate is None:
+        # Not stale — the list is still perfectly valid, the user simply has not chosen. Keeping
+        # the batch here is the difference between a prompt and a punishment.
+        return _variant_batch_skips() + (
+            gr.skip(), gr.skip(),
+            "Select a candidate above, then press Apply Selected Variant.")
+
+    _master_seed, config, base, audio_config, audio_base = _build_variant_resolution_context(
+        variant_master_seed, variation_spread, variant_randomize,
+        range_cut_density_min, range_cut_density_max,
+        range_micro_cuts_min, range_micro_cuts_max,
+        range_semantic_emphasis_min, range_semantic_emphasis_max,
+        range_energy_response_min, range_energy_response_max,
+        range_motion_bias_min, range_motion_bias_max,
+        range_source_diversity_min, range_source_diversity_max,
+        variant_audio_randomize,
+        range_music_under_voice_min, range_music_under_voice_max,
+        range_sfx_amount_min, range_sfx_amount_max,
+        range_sfx_level_min, range_sfx_level_max,
+        cut_density, micro_cuts, semantic_emphasis,
+        energy_response, motion_bias, source_diversity,
+        music_under_voice, sfx_amount, sfx_level,
+        # R1: validation must be deterministic. Minting here would let a blanked Master Seed box
+        # pass the gate whenever the hidden draw happened to land on the batch's own root.
+        mint_unset_master=False)
+    live_declaration = fork_batch.declaration_from(
+        config, base, audio_config, audio_base, variant_candidate_count)
+
+    if not live_declaration.matches(batch.declaration):
+        return _variant_batch_skips() + (
+            None,
+            gr.update(choices=[], value=None),
+            "These candidates were generated from different settings and no longer describe this "
+            "screen, so nothing was applied. Press Generate Variants to make a new list.")
+
+    resolution, audio_resolution = fork_batch.rehydrate(batch.declaration, candidate)
+    applied = _variant_apply_outputs(candidate.master_seed, resolution, audio_resolution)
+    return applied + (
+        None,
+        gr.update(choices=[], value=None),
+        f"Applied candidate {candidate.index + 1} (master {candidate.master_seed}) from batch "
+        f"root {batch.declaration.root_master_seed}. Press Create Music Video when ready.")
 
 
 def process_video_guarded(audio_file: str,
@@ -1735,6 +2000,13 @@ def create_ui() -> gr.Blocks:
         # [FORK] Digital-Union (P V1): preparation has its OWN state object. It is never read or
         # written by the source-confirmation handlers, and it never reaches `process_video_guarded`.
         prep_state = gr.State(initial_prep_state())
+        # [FORK] Digital-Union (Variant Lab C3 V1): the candidate list awaiting selection, and
+        # nothing else. Comparison/selection state: only `apply_variant_btn` ever reads it, it is
+        # absent from `process_btn.click`, `source_outputs`, `prep_outputs` and `live_declaration`,
+        # and no planner, renderer, profile or cache has heard of it. Its value is a frozen
+        # `VariantBatch` of plain ints, strings and tuples — Gradio deep-copies state, so a config
+        # or resolution object (which carry `MappingProxyType`) could not live here.
+        variant_batch_state = gr.State(None)
 
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
@@ -2111,6 +2383,61 @@ def create_ui() -> gr.Blocks:
                             interactive=False,
                             elem_id='variant-report-box',
                         )
+                        # [FORK] Digital-Union (Variant Lab C3 V1): compare several candidates and
+                        # apply one. Inside the *existing* accordion, below the single-variant
+                        # flow, because it is the same workflow at a different width — not a
+                        # second Variant Lab. Like every other lab widget these are read at click
+                        # time and register nothing; the candidate selector deliberately has no
+                        # `.change()` handler, since Apply reads its current value itself.
+                        gr.Markdown(INFO_VARIANT_COMPARE)
+                        variant_candidate_count = gr.Number(
+                            label=LABEL_CANDIDATE_COUNT,
+                            value=fork_batch.CANDIDATE_COUNT_DEFAULT,
+                            precision=0,
+                            minimum=fork_batch.CANDIDATE_COUNT_MIN,
+                            maximum=fork_batch.CANDIDATE_COUNT_MAX,
+                            info=INFO_CANDIDATE_COUNT,
+                            elem_id='variant-candidate-count',
+                        )
+                        generate_variants_btn = gr.Button(
+                            LABEL_GENERATE_VARIANTS, variant='secondary',
+                            elem_id='generate-variants-button')
+                        # Monospace-ish fixed-width rows produced entirely by
+                        # `VariantBatch.table_text()` — one formatter per read-out, exactly as the
+                        # two mix reports work. Thirteen lines holds the header, the column rule
+                        # and the maximum twelve candidates without clipping a row.
+                        variant_batch_table = gr.Textbox(
+                            label=LABEL_VARIANT_BATCH_TABLE,
+                            value='',
+                            placeholder=PLACEHOLDER_VARIANT_BATCH_TABLE,
+                            lines=13,
+                            max_lines=16,
+                            interactive=False,
+                            elem_id='variant-batch-table',
+                        )
+                        # `(label, value)` choices again, and the value IS the candidate index —
+                        # never the display string, which a reworded label could silently re-map
+                        # onto a different candidate.
+                        variant_candidate_selector = gr.Radio(
+                            choices=[],
+                            value=None,
+                            label=LABEL_VARIANT_CANDIDATE,
+                            info=INFO_VARIANT_CANDIDATE,
+                            elem_id='variant-candidate-selector',
+                        )
+                        apply_variant_btn = gr.Button(
+                            LABEL_APPLY_VARIANT, variant='secondary',
+                            elem_id='apply-variant-button')
+                        variant_batch_status = gr.Textbox(
+                            label=LABEL_VARIANT_BATCH_STATUS,
+                            value='',
+                            placeholder=PLACEHOLDER_VARIANT_BATCH_STATUS,
+                            lines=2,
+                            max_lines=3,
+                            interactive=False,
+                            elem_id='variant-batch-status',
+                        )
+                        gr.Markdown(INFO_VARIANT_APPLY)
 
                 with gr.Group():
                     gr.Markdown(f'### 🎬 Processing Mode')
@@ -2337,6 +2664,40 @@ def create_ui() -> gr.Blocks:
             fn=_on_new_variant,
             inputs=variant_lab_inputs,
             outputs=variant_lab_outputs,
+        )
+
+        # [FORK] Digital-Union (Variant Lab C3 V1): generate / compare / apply one.
+        #
+        # Both C3 events reuse `variant_lab_inputs` verbatim rather than restating it, so the
+        # declaration Apply re-derives is read from exactly the widgets Generate Variants read.
+        # The candidate count leads each list, matching both handlers' parameter order, and Apply
+        # additionally leads with the state and the selector it consumes.
+        variant_batch_inputs = [variant_candidate_count] + variant_lab_inputs
+
+        # Note what is absent from these outputs: every execution widget. Generating candidates
+        # writes the root master seed back (so a freshly minted one is visible), the batch state,
+        # the table, the selector and the status — and NOT the Variation Seed, the six sliders,
+        # the preset label, the three audio levels or the Variant Lab report. That absence is what
+        # makes candidate chaining structurally impossible, not merely avoided.
+        variant_batch_outputs = [
+            variant_master_seed, variant_batch_state, variant_batch_table,
+            variant_candidate_selector, variant_batch_status,
+        ]
+
+        generate_variants_btn.click(
+            fn=_on_generate_variants,
+            inputs=variant_batch_inputs,
+            outputs=variant_batch_outputs,
+        )
+
+        # Apply writes the ordinary Variant Lab output set — the same thirteen widgets a single
+        # Generate writes, through the same projection helper — and then consumes the batch it
+        # applied from. It is the only reader of `variant_batch_state`.
+        apply_variant_btn.click(
+            fn=_on_apply_selected_variant,
+            inputs=[variant_batch_state, variant_candidate_selector] + variant_batch_inputs,
+            outputs=variant_lab_outputs + [
+                variant_batch_state, variant_candidate_selector, variant_batch_status],
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.
