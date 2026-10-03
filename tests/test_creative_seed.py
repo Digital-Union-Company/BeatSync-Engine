@@ -511,11 +511,19 @@ def test_the_gui_normalises_the_seed_before_it_reaches_the_pipeline():
     Creative Controls Core moved the normalisation one seam earlier: the guarded handler collapses
     the four raw widget values into one already-normalised ``CreativeProfile``, so what reaches the
     pipeline is a profile rather than a scalar the implementation has to re-clean.
+    **Re-pointed by C3-R0.** The normalisation moved one function inward, into the shared
+    live-source-gate + render core that both the single-render wrapper and the two-candidate batch
+    wrapper call. The seam is unchanged; it is now the seam for *both* render paths.
     """
     tree = _gui_tree()
-    guarded = ast.unparse(_func(tree, "process_video_guarded"))
+    guarded = ast.unparse(_func(tree, "_process_video_guarded_unlocked"))
     assert "fork_creative.CreativeProfile.from_widgets(" in guarded
     assert "seed=variation_seed" in guarded
+
+    # the public wrapper still owns the Gradio contract and delegates rather than re-normalising
+    wrapper = ast.unparse(_func(tree, "process_video_guarded"))
+    assert "_process_video_guarded_unlocked(" in wrapper
+    assert "fork_creative.CreativeProfile.from_widgets(" not in wrapper
 
     source = ast.unparse(_func(tree, "_process_video_impl"))
     assert "creative=creative.as_dict()" in source

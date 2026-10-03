@@ -75,6 +75,22 @@ VARIANT_LAB_WRITERS = ["generate_variant_btn.click", "new_variant_btn.click",
                        "apply_variant_btn.click"]
 
 
+#: [FORK] Digital-Union (C3-R0): the shared live-source-gate + render core.
+#:
+#: Until C3-R0 the gate body lived inside `process_video_guarded`, and the assertions below looked
+#: it up there. C3-R0 made rendering mutually exclusive and added a second render entry point, so
+#: the body moved into one shared core that BOTH mutex-owning wrappers call —
+#: `process_video_guarded` for a single render and `render_selected_variants_guarded` for the
+#: two-candidate batch. Every property in this section is therefore a property of the core, and
+#: asserting it there is strictly stronger: it now covers both execution paths at once rather than
+#: only the single-render one.
+#:
+#: What deliberately stays pinned to the public wrapper: its positional signature (the Gradio
+#: contract with `process_btn.click`) and the report writer matrices. See
+#: `test_the_public_wrapper_owns_the_mutex_and_duplicates_no_gate_logic`.
+GATE_CORE = "_process_video_guarded_unlocked"
+
+
 def tree() -> ast.Module:
     with open(_GUI, "r", encoding="utf-8") as handle:
         return ast.parse(handle.read(), filename=_GUI)
@@ -354,7 +370,8 @@ def test_mixed_master_path_is_initialised_before_the_try():
 
 
 def test_the_guard_collapses_the_widgets_into_one_normalised_config():
-    source = body_source("process_video_guarded")
+    """**Re-pointed by C3-R0** to the shared core; the assertion itself is unchanged."""
+    source = body_source(GATE_CORE)
     assert "fork_audio_mix.AudioMixConfig(" in source
     for widget in ("voice_start_delay", "voice_min_gap", "voice_avoid_drops",
                    "music_under_voice"):
@@ -364,12 +381,12 @@ def test_the_guard_collapses_the_widgets_into_one_normalised_config():
 
 
 def test_the_config_is_built_only_after_the_gate_allows_the_render():
-    source = body_source("process_video_guarded")
+    source = body_source(GATE_CORE)
     assert source.index("if not decision.allowed:") < source.index("AudioMixConfig(")
 
 
 def test_audio_widgets_never_reach_the_source_declaration():
-    source = body_source("process_video_guarded")
+    source = body_source(GATE_CORE)
     declaration = source[source.index("live_declaration("):]
     declaration = declaration[:declaration.index(")")]
     for widget in AUDIO_WIDGETS:
@@ -728,7 +745,7 @@ def test_a_mix_failure_leaves_no_stale_report():
 
 def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():
     """Every path through the handlers starts from a blank report, including a refused render."""
-    guarded = body_source("process_video_guarded")
+    guarded = body_source(GATE_CORE)
     impl = body_source("_process_video_impl")
     assert "session_state[AUDIO_LAYERS_REPORT_KEY] = ''" in guarded
     assert guarded.index("AUDIO_LAYERS_REPORT_KEY] = ''") < guarded.index("resolve_for_render(")
@@ -738,7 +755,7 @@ def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():
 
 def test_a_refused_render_yields_a_blank_report():
     """The gate's own refusal is a yield, so it has to carry the fourth value itself."""
-    refusal = next(node for node in ast.walk(func("process_video_guarded"))
+    refusal = next(node for node in ast.walk(func(GATE_CORE))
                    if isinstance(node, ast.If)
                    and ast.unparse(node.test) == "not decision.allowed")
     yielded = next(n for n in ast.walk(refusal) if isinstance(n, ast.Yield))
@@ -757,8 +774,12 @@ def test_the_guard_projects_the_three_value_stream_onto_five_outputs():
     the test exists for is untouched and is the stronger half — the *inner* generator's streaming
     contract did not change, so the worker thread still carries nothing but `session_state`.
     """
-    guarded = body_source("process_video_guarded")
-    assert "for video, status, state in process_video(" in guarded
+    guarded = body_source(GATE_CORE)
+    # **C3-R0 R1**: the stream is owned so it can be closed deterministically — the worker
+    # lifetime chain depends on it. The 3-value contract this test exists for is unchanged.
+    assert "render_stream = process_video(" in guarded
+    assert "for video, status, state in render_stream:" in guarded
+    assert "render_stream.close()" in guarded
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
             "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in guarded
     # the inner generator's 3-value contract is unchanged; only the outer handler is 5-valued
@@ -1223,12 +1244,12 @@ def test_the_click_inputs_align_with_the_guard_parameters():
 
 
 def test_the_guard_builds_one_normalised_config_after_the_gate():
-    guarded = body_source("process_video_guarded")
+    guarded = body_source(GATE_CORE)
     assert "fork_smart_mix.SmartMixConfig(" in guarded
     assert (guarded.index("resolve_for_render(")
             < guarded.index("fork_smart_mix.SmartMixConfig(")), (
         "the config must be built only after the gate has allowed the render")
-    call = next(n for n in ast.walk(func("process_video_guarded"))
+    call = next(n for n in ast.walk(func(GATE_CORE))
                 if isinstance(n, ast.Call)
                 and ast.unparse(n.func) == "fork_smart_mix.SmartMixConfig")
     assert {kw.arg for kw in call.keywords} == {
@@ -1247,7 +1268,7 @@ def test_the_sfx_root_stays_a_runtime_path_not_creative_state():
 
 
 def test_both_reports_are_cleared_before_the_gate_and_before_the_attempt():
-    guarded = body_source("process_video_guarded")
+    guarded = body_source(GATE_CORE)
     impl = body_source("_process_video_impl")
     for key in ("AUDIO_LAYERS_REPORT_KEY", "SMART_MIX_REPORT_KEY"):
         assert f"session_state[{key}] = ''" in guarded
@@ -1448,5 +1469,131 @@ def test_diagnostics_stay_out_of_every_other_data_model():
         for node in ast.walk(impl):
             if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(callee):
                 assert "sfx_diagnostics" not in ast.unparse(node), callee
-    guarded = body_source("process_video_guarded")
+    guarded = body_source(GATE_CORE)
     assert "sfx_diagnostics" not in guarded
+
+
+# ===========================================================================
+# C3-R0: ONE gate implementation, TWO mutex-owning wrappers
+# ===========================================================================
+
+
+def test_the_public_wrapper_owns_the_mutex_and_duplicates_no_gate_logic():
+    """**Added by C3-R0.** Re-pointing the assertions above is only honest if the thing they were
+    re-pointed *to* is genuinely the only implementation.
+
+    The cheap way to make this file pass after the refactor would have been to copy the old body
+    back into `process_video_guarded` beside the core. That would be two source gates, two
+    `AudioMixConfig` constructions and two chances to drift — exactly what
+    `.claude/rules/input-gate.md` forbids. So the wrapper is asserted to be a wrapper: it takes the
+    lock, it delegates, and it builds nothing.
+    """
+    root = tree()
+    wrapper = body_source("process_video_guarded")
+    core = body_source(GATE_CORE)
+
+    # the wrapper owns mutual exclusion and nothing else
+    assert "_RENDER_LOCK.acquire(blocking=False)" in wrapper
+    assert "_RENDER_LOCK.release()" in wrapper
+    assert f"{GATE_CORE}(" in wrapper, "the wrapper must delegate to the shared core"
+
+    # ...and duplicates no part of the gate
+    for duplicated in ("resolve_for_render(", "live_declaration(",
+                       "fork_audio_mix.AudioMixConfig(", "fork_smart_mix.SmartMixConfig(",
+                       "fork_creative.CreativeProfile.from_widgets(", "process_video("):
+        assert duplicated not in wrapper, f"process_video_guarded duplicates {duplicated}"
+
+    # the core holds the one authoritative gate
+    assert "resolve_for_render(" in core
+    assert "live_declaration(" in core
+    assert "fork_audio_mix.AudioMixConfig(" in core
+    assert "fork_smart_mix.SmartMixConfig(" in core
+
+    # and there is exactly ONE of each in the whole module.
+    #
+    # Counted as *calls with keyword arguments*, deliberately: `_process_video_impl` has always
+    # carried bare `AudioMixConfig()` / `SmartMixConfig()` defaulting fallbacks for a caller that
+    # passed none, and those are not a second widget-collapsing boundary. The thing that must be
+    # unique is the construction FROM widget values.
+    stripped = _strip_module_docstrings(root)
+    built = {"fork_audio_mix.AudioMixConfig": [], "fork_smart_mix.SmartMixConfig": [],
+             "resolve_for_render": []}
+    for node in ast.walk(stripped):
+        if isinstance(node, ast.Call):
+            rendered = ast.unparse(node.func)
+            if rendered in built and (node.keywords or node.args):
+                built[rendered].append(rendered)
+    for name, found in built.items():
+        assert len(found) == 1, f"{name} is constructed {len(found)} times; expected exactly one"
+
+
+def _strip_module_docstrings(node):
+    """Docstrings removed, so prose naming a construct is never counted as using it."""
+    import copy
+    node = copy.deepcopy(node)
+    for inner in ast.walk(node):
+        body = getattr(inner, "body", None)
+        if isinstance(body, list) and body:
+            first = body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                body.pop(0)
+                if not body:
+                    body.append(ast.Pass())
+    return ast.fix_missing_locations(node)
+
+
+def test_the_core_is_not_a_public_render_entry_point():
+    """Only the two mutex-owning wrappers may call the unlocked core."""
+    root = tree()
+    callers = []
+    for node in ast.walk(root):
+        # the core's own `def` line mentions its name, so it is never its own caller
+        if isinstance(node, ast.FunctionDef) and node.name != GATE_CORE:
+            body = chr(10).join(ast.unparse(_strip_module_docstrings(stmt))
+                                for stmt in node.body)
+            if f"{GATE_CORE}(" in body:
+                callers.append(node.name)
+    assert sorted(callers) == ["process_video_guarded",
+                               "render_selected_variants_guarded"], callers
+
+    # and no Gradio event is wired straight to it
+    for node in ast.walk(root):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            fn = next((kw.value for kw in node.keywords if kw.arg == "fn"), None)
+            if fn is not None:
+                assert ast.unparse(fn) != GATE_CORE, "the core must never be an event handler"
+
+
+def test_the_public_wrapper_keeps_its_positional_gradio_contract():
+    """The signature is half of the contract with `process_btn.click(inputs=...)`.
+
+    C3-R0 moved the *body*, never the signature, and the ordinary registration must still name the
+    wrapper rather than the core — otherwise the single render would bypass the render mutex.
+    """
+    root = tree()
+    params = [a.arg for a in func("process_video_guarded").args.args]
+    click = next(n for n in ast.walk(root)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and ast.unparse(n.func) == "process_btn.click")
+    kwargs = {kw.arg: kw.value for kw in click.keywords}
+    assert ast.unparse(kwargs["fn"]) == "process_video_guarded"
+    inputs = [getattr(n, "id", None) for n in kwargs["inputs"].elts]
+    assert params[0] == "audio_file"
+    assert inputs[1:] == params[1:], "Gradio passes positionally; the two are one contract"
+
+    # the batch-only flag can never arrive from that positional list
+    assert [a.arg for a in func(GATE_CORE).args.kwonlyargs] == ["refuse_existing_output"]
+    assert "refuse_existing_output" not in params
+
+
+def test_the_batch_event_writes_neither_diagnostic_panel():
+    """C3-R0 reads the reports from `session_state`; it does not become a second panel writer."""
+    root = tree()
+    assert _writers_of(root, "audio_layers_report") == ["process_btn.click"]
+    assert _writers_of(root, SMART_MIX_REPORT_WIDGET) == ["process_btn.click"]
+
+    batch = body_source("render_selected_variants_guarded")
+    assert "AUDIO_LAYERS_REPORT_KEY" in batch, "it reads them from session_state"
+    assert "SMART_MIX_REPORT_KEY" in batch

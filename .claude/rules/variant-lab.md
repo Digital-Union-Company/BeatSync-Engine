@@ -358,3 +358,81 @@ microseconds. Those two do not belong in one feature, and the deferred milestone
   is walked from both C3 buttons and may not reach `process_video_guarded`, `process_video`,
   `analyze_beats_auto` or `create_music_video`. A rename cannot evade that the way a word list
   would.
+
+## Rendering exactly two compared candidates (C3-R0)
+
+C3 V1 let the user generate N candidates, compare them and apply one. The payoff of a comparison
+is watching the videos, and getting two meant two manual round-trips — with the batch consumed by
+the first Apply and the base moved out from under the rest. C3-R0 closes that loop:
+
+```
+generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
+                                                     candidate A, then candidate B
+```
+
+- **Exactly two, sequential, no cancellation — one decision, not three.** There is no safe stop
+  channel in this architecture: a cancelled Gradio event can return its slot while the daemon
+  render worker is still alive, and the next render would wipe the live one's process-global
+  processing dir. Rather than ship a Stop button that cannot stop FFmpeg, C3-R0 ships none and
+  bounds the commitment to two renders. Three or more, continue-after-failure and real
+  cancellation are **C3-R1**, behind an explicit worker lifecycle. `RENDER_SELECTION_SIZE = 2` is
+  deliberately unrelated to `CANDIDATE_COUNT_MAX = 12`: that bound is comparison legibility and
+  costs a millisecond, this one is uninterruptible render minutes.
+- **A separate selector.** The Apply `gr.Radio` stays; rendering gets its own `gr.CheckboxGroup`,
+  empty by default and never pre-filled. One control cannot honestly mean both "apply this one"
+  and "render these two". Neither registers a handler; the selection is validated at click time.
+- **Canonical ascending index order**, not tick order — the render sequence is a property of the
+  batch, so re-ticking the same pair the other way round renders the same two videos in the same
+  order.
+- **The batch request is execution authority for its own invocation, and only that.** Two
+  candidates are never simultaneously on screen, so live widgets cannot be the authority for a
+  batch. Candidate values come from the **stored recipes** (`CreativeRecipe` / `AudioRecipe`,
+  already-validated frozen artifacts — nothing is re-resolved); everything else (audio, voice,
+  SFX, source, output, encoder, FPS) is frozen from the submitted event arguments, so edits made
+  while the batch runs cannot reach it. This is not hidden mutable state: it is built explicitly
+  from submitted values, lives for one invocation, is never cached, and reaches no Stage-5
+  identity.
+- **Rendering does NOT use Apply's stale-declaration gate.** Apply has one because it writes a
+  historical candidate into the *current* screen; rendering reads resolved artifacts and writes no
+  widget. A user who nudged a slider after generating may still render the pair. Do not conflate
+  Apply staleness with recipe validity — and do not weaken Apply's gate.
+- **Rendering does not consume the `VariantBatch`.** The comparison survives, so the pair can be
+  rendered again or one of them applied. Apply keeps its existing terminal semantics; when Apply
+  *does* consume the batch (success or stale refusal) it clears the render selector too, because
+  render choices for a batch that no longer exists are an offer the app cannot honour.
+- **`variant_batch_state` now has exactly TWO readers**: `apply_variant_btn.click` and
+  `render_selected_variants_btn.click`. Pinned as an exact list, never a containment check.
+- **Output identity cannot rest on the Variation Seed.** C3 deduplicates candidate *masters*
+  deliberately; `CreativeRecipe.seed` is an independent draw and is not deduplicated anywhere —
+  measured: root 5484 gives masters 945730 and 862920 that **both** resolve Variation Seed 536635.
+  Since the render path names its file `_seed<VariationSeed>` and `shutil.move` overwrites
+  silently, the batch derives a stem carrying the request tag, the candidate index and the
+  candidate master (`music_video_batch<tag>_c01_m609591`) and lets the existing suffix follow
+  unchanged.
+- **Batch-only hard no-overwrite.** `refuse_existing_output` is keyword-only (so the positional
+  widget list can never set it), defaults `False` so ordinary Create Music Video keeps its shipped
+  behaviour, and C3-R0 passes `True`: the exact destination is checked before Stage 1 *and* again
+  immediately before the move, and an existing file is preserved rather than replaced. The
+  pre-existing single-render overwrite is a separate latent defect, reported rather than changed
+  here.
+- **Durable output is the success authority**, not the preview and not the status prose. A ProRes
+  render moves the real `.mov` into `output/` and then returns a session-temp `_preview.mp4`, so a
+  preview step failing afterwards must not retroactively fail a finished render.
+  `session_state[LAST_OUTPUT_PATH_KEY]` carries it: cleared before every attempt, set only after
+  the move succeeds. Nothing parses `Output: …` out of a status string.
+- **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
+  The render boundary exposes no typed failure classification, so a batch cannot tell a
+  shared-input failure (which would simply repeat) from a candidate-local one. Continue-on-failure
+  waits for C3-R1 and a typed outcome model.
+- **Report ownership.** `audio_layers_report` and `smart_mix_report` keep `process_btn.click` as
+  their **only** writer; the batch reads them from `session_state` after each candidate and the
+  dedicated summary owns multi-render diagnostics. `variant_batch_table` and
+  `variant_batch_status` keep describing generation and comparison only. The video preview shows
+  the latest successful candidate and a later failure never blanks it.
+- **One formatter.** `RenderBatchOutcome.summary_text()` renders the whole read-out; `gui.py`
+  formats none of it, exactly as it formats none of the two mix reports.
+- **Nothing in the pipeline changed.** `video_processor.py`, `ffmpeg_processing.py`,
+  `video_analysis.py`, `audio_mix.py`, `smart_mix.py` and `src/auto_mode/*` are untouched; no
+  stage cache, no shortlist, no rendered gallery, no Qwen or cache-contract change.
+  `variant_batch.py` is untouched too and keeps its own render ban at full strength — that guard
+  is what holds the generation/render module split honest.

@@ -622,10 +622,21 @@ def test_all_four_controls_are_live_render_request_inputs():
         assert parameter == widget or (parameter, widget) == ("audio_file", "audio_input")
 
 
+#: [FORK] Digital-Union (C3-R0): the shared live-source-gate + render core.
+#:
+#: Until C3-R0 this body lived in `process_video_guarded`. C3-R0 made rendering mutually exclusive
+#: and added a second render entry point, so the gate, the config normalisation and the delegation
+#: moved into one core that BOTH mutex-owning wrappers call. Asserting these properties there is
+#: strictly stronger than before: they now hold for the single render *and* for every candidate of
+#: a two-candidate batch. What stays pinned to the public wrapper is its positional Gradio
+#: signature and its `fn=` registration.
+GATE_CORE = "_process_video_guarded_unlocked"
+
+
 def test_the_guard_collapses_the_widgets_into_one_profile():
     """Four loose scalars threaded through every inner function is the shape this avoids, and it is
     also where normalisation happens: nothing past this seam sees a raw widget value."""
-    body = _body_code(_func(_gui_tree(), "process_video_guarded"))
+    body = _body_code(_func(_gui_tree(), GATE_CORE))
 
     assert "fork_creative.CreativeProfile.from_widgets(" in body
     for widget in _ALL_CREATIVE_WIDGETS:
@@ -649,7 +660,7 @@ def test_the_profile_is_what_flows_down_the_pipeline():
 def test_the_gate_itself_is_unchanged():
     """The creative controls ride alongside the source verification; they must not participate in
     it. The decision is still resolved from the source state plus the live source declaration."""
-    body = _body_code(_func(_gui_tree(), "process_video_guarded"))
+    body = _body_code(_func(_gui_tree(), GATE_CORE))
 
     assert "resolve_for_render(source_state, live_declaration(" in body.replace("\n", "")
     declaration = body[body.index("live_declaration("):]
@@ -658,6 +669,15 @@ def test_the_gate_itself_is_unchanged():
         assert widget not in declaration, f"{widget} reached the source declaration"
     # and the profile is built only after the gate has allowed the render
     assert body.index("if not decision.allowed:") < body.index("CreativeProfile.from_widgets")
+
+    # ONE gate, module-wide: the wrapper delegates, it does not rebuild
+    source = open(_GUI, encoding="utf-8").read()
+    assert source.count("resolve_for_render(") == 1, "a second source gate appeared"
+    wrapper = _body_code(_func(_gui_tree(), "process_video_guarded"))
+    for duplicated in ("resolve_for_render(", "live_declaration(",
+                       "fork_creative.CreativeProfile.from_widgets("):
+        assert duplicated not in wrapper, f"the mutex wrapper duplicates {duplicated}"
+    assert f"{GATE_CORE}(" in wrapper, "the wrapper must delegate to the shared core"
 
 
 def test_no_preset_randomizer_or_freestyle_control_was_added():

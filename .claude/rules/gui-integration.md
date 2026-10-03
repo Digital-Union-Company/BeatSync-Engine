@@ -32,7 +32,35 @@ automatically.
 - **Stage identity is `event.stage`, an integer.** The old
   `re.search(r"Stage (\d+) is processing", message)` recovery is gone from `gui.py` and must not come
   back; a test asserts its absence.
-- **`process_video_guarded()` is the real render gate** and it validates the **live** source controls
+- **One render gate core, two mutex-owning wrappers, one render at a time (C3-R0).**
+  `_process_video_guarded_unlocked()` is the single authoritative live-source-gate + render body;
+  `process_video_guarded()` wraps it for a single render and `render_selected_variants_guarded()`
+  for the two-candidate batch. Both acquire the **process-global `_RENDER_LOCK`** non-blockingly
+  and refuse cleanly when it is held — `create_music_video` clears one process-global processing
+  dir per render, so two overlapping renders would delete each other's in-flight clips. Both
+  events also share one `concurrency_id` with `concurrency_limit=1`, but that is cooperative: the
+  lock is the authority, because it is provable without Gradio.
+
+  **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
+  `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
+  event, an exception while draining — the frame unwinds immediately. Without a finalizer the
+  worker kept running, the wrapper's `finally: _RENDER_LOCK.release()` ran anyway, and a second
+  render could clear the processing dir out from under the first. So the chain is explicit and
+  ordered: closing a wrapper closes the nested stream it **owns**, which closes `process_video`,
+  whose finalizer **joins** the worker — and only then does the mutex release. Both wrappers own
+  their nested stream (`render_stream` / `candidate_stream`) and close it in a `finally` nested
+  *inside* the lock-holding `try`, so the ordering is structural rather than incidental. No
+  worker is ever terminated and there is no timeout: with no cancellation, abandoning a stream
+  means waiting for the render in flight. The lock is a plain non-reentrant
+  `Lock` on purpose — a batch that re-entered the single-render wrapper would refuse itself on its
+  own first candidate, and an `RLock` would hide that instead of exposing it. Never wire an event
+  directly to the core, and never let a wrapper rebuild the gate.
+- **Diagnostics the batch reads rather than writes.** C3-R0 records each candidate's durable
+  output in `session_state[LAST_OUTPUT_PATH_KEY]` — cleared before every attempt, set only after
+  the move into `output/` succeeds, and never the ProRes preview — and reads the two report keys
+  after each candidate. It becomes a writer of **neither** report panel; the batch summary owns
+  multi-render diagnostics so no panel can describe a candidate the user is not looking at.
+- **The gate validates the **live** source controls**
   (`source_mode`, `source_folder`, `source_recursive`, `video_input`), not just `gr.State`. Gradio
   delivers widget changes as separate queued events, so the state can lag the widgets at click time.
   **Never reduce this handler's inputs back to `source_state` alone.**
@@ -69,7 +97,8 @@ automatically.
 | Seam you are editing | Open |
 |---|---|
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
-| Video Source block, scan/confirm/gate, `process_video_guarded` | `.claude/rules/input-gate.md` |
+| Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
+| C3-R0 render-two-candidates seam, render mutex, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |
 | Variant Lab **visual** widgets, master seed, Spread, Generate handlers | `.claude/rules/variant-lab.md` |

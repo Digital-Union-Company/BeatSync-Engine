@@ -648,6 +648,40 @@ PLACEHOLDER_VARIANT_BATCH_STATUS = (
     "Create Music Video is still the only thing that renders."
 )
 
+# ============================================================================
+# [FORK] Digital-Union: C3-R0 — render exactly two compared candidates
+# See src/beatsync_fork/render_batch.py. This copy has two jobs: make clear that rendering is a
+# real, uninterruptible commitment of two renders, and make clear that it uses the *stored*
+# candidate settings rather than whatever the Variant Lab controls happen to say now.
+# ============================================================================
+
+LABEL_RENDER_CANDIDATES = "🎬 Candidates to render"
+INFO_RENDER_CANDIDATES = (
+    "Tick exactly two candidates from the list above. Nothing happens until you press Render "
+    "Selected Variants."
+)
+
+LABEL_RENDER_SELECTED = "🎞️ Render Selected Variants"
+
+LABEL_RENDER_BATCH_SUMMARY = "Render batch result"
+PLACEHOLDER_RENDER_BATCH_SUMMARY = (
+    "No batch rendered yet. Tick two candidates above and press Render Selected Variants."
+)
+
+INFO_RENDER_SELECTED = (
+    "**This makes two real videos**, one after the other — it is the only button here that "
+    "renders anything other than Create Music Video. Each candidate uses the settings it was "
+    "generated with, so editing the Variant Lab controls afterwards does not change what gets "
+    "rendered. Everything that is *not* a candidate setting — your audio, voice clips, SFX "
+    "folder, source videos, output name, encoder and FPS — is taken as it stands the moment you "
+    "press the button, and later edits do not affect the batch already running.\n\n"
+    "There is **no Stop button in this version**, so treat it as a commitment to two renders. If "
+    "the first one fails the second is not attempted; if the second fails the first video is "
+    "still yours. Each file is named for its candidate, so neither can overwrite the other or "
+    "anything already in your output folder. The comparison list is not used up — you can still "
+    "apply a candidate, or render the same pair again."
+)
+
 INFO_VARIANT_APPLY = (
     "**Apply Selected Variant** writes that candidate's Variation Seed, six sliders and three "
     "audio levels into the controls above, exactly as a single Generate Variant would — then you "
