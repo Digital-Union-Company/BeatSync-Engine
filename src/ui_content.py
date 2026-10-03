@@ -525,9 +525,9 @@ INFO_CREATIVE_PRESET = (
 
 # ============================================================================
 # [FORK] Digital-Union: Variant Lab V1 (C2)
-# See src/beatsync_fork/variant_lab.py for the resolver these labels describe. Variant Lab writes
-# the Variation Seed and the six sliders and nothing else — it never renders, and it never
-# re-analyses your videos.
+# See src/beatsync_fork/variant_lab.py for the resolvers these labels describe. Variant Lab writes
+# the Variation Seed, the six sliders and (E2, opt-in) the three audio levels — and nothing else.
+# It never renders, and it never re-analyses your videos.
 # ============================================================================
 
 LABEL_VARIANT_LAB = "🧪 Variant Lab"
@@ -536,8 +536,9 @@ INFO_VARIANT_LAB = (
     "choose how far from your current settings to wander, and generate one recipe. "
     "**Your current six sliders above are the starting point**, whatever preset they came from — "
     "and generating writes the result back into them, so the next Generate starts from the new "
-    "values. Generating only moves the Variation Seed and those sliders: it never starts a render, "
-    "never re-analyses your videos, and never affects your confirmed source files."
+    "values. Generating moves the Variation Seed, those sliders and — only if you tick something "
+    "under Audio variation — the three audio levels: it never starts a render, never re-analyses "
+    "your videos, and never affects your confirmed source files."
 )
 
 LABEL_MASTER_SEED = "🧬 Master Creative Seed"
@@ -546,8 +547,12 @@ INFO_MASTER_SEED = (
     "Variant Lab fills in for you. A Master Seed repeats a draw only when the starting slider "
     "values and the Lab settings below (ranges, ticked controls, Spread) are the same. Because "
     "Generate overwrites the sliders, pressing it twice in a row gives two different recipes: to "
-    "replay an old Master Seed, set the starting preset or values back first. The exact render "
-    "settings are always the Variation Seed plus the six sliders, not the Master Seed. "
+    "replay an old Master Seed, set the starting preset or values back first, and put the Lab "
+    "settings back the way they were. What a draw produces is written into widgets you can see — "
+    "the Variation Seed, the six sliders, and the three audio levels when you tick them under "
+    "Audio variation — and it is those widgets, never the Master Seed, that the render reads. "
+    "Everything else is still yours and is never generated: your source videos, voice clips, "
+    "voice timing, Avoid drops, the SFX folder and the enabled SFX roles. "
     "Leave this at 0 and a fresh one is created and shown here."
 )
 
@@ -556,7 +561,9 @@ INFO_VARIATION_SPREAD = (
     "Conservative ↔ Crazy. How far a generated recipe may wander from your current sliders — not "
     "how high the values go: each control moves up or down independently, so a wild recipe might "
     "be dense cuts with calm footage. 0 keeps the six controls exactly where they are, but you "
-    "still get a fresh Variation Seed, so the clip choices change."
+    "still get a fresh Variation Seed, so the clip choices change. The same Spread also drives "
+    "Audio variation below, where 0 genuinely changes nothing — there is no audio equivalent of "
+    "the Variation Seed."
 )
 
 LABEL_VARIANT_RANDOMIZE = "🎯 Controls that may vary"
@@ -569,6 +576,29 @@ INFO_VARIANT_RANGES = (
     "These stay put when you change preset or move a slider; if your current value falls outside a "
     "range, variation is centred on the nearest edge instead. A min above its max is read as a "
     "fixed value, never silently swapped."
+)
+
+# [FORK] Digital-Union (Variant Lab Audio / E2 V1): the audio subsection of the existing Variant
+# Lab. Three controls only, and the copy is explicit about what is deliberately NOT here — a user
+# who expects the voice timing or the SFX roles to vary should learn that from the UI, not from a
+# render that surprised them.
+INFO_VARIANT_AUDIO = (
+    "**Audio variation** — optional, and off until you tick something. The same Master Seed and "
+    "Variation Spread above drive these, and generating writes the result into the Audio Layers and "
+    "Smart Mix sliders. Only these three levels can vary: your voice clips, SFX folder, enabled SFX "
+    "roles, voice timing and *Avoid drops* are always left exactly as you set them."
+)
+
+LABEL_VARIANT_AUDIO_RANDOMIZE = "🔊 Audio levels that may vary"
+INFO_VARIANT_AUDIO_RANDOMIZE = (
+    "Nothing is ticked by default, so audio is untouched until you ask for it. Unticked levels are "
+    "left exactly as they are, and their range below is ignored."
+)
+
+INFO_VARIANT_AUDIO_RANGES = (
+    "**Allowed audio ranges** — read exactly like the ranges above: a ticked level always lands "
+    "inside its range, a value outside its range is centred on the nearest edge, and a min above "
+    "its max is read as a fixed value rather than silently swapped."
 )
 
 LABEL_GENERATE_VARIANT = "✨ Generate Variant"

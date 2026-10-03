@@ -11,20 +11,37 @@ paths:
 ## Variant Lab V1 generates one reproducible recipe (C2)
 
 `beatsync_fork/variant_lab.py` + `beatsync_fork/creative_recipe.py`. The user declares **what may
-vary**; the lab resolves **exactly one** thing that will be rendered:
+vary**; the lab resolves **exactly one** visual recipe:
 
 ```
 VARIANT LAB     = what MAY vary          (configuration, ephemeral)
-CREATIVE RECIPE = what WILL be rendered  (seven integers, the execution artifact)
+CREATIVE RECIPE = what WILL be rendered  (seven integers, the VISUAL execution artifact)
 THE SIX SLIDERS = where the recipe lands (unchanged execution truth)
 ```
 
-Generating writes the **existing** Variation Seed and the six sliders and nothing else, so the
-pipeline keeps receiving the same seven values it always has. No Variant Lab state reaches
-`CreativeProfile`, `beat_info["creative"]`, `process_video_guarded`, `render_info`, the filename or
-any stage — the planner has never heard of recipes. **It renders nothing**; the user still presses
-Create Music Video. Multi-variant generation, batch rendering and variant comparison are **C3** and
-a test asserts none of that machinery exists.
+**This section is the visual half, and only the visual half.** E2 V1 added a *sibling* audio
+resolution, so one press of Generate today does:
+
+```
+GENERATE =  one visual recipe  (CreativeRecipe: Variation Seed + the six creative sliders)
+         +  one audio recipe   (AudioRecipe:    the three existing audio level widgets)
+         resolved from ONE shared master seed and ONE shared Spread,
+         written into the visible execution widgets — and it renders nothing.
+```
+
+`AudioRecipe` is a **sibling** of `CreativeRecipe`, never a field of it, and no audio value enters
+`CreativeProfile` or `beat_info["creative"]`. The visual contract below is therefore unchanged by
+E2: the pipeline still receives exactly the same seven values it always has, because the three
+audio levels reach the render the way they always have — as the live Audio Layers / Smart Mix
+widgets that `process_video_guarded` normalises at Create Music Video click time. The audio section
+at the bottom of this file is the full E2 contract.
+
+Generating writes the **existing** Variation Seed, the six sliders and — only when the user ticks
+something under Audio variation — the three audio level widgets. Nothing else. No Variant Lab state
+reaches `CreativeProfile`, `beat_info["creative"]`, `process_video_guarded`, `render_info`, the
+filename or any stage — the planner has never heard of recipes. **It renders nothing**; the user
+still presses Create Music Video. Multi-variant generation, batch rendering and variant comparison
+are **C3** and a test asserts none of that machinery exists.
 
 - **The base is always the live sliders.** No base control inside the lab and no cached snapshot:
   the six current values are read at click time, so Balanced explores around Balanced and a
@@ -33,7 +50,7 @@ a test asserts none of that machinery exists.
   to the nearest edge (`anchor = clamp(base, lo, hi)`) rather than raising.
 - **Named RNG sub-streams, and this is the load-bearing part.** Key format, pinned by golden-vector
   tests: `"variant_lab|1|<master>|<domain>|<name>"` → SHA-1 → first 12 hex digits → `random.Random`.
-  Domains are `clips`, `controls` and `audio` (reserved for E2, unused). A single sequential
+  Domains are `clips`, `controls` and `audio` — all three are **used** since E2 V1. A single sequential
   `random.Random(master)` would be simpler and is exactly what this must not be: adding one control
   later would shift every subsequent draw and silently invalidate every master seed a user wrote
   down. Five properties each have a test — enabling/disabling another control, re-ranging another
@@ -57,7 +74,12 @@ a test asserts none of that machinery exists.
   ```
   MASTER SEED     = generator provenance   (reproduces a draw only with the same inputs)
   CREATIVE RECIPE = execution artifact     (the seven values; durable on its own)
+  AUDIO RECIPE    = execution artifact     (the three levels; sibling, E2 V1)
   ```
+
+  Both artifacts are *what the lab generated*, not a complete description of a render: the voice
+  clips, voice timing, `avoid_drops`, the SFX folder, the enabled roles and the source media are
+  pre-existing render/resource intent the lab never writes, and a replay needs those back too.
 
   The resolver's real contract is *same master **and** same base, ranges, randomize selection,
   spread and algorithm version → same recipe*. Because the base is the live sliders and Generate
@@ -67,7 +89,9 @@ a test asserts none of that machinery exists.
   restore Cinematic → `55/15/60/63/22/62` again. The clip seed stays `822019` throughout, because it
   depends on the master alone. **Do not "fix" this with a cached base snapshot** — hidden state that
   disagrees with the visible sliders is worse than the honest explanation. A structural test keeps
-  `INFO_MASTER_SEED` from reclaiming master-only reproducibility.
+  `INFO_MASTER_SEED` from reclaiming master-only reproducibility — and, since E2 V1, from the
+  opposite two failures as well: describing the generated values as only the Variation Seed and the
+  six sliders, or implying that what the lab generates *is* the whole render.
 - **`🎲 New Variant` guarantees a different master, it does not merely hope for one** (R1-B).
   `random_seed()` draws from 1..999999 and *can* return the value already in the box, so
   `_fresh_variant_master_seed(previous)` draws once and, on a collision with a usable previous
@@ -106,9 +130,11 @@ a test asserts none of that machinery exists.
   `preset_label` — provenance lives on `VariantLabResolution`, so a non-random generator can emit a
   recipe without inventing a master seed it never had.
 - **No new slider handlers.** The PR3 preset graph is untouched (one `.input()` per slider) and the
-  lab's thirteen config widgets register nothing — they are read at click time. Because programmatic
-  writes do not fire `.input()`, the generate handler computes `matching_preset(resolved six)`
-  explicitly; at spread 0 that correctly reads the base preset's own name.
+  lab's config widgets register nothing — they are read at click time. Thirteen of them in C2;
+  **twenty since E2 V1**, which added one `CheckboxGroup` and three min/max `gr.Number` pairs to the
+  same accordion and registered nothing for any of them either. Because programmatic writes do not
+  fire `.input()`, the generate handler computes `matching_preset(resolved six)` explicitly; at
+  spread 0 that correctly reads the base preset's own name.
 - **`gr.RangeSlider` does not exist in Gradio 6.19.0** (verified against the installed package), so
   each control gets an explicit min/max `gr.Number` pair. One `gr.CheckboxGroup` carries the
   selection using `(label, value)` choices, so the returned value is the exact field name — never
@@ -121,9 +147,67 @@ a test asserts none of that machinery exists.
   `stage5_cache_v3`, `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`, and
   `src/auto_mode/*`, `video_analysis.py`, `video_processor.py`, `creative.py`, `presets.py` and
   `variation.py` are byte-identical. **No CLI flag** — the CLI already exposes all seven resolved
-  values, which are the reproducible execution contract.
+  *visual* values, which are the reproducible execution contract for the edit. That parity is a C2
+  statement and does **not** extend to E2: no CLI flag was added for the three audio levels and
+  there is no CLI equivalent of the audio generator, so the audio half of Variant Lab is GUI-only.
 
 Measured on real material (Nero track + 41-source TEST1, real Stage 4 and Stage 6 per recipe against
 a warm cache; no render, no Qwen, no cache write): 240 resolved recipes, **240 complete plans, zero
 fallbacks, zero adjacent candidate repeats**, minimum cut gap unchanged. At spread 50 a variant
 shifts the real cut count by a median 8%.
+
+## Variant Lab audio variation (E2 V1)
+
+E2 varies **exactly three** audio values and nothing else:
+
+```
+AUDIO_CONTROL_FIELDS = ("music_under_voice_percent", "sfx_amount", "sfx_level_percent")
+```
+
+- **A parallel path, not a wider recipe.** `resolve_audio()` is a sibling of `resolve()`;
+  `_resolve_v1` and `resolve` were **not modified**, so every C2 golden vector is preserved
+  structurally rather than by assertion. `_resolve_control` gained a `domain` parameter defaulting to
+  `DOMAIN_CONTROLS`, which is why the C2 call site and its keys are byte-identical — and why E2 reuses
+  the one spread formula instead of copying it.
+- **One master seed, one Spread, shared by both halves.** There is deliberately no audio master seed
+  and no audio Spread widget. `resolve_audio(master, config, spread, base)`.
+- **The three field names are RNG stream names and are frozen forever.** Renaming one silently
+  re-keys that control for every master seed a user has written down. They are the
+  `AudioMixConfig`/`SmartMixConfig` field names, not the GUI's widget variable names.
+- **The default ticked selection is EMPTY**, unlike the visual side's all-six. Opening an existing
+  Variant Lab and pressing Generate must not move a mix level, so audio variation is opt-in. Two
+  tests pin it (resolver default and widget default) and a mutation to all-three kills exactly those.
+- **Spread 0 varies nothing here.** There is no audio analogue of the clip Variation Seed, so unlike
+  C2 — where spread 0 still re-seeds clip choice — spread 0 holds all three at their base. The help
+  text and `describe()` both say so.
+- **Why only these three.** They are the audio settings that are already plain `0..100` integers, so
+  `ControlRange`, `_resolve_control` and `_half_up` are reused verbatim: no second range
+  implementation, no fractional-seconds model, no boolean randomization. Deliberately excluded, and
+  these are product decisions rather than omissions: **voice clips** and the **SFX folder** are
+  resource identity; **`avoid_drops`** is a *protective* rule with measured evidence behind it (a clip
+  starting 0.44 s before a drop puts 96 % of its speech inside it), so a draw that flipped it off
+  would produce a measurably bad variant; **enabled SFX roles** are structural intent whose toggling
+  perturbs the frozen cross-role occupancy; and **`voice_start_delay` / `voice_min_gap`** are deferred
+  fractional-seconds *placement* controls whose draws can legitimately make a render refuse. Adding
+  any of them later is purely additive — a new stream name cannot perturb these three.
+- **Each base uses the normaliser that OWNS its control**, and this is load-bearing, not tidiness:
+  `music_under_voice_percent` falls back to **35** (Audio Layers) while both Smart Mix controls fall
+  back to **50**. Routing all three through `creative.normalize_control` (fallback 50) would silently
+  raise the music floor on a malformed widget value. `variant_lab` delegates to
+  `audio_mix.normalize_music_under_voice` and `smart_mix.normalize_control` rather than restating
+  them, exactly as `normalize_master_seed` delegates to `variation.normalize_seed`.
+- **`AudioRecipe` is a trust boundary like `CreativeRecipe`**: frozen, validation **raises**, nothing
+  clamps. It carries no path, role, voice clip, master seed, Spread or range — provenance lives on
+  `AudioVariantResolution`. It is **not** a field of `CreativeRecipe` and must not become one.
+- **The visible widgets stay execution truth.** `process_video_guarded` still builds
+  `AudioMixConfig`/`SmartMixConfig` from the live widgets at render click time; no `AudioRecipe`,
+  `AudioVariantConfig`, master seed or lab range reaches the planner, the renderer,
+  `CreativeProfile`, `beat_info["creative"]`, `AudioMixPlan` or `SmartMixPlan`.
+- **Isolation unchanged.** `audio_mix.py` and `smart_mix.py` were **not modified**;
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`; `video_analysis.py`, `video_processor.py`,
+  `ffmpeg_processing.py`, `library_prep.py` and `src/auto_mode/*` are untouched. **No CLI flag.**
+- **The GUI delegates and implements none of it.** `gui.py` contains no `rng_for` and no
+  `DOMAIN_AUDIO`; it calls `fork_lab.resolve_audio(...)`, and the pure resolver is the only consumer
+  of the `audio` domain. The writer matrix is pinned by **split** seam guards in
+  `.claude/rules/audio-mixdown.md`'s suite — see that rule before touching an audio widget.

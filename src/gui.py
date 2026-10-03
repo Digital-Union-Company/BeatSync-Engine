@@ -130,8 +130,9 @@ from beatsync_fork import presets as fork_presets
 # sub-streams, the spread formula and every normalisation live in src/beatsync_fork/variant_lab.py,
 # and the resolved seven-integer recipe it returns is src/beatsync_fork/creative_recipe.py (both
 # stdlib-only, Gradio-free). This module only wires them to widgets: a resolved recipe is written
-# into the existing Variation Seed and six sliders, and nothing downstream of them learns that
-# Variant Lab exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
+# into the existing Variation Seed and six sliders — and, since E2 V1, a sibling audio recipe into
+# the three existing audio level widgets — and nothing downstream of them learns that Variant Lab
+# exists. `creative_recipe` is deliberately NOT imported here — the GUI only ever
 # handles the resolution object, so it has no reason to name the recipe type.
 from beatsync_fork import variant_lab as fork_lab
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
@@ -1091,17 +1092,20 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
                                          energy_response, motion_bias, source_diversity))
 
 
-# [FORK] Digital-Union (Variant Lab V1 / C2): the two Variant Lab handlers.
+# [FORK] Digital-Union (Variant Lab V1 / C2; audio half added by Variant Lab Audio / E2 V1): the
+# two Variant Lab handlers.
 #
-# Both read the six LIVE slider values as inputs — there is no cached base profile anywhere, so a
-# preset change or a manual edit is picked up by the next Generate automatically. Neither handler
-# registers anything on a slider: the existing preset `.input()` graph is untouched, and these run
-# only on their own button clicks.
+# Both read the LIVE widget values as inputs — the six creative sliders, and since E2 V1 the three
+# audio levels as well — so there is no cached base profile anywhere and a preset change or a
+# manual edit is picked up by the next Generate automatically. Neither handler registers anything
+# on a slider: the existing preset `.input()` graph is untouched, and these run only on their own
+# button clicks.
 #
 # What they write is deliberately the whole story: the master seed (so a freshly minted one is
-# always visible), the existing Variation Seed, the six sliders, the preset label and the report.
-# No source widget, no preparation widget, no `process_btn` — generating a variant cannot clear a
-# confirmation or start a render.
+# always visible), the existing Variation Seed, the six sliders, the preset label, the three audio
+# levels (`music_under_voice`, `sfx_amount`, `sfx_level` — E2 V1) and the report. No source widget,
+# no preparation widget, no `process_btn` — generating a variant cannot clear a confirmation or
+# start a render.
 
 
 #: Display label for each creative control inside the Variant Lab checkbox group. An explicit
@@ -1122,20 +1126,29 @@ _VARIANT_RANDOMIZE_CHOICES = [
 ]
 
 
-def _variant_apply_outputs(master_seed: int, resolution) -> Tuple:
-    """Project one resolution onto the widgets Variant Lab is allowed to write.
+def _variant_apply_outputs(master_seed: int, resolution, audio_resolution) -> Tuple:
+    """Project one visual + audio resolution onto the widgets Variant Lab is allowed to write.
 
     Ordered to match the `outputs` list: master seed, Variation Seed, the six sliders in
-    `CREATIVE_CONTROL_FIELDS` order, the preset label, the report. The preset label is computed
-    explicitly because programmatic slider writes do not fire the sliders' `.input()` handlers —
-    without it the label would keep claiming whatever preset the base came from.
+    `CREATIVE_CONTROL_FIELDS` order, the preset label, the three audio levels in
+    `AUDIO_CONTROL_FIELDS` order, the report. The preset label is computed explicitly because
+    programmatic slider writes do not fire the sliders' `.input()` handlers — without it the label
+    would keep claiming whatever preset the base came from.
+
+    [FORK] Digital-Union (Variant Lab Audio / E2 V1): there is **one** projection helper, so the
+    widget output tuple has a single definition and the visual and audio halves cannot drift out of
+    alignment with the `outputs` list. The report is the two resolutions' own `describe()` output
+    joined — this function formats no text of its own, so each half keeps exactly one formatter.
     """
     recipe = resolution.recipe
     values = tuple(getattr(recipe, field)
                    for field in fork_presets.CREATIVE_CONTROL_FIELDS)
+    audio_values = tuple(getattr(audio_resolution.recipe, field)
+                         for field in fork_lab.AUDIO_CONTROL_FIELDS)
     return (master_seed, recipe.seed) + values + (
         fork_presets.matching_preset(values),
-        resolution.describe(),
+    ) + audio_values + (
+        '\n'.join([resolution.describe(), audio_resolution.describe()]),
     )
 
 
@@ -1146,8 +1159,13 @@ def _on_generate_variant(variant_master_seed, variation_spread, variant_randomiz
                          range_energy_response_min, range_energy_response_max,
                          range_motion_bias_min, range_motion_bias_max,
                          range_source_diversity_min, range_source_diversity_max,
+                         variant_audio_randomize,
+                         range_music_under_voice_min, range_music_under_voice_max,
+                         range_sfx_amount_min, range_sfx_amount_max,
+                         range_sfx_level_min, range_sfx_level_max,
                          cut_density, micro_cuts, semantic_emphasis,
-                         energy_response, motion_bias, source_diversity) -> Tuple:
+                         energy_response, motion_bias, source_diversity,
+                         music_under_voice, sfx_amount, sfx_level) -> Tuple:
     """Resolve and apply exactly one recipe from the live base and the lab configuration.
 
     An unusable master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh
@@ -1183,7 +1201,39 @@ def _on_generate_variant(variant_master_seed, variation_spread, variant_randomiz
         'motion_bias': motion_bias,
         'source_diversity': source_diversity,
     }
-    return _variant_apply_outputs(master_seed, fork_lab.resolve(config, base))
+
+    # [FORK] Digital-Union (Variant Lab Audio / E2 V1): the audio half, resolved from the SAME
+    # visible master seed and the SAME visible Spread — there is deliberately no second audio seed
+    # and no second audio Spread widget. The default ticked selection is empty, so an existing C2
+    # user who presses Generate gets their audio levels back unchanged.
+    audio_config = fork_lab.AudioVariantConfig(
+        randomized=variant_audio_randomize,
+        ranges={
+            'music_under_voice_percent': (range_music_under_voice_min,
+                                          range_music_under_voice_max),
+            'sfx_amount': (range_sfx_amount_min, range_sfx_amount_max),
+            'sfx_level_percent': (range_sfx_level_min, range_sfx_level_max),
+        },
+    )
+    # Each audio base goes through the normaliser that OWNS that control, never a shared 0..100 one:
+    # `music_under_voice` falls back to 35 while both Smart Mix controls fall back to 50, so routing
+    # all three through `creative.normalize_control` (fallback 50) would silently change the music
+    # floor a malformed widget value resolves to. The resolver delegates to these same functions, so
+    # the two cannot disagree.
+    audio_base = {
+        'music_under_voice_percent':
+            fork_audio_mix.normalize_music_under_voice(music_under_voice),
+        'sfx_amount':
+            fork_smart_mix.normalize_control(sfx_amount, fork_smart_mix.DEFAULT_AMOUNT),
+        'sfx_level_percent':
+            fork_smart_mix.normalize_control(sfx_level,
+                                             fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT),
+    }
+    return _variant_apply_outputs(
+        master_seed,
+        fork_lab.resolve(config, base),
+        fork_lab.resolve_audio(master_seed, audio_config, variation_spread, audio_base),
+    )
 
 
 def _fresh_variant_master_seed(previous) -> int:
@@ -2008,18 +2058,56 @@ def create_ui() -> gr.Blocks:
                         with gr.Row():
                             range_source_diversity_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SOURCE_DIVERSITY} min', elem_id='variant-range-source-diversity-min')
                             range_source_diversity_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SOURCE_DIVERSITY} max', elem_id='variant-range-source-diversity-max')
+                        # [FORK] Digital-Union (Variant Lab Audio / E2 V1): the audio subsection of
+                        # this same accordion — not a second Variant Lab and not a second workflow.
+                        # Seven components: one CheckboxGroup and three min/max pairs. There is
+                        # deliberately no audio master seed and no audio Spread; the two above drive
+                        # both halves. Like every other lab widget these register NOTHING and are
+                        # read at click time only.
+                        gr.Markdown(INFO_VARIANT_AUDIO)
+                        # `(label, value)` choices, so the returned value IS the exact field name
+                        # the resolver keys on and the RNG stream is named by. Never derived from
+                        # the display label by lowercasing or rewriting: these three strings are
+                        # frozen stream names, so a reworded label must not be able to re-key them.
+                        variant_audio_randomize = gr.CheckboxGroup(
+                            choices=[
+                                (LABEL_MUSIC_UNDER_VOICE, 'music_under_voice_percent'),
+                                (LABEL_SFX_AMOUNT, 'sfx_amount'),
+                                (LABEL_SFX_LEVEL, 'sfx_level_percent'),
+                            ],
+                            # Empty by default, unlike the visual side's all-six: opening an
+                            # existing Variant Lab and pressing Generate must not move a mix level.
+                            value=sorted(fork_lab.default_audio_randomized()),
+                            label=LABEL_VARIANT_AUDIO_RANDOMIZE,
+                            info=INFO_VARIANT_AUDIO_RANDOMIZE,
+                            elem_id='variant-audio-randomize-group',
+                        )
+                        gr.Markdown(INFO_VARIANT_AUDIO_RANGES)
+                        with gr.Row():
+                            range_music_under_voice_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} min', elem_id='variant-range-music-under-voice-min')
+                            range_music_under_voice_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} max', elem_id='variant-range-music-under-voice-max')
+                        with gr.Row():
+                            range_sfx_amount_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SFX_AMOUNT} min', elem_id='variant-range-sfx-amount-min')
+                            range_sfx_amount_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SFX_AMOUNT} max', elem_id='variant-range-sfx-amount-max')
+                        with gr.Row():
+                            range_sfx_level_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SFX_LEVEL} min', elem_id='variant-range-sfx-level-min')
+                            range_sfx_level_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_SFX_LEVEL} max', elem_id='variant-range-sfx-level-max')
                         with gr.Row():
                             generate_variant_btn = gr.Button(LABEL_GENERATE_VARIANT, variant='secondary', elem_id='generate-variant-button')
                             new_variant_btn = gr.Button(LABEL_NEW_VARIANT, elem_id='new-variant-button')
                         # "Last generated", never "Current": the user may edit the seed or any
                         # slider afterwards, and a read-out claiming to describe the render would
                         # then be lying. The seed and sliders above stay the execution truth.
+                        # Seven lines: the visual resolution's five plus the audio resolution's two.
+                        # Raised for truthful display only — if the box were left at five the audio
+                        # half would be silently clipped out of a read-out that claims to describe
+                        # the whole generated variant.
                         variant_report = gr.Textbox(
                             label=LABEL_VARIANT_REPORT,
                             value='',
                             placeholder=PLACEHOLDER_VARIANT_REPORT,
-                            lines=5,
-                            max_lines=5,
+                            lines=7,
+                            max_lines=7,
                             interactive=False,
                             elem_id='variant-report-box',
                         )
@@ -2203,6 +2291,19 @@ def create_ui() -> gr.Blocks:
         # `inputs` is config first, then the six LIVE slider values, matching both handlers'
         # parameter order (Gradio passes positionally). The base is read here and nowhere else,
         # which is what makes "the current sliders are the base" true rather than aspirational.
+        # [FORK] Digital-Union (Variant Lab Audio / E2 V1): the audio config widgets extend the
+        # same list, and the three live audio widgets extend the base block — config first, then
+        # every live base, so the documented "config then bases" shape still describes the whole
+        # list. `_on_generate_variant`'s parameter order mirrors this exactly and a seam test pins
+        # the alignment, because Gradio passes these positionally.
+        variant_lab_audio_config = [
+            variant_audio_randomize,
+            range_music_under_voice_min, range_music_under_voice_max,
+            range_sfx_amount_min, range_sfx_amount_max,
+            range_sfx_level_min, range_sfx_level_max,
+        ]
+        variant_lab_audio_bases = [music_under_voice, sfx_amount, sfx_level]
+
         variant_lab_inputs = [
             variant_master_seed, variation_spread, variant_randomize,
             range_cut_density_min, range_cut_density_max,
@@ -2211,14 +2312,21 @@ def create_ui() -> gr.Blocks:
             range_energy_response_min, range_energy_response_max,
             range_motion_bias_min, range_motion_bias_max,
             range_source_diversity_min, range_source_diversity_max,
-        ] + creative_control_sliders
+        ] + variant_lab_audio_config + creative_control_sliders + variant_lab_audio_bases
 
         # Note what is absent from `outputs`: `source_outputs`, `prep_outputs`, `process_btn` and
         # every render setting. A variant moves the master seed, the Variation Seed, the six
-        # sliders, the preset label and the report — and starts nothing.
+        # sliders, the preset label, the three audio levels and the report — and starts nothing.
+        #
+        # The three audio levels are the ONLY audio widgets Variant Lab may write. `voice_files`,
+        # `voice_start_delay`, `voice_min_gap`, `voice_avoid_drops`, `sfx_folder` and `sfx_roles`
+        # stay zero-writer configuration, and the two report panels keep `process_btn.click` as
+        # their single writer. Split seam tests pin that whole matrix rather than trusting this note.
         variant_lab_outputs = [
             variant_master_seed, variation_seed,
-        ] + creative_control_sliders + [creative_preset, variant_report]
+        ] + creative_control_sliders + [
+            creative_preset,
+        ] + variant_lab_audio_bases + [variant_report]
 
         generate_variant_btn.click(
             fn=_on_generate_variant,

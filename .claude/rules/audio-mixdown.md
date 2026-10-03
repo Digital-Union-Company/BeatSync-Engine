@@ -107,8 +107,10 @@ test asserts this against the real call — it is the most important test in D.
   sources are never copied or deleted.
 - **Isolation.** Voice never reaches Stage 5 (`stage5_cache_v3` and
   `auto_av_analysis_v8_llama_vulkan_batched` unchanged), `CreativeProfile`, `CreativeRecipe`,
-  `VariantLabConfig` or the presets. Variant Lab audio integration is **E2** — `AudioMixConfig` is
-  its future destination, and D must not pre-empt it. **No CLI flag.**
+  `VariantLabConfig` or the presets. Variant Lab audio integration **shipped as E2 V1** and reaches
+  exactly one Audio Layers control — `music_under_voice` — by writing the widget, which
+  `AudioMixConfig` then normalises at the render boundary as it always has. `AudioMixConfig` itself
+  was **not modified**. See the Variant Lab audio section below. **No CLI flag.**
 - Seconds controls deliberately do **not** reuse `creative.normalize_control` (`2.5` is a valid
   delay) but keep its explicit type boundary; NaN/inf fall back to the default rather than clamping,
   so an infinite delay cannot become an enormous `adelay`.
@@ -158,8 +160,11 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
   non-fatal and ignored, the fatal rules are untouched, and diagnostics reach no placement, no
   `AudioMixPlan`, no creative state and no cache.
 - **Seedless.** Pools are ordered with `input_manager.order_key` and consumed round-robin, so the
-  same library, track and settings always reproduce. No `rng_for`, no Variation Seed, no Master
-  Creative Seed — E2 still owns the reserved `"audio"` RNG domain and it stays unused.
+  same library, track and settings always reproduce. The *planner* contains no `rng_for`, no
+  Variation Seed and no Master Creative Seed, and `smart_mix.py` was **not modified** by E2: Variant
+  Lab varies `sfx_amount` and `sfx_level` by writing those two widgets, and the planner still
+  receives one already-normalised `SmartMixConfig`. Given a config, placement remains fully
+  deterministic and seedless.
 - **The asset cursor advances on every candidate ATTEMPT, not every success.** Candidate `k` takes
   `pool[k % N]` whether or not it lands. Without that, one asset too long to fit would be retried at
   every later anchor and permanently block the rest of its pool.
@@ -245,3 +250,41 @@ master**, and `video_processor.py` / `ffmpeg_processing.py` are untouched.
   button; the library is validated by the render preflight. The report mirrors D's R1-B lifecycle:
   cleared before every attempt and before the gate, blank when inactive or on preflight failure,
   populated only from `SmartMixPlan.report_lines()`, and written by **`process_btn.click` alone**.
+
+## What Variant Lab may touch here (E2 V1)
+
+**Variant Lab writes exactly three audio widgets, and only from its own two buttons:**
+
+```
+music_under_voice   <-  generate_variant_btn.click, new_variant_btn.click
+sfx_amount          <-  generate_variant_btn.click, new_variant_btn.click
+sfx_level           <-  generate_variant_btn.click, new_variant_btn.click
+```
+
+**It writes nothing else.** `voice_files`, `voice_start_delay`, `voice_min_gap`,
+`voice_avoid_drops`, `sfx_folder` and `sfx_roles` remain **zero-writer** configuration values that
+no event in the app may set programmatically, and `audio_layers_report` / `smart_mix_report` keep
+`process_btn.click` as their single writer. Those are the user's decisions and the render's
+diagnostics respectively; neither is a value to vary.
+
+Why those six are excluded is in `.claude/rules/variant-lab.md` — in short: files and folders are
+resource identity, `avoid_drops` is a measured protective rule, roles are structural intent, and the
+two seconds controls are deferred placement controls. **Do not add them here without reading that
+rule first.**
+
+Load-bearing test detail, because this is where a future change would go wrong quietly:
+
+- **The writer guards were split, never weakened.** `test_no_audio_configuration_widget_is_ever_written`
+  and `test_no_smart_mix_config_widget_is_ever_written` now assert **zero** writers for the excluded
+  controls, and two new tests assert the permitted three have **exactly** the two Variant Lab writers
+  — the writer *list* is pinned, so wiring one of them into any other event fails.
+- **Those guards must resolve list indirection.** `variant_lab_outputs` reaches its widgets through a
+  named sub-list (`variant_lab_audio_bases`), so a plain `names_in` sees the sub-list name and never
+  `music_under_voice`. `expanded_names_in` exists for exactly this reason: without it every
+  "is this widget ever written?" assertion in the suite would pass **vacuously** the moment a widget
+  moved behind one level of indirection. A test asserts the non-expanded form genuinely does *not*
+  see the widget, so the expander cannot be quietly dropped.
+- **`audio_mix.py` and `smart_mix.py` were not modified**, and `tests/test_audio_mix.py` /
+  `tests/test_smart_mix.py` are **unchanged** — they are independent regression controls for the
+  placement algorithms, the duck model, the frozen Nero ladder and the occupancy policy. E2 changes
+  which *values* reach those planners, never how they behave given a value.

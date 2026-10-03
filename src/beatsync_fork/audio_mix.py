@@ -27,9 +27,22 @@ Ordering therefore reuses :func:`input_manager.order_key`, the project's existin
 order, so there is one path-sorting rule in the fork rather than two subtly different ones.
 
 Placement is deterministic and seedless. There is no RNG, no Variation Seed and no Master Creative
-Seed: the same music structure, voice durations and config always produce the same plan. Variant Lab
-deliberately does not reach audio in V1 — that is E2, and :class:`AudioMixConfig` is its future
-destination rather than ``CreativeRecipe``.
+Seed: the same music structure, voice durations and :class:`AudioMixConfig` always produce the same
+plan.
+
+**Variant Lab reaches audio since E2 V1 — and this planner still knows nothing about it.** That is
+not a contradiction, because what E2 added happens entirely *upstream* of here. Variant Lab resolves
+one Audio Layers value, ``music_under_voice_percent``, and writes the existing *Music under voice*
+widget with it; the GUI then builds an :class:`AudioMixConfig` from that visible widget at
+render-click time, exactly as it did before E2 existed. Nothing hands this module a generated
+object: no master seed, no ``"audio"`` RNG stream, no ``AudioRecipe``, no ``AudioVariantConfig`` and
+no Variant Lab range ever arrives here. The planner receives one already-normalised config, and a
+config is a config however its number was chosen — so every placement rule below, and the duck
+model, remain exactly as deterministic and as seedless as they were in V1.
+
+:class:`AudioMixConfig` is therefore where a varied value *lands*, not a destination still waiting
+on future work, and it is still emphatically not a field of ``CreativeRecipe``. E2's other two
+levels are Smart Mix controls and never enter this planner either.
 
 ===============================================================================
 Two rules worth stating in full

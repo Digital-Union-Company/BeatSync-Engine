@@ -134,6 +134,37 @@ def _assigned_list(tree, name):
     return _ordered_names(node.value)
 
 
+def _list_valued_assign(tree, name):
+    """The assigned value for `name`, but only when it is a list or a concatenation of lists.
+
+    A widget assignment (`variant_master_seed = gr.Number(...)`) is an `Assign` too, so without
+    this guard an expander would happily walk into a `gr.Number` call and return the names of its
+    keyword arguments.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == name:
+            return node.value if isinstance(node.value, (ast.List, ast.BinOp)) else None
+    return None
+
+
+def _expanded_list(tree, name, _depth=0):
+    """`_assigned_list`, with locally-assigned *list* variables resolved into their own elements.
+
+    `variant_lab_inputs` and `variant_lab_outputs` are built by concatenating named sub-lists
+    (`creative_control_sliders`, `variant_lab_audio_config`, `variant_lab_audio_bases`), so the
+    opaque form cannot see the individual widgets. E2's writer matrix has to name exact widgets,
+    so this flattens the indirection until only real widget names remain.
+    """
+    assert _depth < 6, "list indirection is deeper than expected"
+    out = []
+    for item in _assigned_list(tree, name):
+        if _list_valued_assign(tree, item) is not None:
+            out.extend(_expanded_list(tree, item, _depth + 1))
+        else:
+            out.append(item)
+    return out
+
+
 # ===========================================================================
 # 1. GOLDEN RNG VECTORS — the reproducibility promise
 # ===========================================================================
@@ -801,22 +832,56 @@ def test_no_creative_slider_gained_a_second_handler(widget: str):
     assert ast.unparse(_kwargs(calls[0])["fn"]) == "_on_creative_control_input"
 
 
-def test_the_input_list_is_config_then_the_six_live_sliders():
+#: The widget names behind the audio halves of the lab's input list. E2 (§10/§12): one
+#: CheckboxGroup plus three min/max pairs of configuration, and the three live levels as bases.
+AUDIO_CONFIG_WIDGETS = (["variant_audio_randomize"]
+                        + [f"range_{w}_{e}" for w in ("music_under_voice", "sfx_amount",
+                                                      "sfx_level")
+                           for e in ("min", "max")])
+AUDIO_BASE_WIDGETS = ["music_under_voice", "sfx_amount", "sfx_level"]
+
+
+def test_the_input_list_is_config_then_every_live_base():
+    """Config first (visual then audio), then every live base (visual then audio).
+
+    E2 extended this list rather than creating a second one, so the documented "config then bases"
+    shape still describes the whole thing.
+    """
     names = _assigned_list(_tree(_GUI), "variant_lab_inputs")
     expected = (["variant_master_seed", "variation_spread", "variant_randomize"]
                 + [f"range_{f}_{e}" for f in FIELDS for e in ("min", "max")]
-                + ["creative_control_sliders"])
+                + ["variant_lab_audio_config", "creative_control_sliders",
+                   "variant_lab_audio_bases"])
     assert names == expected
 
 
+def test_the_input_list_expands_to_exactly_the_expected_widgets():
+    """The same contract with the sub-list indirection resolved, so the exact widgets are pinned."""
+    tree = _tree(_GUI)
+    expected = (["variant_master_seed", "variation_spread", "variant_randomize"]
+                + [f"range_{f}_{e}" for f in FIELDS for e in ("min", "max")]
+                + AUDIO_CONFIG_WIDGETS + list(FIELDS) + AUDIO_BASE_WIDGETS)
+    assert _expanded_list(tree, "variant_lab_inputs") == expected
+
+
 def test_the_input_list_matches_both_handlers_parameter_order():
-    """Gradio passes `inputs` positionally, so the list and the signatures are one contract."""
+    """Gradio passes `inputs` positionally, so the list and the signatures are one contract.
+
+    This is the test that would catch an E2 parameter inserted in the wrong place — the failure
+    mode would otherwise be a silently mis-assigned audio range rather than an exception.
+    """
     tree = _tree(_GUI)
     parameters = [a.arg for a in _func(tree, "_on_generate_variant").args.args]
     expected = (["variant_master_seed", "variation_spread", "variant_randomize"]
                 + [f"range_{f}_{e}" for f in FIELDS for e in ("min", "max")]
-                + list(FIELDS))
+                + ["variant_audio_randomize"]
+                + [f"range_{w}_{e}" for w in ("music_under_voice", "sfx_amount", "sfx_level")
+                   for e in ("min", "max")]
+                + list(FIELDS) + AUDIO_BASE_WIDGETS)
     assert parameters == expected
+
+    # and the signature order is the *expanded* input order, element for element
+    assert parameters == _expanded_list(tree, "variant_lab_inputs")
 
     new_variant = _func(tree, "_on_new_variant")
     assert [a.arg for a in new_variant.args.args] == ["variant_master_seed"]
@@ -826,7 +891,21 @@ def test_the_input_list_matches_both_handlers_parameter_order():
 def test_the_output_list_is_exactly_what_variant_lab_may_write():
     names = _assigned_list(_tree(_GUI), "variant_lab_outputs")
     assert names == ["variant_master_seed", "variation_seed", "creative_control_sliders",
-                     "creative_preset", "variant_report"]
+                     "creative_preset", "variant_lab_audio_bases", "variant_report"]
+
+
+def test_the_output_list_expands_to_the_exact_writable_widgets():
+    """E2 adds exactly three writable widgets — the three audio levels — and nothing else.
+
+    Everything else in Audio Layers / Smart Mix stays unwritable, which is the property the split
+    seam guards in `test_audio_layers_seam.py` assert from the other direction.
+    """
+    expanded = _expanded_list(_tree(_GUI), "variant_lab_outputs")
+    assert expanded == (["variant_master_seed", "variation_seed"] + list(FIELDS)
+                        + ["creative_preset"] + AUDIO_BASE_WIDGETS + ["variant_report"])
+    for forbidden in ("voice_files", "voice_start_delay", "voice_min_gap", "voice_avoid_drops",
+                      "sfx_folder", "sfx_roles", "audio_layers_report", "smart_mix_report"):
+        assert forbidden not in expanded, forbidden
 
 
 def test_variant_lab_writes_no_gate_or_preparation_widget():
@@ -975,6 +1054,8 @@ _HANDLER_NAMES = ("_variant_apply_outputs", "_on_generate_variant",
 
 
 def _gui_handlers():
+    from beatsync_fork import audio_mix as fork_audio_mix
+    from beatsync_fork import smart_mix as fork_smart_mix
     from beatsync_fork import variation as fork_variation
     from typing import Tuple
 
@@ -986,20 +1067,43 @@ def _gui_handlers():
     missing = [name for name, node in wanted.items() if node is None]
     assert not missing, f"handlers not found at module level: {missing}"
 
+    # `fork_audio_mix` / `fork_smart_mix` joined the extraction namespace with E2: the handler
+    # derives each audio base through the normaliser that OWNS that control, so those two modules
+    # are now part of the handler's real dependency set.
     namespace = {"fork_presets": fork_presets, "fork_lab": fork_lab,
-                 "fork_variation": fork_variation, "Tuple": Tuple}
+                 "fork_variation": fork_variation, "fork_audio_mix": fork_audio_mix,
+                 "fork_smart_mix": fork_smart_mix, "Tuple": Tuple}
     exec(compile(ast.Module(body=list(wanted.values()), type_ignores=[]),
                  filename=_GUI, mode="exec"), namespace)
     return namespace
 
 
-def _generate(master, base, spread=50, randomized=None, ranges=None):
+#: E2's three audio controls and their *owning* defaults — 35 for Audio Layers' music floor, 50 for
+#: both Smart Mix controls. Written out rather than imported from the fork so a change to either
+#: default is visible here as a deliberate test edit.
+AUDIO_FIELDS = fork_lab.AUDIO_CONTROL_FIELDS
+AUDIO_BASE_DEFAULTS = {"music_under_voice_percent": 35, "sfx_amount": 50, "sfx_level_percent": 50}
+
+
+def _generate(master, base, spread=50, randomized=None, ranges=None,
+              audio_randomized=None, audio_ranges=None, audio_base=None):
+    """Invoke the real handler. The audio defaults mirror a **first-open** lab — nothing ticked,
+    full ranges, each control at its own default — so every pre-E2 call site in this file still
+    describes exactly the scenario it always did, which is itself part of the C2 regression proof.
+    """
     handlers = _gui_handlers()
     randomized = list(FIELDS) if randomized is None else randomized
     ranges = {f: (0, 100) for f in FIELDS} if ranges is None else ranges
     flat_ranges = [value for f in FIELDS for value in ranges[f]]
+    audio_randomized = [] if audio_randomized is None else audio_randomized
+    audio_ranges = ({f: (0, 100) for f in AUDIO_FIELDS}
+                    if audio_ranges is None else audio_ranges)
+    flat_audio_ranges = [value for f in AUDIO_FIELDS for value in audio_ranges[f]]
+    audio_base = dict(AUDIO_BASE_DEFAULTS) if audio_base is None else audio_base
     return handlers["_on_generate_variant"](
-        master, spread, randomized, *flat_ranges, *[base[f] for f in FIELDS])
+        master, spread, randomized, *flat_ranges,
+        audio_randomized, *flat_audio_ranges,
+        *[base[f] for f in FIELDS], *[audio_base[f] for f in AUDIO_FIELDS])
 
 
 def test_the_real_handler_produces_the_exact_expected_outputs():
@@ -1010,10 +1114,14 @@ def test_the_real_handler_produces_the_exact_expected_outputs():
     assert outputs[1] == 822019                       # resolved clip Variation Seed
     assert outputs[2:8] == (55, 15, 60, 63, 22, 62)   # the six sliders, in field order
     assert outputs[8] == "Custom"                     # preset label, computed explicitly
-    assert "algorithm v1" in outputs[9]
-    assert "Master seed 582913" in outputs[9]
-    assert "6 randomized / 0 fixed" in outputs[9]
-    assert len(outputs) == 10
+    # E2: the three audio levels. Nothing is ticked by default, so these are the untouched bases —
+    # the exact backward-compatibility property, asserted through the real handler.
+    assert outputs[9:12] == (35, 50, 50)
+    assert "algorithm v1" in outputs[12]
+    assert "Master seed 582913" in outputs[12]
+    assert "6 randomized / 0 fixed" in outputs[12]
+    assert "Audio · 0 randomized / 3 fixed (audio variation off)" in outputs[12]
+    assert len(outputs) == 13
 
 
 def test_the_real_handler_is_reproducible():
@@ -1032,10 +1140,15 @@ def test_an_unusable_master_seed_is_replaced_by_a_fresh_visible_one(bad_master: 
     assert _generate(minted, BALANCED) == outputs
 
 
-def _new_variant(handlers, previous, base, spread=50):
+def _new_variant(handlers, previous, base, spread=50, audio_randomized=None, audio_base=None):
     flat_ranges = [value for _ in FIELDS for value in (0, 100)]
+    flat_audio_ranges = [value for _ in AUDIO_FIELDS for value in (0, 100)]
+    audio_randomized = [] if audio_randomized is None else audio_randomized
+    audio_base = dict(AUDIO_BASE_DEFAULTS) if audio_base is None else audio_base
     return handlers["_on_new_variant"](
-        previous, spread, list(FIELDS), *flat_ranges, *[base[f] for f in FIELDS])
+        previous, spread, list(FIELDS), *flat_ranges,
+        audio_randomized, *flat_audio_ranges,
+        *[base[f] for f in FIELDS], *[audio_base[f] for f in AUDIO_FIELDS])
 
 
 def test_new_variant_mints_a_fresh_visible_master_on_the_normal_path():
@@ -1170,9 +1283,24 @@ def test_replay_also_requires_the_same_lab_configuration(changed: str):
 
 
 def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
-    """**R1-A structural guard.** The help text said "Type a master seed you used before and
-    Generate to get that exact recipe back", which is false on its own: Generate overwrites the
-    sliders it generated from. This stops that claim returning."""
+    """**R1-A structural guard, extended for E2 V1.** Two failures are pinned here, not one.
+
+    *R1-A's.* The copy said "Type a master seed you used before and Generate to get that exact
+    recipe back", which is false on its own: Generate overwrites the sliders it generated from.
+    That half is unchanged — Master Seed alone is **not** a recipe identifier.
+
+    *E2's.* The sentence that replaced it — "the exact render settings are always the Variation
+    Seed plus the six sliders" — was true of C2's visual-only generator and became **incomplete**
+    the moment Variant Lab could also write `music_under_voice`, `sfx_amount` and `sfx_level`. The
+    guard below required only "variation seed" and "six sliders", so it went on passing. It now
+    also requires the audio levels to be named.
+
+    And it must not over-correct in the other direction. Those ten numbers are what the *lab*
+    generates, not a complete description of the physical render: voice clips, voice timing, Avoid
+    drops, the SFX folder, the enabled roles and the source media are render intent the lab never
+    touches, and a replay needs them back too. The copy has to say so. Semantic facts are pinned
+    here; the prose is free to change.
+    """
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
     start = source.index("INFO_MASTER_SEED")
     info = source[start:source.index("\n)", start)]
@@ -1182,12 +1310,25 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
     assert "starting slider" in lowered or "starting preset" in lowered or "starting value" in lowered
     assert "spread" in lowered
     assert "overwrites the sliders" in lowered or "generate overwrites" in lowered
-    # and it must say where the real render contract lives
-    assert "variation seed" in lowered and "six sliders" in lowered
 
-    # and it must not make the old unconditional promise
+    # it must name every value a draw actually writes — the visual two since C2...
+    assert "variation seed" in lowered and "six sliders" in lowered
+    # ...and the three audio levels since E2 V1, including the opt-in that produces them
+    assert "audio level" in lowered, "E2 V1 also generates the three audio levels"
+    assert "audio variation" in lowered, "and the copy must name the opt-in they come from"
+
+    # it must keep saying the seed is provenance and the widgets are what is read
+    assert "never the master seed" in lowered or "not the master seed" in lowered
+
+    # it must not claim the generated values are the whole render: at least one piece of
+    # pre-existing render/resource intent has to be named as staying the user's
+    assert any(token in lowered for token in ("voice clip", "sfx folder", "source video")), \
+        "INFO_MASTER_SEED must not imply the generated values describe the entire render"
+
+    # and it must not make the old unconditional promise, nor the C2-era exhaustiveness claim
     for overclaim in ("that exact recipe back", "get the same recipe back",
-                      "reproduces the recipe", "always reproduces"):
+                      "reproduces the recipe", "always reproduces",
+                      "exact render settings are always"):
         assert overclaim not in lowered, f"INFO_MASTER_SEED claims {overclaim!r}"
 
 
@@ -1232,3 +1373,464 @@ def test_every_resolved_recipe_is_a_valid_recipe_and_profile():
                 for field in FIELDS:
                     value = getattr(recipe, field)
                     assert fork_creative.normalize_control(value) == value
+
+
+# ===========================================================================
+# 11. AUDIO VARIATION (E2 V1)
+#
+# The feature's load-bearing claim is that it landed *without* re-keying anything: the audio domain
+# is a sibling of `controls`/`clips`, `_resolve_v1` was not touched, and the default is off. Every
+# property below exists to make one of those claims falsifiable.
+# ===========================================================================
+
+AUDIO_BASE = {"music_under_voice_percent": 35, "sfx_amount": 50, "sfx_level_percent": 50}
+
+#: `int(sha1("variant_lab|1|<master>|audio|<name>").hexdigest()[:12], 16)`, computed independently
+#: of this module (a standalone script importing nothing from the repo) and pasted in as literals.
+#: Calling `rng_for` to produce the expectation would assert only that the function equals itself.
+_GOLDEN_AUDIO_SEEDS = {
+    "variant_lab|1|1|audio|music_under_voice_percent": 113_440_183_495_007,
+    "variant_lab|1|1|audio|sfx_amount": 96_089_840_406_388,
+    "variant_lab|1|1|audio|sfx_level_percent": 113_071_866_695_483,
+    "variant_lab|1|582913|audio|music_under_voice_percent": 151_937_303_078_522,
+    "variant_lab|1|582913|audio|sfx_amount": 217_584_134_425_872,
+    "variant_lab|1|582913|audio|sfx_level_percent": 48_345_587_537_798,
+    "variant_lab|1|999999|audio|music_under_voice_percent": 140_493_823_870_728,
+    "variant_lab|1|999999|audio|sfx_amount": 9_444_017_410_338,
+    "variant_lab|1|999999|audio|sfx_level_percent": 203_896_594_817_344,
+}
+
+#: Resolved audio recipes for the full 0..100 range with all three ticked, from the same
+#: independent reimplementation of the spread formula. These pin the *whole* path — key format,
+#: draw, anchor, directional headroom, half-up quantisation and clamp — not merely the hash.
+_GOLDEN_AUDIO_RECIPES = {
+    (1, 25): {"music_under_voice_percent": 45, "sfx_amount": 47, "sfx_level_percent": 49},
+    (1, 50): {"music_under_voice_percent": 55, "sfx_amount": 44, "sfx_level_percent": 49},
+    (1, 65): {"music_under_voice_percent": 61, "sfx_amount": 42, "sfx_level_percent": 48},
+    (1, 100): {"music_under_voice_percent": 74, "sfx_amount": 37, "sfx_level_percent": 47},
+    (582913, 25): {"music_under_voice_percent": 32, "sfx_amount": 46, "sfx_level_percent": 54},
+    (582913, 50): {"music_under_voice_percent": 29, "sfx_amount": 42, "sfx_level_percent": 58},
+    (582913, 65): {"music_under_voice_percent": 27, "sfx_amount": 40, "sfx_level_percent": 60},
+    (582913, 100): {"music_under_voice_percent": 23, "sfx_amount": 34, "sfx_level_percent": 65},
+    (999999, 25): {"music_under_voice_percent": 34, "sfx_amount": 45, "sfx_level_percent": 57},
+    (999999, 50): {"music_under_voice_percent": 33, "sfx_amount": 40, "sfx_level_percent": 63},
+    (999999, 65): {"music_under_voice_percent": 33, "sfx_amount": 37, "sfx_level_percent": 68},
+    (999999, 100): {"music_under_voice_percent": 32, "sfx_amount": 30, "sfx_level_percent": 77},
+}
+
+
+def _audio(master=582913, spread=50, randomized=None, ranges=None, base=None):
+    randomized = AUDIO_FIELDS if randomized is None else randomized
+    config = fork_lab.AudioVariantConfig(randomized=randomized, ranges=ranges or {})
+    return fork_lab.resolve_audio(master, config, spread,
+                                  AUDIO_BASE if base is None else base)
+
+
+# -- the stream names and the golden vectors --------------------------------
+
+
+def test_the_three_audio_field_names_are_frozen():
+    """These strings are RNG stream names, so renaming one silently re-keys that control."""
+    assert fork_lab.AUDIO_CONTROL_FIELDS == (
+        "music_under_voice_percent", "sfx_amount", "sfx_level_percent")
+
+
+@pytest.mark.parametrize("key,expected", sorted(_GOLDEN_AUDIO_SEEDS.items()))
+def test_golden_audio_derived_seeds(key: str, expected: int):
+    """The stream `rng_for` builds must be the stream the literal seed builds, draw for draw.
+
+    Comparing several draws rather than one makes the assertion about the generator's whole state
+    instead of a single float that two different seeds could coincidentally share.
+    """
+    parts = key.split("|")
+    stream = fork_lab.rng_for(int(parts[2]), fork_lab.DOMAIN_AUDIO, parts[4])
+    reference = random.Random(expected)
+    assert [stream.random() for _ in range(5)] == [reference.random() for _ in range(5)]
+
+
+@pytest.mark.parametrize("key,expected", sorted(_GOLDEN_AUDIO_RECIPES.items()))
+def test_golden_audio_recipes(key: tuple, expected: dict):
+    master, spread = key
+    assert _audio(master=master, spread=spread).recipe.as_mapping() == expected
+
+
+def test_audio_resolution_is_deterministic():
+    for master in MASTERS[:40]:
+        assert _audio(master=master).recipe == _audio(master=master).recipe
+
+
+def test_the_resolver_actually_consumes_the_audio_domain():
+    """Not a tautology: if the resolver drew from `controls` instead, these would be equal."""
+    name = "sfx_amount"
+    audio_u = fork_lab.rng_for(582913, fork_lab.DOMAIN_AUDIO, name).uniform(-1.0, 1.0)
+    control_u = fork_lab.rng_for(582913, fork_lab.DOMAIN_CONTROLS, name).uniform(-1.0, 1.0)
+    assert audio_u != control_u
+
+    anchor = AUDIO_BASE[name]
+    expected = anchor + 0.5 * audio_u * ((anchor - 0) if audio_u < 0 else (100 - anchor))
+    assert _audio(spread=50).recipe.sfx_amount == max(0, min(100, int(expected + 0.5)))
+
+
+# -- independence: the principal E2 regression contract ---------------------
+
+
+def test_audio_draws_do_not_move_the_clip_seed():
+    reference = fork_lab.resolve_clip_seed(REF_MASTER)
+    for name in AUDIO_FIELDS:
+        fork_lab.rng_for(REF_MASTER, fork_lab.DOMAIN_AUDIO, name).uniform(-1.0, 1.0)
+    _audio(master=REF_MASTER)
+    assert fork_lab.resolve_clip_seed(REF_MASTER) == reference
+
+
+def test_audio_resolution_does_not_move_any_visual_control():
+    reference = _ref_recipe().as_mapping()
+    for spread in (0, 25, 50, 100):
+        _audio(master=REF_MASTER, spread=spread)
+    assert _ref_recipe().as_mapping() == reference
+
+
+def test_each_audio_field_has_its_own_stream():
+    draws = {name: fork_lab.rng_for(582913, fork_lab.DOMAIN_AUDIO, name).random()
+             for name in AUDIO_FIELDS}
+    assert len(set(draws.values())) == len(AUDIO_FIELDS)
+
+
+@pytest.mark.parametrize("target", AUDIO_FIELDS)
+def test_enabling_or_disabling_one_audio_field_leaves_the_others_alone(target: str):
+    others = [n for n in AUDIO_FIELDS if n != target]
+    with_target = _audio(randomized=AUDIO_FIELDS).recipe.as_mapping()
+    without_target = _audio(randomized=others).recipe.as_mapping()
+    for name in others:
+        assert with_target[name] == without_target[name], name
+
+
+@pytest.mark.parametrize("target", AUDIO_FIELDS)
+def test_re_ranging_one_audio_field_leaves_the_others_alone(target: str):
+    reference = _audio().recipe.as_mapping()
+    narrowed = _audio(ranges={target: (10, 20)}).recipe.as_mapping()
+    for name in AUDIO_FIELDS:
+        if name != target:
+            assert narrowed[name] == reference[name], name
+    assert 10 <= narrowed[target] <= 20
+
+
+def test_reordering_the_audio_declarations_changes_nothing():
+    assert _audio(randomized=list(AUDIO_FIELDS)).recipe == \
+        _audio(randomized=list(reversed(AUDIO_FIELDS))).recipe
+
+
+def test_a_future_fourth_audio_field_cannot_shift_todays_three():
+    """The decisive sequential-RNG regression for E2, in both available directions."""
+    reference = _audio().recipe.as_mapping()
+
+    extended_ranges = dict(fork_lab.default_audio_ranges())
+    extended_ranges["sfx_stutter"] = fork_lab.ControlRange(0, 100)
+    extended = _audio(randomized=list(AUDIO_FIELDS) + ["sfx_stutter"],
+                      ranges=extended_ranges).recipe.as_mapping()
+    assert extended == reference
+
+    # and even if such a field existed and were drawn, its stream is its own
+    for future in ("sfx_stutter", "voice_pitch", "filter_sweep"):
+        fork_lab.rng_for(582913, fork_lab.DOMAIN_AUDIO, future).uniform(-1.0, 1.0)
+    assert _audio().recipe.as_mapping() == reference
+
+
+def test_an_unknown_audio_field_is_dropped_not_honoured():
+    config = fork_lab.AudioVariantConfig(randomized=["sfx_amount", "not_a_control"])
+    assert config.randomized == frozenset({"sfx_amount"})
+
+
+# -- the off switches -------------------------------------------------------
+
+
+def test_the_default_audio_randomize_selection_is_empty():
+    """Load-bearing backward compatibility: audio variation is opt-in, not opt-out."""
+    assert fork_lab.default_audio_randomized() == frozenset()
+    assert fork_lab.AudioVariantConfig().randomized == frozenset()
+    assert fork_lab.AudioVariantConfig().varies_anything is False
+
+
+def test_an_empty_selection_leaves_every_audio_value_at_its_base():
+    for master in MASTERS[:20]:
+        for spread in (0, 50, 100):
+            resolution = _audio(master=master, spread=spread, randomized=[])
+            assert resolution.recipe.as_mapping() == AUDIO_BASE
+            assert resolution.fixed_fields == frozenset(AUDIO_FIELDS)
+
+
+def test_spread_zero_leaves_every_audio_value_at_its_base():
+    """Unlike C2, spread 0 genuinely varies **nothing** here — there is no audio clip seed."""
+    for master in MASTERS[:20]:
+        assert _audio(master=master, spread=0).recipe.as_mapping() == AUDIO_BASE
+
+
+def test_a_field_with_randomize_off_ignores_its_configured_range():
+    """Randomize OFF means *leave it alone*, not *clamp it into the range*."""
+    resolution = _audio(randomized=["sfx_amount"],
+                        ranges={"music_under_voice_percent": (90, 100),
+                                "sfx_level_percent": (0, 5)})
+    assert resolution.recipe.music_under_voice_percent == AUDIO_BASE["music_under_voice_percent"]
+    assert resolution.recipe.sfx_level_percent == AUDIO_BASE["sfx_level_percent"]
+
+
+# -- the trust boundary -----------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [101, -1, 50.5, True, False, None, "50", float("nan"),
+                                 float("inf")])
+def test_audio_recipe_rejects_malformed_values_rather_than_clamping(bad: Any):
+    with pytest.raises(ValueError):
+        fork_lab.AudioRecipe(music_under_voice_percent=bad, sfx_amount=50, sfx_level_percent=50)
+
+
+def test_audio_recipe_is_frozen_and_round_trips():
+    recipe = fork_lab.AudioRecipe(music_under_voice_percent=35, sfx_amount=50,
+                                  sfx_level_percent=50)
+    with pytest.raises(Exception):
+        recipe.sfx_amount = 10
+    assert recipe.as_mapping() == AUDIO_BASE
+    assert recipe.as_mapping() is not recipe.as_mapping()
+
+
+def test_the_audio_recipe_carries_no_provenance_resource_or_structure():
+    recipe = _audio().recipe
+    for forbidden in ("master_seed", "spread", "ranges", "randomized", "algorithm_version",
+                      "voice_files", "sfx_folder", "sfx_roles", "enabled_roles",
+                      "avoid_drops", "start_delay_seconds", "min_gap_seconds"):
+        assert not hasattr(recipe, forbidden), forbidden
+        assert forbidden not in recipe.as_mapping(), forbidden
+    assert set(recipe.as_mapping()) == set(AUDIO_FIELDS)
+
+
+def test_provenance_lives_on_the_resolution_not_the_recipe():
+    resolution = _audio(master=582913, spread=65)
+    assert resolution.master_seed == 582913
+    assert resolution.spread == 65
+    assert resolution.algorithm_version == fork_lab.VARIANT_LAB_ALGORITHM_VERSION
+    assert isinstance(resolution.config, fork_lab.AudioVariantConfig)
+
+
+def test_no_audio_field_was_added_to_the_visual_recipe_or_config():
+    """E2's data model is a sibling, never a widening of the visual execution artifact."""
+    recipe = _ref_recipe()
+    config = fork_lab.VariantLabConfig(master_seed=1)
+    for name in AUDIO_FIELDS:
+        assert not hasattr(recipe, name), name
+        assert name not in recipe.as_mapping(), name
+        assert not hasattr(config, name), name
+    assert set(recipe.as_mapping()) == set(fork_recipe.VARIANT_RECIPE_FIELDS)
+
+
+def test_resolve_audio_requires_a_positive_master_seed():
+    for bad in (0, None, "", -5, 7.9, True):
+        with pytest.raises(ValueError):
+            fork_lab.resolve_audio(bad, fork_lab.AudioVariantConfig(), 50, AUDIO_BASE)
+
+
+# -- totality ---------------------------------------------------------------
+
+
+def test_malformed_audio_input_is_total_and_never_raises():
+    resolution = fork_lab.resolve_audio(
+        582913,
+        fork_lab.AudioVariantConfig(randomized="not iterable",
+                                    ranges={"sfx_amount": (80, 20), "sfx_level_percent": None}),
+        "not a number",
+        "not a mapping")
+    assert resolution.recipe.as_mapping() == AUDIO_BASE
+
+
+def test_each_audio_base_uses_its_own_owning_normaliser():
+    """The music floor falls back to **35** and the two Smart Mix levels to **50**.
+
+    A single shared 0..100 normaliser would make all three fall back to 50, silently raising the
+    music-under-voice floor whenever a widget value was malformed. This is the test that fails if
+    someone "simplifies" the three delegations into `creative.normalize_control`.
+    """
+    assert fork_lab.normalize_audio_base_value("music_under_voice_percent", "junk") == 35
+    assert fork_lab.normalize_audio_base_value("sfx_amount", "junk") == 50
+    assert fork_lab.normalize_audio_base_value("sfx_level_percent", "junk") == 50
+
+    resolved = fork_lab.resolve_audio(
+        1, fork_lab.AudioVariantConfig(), 50,
+        {"music_under_voice_percent": None, "sfx_amount": None, "sfx_level_percent": None})
+    assert resolved.recipe.as_mapping() == AUDIO_BASE
+
+
+def test_every_resolved_audio_recipe_is_in_range():
+    for master in MASTERS:
+        for spread in (0, 50, 100):
+            mapping = _audio(master=master, spread=spread).recipe.as_mapping()
+            assert all(isinstance(v, int) and 0 <= v <= 100 for v in mapping.values())
+
+
+# -- the read-out -----------------------------------------------------------
+
+
+def test_the_audio_describe_tells_the_truth_about_being_off():
+    assert "audio variation off" in _audio(randomized=[]).describe()
+    assert "held at base" in _audio(spread=0).describe()
+    on = _audio(spread=50).describe()
+    assert "3 randomized / 0 fixed" in on
+    assert "audio variation off" not in on and "held at base" not in on
+
+
+def test_the_audio_describe_reports_the_resolved_values():
+    text = _audio(master=582913, spread=65).describe()
+    assert "Music under voice 27" in text
+    assert "SFX Amount 40" in text
+    assert "SFX Level 60" in text
+
+
+# ===========================================================================
+# 12. THE E2 GUI EXTENSION
+# ===========================================================================
+
+#: The seven E2 configuration components, by `elem_id`. One CheckboxGroup and three min/max pairs.
+E2_CONFIG_ELEM_IDS = (
+    "variant-audio-randomize-group",
+    "variant-range-music-under-voice-min", "variant-range-music-under-voice-max",
+    "variant-range-sfx-amount-min", "variant-range-sfx-amount-max",
+    "variant-range-sfx-level-min", "variant-range-sfx-level-max",
+)
+
+
+def _widget_calls(tree):
+    """Every `gr.X(...)` call in the module, keyed by its `elem_id` where it has one."""
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            elem = next((kw.value for kw in node.keywords if kw.arg == "elem_id"), None)
+            if isinstance(elem, ast.Constant) and isinstance(elem.value, str):
+                found[elem.value] = node
+    return found
+
+
+def test_e2_adds_exactly_seven_configuration_widgets():
+    """One CheckboxGroup + three min/max Number pairs, and no eighth component.
+
+    A second master seed or a second Spread would show up here as an extra widget, which is the
+    failure this counts rather than describes.
+    """
+    widgets = _widget_calls(_tree(_GUI))
+    present = [e for e in E2_CONFIG_ELEM_IDS if e in widgets]
+    assert present == list(E2_CONFIG_ELEM_IDS), \
+        f"missing {set(E2_CONFIG_ELEM_IDS) - set(present)}"
+
+    assert ast.unparse(widgets[E2_CONFIG_ELEM_IDS[0]].func).endswith("CheckboxGroup")
+    for elem in E2_CONFIG_ELEM_IDS[1:]:
+        assert ast.unparse(widgets[elem].func).endswith("Number")
+
+    # no second seed / spread smuggled into the audio subsection
+    for forbidden in ("variant-audio-master-seed", "variant-audio-spread",
+                      "audio-variation-spread-slider"):
+        assert forbidden not in widgets, forbidden
+
+
+def test_the_audio_randomize_group_defaults_to_nothing_ticked():
+    group = _widget_calls(_tree(_GUI))["variant-audio-randomize-group"]
+    value = next(kw.value for kw in group.keywords if kw.arg == "value")
+    rendered = ast.unparse(value)
+    # either a literal empty list, or the resolver's own documented empty default
+    assert rendered in ("[]", "sorted(fork_lab.default_audio_randomized())",
+                        "list(fork_lab.default_audio_randomized())"), rendered
+    assert fork_lab.default_audio_randomized() == frozenset()
+
+
+def test_the_audio_randomize_choices_are_explicit_label_value_pairs():
+    """The returned value must BE the field name, never derived from the display label.
+
+    These three strings are RNG stream names: a lowercase/replace heuristic over a reworded label
+    would silently re-key a control, which is a correctness hazard rather than a cosmetic one.
+    """
+    group = _widget_calls(_tree(_GUI))["variant-audio-randomize-group"]
+    choices = next(kw.value for kw in group.keywords if kw.arg == "choices")
+    assert isinstance(choices, ast.List)
+    assert len(choices.elts) == len(AUDIO_FIELDS)
+
+    values = []
+    for element in choices.elts:
+        assert isinstance(element, ast.Tuple) and len(element.elts) == 2, ast.unparse(element)
+        label, value = element.elts
+        assert isinstance(label, ast.Name), "label should be a LABEL_* constant"
+        assert isinstance(value, ast.Constant) and isinstance(value.value, str)
+        values.append(value.value)
+    assert values == list(AUDIO_FIELDS)
+
+    rendered = ast.unparse(choices)
+    for heuristic in (".lower()", ".replace(", ".strip()", ".casefold()"):
+        assert heuristic not in rendered, heuristic
+
+
+def test_the_handler_resolves_audio_from_the_same_master_seed_and_spread():
+    """One visible seed, one visible Spread, both halves. No hidden second source of randomness."""
+    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_generate_variant")))
+
+    assert "fork_lab.resolve_audio(master_seed, audio_config, variation_spread, audio_base)" \
+        in body
+    assert "fork_lab.resolve(config, base)" in body
+    # the only non-deterministic call stays the visible master-seed mint
+    assert body.count("fork_variation.random_seed()") == 1
+    for forbidden in ("rng_for", "DOMAIN_AUDIO", "SystemRandom", "audio_spread",
+                      "audio_master_seed"):
+        assert forbidden not in body, forbidden
+
+
+def test_the_live_audio_widgets_are_the_audio_bases():
+    """The base is the live widget value, read at click time — no cached audio snapshot."""
+    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_on_generate_variant")))
+    for expected in (
+            "'music_under_voice_percent': fork_audio_mix.normalize_music_under_voice("
+            "music_under_voice)",
+            "'sfx_amount': fork_smart_mix.normalize_control(sfx_amount, "
+            "fork_smart_mix.DEFAULT_AMOUNT)",
+            "'sfx_level_percent': fork_smart_mix.normalize_control(sfx_level, "
+            "fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT)"):
+        assert expected in body, expected
+    # and NOT through the visual normaliser, whose fallback is 50 rather than 35
+    assert "normalize_control(music_under_voice" not in body
+    assert "fork_creative" not in body
+
+
+def test_there_is_no_hidden_audio_state():
+    """No `gr.State`, no module global, no cached snapshot — the widgets are the whole truth."""
+    tree = _tree(_GUI)
+    widgets = _widget_calls(tree)
+    for elem in widgets:
+        assert "audio-variant-state" not in elem and "variant-audio-state" not in elem
+
+    source = _executable_source(_GUI)
+    for forbidden in ("_AUDIO_VARIANT_CACHE", "_LAST_AUDIO_RECIPE", "_audio_base_snapshot",
+                      "AUDIO_VARIANT_STATE_KEY"):
+        assert forbidden not in source, forbidden
+
+    # the audio resolution is consumed by the projection helper and never stored
+    body = ast.unparse(_strip_docstrings(_func(tree, "_on_generate_variant")))
+    assert "global " not in body
+    assert "session_state" not in body
+
+
+def test_generating_audio_still_renders_nothing():
+    """E2 added outputs, not a render path."""
+    tree = _tree(_GUI)
+    for button in ("generate_variant_btn", "new_variant_btn"):
+        for call in _registration(tree, button, attrs=("click",)):
+            outputs = _expanded_list(tree, "variant_lab_outputs")
+            assert "video_output" not in outputs
+            assert "status_output" not in outputs
+            assert _kwargs(call).get("fn") is not None
+    for handler in ("_on_generate_variant", "_on_new_variant", "_variant_apply_outputs"):
+        body = ast.unparse(_strip_docstrings(_func(tree, handler)))
+        for forbidden in ("create_music_video", "analyze_beats_auto", "process_video",
+                          "build_mixed_master", "AudioMixConfig", "SmartMixConfig",
+                          "prepare_voice_inputs", "prepare_sfx_inputs"):
+            assert forbidden not in body, f"{handler} references {forbidden}"
+
+
+def test_the_projection_helper_formats_no_text_of_its_own():
+    """Both describe() formatters stay single-sourced; the GUI only joins them."""
+    body = ast.unparse(_strip_docstrings(_func(_tree(_GUI), "_variant_apply_outputs")))
+    assert "resolution.describe()" in body
+    assert "audio_resolution.describe()" in body
+    assert "Audio ·" not in body and "Music under voice" not in body
+    assert "SFX Amount" not in body and "SFX Level" not in body
