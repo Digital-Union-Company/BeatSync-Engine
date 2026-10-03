@@ -84,6 +84,22 @@ Cuts; Stage 6 reads the seed, Semantic Emphasis, Energy Response, Motion Bias an
 0–100 sliders, resolved entirely in the UI — see `.claude/rules/creative-presets.md`. Nothing in this table
 changes because a preset was selected; only the slider values do.
 
+**AI Director V1 is not an eighth control either, and not a new Stage-4/6 mechanism.** It is a
+**second reviewed producer of these same seven values**, alongside Variant Lab:
+
+```
+PRESET SELECTOR  ->  writes six slider values            (PR3)
+VARIANT LAB      ->  resolves a CreativeRecipe from a master seed, ranges and a spread   (C2/C3)
+AI DIRECTOR      ->  proposes a CreativeRecipe from one sentence, applied on an explicit press
+THE SEED + SIX SLIDERS  =  still the sole execution truth
+```
+
+Director Apply writes `variation_seed`, the six sliders and the preset label — and nothing else. It
+produces a `CreativeRecipe`; this table, `CreativeProfile`, Stage 4 and Stage 6 keep ownership of
+what those numbers *mean*, and no stage learns that a Director exists. Generate Proposal writes no
+execution widget at all. The full contract, including the measured one-shot invocation and why
+`CreativeRecipe.from_mapping` is reused unmodified, is `.claude/rules/director.md`.
+
 **Stage 6 has two halves and the split is load-bearing.** Semantic Emphasis, Energy Response and
 Motion Bias are *static* — they depend on (candidate, target) only, so they live in the L1A
 precompute table.
@@ -331,6 +347,11 @@ process_video_guarded(…, variation_seed, cut_density, energy_response, motion_
 The preset selector sits entirely above that chain: it writes slider *values* and is itself absent
 from `process_video_guarded`'s inputs, so everything from `from_widgets` down is unchanged by PR3.
 
+- **The Variation Seed has exactly five writers, and the list is extended by review.** Randomize,
+  the three Variant Lab registrations that write it through `variant_lab_outputs`, and — since AI
+  Director V1 — `apply_director_btn.click`, because a proposal *is* a `CreativeRecipe` and a recipe
+  carries the seed. Pinned as an exact sorted list in `tests/test_creative_controls_seam.py` with
+  the list indirection resolved; `generate_director_btn.click` is deliberately absent.
 - **Four sliders' worth of render-request creative state, not source identity.** All three new
   controls sit in the Creative Direction group, register **no** handler of their own, appear in no
   source or preparation handler's `inputs`/`outputs`, and are absent from `source_outputs` and

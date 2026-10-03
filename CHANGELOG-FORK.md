@@ -20,6 +20,97 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-03 (AI Director V1)
+
+**Describe the edit you want in a sentence; get a reviewable proposal for the seven creative values
+that already decided every render.** AI Director V1 is a **second producer of `CreativeRecipe`, not
+a new render pipeline** — which is exactly the role C2 wrote that class for when it refused to
+carry a master seed, a spread or any other generator provenance. `creative_recipe.py` needed no
+change at all.
+
+```
+natural-language intent -> local text-only Qwen -> validated proposal
+-> the user presses Apply Proposal -> the existing Variation Seed + six Creative Controls
+```
+
+- **Visual only, and resource identity is untouchable.** The model emits exactly the six 0..100
+  controls in `presets.CREATIVE_CONTROL_FIELDS` order. It generates nothing else: not the three
+  audio levels, voice clips, voice timing, `avoid_drops`, the SFX folder or roles, the source
+  folder or files, FPS, the encoder, the output filename, the source confirmation or the Media
+  Library Preparation state.
+- **The model never chooses the Variation Seed.** The schema has no `seed` property and
+  `additionalProperties` is `false`, so the grammar cannot emit one — and the strict parser rejects
+  one that arrives anyway rather than ignoring it, because a producer that thinks it owns the seed
+  is a producer worth failing. The GUI mints it with the existing `variation.random_seed()`
+  **after** six valid controls exist; a test counts the draws and requires **zero** for an invalid
+  response, so a malformed answer cannot yield a plausible-looking half proposal.
+- **The existing trust boundary is reused, unmodified.** `CreativeRecipe.from_mapping` decides, and
+  its all-or-nothing contract is unweakened: missing field, extra field, wrong type, `bool`,
+  `float`, out of range or seed 0 rejects the whole recipe. No coercion, no clamping, no partial
+  application, no fallback to Balanced.
+- **Strict execution, tolerant explanation.** A missing, non-string or overlong `explanation` still
+  yields a valid proposal (blank or bounded); an invalid *control* rejects the proposal entirely.
+  The explanation is display text and reaches no recipe, profile, bus, stage, planner, cache or
+  Qwen request. Measured: llama.cpp does **not** compile the schema's `maxLength` into its grammar
+  on this build (60/160/280 all produced identical ~460-character output), so the bound is a
+  request in the schema and a guarantee only in `normalize_explanation`.
+- **The whole of stdout is parsed strictly.** No regex fishes a `{...}` out of prose — that is how
+  a truncated object or a chatty preamble gets half-accepted, and Stage 5's own documented
+  truncation defect lived exactly there. Strip, remove the one fixed `[end of text]` marker
+  llama.cpp appends to its own output, `json.loads` the remainder, require the exact key set.
+  `--json-schema` is defence in depth; the parser is the authority.
+- **Two measured deviations from the obvious invocation, both load-bearing.** On the installed
+  build (`b9842-6f4f53f2b`) `llama-cli` is an interactive chat front end: it *rejects* `-no-cnv`
+  ("please use llama-completion instead"), ignores `--no-display-prompt`, and prints its banner and
+  timings **into stdout**. So the Director uses **`llama-completion.exe`** from the same `bin`
+  layout, which emits the JSON object alone on stdout. And it uses **`-cnv -st`** rather than
+  `-no-cnv`: `-cnv` applies the model's chat template and `-st` runs one turn and exits. Raw
+  completion skips the template, and on an Instruct model that is not a small difference —
+  measured over five intents, `-no-cnv` collapsed every control to 0 or 1 and rambled past the
+  token budget, while `-cnv -st` produced coherent, well-separated recipes. The retained P0 probes
+  could not tell the two apart, because both of them in fact measured template-applied output.
+- **Model assets reused; the Stage-5 worker is not.** The same installed
+  `Qwen3VL-2B-Instruct-Q8_0.gguf`, **text-only** — no `mmproj`, no image argument.
+  `stage5_qwen_scene_worker.py` is not invoked, `qwen_progress` is not used, and neither is
+  imported for its paths; `gui.py` derives both from the one general `ROOT_DIR` constant. One
+  bounded `subprocess.run` per proposal with a **60 s** timeout and `CREATE_NO_WINDOW`: no
+  `llama-server`, no port, no persistent process, no session, no chat history.
+- **Media-blind, slider-blind, cacheless.** The invocation receives the instruction, the system
+  prompt and the schema — no frames, filenames, Stage-5 records, `beat_info`, sections, tempo or
+  source state. It does not read the current seed, sliders, preset or Variant Lab state either, so
+  an instruction is an *absolute* editing intention rather than a transformation of the screen.
+  There is no Stage-5 cache use, no proposal cache, no prompt history: every press is independent.
+- **Propose, then apply.** Generate Proposal writes **zero** execution widgets — only the proposal
+  state and the two read-outs — which is what makes generating-is-not-applying structural, exactly
+  as it is for `generate_variants_btn`. Apply writes `variation_seed`, the six sliders,
+  `creative_preset` and the Director status, and nothing else. Neither renders, and neither can
+  reach a render entry point or the source gate (walked structurally from both buttons).
+  **Unlike Variant Lab's Apply there is deliberately no stale gate**: a proposal is an absolute set
+  of seven values, so it survives an apply and may be re-applied after manual experiments.
+- **The Director emits no preset label.** Which named recipe six numbers match is a GUI read-out,
+  so Apply recomputes `presets.matching_preset(...)` itself (programmatic slider writes do not fire
+  `.input()`). `_variant_apply_outputs` is deliberately **not** reused — it also writes the lab's
+  Master Seed, the three audio levels and the lab report, none of which the Director generates —
+  but `matching_preset` is, so there is still exactly one preset-label path.
+- **Writer matrices extended by exact list, never relaxed.** The six sliders, the Variation Seed and
+  `creative_preset` each gained precisely `apply_director_btn.click` and nothing else;
+  `generate_director_btn.click` is absent from all three. `director_proposal_state` has exactly one
+  reader.
+- **Isolation.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, and `video_analysis.py`,
+  `stage5_qwen_scene_worker.py`, `src/auto_mode/*`, `video_processor.py`, `ffmpeg_processing.py`,
+  `creative.py`, `presets.py`, `creative_recipe.py`, `variant_lab.py`, `variant_batch.py`,
+  `render_batch.py`, `audio_mix.py` and `smart_mix.py` are **untouched**. Director widgets are
+  absent from every source and preparation list, and the Director borrows no existing read-out
+  panel. Variant Lab interoperability is through the live sliders only — Apply moves them, and the
+  lab reads them as its base exactly as it always has. **No CLI flag**: the CLI already takes the
+  seven resolved numbers, which are the reproducible contract.
+- **Real-runtime acceptance** on the installed build, text-only, no mmproj: **2.54–2.57 s** per
+  proposal end to end (cold model load every time, because the process exits), `rc=0`, strict
+  payload valid, recipe `20/10/70/60/30/50` for a cinematic instruction, GUI-minted Variation Seed,
+  `matching_preset -> Custom`, no orphan process, and the applied sliders accepted unchanged as a
+  Variant Lab and `variant_batch` base. No render was performed.
+
 ### Fixed — 2026-10-03 (Universal GUI atomic no-overwrite — H1)
 
 **No BeatSync GUI render can silently replace an existing durable output any more.** Ordinary

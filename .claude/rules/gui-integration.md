@@ -104,6 +104,49 @@ automatically.
   seed. That absence is load-bearing: it is what makes candidate chaining structurally impossible.
   Only `apply_variant_btn.click` writes execution widgets, and only after re-deriving the live
   declaration and requiring it to equal the one its batch was generated from.
+
+  **AI Director V1 repeats that split exactly**, and the symmetry is deliberate rather than
+  stylistic:
+
+  ```
+  generate_director_btn.click  ->  director_proposal_state, director_proposal, director_status
+                                   and NOTHING else — no execution widget at all
+  apply_director_btn.click     ->  variation_seed, the six sliders, creative_preset,
+                                   director_status — and nothing else
+  ```
+
+  `generate_director_btn.click` is absent from every writer matrix (sliders, Variation Seed,
+  `creative_preset`), exactly as `generate_variants_btn.click` is. `apply_director_btn.click` is
+  the **one** Director execution-widget writer, and each of those three matrices was extended by
+  precisely that one entry — by exact list, never relaxed to containment.
+- **`director_proposal_state` has exactly one reader**, `apply_director_btn.click`, pinned as an
+  exact list (the same contract `variant_batch_state` carries, which now has exactly two). It is
+  absent from `process_btn.click`, `render_selected_variants_btn.click`, `source_outputs`,
+  `prep_outputs`, `live_declaration`, `CreativeProfile` and both mix configs.
+- **The Director does not render and cannot reach the source gate.** Neither handler's call graph
+  may touch `process_video_guarded`, `_process_video_guarded_unlocked`, `process_video`,
+  `_process_video_impl`, `analyze_beats_auto`, `create_music_video`,
+  `render_selected_variants_guarded`, `_promote_output_no_replace`, `resolve_for_render` or
+  `live_declaration` — walked structurally from both buttons, so a rename cannot evade it. Neither
+  takes `_RENDER_LOCK`, joins `RENDER_CONCURRENCY_ID` or touches the processing directory: a
+  proposal is not a render. Director widgets are also absent from `source_outputs`, `prep_outputs`
+  and every source/preparation handler, so generating or applying intent cannot invalidate a
+  confirmed source set.
+- **Unlike Variant Lab's Apply, Director Apply is deliberately NOT stale-gated.** Variant Lab has a
+  live-declaration gate because a candidate describes a *base* the screen may have moved away from;
+  a Director proposal is an absolute set of seven values, as valid now as when it was generated. So
+  the proposal state survives an apply and may be re-applied. Do not conflate the two, and do not
+  weaken Variant Lab's gate.
+- **One new subprocess, bounded and windowless.** `_run_director_model` is one
+  `subprocess.run(..., timeout=60, creationflags=CREATE_NO_WINDOW)` with stdout and stderr captured
+  separately — `run` rather than `Popen` precisely so a timeout kills and reaps the child. `gui.py`
+  now has exactly two `subprocess.run` call sites (the pre-existing ProRes preview and this one),
+  pinned by test. It uses `llama-completion.exe` rather than `llama-cli.exe` on measured grounds;
+  see `.claude/rules/director.md` before touching the argv.
+- **The Director owns its own read-outs.** `director_proposal` and `director_status` are written
+  only by Director handlers, and no Director handler writes `variant_report`,
+  `variant_batch_status`, `variant_batch_table`, `audio_layers_report`, `smart_mix_report`,
+  `render_batch_summary` or `status_output`. Their existing single writers are unchanged.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -115,6 +158,7 @@ automatically.
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | C3-R0 render-two-candidates seam, render mutex, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
+| the **AI Director** group, its instruction box, either Director button, `director_proposal_state`, or the one-shot model invocation | `.claude/rules/director.md` **+** `.claude/rules/creative-controls.md` **+** `.claude/rules/creative-presets.md` — Apply writes the seed, the six sliders and the preset label, so all three writer matrices apply |
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |
 | Variant Lab **visual** widgets, master seed, Spread, Generate handlers | `.claude/rules/variant-lab.md` |
 | Variant Lab **audio** subsection, or any of its three audio outputs (E2) | `.claude/rules/variant-lab.md` **+** `.claude/rules/audio-mixdown.md` |

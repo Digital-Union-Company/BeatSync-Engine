@@ -703,9 +703,87 @@ def test_the_gui_carries_only_the_accepted_c3_machinery():
     # **Split again by C3-R0**, which implements render_batch deliberately. What stays banned is
     # what C3-R0 refused to build; the structural render-boundary proofs live in
     # `tests/test_gui_guard_seam.py`, because a token list never survives a rename.
+    #
+    # **Split once more by AI Director V1**, and this one is a *reconciliation of a stale negative
+    # guard* rather than a weakening. `director` was banned here while an AI Director was still
+    # speculative. It is now an authorized GUI feature, so the ban became false in `gui.py` — and
+    # the honest fix is to say so rather than rename `apply_director_btn` and
+    # `_on_generate_director_proposal` around a boundary guard. The ban stays at **full strength
+    # where it was always load-bearing**: `variant_lab.py` and `creative_recipe.py`, pinned by
+    # `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` above and again, in
+    # both directions at once, by `test_the_director_lives_only_in_the_gui` below.
     for word in ("variant_gallery", "stage_cache", "shortlist",
-                 "freestyle", "director", "thumbnail", "variant_preview"):
+                 "freestyle", "thumbnail", "variant_preview"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+
+
+def _identifier_parts(source: str) -> set:
+    """Every identifier in `source`, plus its `snake_case` and `camelCase` parts, lowercased.
+
+    The whole-word form above cannot see a compound leak: `\\bdirector\\b` does not match inside
+    `DIRECTOR_PROPOSAL`, because `_` is a word character — and a compound name is exactly the shape
+    a real leak takes. Plain substring matching is not the fix either, since `director` is a
+    substring of `directory`. Decomposing identifiers answers both: `directory` yields
+    `{"directory"}` and never `"director"`, while `DIRECTOR_PROPOSAL` and `DirectorProposal` both
+    yield `{"director", "proposal", …}`.
+
+    This is **additive**. The pre-existing `\\bdirector\\b` ban in
+    `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` is untouched and still
+    load-bearing; this covers the shape it cannot see.
+    """
+    parts = set()
+    for identifier in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source):
+        lowered = identifier.lower()
+        parts.add(lowered)
+        parts.update(lowered.split("_"))
+        parts.update(piece.lower() for piece in re.findall(r"[A-Z]?[a-z0-9]+", identifier))
+    return parts
+
+
+def test_the_compound_identifier_guard_would_actually_notice_a_leak():
+    """Calibration: a guard that never fires proves nothing, and this one exists because the
+    whole-word form demonstrably does not fire on `DIRECTOR_PROPOSAL`."""
+    assert re.search(r"\bdirector\b", "DIRECTOR_PROPOSAL = None".lower()) is None, (
+        "the premise of the compound guard: whole-word matching misses this")
+    assert "director" in _identifier_parts("DIRECTOR_PROPOSAL = None")
+    assert "proposal" in _identifier_parts("class DirectorProposal: pass")
+    assert "director" not in _identifier_parts("os.makedirs(directory)")
+    assert "director" in _identifier_parts("director = None")
+
+
+def test_the_director_lives_only_in_the_gui():
+    """The reconciliation above, proved in **both directions at once**.
+
+    This is the assertion that makes "accepted in the GUI, still forbidden in the core" a measured
+    property rather than two separate claims that could drift apart: the same token, the same
+    executable-source extraction, one test.
+
+    `creative_recipe.py`'s *docstring* discusses an AI Director at length — deliberately, because
+    explaining why the class carries no master seed, spread or ranges is exactly how it explains
+    what it is for. Prose stating a boundary must never be read as crossing it, which is why this
+    reads `_executable_source` (docstrings stripped at every nesting level) rather than the file.
+    """
+    gui = _executable_source(_GUI).lower()
+    assert re.search(r"\bdirector\b", gui), (
+        "the GUI must carry the accepted Director surface — the reconciliation is not a licence "
+        "to remove the feature")
+    for accepted in ("director_proposal_state", "apply_director_btn",
+                     "_on_generate_director_proposal", "_on_apply_director_proposal"):
+        assert accepted in gui, f"gui.py lost the Director's {accepted!r}"
+
+    for path in (_LAB, _RECIPE):
+        parts = _identifier_parts(_executable_source(path))
+        for word in ("director", "directorproposal", "proposal", "instruction", "explanation",
+                     "llama", "subprocess"):
+            assert word not in parts, (
+                f"{os.path.basename(path)} mentions {word!r}: the Director is a SIBLING producer "
+                "of CreativeRecipe, never machinery inside it")
+
+    # ...and the prose really is where the Director is discussed, so the strip above is doing work
+    with open(_RECIPE, "r", encoding="utf-8") as handle:
+        assert "Director" in handle.read(), (
+            "creative_recipe.py's docstring explains the Director boundary; do not delete it to "
+            "make this test tidier")
 
 
 def test_no_c3_handler_can_reach_a_render_entry_point():
@@ -2512,7 +2590,25 @@ def test_the_mint_switch_is_keyword_only_and_apply_passes_false():
 
 
 def test_only_the_shared_helper_owns_the_draw():
-    """One `random_seed()` call site for the whole lab, plus Randomize and New Variant's own."""
+    """One `random_seed()` call site for the whole lab, plus Randomize and New Variant's own.
+
+    **Extended by exactly one entry for AI Director V1**, and the list stays exact equality.
+
+    This enumerates every `gui.py` function that mints a seed, so that a second, *unsurfaced*
+    draw cannot appear beside the lab's — the property C2 R1-B and C3 R1 both rest on. The
+    Director is a newly authorized minting feature, and the original AI Director authorization
+    requires it to mint through precisely this call ("No second seed implementation"): the GUI
+    obtains the Variation Seed from the existing `variation.random_seed()` once a valid
+    six-control payload exists, which is why `_on_generate_director_proposal` is here and not a
+    private helper of its own.
+
+    What is **not** relaxed: this is still an exact sorted list, not a containment check, so a
+    fourth minting site still fails. Nothing about the lab's own draws moved —
+    `_build_variant_resolution_context` still owns the master seed for all three lab handlers and
+    `_fresh_variant_master_seed` still owns New Variant's guaranteed-different one. The Director's
+    draw is also *surfaced*, like every other draw in this application: it lands in the proposal
+    the user reviews before applying it.
+    """
     tree = _tree(_GUI)
     owners = []
     for node in ast.walk(tree):
@@ -2520,4 +2616,17 @@ def test_only_the_shared_helper_owns_the_draw():
                 and "fork_variation.random_seed()" in ast.unparse(_strip_docstrings(node))):
             owners.append(node.name)
     assert sorted(owners) == ["_build_variant_resolution_context",
-                              "_fresh_variant_master_seed"], owners
+                              "_fresh_variant_master_seed",
+                              "_on_generate_director_proposal"], owners
+
+    # The lab's own two sites are unchanged, and the Director's is NOT one of the lab's handlers.
+    for lab_handler in ("_on_generate_variant", "_on_new_variant", "_on_generate_variants",
+                        "_on_apply_selected_variant"):
+        body = ast.unparse(_strip_docstrings(_func(tree, lab_handler)))
+        assert "fork_variation.random_seed()" not in body, (
+            f"{lab_handler} must delegate its draw, not own one")
+    director = ast.unparse(_strip_docstrings(_func(tree, "_on_generate_director_proposal")))
+    for lab_only in ("_build_variant_resolution_context", "_fresh_variant_master_seed",
+                     "fork_lab", "fork_batch", "variant_batch_state"):
+        assert lab_only not in director, (
+            f"the Director reuses {lab_only}: it is a sibling producer, not a lab handler")

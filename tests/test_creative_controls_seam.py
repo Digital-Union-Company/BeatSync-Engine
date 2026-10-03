@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Sequence
 import pytest
 
 from beatsync_fork import creative as fork_creative
+from beatsync_fork import presets as fork_presets
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _VA = os.path.join(_REPO_ROOT, "src", "video_analysis.py")
@@ -401,6 +402,12 @@ _NEW_CONTROLS = ("cut_density", "energy_response", "motion_bias",
                  "source_diversity", "micro_cuts", "semantic_emphasis")
 _ALL_CREATIVE_WIDGETS = ("variation_seed",) + _NEW_CONTROLS
 
+#: The same six, in **`CREATIVE_CONTROL_FIELDS` order** rather than widget-declaration order.
+#: Derived, never restated: Gradio matches `outputs` positionally, so any output list containing
+#: `creative_control_sliders` expands in exactly this order and a second literal copy here is how
+#: an assertion would eventually disagree with the registry.
+_NEW_CONTROLS_IN_FIELD_ORDER = fork_presets.CREATIVE_CONTROL_FIELDS
+
 
 def _gui_tree():
     return _tree(_GUI)
@@ -419,6 +426,22 @@ def _kwargs(call):
 
 def _names(node):
     return [n.id for n in ast.walk(node) if isinstance(n, ast.Name)]
+
+
+def _ordered_names(node) -> list:
+    """Names in **source order**, descending through list concatenation.
+
+    `_names` uses `ast.walk`, which is breadth-first and therefore loses the one thing a Gradio
+    `outputs` list actually depends on: position. Required for any assertion about a list built as
+    `[a] + shared + [b, c]`.
+    """
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [name for item in node.elts for name in _ordered_names(item)]
+    if isinstance(node, ast.BinOp):
+        return _ordered_names(node.left) + _ordered_names(node.right)
+    return []
 
 
 def _widget_call(tree, name: str) -> ast.Call:
@@ -521,6 +544,42 @@ def test_no_source_handler_reads_any_creative_control(button):
         assert "source_outputs" in outputs or "source_report" in outputs
 
 
+def _aliases_of(tree, widget: str) -> set:
+    """Every name that transitively denotes a list containing `widget`.
+
+    Resolving the indirection is the load-bearing half of a writer matrix: wrapping a widget in
+    one more intermediate list would otherwise hide its writer from these assertions.
+    """
+    aliases = {widget}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id not in aliases
+                    and aliases & set(_names(node.value))):
+                aliases.add(node.targets[0].id)
+                changed = True
+    return aliases
+
+
+def _writers_reaching(tree, aliases: set) -> list:
+    """Every registration whose `outputs` can reach any of `aliases`, read off the registration."""
+    writers = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
+            if outputs is not None and aliases & set(_names(outputs)):
+                writers.append(ast.unparse(node.func))
+    return writers
+
+
+def _writers_of(tree, widget: str) -> list:
+    return _writers_reaching(tree, _aliases_of(tree, widget))
+
+
 @pytest.mark.parametrize("widget", _NEW_CONTROLS)
 def test_only_the_preset_selector_writes_a_creative_control(widget):
     """Randomize is still seed-only and there is still no reset button.
@@ -541,6 +600,12 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
     generating candidates deliberately writes no execution widget at all. This stays an exact
     sorted list rather than a containment check: "the writers include the ones we expect" would
     have let C3 add a fifth writer nobody reviewed.
+
+    **Amended again by AI Director V1:** applying a reviewed proposal writes the same six sliders,
+    so `apply_director_btn.click` is a fifth exact writer — the list is **extended by one, never
+    relaxed to containment**. And note again what is absent:
+    `generate_director_btn.click`, for exactly the reason `generate_variants_btn.click` is absent.
+    Generating a proposal produces a *proposal*; applying one is a separate, explicit press.
     """
     tree = _gui_tree()
 
@@ -557,20 +622,41 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
                 aliases.add(node.targets[0].id)
                 changed = True
 
-    writers = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"click", "change", "input", "submit", "release"}):
-            outputs = next((kw.value for kw in node.keywords if kw.arg == "outputs"), None)
-            if outputs is not None and aliases & set(_names(outputs)):
-                writers.append(ast.unparse(node.func))
+    writers = _writers_reaching(tree, aliases)
 
-    assert sorted(writers) == ["apply_variant_btn.click",
+    assert sorted(writers) == ["apply_director_btn.click",
+                               "apply_variant_btn.click",
                                "creative_preset.input",
                                "generate_variant_btn.click",
                                "new_variant_btn.click"], f"{widget} is written by {writers}"
-    assert "generate_variants_btn.click" not in writers, (
-        "generating candidates must write no execution widget")
+    for generator in ("generate_variants_btn.click", "generate_director_btn.click"):
+        assert generator not in writers, (
+            f"{generator} must write no execution widget — generating is not applying")
+
+
+def test_the_variation_seed_writer_matrix_is_exactly_five_registrations():
+    """**Measured from main and extended by exactly one (AI Director V1).**
+
+    Before the Director the seed had four writers: Randomize, and the three Variant Lab
+    registrations that write it through `variant_lab_outputs`. Director Apply is a fifth
+    legitimate writer, because a proposal *is* a `CreativeRecipe` and a recipe carries the
+    Variation Seed.
+
+    An exact sorted list, never a containment check, and never inferred from memory — the
+    indirection through `variant_lab_outputs` / `director_apply_outputs` is resolved, so a sixth
+    writer hidden behind one more list cannot arrive unreviewed.
+    """
+    writers = _writers_of(_gui_tree(), "variation_seed")
+
+    assert sorted(writers) == ["apply_director_btn.click",
+                               "apply_variant_btn.click",
+                               "generate_variant_btn.click",
+                               "new_variant_btn.click",
+                               "randomize_btn.click"], writers
+    assert "generate_director_btn.click" not in writers, (
+        "generating a proposal must not move the Variation Seed")
+    assert "generate_variants_btn.click" not in writers
+    assert "creative_preset.input" not in writers, "no preset may move the seed"
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():
@@ -685,17 +771,242 @@ def test_no_preset_randomizer_or_freestyle_control_was_added():
 
     Creative Controls Extra PR3 added a preset *selector* (`creative_preset`, a `gr.Radio`), which
     none of these tokens describes. What stays out of scope is a preset button, a randomiser or a
-    reset for the six controls, and every Freestyle / Director mode.
+    reset for the six controls, and Freestyle mode.
 
     **Amended by Variant Lab V1 (C2).** `variant_lab` and `creative_recipe` were forbidden here as
     speculative; C2 implements them, so they left this list rather than being renamed around it.
     `presets.py` still knows nothing about either — `test_creative_presets.py` owns that assertion —
     and everything genuinely still speculative stays forbidden below.
+
+    **Amended again by AI Director V1, and split rather than weakened.** `director` was forbidden
+    here as speculative. V1 implements it in `gui.py`, so the blanket form became false — and the
+    honest fix is to say so out loud rather than to rename the handlers around a boundary guard.
+    The prohibition is kept at **full strength where it was always load-bearing**: the pipeline,
+    the planner, Stage 5 and `creative.py` still know nothing about a Director, which
+    `test_no_stage_cache_or_director_machinery_was_added` above already pins and which is the
+    architectural property this guard actually cared about. What *remains* speculative in the GUI
+    — a preset button, a slider randomiser, a creative reset and Freestyle — stays banned, and the
+    accepted Director surface is an explicit allow-list so a *second* director concept cannot
+    arrive unnoticed.
     """
     source = open(_GUI, encoding="utf-8").read().lower()
-    for word in ("preset_btn", "freestyle", "director",
-                 "randomize_controls", "reset_creative"):
+    for word in ("preset_btn", "freestyle", "randomize_controls", "reset_creative"):
         assert word not in source, f"gui.py contains {word!r}"
+
+    # Still speculative in the GUI: a content-aware Director, a cached or remembered proposal, a
+    # Director-driven render, and a Director that rewrites the current settings.
+    for word in ("director_cache", "director_history", "director_render", "director_media",
+                 "director_frames", "director_transform", "director_session", "director_chat"):
+        assert word not in source, f"gui.py contains {word!r}"
+
+    # The allow-list is a statement about what V1 *is*, so it has to actually be there.
+    for word in ("director_proposal_state", "_on_generate_director_proposal",
+                 "_on_apply_director_proposal", "apply_director_btn"):
+        assert word in source, f"gui.py lost the Director's {word!r}"
+
+
+# ===========================================================================
+# 3b. AI DIRECTOR V1 — THE GUI SEAM
+#
+# Generate proposes and writes no execution widget; Apply is the one Director execution-widget
+# writer; neither reaches a source, preparation, render, audio or Variant Lab surface. Asserted
+# over the real registrations, with list indirection resolved.
+# ===========================================================================
+
+
+_DIRECTOR_SURFACES = ("director_instruction", "director_proposal", "director_status",
+                      "director_proposal_state")
+
+
+def _registration_kwargs(tree, widget: str, attr: str = "click") -> dict:
+    calls = _registration(tree, widget, attrs=(attr,))
+    assert len(calls) == 1, f"{widget} registers {len(calls)} {attr} handlers, expected 1"
+    return _kwargs(calls[0])
+
+
+def test_generate_proposal_reads_the_instruction_and_nothing_else():
+    """`DIRECTOR_READS_CURRENT_SLIDERS = NO`, and no hidden creative base.
+
+    The handler's parameter order is pinned against the `inputs` list too, because Gradio passes
+    them positionally.
+    """
+    tree = _gui_tree()
+    kwargs = _registration_kwargs(tree, "generate_director_btn")
+
+    assert ast.unparse(kwargs["fn"]) == "_on_generate_director_proposal"
+    assert _names(kwargs["inputs"]) == ["director_instruction"]
+    assert [a.arg for a in _func(tree, "_on_generate_director_proposal").args.args] == [
+        "director_instruction"]
+
+    reachable = set(_names(kwargs["inputs"]))
+    for forbidden in _ALL_CREATIVE_WIDGETS + ("creative_preset", "variant_master_seed",
+                                              "variation_spread", "variant_batch_state",
+                                              "variant_candidate_selector", "source_state",
+                                              "prep_state", "session_state", "audio_input",
+                                              "music_under_voice", "sfx_amount", "sfx_level"):
+        assert forbidden not in reachable, f"Generate Proposal reads {forbidden}"
+
+
+def test_generate_proposal_writes_only_the_director_surfaces():
+    """`GENERATING_IS_NOT_APPLYING = YES`, read off the registration rather than off a named list:
+    `outputs=[...] + [a_slider]` would satisfy a list-only check while writing it every press."""
+    tree = _gui_tree()
+    kwargs = _registration_kwargs(tree, "generate_director_btn")
+
+    assert _names(kwargs["outputs"]) == ["director_proposal_state", "director_proposal",
+                                         "director_status"]
+    outputs = set(_names(kwargs["outputs"]))
+    for forbidden in (_ALL_CREATIVE_WIDGETS + ("creative_preset",)
+                      + _GATE_AND_PREP_OUTPUTS
+                      + ("variant_master_seed", "variant_report", "variant_batch_state",
+                         "variant_batch_table", "variant_batch_status",
+                         "variant_candidate_selector", "variant_render_selector",
+                         "render_batch_summary", "music_under_voice", "sfx_amount", "sfx_level",
+                         "audio_layers_report", "smart_mix_report", "video_output",
+                         "status_output")):
+        assert forbidden not in outputs, f"Generate Proposal writes {forbidden}"
+
+
+def test_apply_proposal_writes_exactly_the_seed_sliders_preset_and_status():
+    tree = _gui_tree()
+    kwargs = _registration_kwargs(tree, "apply_director_btn")
+
+    assert ast.unparse(kwargs["fn"]) == "_on_apply_director_proposal"
+    assert _names(kwargs["inputs"]) == ["director_proposal_state"]
+    assert _names(kwargs["outputs"]) == ["director_apply_outputs"]
+
+    assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                      and getattr(n.targets[0], "id", None) == "director_apply_outputs")
+    expanded = []
+    for inner in _ordered_names(assignment.value):
+        if inner == "creative_control_sliders":
+            expanded.extend(_NEW_CONTROLS_IN_FIELD_ORDER)
+        else:
+            expanded.append(inner)
+
+    assert expanded == (["variation_seed"] + list(_NEW_CONTROLS_IN_FIELD_ORDER)
+                        + ["creative_preset", "director_status"]), expanded
+
+
+def test_apply_proposal_writes_nothing_else():
+    tree = _gui_tree()
+    aliases = _aliases_of(tree, "director_apply_outputs")
+    forbidden_widgets = (_GATE_AND_PREP_OUTPUTS
+                         + ("variant_master_seed", "variant_report", "variant_batch_state",
+                            "variant_batch_table", "variant_batch_status",
+                            "variant_candidate_selector", "variant_render_selector",
+                            "render_batch_summary", "music_under_voice", "sfx_amount",
+                            "sfx_level", "voice_files", "voice_start_delay", "voice_min_gap",
+                            "voice_avoid_drops", "sfx_folder", "sfx_roles",
+                            "audio_layers_report", "smart_mix_report", "video_output",
+                            "status_output", "output_filename", "processing_mode", "custom_fps",
+                            "director_instruction", "director_proposal",
+                            "director_proposal_state"))
+    assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                      and getattr(n.targets[0], "id", None) == "director_apply_outputs")
+    reachable = set(_names(assignment.value)) | set(_NEW_CONTROLS_IN_FIELD_ORDER)
+
+    for forbidden in forbidden_widgets:
+        assert forbidden not in reachable, f"Apply Proposal writes {forbidden}"
+    assert "director_apply_outputs" in aliases
+
+
+def test_the_proposal_state_has_exactly_one_reader():
+    """`DIRECTOR_STATE_READER_COUNT = 1`. An exact list, never a containment check — the same
+    contract `variant_batch_state` carries, for the same reason."""
+    tree = _gui_tree()
+    readers = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"click", "change", "input", "submit", "release"}):
+            inputs = next((kw.value for kw in node.keywords if kw.arg == "inputs"), None)
+            if inputs is not None and "director_proposal_state" in _names(inputs):
+                readers.append(ast.unparse(node.func))
+
+    assert readers == ["apply_director_btn.click"], readers
+
+
+def test_the_director_widgets_register_no_handler_of_their_own():
+    """The instruction box and both read-outs are read at click time, exactly like every Variant
+    Lab configuration widget — so typing an instruction cannot move a control or start anything."""
+    tree = _gui_tree()
+    for widget in ("director_instruction", "director_proposal", "director_status"):
+        assert _registration(tree, widget) == [], f"{widget} registers a handler"
+
+
+def test_the_director_is_absent_from_the_source_and_preparation_wiring():
+    """Changing, generating or applying Director intent must not invalidate source confirmation."""
+    tree = _gui_tree()
+    for list_name in ("source_outputs", "prep_outputs"):
+        assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                          and getattr(n.targets[0], "id", None) == list_name)
+        names = _names(assignment.value)
+        for widget in _DIRECTOR_SURFACES:
+            assert widget not in names, f"{widget} is in {list_name}"
+
+    for button in ("source_mode", "source_folder", "source_recursive", "scan_btn", "video_input",
+                   "confirm_btn", "prep_folder", "prep_recursive", "prep_batch_size",
+                   "prep_scan_btn", "prep_analyze_btn"):
+        for call in _registration(tree, button, attrs=("click", "change")):
+            kwargs = _kwargs(call)
+            for key in ("inputs", "outputs"):
+                if key in kwargs:
+                    for widget in _DIRECTOR_SURFACES:
+                        assert widget not in _names(kwargs[key]), f"{button}.{key} has {widget}"
+
+    # and no Director registration writes source or preparation state
+    for button in ("generate_director_btn", "apply_director_btn"):
+        outputs = _names(_registration_kwargs(tree, button)["outputs"])
+        for forbidden in ("source_state", "prep_state", "source_outputs", "prep_outputs"):
+            assert forbidden not in outputs, f"{button} writes {forbidden}"
+
+
+def test_the_director_is_not_a_render_request_input():
+    """The six sliders and the seed already are, and they stay the only creative values the render
+    carries. A proposal reaching the render handler would be a second source of truth."""
+    tree = _gui_tree()
+    for button in ("process_btn", "render_selected_variants_btn"):
+        kwargs = _registration_kwargs(tree, button)
+        reachable = set(_names(kwargs["inputs"])) | set(_names(kwargs["outputs"]))
+        for widget in _DIRECTOR_SURFACES:
+            assert widget not in reachable, f"{button} touches {widget}"
+
+    for name in ("process_video_guarded", "_process_video_guarded_unlocked", "process_video",
+                 "_process_video_impl", "render_selected_variants_guarded"):
+        fn = _func(tree, name)
+        assert not set(a.arg for a in fn.args.args) & set(_DIRECTOR_SURFACES), name
+        body = _body_code(fn)
+        for word in ("fork_director", "DirectorProposal", "director_proposal",
+                     "DIRECTOR_LLAMA_EXE", "DIRECTOR_MODEL"):
+            assert word not in body, f"{name} references {word}"
+
+
+def test_no_director_value_reaches_the_creative_profile_or_the_bus():
+    """A proposal produces a `CreativeRecipe`; the existing controls and stages keep ownership.
+    Nothing named after the Director may reach the profile seam or the shared bus."""
+    tree = _gui_tree()
+    core = _body_code(_func(tree, GATE_CORE))
+
+    assert "fork_creative.CreativeProfile.from_widgets(" in core
+    for word in ("fork_director", "director", "proposal", "instruction", "explanation"):
+        assert word not in core.lower(), f"the gate core references {word!r}"
+
+
+def test_the_director_borrows_no_existing_report_panel():
+    """It owns its own read-outs. Overloading `variant_report`, `variant_batch_status` or either
+    mix report would leave the user unable to tell which statement was about which thing."""
+    tree = _gui_tree()
+    for panel in ("variant_report", "variant_batch_status", "variant_batch_table",
+                  "audio_layers_report", "smart_mix_report", "render_batch_summary",
+                  "status_output"):
+        writers = _writers_of(tree, panel)
+        for button in ("generate_director_btn.click", "apply_director_btn.click"):
+            assert button not in writers, f"the Director writes {panel}"
+
+    for surface in ("director_proposal", "director_status"):
+        writers = sorted(set(_writers_of(tree, surface)))
+        assert writers and all(w.startswith(("generate_director_btn", "apply_director_btn"))
+                               for w in writers), f"{surface} is written by {writers}"
 
 
 # ===========================================================================

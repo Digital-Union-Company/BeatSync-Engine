@@ -706,9 +706,17 @@ def test_e_no_director_or_freestyle_machinery_was_added():
     **Stage-5 side** — `video_analysis.py`, the Qwen worker and `library_prep.py` — must still know
     nothing about a master seed, which is the architectural property P2 actually cared about, and
     every other token stays forbidden everywhere including the GUI.
+
+    **Amended again by AI Director V1, by exactly the same rule.** `director` moves from
+    "speculative everywhere" to "speculative on the Stage-5 side", because that is the half P2
+    actually cared about: a Director may exist, but **Stage 5 must never hear of it**. The GUI now
+    legitimately defines `_on_generate_director_proposal` and `_on_apply_director_proposal`, and
+    the names are kept rather than disguised. `freestyle`, `shortlist`, `second_pass` and
+    `interpretation_mode` are untouched and still forbidden everywhere, including the GUI — the
+    Director is a *Stage-6-and-above creative producer*, not a second interpretation pass over the
+    persisted library, and nothing here licenses one.
     """
-    speculative_everywhere = ("director", "freestyle", "shortlist",
-                              "second_pass", "interpretation_mode")
+    speculative_everywhere = ("freestyle", "shortlist", "second_pass", "interpretation_mode")
     stage5_side = (_VA, _WORKER, os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"))
 
     for path in stage5_side + (_GUI,):
@@ -718,10 +726,105 @@ def test_e_no_director_or_freestyle_machinery_was_added():
                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         forbidden = speculative_everywhere
         if path in stage5_side:
-            forbidden = forbidden + ("master_seed",)
+            forbidden = forbidden + ("master_seed", "director", "proposal")
         for speculative in forbidden:
             assert not any(speculative in name for name in defined), (
                 f"{path} defines speculative {speculative} machinery")
+
+    # The positive half: the accepted Director surface really is in the GUI and only there.
+    gui_defined = {n.name for n in ast.walk(ast.parse(open(_GUI, encoding="utf-8").read()))
+                   if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    assert {"_on_generate_director_proposal", "_on_apply_director_proposal"} <= gui_defined
+
+
+def _identifier_parts(source: str) -> set:
+    """Every identifier in `source`, plus its `snake_case` and `camelCase` parts, lowercased.
+
+    **Whole-word matching is not enough here, and a mutation proved it.** `\\bdirector\\b` does not
+    match inside `DIRECTOR_PROPOSAL_INSTRUCTION`, because `_` is a word character — so a leak in
+    exactly the shape a real leak would take (a compound name) walked straight past the guard.
+    Plain substring matching is not the fix either: `director` is a substring of `directory`, and
+    `os.makedirs(directory)` must not read as a Director reference. Decomposing identifiers answers
+    both: `directory` yields `{"directory"}` and never `"director"`, while
+    `DIRECTOR_PROPOSAL_INSTRUCTION` and `DirectorProposal` both yield `{"director", "proposal", …}`.
+    """
+    parts = set()
+    for identifier in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source):
+        lowered = identifier.lower()
+        parts.add(lowered)
+        parts.update(lowered.split("_"))
+        parts.update(piece.lower() for piece in re.findall(r"[A-Z]?[a-z0-9]+", identifier))
+    return parts
+
+
+def test_e_the_director_vocabulary_reaches_no_stage_5_surface():
+    """**§34.** `DIRECTOR_CHANGES_PERSISTED_MEDIA_SEMANTICS = NO`.
+
+    Stage 5 records intrinsic media truth; the Director is creative interpretation and lives
+    entirely above it. So no Stage-5 file, no Qwen request builder, no prompt and no persisted
+    record may so much as name it — not even as one part of a compound identifier, which is the
+    shape a real leak actually takes.
+
+    The six control names are deliberately **not** repeated here:
+    `test_creative_controls_seam.py` already pins their absence from every identity and completion
+    function, executably as well as structurally, and a second copy of that list is a second place
+    for it to go stale.
+    """
+    director_words = ("director", "proposal", "instruction", "explanation",
+                      "directorproposal", "creativerecipe")
+    paths = (_VA, _WORKER, os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"),
+             os.path.join(_REPO, "src", "auto_mode", "stage6_av_planner.py"))
+
+    for path in paths:
+        parts = _identifier_parts(_executable_source(path))
+        for word in director_words:
+            assert word not in parts, f"{os.path.basename(path)} mentions {word!r}"
+
+    # the decomposition really does tell a leak from an innocent word
+    assert "director" not in _identifier_parts("os.makedirs(directory)")
+    assert "director" in _identifier_parts("DIRECTOR_PROPOSAL_INSTRUCTION = 'x'")
+    assert "proposal" in _identifier_parts("class DirectorProposal: pass")
+
+
+def test_e_the_qwen_request_builders_and_prompt_never_see_a_director():
+    """The process boundary, where separation is easiest to lose: whatever the parent stops
+    sending, the worker must also stop being able to ask for."""
+    tree = _tree(_VA)
+    for builder in ("_run_qwen_worker", "_run_qwen_worker_batch"):
+        body = _body_code(_func(tree, builder)).lower()
+        for word in ("director", "proposal", "instruction", "explanation", "creative"):
+            assert not re.search(rf"\b{re.escape(word)}\b", body), f"{builder} mentions {word!r}"
+
+    prompt = _body_code(_func(_tree(_WORKER), "_build_prompt")).lower()
+    for word in ("director", "proposal", "instruction", "editing intention", "creative"):
+        assert not re.search(rf"\b{re.escape(word)}\b", prompt), f"the prompt mentions {word!r}"
+
+
+def test_e_the_director_does_not_move_the_cache_contract_or_analysis_version():
+    """`DIRECTOR_CHANGES_STAGE5_CACHE_IDENTITY = NO`. The Director re-plans; it never re-analyses,
+    so neither constant may move and no cold rebuild may be charged for it."""
+    values = {}
+    for node in ast.walk(_tree(_VA)):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {
+                        "CACHE_CONTRACT_VERSION", "ANALYSIS_VERSION"}:
+                    values[target.id] = node.value.value
+
+    assert values["CACHE_CONTRACT_VERSION"] == "stage5_cache_v3"
+    assert values["ANALYSIS_VERSION"] == "auto_av_analysis_v8_llama_vulkan_batched"
+
+
+def test_e_the_director_module_knows_nothing_about_stage_5_or_a_cache():
+    """The other direction, and the reason the Director is media-blind in V1: there is nowhere in
+    the pure module for a frame, a filename, a semantic record or a cache token to enter."""
+    director = os.path.join(_REPO, "src", "beatsync_fork", "director.py")
+    source = _executable_source(director).lower()
+    for word in ("cache", "cache_contract_version", "analysis_version", "video_signature",
+                 "audio_visual_profile", "beat_info", "semantics", "candidate", "frame",
+                 "mmproj", "qwen", "stage5", "video_analysis", "smart_preset", "audio_profile",
+                 "tempo", "sections", "source_file", "filename"):
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"director.py mentions {word!r}"
 
 
 def test_e_stage_6_scoring_and_planning_are_untouched():
