@@ -57,9 +57,24 @@ automatically.
   directly to the core, and never let a wrapper rebuild the gate.
 - **Diagnostics the batch reads rather than writes.** C3-R0 records each candidate's durable
   output in `session_state[LAST_OUTPUT_PATH_KEY]` — cleared before every attempt, set only after
-  the move into `output/` succeeds, and never the ProRes preview — and reads the two report keys
-  after each candidate. It becomes a writer of **neither** report panel; the batch summary owns
-  multi-render diagnostics so no panel can describe a candidate the user is not looking at.
+  the promotion into `output/` succeeds, and never the ProRes preview — and reads the two report
+  keys after each candidate. It becomes a writer of **neither** report panel; the batch summary
+  owns multi-render diagnostics so no panel can describe a candidate the user is not looking at.
+- **One universal durable-output policy: no GUI render may ever replace an existing file (H1).**
+  There is exactly one promotion into `output/`, `_promote_output_no_replace()`, and it is a single
+  no-replace `os.rename` — not `shutil.move`, not `os.replace`, and not an `os.path.exists` check
+  followed by a move. The check *is* the operation, so nothing can appear in a window between
+  them. Ordinary Create Music Video and the C3-R0 batch get the identical guarantee: C3-R0's
+  keyword-only `refuse_existing_output` is **gone**, and no boolean may take its place — a
+  per-caller overwrite policy is how the single render stayed destructive while the batch was
+  safe. The exact final path is also checked once before `analyze_beats_auto`, purely so a doomed
+  render costs no analysis; that check is a courtesy and the rename is the authority. Every
+  failure is **fail-closed**: the destination is never deleted to make room, the new render stays
+  in `session_dir` and is named in the message, `LAST_OUTPUT_PATH_KEY` stays empty, and a ProRes
+  preview is not generated at all. A cross-volume destination (`errno.EXDEV`) refuses rather than
+  copying — a copy is not an atomic promotion, and an interrupted one leaves a partial video
+  looking like a finished render. See `.claude/rules/pipeline-core.md` for why this rests on
+  Windows-specific `os.rename` semantics.
 - **The gate validates the **live** source controls**
   (`source_mode`, `source_folder`, `source_recursive`, `video_input`), not just `gr.State`. Gradio
   delivers widget changes as separate queued events, so the state can lag the widgets at click time.

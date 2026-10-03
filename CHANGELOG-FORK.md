@@ -20,6 +20,48 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-03 (Universal GUI atomic no-overwrite — H1)
+
+**No BeatSync GUI render can silently replace an existing durable output any more.** Ordinary
+Create Music Video could: the promotion into `output/` was `shutil.move`, which on the supported
+Windows environment replaces the destination without a word — measured, with the user's old bytes
+simply gone. The name is distinct only per second per Variation Seed, so an earlier run, a manual
+copy or a same-second retry was enough to lose a finished video.
+
+- **One universal policy, no opt-in.** C3-R0 had protected only the batch, behind a keyword-only
+  `refuse_existing_output` that defaulted to `False` — which is precisely how the single render
+  kept the destructive path. That flag is **removed** from the whole GUI render chain and is not
+  replaced by another boolean: with an atomic primitive, overwriting is *impossible* rather than
+  *disabled*, and a flag defaulting to the unsafe value is a trap for the next caller.
+- **The promotion is a single no-replace OS operation.** `gui._promote_output_no_replace()` calls
+  `os.rename` once — not `shutil.move`, not `os.replace`, not `exists()`-then-move. The old
+  double-`exists()` guard was a TOCTOU pair: another process could create the path in the window
+  between the check and the move, and the move destroyed it anyway. Measured on Windows:
+  destination free promotes; destination occupied raises `FileExistsError` (`WinError 183`) with
+  the existing bytes unchanged and the render still on disk. **This rests on Windows-specific
+  semantics** — POSIX `rename(2)` replaces silently — which is sound only because this app is
+  Windows-only by construction, and is recorded as such in `.claude/rules/pipeline-core.md`.
+- **An early check still runs before Stage 1**, purely so a doomed render costs no analysis. It is
+  a courtesy; the rename is the authority, and there is deliberately no second `exists()` before
+  it.
+- **Every failure is fail-closed.** Nothing is ever deleted to make room. A collision or a
+  promotion error preserves the existing file, **retains the new render** in `session_dir` and
+  names both paths, leaves `LAST_OUTPUT_PATH_KEY` empty, and generates no ProRes preview — a
+  promotion failure must never read as a finished render. A cross-volume destination
+  (`errno.EXDEV`, measured as `WinError 17`) refuses rather than copying: a copy is not an atomic
+  promotion, and an interrupted one would leave a partial video at the final path.
+- **Nothing about naming changed.** Same timestamp, same `_seedNNNNNN` suffix, same `.mp4`/`.mov`
+  choice, same ProRes `_preview.mp4`. No auto-rename, no `_2`, no counter, no UUID — the Phase A
+  contract is explicit that today's names must not change, and a collision counter would invent a
+  naming subsystem with a race of its own.
+- **The CLI is untouched.** `video_processor.py` has no `shutil.move` at all: it hands the user's
+  explicit `-o` path to FFmpeg, which writes it with `-y`. Overwriting a path the user named is
+  the standard command-line contract, so H1 is GUI-only.
+- **C3-R0 keeps its candidate stems**, and the reason is restated rather than retired. They were
+  introduced because a same-name collision meant one candidate destroying the other's video; now
+  it would make the second candidate legitimately *refuse*, and a batch asked for two videos would
+  deliver one. Identity is what lets both succeed.
+
 ### Added — 2026-10-03 (Variant Lab Render Two Compared Candidates — C3-R0)
 
 C3 V1 let the user generate N candidate settings, compare them and apply **one**. The payoff of a
@@ -58,12 +100,15 @@ loop: tick exactly two candidates, press Render Selected Variants, get two real 
   overwrites silently (also measured), each candidate gets a stem carrying the request tag, the
   candidate index and the candidate master — `music_video_batch<tag>_c01_m609591` — and the
   existing suffix follows unchanged.
-- **Batch-only hard no-overwrite.** `refuse_existing_output` is keyword-only so the positional
-  widget list can never supply it, defaults to `False` so ordinary Create Music Video keeps its
-  shipped behaviour exactly, and the batch passes `True`: the destination is checked before Stage
-  1 *and* again immediately before the move, preserving whatever is already on disk. The
-  pre-existing single-render overwrite is a separate latent defect, reported rather than changed
-  inside this feature.
+- **Batch-only no-overwrite.** `refuse_existing_output` is keyword-only so the positional widget
+  list can never supply it, defaults to `False` so ordinary Create Music Video keeps its shipped
+  behaviour exactly, and the batch passes `True`: the destination is checked before Stage 1 *and*
+  again immediately before the move, preserving whatever is already on disk. The pre-existing
+  single-render overwrite is a separate latent defect, reported rather than changed inside this
+  feature. **Superseded by H1 below, which also corrects this entry's original wording**: it said
+  "hard no-overwrite", which overstated two `os.path.exists` checks around a `shutil.move` — a
+  TOCTOU pair, sound against this batch's own second candidate but only best-effort against
+  another process.
 - **Durable output is the success authority**, not the preview and not the status prose. A ProRes
   render moves the real `.mov` into `output/` and then returns a session-temp `_preview.mp4`, so a
   preview step failing afterwards must not retroactively fail a finished render. A new

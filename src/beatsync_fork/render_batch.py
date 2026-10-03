@@ -46,13 +46,22 @@ Seed 536635.
 
 That matters because the existing render path names its output
 ``<stem>_<timestamp>_seed<VariationSeed><ext>``. Two such candidates rendered in the same second
-would compute an identical destination — and ``shutil.move`` silently overwrites, measured. So the
-stem derived here carries the **candidate index and the candidate master**, plus a per-invocation
-request tag::
+would compute an identical destination. So the stem derived here carries the **candidate index and
+the candidate master**, plus a per-invocation request tag::
 
     music_video_batch20261003_161234_123456_c01_m609591
 
 The existing suffix is left entirely alone; this only makes the *base* distinct.
+
+**What H1 changed about that motivation, and what it did not.** When C3-R0 wrote this, the render
+path promoted with ``shutil.move``, which silently replaced an existing destination (measured), so
+a stem collision meant one candidate *destroying* the other's video. H1 replaced that promotion
+with an atomic no-replace ``os.rename``, so destructive replacement is no longer possible from any
+GUI render. Distinct candidate stems are nevertheless still **required**, for the other half of the
+reason: two candidates landing on one name would now make the second one legitimately *refuse*, and
+a batch that was asked for two videos would return one. Identity here is what lets both requested
+candidates succeed; the promotion is what guarantees neither can be overwritten. Do not drop one
+because the other exists.
 """
 
 from __future__ import annotations

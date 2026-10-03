@@ -73,6 +73,8 @@ import gradio as gr
 import tempfile
 import shutil
 import datetime
+# [FORK] Digital-Union (H1): `errno.EXDEV` tells a cross-volume promotion apart from a collision.
+import errno
 import multiprocessing
 import queue
 import re
@@ -582,6 +584,49 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
     return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
 
 
+def _promote_output_no_replace(temp_output: str, output_path: str) -> str:
+    """Promote a finished render into `output/`, and **never** replace what is already there.
+
+    [FORK] Digital-Union (H1): this one OS call is what makes a render durable, and it is the whole
+    no-overwrite guarantee. Returns `''` on success, or the user-facing failure text. It never
+    raises, and on no path does it remove anything.
+
+    **Why not `shutil.move` + `os.path.exists`.** The previous promotion was `shutil.move`, which
+    silently replaced an existing destination — measured on the supported Windows environment: the
+    user's old bytes were simply gone. C3-R0 guarded it with an `os.path.exists` check immediately
+    beforehand, which helps but is a TOCTOU pair: another process can create the path in the window
+    between the check and the move, and the move then destroys it anyway.
+
+    **Why `os.rename`.** The check *is* the operation, so there is no window. Measured on Windows:
+    renaming onto an existing name raises `FileExistsError` (`winerror 183`) with the destination
+    bytes unchanged and the source still on disk; renaming onto a free name promotes cleanly. This
+    is deliberately Windows-specific behaviour — POSIX `rename(2)` replaces silently — and it is
+    only sound as a guarantee because this app is Windows-only by construction
+    (`.claude/rules/platform-and-packaging.md`). The portable test suite therefore stubs
+    `os.rename` rather than asserting the real platform's semantics.
+
+    **Every failure is fail-closed.** The destination is never deleted to make room and the new
+    render is never discarded, so a collision leaves the user holding *both* files. There is no
+    copy fallback for a cross-volume destination on purpose: a copy is not an atomic promotion, and
+    an interrupted one would leave a partial video sitting at the final path — which is worse than
+    refusing, because it looks like a finished render.
+    """
+    try:
+        os.rename(temp_output, output_path)
+    except FileExistsError:
+        return (f"❌ Output already exists and was preserved: {output_path}\n"
+                f"Nothing was overwritten. The new render is kept at: {temp_output}")
+    except OSError as exc:
+        if getattr(exc, 'errno', None) == errno.EXDEV:
+            return (f"❌ Durable promotion failed: the render folder and the output folder are on "
+                    f"different volumes, so the move cannot be atomic and was not attempted by "
+                    f"copying. The destination was not replaced: {output_path}\n"
+                    f"The new render is kept at: {temp_output}")
+        return (f"❌ Durable promotion failed ({exc}). The destination was not replaced: "
+                f"{output_path}\nThe new render is kept at: {temp_output}")
+    return ''
+
+
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, creative: fork_creative.CreativeProfile | None,
@@ -593,8 +638,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        voice_files: VideoFilesInput = None,
                        audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                        sfx_root: str | None = None,
-                       smart_mix: fork_smart_mix.SmartMixConfig | None = None,
-                       refuse_existing_output: bool = False) -> StatusResult:
+                       smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
     # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
@@ -614,6 +658,13 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # and they are not source or preparation state.
     session_state[AUDIO_LAYERS_REPORT_KEY] = ''
     session_state[SMART_MIX_REPORT_KEY] = ''
+    # [FORK] Digital-Union (H1): the durable-output key joins them, with the same lifecycle. The
+    # gate core already clears it before the gate — that clear must stay, because a gate refusal
+    # never reaches this function — but "empty unless a promotion succeeded" is a property of
+    # *this* function and is now guaranteed here rather than inherited from a caller. Every
+    # collision, promotion failure and early return below therefore leaves it empty by
+    # construction instead of by remembering to.
+    session_state[LAST_OUTPUT_PATH_KEY] = ''
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -733,20 +784,22 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         output_path = os.path.join(output_folder, filename)
         temp_output = os.path.join(session_dir, filename)
 
-        # [FORK] Digital-Union (C3-R0): batch-only hard no-overwrite, checked BEFORE any analysis.
+        # [FORK] Digital-Union (H1): the universal early collision check, BEFORE any analysis.
         #
-        # `shutil.move` silently overwrites an existing destination on this platform (measured), and
-        # the name above is only distinct per second per Variation Seed. C3 guarantees candidate
-        # *master* uniqueness but says nothing about `CreativeRecipe.seed`, so two candidates of one
-        # batch really can compute the same `_seedNNN` — a batch must never destroy the render it
-        # just produced. Refusing here costs nothing; refusing after Stage 5 would waste the run.
+        # Unconditional, and that is the point: C3-R0 made this batch-only behind a flag, which
+        # left ordinary Create Music Video able to destroy an existing output. There is no GUI
+        # caller that wants destructive replacement, so there is no flag — see
+        # `_promote_output_no_replace`, which is the authority this only anticipates.
         #
-        # Default `False`, so ordinary Create Music Video keeps its shipped behaviour exactly. The
-        # pre-existing single-render overwrite is a separate latent defect, reported rather than
-        # changed inside this feature.
-        if refuse_existing_output and os.path.exists(output_path):
-            return None, (f"❌ Output already exists and would be overwritten: {output_path}"), \
-                session_state
+        # The name above is distinct only per second per Variation Seed, so a collision is real:
+        # C3 guarantees candidate *master* uniqueness but says nothing about `CreativeRecipe.seed`,
+        # two candidates of one batch really can compute the same `_seedNNN`, and an earlier app
+        # run or a manual copy can occupy the path for a single render. Refusing here costs
+        # nothing; refusing after Stage 5 would waste the whole run.
+        if os.path.exists(output_path):
+            return None, (f"❌ Output already exists and was preserved: {output_path}\n"
+                          f"Nothing was rendered. Rename the output, or move the existing file, "
+                          f"and run again."), session_state
 
         selected_beats, beat_info = analyze_beats_auto(
             local_audio_path,
@@ -837,19 +890,21 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             event_callback=event_callback
         )
 
-        # [FORK] Digital-Union (C3-R0): second collision check, immediately before the move.
-        # The first one ran before Stage 1; a render takes minutes, and another process or an
-        # earlier candidate of this same batch could have produced this exact path meanwhile.
-        # Preserve what is already on disk and fail this candidate rather than overwrite it.
-        if refuse_existing_output and os.path.exists(output_path):
-            return None, (f"❌ Output appeared while rendering and was not overwritten: "
-                          f"{output_path}"), session_state
-
-        # Move to output folder
-        shutil.move(result_path, output_path)
+        # [FORK] Digital-Union (H1): the ONE durable promotion, and it is a single no-replace OS
+        # operation rather than a check followed by a move. The early check above ran before Stage
+        # 1 and a render takes minutes, so the path can be occupied by now — by another process, by
+        # an earlier candidate of this same batch, or by the user. `os.rename` decides and acts
+        # atomically, so no window remains for anything to appear in; it is deliberately NOT
+        # preceded by another `os.path.exists`, which would only re-open the race it closes.
+        promotion_error = _promote_output_no_replace(result_path, output_path)
+        if promotion_error:
+            # Fail closed. Both files survive, the durable-output key stays empty (cleared at the
+            # top of this function, and again by the gate core before the gate), and the message
+            # names both paths — a promotion failure must never read as a finished render.
+            return None, promotion_error, session_state
         # [FORK] Digital-Union (C3-R0): the durable artifact is now on disk, so record it. Set
-        # only here — after the move succeeded — and never from the returned display path, which
-        # for ProRes is a session-temp preview rather than the real `.mov`.
+        # only here — after the promotion succeeded — and never from the returned display path,
+        # which for ProRes is a session-temp preview rather than the real `.mov`.
         session_state[LAST_OUTPUT_PATH_KEY] = output_path
 
         # Create preview for ProRes if needed
@@ -941,8 +996,8 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  voice_files: VideoFilesInput = None,
                  audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                  sfx_root: str | None = None,
-                 smart_mix: fork_smart_mix.SmartMixConfig | None = None,
-                 refuse_existing_output: bool = False) -> Iterator[StatusResult]:
+                 smart_mix: fork_smart_mix.SmartMixConfig | None = None
+                 ) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
     [FORK] Digital-Union: the queue now carries :class:`ProgressEvent` objects instead of status
@@ -988,7 +1043,6 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     audio_mix=audio_mix,
                     sfx_root=sfx_root,
                     smart_mix=smart_mix,
-                    refuse_existing_output=refuse_existing_output,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
@@ -1626,10 +1680,7 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     source_diversity: int, micro_cuts: int,
                                     semantic_emphasis: int,
                                     session_state: dict,
-                                    source_state,
-                                    *,
-                                    refuse_existing_output: bool = False
-                                    ) -> Iterator[GuardedResult]:
+                                    source_state) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
@@ -1654,9 +1705,11 @@ def _process_video_guarded_unlocked(audio_file: str,
     batch and calling a wrapper that acquires the same non-reentrant lock would make the batch
     refuse itself on its own first candidate.
 
-    `refuse_existing_output` is keyword-only and batch-only: the ordinary positional widget list
-    cannot supply it, so Create Music Video keeps today's behaviour exactly. See
-    `_resolve_output_path`.
+    [FORK] Digital-Union (H1): there is **no** overwrite-policy parameter here, and that absence is
+    the contract. Both wrappers get one universal durable-output policy — atomic no-replace
+    promotion, see `_promote_output_no_replace` — because no GUI caller ever wants to destroy an
+    existing output. C3-R0's keyword-only `refuse_existing_output` made safety opt-in and left the
+    ordinary single render destructive; do not reintroduce it or any other boolean in its place.
     """
     # Parameter names deliberately mirror the widget names in process_btn.click(inputs=...):
     # Gradio supplies them positionally, so a silent reordering would be invisible. A test asserts
@@ -1762,7 +1815,6 @@ def _process_video_guarded_unlocked(audio_file: str,
         audio_mix=audio_mix,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
-        refuse_existing_output=refuse_existing_output,
     )
     try:
         for video, status, state in render_stream:
@@ -1923,8 +1975,7 @@ def render_selected_variants_guarded(
                         recipe.seed,
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
-                        session_state, source_state,
-                        refuse_existing_output=True)
+                        session_state, source_state)
             try:
                 for video, status, state, _a_report, _s_report in candidate_stream:
                     last_status = status or ''
