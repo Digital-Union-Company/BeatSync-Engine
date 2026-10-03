@@ -1172,7 +1172,8 @@ def _build_variant_resolution_context(
         range_sfx_level_min, range_sfx_level_max,
         cut_density, micro_cuts, semantic_emphasis,
         energy_response, motion_bias, source_diversity,
-        music_under_voice, sfx_amount, sfx_level) -> Tuple:
+        music_under_voice, sfx_amount, sfx_level,
+        *, mint_unset_master: bool = True) -> Tuple:
     """Normalise the whole Variant Lab screen into `(master_seed, config, base, audio_config,
     audio_base)` — the **one** place that construction happens.
 
@@ -1182,17 +1183,30 @@ def _build_variant_resolution_context(
     against is only trustworthy if it is built by the *same* code that built the batch. A second
     copy of this would be a second opinion about what the screen says.
 
-    An unusable master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh
-    positive one, **and every caller returns it to `variant_master_seed`**, so it is on screen
-    before it is used. That is the whole rule about hidden randomness: `fork_variation.random_seed()`
-    is the only non-deterministic call here, it happens in the GUI rather than in the pure
-    resolvers, and its result is always surfaced. Everything after it is a pure function of visible
-    values.
+    **`mint_unset_master` is the one place the three callers legitimately differ, and getting it
+    wrong is a correctness bug rather than a nuisance (R1).** Generating is an *action*: an unusable
+    master seed (0, empty, or anything `normalize_seed` refuses) is replaced by a fresh positive
+    one, and both Generate handlers return it to `variant_master_seed`, so it is on screen before it
+    is used — `fork_variation.random_seed()` is the only non-deterministic call in the lab, it
+    happens here in the GUI rather than in the pure resolvers, and its result is always surfaced.
+
+    Apply is **not** an action until its gate passes; it is rebuilding the live declaration in order
+    to *compare* it. Minting there would make a correctness decision depend on a draw: with the
+    Master Seed box blanked, a one-in-a-million `random_seed()` landing on the batch's original root
+    would make the reconstructed declaration compare **equal**, and Apply would write a candidate
+    for a screen that no longer declares that root — unsurfaced randomness deciding a gate. So Apply
+    passes `mint_unset_master=False`: an unusable live master normalises to `0`, stays unusable, and
+    the declaration is therefore *deterministically* stale. Exactly the reasoning that made
+    `_fresh_variant_master_seed` a guarantee rather than a probability.
+
+        Generate Variant / Generate Variants  ->  may mint, and surfaces what it minted
+        Apply Selected (validation)           ->  NEVER mints; unset master => stale, always
 
     Parameter names and order mirror the `inputs` list, because Gradio passes them positionally.
+    `mint_unset_master` is keyword-only so it can never be supplied by that positional list.
     """
     master_seed = fork_lab.normalize_master_seed(variant_master_seed)
-    if master_seed <= 0:
+    if master_seed <= 0 and mint_unset_master:
         master_seed = fork_variation.random_seed()
 
     config = fork_lab.VariantLabConfig(
@@ -1444,6 +1458,12 @@ def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
     candidate that describes a base the user has since moved away from must be impossible rather
     than merely unlikely.
 
+    **The rebuild never mints a master seed (R1).** It passes `mint_unset_master=False`, so a
+    blanked or malformed Master Seed box normalises to `0`, stays unusable, and makes the live
+    declaration *deterministically* unequal to any real batch's. Minting here would have put a
+    `random_seed()` draw inside a correctness decision — and on the draw that happened to equal the
+    batch's own root, Apply would have written a candidate for a screen no longer declaring it.
+
     There is deliberately **no** `.change()` invalidation on the declaration widgets. Adding one to
     every slider would put a second handler on widgets whose single `.input()` binding is itself a
     load-bearing contract (see `.claude/rules/creative-presets.md`). The table is labelled *Last
@@ -1491,7 +1511,10 @@ def _on_apply_selected_variant(variant_batch_state, variant_candidate_selector,
         range_sfx_level_min, range_sfx_level_max,
         cut_density, micro_cuts, semantic_emphasis,
         energy_response, motion_bias, source_diversity,
-        music_under_voice, sfx_amount, sfx_level)
+        music_under_voice, sfx_amount, sfx_level,
+        # R1: validation must be deterministic. Minting here would let a blanked Master Seed box
+        # pass the gate whenever the hidden draw happened to land on the batch's own root.
+        mint_unset_master=False)
     live_declaration = fork_batch.declaration_from(
         config, base, audio_config, audio_base, variant_candidate_count)
 

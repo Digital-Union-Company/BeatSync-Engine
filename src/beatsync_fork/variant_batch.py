@@ -94,9 +94,10 @@ Staleness is answered by equality, not by a digest
 :class:`VariantBatchDeclaration` is a canonical, fully normalised, totally ordered record of
 everything a batch was generated from. Deciding whether a candidate list still describes the screen
 is therefore plain structural equality between two small frozen records — no hash, no canonical
-serialisation contract, and nothing that could disagree with the values it claims to summarise. A
-short digest is offered for *display* only (:meth:`VariantBatchDeclaration.short_digest`) and is
-never the correctness authority.
+serialisation contract, and nothing that could disagree with the values it claims to summarise.
+There is no digest here at all, not even a decorative one: the only RNG this module reaches for is
+one candidate master per index under :data:`variant_lab.DOMAIN_BATCH`, and the Variant Lab domain
+registry is exactly ``clips`` / ``controls`` / ``audio`` / ``batch``.
 """
 
 from __future__ import annotations
@@ -224,20 +225,16 @@ class VariantBatchDeclaration:
     count: int
 
     def matches(self, other: Any) -> bool:
-        """Structural equality, named so the call site reads as the gate it is."""
-        return isinstance(other, VariantBatchDeclaration) and self == other
+        """Structural equality, named so the call site reads as the gate it is.
 
-    def short_digest(self) -> str:
-        """A compact display tag. **Diagnostics only** — never the staleness authority.
-
-        Equality above is the authority. This exists so a status line can say *which* batch is on
-        screen without printing nine fields, and it deliberately reuses the fork's one hashing
-        idiom instead of introducing a serialisation contract of its own.
+        There is deliberately no digest, fingerprint or display tag beside this. An earlier draft
+        carried a `short_digest()` that nothing consumed and that reached `rng_for` with a
+        `"display"` domain string — inventing a **fifth** RNG domain outside the registry in
+        `variant_lab.py`, to decorate a status line. Removed in R1: the declaration is nine small
+        fields, equality is the whole contract, and the registry stays `clips` / `controls` /
+        `audio` / `batch`.
         """
-        parts = (self.root_master_seed, self.spread, self.visual_randomized, self.visual_ranges,
-                 self.visual_base, self.audio_randomized, self.audio_ranges, self.audio_base,
-                 self.count)
-        return f"{fork_lab.rng_for(self.root_master_seed, 'display', str(parts)).randrange(1 << 24):06x}"
+        return isinstance(other, VariantBatchDeclaration) and self == other
 
     def visual_base_mapping(self) -> dict:
         return dict(zip(fork_presets.CREATIVE_CONTROL_FIELDS, self.visual_base))

@@ -486,18 +486,65 @@ def test_ordered_members_follow_their_owning_modules_field_order():
     assert tuple(n for n, _lo, _hi in declaration.audio_ranges) == tuple(AUDIO_FIELDS)
 
 
-def test_the_short_digest_is_display_only_and_never_the_authority():
-    """It may exist for a status line, but equality must not be implemented in terms of it."""
-    declaration = _declaration()
-    assert re.fullmatch(r"[0-9a-f]{6}", declaration.short_digest())
-    assert declaration.short_digest() == _declaration().short_digest()
+def test_structural_equality_is_the_only_staleness_authority():
+    """**Strengthened in R1**, replacing a weaker test that merely tolerated a digest beside it.
 
-    with open(_BATCH, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read())
+    R0 carried a `short_digest()` for a status line nothing ever rendered, and it reached
+    `rng_for` with a `"display"` domain string — inventing a fifth RNG domain outside the registry
+    to decorate dead diagnostics. Both are gone. The property this file now pins is the stronger
+    one: there is no second answer to "is this batch still current", not even an unused one.
+    """
+    source = _executable_source(_BATCH)
+    for forbidden in ("short_digest", "digest", "fingerprint", "checksum", "sha", "md5",
+                      "hashlib", "__hash__"):
+        assert forbidden not in source, f"variant_batch carries {forbidden!r}"
+
+    tree = ast.parse(source)
     matches = next(n for n in ast.walk(tree)
                    if isinstance(n, ast.FunctionDef) and n.name == "matches")
     body = ast.unparse(matches)
-    assert "digest" not in body and "hash" not in body, "equality must not route through a digest"
+    assert "==" in body and "VariantBatchDeclaration" in body
+    assert not hasattr(fork_batch.VariantBatchDeclaration, "short_digest")
+
+    # and equality really is total and structural, not identity
+    assert _declaration() == _declaration()
+    assert _declaration() is not _declaration()
+
+
+def test_the_module_consumes_no_undeclared_rng_domain():
+    """The Variant Lab RNG registry is exactly four domains, and C3 may use only `batch`.
+
+    Pinned structurally rather than by reading the constant: every `rng_for(...)` call in this
+    module is inspected and its domain argument must be the named `fork_lab.DOMAIN_BATCH`, never a
+    bare string. A literal would compile and work perfectly while quietly creating a fifth domain
+    that the registry in `variant_lab.py` does not know about — which is exactly what R0 did.
+    """
+    tree = ast.parse(_executable_source(_BATCH))
+
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and ast.unparse(n.func).endswith("rng_for")]
+    assert calls, "expected at least one rng_for call — candidate masters come from one"
+    for call in calls:
+        domain = call.args[1] if len(call.args) > 1 else next(
+            (kw.value for kw in call.keywords if kw.arg == "domain"), None)
+        assert domain is not None, ast.unparse(call)
+        assert ast.unparse(domain) == "fork_lab.DOMAIN_BATCH", \
+            f"undeclared RNG domain in {ast.unparse(call)}"
+
+    # no bare domain literal anywhere in the module, declared or not
+    for literal in ("'display'", '"display"', "'clips'", "'controls'", "'audio'", "'batch'"):
+        assert literal not in _executable_source(_BATCH), f"bare domain literal {literal}"
+
+
+def test_the_variant_lab_domain_registry_is_exactly_four():
+    """One registry, in one module. A fifth domain must be a deliberate, reviewed addition."""
+    domains = {name: getattr(fork_lab, name) for name in dir(fork_lab)
+               if name.startswith("DOMAIN_")}
+    assert domains == {"DOMAIN_CLIPS": "clips", "DOMAIN_CONTROLS": "controls",
+                       "DOMAIN_AUDIO": "audio", "DOMAIN_BATCH": "batch"}
+    assert len(set(domains.values())) == 4, "domain values must be distinct"
+    for name in domains:
+        assert name in fork_lab.__all__, f"{name} is not exported"
 
 
 # ===========================================================================

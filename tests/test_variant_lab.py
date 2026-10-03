@@ -2381,3 +2381,136 @@ def test_new_variant_still_delegates_to_the_one_single_variant_path():
     assert "_on_generate_variant(" in body
     assert "_on_generate_variants(" not in body, "New Variant stays single-variant"
     assert "fork_batch" not in body
+
+
+# --- R1: Apply validation is deterministic and never mints -----------------
+
+
+class _CountingRandomSeed:
+    """A `random_seed` stand-in that both counts calls and returns the worst possible value."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.value
+
+
+#: Every spelling of "the Master Seed box no longer holds a usable value". `normalize_seed`
+#: refuses each of them, which is exactly why R0's mint branch fired on all of them. Note what is
+#: deliberately absent: a numeric *string*. `variation.normalize_seed` accepts `"582913"` as 582913,
+#: so that box is still declaring the same root and Apply must succeed — a test below pins it, and
+#: listing it here would have asserted the opposite of the truth.
+_UNUSABLE_MASTERS = [0, None, "", -5, 7.9, True, float("nan"), float("inf")]
+
+
+@pytest.mark.parametrize("unusable", _UNUSABLE_MASTERS)
+def test_apply_never_mints_a_master_while_validating(unusable, monkeypatch):
+    """**R1 — the load-bearing regression.** Apply's gate must not depend on a draw.
+
+    R0 reused the Generate normalisation wholesale, so rebuilding the live declaration minted a
+    master whenever the box was unusable. With the box blanked, a `random_seed()` that happened to
+    return the batch's own root made the reconstructed declaration compare **equal**, and Apply
+    wrote a candidate for a screen that no longer declared that root — a correctness decision
+    resolved by a one-in-a-million draw, and an unsurfaced one at that.
+
+    This forces the unlucky draw rather than waiting for it: `random_seed` is patched to return
+    exactly the batch root. Apply must still refuse, and must not have called it at all.
+    """
+    handlers = _c3_handlers()
+    root = 582913
+    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    assert batch.declaration.root_master_seed == root
+
+    spy = _CountingRandomSeed(root)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+
+    applied = _apply(batch, 0, handlers=handlers, master=unusable)
+
+    assert spy.calls == 0, "Apply must not draw while validating a candidate list"
+    for value in applied[:13]:
+        assert isinstance(value, _FakeSkip), "a refusal must change no execution widget"
+    assert applied[13] is None, "the stale batch must be consumed"
+    assert applied[14] == _FakeUpdate(choices=[], value=None)
+    assert "no longer describe" in applied[15].lower()
+
+
+def test_an_unusable_live_master_is_stale_deterministically_every_time(monkeypatch):
+    """Not "usually stale": the same refusal a hundred times, with the draw rigged against us."""
+    handlers = _c3_handlers()
+    root = 582913
+    _master, batch, _t, _s, _st = _generate_batch(master=root, handlers=handlers)
+    spy = _CountingRandomSeed(root)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+
+    for _ in range(100):
+        applied = _apply(batch, 0, handlers=handlers, master=0)
+        assert all(isinstance(v, _FakeSkip) for v in applied[:13])
+    assert spy.calls == 0
+
+
+def test_the_two_generate_handlers_still_mint_and_surface(monkeypatch):
+    """The other half of the split: generating is an action, so it may mint — and must show it."""
+    handlers = _c3_handlers()
+    minted = 424242
+
+    spy = _CountingRandomSeed(minted)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+    master, batch, _t, _s, _st = _generate_batch(master=0, handlers=handlers)
+    assert spy.calls == 1, "Generate Variants mints exactly once"
+    assert master == minted, "and returns it to variant_master_seed"
+    assert batch.declaration.root_master_seed == minted
+
+    spy = _CountingRandomSeed(minted)
+    monkeypatch.setattr(handlers["fork_variation"], "random_seed", spy)
+    single = _gui_handlers()["_on_generate_variant"](*_lab_args(master=0))
+    assert spy.calls == 1
+    assert single[0] == minted, "single Generate also surfaces what it minted"
+
+
+def test_a_numeric_string_master_is_the_same_declaration_not_a_stale_one():
+    """`variation.normalize_seed` accepts `"582913"` as 582913, so the box still declares the same
+    root and Apply must succeed. The gate refuses values that are *unusable*, not values that are
+    merely typed differently — a stale check that fired on re-typing would be a bug of its own."""
+    handlers = _c3_handlers()
+    _master, batch, _t, _s, _st = _generate_batch(master=582913, handlers=handlers)
+    applied = _apply(batch, 0, handlers=handlers, master="582913")
+    assert not any(isinstance(v, _FakeSkip) for v in applied[:13])
+    assert applied[0] == batch.candidates[0].master_seed
+
+
+def test_the_mint_switch_is_keyword_only_and_apply_passes_false():
+    """Structural: the positional `inputs` list must never be able to supply this flag."""
+    tree = _tree(_GUI)
+    helper = _func(tree, "_build_variant_resolution_context")
+    assert [a.arg for a in helper.args.kwonlyargs] == ["mint_unset_master"]
+    assert helper.args.args[-1].arg == "sfx_level", "the 30 positional widget args are unchanged"
+    default = helper.args.kw_defaults[0]
+    assert isinstance(default, ast.Constant) and default.value is True
+
+    body = ast.unparse(_strip_docstrings(helper))
+    assert "if master_seed <= 0 and mint_unset_master:" in body
+    assert body.count("fork_variation.random_seed()") == 1
+
+    apply_body = ast.unparse(_strip_docstrings(_func(tree, "_on_apply_selected_variant")))
+    assert "mint_unset_master=False" in apply_body
+    assert "fork_variation" not in apply_body, "Apply owns no randomness of its own"
+    assert "random_seed" not in apply_body
+
+    for generator in ("_on_generate_variant", "_on_generate_variants"):
+        generated = ast.unparse(_strip_docstrings(_func(tree, generator)))
+        assert "mint_unset_master" not in generated, f"{generator} keeps the minting default"
+
+
+def test_only_the_shared_helper_owns_the_draw():
+    """One `random_seed()` call site for the whole lab, plus Randomize and New Variant's own."""
+    tree = _tree(_GUI)
+    owners = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.FunctionDef)
+                and "fork_variation.random_seed()" in ast.unparse(_strip_docstrings(node))):
+            owners.append(node.name)
+    assert sorted(owners) == ["_build_variant_resolution_context",
+                              "_fresh_variant_master_seed"], owners

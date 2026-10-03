@@ -271,8 +271,31 @@ microseconds. Those two do not belong in one feature, and the deferred milestone
   audio split is not interchangeable), so `50` and `50.0` are one declaration rather than two.
 - **Staleness is answered by equality, not a digest.** `live_declaration.matches(batch.declaration)`
   is plain structural equality between two small frozen records — no canonical-serialisation
-  contract to keep in step. `short_digest()` exists for display only, and a test asserts `matches`
-  does not route through it.
+  contract to keep in step, and **no digest, fingerprint or display tag exists beside it**. An R0
+  draft carried a `short_digest()` that nothing consumed and that reached `rng_for` with a
+  `"display"` domain string, inventing a **fifth** RNG domain to decorate a status line; R1 removed
+  the method rather than registering the domain. A test now forbids `digest` / `hashlib` /
+  `__hash__` in the module outright, so there is no second answer to "is this batch current", not
+  even an unused one.
+- **Apply validation never mints a master seed (R1), and that is a correctness rule rather than
+  tidiness.** The three handlers share one normalisation helper, which takes a keyword-only
+  `mint_unset_master`:
+
+  ```
+  Generate Variant / Generate Variants  ->  may mint an unset master, and SURFACE what they minted
+  Apply Selected   (validation)         ->  NEVER mints; an unusable live master stays 0,
+                                            so the declaration is deterministically stale
+  ```
+
+  R0 reused the Generate normalisation wholesale, so rebuilding the live declaration minted
+  whenever the box was unusable. With the Master Seed blanked, a `random_seed()` that happened to
+  return the batch's own root made the reconstructed declaration compare **equal**, and Apply wrote
+  a candidate for a screen that no longer declared that root — an unsurfaced draw deciding a gate,
+  the exact class C2 R1-B already rejected for `_fresh_variant_master_seed`. A forced-draw
+  regression test pins it: `random_seed` is patched to return the batch root, and Apply must still
+  refuse with **zero** invocations. Note the boundary is *usability*, not spelling —
+  `normalize_seed` accepts `"582913"`, so the string form is the same declaration and Apply
+  correctly succeeds.
 - **The gate is live and fail-closed, and there are deliberately NO `.change()` invalidation
   handlers.** Apply re-reads the whole screen through the shared normalisation helper at click time
   and refuses unless it equals the stored declaration — the same reason `process_btn` validates the
