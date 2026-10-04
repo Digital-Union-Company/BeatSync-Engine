@@ -75,11 +75,24 @@ MISS  run the pre-L2 body verbatim             ->  publish, only after Stage 3 s
 - **Defensive deep copying on both sides is load-bearing.** `put` stores a `copy.deepcopy` and `get`
   returns one, so the stored graph is never reachable from any caller and a downstream mutation of a
   cache-hit bundle cannot corrupt a later hit. This does not rely on downstream code being careful.
-- **Fail open.** Key creation, lookup, copying and the store each degrade to the existing uncached
-  path; `Exception` only, so a `KeyboardInterrupt` or `MemoryError` still propagates. Nothing is
-  published before Stage 3 succeeds, so a failed stage cannot poison the entry, and a failed store
-  costs the next call its reuse rather than the current render. Existing `librosa.load`, Stage 1/2/3
-  and empty-audio failures keep their current behaviour exactly.
+- **Fail open on an ordinary failure; propagate memory exhaustion.** Key creation, lookup, copying
+  and an ordinary store failure each degrade to the existing uncached path — no cache, a miss and
+  recompute, or reuse lost with the current render continuing. **`MemoryError` is explicitly
+  re-raised ahead of that handler**, because turning a failed allocation into a cache miss would
+  immediately start the ~15.7 s uncached audio-analysis path at the moment the process has least
+  memory for it. `KeyboardInterrupt` and `SystemExit` are not caught at all, being `BaseException`
+  subclasses; there is no `BaseException` catch and no bare `except`.
+
+  *(Corrected in R2. R1's code and prose both claimed "`Exception` only, so a `MemoryError` still
+  propagates", which is false in Python: `MemoryError` subclasses `Exception`, so the single
+  `except Exception` swallowed it. The code now matches the stated intent and the prose matches the
+  code; a permanent test asserts the subclass relationship mechanically, another pins the handler
+  order, and three behavioural tests prove `MemoryError` propagates at each seam with no Stage 1–3
+  recomputation.)*
+
+  Nothing is published before Stage 3 succeeds, so a failed stage cannot poison the entry, and an
+  entry stored before a later `MemoryError` stays reusable. Existing `librosa.load`, Stage 1/2/3 and
+  empty-audio failures keep their current behaviour exactly.
 - **The miss path is the pre-L2 body, proven rather than asserted.** A differential test extracts
   `analyze_beats_auto` from both the authorized base and this revision, runs them against identical
   deterministic stubs and requires array-exact equality of `beat_times`, `tempo`, `features`,

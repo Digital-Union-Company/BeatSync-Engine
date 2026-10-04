@@ -906,8 +906,36 @@ def test_a_failure_after_a_successful_publication_leaves_the_good_entry(track):
 
 
 # ===========================================================================
-# §41  CACHE MACHINERY FAILURE FAILS OPEN
+# §41  CACHE MACHINERY FAILURE FAILS OPEN — for an ORDINARY failure
+#
+# R2 made the boundary two-class, because R1's "`Exception` only, so `MemoryError` propagates" was
+# simply false in Python: `MemoryError` subclasses `Exception`, so a lone `except Exception`
+# swallowed it. Both halves are pinned permanently below.
+#
+#   ordinary Exception  ->  fail open   (no cache / miss / reuse lost)
+#   MemoryError         ->  propagate
+#
+# `KeyboardInterrupt` and `SystemExit` propagate for an unrelated reason — they are `BaseException`,
+# not `Exception` — and nothing in the seam catches `BaseException`.
 # ===========================================================================
+
+
+def test_memoryerror_is_an_exception_subclass_which_is_why_r2_exists():
+    """The premise, stated mechanically so the rest of this section cannot be misread.
+
+    `except Exception` is NOT a filter that lets memory exhaustion through. Anyone tempted to
+    collapse the two handlers back into one should read this first.
+    """
+    assert issubclass(MemoryError, Exception) is True
+    assert issubclass(KeyboardInterrupt, Exception) is False
+    assert issubclass(SystemExit, Exception) is False
+
+    caught = None
+    try:
+        raise MemoryError("exhausted")
+    except Exception as exc:          # noqa: BLE001 - demonstrating the hazard on purpose
+        caught = type(exc)
+    assert caught is MemoryError, "a bare `except Exception` swallows MemoryError"
 
 
 def test_a_broken_key_builder_falls_back_to_the_uncached_path(track, monkeypatch):
@@ -1002,18 +1030,190 @@ def test_an_incomplete_stored_bundle_degrades_to_a_miss(track):
     assert namespace["_CALLS"]["stage1"] == before + 1
 
 
-def test_the_l2_boundary_catches_exception_not_baseexception():
-    """A `KeyboardInterrupt` or `MemoryError` must still reach the caller."""
+# ===========================================================================
+# R2  MEMORY EXHAUSTION IS NOT AN ORDINARY OPTIMIZATION FAILURE
+#
+# Turning a failed allocation into a cache miss starts the ~15.7 s front end plus Stages 1-3 under
+# memory pressure — doing substantially MORE work at the moment the process has least room for it.
+# So `MemoryError` is re-raised ahead of the ordinary handler at all three seams.
+# ===========================================================================
+
+
+_SEAM_WRAPPERS = ("_stage3_cache_key", "_stage3_cache_get", "_stage3_cache_put")
+
+
+class _MemoryErrorCache:
+    """A cache whose chosen operation exhausts memory; every other operation is ordinary."""
+
+    def __init__(self, failing: str):
+        self.failing = failing
+        self.calls = {"get": 0, "put": 0}
+
+    def get(self, _key):
+        self.calls["get"] += 1
+        if self.failing == "get":
+            raise MemoryError("cannot allocate the bundle copy")
+        return None
+
+    def put(self, _key, _value):
+        self.calls["put"] += 1
+        if self.failing == "put":
+            raise MemoryError("cannot allocate the bundle copy")
+        return None
+
+    def has_entry(self):
+        return False
+
+
+def test_memoryerror_from_the_key_builder_propagates(track, monkeypatch):
+    """No fallback: the render stops rather than beginning the expensive uncached path."""
+    namespace = _build()
+
+    def exhausted(*_args, **_kwargs):
+        raise MemoryError("cannot allocate the key")
+
+    monkeypatch.setattr(fork_stage_cache, "stage3_cache_key", exhausted)
+    with pytest.raises(MemoryError, match="cannot allocate the key"):
+        _run(namespace, track)
+
+    calls = namespace["_CALLS"]
+    assert calls["stage1"] == 0, "Stage 1 must not begin as a fallback"
+    assert calls["load"] == 0 and calls["hpss"] == 0
+    assert calls["stage4"] == 0
+
+
+def test_memoryerror_from_the_lookup_propagates_and_starts_no_analysis(track, monkeypatch):
+    """**The load-bearing regression case.**
+
+    The hit path's deep copy is where an allocation is most likely to fail. R1 answered "miss" there
+    and then ran the whole front end plus Stages 1-3 — the single most expensive thing it could do
+    with no memory. Nothing may be recomputed.
+    """
+    namespace = _build()
+    broken = _MemoryErrorCache("get")
+    monkeypatch.setattr(fork_stage_cache, "STAGE3_CACHE", broken)
+
+    with pytest.raises(MemoryError, match="cannot allocate the bundle copy"):
+        _run(namespace, track)
+
+    calls = namespace["_CALLS"]
+    assert broken.calls["get"] == 1, "the lookup must have been attempted"
+    assert calls["stage1"] == 0, "Stage 1 must NOT execute as a fallback"
+    assert calls["stage2"] == 0, "Stage 2 must NOT execute"
+    assert calls["stage3"] == 0, "Stage 3 must NOT execute"
+    assert calls["load"] == 0 and calls["normalize"] == 0 and calls["hpss"] == 0
+    assert calls["stage4"] == 0
+    assert broken.calls["put"] == 0, "nothing may be published after a failed lookup"
+
+
+def test_memoryerror_from_the_store_propagates(track, monkeypatch):
+    """The one case where the current render is deliberately *not* protected.
+
+    An ordinary store failure costs the next call its reuse and nothing else. A store failing for
+    want of memory says the process is out of memory, and reporting a completed render while
+    continuing into Stage 4 and a full FFmpeg render would claim a success the machine cannot
+    deliver. This test deliberately does **not** assert the current render completes.
+    """
+    namespace = _build()
+    broken = _MemoryErrorCache("put")
+    monkeypatch.setattr(fork_stage_cache, "STAGE3_CACHE", broken)
+
+    with pytest.raises(MemoryError, match="cannot allocate the bundle copy"):
+        _run(namespace, track)
+
+    calls = namespace["_CALLS"]
+    # the miss path ran in full — the store is the last statement of that branch
+    assert calls["load"] == 1 and calls["hpss"] == 1
+    assert calls["stage1"] == 1 and calls["stage2"] == 1 and calls["stage3"] == 1
+    assert broken.calls["put"] == 1
+    assert calls["stage4"] == 0, "the exception must stop the render before Stage 4"
+
+
+def test_a_memoryerror_raised_by_the_real_deepcopy_propagates(track, monkeypatch):
+    """Through the *real* cache object rather than a stand-in, so the seam is what is under test.
+
+    `test_a_broken_deepcopy_falls_back_rather_than_sharing_state` above pins the ordinary half with
+    a `RuntimeError`; this is the same injection point with the exception that must not be absorbed.
+    """
+    namespace = _build()
+    _run(namespace, track)
+    baseline = dict(namespace["_CALLS"].counts)
+
+    def exhausted(_value, memo=None):
+        raise MemoryError("deepcopy out of memory")
+
+    monkeypatch.setattr(fork_stage_cache.copy, "deepcopy", exhausted)
+    with pytest.raises(MemoryError, match="deepcopy out of memory"):
+        _run(namespace, track)
+
+    calls = namespace["_CALLS"]
+    assert calls["stage1"] == baseline["stage1"], "no recomputation under memory pressure"
+    assert calls["stage3"] == baseline["stage3"]
+
+
+def test_memoryerror_does_not_poison_the_entry_and_a_later_call_still_hits(track, monkeypatch):
+    """Recovery: once memory is available again, the artifact stored before the failure is reusable."""
+    namespace = _build()
+    _run(namespace, track)                      # populates the entry
+    assert namespace["_CALLS"]["cache_put"] == 1
+
+    def exhausted(_value, memo=None):
+        raise MemoryError("transient exhaustion")
+
+    monkeypatch.setattr(fork_stage_cache.copy, "deepcopy", exhausted)
+    with pytest.raises(MemoryError):
+        _run(namespace, track)
+    monkeypatch.undo()
+
+    later = _build()
+    _run(later, track)
+    assert later["_CALLS"]["cache_hit"] == 1, "the surviving entry must still be reusable"
+    assert later["_CALLS"]["stage1"] == 0
+
+
+@pytest.mark.parametrize("name", _SEAM_WRAPPERS)
+def test_the_seam_re_raises_memoryerror_before_the_ordinary_handler(name):
+    """Structural, so a later "simplification" back to one broad `except Exception` cannot pass.
+
+    Order matters as much as presence: `except Exception` placed first would shadow the
+    `MemoryError` clause entirely, which is exactly the defect R2 corrects.
+    """
     with open(_AUTO_MODE_PATH, "r", encoding="utf-8") as handle:
         tree = ast.parse(handle.read(), filename=_AUTO_MODE_PATH)
-    for name in ("_stage3_cache_key", "_stage3_cache_get", "_stage3_cache_put"):
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    tries = [n for n in ast.walk(fn) if isinstance(n, ast.Try)]
+    assert tries, f"{name} must still have an exception boundary"
+
+    for node in tries:
+        kinds = [ast.unparse(h.type) if h.type else "<bare>" for h in node.handlers]
+        assert "<bare>" not in kinds, f"{name}: bare except"
+        assert "BaseException" not in kinds, f"{name}: must not catch BaseException"
+        assert "MemoryError" in kinds, f"{name}: no explicit MemoryError clause ({kinds})"
+        assert "Exception" in kinds, f"{name}: ordinary fail-open handler is missing ({kinds})"
+        assert kinds.index("MemoryError") < kinds.index("Exception"), (
+            f"{name}: MemoryError must be handled BEFORE Exception, else it is shadowed: {kinds}")
+
+        memory_handler = node.handlers[kinds.index("MemoryError")]
+        assert [type(stmt) for stmt in memory_handler.body] == [ast.Raise], (
+            f"{name}: the MemoryError clause must re-raise, not absorb: "
+            f"{[ast.unparse(s) for s in memory_handler.body]}")
+        assert memory_handler.body[0].exc is None, (
+            f"{name}: re-raise the original exception, do not construct a new one")
+
+
+def test_no_seam_claims_that_except_exception_lets_memoryerror_through():
+    """R1's docstrings asserted "`Exception` only - a `KeyboardInterrupt` or a `MemoryError` must
+    still reach the caller", which is false for `MemoryError`. The claim must not come back."""
+    with open(_AUTO_MODE_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_AUTO_MODE_PATH)
+    for name in _SEAM_WRAPPERS:
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == name)
-        handlers = [h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler)]
-        assert handlers, f"{name} must fail open"
-        for handler in handlers:
-            assert handler.type is not None, f"{name}: bare except"
-            assert ast.unparse(handler.type) == "Exception", f"{name}: {ast.unparse(handler.type)}"
+        doc = (ast.get_docstring(fn) or "").replace("\n", " ")
+        normalised = " ".join(doc.split()).lower()
+        assert "`exception` only - a `keyboardinterrupt` or a `memoryerror`" not in normalised, (
+            f"{name}: the retired false claim is back")
 
 
 # ===========================================================================

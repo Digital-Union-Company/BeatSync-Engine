@@ -491,14 +491,23 @@ def _stage3_cache_key(audio_file: str, start_time, effective_duration, cfg: Auto
                       use_gpu) -> object | None:
     """[FORK] Digital-Union (L2 V1): the Stage-3 key, or None when caching is unavailable.
 
-    Fails open. This cache is an optimization, never execution authority: if identity cannot be
-    proven (unreadable/unstatable audio) or anything about key construction goes wrong, the answer is
-    `None` and the render takes the existing uncached path. `Exception` only - a `KeyboardInterrupt`
-    or a `MemoryError` must still reach the caller.
+    Fails open on an *ordinary* failure. This cache is an optimization, never execution authority: if
+    identity cannot be proven (unreadable/unstatable audio) or anything about key construction goes
+    wrong, the answer is `None` and the render takes the existing uncached path.
+
+    **`MemoryError` is re-raised, and that is not the same statement as "`Exception` only".**
+    `MemoryError` *is* an `Exception` subclass, so a lone `except Exception` would swallow it (R1's
+    docstring claimed otherwise and was wrong). Converting memory exhaustion into a cache miss would
+    immediately start the substantially more expensive uncached audio path, making the system state
+    worse at precisely the wrong moment. `KeyboardInterrupt` and `SystemExit` propagate for a
+    different reason - they are `BaseException`, not `Exception` - and nothing here catches
+    `BaseException`.
     """
     try:
         return fork_stage_cache.stage3_cache_key(
             audio_file, start_time, effective_duration, cfg, use_gpu)
+    except MemoryError:
+        raise
     except Exception:
         return None
 
@@ -508,6 +517,11 @@ def _stage3_cache_get(key) -> Dict | None:
 
     A malformed or incomplete stored bundle degrades to an ordinary miss rather than entering the
     pipeline as half a result - the five fields are all or nothing.
+
+    **`MemoryError` is re-raised; see `_stage3_cache_key`.** This seam is the load-bearing one: the
+    hit path's deep copy is where an allocation is most likely to fail, and answering "miss" there
+    would start the ~15.7 s front end plus Stages 1-3 under memory pressure. A failed copy is a
+    reason to stop, not a reason to do more work.
     """
     if key is None:
         return None
@@ -516,6 +530,8 @@ def _stage3_cache_get(key) -> Dict | None:
         if bundle is None or not fork_stage_cache.bundle_is_complete(bundle):
             return None
         return bundle
+    except MemoryError:
+        raise
     except Exception:
         return None
 
@@ -523,14 +539,22 @@ def _stage3_cache_get(key) -> Dict | None:
 def _stage3_cache_put(key, bundle: Dict) -> bool:
     """[FORK] Digital-Union (L2 V1): publish the artifact. Called ONLY after Stage 3 succeeded.
 
-    A failed store costs the *next* call its reuse; it must never cost the current render, which has
-    already produced every fact it needs.
+    An *ordinary* failed store costs the **next** call its reuse; it must never cost the current
+    render, which has already produced every fact it needs.
+
+    **`MemoryError` is re-raised; see `_stage3_cache_key`.** That is the one case where the current
+    render is not protected, and deliberately so: the store's deep copy failing for want of memory
+    says the process is out of memory, and reporting a completed render while continuing into Stage 4
+    and a full FFmpeg render would be claiming a success the machine cannot deliver. `False` means
+    "reuse lost", not "allocation failed".
     """
     if key is None:
         return False
     try:
         fork_stage_cache.STAGE3_CACHE.put(key, bundle)
         return True
+    except MemoryError:
+        raise
     except Exception:
         return False
 

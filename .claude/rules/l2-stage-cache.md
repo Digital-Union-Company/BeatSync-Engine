@@ -206,13 +206,51 @@ outside the lock. This does not rely on downstream code being careful, and it mu
 into a shallow copy or a direct return. `stage_cache.py` therefore imports `copy`, which is why
 `tests/test_no_runtime_dependency.py`'s stdlib allow-list includes it.
 
-## Fail open: this is an optimization, never execution authority
+## The exception contract: fail open, except for memory exhaustion (R2)
 
-If key creation, lookup, copying or the store fails unexpectedly, the render takes the existing
-uncached path. It must never fabricate a hit, never return partial data, and never fail an otherwise
-valid render. The three seams (`_stage3_cache_key`, `_stage3_cache_get`, `_stage3_cache_put`) catch
-**`Exception` only** — a `KeyboardInterrupt` or a `MemoryError` still reaches the caller, and a test
-asserts no bare `except` and no `BaseException`.
+The boundary has **two classes** of failure, and the distinction is load-bearing. The three seams
+are `_stage3_cache_key`, `_stage3_cache_get` and `_stage3_cache_put`, each shaped:
+
+```python
+try:
+    ...
+except MemoryError:
+    raise
+except Exception:
+    <fail open>
+```
+
+**Ordinary cache-mechanism `Exception`s fail open.** An `OSError`, a malformed key input, an
+ordinary deep-copy failure — the render takes the existing uncached path. It must never fabricate a
+hit, never return partial data, and never fail an otherwise valid render:
+
+```
+key failure  ->  no cache for this invocation
+get failure  ->  cache miss, recompute
+put failure  ->  the current render continues, reuse is lost
+```
+
+**`MemoryError` is explicitly re-raised, before the ordinary handler.** Converting failed allocation
+into a cache miss would immediately start the substantially more expensive uncached audio-analysis
+path — the ~15.7 s front end plus Stages 1–3 — at precisely the moment the process has least room
+for it, making the system state worse. So memory exhaustion is a reason to stop, not a reason to do
+more work. It is never converted into a cache miss, a recomputation, a successful current render or
+a `False` store result; `False` means "reuse lost", not "allocation failed".
+
+**Order matters as much as presence.** `except Exception` placed first would shadow the `MemoryError`
+clause entirely. A test pins the clause order, that the clause is a bare `raise` (the original
+exception, not a new one), and that the ordinary handler survives alongside it.
+
+**Do not write "`Exception` only, therefore `MemoryError` propagates".** That statement is false in
+Python — `MemoryError` subclasses `Exception`, so a lone `except Exception` swallows it. R1's
+docstrings and this rule both asserted it and were wrong; R2 corrected the code to match the intent
+and the prose to match the code. A permanent test states `issubclass(MemoryError, Exception) is True`
+mechanically so the premise cannot be misread again, and another forbids the retired wording from
+returning to the seam docstrings.
+
+**`KeyboardInterrupt` and `SystemExit` propagate for a different reason** — they are `BaseException`
+subclasses, not `Exception` — so nothing in the seam has to name them. **No `BaseException` catch
+exists**, and no bare `except`; tests assert both.
 
 Existing failures keep their current behaviour: a `librosa.load` error, a Stage 1/2/3 exception and
 the empty-audio `ValueError` are untouched. Once the uncached path starts, its exceptions are exactly
@@ -220,7 +258,11 @@ what they were.
 
 **Nothing is published before Stage 3 succeeds.** The `_stage3_cache_put` call is the last statement
 of the miss branch, so anything raising above it leaves the cache untouched and a later call
-recomputes. A store that itself fails costs the **next** call its reuse — never the current render.
+recomputes. An **ordinary** store failure costs the next call its reuse — never the current render;
+a `MemoryError` from the store is the one case where the current render is deliberately not
+protected, because reporting a completed render while continuing into Stage 4 and a full FFmpeg
+render would claim a success the machine cannot deliver. An entry stored before a later
+`MemoryError` survives and stays reusable once memory is available again, which a test pins.
 
 ## What still runs on every render
 
