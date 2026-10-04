@@ -349,6 +349,22 @@ def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: 
     moves, because ``max_extra`` is a ratio of the main selected grid, which density does change —
     that is a proportional consequence, not a policy change. **This is not the future Micro Cuts
     control**, which would be a separate creative control over these fields themselves.
+
+    [FORK] Digital-Union (Legacy Micro Cuts Safety R1): the accent layer is **self-safe**. Every
+    accepted extra joins ``occupied`` immediately, so each later candidate is measured against the
+    main grid *plus all earlier accepted extras* rather than against the grid alone.
+
+    Historically it was not. ``selected_sorted`` was built once before the loop and accepted extras
+    never rejoined it, so two extras could each clear the floor against the grid while violating it
+    against each other. Measured on the funded 200 BPM fixture: a pair **0.3000 s** apart against a
+    **0.3400 s** floor, at Micro Cuts 75 and 100. The post-micro ``final_wave_cleanup`` did not close
+    it either — it enforces ``peak_energy_min_interval`` (0.30 s, and *divided* by the density
+    factor), which is a Cut Density gap and is unrelated to ``micro_min_gap`` by design.
+
+    The floor itself is unchanged, and so is the budget: a rejected candidate does **not** consume
+    budget, and the scan continues, so a funded render still delivers ``max_extra`` *safe* accents
+    rather than fewer. That is load-bearing — post-filtering the old output instead would silently
+    under-deliver the funded budget.
     """
     if not cfg.enable_rare_micro_cuts or len(beat_times) < 3 or selected.size == 0:
         return selected
@@ -364,7 +380,11 @@ def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: 
         return selected
 
     extras: List[float] = []
-    selected_sorted = np.sort(selected)
+    # The occupied set an extra must clear. It starts as the main grid and grows with every accepted
+    # extra, which is the whole of the R1 correction. Not re-sorted on append: the only thing read
+    # from it is `np.min(np.abs(occupied - t))`, which does not depend on order.
+    occupied = np.sort(selected)
+    micro_floor = max(cfg.micro_min_gap, median_beat * 0.45)
 
     candidates = np.where((features["impact_score"] >= threshold) & (features["wave"] >= 0.88))[0]
     for idx in candidates:
@@ -373,9 +393,10 @@ def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: 
         t = float(beat_times[idx] + 0.5 * (beat_times[idx + 1] - beat_times[idx]))
         if t <= 0.0 or t >= audio_duration:
             continue
-        nearest = np.min(np.abs(selected_sorted - t)) if selected_sorted.size else 999.0
-        if nearest >= max(cfg.micro_min_gap, median_beat * 0.45):
+        nearest = np.min(np.abs(occupied - t)) if occupied.size else 999.0
+        if nearest >= micro_floor:
             extras.append(t)
+            occupied = np.append(occupied, t)
 
     if not extras:
         return selected

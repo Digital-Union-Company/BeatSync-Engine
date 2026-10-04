@@ -20,6 +20,69 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-04 (Legacy Micro Cuts Safety R1)
+
+**The rare half-beat accent layer now keeps its own spacing floor between its own accents.**
+`add_rare_micro_cuts` built its occupied set once, before the candidate loop, and never returned an
+accepted extra to it. Each candidate was therefore judged against the main grid **only**, so two
+accepted extras could each clear the floor against the grid while violating it against each other.
+
+```
+before   occupied = the main grid, fixed for the whole loop
+after    occupied = the main grid + every extra accepted so far
+```
+
+- **Measured, freshly, on merged `main` before the edit.** Funded 200 BPM fixture, 50-cut grid: at
+  Micro Cuts 75 a pair **0.3000 s** apart and at Micro Cuts 100 the same, against a **0.3400 s**
+  floor, with the budget fully funded (2 and 4 accents). After the fix the closest pair is 2.4000 s
+  at both settings.
+- **`final_wave_cleanup` never closed it and was never going to.** It enforces
+  `peak_energy_min_interval` — 0.30 s, and *divided* by the density factor, so 0.15 s at Cut Density
+  100 — which is Cut Density policy. `micro_min_gap` is deliberately density-independent, so the two
+  cannot coincide at any setting. The fix therefore belongs in the accent layer, which already owns
+  the floor, and no density field was touched.
+- **The floor and the budget are unchanged.** Still `max(cfg.micro_min_gap, median_beat * 0.45)`; no
+  new floor, nothing density-derived. `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
+  `MICRO_CUT_RATIO_CAP`, `micro_percentile` and the four density fields are untouched. This is a
+  safety correction, not a retune.
+- **A rejected candidate does not consume budget, and that is load-bearing.** The scan continues, so
+  a funded render still delivers `max_extra` *safe* accents. The rejected alternative — leaving the
+  inserter alone and post-filtering its output with the existing `micro_extra_safety` — satisfies
+  every spacing assertion and silently under-delivers the funded budget: measured **1 of 2** accents
+  at Micro Cuts 75 and **2 of 4** at 100. A permanent test asserts `len(extras) == max_extra` so that
+  shape of regression is loud, and a mutation reproducing it fails that test.
+- **Nothing changed on realistic material.** A permanent 25-combination compatibility matrix
+  (Cut Density × Micro Cuts, both 0/25/50/75/100) on the real 13-section 123 BPM fixture requires
+  `np.array_equal` against a frozen pre-fix reference, and all 25 agree. The collision needs a fast
+  tempo — roughly **176–273 BPM**, since it requires `period < 0.34 s` and the layer returns early
+  below `median_beat 0.22` — which that fixture never reaches. The compatibility rule is explicit: an
+  output may differ **only** where the old behaviour accepted a floor-violating extra.
+- **The oracle does not regenerate expected values from the new code.**
+  `_legacy_add_rare_micro_cuts_reference`, labelled `LEGACY_REFERENCE_FOR_COMPATIBILITY_ONLY`, is a
+  frozen transcription of the pre-R1 body living in the test module; a calibration test asserts it
+  still reproduces the 0.3000 s defect, and a guard asserts production never imports it.
+- **Freestyle V1 is behaviourally untouched**, pinned byte-identical across 30 real heterogeneous
+  combinations (plus 6 that resolve uniformly and are skipped by name). `micro_extra_safety` is now a
+  measured no-op on tested inputs, and is **deliberately retained** in the heterogeneous composition
+  as a preserved guard — the structural tripwire that keeps the two Stage-4 compositions distinct
+  still holds. It was not removed, and the no-op measurement is recorded rather than acted on.
+- **One historical test was converted, not deleted.**
+  `test_the_legacy_micro_pass_really_can_place_two_extras_too_close` asserted the defect *existed* —
+  its own docstring named this milestone as the one that should retire it. It is now
+  `test_the_legacy_micro_pass_keeps_its_own_floor_between_extras`, asserting the positive invariant
+  with the historical 0.3000 s / 0.3400 s measurement preserved in its docstring and a guard that the
+  pre-fix value is no longer reachable.
+
+Freestyle V1's own entry below is **not** rewritten: the defect was real when that milestone shipped
+and was recorded there honestly. This later milestone corrected it; `.claude/rules/freestyle.md` now
+carries both the history and the current invariant.
+
+Scope: `src/auto_mode/stage4_select.py`, `tests/test_micro_cuts.py`,
+`.claude/rules/pipeline-core.md`, `.claude/rules/freestyle.md`, `CHANGELOG-FORK.md`. No Stage 5, no
+Stage 6, no GUI; `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`. Windows runtime acceptance has **not** been run against
+this commit.
+
 ### Added — 2026-10-04 (Freestyle V1)
 
 **One song, edited two ways.** Every creative control the app has ever had is global for the whole

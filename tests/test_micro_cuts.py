@@ -642,31 +642,43 @@ def test_the_collision_fixture_is_actually_funded(stage4, shared, collision):
     assert len(extras) >= 2, f"only {len(extras)} extras were produced"
 
 
-def test_the_legacy_micro_pass_really_can_place_two_extras_too_close(stage4, shared, collision):
-    """**A pre-existing defect on `main`, recorded and deliberately NOT fixed.**
+def test_the_legacy_micro_pass_keeps_its_own_floor_between_extras(stage4, shared, collision):
+    """**The converted historical defect test. `add_rare_micro_cuts` is now self-safe.**
 
-    `add_rare_micro_cuts` computes `selected_sorted` once, before its loop, and never adds an
-    accepted extra into it. Each candidate is therefore judged against the main grid only, so two
-    accepted extras can finish closer to each other than the layer's own declared floor.
+    HISTORY — this is the measurement the fix was built against, kept because the defect was real
+    and shipped. Before Legacy Micro Cuts Safety R1, `add_rare_micro_cuts` built `selected_sorted`
+    once before its loop and never returned an accepted extra to it, so each candidate was judged
+    against the main grid **only**. Two accepted extras could therefore each clear the floor against
+    the grid while violating it against each other. Measured on this exact fixture:
 
-    On the legacy uniform path `final_wave_cleanup` runs afterwards — but it enforces only
-    `peak_energy_min_interval`, not `micro_min_gap`, so it does not close this either. Fixing it
-    would change the output of every existing uniform render, which is out of scope here; the
-    Freestyle path does not inherit it, and that is what `micro_extra_safety` is for.
+        before fix:  closest accepted extra pair 0.3000 s  against a 0.3400 s floor
+                     (reproduced at Micro Cuts 75 and 100, budget fully funded)
 
-    This test asserts the defect EXISTS so the fix below cannot be mistaken for a no-op. If
-    `add_rare_micro_cuts` is ever made self-safe on purpose, this test is the one that should fail
-    and be deleted with that decision recorded.
+    `final_wave_cleanup` did not close it either, and could not: it enforces
+    `peak_energy_min_interval` (0.30 s, and *divided* by the density factor), which is a Cut Density
+    gap. `micro_min_gap` is deliberately density-independent, so the two can never coincide.
+
+    This test now asserts the **positive** invariant. It deliberately re-checks funded-ness first:
+    without that, an empty or single-element extras list would satisfy the spacing assertion
+    vacuously, which is exactly how the original version of this fixture failed.
     """
     beat_times = collision[0]
     main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
     extras = _extras_of(main_grid, with_micro)
     floor = _micro_floor(shared, beat_times, cfg)
 
+    budget = int(max(0, round(main_grid.size * cfg.max_micro_cut_ratio)))
+    assert budget >= 2, f"max_extra = {budget}: the fixture no longer funds a collision"
+    assert len(extras) >= 2, (
+        f"only {len(extras)} extras produced; the spacing assertion below would be vacuous")
+
     closest = min((b - a for a, b in zip(extras, extras[1:])), default=float("inf"))
-    assert closest < floor, (
-        f"the legacy hole did not reproduce: closest extra pair {closest:.4f}s "
-        f"vs floor {floor:.4f}s. The fixture may have stopped being funded.")
+    assert closest >= floor - 1e-9, (
+        f"two accepted extras are {closest:.4f}s apart, under the {floor:.4f}s micro floor — the "
+        f"R1 occupied-set correction has regressed")
+    # ...and the pre-fix value must no longer be reachable on this fixture.
+    assert closest > 0.3000 + 1e-9, (
+        f"closest pair {closest:.4f}s reproduces the pre-fix 0.3000s measurement")
 
 
 # --- micro_extra_safety closes it on the Freestyle path ----------------------------------
@@ -873,3 +885,370 @@ def test_practical_diagnostic_micro_extra_collision(stage4, shared, collision):
           f"\n  micro_extra_safety  : {len(after):2d} extras, closest pair {worst_after:.4f}s")
 
     assert worst_after >= floor - 1e-9
+
+
+# ===========================================================================
+# 8. LEGACY MICRO CUTS SAFETY R1 — THE SELF-SAFE ACCENT LAYER
+# ===========================================================================
+#
+# R1 made `add_rare_micro_cuts` self-safe: an accepted extra joins the occupied set immediately, so
+# every later candidate is measured against the main grid PLUS all earlier accepted extras.
+#
+# Two things these tests exist to stop regressing, and they pull in opposite directions:
+#
+#   * the SAFETY half — no accepted extra may sit closer than the floor to the grid or to another
+#     accepted extra (that is the defect itself); and
+#   * the BUDGET half — a rejected candidate must not consume budget, and the scan must continue, so
+#     a funded render still delivers `max_extra` *safe* accents. Architecture B (post-filtering the
+#     old output with `micro_extra_safety`) satisfies the first and silently fails the second:
+#     measured 1 of 2 accents at Micro Cuts 75 and 2 of 4 at 100. `test_the_funded_budget_is_fully
+#     _spent_on_safe_extras` is what makes a B-shaped regression loud.
+#
+# The floor is unchanged: `max(cfg.micro_min_gap, median_beat * 0.45)`. No new floor, nothing
+# density-derived, and `micro_min_gap` / `max_micro_cut_ratio` / `micro_percentile` are untouched.
+
+
+def _accepted_extras(stage4, shared, collision, micro_value):
+    beat_times, features, _sections, main_grid = collision
+    cfg = _cfg_for(shared, micro_value)
+    produced = stage4.add_rare_micro_cuts(
+        main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    return main_grid, cfg, _extras_of(main_grid, produced), produced
+
+
+@pytest.mark.parametrize("micro", (75, 100))
+def test_the_funded_fixture_still_funds_a_real_collision_opportunity(stage4, shared, collision,
+                                                                     micro):
+    """(A) Non-vacuity gate for everything below: the budget must permit >= 2 extras and the layer
+    must actually produce them. An empty or single-element list must never be able to pass."""
+    main_grid, cfg, extras, _ = _accepted_extras(stage4, shared, collision, micro)
+    budget = int(max(0, round(main_grid.size * cfg.max_micro_cut_ratio)))
+    assert budget >= 2, f"micro={micro}: max_extra={budget} funds no collision"
+    assert len(extras) >= 2, f"micro={micro}: only {len(extras)} extras produced"
+
+
+@pytest.mark.parametrize("micro", (25, 50, 75, 100))
+def test_every_accepted_extra_clears_the_floor_against_the_main_grid(stage4, shared, collision,
+                                                                     micro):
+    """(B) extra-to-main safety. This half held before R1 too; it is pinned so the correction cannot
+    be "achieved" by weakening it."""
+    beat_times = collision[0]
+    main_grid, cfg, extras, _ = _accepted_extras(stage4, shared, collision, micro)
+    floor = _micro_floor(shared, beat_times, cfg)
+    assert extras, f"micro={micro}: no extras, assertion would be vacuous"
+    for t in extras:
+        gap = float(np.min(np.abs(main_grid - t)))
+        assert gap >= floor - 1e-9, f"micro={micro}: extra {t:.4f} is {gap:.4f}s from the grid"
+
+
+@pytest.mark.parametrize("micro", (75, 100))
+def test_every_accepted_extra_clears_the_floor_against_earlier_extras(stage4, shared, collision,
+                                                                      micro):
+    """(C) extra-to-extra safety — **the defect R1 fixed**.
+
+    Asserted pairwise against every *earlier* accepted extra rather than only against the nearest
+    neighbour in sorted order, because that is the actual invariant the occupied set provides.
+    """
+    beat_times = collision[0]
+    main_grid, cfg, extras, _ = _accepted_extras(stage4, shared, collision, micro)
+    floor = _micro_floor(shared, beat_times, cfg)
+    assert len(extras) >= 2, f"micro={micro}: fewer than two extras, nothing to compare"
+    for position, t in enumerate(extras):
+        for earlier in extras[:position]:
+            gap = abs(t - earlier)
+            assert gap >= floor - 1e-9, (
+                f"micro={micro}: extras {earlier:.4f} and {t:.4f} are {gap:.4f}s apart, "
+                f"under the {floor:.4f}s floor")
+
+
+@pytest.mark.parametrize("micro", (75, 100))
+def test_the_funded_budget_is_fully_spent_on_safe_extras(stage4, shared, collision, micro):
+    """(D) **The anti-Architecture-B test.** A rejected collider must not consume budget and the scan
+    must continue, so a funded render delivers exactly `max_extra` accents — all of them safe.
+
+    Post-filtering the old output would pass every safety test above and fail this one: measured
+    1 of 2 at micro 75 and 2 of 4 at micro 100.
+    """
+    beat_times = collision[0]
+    main_grid, cfg, extras, _ = _accepted_extras(stage4, shared, collision, micro)
+    budget = int(max(0, round(main_grid.size * cfg.max_micro_cut_ratio)))
+    floor = _micro_floor(shared, beat_times, cfg)
+    assert len(extras) == budget, (
+        f"micro={micro}: {len(extras)} accents delivered against a funded budget of {budget} — "
+        f"a rejected candidate consumed budget, or the scan stopped early")
+    closest = min((b - a for a, b in zip(extras, extras[1:])), default=float("inf"))
+    assert closest >= floor - 1e-9, "the budget was spent on unsafe extras"
+
+
+@pytest.mark.parametrize("micro", _SWEEP)
+def test_the_main_grid_is_preserved_exactly(stage4, shared, collision, micro):
+    """(E) The layer may append and may reject. It may never remove a main-grid cut or insert a
+    main-grid anchor. Exact float identity: both sides are the same objects from the same
+    arithmetic, so a tolerance would only add a way to miss a real change."""
+    main_grid, cfg, _extras, produced = _accepted_extras(stage4, shared, collision, micro)
+    grid_values = set(np.asarray(main_grid, dtype=float).tolist())
+    produced_values = set(np.asarray(produced, dtype=float).tolist())
+    assert grid_values <= produced_values, "a main-grid cut went missing"
+    assert produced.size >= main_grid.size
+
+
+@pytest.mark.parametrize("micro", _SWEEP)
+def test_the_caller_arrays_are_never_mutated(stage4, shared, collision, micro):
+    """(F) Input purity. `occupied` grows by `np.append`, which copies; nothing may write through to
+    the caller's grid or beat array."""
+    beat_times, features, _sections, main_grid = collision
+    cfg = _cfg_for(shared, micro)
+    grid_before = main_grid.copy()
+    beats_before = beat_times.copy()
+    impact_before = features["impact_score"].copy()
+    stage4.add_rare_micro_cuts(main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    assert np.array_equal(main_grid, grid_before), "the selected grid was mutated"
+    assert np.array_equal(beat_times, beats_before), "beat_times was mutated"
+    assert np.array_equal(features["impact_score"], impact_before), "features were mutated"
+
+
+def test_micro_zero_still_returns_the_caller_grid_object(stage4, shared, collision):
+    """(G) The disabled-layer early return is untouched — and it must still hand back the caller's
+    own object, not an equal rebuild, because that identity is what other suites assert."""
+    beat_times, features, _sections, main_grid = collision
+    cfg = _cfg_for(shared, 0)
+    assert not cfg.enable_rare_micro_cuts, "micro 0 must disable the layer"
+    out = stage4.add_rare_micro_cuts(main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    assert out is main_grid, "micro 0 no longer returns the caller's grid object"
+
+
+@pytest.mark.parametrize("micro", _SWEEP)
+def test_the_budget_bound_is_never_exceeded(stage4, shared, collision, micro):
+    """(H) The correction may only ever *reject*, so it cannot raise the accent count above the
+    funded budget."""
+    main_grid, cfg, extras, _ = _accepted_extras(stage4, shared, collision, micro)
+    budget = int(max(0, round(main_grid.size * cfg.max_micro_cut_ratio)))
+    assert len(extras) <= budget, f"micro={micro}: {len(extras)} extras exceed budget {budget}"
+
+
+def test_the_accent_layer_is_deterministic(stage4, shared, collision):
+    """No RNG, no clock: two identical calls must agree exactly."""
+    for micro in (75, 100):
+        _g, _c, _e, first = _accepted_extras(stage4, shared, collision, micro)
+        _g, _c, _e, second = _accepted_extras(stage4, shared, collision, micro)
+        assert np.array_equal(first, second), f"micro={micro} is not deterministic"
+
+
+# --- the compatibility oracle -------------------------------------------------------------
+#
+# The rule R1 is allowed to live by: an output may differ from pre-fix behaviour ONLY where the
+# pre-fix run accepted an extra that violated the floor against the grid or against an earlier
+# accepted extra. Everywhere else the arrays must be `np.array_equal`.
+#
+# The oracle has to be independent of the changed loop, so expected values are NOT regenerated from
+# production. `_legacy_add_rare_micro_cuts_reference` below is a frozen transcription of the
+# pre-R1 body — the single difference being that it measures against the ORIGINAL grid only.
+
+
+def _legacy_add_rare_micro_cuts_reference(selected, beat_times, features, audio_duration, cfg):
+    """LEGACY_REFERENCE_FOR_COMPATIBILITY_ONLY.
+
+    A frozen copy of `add_rare_micro_cuts` **as it behaved before R1**: `selected_sorted` is built
+    once and accepted extras never rejoin it. It exists so the compatibility matrix below has a
+    reference that cannot drift with the production loop.
+
+    Never imported by production, and `test_the_legacy_reference_is_test_only` pins that.
+    """
+    if not cfg.enable_rare_micro_cuts or len(beat_times) < 3 or selected.size == 0:
+        return selected
+    beat_diffs = np.diff(beat_times)
+    median_beat = float(np.median(beat_diffs)) if beat_diffs.size else 0.5
+    if median_beat < 0.22:
+        return selected
+    threshold = _safe_percentile_ref(features["impact_score"], cfg.micro_percentile, 0.97)
+    max_extra = int(max(0, round(len(selected) * cfg.max_micro_cut_ratio)))
+    if max_extra <= 0:
+        return selected
+    extras = []
+    selected_sorted = np.sort(selected)
+    candidates = np.where((features["impact_score"] >= threshold) & (features["wave"] >= 0.88))[0]
+    for idx in candidates:
+        if len(extras) >= max_extra or idx >= len(beat_times) - 1:
+            break
+        t = float(beat_times[idx] + 0.5 * (beat_times[idx + 1] - beat_times[idx]))
+        if t <= 0.0 or t >= audio_duration:
+            continue
+        nearest = np.min(np.abs(selected_sorted - t)) if selected_sorted.size else 999.0
+        if nearest >= max(cfg.micro_min_gap, median_beat * 0.45):
+            extras.append(t)
+    if not extras:
+        return selected
+    return np.concatenate([selected, np.asarray(extras, dtype=float)])
+
+
+def _safe_percentile_ref(values, percentile, default):
+    """The reference's own percentile, taken from the shared helper so the frozen copy cannot drift
+    on an unrelated axis. Resolved lazily to keep the reference a plain module-level function."""
+    _module, shared = _load_stage4()
+    return shared._safe_percentile(values, percentile, default)
+
+
+def _legacy_violates_floor(grid, produced, beat_times, cfg):
+    """Did the PRE-FIX run accept an extra that broke the floor? This is the only licence to differ."""
+    diffs = np.diff(np.asarray(beat_times, dtype=float))
+    median_beat = float(np.median(diffs)) if diffs.size else 0.5
+    floor = max(cfg.micro_min_gap, median_beat * 0.45)
+    extras = _extras_of(grid, produced)
+    for position, t in enumerate(extras):
+        if float(np.min(np.abs(np.asarray(grid, dtype=float) - t))) < floor - 1e-12:
+            return True
+        for earlier in extras[:position]:
+            if abs(t - earlier) < floor - 1e-12:
+                return True
+    return False
+
+
+_COMPAT_DENSITIES = (0, 25, 50, 75, 100)
+_COMPAT_MICRO = (0, 25, 50, 75, 100)
+
+
+@pytest.mark.parametrize("density", _COMPAT_DENSITIES)
+@pytest.mark.parametrize("micro", _COMPAT_MICRO)
+def test_r1_changes_nothing_except_where_the_old_behaviour_violated_the_floor(stage4, shared,
+                                                                             density, micro):
+    """The compatibility rule, on the realistic 13-section fixture: 25 density x micro combinations
+    through the FULL legacy Stage-4 path.
+
+    For every combination the pre-R1 reference and today's production must agree **exactly**, unless
+    the reference itself accepted a floor-violating extra — in which case production must be the one
+    that is safe. Measured on this fixture: zero combinations differ, because the violation needs a
+    fast tempo (the collision window is roughly 176-273 BPM) that this 123 BPM fixture never reaches.
+    """
+    beat_times, features, sections = _fixture()
+    profile = fork_creative.CreativeProfile(cut_density=density, micro_cuts=micro)
+    cfg, factor = (shared.CONFIG, None)
+    if not profile.is_neutral_cuts():
+        factor = profile.cut_density_factor()
+        cfg = shared.density_scaled_config(shared.CONFIG, factor)
+    if not profile.is_neutral_micro_cuts():
+        cfg = shared.micro_cut_scaled_config(cfg, profile)
+
+    grid = stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=_TEMPO,
+        audio_duration=_DURATION, cfg=cfg, density_factor=factor)[0]
+
+    # the main grid alone, so extras can be identified on both sides
+    bare = stage4.final_wave_cleanup(
+        stage4.add_rare_micro_cuts(grid, beat_times, features, _DURATION, cfg),
+        beat_times, features, _DURATION, cfg)
+    legacy_micro = _legacy_add_rare_micro_cuts_reference(
+        grid, beat_times, features, _DURATION, cfg)
+    legacy = stage4.final_wave_cleanup(
+        legacy_micro, beat_times, features, _DURATION, cfg)
+
+    if _legacy_violates_floor(grid, legacy_micro, beat_times, cfg):
+        current = stage4.add_rare_micro_cuts(grid, beat_times, features, _DURATION, cfg)
+        assert not _legacy_violates_floor(grid, current, beat_times, cfg), (
+            f"d={density} m={micro}: the old behaviour violated the floor and the new one still does")
+    else:
+        assert np.array_equal(bare, legacy), (
+            f"d={density} m={micro}: output changed with no floor violation to justify it "
+            f"({bare.size} vs {legacy.size} cuts)")
+
+
+def test_the_compatibility_oracle_is_not_vacuous(stage4, shared, collision):
+    """Calibration: the frozen reference must actually reproduce the pre-fix defect, or the matrix
+    above is comparing production against itself."""
+    beat_times, features, _sections, main_grid = collision
+    cfg = _cfg_for(shared, 100)
+    legacy = _legacy_add_rare_micro_cuts_reference(
+        main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    current = stage4.add_rare_micro_cuts(
+        main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    floor = _micro_floor(shared, beat_times, cfg)
+
+    legacy_extras = _extras_of(main_grid, legacy)
+    legacy_closest = min((b - a for a, b in zip(legacy_extras, legacy_extras[1:])),
+                         default=float("inf"))
+    assert legacy_closest < floor, (
+        f"the frozen reference no longer reproduces the defect ({legacy_closest:.4f}s vs "
+        f"{floor:.4f}s floor) — the compatibility matrix would be self-confirming")
+    assert abs(legacy_closest - 0.3000) < 1e-9, (
+        f"the reference reproduces {legacy_closest:.4f}s, not the recorded pre-fix 0.3000s")
+    assert not np.array_equal(np.sort(legacy), np.sort(current)), (
+        "reference and production agree on the funded fixture; the reference is not frozen pre-fix")
+
+
+def test_the_legacy_reference_is_test_only():
+    """The frozen reference must never be imported by production."""
+    import ast
+    for name in ("stage4_select.py", "__init__.py"):
+        path = os.path.join(_REPO_ROOT, "src", "auto_mode", name)
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        assert "_legacy_add_rare_micro_cuts_reference" not in source, path
+        assert "LEGACY_REFERENCE_FOR_COMPATIBILITY_ONLY" not in source, path
+        tree = ast.parse(source, filename=path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                assert "test_" not in ast.unparse(node), ast.unparse(node)
+
+
+# --- the Freestyle heterogeneous path is unchanged ----------------------------------------
+
+
+def _freestyle_hetero(stage4, shared, density, micro, rules):
+    """The real heterogeneous composition, as `_select_wave_cuts_per_section` runs it."""
+    from beatsync_fork import freestyle as fork_freestyle
+    beat_times, features, sections = _fixture()
+    # `build` is in the fixture but is not a `classify_section` outcome and cannot carry a rule;
+    # `body` is the fallthrough-equivalent real type (see test_cut_density's uniform matrix).
+    sections = [dict(s, type=("body" if s["type"] == "build" else s["type"])) for s in sections]
+    profile = fork_creative.CreativeProfile(cut_density=density, micro_cuts=micro)
+    declaration = fork_freestyle.FreestyleDeclaration(enabled=True, overrides=tuple(
+        (t, fork_freestyle.SectionOverride(cut_density=d)) for t, d in sorted(
+            rules.items(), key=lambda kv: fork_freestyle.SECTION_TYPES.index(kv[0]))))
+    uniform, settings = shared._freestyle_stage4_plan(
+        declaration, profile, shared.CONFIG, sections)
+    if settings is None:
+        return None, None, None, None
+    resolved = int(profile.cut_density) if uniform is None else int(uniform)
+    cfg, factor = shared._density_stage4_config(shared.CONFIG, profile, resolved)
+    cuts, _info = stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=_TEMPO,
+        audio_duration=_DURATION, cfg=cfg, density_factor=factor, section_settings=settings)
+    return cuts, cfg, beat_times, features
+
+
+_FREESTYLE_RULES = ({"drop": 100}, {"chorus": 0}, {"intro": 0, "drop": 100},
+                    {"intro": 100, "verse": 0, "chorus": 100, "drop": 0, "outro": 100})
+
+
+@pytest.mark.parametrize("rules", _FREESTYLE_RULES)
+@pytest.mark.parametrize("density", (0, 50, 100))
+@pytest.mark.parametrize("micro", (0, 50, 100))
+def test_the_freestyle_heterogeneous_path_is_unchanged_by_r1(stage4, shared, density, micro, rules):
+    """R1 edits a function the Freestyle path also calls, so its output is pinned against the frozen
+    pre-R1 reference. Measured: zero heterogeneous combinations change on realistic material."""
+    current, cfg, beat_times, features = _freestyle_hetero(stage4, shared, density, micro, rules)
+    if current is None:
+        pytest.skip("this base/rule pair resolves uniformly, not to the heterogeneous path")
+
+    real = stage4.add_rare_micro_cuts
+    stage4.add_rare_micro_cuts = _legacy_add_rare_micro_cuts_reference
+    try:
+        legacy, _c, _b, _f = _freestyle_hetero(stage4, shared, density, micro, rules)
+    finally:
+        stage4.add_rare_micro_cuts = real
+    assert np.array_equal(current, legacy), (
+        f"d={density} m={micro} rules={rules}: Freestyle heterogeneous output changed "
+        f"({current.size} vs {legacy.size} cuts)")
+
+
+@pytest.mark.parametrize("micro", (25, 50, 75, 100))
+def test_micro_extra_safety_is_now_a_no_op_on_the_funded_path(stage4, shared, collision, micro):
+    """R1 makes the heterogeneous path's final safety pass redundant on tested inputs, and that
+    redundancy is **deliberately retained** — `micro_extra_safety` stays in the composition as a
+    preserved guard. This records the equivalence rather than acting on it; do not use it to justify
+    removing the helper.
+    """
+    beat_times = collision[0]
+    main_grid, cfg, _extras, produced = _accepted_extras(stage4, shared, collision, micro)
+    after = stage4.micro_extra_safety(main_grid, produced, beat_times, cfg)
+    assert np.array_equal(np.sort(produced), np.sort(after)), (
+        f"micro={micro}: micro_extra_safety still removed something after R1")

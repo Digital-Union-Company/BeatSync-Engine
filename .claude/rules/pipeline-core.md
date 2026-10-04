@@ -199,6 +199,35 @@ Micro Cuts stays **one global control** on both paths: its policy comes from the
 config, and no section rule may rewrite `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
 `micro_min_gap` or `micro_percentile`. Full contract: `.claude/rules/freestyle.md`.
 
+### The accent layer is self-safe (Legacy Micro Cuts Safety R1)
+
+`add_rare_micro_cuts` enforces its own floor, `max(cfg.micro_min_gap, median_beat * 0.45)`, against
+the main grid **and against every extra it has already accepted**:
+
+```
+occupied = the main grid
+for each candidate extra:
+    measure against occupied
+    if it clears the floor:  accept it AND add it to occupied
+```
+
+**Old behaviour, for the record:** `selected_sorted` was built once before the loop and accepted
+extras never rejoined it, so each candidate was judged against the grid alone. Two accepted extras
+could therefore each clear the floor against the grid while violating it against each other —
+measured on a funded 50-cut grid at 200 BPM: a pair **0.3000 s** apart against a **0.3400 s** floor.
+
+`final_wave_cleanup` never closed that and must not be expected to. It enforces
+`peak_energy_min_interval` — 0.30 s, **divided by the density factor** — which is Cut Density policy;
+`micro_min_gap` is deliberately density-independent, so the two cannot coincide at any setting. Do
+not fold the micro floor into the density pass: that mixes the two policies, which is the thing this
+split exists to prevent.
+
+Two properties of the correction are load-bearing. A rejected candidate **does not consume budget**
+and the scan continues, so a funded render still delivers `max_extra` *safe* accents rather than
+fewer — post-filtering the old output instead would silently under-deliver (measured 1 of 2 and 2 of
+4). And the layer may only ever **append or reject**: it never removes a main-grid cut, never inserts
+a main-grid anchor, and never mutates the caller's arrays.
+
 ## The frame-lock invariant
 
 The whole sync story rests on `video_processor.build_frame_aligned_cut_timeline()`: **absolute** cut
