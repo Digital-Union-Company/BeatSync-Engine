@@ -27,6 +27,8 @@ from typing import Any
 
 import pytest
 
+from beatsync_fork import freestyle as fork_freestyle
+
 from beatsync_fork import creative as fork_creative
 from beatsync_fork import creative_recipe as fork_recipe
 from beatsync_fork import presets as fork_presets
@@ -712,8 +714,12 @@ def test_the_gui_carries_only_the_accepted_c3_machinery():
     # where it was always load-bearing**: `variant_lab.py` and `creative_recipe.py`, pinned by
     # `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` above and again, in
     # both directions at once, by `test_the_director_lives_only_in_the_gui` below.
+    # **Split again by Freestyle V1.** `freestyle` was banned here as speculative; V1 implements it
+    # in `gui.py`. The ban keeps full strength in the lab's own core — asserted by
+    # `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` above and again, in
+    # both directions at once, by `test_freestyle_lives_outside_the_variant_lab_core` below.
     for word in ("variant_gallery", "stage_cache", "shortlist",
-                 "freestyle", "thumbnail", "variant_preview"):
+                 "thumbnail", "variant_preview"):
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
 
 
@@ -2630,3 +2636,194 @@ def test_only_the_shared_helper_owns_the_draw():
                      "fork_lab", "fork_batch", "variant_batch_state"):
         assert lab_only not in director, (
             f"the Director reuses {lab_only}: it is a sibling producer, not a lab handler")
+
+
+# ======================================================================================
+# FREESTYLE V1 — THE BOUNDARY AGAINST THE VARIANT LAB
+# ======================================================================================
+#
+# Freestyle and the Variant Lab both sit above the six sliders, so the thing worth proving is that
+# they do not know about each other:
+#
+#     VARIANT LAB  ->  resolves seven GLOBAL values from a master seed, ranges and a spread
+#     FREESTYLE    ->  declares per-SECTION rules that modulate five of them at render time
+#
+# A Freestyle rule is not a recipe, a recipe is not a rule, and neither is an input to the other.
+
+
+_FREESTYLE = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "freestyle.py")
+
+
+def test_freestyle_lives_outside_the_variant_lab_core():
+    """Both directions at once, which is what makes this the load-bearing half.
+
+    `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` above already bans
+    `freestyle` from `variant_lab.py` and `creative_recipe.py`. This is the mirror: `freestyle.py`
+    must know nothing about the lab either, so the dependency is not merely one-way but absent.
+    """
+    source = _executable_source(_FREESTYLE).lower()
+    for word in ("variant", "variant_lab", "creative_recipe", "master_seed", "spread",
+                 "controlrange", "rng_for", "resolve_audio", "audiorecipe", "hashlib",
+                 "director", "variant_batch", "render_batch"):
+        assert not re.search(rf"\b{re.escape(word)}\b", source), (
+            f"freestyle.py mentions {word!r}")
+
+    tree = _tree(_FREESTYLE)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            rendered = ast.unparse(node)
+            for forbidden in ("variant_lab", "variant_batch", "creative_recipe", "render_batch",
+                              "director"):
+                assert forbidden not in rendered, rendered
+
+
+def test_the_lab_resolvers_do_not_import_freestyle():
+    """The other half of the same statement, read off the import lists rather than the words."""
+    for path in (_LAB, _RECIPE):
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                assert "freestyle" not in ast.unparse(node), (path, ast.unparse(node))
+
+
+def test_no_freestyle_value_is_an_rng_stream_name():
+    """A Freestyle rule must never become a draw.
+
+    `AUDIO_CONTROL_FIELDS` and the six creative fields are frozen RNG stream names, because
+    renaming one silently re-keys that control for every master seed a user wrote down. Freestyle
+    adds no stream: it is a *declaration* the user made, not something the lab resolves. So no
+    Freestyle name may appear in the lab's domain registry or its field tuples.
+    """
+    source = _executable_source(_LAB)
+    for name in ("freestyle", "section", "DOMAIN_FREESTYLE", "DOMAIN_SECTION"):
+        assert name not in source, f"variant_lab.py mentions {name!r}"
+    assert "DOMAIN_SECTIONS" not in source
+
+
+def test_the_lab_still_declares_exactly_four_domains():
+    """Pinned as an exact set: Freestyle must not have added a fifth, the way an R0 draft of C3
+    nearly added a `"display"` domain to decorate a status line."""
+    domains = {ast.unparse(node.value).strip("'\"")
+               for node in _tree(_LAB).body
+               if isinstance(node, ast.Assign)
+               for target in node.targets
+               if isinstance(target, ast.Name) and target.id.startswith("DOMAIN_")}
+    assert domains == {"clips", "controls", "audio", "batch"}, domains
+
+
+def test_a_creative_recipe_still_carries_no_section_concept():
+    """`CreativeRecipe` is seven global integers. A per-section field on it would make a recipe
+    undeliverable to the sliders it exists to write."""
+    source = _executable_source(_RECIPE).lower()
+    for word in ("section", "freestyle", "override", "per_section", "rule"):
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"creative_recipe.py: {word!r}"
+
+
+# --- the C3 freeze: one declaration per batch ---------------------------------------------
+
+
+def _output_widgets(tree, widget):
+    """The widget names one registration writes, with list indirection resolved."""
+    registrations = _registration(tree, widget)
+    assert len(registrations) == 1, f"{widget} has {len(registrations)} registrations"
+    outputs = _kwargs(registrations[0])["outputs"]
+    if isinstance(outputs, ast.Name) and _list_valued_assign(tree, outputs.id) is not None:
+        return _expanded_list(tree, outputs.id)
+    return _ordered_names(outputs)
+
+
+def test_the_batch_freezes_one_freestyle_declaration_before_the_candidate_loop():
+    """C3-R0's rule is that *shared* render intent is frozen from the submitted event arguments
+    once, before any candidate runs — so an edit made while the batch renders cannot reach it.
+    Freestyle is shared render intent, so it is frozen the same way.
+
+    Structural, by line position: the value must be built **before** the loop over candidates.
+    Comparing nesting levels would miss it, because the loop sits inside the lock-holding `try`.
+    """
+    fn = _func(_tree(_GUI), "render_selected_variants_guarded")
+
+    assigns = [node.lineno for node in ast.walk(fn)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(t, ast.Name) and "freestyle" in t.id for t in node.targets)]
+    assert assigns, "the batch never builds a frozen Freestyle value"
+
+    loops = [node.lineno for node in ast.walk(fn) if isinstance(node, (ast.For, ast.While))]
+    assert loops, "the batch has no candidate loop; this test is measuring nothing"
+    assert min(assigns) < min(loops), (
+        "the Freestyle declaration is built inside the candidate loop; it must be frozen before "
+        "it, like every other shared render input")
+
+    # ...and it is built exactly once, so two candidates cannot be given two declarations.
+    assert len(assigns) == 1, f"{len(assigns)} Freestyle assignments in the batch wrapper"
+
+
+def test_both_render_wrappers_take_the_same_freestyle_widgets():
+    """Single render and batch must agree on the surface, or the two paths could interpret one
+    screen differently. Pinned as exact appended parameter lists."""
+    tree = _tree(_GUI)
+    single = [a.arg for a in _func(tree, "process_video_guarded").args.args]
+    batch = [a.arg for a in _func(tree, "render_selected_variants_guarded").args.args]
+
+    single_fs = [name for name in single if name.startswith("freestyle")]
+    batch_fs = [name for name in batch if name.startswith("freestyle")]
+    assert single_fs == batch_fs, (single_fs, batch_fs)
+    assert single_fs[0] == "freestyle_enabled"
+    assert len(single_fs) == 1 + len(fork_freestyle.SECTION_TYPES), single_fs
+    assert single_fs[1:] == [f"freestyle_{name}" for name in fork_freestyle.SECTION_TYPES]
+
+
+def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():
+    """Gradio matches positionally. Appending keeps every pre-existing parameter at its own index,
+    which is why the pre-Freestyle seam alignments still hold."""
+    tree = _tree(_GUI)
+    for handler in ("process_video_guarded", "render_selected_variants_guarded"):
+        names = [a.arg for a in _func(tree, handler).args.args]
+        first = next(i for i, n in enumerate(names) if n.startswith("freestyle"))
+        assert all(n.startswith("freestyle") for n in names[first:]), (handler, names[first:])
+
+
+def test_generating_variants_still_writes_no_freestyle_widget():
+    """Generating candidates writes no execution widget, and a Freestyle dropdown is one. The
+    absence is what makes candidate chaining structurally impossible."""
+    tree = _tree(_GUI)
+    outputs = _output_widgets(tree, "generate_variants_btn")
+    assert not [name for name in outputs if "freestyle" in name], outputs
+
+
+def test_applying_a_variant_still_writes_no_freestyle_widget():
+    """A candidate describes the seven GLOBAL values. It has no opinion about section rules, so
+    Apply must not silently reset or rewrite them."""
+    tree = _tree(_GUI)
+    outputs = _output_widgets(tree, "apply_variant_btn")
+    assert not [name for name in outputs if "freestyle" in name], outputs
+
+
+def test_applying_a_director_proposal_still_writes_no_freestyle_widget():
+    """Same argument for the Director: a proposal is seven global integers, not a section rule."""
+    tree = _tree(_GUI)
+    outputs = _output_widgets(tree, "apply_director_btn")
+    assert not [name for name in outputs if "freestyle" in name], outputs
+
+
+def test_no_freestyle_widget_registers_a_handler_that_writes_an_execution_widget():
+    """Freestyle's own eleven `.change()` registrations exist only to refresh the read-only
+    summary. None may write a slider, the Variation Seed, the preset label or any lab widget."""
+    tree = _tree(_GUI)
+    execution = {"variation_seed", "creative_preset", "cut_density", "micro_cuts",
+                 "semantic_emphasis", "energy_response", "motion_bias", "source_diversity",
+                 "variant_master_seed", "music_under_voice", "sfx_amount", "sfx_level"}
+    found = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if not isinstance(node.func.value, ast.Name):
+            continue
+        if not node.func.value.id.startswith("freestyle"):
+            continue
+        found += 1
+        outputs = _kwargs(node).get("outputs")
+        names = set(_ordered_names(outputs)) if outputs is not None else set()
+        assert not (names & execution), (node.func.value.id, sorted(names & execution))
+    assert found == 1 + len(fork_freestyle.SECTION_TYPES), (
+        f"{found} Freestyle widget registrations; expected "
+        f"{1 + len(fork_freestyle.SECTION_TYPES)}")

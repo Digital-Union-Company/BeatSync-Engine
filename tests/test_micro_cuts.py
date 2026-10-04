@@ -508,3 +508,368 @@ def test_practical_diagnostic_micro_cut_sweep(shared, sweep, main_grid):
           f"(main grid {main_grid.size} cuts):\n" + "\n".join(lines))
 
     assert len(lines) == len(_SWEEP)
+
+
+# ===========================================================================
+# 6. FREESTYLE V1 — THE GLOBAL MICRO LAYER ON A HETEROGENEOUS TIMELINE
+# ===========================================================================
+#
+# Micro Cuts stays **one global control**: `add_rare_micro_cuts` is called once, with the base
+# config, after the per-section grids are composed. Nothing per-section may rewrite its four
+# fields (`test_cut_density` pins that), and `add_rare_micro_cuts` itself is unchanged.
+#
+# What *did* need an answer is the accepted P0-R2 question: the legacy path leans on
+# `final_wave_cleanup` after the micro pass, and the heterogeneous path does not call it. So
+# `micro_extra_safety` runs instead, and it had better be doing real work — which is where the
+# first measurement went wrong. A 4-cut grid gives `max_extra = round(4 * 0.025) = 0`, so the
+# original collision fixture produced no extras at all and "no collision" was vacuous. The fixture
+# below is **funded**: enough main-grid cuts that the ratio budget permits several extras, and two
+# half-beat accents deliberately placed close enough to collide with each other.
+
+
+#: 200 BPM. The tempo is the load-bearing choice and it took a measurement to find.
+#:
+#: `add_rare_micro_cuts` places an accent at the **half-beat after** a qualifying beat, so on a
+#: uniform grid two accents from adjacent qualifying beats are exactly one *period* apart. The
+#: layer's floor is `max(micro_min_gap, median_beat * 0.45)`, which is `micro_min_gap` (0.34 s) for
+#: any period under ~0.756 s. A collision therefore needs `period < 0.34`, and the function's own
+#: `median_beat < 0.22` guard sets the other end — so the window is period in [0.22, 0.34).
+#:
+#: At 0.75 s/beat (the `_micro_track` tempo) adjacent accents land 0.75 s apart and **no collision
+#: is reachable at all**. The first version of this fixture used that tempo and measured nothing;
+#: the calibration test below is what caught it.
+_COLLIDE_PERIOD = 0.30
+_COLLIDE_BEATS = 400
+_COLLIDE_DURATION = _COLLIDE_BEATS * _COLLIDE_PERIOD
+#: Every 8th beat, i.e. a cut every 2.4 s — sparse enough that an accent 1.05 s away clears the
+#: floor against the main grid, so `add_rare_micro_cuts` accepts it and the only remaining question
+#: is how it behaves against the other accepted accents.
+_COLLIDE_GRID_STRIDE = 8
+#: Adjacent qualifying pairs, each pair sitting mid-way between two main-grid cuts.
+_COLLIDE_SPIKES = (3, 4, 11, 12, 19, 20, 27, 28)
+
+
+def _funded_collision_fixture():
+    """A main grid large enough to fund extras, with accent pairs that collide with EACH OTHER.
+
+    The legacy hole needs four things at once, and the first attempt at this fixture satisfied only
+    three:
+
+    * **budget** — `max_extra = round(len(selected) * max_micro_cut_ratio)` must be >= 2. A 4-cut
+      grid funds `round(4 * 0.025) = 0` extras and measures nothing.
+    * **candidate accents closer to each other than the floor** — see the tempo note above.
+    * **each accent far enough from the MAIN GRID to be accepted**, because that is the only
+      distance `add_rare_micro_cuts` ever checks.
+    * **nothing afterwards** — on the heterogeneous path there is no `final_wave_cleanup`, so the
+      pair survives unless `micro_extra_safety` catches it.
+
+    The main grid is constructed explicitly rather than selected, so the spacing the accents are
+    judged against is a property of the fixture instead of an outcome of Stage 4's selector. That
+    is deliberate: the thing under test is the accent layer, and letting the selector decide the
+    grid is how the earlier probe lost control of the distances.
+    """
+    beat_times = np.array([i * _COLLIDE_PERIOD for i in range(_COLLIDE_BEATS)], dtype=float)
+    idx = np.arange(_COLLIDE_BEATS)
+
+    # A flat low baseline, lifted over the `wave >= 0.88` gate only at the spikes, so the candidate
+    # set is exactly the spike beats whatever the percentile resolves to.
+    wave = np.full(_COLLIDE_BEATS, 0.42, dtype=float)
+    impact = np.full(_COLLIDE_BEATS, 0.45, dtype=float)
+    for beat in _COLLIDE_SPIKES:
+        wave[beat] = 0.95
+        impact[beat] = 0.99
+    rhythm = np.clip(wave * 0.7, 0.0, 1.0)
+    novelty = np.full(_COLLIDE_BEATS, 0.3, dtype=float)
+
+    features = {
+        "wave": wave, "arc": np.clip(idx / _COLLIDE_BEATS, 0.0, 1.0),
+        "impact_score": impact, "rhythm_score": rhythm, "novelty": novelty,
+        "is_bar_anchor": (idx % 4 == 0), "is_phrase_anchor": (idx % 8 == 0),
+        "is_strong_kick": (impact >= 0.7).astype(float),
+        "is_strong_clap": (rhythm >= 0.7).astype(float),
+        "is_strong_bass": (wave >= 0.7).astype(float),
+        "is_strong_hihat": (novelty >= 0.7).astype(float),
+    }
+    main_grid = np.array(
+        [float(beat_times[i]) for i in range(0, _COLLIDE_BEATS, _COLLIDE_GRID_STRIDE)],
+        dtype=float)
+    span = _COLLIDE_DURATION / 4
+    sections = [{"index": i, "type": kind, "start": i * span, "end": (i + 1) * span,
+                 "duration": span, "energy": 0.45, "dominant_pattern": "mixed"}
+                for i, kind in enumerate(["verse", "chorus", "verse", "chorus"])]
+    return beat_times, features, sections, main_grid
+
+
+@pytest.fixture(scope="module")
+def collision():
+    return _funded_collision_fixture()
+
+
+def _micro_floor(shared, beat_times, cfg=None):
+    cfg = cfg if cfg is not None else shared.CONFIG
+    diffs = np.diff(np.asarray(beat_times, dtype=float))
+    return max(cfg.micro_min_gap, float(np.median(diffs)) * 0.45)
+
+
+def _extras_of(grid, produced):
+    grid_values = set(np.asarray(grid, dtype=float).tolist())
+    return sorted(float(t) for t in np.asarray(produced, dtype=float).tolist()
+                  if float(t) not in grid_values)
+
+
+def _collision_run(stage4, shared, collision, micro_value: int = 100):
+    """The explicit main grid, then the **real, unmodified** global micro pass."""
+    beat_times, features, _, main_grid = collision
+    cfg = _cfg_for(shared, micro_value)
+    with_micro = stage4.add_rare_micro_cuts(
+        main_grid, beat_times, features, _COLLIDE_DURATION, cfg)
+    return main_grid, with_micro, cfg
+
+
+# --- the fixture must not be vacuous -----------------------------------------------------
+
+
+def test_the_collision_fixture_is_actually_funded(stage4, shared, collision):
+    """The calibration that the first attempt failed. Without this, every assertion below would
+    pass on an empty extras list."""
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    extras = _extras_of(main_grid, with_micro)
+
+    budget = round(main_grid.size * cfg.max_micro_cut_ratio)
+    assert main_grid.size >= 40, f"main grid too small to fund extras: {main_grid.size}"
+    assert budget >= 2, f"max_extra = {budget}; the fixture funds no collision"
+    assert len(extras) >= 2, f"only {len(extras)} extras were produced"
+
+
+def test_the_legacy_micro_pass_really_can_place_two_extras_too_close(stage4, shared, collision):
+    """**A pre-existing defect on `main`, recorded and deliberately NOT fixed.**
+
+    `add_rare_micro_cuts` computes `selected_sorted` once, before its loop, and never adds an
+    accepted extra into it. Each candidate is therefore judged against the main grid only, so two
+    accepted extras can finish closer to each other than the layer's own declared floor.
+
+    On the legacy uniform path `final_wave_cleanup` runs afterwards — but it enforces only
+    `peak_energy_min_interval`, not `micro_min_gap`, so it does not close this either. Fixing it
+    would change the output of every existing uniform render, which is out of scope here; the
+    Freestyle path does not inherit it, and that is what `micro_extra_safety` is for.
+
+    This test asserts the defect EXISTS so the fix below cannot be mistaken for a no-op. If
+    `add_rare_micro_cuts` is ever made self-safe on purpose, this test is the one that should fail
+    and be deleted with that decision recorded.
+    """
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    extras = _extras_of(main_grid, with_micro)
+    floor = _micro_floor(shared, beat_times, cfg)
+
+    closest = min((b - a for a, b in zip(extras, extras[1:])), default=float("inf"))
+    assert closest < floor, (
+        f"the legacy hole did not reproduce: closest extra pair {closest:.4f}s "
+        f"vs floor {floor:.4f}s. The fixture may have stopped being funded.")
+
+
+# --- micro_extra_safety closes it on the Freestyle path ----------------------------------
+
+
+def test_micro_extra_safety_closes_the_extra_to_extra_gap(stage4, shared, collision):
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    floor = _micro_floor(shared, beat_times, cfg)
+
+    extras = _extras_of(main_grid, final)
+    assert extras, "every extra was dropped; the filter is too aggressive to measure"
+    for a, b in zip(extras, extras[1:]):
+        assert b - a >= floor - 1e-9, f"extras {a:.4f} and {b:.4f} are {b - a:.4f}s apart"
+
+
+def test_micro_extra_safety_also_respects_the_gap_to_the_main_grid(stage4, shared, collision):
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    floor = _micro_floor(shared, beat_times, cfg)
+
+    for t in _extras_of(main_grid, final):
+        assert float(np.min(np.abs(main_grid - t))) >= floor - 1e-9, t
+
+
+def test_micro_extra_safety_never_removes_a_main_grid_cut(stage4, shared, collision):
+    """The one thing it must never do. The main grid is each section's own Cut Density decision,
+    already cleaned by that section's own band."""
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    assert set(main_grid.tolist()) <= set(final.tolist())
+    assert final.size >= main_grid.size
+
+
+def test_micro_extra_safety_keeps_the_earlier_of_a_colliding_pair(stage4, shared):
+    """Deterministic in time order, same rule as `cross_section_safety`: keep earlier, drop later."""
+    beat_times = np.array([i * 0.75 for i in range(40)], dtype=float)
+    main_grid = np.array([0.0, 6.0, 12.0], dtype=float)
+    with_micro = np.array([0.0, 3.0, 3.2, 6.0, 12.0], dtype=float)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, shared.CONFIG)
+    assert list(final) == [0.0, 3.0, 6.0, 12.0], "3.2 should lose to the earlier 3.0"
+
+
+def test_micro_extra_safety_never_compares_an_extra_against_itself(stage4, shared):
+    """`occupied` starts as the main grid alone, and an accepted extra joins it only *after* its
+    own check — so an extra can never measure a zero distance to itself.
+
+    That is a real trap rather than a hypothetical: the P0-R2 probe excluded a cut from its own
+    distance check *by value* against a rounded set, every extra matched itself, and it reported a
+    spurious safety failure. Here a lone extra far from the grid must simply be accepted.
+    """
+    beat_times = np.array([i * 0.75 for i in range(40)], dtype=float)
+    main_grid = np.array([0.0, 6.0], dtype=float)
+    with_micro = np.array([0.0, 3.0, 6.0], dtype=float)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, shared.CONFIG)
+    assert 3.0 in set(final.tolist()), "a lone extra was rejected by a comparison with itself"
+
+
+def test_micro_extra_safety_measures_extras_against_the_whole_main_grid(stage4, shared):
+    """`occupied` must be seeded with the grid, not built up from nothing. Starting empty would let
+    the first extra sit anywhere, including on top of a main-grid cut."""
+    beat_times = np.array([i * 0.75 for i in range(40)], dtype=float)
+    main_grid = np.array([0.0, 3.0, 6.0], dtype=float)
+    # 3.1 is 0.1s from the grid cut at 3.0 — far inside the 0.34s floor.
+    with_micro = np.array([0.0, 3.0, 3.1, 6.0], dtype=float)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, shared.CONFIG)
+    assert list(final) == [0.0, 3.0, 6.0], "an extra was accepted on top of a main-grid cut"
+
+
+def test_micro_extra_safety_is_a_no_op_when_there_are_no_extras(stage4, shared):
+    beat_times = np.array([i * 0.75 for i in range(40)], dtype=float)
+    grid = np.array([0.0, 6.0, 12.0], dtype=float)
+    assert list(stage4.micro_extra_safety(grid, grid, beat_times, shared.CONFIG)) == list(grid)
+    assert list(stage4.micro_extra_safety(
+        grid, np.array([], dtype=float), beat_times, shared.CONFIG)) == list(grid)
+
+
+def test_micro_extra_safety_handles_an_empty_grid(stage4, shared):
+    beat_times = np.array([i * 0.75 for i in range(40)], dtype=float)
+    empty = np.array([], dtype=float)
+    extras = np.array([3.0, 3.2, 9.0], dtype=float)
+    final = stage4.micro_extra_safety(empty, extras, beat_times, shared.CONFIG)
+    assert list(final) == [3.0, 9.0]
+
+
+def test_micro_extra_safety_is_pure(stage4, shared, collision):
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    grid_before, micro_before = main_grid.copy(), with_micro.copy()
+    stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    assert np.array_equal(main_grid, grid_before)
+    assert np.array_equal(with_micro, micro_before)
+
+
+def test_micro_extra_safety_is_deterministic(stage4, shared, collision):
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    first = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    second = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    assert np.array_equal(first, second)
+    assert list(first) == sorted(first)
+
+
+def test_the_floor_is_the_micro_layers_own_and_is_density_independent(shared):
+    """`micro_min_gap` is rewritten by neither derived config, so a section's density cannot move
+    the accent floor. Structural, from the configs themselves."""
+    dense = shared.density_scaled_config(shared.CONFIG, 2.0)
+    sparse = shared.density_scaled_config(shared.CONFIG, 0.5)
+    assert dense.micro_min_gap == shared.CONFIG.micro_min_gap
+    assert sparse.micro_min_gap == shared.CONFIG.micro_min_gap
+
+    profile = __import__("beatsync_fork.creative", fromlist=["x"]).CreativeProfile(micro_cuts=100)
+    assert shared.micro_cut_scaled_config(shared.CONFIG, profile).micro_min_gap == \
+        shared.CONFIG.micro_min_gap
+
+
+# --- the legacy path is untouched --------------------------------------------------------
+
+
+def test_add_rare_micro_cuts_was_not_modified(stage4, shared, micro_track, main_grid):
+    """Micro Cuts remains a derived config, not a new mechanism. `add_rare_micro_cuts` still takes
+    exactly `(selected, beat_times, features, audio_duration, cfg)` and reads only `cfg`."""
+    import inspect
+    parameters = list(inspect.signature(stage4.add_rare_micro_cuts).parameters)
+    assert parameters == ["selected", "beat_times", "features", "audio_duration", "cfg"]
+
+    source = inspect.getsource(stage4.add_rare_micro_cuts).lower()
+    for forbidden in ("freestyle", "section_settings", "micro_extra_safety", "declaration"):
+        assert forbidden not in source, f"add_rare_micro_cuts references {forbidden!r}"
+
+
+def test_the_legacy_uniform_path_output_is_unchanged_by_the_new_helper(stage4, shared,
+                                                                      micro_track, main_grid):
+    """`micro_extra_safety` exists only on the heterogeneous path. The uniform path must still be
+    `add_rare_micro_cuts` -> `final_wave_cleanup`, with its frozen output."""
+    beat_times, features, sections = micro_track
+    cfg = _cfg_for(shared, 100)
+    produced = stage4.add_rare_micro_cuts(main_grid, beat_times, features, _MICRO_DURATION, cfg)
+
+    cuts, _ = stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=_MICRO_TEMPO,
+        audio_duration=_MICRO_DURATION, cfg=cfg)
+    filtered = stage4.micro_extra_safety(main_grid, produced, beat_times, cfg)
+    # Not an equality claim between the two pipelines — only that the uniform render did NOT go
+    # through the new helper, which would have shown up as the helper's stricter extra spacing.
+    assert cuts.size > 0
+    assert filtered.size <= produced.size
+
+
+def test_the_heterogeneous_path_calls_the_new_helper_and_the_legacy_one_does_not(stage4, shared,
+                                                                                collision,
+                                                                                monkeypatch):
+    """Structural: which composition ran, asserted by tripwire rather than inferred from spacing."""
+    beat_times, features, sections, _ = collision
+    duration = _COLLIDE_DURATION
+    calls = []
+    real = stage4.micro_extra_safety
+
+    def _counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(stage4, "micro_extra_safety", _counting)
+
+    stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=80.0,
+        audio_duration=duration, cfg=shared.CONFIG)
+    assert calls == [], "the legacy path must not call micro_extra_safety"
+
+    dense = shared.density_scaled_config(shared.CONFIG, 2.0)
+    settings = {0: (dense, 2.0), 1: (shared.CONFIG, None),
+                2: (shared.CONFIG, None), 3: (shared.CONFIG, None)}
+    stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=80.0,
+        audio_duration=duration, cfg=shared.CONFIG, section_settings=settings)
+    assert calls == [1], "the heterogeneous path must call micro_extra_safety exactly once"
+
+
+# ===========================================================================
+# 7. FREESTYLE MICRO DIAGNOSTIC (captured by default)
+# ===========================================================================
+
+
+def test_practical_diagnostic_micro_extra_collision(stage4, shared, collision):
+    """The measurement behind the P0-R2 answer::
+
+        python -m pytest tests/test_micro_cuts.py -s -k practical_diagnostic_micro_extra
+    """
+    beat_times = collision[0]
+    main_grid, with_micro, cfg = _collision_run(stage4, shared, collision)
+    final = stage4.micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    floor = _micro_floor(shared, beat_times, cfg)
+
+    before = _extras_of(main_grid, with_micro)
+    after = _extras_of(main_grid, final)
+    worst_before = min((b - a for a, b in zip(before, before[1:])), default=float("inf"))
+    worst_after = min((b - a for a, b in zip(after, after[1:])), default=float("inf"))
+
+    print(f"\nMicro extras on a {main_grid.size}-cut funded grid (floor {floor:.4f}s):"
+          f"\n  add_rare_micro_cuts : {len(before):2d} extras, closest pair {worst_before:.4f}s"
+          f"\n  micro_extra_safety  : {len(after):2d} extras, closest pair {worst_after:.4f}s")
+
+    assert worst_after >= floor - 1e-9

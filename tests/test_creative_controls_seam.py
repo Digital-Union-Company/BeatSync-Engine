@@ -200,15 +200,40 @@ def test_the_audio_visual_profile_carries_no_creative_state():
 
 
 def test_no_stage_cache_or_director_machinery_was_added():
-    """Explicitly out of scope: L2 stage caching, Freestyle, an AI Director, Variant Lab, per-section
-    profiles and a second Qwen pass are documented future work, not speculative abstraction here."""
+    """Explicitly out of scope: L2 stage caching, an AI Director inside the pipeline, Variant Lab,
+    per-section *profiles as a planner mode* and a second Qwen pass are documented future work, not
+    speculative abstraction here.
+
+    **Split by Freestyle V1, not weakened.** `freestyle` was banned in all five files as
+    speculative. V1 implements it, and two of those files legitimately carry it: Stage 4's
+    orchestrator resolves per-section Cut Density after Stage 3, and Stage 6 looks a segment's
+    section type up. So the ban keeps full strength exactly where it was always load-bearing — the
+    **Stage-5 side** (`video_analysis.py`, the Qwen worker) and `creative.py`, which must stay a
+    seven-control record with no section concept at all — and the two pipeline files that implement
+    it get an explicit allow-list below instead of a rename to slip past a word check.
+
+    `per_section_profile` stays banned everywhere: Freestyle is a sparse *override* layer composed
+    into the existing `CreativeProfile`, never a stored per-section profile object.
+    """
+    freestyle_accepted = (
+        _AUTO_MODE,
+        os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py"),
+    )
     for path in (_VA, _WORKER, _AUTO_MODE,
                  os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py"),
                  os.path.join(_REPO_ROOT, "src", "beatsync_fork", "creative.py")):
         source = _executable_source(path).lower()
-        for word in ("freestyle", "director", "variant_lab", "creative_recipe", "master_seed",
-                     "shortlist", "stage_cache", "per_section_profile", "micro_cuts_control"):
+        banned = ("director", "variant_lab", "creative_recipe", "master_seed",
+                  "shortlist", "stage_cache", "per_section_profile", "micro_cuts_control")
+        if path not in freestyle_accepted:
+            banned = banned + ("freestyle",)
+        for word in banned:
             assert not re.search(rf"\b{re.escape(word)}\b", source), f"{path} mentions {word!r}"
+
+    # The allow-list is a statement about what Freestyle V1 *is*, so it has to actually be there.
+    for path in freestyle_accepted:
+        assert "freestyle" in _executable_source(path).lower(), (
+            f"{path} lost its Freestyle seam")
 
 
 # ===========================================================================
@@ -790,8 +815,22 @@ def test_no_preset_randomizer_or_freestyle_control_was_added():
     arrive unnoticed.
     """
     source = open(_GUI, encoding="utf-8").read().lower()
-    for word in ("preset_btn", "freestyle", "randomize_controls", "reset_creative"):
+    for word in ("preset_btn", "randomize_controls", "reset_creative"):
         assert word not in source, f"gui.py contains {word!r}"
+
+    # **Split again by Freestyle V1, by the same rule as the Director split above.** `freestyle`
+    # was banned here as speculative; V1 implements it in `gui.py`, so the blanket form became
+    # false. What stays banned is what Freestyle V1 deliberately did NOT build — per-section Micro
+    # Cuts, a per-section seed, numeric per-section sliders, a section-instance timeline editor, a
+    # pre-render Analyze Music workflow and any Director/Variant-Lab coupling.
+    for word in ("freestyle_micro", "freestyle_seed", "freestyle_slider", "freestyle_numeric",
+                 "freestyle_instance", "freestyle_timeline", "analyze_music",
+                 "freestyle_director", "freestyle_variant"):
+        assert word not in source, f"gui.py contains {word!r}"
+
+    # ...and the accepted surface really is there.
+    for word in ("freestyle_enabled", "_on_freestyle_change", "freestyle_summary"):
+        assert word in source, f"gui.py lost Freestyle's {word!r}"
 
     # Still speculative in the GUI: a content-aware Director, a cached or remembered proposal, a
     # Director-driven render, and a Director that rewrites the current settings.

@@ -716,7 +716,12 @@ def test_e_no_director_or_freestyle_machinery_was_added():
     Director is a *Stage-6-and-above creative producer*, not a second interpretation pass over the
     persisted library, and nothing here licenses one.
     """
-    speculative_everywhere = ("freestyle", "shortlist", "second_pass", "interpretation_mode")
+    # **`freestyle` moved from "speculative everywhere" to "speculative on the Stage-5 side"** by
+    # Freestyle V1, exactly as `director` did before it and for the same reason: a Freestyle layer
+    # may exist, but **Stage 5 must never hear of it**. `shortlist`, `second_pass` and
+    # `interpretation_mode` are untouched and still forbidden everywhere including the GUI — a
+    # second interpretation pass over the persisted library is still not built.
+    speculative_everywhere = ("shortlist", "second_pass", "interpretation_mode")
     stage5_side = (_VA, _WORKER, os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"))
 
     for path in stage5_side + (_GUI,):
@@ -726,7 +731,7 @@ def test_e_no_director_or_freestyle_machinery_was_added():
                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         forbidden = speculative_everywhere
         if path in stage5_side:
-            forbidden = forbidden + ("master_seed", "director", "proposal")
+            forbidden = forbidden + ("master_seed", "director", "proposal", "freestyle")
         for speculative in forbidden:
             assert not any(speculative in name for name in defined), (
                 f"{path} defines speculative {speculative} machinery")

@@ -256,7 +256,10 @@ def get_success_message_auto(total_cuts, total_beats, tempo, sections_info,
                             codec_info, fps_info, filename, audio_info,
                             audio_duration=None, output_fps=None,
                             total_processing_seconds=None, processing_label=None,
-                            variation_text=None):
+                            variation_text=None,
+                            # [FORK] Digital-Union (Freestyle V1): optional and appended last, so
+                            # every existing caller renders exactly as before.
+                            freestyle_text=None):
     """Success message for Auto mode. Compatible with Auto Mode V1/V2/V3/V3.2."""
 
     section_summary = _format_auto_section_summary(sections_info)
@@ -277,12 +280,18 @@ def get_success_message_auto(total_cuts, total_beats, tempo, sections_info,
     # [FORK] Digital-Union (Phase A): optional, so existing callers render exactly as before.
     # A seed is only worth reading back when the user actually chose one.
     variation_line = f"Creative variation: {variation_text}\n" if variation_text else ""
+    # [FORK] Digital-Union (Freestyle V1): the section rules, as the numbers that actually ran.
+    # Omitted when Freestyle had no effect, so a today-style render's panel is byte-identical.
+    # The label lives here rather than in `FreestyleDeclaration.describe()`, exactly as it does for
+    # the variation line above: `describe()` then stays a bare list of resolved numbers, which is
+    # what makes it read correctly inside the Stage-4 console line's parentheses too.
+    freestyle_line = f"Freestyle: {freestyle_text}\n" if freestyle_text else ""
 
     return f"""✅ Video created successfully!
 
 Statistics:
 Video processing: {processing_text}
-{variation_line}Total cuts: {total_cuts}
+{variation_line}{freestyle_line}Total cuts: {total_cuts}
 Audio duration: {audio_duration_f:.2f} seconds
 Output FPS: {fps_text}
 {total_beats} beats detected at {tempo:.1f} BPM
@@ -565,6 +574,40 @@ INFO_CREATIVE_PRESET = (
     "BeatSync behaviour and is also the way back to it. The Variation Seed is never changed by a "
     "preset, and no preset re-analyses your videos."
 )
+
+# ============================================================================
+# [FORK] Digital-Union: Freestyle V1
+# See src/beatsync_fork/freestyle.py. Two things this copy must say plainly, because both are
+# places a user could reasonably assume otherwise: a section style applies only FIVE of the six
+# controls (Micro Cuts stays global), and every instance of a section type shares one rule. The
+# summary shows `Base` rather than an inherited number on purpose — the global controls have five
+# legitimate writers, so a number there could not be kept honest.
+# ============================================================================
+
+LABEL_FREESTYLE = "🎚️ Freestyle (per-section rules)"
+INFO_FREESTYLE = (
+    "**Let different parts of the song be edited differently.** Pick a style for a section type "
+    "and every section of that type uses it; the rest of the track keeps your global Creative "
+    "Controls above.\n\n"
+    "A section style sets **five** controls — Cut Density, Semantic Emphasis, Energy Response, "
+    "Motion Bias and Source Diversity. **Micro Cuts and the Variation Seed stay global** for the "
+    "whole render, so a style named *Cinematic* applies Cinematic's five values and keeps your "
+    "Micro Cuts exactly as you set it.\n\n"
+    "Section types are detected from the music while rendering, so rules are matched by type "
+    "rather than by position: if the track has two choruses, both use the *chorus* rule. A type "
+    "that does not occur simply never applies. Nothing here re-analyses your videos, starts a "
+    "render, or affects your confirmed source files."
+)
+
+LABEL_FREESTYLE_ENABLED = "Enable Freestyle"
+INFO_FREESTYLE_ENABLED = (
+    "Off by default. With this off — or on with every section left at Base — the render is exactly "
+    "what it would be without Freestyle at all."
+)
+
+LABEL_FREESTYLE_SECTION_PREFIX = "🎵"
+
+LABEL_FREESTYLE_SUMMARY = "Freestyle rules"
 
 # ============================================================================
 # [FORK] Digital-Union: Variant Lab V1 (C2)

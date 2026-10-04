@@ -16,6 +16,10 @@ from beatsync_fork import variation as fork_variation
 from beatsync_fork import creative as fork_creative
 # [FORK] Digital-Union: the pre-Qwen deterministic candidate view (stdlib-only fork module).
 from beatsync_fork import deterministic_view as fork_deterministic
+# [FORK] Digital-Union (Freestyle V1): section-scoped creative modulation (stdlib-only fork module).
+# The declaration and the sparse-override composition live there; this module only looks a segment's
+# section type up and plans with whatever profile comes back.
+from beatsync_fork import freestyle as fork_freestyle
 
 
 def _clamp(value, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -49,6 +53,19 @@ def creative_profile(beat_info: Dict | None) -> fork_creative.CreativeProfile:
     if not isinstance(beat_info, dict):
         return fork_creative.NEUTRAL_PROFILE
     return fork_creative.CreativeProfile.from_mapping(beat_info.get("creative"))
+
+
+def freestyle_declaration(beat_info: Dict | None):
+    """[FORK] Digital-Union (Freestyle V1): the render's section rules, off the shared bus.
+
+    One reader for one key, exactly as `creative_profile` is the one reader of `"creative"`, so the
+    Freestyle state cannot fork into two independently-parsed views. Total: an absent, stale or
+    foreign value degrades to an inactive declaration and the planner takes its global path.
+    """
+    value = (beat_info or {}).get("freestyle")
+    if isinstance(value, fork_freestyle.FreestyleDeclaration):
+        return value
+    return fork_freestyle.FreestyleDeclaration()
 
 
 def creative_seed(beat_info: Dict | None) -> int:
@@ -101,6 +118,39 @@ def build_planned_clip_sequence(
         else profile_settings.source_diversity_factor()
     )
 
+    # [FORK] Digital-Union (Freestyle V1): the per-section layer. `profile_settings` above stays the
+    # GLOBAL base and the seed stays global — Freestyle varies only the four Stage-6 controls, and
+    # it does so by section TYPE, which `_build_segment_profiles` has already attached to every
+    # segment as `profile["section_type"]`. So this needs no new section resolution at all.
+    #
+    # Resolution is memoised per distinct section type, not per segment: a thirteen-section track
+    # with two rules resolves two effective profiles. A section with no rule gets back the base
+    # object itself, so it reuses the base controls by identity rather than an equal-but-separate
+    # copy — which is what keeps the distinct-controls count honest.
+    declaration = freestyle_declaration(beat_info)
+    freestyle_active = declaration.is_active()
+    if freestyle_active:
+        resolved_by_type: dict = {}
+
+        def _section_controls(section_type):
+            if section_type not in resolved_by_type:
+                effective = fork_freestyle.effective_profile(
+                    profile_settings, section_type, declaration)
+                if effective is profile_settings:
+                    resolved_by_type[section_type] = (controls, source_diversity_factor)
+                else:
+                    resolved_by_type[section_type] = (
+                        effective.scoring_controls(),
+                        None if effective.is_neutral_source_diversity()
+                        else effective.source_diversity_factor(),
+                    )
+            return resolved_by_type[section_type]
+
+        segment_controls = [
+            _section_controls(profile.get("section_type")) for profile in profiles]
+    else:
+        segment_controls = [(controls, source_diversity_factor) for _ in profiles]
+
     # [FORK] Digital-Union (L1A): the static half of the score, computed once per
     # (candidate, target) instead of once per (candidate, segment). A real run measured 148 segments
     # × 9241 candidates = 1,367,668 evaluations across at most five distinct targets, so this is
@@ -119,7 +169,68 @@ def build_planned_clip_sequence(
     segment_targets = [profile.get("target", "flow") for profile in profiles]
     deterministic_views: tuple | None = None
     deterministic_by_candidate: dict = {}
-    if controls.is_neutral:
+    if freestyle_active:
+        # [FORK] Digital-Union (Freestyle V1): the heterogeneous table. Keyed by
+        # `(ScoringControls, target)` and built LAZILY on first use, never by segment — so the work
+        # is bounded by `min(distinct controls × distinct targets, segments)` and can never reach
+        # the pre-L1A `candidates × segments` shape. Measured on the real 9241-candidate /
+        # 148-segment library: one candidates-wide column is 61 ms, today's global case is 5 columns
+        # (0.30 s), ten distinct profiles lazily is 10 columns (0.61 s), and the pre-L1A shape was
+        # 148 columns (9.02 s).
+        #
+        # `ScoringControls` is a frozen dataclass of three floats/None, so it is hashable and
+        # equality-deduping: two sections that resolve to the same controls share one table, and no
+        # new score-table identity type was invented.
+        distinct_controls = tuple(dict.fromkeys(item[0] for item in segment_controls))
+        # The deterministic views are the one genuinely expensive part of Semantic Emphasis, and
+        # they depend on the CANDIDATE only — never on the control values — so they are built once
+        # for the whole call if ANY active profile needs them, and reused by every table.
+        if any(item.needs_deterministic_views for item in distinct_controls):
+            deterministic_views = tuple(
+                fork_deterministic.deterministic_candidate_view(candidate)
+                for candidate in candidates
+            )
+            deterministic_by_candidate = {
+                id(candidate): view for candidate, view in zip(candidates, deterministic_views)
+            }
+
+        # Energy Response blends each target against the generic "flow" score computed under the
+        # SAME controls, so a flow column is cached per distinct controls tuple and never shared
+        # across different ones — sharing would blend two different interpretations together.
+        flow_by_controls: dict = {}
+        base_scores_by_key: dict = {}
+
+        def _view_at(position):
+            return None if deterministic_views is None else deterministic_views[position]
+
+        def _table_for(scoring, target):
+            key = (scoring, target)
+            table = base_scores_by_key.get(key)
+            if table is not None:
+                return table
+            if scoring.is_neutral:
+                table = tuple(_static_base_score(candidate, target) for candidate in candidates)
+            else:
+                flow_scores = flow_by_controls.get(scoring)
+                if scoring.needs_flow_column and flow_scores is None:
+                    flow_scores = tuple(
+                        _semantic_adjusted_score(candidate, "flow", scoring, _view_at(position))
+                        for position, candidate in enumerate(candidates)
+                    )
+                    flow_by_controls[scoring] = flow_scores
+                table = tuple(
+                    _effective_base_score(
+                        candidate, target, scoring,
+                        flow_score=None if flow_scores is None else flow_scores[position],
+                        deterministic=_view_at(position),
+                    )
+                    for position, candidate in enumerate(candidates)
+                )
+            base_scores_by_key[key] = table
+            return table
+
+        base_scores_by_target = None
+    elif controls.is_neutral:
         base_scores_by_target = {
             target: tuple(_static_base_score(candidate, target) for candidate in candidates)
             for target in dict.fromkeys(segment_targets)
@@ -170,6 +281,13 @@ def build_planned_clip_sequence(
     planned: List[Dict] = []
 
     for i, profile in enumerate(profiles):
+        # [FORK] Digital-Union (Freestyle V1): this segment's effective scoring controls and its
+        # Source Diversity factor. On a global render both are the base values for every segment,
+        # so the loop is unchanged in shape. The seed is NOT per-segment: it stays global, so
+        # `_stable_rng(seed, index, target, start)` keeps the exact stream it has always had.
+        segment_scoring, segment_diversity = segment_controls[i]
+        base_scores = (_table_for(segment_scoring, segment_targets[i]) if freestyle_active
+                       else base_scores_by_target[segment_targets[i]])
         candidate = _choose_candidate(
             candidates=candidates,
             profile=profile,
@@ -178,9 +296,9 @@ def build_planned_clip_sequence(
             usage=usage,
             index=i,
             seed=seed,
-            base_scores=base_scores_by_target[segment_targets[i]],
-            controls=controls,
-            source_diversity_factor=source_diversity_factor,
+            base_scores=base_scores,
+            controls=segment_scoring,
+            source_diversity_factor=segment_diversity,
         )
         if not candidate:
             continue
@@ -188,7 +306,10 @@ def build_planned_clip_sequence(
             candidate=candidate,
             profile=profile,
             index=i,
-            controls=controls,
+            # The recorded diagnostic score must describe what actually selected this clip, so it
+            # uses THIS segment's effective controls — not the global base a section override
+            # replaced.
+            controls=segment_scoring,
             deterministic=deterministic_by_candidate.get(id(candidate)),
         )
         planned.append(planned_clip)

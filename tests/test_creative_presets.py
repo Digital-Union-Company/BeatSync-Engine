@@ -520,13 +520,25 @@ def test_the_preset_module_names_no_pipeline_or_ui_machinery():
 #: **`director` left this tuple with AI Director V1**, which implements it in `gui.py` — see
 #: `_DIRECTOR_ACCEPTED_IN_GUI` below for the split. `presets.py` keeps the full prohibition
 #: through `_PRESETS_ONLY_SPECULATIVE`.
-_STILL_SPECULATIVE = ("freestyle", "shortlist", "stage_cache", "source_group",
+_STILL_SPECULATIVE = ("shortlist", "stage_cache", "source_group",
                       "per_section_profile", "preset_history", "last_preset", "preset_state")
+
+#: **`freestyle` left `_STILL_SPECULATIVE` with Freestyle V1**, which implements it in `gui.py` and
+#: `beatsync_fork/freestyle.py`. `presets.py` keeps the full prohibition through
+#: `_PRESETS_ONLY_SPECULATIVE` below: a preset stays a name for six values and learns no section
+#: mechanism. `per_section_profile` also stays banned everywhere — Freestyle is a sparse *override*
+#: composed into the existing `CreativeProfile`, never a stored per-section profile object.
+_FREESTYLE_ACCEPTED_IN_GUI = ("freestyle_enabled", "freestyle_summary", "fork_freestyle")
+
+#: What Freestyle V1 deliberately did NOT build, banned by name rather than incidentally.
+_FREESTYLE_STILL_SPECULATIVE = ("freestyle_micro", "freestyle_seed", "freestyle_slider",
+                                "freestyle_instance", "freestyle_timeline", "analyze_music")
 
 #: Forbidden in `presets.py` specifically. A preset stays a named set of slider values with no
 #: generator concept at all, so the module must know nothing about a Director either — the same
 #: split C2 applied for Variant Lab vocabulary, applied again.
-_PRESETS_ONLY_SPECULATIVE = ("director", "proposal", "instruction")
+_PRESETS_ONLY_SPECULATIVE = ("director", "proposal", "instruction", "freestyle",
+                             "section_override", "section_rule")
 
 #: What AI Director V1 legitimately added to the GUI, by name. Listed explicitly rather than simply
 #: removed from the ban, so the accepted surface is a reviewed allow-list and a *second* director
@@ -615,6 +627,8 @@ def test_the_gui_added_no_speculative_mode_machinery():
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
     for word in _DIRECTOR_STILL_SPECULATIVE:
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
+    for word in _FREESTYLE_STILL_SPECULATIVE:
+        assert not re.search(rf"\b{re.escape(word)}\b", source), f"gui.py mentions {word!r}"
 
     # the allow-list is a statement about what each milestone *is*, so it has to actually be there
     for word in _C3_ACCEPTED_IN_GUI:
@@ -623,6 +637,8 @@ def test_the_gui_added_no_speculative_mode_machinery():
         assert word in source, f"gui.py lost C3-R0's {word!r}"
     for word in _DIRECTOR_ACCEPTED_IN_GUI:
         assert word in source, f"gui.py lost the Director's {word!r}"
+    for word in _FREESTYLE_ACCEPTED_IN_GUI:
+        assert word in source, f"gui.py lost Freestyle's {word!r}"
 
 
 def test_the_accepted_c3_machinery_is_not_rendering_machinery():

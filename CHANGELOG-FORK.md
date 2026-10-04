@@ -20,6 +20,111 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-04 (Freestyle V1)
+
+**One song, edited two ways.** Every creative control the app has ever had is global for the whole
+track: one Cut Density, one Motion Bias, one of everything, first beat to last. Freestyle V1 is the
+first feature that lets a `drop` be cut differently from the `verse` before it.
+
+```
+THE SIX SLIDERS   = the global base                      (unchanged execution truth)
+A FREESTYLE RULE  = a per-SECTION delta on five of them  (a render request, never source identity)
+STILL EXACTLY ONE EACH = the Variation Seed, and Micro Cuts
+```
+
+- **Five fields per section, derived not restated.** `FREESTYLE_CONTROL_FIELDS` is
+  `presets.CREATIVE_CONTROL_FIELDS` minus `micro_cuts`: Cut Density, Semantic Emphasis, Energy
+  Response, Motion Bias, Source Diversity. **Micro Cuts stays global** because it governs a rare
+  accent layer whose whole contract is that it cannot become flicker, and **the Variation Seed stays
+  global** so the one number a user writes down keeps describing the render. Neither has a field on
+  `SectionOverride`, so a rule cannot touch them — structural, not careful.
+- **Sparse, and keyed by section TYPE.** Unset fields inherit the live global value; a section with
+  no rule, an unknown section type, an empty rule or a stale declaration all get the global base
+  object back **by identity**. Every instance of a repeated type shares one rule.
+- **Freestyle OFF is byte-identical to current `main`, and so are three more cases.** The
+  short-circuit tests the resolved *values*, not the checkbox: off, on with no rule, on with a rule
+  that sets no density, and on with every rule landing on the base density all take Stage 4's exact
+  legacy composition. Rules are *retained* while the checkbox is off, so switching Freestyle on
+  without setting anything also changes nothing.
+- **Stage 4 gained a second composition, and `final_wave_cleanup` is deliberately absent from it.**
+  Its density band is computed from the global beat count and its cap ranks cuts across the whole
+  track, so running it after per-section selection let one section's rule delete cuts from unrelated
+  sections — measured: changing only the `drop` rule mutated five non-target sections, three not even
+  adjacent. The heterogeneous path is `section_density_cleanup` per section →
+  `cross_section_safety` (boundary-straddling pairs only, `min(gapA, gapB)`, keep earlier) →
+  **unchanged** `add_rare_micro_cuts` → `micro_extra_safety`. Measured on the 566-beat / 13-section
+  fixture: moving only `drop` from 50 to 100 leaves all eleven non-drop sections byte-identical.
+- **A known legacy defect is recorded and deliberately NOT fixed.** `add_rare_micro_cuts` computes
+  `selected_sorted` before its loop and never adds an accepted extra back, so two extras can land
+  closer together than the accent layer's own floor; the post-micro cleanup enforces only
+  `peak_energy_min_interval` and does not close it either. Fixing it would change the output of every
+  existing uniform render, so it is out of scope. Measured at 200 BPM on a funded 50-cut grid:
+  4 extras, closest pair **0.3000 s** against a 0.3400 s floor. The Freestyle path does not inherit
+  it — `micro_extra_safety` returns 2 extras, closest pair 2.4000 s — and a test asserts the legacy
+  defect *exists*, so the fix cannot be mistaken for a no-op.
+- **L1A survived the refactor it was designed for.** `ScoringControls` became a per-segment value, so
+  the Stage-6 static table grew a key dimension — `(ScoringControls, target)`, built **lazily**, so
+  the column count is bounded by `min(distinct controls × distinct targets, segments)` and can never
+  reach the pre-L1A per-segment shape. `ScoringControls` is a frozen dataclass of three
+  `float | None`, hence hashable and equality-deduping, so two sections resolving to the same values
+  share one column and no new identity type was invented. **Source Diversity stays out of the table**
+  and is threaded per segment, because it reads the running `usage` counter. `usage`, `recent_ids`
+  and `recent_videos` are still created once for the whole plan, and the seed is still global.
+- **Nothing re-analyses.** No Freestyle value reaches `_qwen_config_token`, `_video_signature`,
+  `_cache_path`, a Qwen request, the prompt or a persisted record. `video_analysis.py`,
+  `stage5_qwen_scene_worker.py`, `video_processor.py`, `ffmpeg_processing.py`, `creative.py`,
+  `presets.py`, `creative_recipe.py`, `variant_lab.py`, `variant_batch.py`, `render_batch.py`,
+  `director.py`, `audio_mix.py` and `smart_mix.py` were **not modified**; `CACHE_CONTRACT_VERSION`
+  stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`.
+  Changing a rule re-plans; it never re-analyses.
+- **GUI: one accordion, eleven widgets, one read-out.** A checkbox, ten section dropdowns
+  (`Base` plus the four named presets — `Custom` excluded, since it is a state with no values to
+  project) and a read-only summary. All eleven `.change()` registrations write **only** the summary.
+  The summary marks every inherited field `Base` and never prints an inherited number, because the
+  global controls have five legitimate writers and a number there could not be kept honest.
+- **No CLI flag**, no new environment variable, no stage cache, no per-section Micro Cuts, no
+  per-section seed, no section-instance editor and no visual timeline. Tests ban each by name.
+
+**Runtime acceptance status — read this before citing the numbers below.** The three
+Freestyle files (`src/beatsync_fork/freestyle.py`, `tests/test_freestyle.py`,
+`.claude/rules/freestyle.md`) were **absent** from the working tree and from every reachable git
+object when this feature was finished, while the Stage-4, Stage-6, GUI, `ui_content`, rule and test
+changes that *call* them were already present. The module was therefore **reconstructed** against
+that call surface: the eleven-widget GUI seam, `auto_mode._resolve_freestyle` /
+`_freestyle_section_settings`, `stage6_av_planner.freestyle_declaration` and the assertions in
+`test_cut_density.py`, `test_micro_cuts.py`, `test_stage6_score_precompute.py`, `test_variant_lab.py`,
+`test_creative_presets.py` and `test_creative_controls_seam.py`. The whole suite passes
+(3736 passed, 260 skipped; the 3 remaining failures are pre-existing Windows-only path-case
+assertions that also fail on the parent commit). The paragraph below is the **original** run's
+recorded evidence and is retained as such — it was **not** re-run against the reconstructed module,
+and could not be: this is a Windows-only app and the reconstruction was done in a Linux session with
+no portable runtime, no FFmpeg and no Qwen models. Treat the measured cut counts as unverified for
+this code until the acceptance run is repeated on the Windows machine.
+
+Runtime acceptance (original run, not re-verified): real Stages 1–6 through real FFmpeg on a
+140 BPM / 72 s synthetic track with Stage-3 sections `intro`/`drop`/`verse`/`finale` and three sources, in an isolated scratch build.
+Freestyle OFF gave 47 cuts; ON with every section `Base` gave a **byte-identical** 47; ON with
+`drop=High Energy` + `intro=Cinematic` gave 43 and reproduced exactly on a repeat run. Both renders
+came out at 72.000 s with video and audio streams. Holding a per-section baseline and moving only
+the `drop` rule, the number of other sections that changed was **zero**.
+
+One measured behaviour worth stating because it looks wrong and is not: ruling `drop` at density 65
+or 100 *reduced* that section from 17 cuts to 14. The **global** Cut Density slider does exactly the
+same on the same material (50 → 17; 65/80/100 → 14), so the per-section control faithfully
+reproduces the global one, non-monotonicity included. That discreteness is pre-existing and is
+recorded, not fixed.
+
+New files: `src/beatsync_fork/freestyle.py` (stdlib-only; imports `creative` and `presets` and
+nothing else) and `tests/test_freestyle.py`, which owns the record's own contract — the derived field
+registry, the two unreachable controls, the `SECTION_TYPES` pin against the real
+`stage3_sections.classify_section`, the preset projection, the identity-preserving composition and
+the two read-outs. `ui_content` supplies the `Freestyle:` label for the success panel, exactly as it
+does `Creative variation:`, so `describe()` stays a bare list of resolved numbers and reads correctly
+inside the Stage-4 console line too. `tests/test_library_preparation.py`'s frozen render-request list
+gained the eleven appended widgets, derived from `freestyle.SECTION_TYPES` rather than retyped; the
+property it protects — no preparation state reaches the render request — is unchanged. Full contract:
+`.claude/rules/freestyle.md`.
+
 ### Added — 2026-10-03 (AI Director V1)
 
 **Describe the edit you want in a sentence; get a reviewable proposal for the seven creative values

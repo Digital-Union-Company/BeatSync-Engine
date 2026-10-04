@@ -33,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
 
+from beatsync_fork import freestyle as fork_freestyle
 from beatsync_fork import library_prep as lp
 from beatsync_fork import progress as fork_progress
 
@@ -988,10 +989,17 @@ def _click_kwargs(tree: ast.Module, button: str) -> Dict[str, ast.AST]:
 #: layer onto. All of them are render-request state, not preparation state — which is the property
 #: the assertions below actually care about, and which is asserted directly as well so this list
 #: staying in step with the GUI never becomes the only thing being checked.
-#: The exact render request. Amended when Audio Layers (D) added five voice widgets and again when
+#: The exact render request. Amended when Audio Layers (D) added five voice widgets, again when
 #: Smart Mix (E) added four SFX *config* widgets — the Smart Mix report is an output and is
-#: deliberately absent. The property these two tests protect is unchanged and still asserted
-#: directly below: **no preparation state reaches the render request.**
+#: deliberately absent — and again when Freestyle V1 appended its eleven live widgets at the very
+#: end. The property these two tests protect is unchanged and still asserted directly below:
+#: **no preparation state reaches the render request.**
+#:
+#: Freestyle's widgets are render-request state in exactly the sense this list is about: they are
+#: read at click time and describe the edit to produce, not which library has been prepared. They
+#: sit **last** on purpose, so every pre-existing entry keeps its own index and Gradio's positional
+#: matching against the guard signature is untouched. The ten section dropdowns are derived from
+#: `freestyle.SECTION_TYPES` rather than retyped, so the GUI's order and this list cannot drift.
 _RENDER_CLICK_INPUTS = [
     "audio_input",
     "voice_files", "voice_start_delay", "voice_min_gap", "voice_avoid_drops",
@@ -1002,7 +1010,8 @@ _RENDER_CLICK_INPUTS = [
     "cut_density", "energy_response", "motion_bias", "source_diversity", "micro_cuts",
     "semantic_emphasis",
     "session_state", "source_state",
-]
+    "freestyle_enabled",
+] + [f"freestyle_{name}" for name in fork_freestyle.SECTION_TYPES]
 
 
 def test_i_the_render_click_inputs_carry_no_preparation_state():

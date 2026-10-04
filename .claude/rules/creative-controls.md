@@ -100,6 +100,31 @@ what those numbers *mean*, and no stage learns that a Director exists. Generate 
 execution widget at all. The full contract, including the measured one-shot invocation and why
 `CreativeRecipe.from_mapping` is reused unmodified, is `.claude/rules/director.md`.
 
+**Freestyle V1 is not an eighth control either — it is the first thing that makes five of these
+seven values stop being global.** Presets, Variant Lab and the Director are all *producers* of one
+global seven-value recipe. Freestyle is orthogonal to all three: it declares a sparse, per-**section**
+delta applied on top of whatever the sliders currently hold.
+
+```
+THE SEED + SIX SLIDERS   = the global base, still the sole execution truth
+A FREESTYLE RULE         = a per-SECTION override of five of them, resolved at render time
+    cut_density · semantic_emphasis · energy_response · motion_bias · source_diversity
+STILL EXACTLY ONE EACH   = the Variation Seed, and Micro Cuts
+```
+
+Two consequences for this table. **Cut Density's owner becomes "Stage 4, per section"**: configs are
+derived per distinct effective density and the global `final_wave_cleanup` is replaced by a
+section-scoped cleanup plus a boundary pass, because its density band is computed from the global
+beat count. And **Stage 6's static/dynamic split is now load-bearing twice over**: `ScoringControls`
+becomes a per-*segment* value and the L1A table grows a key dimension
+(`(ScoringControls, target)`, built lazily), while Source Diversity stays threaded separately exactly
+because it reads the running `usage` counter. A control moved into the wrong half would now become a
+table key per section rather than once per render.
+
+`beat_info["freestyle"]` is the bus key, with one reader per stage. Changing a rule **re-plans and
+never re-analyses**, and nothing about a rule reaches Stage-5 identity. Full contract:
+`.claude/rules/freestyle.md`.
+
 **Stage 6 has two halves and the split is load-bearing.** Semantic Emphasis, Energy Response and
 Motion Bias are *static* — they depend on (candidate, target) only, so they live in the L1A
 precompute table.
@@ -392,3 +417,10 @@ There is **no stage cache in this PR**. The intended ownership when one is built
 
 Only the two Stage-4 controls invalidate Stage 4 — and both still reuse the Stage-5 library
 completely, which is the whole reason this boundary is worth having.
+
+**A Freestyle rule inherits the row of whichever control it overrides**, and that is the point of
+having written this table before the feature existed: a rule that sets only `motion_bias` would reuse
+Stages 1–5 and re-run Stage 6; a rule that sets `cut_density` would also re-run Stage 4. A
+declaration whose rules all land on the base density is *already* treated as a global render by Stage
+4's uniform short-circuit, so an L2 key derived from the **resolved** per-section values — not from
+whether the checkbox is ticked — would reuse correctly with no extra machinery.

@@ -27,6 +27,8 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `stage5-reporting.md` | `src/video_analysis.py`, `tests/test_stage5_reporting_truth.py`, `tests/test_qwen_scalar_boundary.py` |
 | `creative-controls.md` | `src/beatsync_fork/{creative,variation,deterministic_view}.py`, `src/auto_mode/stage{4,6}*.py` + their tests |
 | `creative-presets.md` | `src/beatsync_fork/presets.py`, `tests/test_creative_presets.py` |
+| `freestyle.md` | `src/beatsync_fork/freestyle.py`, `tests/test_freestyle.py` |
+| `director.md` | `src/beatsync_fork/director.py`, `tests/test_director.py` |
 | `variant-lab.md` | `src/beatsync_fork/{variant_lab,creative_recipe}.py` + their tests |
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `progress-events.md` | `src/beatsync_fork/{progress,progress_view,qwen_progress}.py`, `tests/test_progress_*.py`, `tests/test_gui_progress_seam.py` |

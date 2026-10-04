@@ -448,3 +448,39 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
   stage cache, no shortlist, no rendered gallery, no Qwen or cache-contract change.
   `variant_batch.py` is untouched too and keeps its own render ban at full strength — that guard
   is what holds the generation/render module split honest.
+
+## The boundary against Freestyle (Freestyle V1)
+
+Freestyle and the Variant Lab both sit above the six sliders, so the thing worth stating is that
+they do not know about each other:
+
+```
+VARIANT LAB  ->  resolves seven GLOBAL values from a master seed, ranges and a spread
+FREESTYLE    ->  declares per-SECTION rules that modulate five of them at render time
+```
+
+A rule is not a recipe, a recipe is not a rule, and neither is an input to the other. The guard is
+asserted in **both directions at once**, which is what makes it load-bearing rather than a word list:
+
+- **`variant_lab.py` and `creative_recipe.py` know nothing about Freestyle**, and that ban keeps full
+  strength — `test_the_frozen_resolvers_know_nothing_about_multi_variant_generation` already bans the
+  word there. `CreativeRecipe` carries no section concept at all; a per-section field on it would
+  make a recipe undeliverable to the sliders it exists to write.
+- **`freestyle.py` knows nothing about the lab** — no `variant`, `master_seed`, `spread`,
+  `ControlRange`, `rng_for`, `resolve_audio` or `hashlib`.
+- **No Freestyle name is an RNG stream name.** The six creative fields and `AUDIO_CONTROL_FIELDS` are
+  frozen stream names because renaming one re-keys that control for every master seed a user wrote
+  down. Freestyle adds **no stream**: a rule is a declaration the user made, not something the lab
+  resolves. `variant_lab.py` still declares exactly the four domains `clips`, `controls`, `audio`,
+  `batch`, pinned as an exact set — the same discipline that made R1 remove C3's unused `"display"`
+  domain rather than register it.
+- **No lab or Director handler writes a Freestyle widget.** `generate_variants_btn.click`,
+  `apply_variant_btn.click` and `apply_director_btn.click` all write none: a candidate or a proposal
+  is seven *global* integers and has no opinion about section rules, so Apply must not silently reset
+  them.
+- **C3-R0 freezes one declaration per batch.** Freestyle is shared render intent, so the tuple is
+  built **once, before** the candidate loop, exactly like every other shared render input — and a
+  test pins that by line position, because the loop sits inside the lock-holding `try` and a nesting
+  comparison would miss it. Both render wrappers take the identical eleven appended parameters.
+
+Full contract: `.claude/rules/freestyle.md`.

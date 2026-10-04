@@ -23,6 +23,9 @@ from collections import Counter, deque
 
 import pytest
 
+from beatsync_fork import creative as fork_creative
+from beatsync_fork import freestyle as fork_freestyle
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PLANNER_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py")
 
@@ -522,3 +525,527 @@ def test_the_penalty_constants_are_unchanged(planner):
                   "min(0.18, usage[video_file] * 0.012)", "required_source * 0.55",
                   "score -= 0.18"):
         assert token in adjusted, token
+
+
+# ======================================================================================
+# 10. FREESTYLE V1 — PER-SECTION SCORING ON TOP OF L1A
+# ======================================================================================
+#
+# Four of Freestyle's five controls are Stage-6 controls, and three of those four
+# (Semantic Emphasis, Energy Response, Motion Bias) live in the L1A static table. Making them
+# per-section therefore turns `ScoringControls` from a render constant into a per-segment value,
+# which is exactly the refactor L1A was written to survive:
+#
+#     before   candidates × distinct targets                        (one controls value)
+#     after    candidates × distinct (controls, target) pairs        LAZILY, on first use
+#     never    candidates × segments                                (the pre-L1A shape)
+#
+# Source Diversity stays out of the table, because it reads the running `usage` counter — the
+# split creative-controls.md calls load-bearing. It is threaded per segment instead.
+
+
+def _freestyle_beat_info(seed=None, candidates=None, declaration=None):
+    info = _beat_info(seed, candidates=candidates)
+    if declaration is not None:
+        info["freestyle"] = declaration
+    return info
+
+
+def _declaration(enabled=True, **styles):
+    return fork_freestyle.FreestyleDeclaration.from_styles(enabled, styles)
+
+
+def _rules(**by_type):
+    """A declaration built straight from `SectionOverride`s, so a test can set one field."""
+    ordered = tuple(
+        (section_type, override)
+        for section_type, override in sorted(
+            by_type.items(), key=lambda kv: fork_freestyle.SECTION_TYPES.index(kv[0])))
+    return fork_freestyle.FreestyleDeclaration(enabled=True, overrides=ordered)
+
+
+def _freestyle_plan(planner, seed=None, declaration=None, candidates=None):
+    return planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(seed, candidates, declaration), video_files=[])
+
+
+#: The fixture's four sections, all real Stage-3 types.
+_FIXTURE_SECTION_TYPES = ("intro", "verse", "bridge", "drop")
+
+
+def test_the_fixture_sections_are_real_stage_3_types():
+    """Otherwise a rule would never match and every assertion below would be vacuous."""
+    for section_type in _FIXTURE_SECTION_TYPES:
+        assert section_type in fork_freestyle.SECTION_TYPES, section_type
+
+
+# --- inactive is byte-identical ----------------------------------------------------------
+
+
+def test_an_absent_declaration_plans_exactly_as_before(planner):
+    assert _ids(_freestyle_plan(planner, 0)) == _ids(_plan(planner, 0))
+
+
+@pytest.mark.parametrize("value", [None, 42, "drop", {}, [], object()])
+def test_a_foreign_declaration_on_the_bus_plans_exactly_as_before(planner, value):
+    """One reader, total. A stale or foreign `beat_info["freestyle"]` takes the global path rather
+    than failing a render."""
+    info = _beat_info(0)
+    info["freestyle"] = value
+    plan = planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS, beat_info=info, video_files=[])
+    assert _ids(plan) == _ids(_plan(planner, 0))
+
+
+def test_a_disabled_declaration_plans_exactly_as_before(planner):
+    """Rules are retained while the checkbox is off, so "has rules" is not permission to use
+    them — the same gate Stage 4 enforces."""
+    declaration = _declaration(False, drop="High Energy", intro="Cinematic")
+    assert declaration.overrides, "the rules are still recorded"
+    assert _ids(_freestyle_plan(planner, 0, declaration)) == _ids(_plan(planner, 0))
+
+
+def test_an_enabled_declaration_with_no_rules_plans_exactly_as_before(planner):
+    assert _ids(_freestyle_plan(planner, 0, _declaration(True))) == _ids(_plan(planner, 0))
+
+
+def test_an_all_base_declaration_plans_exactly_as_before(planner):
+    styles = {name: fork_freestyle.BASE_STYLE for name in fork_freestyle.SECTION_TYPES}
+    assert _ids(_freestyle_plan(planner, 0, _declaration(True, **styles))) == _ids(
+        _plan(planner, 0))
+
+
+def test_a_rule_for_a_section_type_the_track_does_not_contain_plans_exactly_as_before(planner):
+    """`outro` is a real Stage-3 type but this fixture has none, so the rule simply never matches.
+    The declaration is active, so the planner does take the heterogeneous path — and must still
+    produce the identical plan, because every section resolves to the base profile."""
+    declaration = _declaration(True, outro="High Energy")
+    assert declaration.is_active()
+    assert _ids(_freestyle_plan(planner, 0, declaration)) == _ids(_plan(planner, 0))
+
+
+def test_the_inactive_path_builds_the_eager_table_not_the_lazy_one(planner):
+    """An inactive declaration must take today's dict comprehension, not a lazy equivalent of it.
+
+    **This has to be asserted structurally, and that is a measured correction rather than a
+    preference.** An evaluation count cannot tell the two apart: with neutral controls the lazy
+    `_table_for` takes its own `_static_base_score` branch and builds exactly one column per
+    distinct target, which is precisely what the eager comprehension builds — so a mutation
+    replacing `declaration.is_active()` with a bare `isinstance` check *survived* a count-based
+    version of this test. The numbers agreeing is good news for robustness and useless as a guard.
+
+    What is actually load-bearing is the gate itself: `freestyle_active` must come from
+    `is_active()`, so "Freestyle off" is one decision shared with Stage 4 rather than two stages
+    each guessing.
+    """
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_PLANNER_PATH)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "build_planned_clip_sequence")
+
+    assigns = [node for node in ast.walk(fn)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "freestyle_active"
+                       for t in node.targets)]
+    assert len(assigns) == 1, f"{len(assigns)} assignments to freestyle_active"
+    assert ast.unparse(assigns[0].value) == "declaration.is_active()", (
+        ast.unparse(assigns[0].value))
+
+    # ...and the eager global branch is still a dict comprehension over distinct targets, not a
+    # lazy table with neutral controls standing in for it.
+    body = ast.unparse(fn)
+    assert "base_scores_by_target = {" in body, "the eager global table is gone"
+    assert "elif controls.is_neutral:" in body, "the neutral global branch is gone"
+
+
+# --- active rules actually change the plan -----------------------------------------------
+
+
+def test_a_per_section_rule_changes_the_plan(planner):
+    """Non-vacuity for everything below."""
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100,
+                                                             semantic_emphasis=0))
+    assert _ids(_freestyle_plan(planner, 0, declaration)) != _ids(_plan(planner, 0))
+
+
+def test_a_rule_on_one_section_leaves_the_other_sections_choices_alone(planner):
+    """Scoring is per-segment and the candidate pool is shared, so the honest claim is bounded:
+    the segments inside the ruled section may change, and the segments *before* it cannot — the
+    `usage`/`recent_*` state they saw was identical. Later segments legitimately may, because the
+    global usage counter has by then seen different winners, which is the intended behaviour of a
+    diversity-aware planner rather than a leak."""
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100))
+    base = _plan(planner, 0)
+    ruled = _freestyle_plan(planner, 0, declaration)
+
+    # `audio_start` is the position on the audio timeline; `start_time` is the offset inside the
+    # source video, which has nothing to do with which section a segment belongs to.
+    before = [item for item in base if item["audio_start"] < 12.0]
+    before_ruled = [item for item in ruled if item["audio_start"] < 12.0]
+    assert len(before) >= 8, "the fixture must have segments ahead of the ruled section"
+    assert [i["candidate_id"] for i in before] == [i["candidate_id"] for i in before_ruled]
+
+
+def test_two_different_rules_produce_two_different_plans(planner):
+    first = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100))
+    second = _rules(drop=fork_freestyle.SectionOverride(motion_bias=0))
+    assert _ids(_freestyle_plan(planner, 0, first)) != _ids(_freestyle_plan(planner, 0, second))
+
+
+def test_a_freestyle_plan_is_reproducible(planner):
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100, energy_response=20))
+    first = _ids(_freestyle_plan(planner, 0, declaration))
+    second = _ids(_freestyle_plan(planner, 0, declaration))
+    assert first == second
+
+
+def test_freestyle_state_cannot_leak_between_plans(planner):
+    """Interleaved: a Freestyle plan must not survive into the next global one."""
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100))
+    baseline = _ids(_plan(planner, 0))
+    _freestyle_plan(planner, 0, declaration)
+    assert _ids(_plan(planner, 0)) == baseline
+
+
+# --- the table shape: lazy, keyed by (controls, target) ----------------------------------
+
+
+def _count_effective(planner, monkeypatch):
+    """Spy on every static-score entry point the table can use."""
+    calls: list[tuple] = []
+    for name in ("_static_base_score", "_effective_base_score", "_semantic_adjusted_score"):
+        real = getattr(planner, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            calls.append((_name, args[1] if len(args) > 1 else None))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(planner, name, spy)
+    return calls
+
+
+def _columns(calls, plan, pool):
+    """Candidates-wide table columns, from the spy log.
+
+    `_effective_base_score` is the only entry point that builds a modified column, and it also
+    calls `_static_base_score` internally — so counting both double-counts the same work and makes
+    a heterogeneous render look like a regression. `_materialize_clip` additionally scores the one
+    winning candidate per segment through the same function, which is pre-existing and must be
+    subtracted before the remainder is divided into columns.
+    """
+    table = len([c for c in calls if c[0] == "_effective_base_score"]) - len(plan)
+    return max(0, table) / len(pool)
+
+
+def test_the_table_is_bounded_by_distinct_pairs_and_never_exceeds_the_segment_count(planner,
+                                                                                    monkeypatch):
+    """The load-bearing L1A property, restated for the heterogeneous case.
+
+    Four sections with four *different* rules is the worst case this fixture can express. Because
+    the table is built **lazily**, the column count is bounded by
+    `min(distinct controls × distinct targets, segments)` — a segment that asks for a column it has
+    already paid for gets the cached one, and a pair no segment asks for is never built at all. So
+    the work can never reach the pre-L1A `candidates × segments` shape even when the pair space is
+    larger than the timeline.
+    """
+    pool = _pool()
+    declaration = _rules(
+        intro=fork_freestyle.SectionOverride(motion_bias=10),
+        verse=fork_freestyle.SectionOverride(motion_bias=30),
+        bridge=fork_freestyle.SectionOverride(motion_bias=70),
+        drop=fork_freestyle.SectionOverride(motion_bias=100),
+    )
+    calls = _count_effective(planner, monkeypatch)
+    plan = planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+
+    assert plan, "the plan must be non-empty for this to mean anything"
+    columns = _columns(calls, plan, pool)
+    distinct_targets = len({item["target"] for item in plan})
+    assert columns <= len(plan), (
+        f"{columns:.1f} columns for {len(plan)} segments — the table is per-segment")
+    assert columns <= 4 * distinct_targets, (
+        f"{columns:.1f} columns exceeds 4 distinct controls × {distinct_targets} targets")
+
+
+def test_the_table_caches_across_every_segment_sharing_controls_and_target(planner, monkeypatch):
+    """The key is `(ScoringControls, target)`, so the column count must track **distinct pairs**,
+    never segments.
+
+    One rule applied to all four section types gives one controls value across sixteen segments.
+    If the lazy table keyed on the segment — or forgot to cache — this would cost sixteen
+    candidates-wide columns instead of one per distinct target.
+    """
+    pool = _pool()
+    same = fork_freestyle.SectionOverride(motion_bias=100)
+    declaration = _rules(**{name: same for name in _FIXTURE_SECTION_TYPES})
+
+    calls = _count_effective(planner, monkeypatch)
+    plan = planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+
+    distinct_targets = len({item["target"] for item in plan})
+    columns = [c for c in calls if c[0] == "_effective_base_score"]
+    # One column per distinct target, plus `_materialize_clip`'s one diagnostic score per segment.
+    assert len(columns) == len(pool) * distinct_targets + len(plan), (
+        f"{len(columns)} evaluations for {distinct_targets} distinct targets over "
+        f"{len(plan)} segments")
+    assert len(columns) < len(pool) * len(plan), "the table is per-segment, not per-pair"
+    assert distinct_targets >= 3, "the fixture must reach several targets for this to bite"
+
+
+def test_equal_section_controls_collapse_to_one_table_key(planner):
+    """The dedup *mechanism*, asserted where it actually lives.
+
+    Column count cannot show this on the fixture above — each of its four sections resolves to a
+    distinct target, so even perfectly deduped controls still need four columns. What makes two
+    sections share a column is that `ScoringControls` is a frozen dataclass of three
+    `float | None`: hashable, and equal by value. So two independently resolved profiles that land
+    on the same three numbers produce the *same dict key*, and no new score-table identity type
+    was invented to achieve it.
+    """
+    base = fork_creative.CreativeProfile(cut_density=40, motion_bias=35, semantic_emphasis=45,
+                                         energy_response=55, source_diversity=60)
+    same = fork_freestyle.SectionOverride(motion_bias=100)
+    first = fork_freestyle.effective_profile(
+        base, "drop", _rules(drop=same)).scoring_controls()
+    second = fork_freestyle.effective_profile(
+        base, "intro", _rules(intro=same)).scoring_controls()
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert len({(first, "drop"), (second, "drop")}) == 1, "the two did not collapse to one key"
+    # ...and a different rule must NOT collapse onto them.
+    other = fork_freestyle.effective_profile(
+        base, "drop", _rules(drop=fork_freestyle.SectionOverride(motion_bias=20))
+    ).scoring_controls()
+    assert other != first
+    assert len({(first, "drop"), (other, "drop")}) == 2
+
+
+def test_source_diversity_alone_builds_no_score_table(planner, monkeypatch):
+    """Source Diversity is dynamic and must stay out of the table — the split creative-controls.md
+    calls load-bearing, because a control in the wrong half is one refactor away from becoming a
+    table key.
+
+    A rule that moves only Source Diversity must therefore build **no candidates-wide column** of
+    modified scores: its `ScoringControls` is neutral, so `_table_for` takes the
+    `_static_base_score` branch. `_materialize_clip` still records one diagnostic score per
+    *segment* through the effective scorer, which is pre-existing and deliberate — so the bound is
+    "per segment", and anything candidates-wide would blow straight through it.
+    """
+    pool = _pool()
+    declaration = _rules(drop=fork_freestyle.SectionOverride(source_diversity=100))
+    calls = _count_effective(planner, monkeypatch)
+    plan = planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+
+    assert not [c for c in calls if c[0] == "_semantic_adjusted_score"], (
+        "a diversity-only rule built a flow column")
+    effective = [c for c in calls if c[0] == "_effective_base_score"]
+    assert len(effective) <= len(plan), (
+        f"{len(effective)} modified-score evaluations for {len(plan)} segments — a "
+        f"diversity-only rule built a candidates-wide table")
+    assert len(effective) < len(pool), "the table is candidates-wide; diversity entered L1A"
+
+
+def test_source_diversity_alone_still_changes_the_plan(planner):
+    """The calibration for the test above: cheap must not mean inert."""
+    declaration = _rules(drop=fork_freestyle.SectionOverride(source_diversity=100))
+    assert _ids(_freestyle_plan(planner, 0, declaration)) != _ids(_plan(planner, 0))
+
+
+def test_the_deterministic_views_are_built_once_for_the_whole_call(planner, monkeypatch):
+    """They depend on the CANDIDATE only, never on the control values, so several distinct
+    Semantic Emphasis rules must not rebuild them per rule. This is the one genuinely expensive
+    part of Semantic Emphasis."""
+    pool = _pool()
+    calls = []
+    real = planner.fork_deterministic.deterministic_candidate_view
+
+    def spy(candidate):
+        calls.append(id(candidate))
+        return real(candidate)
+
+    monkeypatch.setattr(planner.fork_deterministic, "deterministic_candidate_view", spy)
+    declaration = _rules(
+        intro=fork_freestyle.SectionOverride(semantic_emphasis=0),
+        verse=fork_freestyle.SectionOverride(semantic_emphasis=20),
+        bridge=fork_freestyle.SectionOverride(semantic_emphasis=80),
+        drop=fork_freestyle.SectionOverride(semantic_emphasis=100),
+    )
+    planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+
+    assert len(calls) == len(pool), (
+        f"{len(calls)} view builds for {len(pool)} candidates across four distinct rules")
+
+
+def test_no_deterministic_view_is_built_when_no_rule_needs_one(planner, monkeypatch):
+    pool = _pool()
+    calls = []
+    real = planner.fork_deterministic.deterministic_candidate_view
+    monkeypatch.setattr(planner.fork_deterministic, "deterministic_candidate_view",
+                        lambda candidate: (calls.append(1), real(candidate))[1])
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100))
+    planner.build_planned_clip_sequence(
+        cut_times=_CUTS, segment_durations=_DURATIONS,
+        beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+    assert calls == []
+
+
+# --- the seed and the running state stay global ------------------------------------------
+
+
+def test_the_seed_stays_global_under_freestyle(planner):
+    """`_stable_rng(seed, index, target, start)` keeps the exact stream it has always had: there is
+    no per-section seed, so two renders differing only in seed must differ, and the same seed must
+    reproduce — both already asserted — while the *declaration* is what varies independently."""
+    declaration = _rules(drop=fork_freestyle.SectionOverride(motion_bias=100))
+    assert _ids(_freestyle_plan(planner, 0, declaration)) != _ids(
+        _freestyle_plan(planner, 101, declaration))
+
+
+def test_freestyle_adds_no_seed_concept_to_the_planner():
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    for forbidden in ("section_seed", "per_section_seed", "freestyle_seed", "seed_for_section"):
+        assert forbidden not in source, forbidden
+
+
+def test_usage_and_recency_are_one_global_state_not_per_section(planner):
+    """A per-section `usage` counter would let the same candidate be reused once per section, which
+    is the opposite of what the repeat penalties exist for. Asserted on the outcome: no candidate
+    may appear twice in a plan whose pool is large enough to avoid it."""
+    declaration = _rules(
+        intro=fork_freestyle.SectionOverride(source_diversity=100),
+        drop=fork_freestyle.SectionOverride(source_diversity=0),
+    )
+    plan = _freestyle_plan(planner, 0, declaration, candidates=_pool(96))
+    ids = _ids(plan)
+    assert len(ids) == len(set(ids)), "a candidate was reused across sections"
+
+
+def test_the_running_state_is_created_once_before_the_loop():
+    """Structural, from the real source: `usage`, `recent_ids` and `recent_videos` must be
+    initialised outside the segment loop even on the Freestyle path."""
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_PLANNER_PATH)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "build_planned_clip_sequence")
+
+    loop = next(n for n in fn.body if isinstance(n, ast.For))
+    inside = ast.unparse(loop)
+    for name in ("recent_ids = deque", "recent_videos = deque", "usage = Counter"):
+        assert name not in inside, f"{name} is initialised inside the segment loop"
+    body = ast.unparse(fn)
+    for name in ("recent_ids = deque", "recent_videos = deque", "usage = Counter"):
+        assert name in body, name
+
+
+def test_no_adjacent_segment_repeats_under_freestyle(planner):
+    declaration = _rules(
+        intro=fork_freestyle.SectionOverride(motion_bias=100),
+        drop=fork_freestyle.SectionOverride(motion_bias=0),
+    )
+    ids = _ids(_freestyle_plan(planner, 101, declaration))
+    assert all(a != b for a, b in zip(ids, ids[1:])), "an adjacent candidate repeat appeared"
+
+
+# --- isolation ---------------------------------------------------------------------------
+
+
+def test_the_planner_has_exactly_one_reader_of_the_freestyle_key():
+    """One reader for one bus key, exactly as `creative_profile` is the one reader of `creative`."""
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_PLANNER_PATH)
+    readers = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "freestyle"):
+            readers.append(ast.unparse(node))
+    assert len(readers) == 1, f"expected one reader of beat_info['freestyle'], got {readers}"
+
+
+def test_the_planner_never_mutates_the_declaration():
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    for forbidden in ("declaration.enabled =", "declaration.overrides =",
+                      "beat_info['freestyle'] =", 'beat_info["freestyle"] ='):
+        assert forbidden not in source, forbidden
+
+
+def test_freestyle_reaches_no_cache_identity_from_the_planner():
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert "CACHE_CONTRACT_VERSION" not in source
+    assert "ANALYSIS_VERSION" not in source
+    # The identity *functions*, not the word "Qwen" — which legitimately appears in comments
+    # explaining that Semantic Emphasis reinterprets what Stage 5 already persisted.
+    for forbidden in ("_video_signature", "_cache_path", "_qwen_config_token"):
+        assert forbidden not in source, forbidden
+
+
+def test_the_lazy_table_is_invocation_local():
+    """No module-level memo may survive between renders — the same rule L1A already carries."""
+    with open(_PLANNER_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=_PLANNER_PATH)
+    module_assigns = {t.id for n in tree.body if isinstance(n, ast.Assign)
+                      for t in n.targets if isinstance(t, ast.Name)}
+    for name in module_assigns:
+        assert "base_scores" not in name, name
+        assert "resolved_by_type" not in name, name
+        assert "flow_by_controls" not in name, name
+
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "build_planned_clip_sequence")
+    body = ast.unparse(fn)
+    for forbidden in ("lru_cache", "functools.cache", "global "):
+        assert forbidden not in body, forbidden
+
+
+# ======================================================================================
+# 11. FREESTYLE STAGE-6 DIAGNOSTIC (captured by default)
+# ======================================================================================
+
+
+def test_practical_diagnostic_freestyle_table_cost(planner, monkeypatch):
+    """The measured shape, readable::
+
+        python -m pytest tests/test_stage6_score_precompute.py -s -k practical_diagnostic_freestyle
+    """
+    pool = _pool()
+    scenarios = {
+        "global (no freestyle)": None,
+        "1 rule": _rules(drop=fork_freestyle.SectionOverride(motion_bias=100)),
+        "2 equal rules": _rules(intro=fork_freestyle.SectionOverride(motion_bias=100),
+                                drop=fork_freestyle.SectionOverride(motion_bias=100)),
+        "4 distinct rules": _rules(
+            intro=fork_freestyle.SectionOverride(motion_bias=10),
+            verse=fork_freestyle.SectionOverride(motion_bias=30),
+            bridge=fork_freestyle.SectionOverride(motion_bias=70),
+            drop=fork_freestyle.SectionOverride(motion_bias=100)),
+    }
+    lines = []
+    for label, declaration in scenarios.items():
+        calls = _count_effective(planner, monkeypatch)
+        plan = planner.build_planned_clip_sequence(
+            cut_times=_CUTS, segment_durations=_DURATIONS,
+            beat_info=_freestyle_beat_info(0, pool, declaration), video_files=[])
+        neutral = (len([c for c in calls if c[0] == "_static_base_score"]) - len(plan)) / len(pool)
+        modified = _columns(calls, plan, pool)
+        lines.append(f"  {label:24s} {neutral:5.1f} neutral + {modified:4.1f} modified "
+                     f"candidate-wide columns over {len(plan)} segments")
+        monkeypatch.undo()
+
+    print(f"\nStage-6 static-score columns on a {len(pool)}-candidate pool "
+          f"(pre-L1A shape would be {len(_DURATIONS)} columns, one per segment):\n"
+          + "\n".join(lines))
+    assert len(lines) == 4
