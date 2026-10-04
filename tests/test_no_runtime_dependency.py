@@ -103,6 +103,10 @@ def test_fork_modules_import_only_stdlib():
 
     allowed = {
         "__future__",
+        # `copy` arrived with L2 V1: `stage_cache.py`'s defensive deep copying on both PUT and GET is
+        # what stops two renders sharing one mutable bundle, so it is a contract rather than a
+        # convenience (`.claude/rules/l2-stage-cache.md`). Still stdlib, still no runtime dependency.
+        "copy",
         "hashlib",
         "json",
         "os",
