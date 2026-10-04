@@ -29,6 +29,9 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
@@ -50,16 +53,18 @@ _FUNCS = (
     "_backend_component_token", "_llama_version_token", "_resolve_qwen_backend_paths",
     "_qwen_backend_available", "_qwen_backend_model_path", "_qwen_backend_signature_token",
     "_qwen_config_token", "_video_signature", "_cache_path",
+    "_cache_identity_workers", "_compute_cache_paths_parallel",
     "_same_source", "_is_count", "_stored_ai_cache_is_consistent",
     "_deterministic_analysis_completed", "_cache_entry_is_complete", "_load_cache",
     "classify_library_sources",
 )
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_FINGERPRINT_CHUNK",
            "_FINGERPRINT_WHOLE_FILE_LIMIT", "_FINGERPRINT_DIGEST_SIZE", "_NO_AI_CONFIG_TOKEN",
-           "_DETERMINISTIC_SCORING_KEY", "_PREP_PHASE")
+           "_DETERMINISTIC_SCORING_KEY", "_PREP_PHASE", "_CACHE_IDENTITY_WORKER_CAP")
 
 _QWEN_ENV = ("BEATSYNC_QWEN_MAX_WINDOWS", "BEATSYNC_QWEN_FRAME_WIDTH",
              "BEATSYNC_QWEN_MAX_NEW_TOKENS")
+_IDENTITY_WORKERS_ENV = "BEATSYNC_CACHE_IDENTITY_WORKERS"
 _SECOND = 1_700_000_000_000_000_000
 
 
@@ -109,7 +114,8 @@ def _load(root: str, cache_dir: str) -> Dict[str, Any]:
         os.makedirs(directory, exist_ok=True)
 
     namespace: Dict[str, Any] = {
-        "os": os, "json": json, "hashlib": hashlib, "subprocess": subprocess, "time": __import__("time"),
+        "os": os, "json": json, "hashlib": hashlib, "subprocess": subprocess, "time": time,
+        "ThreadPoolExecutor": ThreadPoolExecutor, "as_completed": as_completed,
         "Any": Any, "Dict": Dict, "Iterable": Iterable, "List": List, "Sequence": Sequence,
         "__builtins__": __builtins__,
         "ROOT_DIR": root,
@@ -156,8 +162,9 @@ def _write(path: str, byte: bytes, size: int, mtime_ns: int = _SECOND) -> str:
 
 @pytest.fixture(autouse=True)
 def _clean_qwen_env():
-    saved = {name: os.environ.get(name) for name in _QWEN_ENV}
-    for name in _QWEN_ENV:
+    names = _QWEN_ENV + (_IDENTITY_WORKERS_ENV,)
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
         os.environ.pop(name, None)
     yield
     for name, value in saved.items():
@@ -526,28 +533,48 @@ def test_c_a_second_scan_recomputes_identity(va, tmp_path):
     assert calls["n"] == 2
 
 
-def test_c_every_cache_path_call_receives_the_invocation_tokens():
+def test_c_the_identity_phase_receives_the_invocation_tokens():
+    """L1B moved the per-source `_cache_path` call into the shared bounded helper, so the classifier
+    must thread the invocation tokens into *that* — and must not reach `_cache_path` itself, which
+    would reintroduce a second, possibly untokened identity path."""
     fn = _func(_tree(_VA), "classify_library_sources")
-    calls = _calls_named(fn, "_cache_path")
-    assert calls, "the classifier must use _cache_path"
-    for call in calls:
-        rendered = ast.unparse(call)
-        assert "backend_token=invocation_backend_token" in rendered, rendered
-        assert "config_token=invocation_config_token" in rendered, rendered
-        assert "audio_profile" not in rendered, (
-            "P2: nothing about the music may reach the key formula")
+    assert not _calls_named(fn, "_cache_path"), (
+        "the classifier owns the identity PHASE, not individual _cache_path calls")
+    calls = _calls_named(fn, "_compute_cache_paths_parallel")
+    assert len(calls) == 1, f"exactly one identity phase; found {len(calls)}"
+    rendered = ast.unparse(calls[0])
+    assert "backend_token=invocation_backend_token" in rendered, rendered
+    assert "config_token=invocation_config_token" in rendered, rendered
+    assert "audio_profile" not in rendered, (
+        "P2: nothing about the music may reach the key formula")
 
     assert len(_calls_named(fn, "_qwen_backend_signature_token")) == 1
     assert len(_calls_named(fn, "_qwen_config_token")) == 1
 
 
-def test_c_the_orchestrator_identity_structure_is_untouched():
-    """This PR must not refactor `analyze_video_sources`' own once-per-invocation block, which its
-    existing suites assert in place."""
-    orchestrator = _func(_tree(_VA), "analyze_video_sources")
-    assert len(_calls_named(orchestrator, "_qwen_backend_signature_token")) == 1
-    assert len(_calls_named(orchestrator, "_qwen_config_token")) == 1
-    assert "ai_cache_disabled" in _body_code(orchestrator)
+def test_c_the_two_callers_share_only_the_per_source_identity_helper():
+    """The invocation-scoped backend/config block is deliberately NOT extracted into a shared
+    orchestration abstraction — each caller keeps its own invocation state, its own
+    `ai_cache_disabled` decision and its own reporting. What is shared is exactly one thing: the
+    bounded per-source identity computation."""
+    tree = _tree(_VA)
+    for name in ("analyze_video_sources", "classify_library_sources"):
+        fn = _func(tree, name)
+        body = _body_code(fn)
+        assert len(_calls_named(fn, "_qwen_backend_signature_token")) == 1, name
+        assert len(_calls_named(fn, "_qwen_config_token")) == 1, name
+        assert "invocation_backend_token" in body, name
+        assert "invocation_config_token" in body, name
+        assert "ai_cache_disabled" in body, name
+        assert len(_calls_named(fn, "_compute_cache_paths_parallel")) == 1, name
+
+    # and no new orchestration seam appeared to hold that state for them
+    helper = _func(tree, "_compute_cache_paths_parallel")
+    helper_body = ast.unparse(helper)
+    for forbidden in ("_qwen_backend_signature_token", "_qwen_config_token",
+                      "_qwen_backend_available", "ai_cache_disabled", "fork_prep"):
+        assert forbidden not in helper_body, (
+            f"invocation-scoped ownership must stay with the callers, not move into {forbidden}")
 
 
 def test_c_the_classifier_has_no_edit_style_input_at_all(va, tmp_path):
@@ -2306,3 +2333,275 @@ def test_k_r1_folder_and_recursive_still_invalidate_after_a_retune():
         assert changed.can_analyze() is False, label
         assert changed.report_text == lp.INTRO_TEXT, label
         assert changed.batch_size == 50, "the chosen batch size still survives an invalidation"
+
+
+# ===========================================================================
+# L1B. THE BOUNDED IDENTITY PHASE INSIDE THE REAL CLASSIFIER
+#
+# The classifier body executed here is the production one, so these are behavioural assertions
+# about the real three-way verdict under concurrency - not about the helper in isolation (that is
+# `tests/test_stage5_cache_identity.py`'s job). What must hold: identical verdicts at every worker
+# count, verdicts attached to the right source, and records still untouched.
+# ===========================================================================
+
+
+_L1B_WORKERS = ("1", "2", "4", "8", "16")
+
+
+def _mixed_library(va, tmp_path):
+    """One of each verdict, so parity is checked across the whole classification vocabulary."""
+    warm = _source(tmp_path, "warm.mp4")
+    _put_record(va, warm, _complete_record(va, warm))
+
+    cold = _source(tmp_path, "cold.mp4", size=5000)
+
+    broken = _source(tmp_path, "broken.mp4", size=5100)
+    deferred = _complete_record(va, broken)
+    deferred["ai_deferred"] = True
+    _put_record(va, broken, deferred)
+
+    missing = os.path.join(str(tmp_path), "library", "gone.mp4")
+
+    sources = [warm, cold, broken, missing]
+    expected = {warm: PREPARED, cold: NEW_OR_CHANGED, broken: INCOMPLETE, missing: UNAVAILABLE}
+    return sources, expected
+
+
+@pytest.mark.parametrize("workers", _L1B_WORKERS)
+def test_l1b_every_verdict_is_identical_at_every_worker_count(va, tmp_path, workers):
+    """The classification vocabulary is unchanged and concurrency cannot alter a verdict."""
+    sources, expected = _mixed_library(va, tmp_path)
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+
+    result = _classify(va, sources)
+
+    assert _verdicts(result) == expected
+    assert result["prepared_count"] == 1
+    assert result["needs_analysis_count"] == 2
+    assert result["unavailable_count"] == 1
+    assert result["cache_lookups"] == 2, "only the two sources with a key file are looked up"
+
+
+@pytest.mark.parametrize("workers", _L1B_WORKERS)
+def test_l1b_classifications_stay_in_submitted_source_order(va, tmp_path, workers):
+    """`classifications` is consumed positionally downstream, so completion order must not leak."""
+    sources = [_source(tmp_path, f"s{i}.mp4", size=4096 + i) for i in range(24)]
+    for index in range(0, 24, 3):
+        _put_record(va, sources[index], _complete_record(va, sources[index]))
+
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+    result = _classify(va, sources)
+
+    assert [item["path"] for item in result["classifications"]] == sources
+    assert [item["status"] for item in result["classifications"]] == [
+        PREPARED[0] if i % 3 == 0 else NEW_OR_CHANGED[0] for i in range(24)]
+
+
+def test_l1b_verdict_order_survives_inverted_completion(va, tmp_path):
+    """Forced, not incidental: the first-submitted source is made the slowest, so an implementation
+    that consumed identity results in completion order would attach every verdict to the wrong
+    source."""
+    sources = [_source(tmp_path, f"o{i}.mp4", size=4096 + i) for i in range(8)]
+    # alternate sources are prepared, so a reordering shows up as a wrong verdict, not just a
+    # wrong path order
+    for index in range(0, 8, 2):
+        _put_record(va, sources[index], _complete_record(va, sources[index]))
+
+    real = va["_cache_path"]
+    lock = threading.Lock()
+    completed = []
+
+    def staggered(path, *args, **kwargs):
+        index = sources.index(path)
+        time.sleep(0.02 * (len(sources) - index))
+        result = real(path, *args, **kwargs)
+        with lock:
+            completed.append(index)
+        return result
+
+    va["_cache_path"] = staggered
+    os.environ[_IDENTITY_WORKERS_ENV] = "8"
+    result = _classify(va, sources)
+
+    assert completed == sorted(completed, reverse=True), (
+        f"the fixture failed to invert completion order: {completed}")
+    assert [item["path"] for item in result["classifications"]] == sources
+    assert _verdicts(result) == {
+        path: (PREPARED if i % 2 == 0 else NEW_OR_CHANGED) for i, path in enumerate(sources)}
+
+
+def test_l1b_a_duplicate_source_path_stays_two_classifications(va, tmp_path):
+    """Keying identity results by path would collapse these; position is the authority."""
+    warm = _source(tmp_path, "dup.mp4")
+    _put_record(va, warm, _complete_record(va, warm))
+    other = _source(tmp_path, "other.mp4", size=5000)
+
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    result = _classify(va, [warm, other, warm])
+
+    items = result["classifications"]
+    assert [item["path"] for item in items] == [warm, other, warm]
+    assert [(item["status"], item["reason"]) for item in items] == [
+        PREPARED, NEW_OR_CHANGED, PREPARED]
+    assert result["source_count"] == 3
+    assert result["prepared_count"] == 2, "both positions count"
+
+
+@pytest.mark.parametrize("workers", _L1B_WORKERS)
+def test_l1b_classification_still_mutates_no_cache_record(va, tmp_path, workers):
+    """The read-only guarantee is not weakened by concurrency: no record created, updated or removed."""
+    sources, _expected = _mixed_library(va, tmp_path)
+    before = _record_snapshot(va["_CACHE"])
+
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+    _classify(va, sources)
+
+    assert _record_snapshot(va["_CACHE"]) == before
+
+
+def test_l1b_backend_and_config_identity_stay_once_per_scan_under_parallelism(va, tmp_path):
+    """The whole point of threading the tokens in: N backend fingerprints was measured at 61.7
+    minutes for 702 sources, and a worker computing its own would restore exactly that."""
+    calls = {"backend": 0, "config": 0}
+    real_backend = va["_qwen_backend_signature_token"]
+    real_config = va["_qwen_config_token"]
+
+    def counting_backend(*args, **kwargs):
+        calls["backend"] += 1
+        return real_backend(*args, **kwargs)
+
+    def counting_config(*args, **kwargs):
+        calls["config"] += 1
+        return real_config(*args, **kwargs)
+
+    va["_qwen_backend_signature_token"] = counting_backend
+    va["_qwen_config_token"] = counting_config
+
+    sources = [_source(tmp_path, f"b{i}.mp4", size=4096 + i) for i in range(24)]
+    os.environ[_IDENTITY_WORKERS_ENV] = "16"
+    result = _classify(va, sources)
+
+    assert result["source_count"] == 24
+    assert calls == {"backend": 1, "config": 1}
+
+
+def test_l1b_the_identity_phase_is_bounded_inside_the_real_classifier(va, tmp_path):
+    sources = [_source(tmp_path, f"c{i}.mp4", size=4096 + i) for i in range(32)]
+    real = va["_cache_path"]
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
+    def watched(path, *args, **kwargs):
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        try:
+            time.sleep(0.004)
+            return real(path, *args, **kwargs)
+        finally:
+            with lock:
+                state["live"] -= 1
+
+    va["_cache_path"] = watched
+    result = _classify(va, sources)
+
+    assert result["source_count"] == 32
+    assert 1 < state["peak"] <= va["_CACHE_IDENTITY_WORKER_CAP"] == 16, state["peak"]
+    assert state["live"] == 0
+
+
+def test_l1b_record_loading_is_not_concurrent(va, tmp_path):
+    """`_load_cache` and the verdict construction stay serial: exactly one record is ever being read.
+
+    The three-way split, the counts and the progress numbering are all written for a single-threaded
+    consumer, so moving the loader into a task would make them racy for no measured gain.
+    """
+    sources = [_source(tmp_path, f"l{i}.mp4", size=4096 + i) for i in range(16)]
+    for source in sources:
+        _put_record(va, source, _complete_record(va, source))
+
+    real = va["_load_cache"]
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0, "calls": 0}
+
+    def watched(*args, **kwargs):
+        with lock:
+            state["live"] += 1
+            state["calls"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        try:
+            time.sleep(0.002)
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                state["live"] -= 1
+
+    va["_load_cache"] = watched
+    os.environ[_IDENTITY_WORKERS_ENV] = "16"
+    result = _classify(va, sources)
+
+    assert state["peak"] == 1, "record lookup must remain serial"
+    assert state["calls"] == 16
+    assert result["prepared_count"] == 16
+
+
+def test_l1b_an_unverifiable_backend_starts_no_identity_phase(va, tmp_path):
+    """No pool, and no `_cache_path` call, merely to produce N `None` results.
+
+    The backend failure stays ONE invocation-level failure rather than becoming 1 + N retries.
+    """
+    sources = [_source(tmp_path, f"u{i}.mp4", size=4096 + i) for i in range(12)]
+    va["_qwen_backend_signature_token"] = lambda *_args, **_kwargs: None
+
+    attempts = []
+    real = va["_cache_path"]
+
+    def counting(path, *args, **kwargs):
+        attempts.append(path)
+        return real(path, *args, **kwargs)
+
+    def forbidden_pool(*_args, **_kwargs):
+        raise AssertionError("no thread pool may be started when identity cannot be proven")
+
+    va["_cache_path"] = counting
+    va["ThreadPoolExecutor"] = forbidden_pool
+
+    result = _classify(va, sources)
+
+    assert result["ai_cache_disabled"] is True
+    assert result["classifications"] == []
+    assert result["cache_lookups"] == 0
+    assert attempts == [], "no per-source identity work may be attempted"
+
+
+@pytest.mark.parametrize("workers", _L1B_WORKERS)
+def test_l1b_progress_counts_and_ordering_are_unchanged(va, tmp_path, workers):
+    """Progress is emitted from the serial verdict loop, so it still advances once per source, in
+    source order, ending at total - and it still invents no ETA."""
+    sources = [_source(tmp_path, f"p{i}.mp4", size=4096 + i) for i in range(10)]
+    events = []
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+
+    _classify(va, sources, event_callback=events.append)
+
+    counted = [e for e in events if getattr(e, "current", None) is not None
+               and getattr(e, "total", None) == 10]
+    assert counted, "the per-source counter must still report"
+    assert [e.current for e in counted] == sorted(e.current for e in counted)
+    assert counted[-1].current == 10
+    for event in events:
+        assert "eta" not in event.data
+
+
+def test_l1b_the_no_ai_scan_is_parallelised_too(va, tmp_path):
+    """A legitimately AI-disabled run uses the `no_ai` identity and classifies normally — including
+    through the bounded phase, with the same verdicts a serial pass gives."""
+    sources = [_source(tmp_path, f"n{i}.mp4", size=4096 + i) for i in range(12)]
+
+    os.environ[_IDENTITY_WORKERS_ENV] = "1"
+    serial = _verdicts(_classify(va, sources, enable_ai=False))
+    os.environ[_IDENTITY_WORKERS_ENV] = "16"
+    parallel = _verdicts(_classify(va, sources, enable_ai=False))
+
+    assert parallel == serial
+    assert set(parallel.values()) == {NEW_OR_CHANGED}

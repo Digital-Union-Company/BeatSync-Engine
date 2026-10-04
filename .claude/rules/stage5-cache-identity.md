@@ -65,9 +65,69 @@ i.e. once per source; with content fingerprints that is 702 reads of a ~2.65 GB 
 **61.7 minutes**. Threaded it is ~9–20 ms once. It is invocation-scoped, not module-cached, so a later
 call in the same process still observes a swapped model or llama build.
 
+## Per-source identity is computed concurrently (L1B)
+
+**Identity *semantics* are untouched by L1B.** The source signature is the same eight components, the
+bounded fingerprint reads the same `min(size, 3 MiB)`, `_bounded_fingerprint`, `_video_signature`,
+`_cache_path`, `_qwen_config_token` and `_qwen_backend_signature_token` have **zero** executable
+changes, and `CACHE_CONTRACT_VERSION`/`ANALYSIS_VERSION` are unchanged. No cache was invalidated and
+there is no migration. What changed is **orchestration**: the per-source phase is bounded-parallel.
+
+**The shared helper is `_compute_cache_paths_parallel(sources, enable_ai, qwen_model_path, *,
+backend_token, config_token)`**, used by both production consumers of the per-source identity scan —
+`analyze_video_sources` and `classify_library_sources`. It calls the real `_cache_path` exactly once
+per submitted position on a `ThreadPoolExecutor`, with the invocation's **already-resolved** tokens.
+Identity is I/O bound (one `stat` plus at most 3 MiB read), which is why threads help at all.
+
+**Backend and Qwen-config identity are still computed once per invocation, by the caller.** No worker
+may call `_qwen_backend_signature_token` or `_qwen_config_token` for itself — per source that is the
+61.7-minute shape below, re-created inside a thread pool. The two callers also keep their own
+invocation state (availability, the tokens, `ai_cache_disabled`, their own reporting); only the
+per-source computation is shared, deliberately **not** a new orchestration abstraction.
+
+**Position is the authority, never the path.** Results are written into a pre-sized list by
+submission index, so submitting `[A, B, A]` returns `[key A, key B, key A]`: duplicate paths stay
+distinct positions, nothing is deduplicated, and completion order cannot leak into the returned
+order. Everything downstream — `idx` / `video_file` / `cache_file` ownership, `cache_paths`,
+`results_by_index`, `jobs`, progress numbering, `classifications`, Stage 6 — consumes those results
+positionally, in original source order.
+
+**Failure semantics are the serial ones.** An unprovable identity is still a per-source `None` and
+never fails the phase; an *unexpected* exception is surfaced through `future.result()` rather than
+laundered into `None`, because a weaker success state is exactly what must not be invented here. There
+are no retries: a `None` is final for the run.
+
+**The worker count is bounded hard at 16 and is execution policy only.**
+`_CACHE_IDENTITY_WORKER_CAP = 16`; `_cache_identity_workers(source_count)` returns 0 for ≤ 0 sources,
+1 for one source, and otherwise `min(source_count, 16)`.
+`BEATSYNC_CACHE_IDENTITY_WORKERS` overrides it for benchmarking, clamped to
+`1 … min(source_count, 16)`, with a malformed value falling back to the measured default. **16 is a
+cap, not a tuning default: nothing above 16 workers has been measured**, so raising it is a new
+measurement rather than a configuration change. The knob reaches no signature, no key, no record and
+no contract constant — changing it must produce byte-identical identities, and a test asserts the
+name appears in none of the identity primitives.
+
+**Measured warm, on the real 1672-source Windows library** (`J:\New folder\Cuts`, ~4.75 GiB of
+bounded fingerprint windows), against the exact production identity operation:
+
+| workers | warm identity phase | speed-up |
+|---|---|---|
+| 1 | 6.545 s | — |
+| 2 | 3.552 s | 1.84x |
+| 4 | 1.796 s | 3.65x |
+| 8 | 1.088 s | 6.02x |
+| **16** | **0.746 s** | **8.77x** |
+
+Exact identity parity over the same library: **20,064 comparisons, 0 mismatches, 0 `None` results,
+0 missing results, 0 duplicate results.** A **controlled cold parallel speed-up is NOT MEASURED** —
+do not claim one. See `.claude/rules/stage5-reporting.md` for what the cold figures do and do not
+support.
+
 **If the invocation-level backend identity fails, AI caching is off for that entire run.** The
 orchestrator holds an explicit `ai_cache_disabled` state and then does not call `_cache_path` at all —
-because down in `_video_signature` a `None` `backend_token` means *"not supplied, compute it now"*, so
+and, since L1B, does not start a thread pool either: it constructs the ordered `None` results
+directly, so one invocation-level failure stays one failure rather than becoming 1 + N retries. The
+reason is unchanged: down in `_video_signature` a `None` `backend_token` means *"not supplied, compute it now"*, so
 handing the failed `None` onward made every source retry the fingerprinting (measured **1 + N** calls)
 and let a transient later success re-enable caching *mid-run*. Never overload `None` as both "not
 supplied" and "supplied but failed" at that boundary, and **do not** claim a per-source retry can

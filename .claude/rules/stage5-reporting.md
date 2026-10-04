@@ -92,6 +92,45 @@ event's `elapsed_seconds`), while later profiling — run after the same ~2.52 G
 fingerprint windows were already in the OS cache — measured **~3.2–3.4 s**. That discrepancy is
 **unresolved**. This work fixes reporting truth, not Stage-5 performance.
 
+### What L1B measured about that discrepancy — and what it did not
+
+L1B (bounded-parallel source identity) produced much stronger evidence on a larger real library, and
+it is recorded here exactly as measured. **The historical ~69 s run was not reproduced**, so the
+discrepancy above is **not** declared resolved.
+
+Measured on the real Windows library `J:\New folder\Cuts`, **1672 sources**, ~**4.75 GiB** of bounded
+fingerprint bytes:
+
+| measurement | figure |
+|---|---|
+| first-touch / current-state **serial** identity | **~103.8–110.5 s** |
+| immediate **warm serial** identity | ~6.5–10.5 s |
+| warm **16-thread** identity benchmark | **~0.746 s** median (8.77x vs the warm serial benchmark baseline of 6.545 s) |
+| controlled **cold parallel** speed-up | **NOT MEASURED** |
+
+Three things follow, and the boundaries between them matter:
+
+- **Identity I/O now strongly explains the *shape* of the historical discrepancy.** A cold, serial
+  identity pass over a real library costs ~100 s at 1672 sources; a warm one costs single-digit
+  seconds. That is the same order of magnitude, and the same direction, as ~69 s versus ~3.2–3.4 s.
+- **It is not the same run, and it is not a reproduction.** The ~69 s figure came from an 845-source
+  library through a full `analyze_video_sources()` call. The current real library had **417 cache
+  misses**, so a full warm `analyze_video_sources()` was correctly **not** run — doing so would have
+  launched real Qwen work and changed the library under measurement. The exact historical full-call
+  number therefore remains unreproduced, and nothing here retcons it.
+- **The 8.77x is a WARM benchmark speed-up of the identity phase only.** It is not a cold-start
+  speed-up, not a Stage-5 speed-up, and not a measurement of the ~103.8–110.5 s first-touch case
+  under parallelism. The first-touch serial figure is evidence of **potential** user value, nothing
+  more. **Do not claim a cold parallel improvement**, a production Stage-5 improvement, or a
+  first-touch improvement, until one is measured on Windows against the exact candidate; the
+  pre-implementation benchmark is design authority, not post-implementation acceptance.
+
+Identity parity under parallelism *is* fully measured: **20,064 comparisons, 0 mismatches, 0 `None`
+results, 0 missing results, 0 duplicate results.** The contract is
+`.claude/rules/stage5-cache-identity.md`; the telemetry definition change
+(`cache_identity_seconds` is now wall-clock phase latency, not a serial sum) is
+`.claude/rules/scale-diagnostics.md`.
+
 ## Counts and optional telemetry have different trust contracts (T1)
 
 Everything Stage 5 reads out of a Qwen response arrived as parsed JSON from a subprocess, and

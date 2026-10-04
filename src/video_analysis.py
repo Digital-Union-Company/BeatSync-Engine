@@ -969,6 +969,85 @@ def _video_analysis_workers(video_count: int) -> int:
     return _env_int("BEATSYNC_VIDEO_ANALYSIS_WORKERS", default_workers, lo=1, hi=video_count)
 
 
+_CACHE_IDENTITY_WORKER_CAP = 16
+
+
+def _cache_identity_workers(source_count: int) -> int:
+    """[FORK] Digital-Union (L1B): how many threads may compute per-source identity concurrently.
+
+    Source identity is I/O bound - a stat plus the D2 bounded content fingerprint, i.e. at most
+    3 MiB read per source - so concurrency hides latency rather than competing for CPU. Measured
+    warm on the real 1672-source library (~4.75 GiB of fingerprint windows): 6.545 s at 1 worker,
+    3.552 s at 2 (1.84x), 1.796 s at 4 (3.65x), 1.088 s at 8 (6.02x) and 0.746 s at 16 (8.77x).
+
+    **The cap is hard at 16 on purpose: nothing above 16 has been measured.** Raising it is a new
+    measurement, not a tuning decision. `BEATSYNC_CACHE_IDENTITY_WORKERS` exists for benchmarking and
+    is execution policy only - it reaches no signature, no key and no record, so changing it must
+    produce byte-identical cache identities.
+    """
+    try:
+        count = int(source_count)
+    except (TypeError, ValueError):
+        return 0
+    if count <= 0:
+        return 0
+    if count == 1:
+        return 1
+    default_workers = min(count, _CACHE_IDENTITY_WORKER_CAP)
+    # `hi` is the bound, so a request above the cap (or above the source count) clamps down to it and
+    # a malformed value falls back to the measured default.
+    return _env_int("BEATSYNC_CACHE_IDENTITY_WORKERS", default_workers, lo=1, hi=default_workers)
+
+
+def _compute_cache_paths_parallel(
+    sources: Sequence[str],
+    enable_ai: bool,
+    qwen_model_path: str | None,
+    *,
+    backend_token: str | None = None,
+    config_token: str | None = None,
+) -> List[str | None]:
+    """[FORK] Digital-Union (L1B): one `_cache_path` per source, computed concurrently, in input order.
+
+    This changes **orchestration only**. Identity itself is untouched: the real `_cache_path` is
+    called exactly once per submitted position, with the invocation's already-resolved
+    `backend_token`/`config_token`, so no worker recomputes the backend or Qwen-config identity and
+    no key can differ from the serial one.
+
+    **Position is the authority, never the path.** Results are written into a pre-sized list by
+    submission index, so two identical path strings submitted twice stay two positions, nothing is
+    deduplicated, and completion order cannot leak into the returned order - which the callers'
+    `idx` / `video_file` / `cache_file` ownership and every downstream consumer depend on.
+
+    Failure semantics are the serial ones. An unprovable identity is still a per-source ``None``
+    (never a weak key, never a failed pass), while an *unexpected* exception is surfaced through
+    `future.result()` rather than being laundered into ``None``: a weaker success state is exactly
+    what must not be invented here. There are no retries.
+    """
+    ordered = list(sources)
+    if not ordered:
+        return []
+    workers = _cache_identity_workers(len(ordered))
+    if workers <= 1:
+        return [
+            _cache_path(video_file, enable_ai, qwen_model_path,
+                        backend_token=backend_token, config_token=config_token)
+            for video_file in ordered
+        ]
+    results: List[str | None] = [None] * len(ordered)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _cache_path, video_file, enable_ai, qwen_model_path,
+                backend_token=backend_token, config_token=config_token,
+            ): index
+            for index, video_file in enumerate(ordered)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
 def _candidate_metric_workers(window_count: int, use_gpu: bool) -> int:
     if use_gpu or window_count < 80:
         return 1
@@ -1082,19 +1161,35 @@ def analyze_video_sources(
     # [FORK] Digital-Union (L0): scale diagnostics. Two separate costs hide in the warm-cache loop
     # and they grow differently with library size - strong identity (the D2 bounded content
     # fingerprint, ~5.1 ms/source measured) versus reading and validating the record off disk.
-    # Measured around the EXISTING calls; neither their semantics nor the cache contract changes,
-    # and these numbers are invocation-level observability that never enters a cache payload.
-    cache_identity_seconds = 0.0
+    # Neither call's semantics nor the cache contract changes, and these numbers are
+    # invocation-level observability that never enters a cache payload. L1B made the identity half a
+    # wall-clock phase measurement rather than a serial accumulation; see below.
     cache_lookup_seconds = 0.0
     cache_lookups = 0
 
+    # [FORK] Digital-Union (L1B): the identity phase is bounded-parallel, the record phase is not.
+    # Identity is per-source I/O with no shared state; record lookup stays serial so hit/miss
+    # accounting, job construction and progress keep their existing single-threaded ownership.
+    #
+    # `cache_identity_seconds` is therefore ONE WALL-CLOCK INTERVAL - the latency the caller actually
+    # waited for the whole phase - never the sum of per-worker task durations, which would grow with
+    # the worker count and report a speed-up as a slow-down.
+    #
+    # When AI caching is disabled the ordered `None` results are constructed directly: with no
+    # provable backend identity there is no verdict to compute, so `_cache_path` must not be called at
+    # all (the D2 R2 "1 + N retries" defect) and no pool is started merely to return `None` N times.
+    identity_started = time.perf_counter()
+    cache_files = ([None] * len(existing) if ai_cache_disabled
+                   else _compute_cache_paths_parallel(
+                       existing, ai_available, qwen_model_path,
+                       backend_token=invocation_backend_token,
+                       config_token=invocation_config_token))
+    cache_identity_seconds = time.perf_counter() - identity_started
+
     for idx, video_file in enumerate(existing, 1):
-        identity_started = time.perf_counter()
-        cache_file = None if ai_cache_disabled else _cache_path(
-            video_file, ai_available, qwen_model_path,
-            backend_token=invocation_backend_token,
-            config_token=invocation_config_token)
-        cache_identity_seconds += time.perf_counter() - identity_started
+        # Position is the authority: `cache_files` is in `existing` order, so `idx` still owns the
+        # same (video_file, cache_file) pair it did when identity was computed serially.
+        cache_file = cache_files[idx - 1]
         cache_paths[idx] = cache_file
         lookup_started = time.perf_counter()
         cached = (_load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)
@@ -1530,17 +1625,25 @@ def classify_library_sources(
 
     counter = fork_progress.StageCounter(0, len(sources), min_interval=0.5)
     classifications: List[Dict[str, str]] = []
-    cache_identity_seconds = 0.0
     cache_lookup_seconds = 0.0
     cache_lookups = 0
 
-    for video_file in sources:
-        identity_started = time.perf_counter()
-        cache_file = _cache_path(
-            video_file, ai_available, qwen_model_path,
-            backend_token=invocation_backend_token,
-            config_token=invocation_config_token)
-        cache_identity_seconds += time.perf_counter() - identity_started
+    # [FORK] Digital-Union (L1B): the same bounded identity phase the orchestrator uses - the one
+    # shared piece, so the measured speed-up is not reimplemented here. `ai_cache_disabled` already
+    # returned above, so there is no second guard: a scan that reaches this line has provable
+    # identity inputs. `cache_identity_seconds` is one wall-clock interval, not a sum of task
+    # durations, and the verdict phase below stays serial and in source order.
+    identity_started = time.perf_counter()
+    cache_files = _compute_cache_paths_parallel(
+        sources, ai_available, qwen_model_path,
+        backend_token=invocation_backend_token,
+        config_token=invocation_config_token)
+    cache_identity_seconds = time.perf_counter() - identity_started
+
+    for index, video_file in enumerate(sources):
+        # Position is the authority, so a duplicate path stays two positions and the three-way
+        # verdict below is built against the identity actually computed for *this* source.
+        cache_file = cache_files[index]
 
         if cache_file is None:
             status = fork_prep.PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value

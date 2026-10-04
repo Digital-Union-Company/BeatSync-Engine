@@ -181,49 +181,110 @@ def test_a_report_stays_stdlib_only_and_ui_agnostic():
 # ======================================================================================
 
 
-def test_b_identity_and_lookup_are_timed_separately_around_the_existing_calls():
-    """The two costs grow differently with the library, so one combined number would be useless.
+_ORCHESTRATORS = ("analyze_video_sources", "classify_library_sources")
 
-    Identity is the D2 strong signature (bounded content fingerprint); lookup is reading and
-    validating the record. Each timer must wrap only its own existing call.
+
+def _identity_phase_statements(name: str) -> tuple[int, int, int, list[str]]:
+    """(open index, phase index, close index, lines) for the bounded identity phase.
+
+    L1B replaced the per-source serial accumulation with ONE wall-clock interval around the whole
+    phase, so the timer is located as three statements rather than as a pair inside a loop.
     """
-    code = _body_code(_func(_tree(_VA), "analyze_video_sources"))
+    code = _body_code(_func(_tree(_VA), name))
+    lines = code.splitlines()
+    open_at = next(i for i, l in enumerate(lines) if "identity_started = time.perf_counter()" in l)
+    phase_at = next(i for i, l in enumerate(lines) if "_compute_cache_paths_parallel(" in l)
+    close_at = next(i for i, l in enumerate(lines)
+                    if "cache_identity_seconds = time.perf_counter() - identity_started" in l)
+    return open_at, phase_at, close_at, lines
 
-    assert "identity_started = time.perf_counter()" in code
-    assert "cache_identity_seconds += time.perf_counter() - identity_started" in code
+
+@pytest.mark.parametrize("name", _ORCHESTRATORS)
+def test_b_identity_is_the_wall_clock_latency_of_the_whole_bounded_phase(name):
+    """L1B's load-bearing telemetry semantic.
+
+    Before L1B the serial accumulation *happened* to equal wall time, because only one identity call
+    ran at a time. With bounded parallelism those two stop being the same number, and summing
+    per-worker task durations would make an 8.77x speed-up report as a slow-down. The metric is
+    therefore defined as the latency the caller actually waited for the phase: exactly one
+    `perf_counter()` before it, exactly one elapsed subtraction after it, and nothing accumulated in
+    between.
+    """
+    open_at, phase_at, close_at, lines = _identity_phase_statements(name)
+    assert open_at < phase_at <= close_at, (open_at, phase_at, close_at)
+
+    code = "\n".join(lines)
+    assert "cache_identity_seconds +=" not in code, (
+        "identity must be ONE wall-clock interval, never a sum of per-task durations")
+    assert code.count("identity_started = time.perf_counter()") == 1, "exactly one phase clock"
+    assert code.count("cache_identity_seconds = time.perf_counter() - identity_started") == 1
+
+    # and the clock is not opened or closed inside the per-source loop or a future handler
+    fn = _func(_tree(_VA), name)
+    for loop in [n for n in ast.walk(fn) if isinstance(n, (ast.For, ast.While, ast.With))]:
+        rendered = ast.unparse(loop)
+        assert "identity_started" not in rendered, (
+            "the phase clock must not be opened or closed per source / per future")
+        assert "cache_identity_seconds" not in rendered
+
+
+@pytest.mark.parametrize("name", _ORCHESTRATORS)
+def test_b_record_lookup_stays_a_serial_accumulation(name):
+    """`cache_lookup_seconds` keeps its original meaning, because `_load_cache` is still serial.
+
+    The two costs grow differently with the library, so one combined number would be useless — and
+    conflating a parallel phase latency with a serial per-record sum would be worse still.
+    """
+    code = _body_code(_func(_tree(_VA), name))
     assert "lookup_started = time.perf_counter()" in code
     assert "cache_lookup_seconds += time.perf_counter() - lookup_started" in code
+    assert "cache_lookup_seconds = 0.0" in code, (
+        "the serial accumulator starts at zero, so an empty library reports 0.0")
 
-    # both accumulators start at zero, so an empty library reports 0.0 rather than nothing
-    assert "cache_identity_seconds = 0.0" in code
-    assert "cache_lookup_seconds = 0.0" in code
-
-    # the identity timer brackets _cache_path; the lookup timer brackets _load_cache
     lines = code.splitlines()
-    identity_open = next(i for i, l in enumerate(lines) if "identity_started = time.perf" in l)
-    identity_close = next(i for i, l in enumerate(lines) if "cache_identity_seconds +=" in l)
     lookup_open = next(i for i, l in enumerate(lines) if "lookup_started = time.perf" in l)
     lookup_close = next(i for i, l in enumerate(lines) if "cache_lookup_seconds +=" in l)
-    cache_path_line = next(i for i, l in enumerate(lines) if "cache_file = None if ai_cache" in l)
-    load_line = next(i for i, l in enumerate(lines) if "_load_cache(cache_file" in l)
+    load_line = next(i for i, l in enumerate(lines) if "_load_cache(" in l)
+    assert lookup_open < load_line <= lookup_close
 
-    assert identity_open < cache_path_line < identity_close
-    assert lookup_open < load_line < lookup_close
-    # and they do not overlap: identity finishes before the lookup timer opens
+    # the identity phase closes before the record phase opens: they never overlap
+    _, _, identity_close, _ = _identity_phase_statements(name)
     assert identity_close < lookup_open
 
 
 def test_b_the_existing_cache_operations_are_unchanged():
-    """Measurement only. The calls themselves, and their arguments, must be byte-identical."""
+    """Orchestration only. The identity primitive and the loader are the same calls with the same
+    arguments; what changed is that identity is computed as a bounded-parallel phase first."""
     code = _body_code(_func(_tree(_VA), "analyze_video_sources"))
 
-    assert "cache_file = None if ai_cache_disabled else _cache_path(video_file, ai_available" in code
+    assert "cache_files = [None] * len(existing) if ai_cache_disabled" in code, (
+        "an AI-cache-disabled run must still perform no identity work at all")
     assert "_load_cache(cache_file, require_ai=ai_available, expected_video_file=video_file)" in code
-    # exactly one of each, still inside the per-source loop
+    # identity is delegated once; the loader is still called once, still inside the per-source loop
     tree = _tree(_VA)
     fn = _func(tree, "analyze_video_sources")
-    assert len(_calls(fn, "_cache_path")) == 1
+    assert len(_calls(fn, "_cache_path")) == 0, "the per-source call now lives in the helper"
+    assert len(_calls(fn, "_compute_cache_paths_parallel")) == 1
     assert len(_calls(fn, "_load_cache")) == 1
+    loops = [n for n in ast.walk(fn) if isinstance(n, ast.For)]
+    assert any(_calls(loop, "_load_cache") for loop in loops), "record lookup stays in the loop"
+
+
+def test_b_only_identity_was_parallelised():
+    """The executor owns `_cache_path`. Record loading, hit/miss accounting, job construction,
+    progress and the analysis/Qwen passes keep the concurrency they already had."""
+    tree = _tree(_VA)
+    helper = _func(tree, "_compute_cache_paths_parallel")
+    rendered = ast.unparse(helper)
+    for forbidden in ("_load_cache", "_analyze_single_video", "_complete_deferred_qwen",
+                      "_run_qwen_worker", "cache_hits", "jobs", "results_by_index",
+                      "source_counter", "classifications", "fork_progress"):
+        assert forbidden not in rendered, f"the identity phase must not reach {forbidden}"
+
+    # the pre-existing analysis pool is untouched: still keyed off `_video_analysis_workers`
+    orchestrator = _body_code(_func(tree, "analyze_video_sources"))
+    assert "workers = _video_analysis_workers(len(jobs)) if jobs else 0" in orchestrator
+    assert "ThreadPoolExecutor(max_workers=workers)" in orchestrator
 
 
 def test_b_returned_timings_are_floats_and_counts_are_ints():
@@ -283,7 +344,8 @@ _NEW_STAGE5_FIELDS = ("cache_identity_seconds", "cache_lookup_seconds", "cache_l
 
 def test_d_timings_never_enter_cache_identity_or_the_completion_contract():
     tree = _tree(_VA)
-    for name in ("_video_signature", "_cache_path", "_qwen_config_token",
+    for name in ("_video_signature", "_cache_path", "_compute_cache_paths_parallel",
+                 "_cache_identity_workers", "_qwen_config_token",
                  "_qwen_backend_signature_token", "_cache_entry_is_complete",
                  "_qwen_job_completed", "_stored_ai_cache_is_consistent", "_checkpoint_cache",
                  "_save_cache"):

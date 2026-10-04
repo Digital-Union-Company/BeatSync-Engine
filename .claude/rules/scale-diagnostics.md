@@ -43,10 +43,28 @@ number that would be a gate is out of scope by design.
   optional elapsed override used only for a stage whose END is the first event the logger sees —
   otherwise Stage 0 would print "ended in 0 seconds" for work that already happened.
 - **Stage 5 cache scan** — `cache_identity_seconds` (the `_cache_path`/`_video_signature` side,
-  including the D2 bounded content fingerprint) and `cache_lookup_seconds` (the `_load_cache` side)
-  are accumulated around the *existing* calls with `perf_counter`, plus `cache_lookups`. They are
-  deliberately separate: the two costs scale differently, and combining them would hide which one
-  grows. Never add them to deterministic or Qwen analysis time.
+  including the D2 bounded content fingerprint) and `cache_lookup_seconds` (the `_load_cache` side),
+  plus `cache_lookups`. They are deliberately separate: the two costs scale differently, and
+  combining them would hide which one grows. Never add them to deterministic or Qwen analysis time.
+
+  **The two metrics now have two different definitions, and the difference is load-bearing (L1B):**
+
+  ```
+  cache_identity_seconds = wall-clock duration of the whole bounded identity phase
+                           ONE perf_counter interval the caller actually waited
+
+  cache_lookup_seconds   = serial accumulation around each _load_cache call
+                           (unchanged - record lookup was not parallelised)
+  ```
+
+  Before L1B the identity accumulation *happened* to equal wall time, because only one `_cache_path`
+  ran at a time. With bounded parallelism those stop being the same number, and
+  `sum(per-worker task durations)` would make a measured 8.77x speed-up report as a slow-down — the
+  metric would rise with the worker count while latency fell. So identity is measured as exactly one
+  `perf_counter()` before `_compute_cache_paths_parallel` and one subtraction after it, in **both**
+  `analyze_video_sources` and `classify_library_sources`; nothing is accumulated inside an executor
+  task or a per-future handler. `tests/test_scale_diagnostics.py` pins that structure for both
+  callers, and the worker-count knob is proved absent from every identity primitive.
 - **Stage 5 counts** — `candidate_count` is `len(all_candidates)` directly, never re-derived from
   telemetry, so it cannot disagree with the list Stage 6 receives. `source_count`, `cache_hits` and
   the R1 `*_this_run` fields are unchanged, and the current-run / historical-aggregate separation

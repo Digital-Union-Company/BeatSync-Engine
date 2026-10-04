@@ -20,6 +20,77 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Performance — 2026-10-04 (Stage-5 Bounded Cache Identity Parallelism R1)
+
+**The per-source Stage-5 identity scan is now bounded-parallel. Cache identity itself is unchanged.**
+
+Both production consumers of the per-source strong identity scan — `analyze_video_sources()` and
+`classify_library_sources()` — computed `_cache_path()` one source at a time, then loaded the record.
+The identity half is I/O bound (one `stat` plus the D2 bounded fingerprint, at most 3 MiB read per
+source), so it parallelises; the record half was left exactly as it was.
+
+```
+before   for each source:  _cache_path()  then  _load_cache()
+after    bounded parallel _cache_path phase
+         -> results restored to original source order
+         -> existing serial _load_cache / classification phase
+```
+
+- **Measured warm on the real 1672-source Windows library** (`J:\New folder\Cuts`, ~4.75 GiB of
+  bounded fingerprint bytes), against the exact production identity operation: **6.545 s** at 1
+  worker, 3.552 s at 2 (1.84x), 1.796 s at 4 (3.65x), 1.088 s at 8 (6.02x) and **0.746 s** at 16
+  (**8.77x**). 16 workers is the selected default.
+- **Exact identity parity**: **20,064 comparisons, 0 mismatches, 0 `None` results, 0 missing results,
+  0 duplicate results.** No key changed, so `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and
+  `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`. **No cache invalidation, no
+  migration.** `_bounded_fingerprint`, `_video_signature`, `_cache_path`, `_qwen_config_token`,
+  `_qwen_backend_signature_token`, `_load_cache`, `_cache_entry_is_complete`, `_checkpoint_cache` and
+  `_save_cache` have **zero executable changes**.
+- **A controlled cold parallel speed-up is NOT MEASURED, and is not claimed.** First-touch serial
+  identity on that library measured **~103.8–110.5 s** (immediate warm serial: ~6.5–10.5 s), which is
+  evidence of *potential* user value and nothing more. The historical ~69 s full-call discrepancy is
+  **not** declared resolved: identity I/O now strongly explains its shape, but the current real
+  library had 417 cache misses, so a full warm `analyze_video_sources()` was correctly not run and the
+  exact historical run was not reproduced. Windows acceptance against this candidate is still
+  outstanding.
+- **Position is the authority, never the path.** `_compute_cache_paths_parallel` writes results into a
+  pre-sized list by submission index, so `[A, B, A]` returns `[key A, key B, key A]`: duplicate paths
+  stay distinct positions, nothing is deduplicated, and completion order cannot leak into
+  `cache_paths`, `results_by_index`, `jobs`, progress numbering, `classifications` or Stage 6.
+  Permanent tests force completion order to be the exact **reverse** of submission order rather than
+  trusting the scheduler.
+- **Backend and Qwen-config identity are still computed once per invocation, by the caller.** No
+  worker may call `_qwen_backend_signature_token` or `_qwen_config_token` for itself — per source that
+  is the shape measured at 61.7 minutes for 702 sources. The two callers also keep their own
+  invocation state and their own `ai_cache_disabled` decision; only the per-source computation is
+  shared, deliberately not extracted into a new orchestration abstraction.
+- **Failure semantics are the serial ones.** An unprovable identity is still a per-source `None` and
+  never fails the phase; an unexpected exception is surfaced through `future.result()` rather than
+  laundered into `None`. No retries. When backend identity is unprovable the caller builds the ordered
+  `None` results directly — no `_cache_path` call and no thread pool — so one invocation-level failure
+  stays one failure rather than becoming 1 + N.
+- **The worker cap is hard at 16 because nothing above 16 has been measured.**
+  `_cache_identity_workers()` returns 0 / 1 / `min(n, 16)`; `BEATSYNC_CACHE_IDENTITY_WORKERS` is a
+  benchmarking override clamped to `1 … min(n, 16)`, with a malformed value falling back to the
+  measured default. It is execution policy only: it reaches no signature, no key, no record and no
+  contract constant, and a test proves the name appears in none of the identity primitives while
+  every worker setting reproduces byte-identical keys.
+- **`cache_identity_seconds` changed meaning, deliberately.** It is now the **wall-clock latency of
+  the whole bounded phase** rather than a serial accumulation; summing per-worker task durations would
+  make the 8.77x speed-up report as a slow-down. `cache_lookup_seconds` keeps its original
+  serial-accumulation meaning, because record lookup is still serial. Structural tests pin both
+  definitions in both callers.
+- **Nothing else was parallelised.** Record loading, hit/miss accounting, job construction,
+  classification verdicts and progress remain serial and in source order; the analysis pass keeps its
+  existing `_video_analysis_workers` pool and Qwen keeps its existing sequencing. The classifier
+  remains read-only with respect to cache records, and its four-verdict vocabulary is unchanged and
+  asserted identical at 1, 2, 4, 8 and 16 workers.
+
+Changed: `src/video_analysis.py`, `tests/test_stage5_cache_identity.py`,
+`tests/test_library_preparation.py`, `tests/test_scale_diagnostics.py`,
+`.claude/rules/stage5-cache-identity.md`, `.claude/rules/library-preparation.md`,
+`.claude/rules/scale-diagnostics.md`, `.claude/rules/stage5-reporting.md`.
+
 ### Fixed — 2026-10-04 (Legacy Micro Cuts Safety R1)
 
 **The rare half-beat accent layer now keeps its own spacing floor between its own accents.**
