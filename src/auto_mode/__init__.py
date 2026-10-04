@@ -283,72 +283,114 @@ def _resolve_freestyle(freestyle):
     return fork_freestyle.FreestyleDeclaration()
 
 
-def _freestyle_section_settings(declaration, profile, base_cfg: AutoWaveConfig,
-                                stage4_cfg: AutoWaveConfig,
-                                density_factor: float | None,
-                                sections: List[Dict]) -> Dict | None:
-    """[FORK] Digital-Union (Freestyle V1): ``section index -> (cfg, density_factor)``, or ``None``.
+def _density_stage4_config(base_cfg: AutoWaveConfig,
+                           profile: "fork_creative.CreativeProfile",
+                           density: int) -> tuple:
+    """[FORK] Digital-Union (Freestyle V1 / R1): ``(cfg, density_factor)`` for ONE Cut Density.
 
-    ``None`` means *every section resolves to the same effective Cut Density*, so Stage 4 must take
-    its exact legacy path. That is checked on the resolved **values**, not on whether Freestyle is
-    switched on, so three cases collapse to the same byte-identical render: Freestyle off, Freestyle
-    on with no rule, and Freestyle on with every rule landing on the base density.
+    "What config does Stage 4 run under at Cut Density ``density``, with this render's **global**
+    Micro Cuts policy on top?" — used by every Freestyle-derived config: the uniform override in
+    `analyze_beats_auto` and each per-section config in `_freestyle_stage4_plan`.
 
-    Configs are derived **per distinct effective density**, memoised, so a track with ten sections
-    and two distinct densities derives two configs — never one per section and never one per beat.
-    Each derived config composes exactly as `analyze_beats_auto` does for the global case: density
-    first (`density_scaled_config`), then the **global** Micro Cuts policy on top
-    (`micro_cut_scaled_config`), so a section's density can never rewrite a micro field.
+    It deliberately reproduces `analyze_beats_auto`'s own inline global composition rather than
+    replacing it, because that inline block is pinned literally by the preservation suites
+    (`test_micro_cuts.test_analyze_beats_auto_composes_density_then_micro_with_explicit_neutral_branches`).
+    The two therefore have to agree, and that agreement is not left to inspection: the 35-combination
+    uniform matrix in `test_cut_density.py` compares a uniform Freestyle render against the
+    equivalent global render for every (density, micro) pair, and
+    `test_the_density_config_helper_agrees_with_the_inline_global_composition` pins them field for
+    field, so any drift fails immediately.
+
+    Composition order is the frozen one: density first (`density_scaled_config`), then Micro Cuts
+    (`micro_cut_scaled_config`). A density can never rewrite a micro field, and there is no
+    per-section Micro Cuts.
+
+    A neutral density returns the caller's ``base_cfg`` **object itself** and ``density_factor=None``
+    — never a rebuilt equal config and never ``1.0`` — because Stage 4's legacy branch is selected by
+    exactly that pair.
+    """
+    density_profile = fork_creative.CreativeProfile(cut_density=density)
+    if density_profile.is_neutral_cuts():
+        cfg, factor = base_cfg, None
+    else:
+        factor = density_profile.cut_density_factor()
+        cfg = density_scaled_config(base_cfg, factor)
+    if not profile.is_neutral_micro_cuts():
+        cfg = micro_cut_scaled_config(cfg, profile)
+    return cfg, factor
+
+
+def _freestyle_stage4_plan(declaration, profile, base_cfg: AutoWaveConfig,
+                           sections: List[Dict]) -> tuple:
+    """[FORK] Digital-Union (Freestyle V1 / R1): ``(uniform_density, section_settings)``.
+
+    **The one authoritative computation of what Cut Density each actual Stage-3 section resolves
+    to**, and therefore of which of Stage 4's two compositions this render takes. Exactly three
+    answers, so the caller needs no fourth branch:
+
+    ==================================  =====================================================
+    ``(None, None)``                    Freestyle does not apply — global path at the slider
+    ``(D, None)``                       every actual section resolves to the SAME density
+                                        ``D`` — the exact global/legacy path, **at D**
+    ``(None, {index: (cfg, factor)})``  two or more distinct densities — heterogeneous path
+    ==================================  =====================================================
+
+    The middle row is the R1 correction. R0 returned a bare ``None`` for the uniform case and the
+    caller then configured the legacy path from ``profile.cut_density``, so a screen whose every
+    actual section resolved to one **non-base** density silently rendered at the slider's density
+    while Stage 6 still applied the same rules' four scoring controls — a half-applied rule, with the
+    summary panel still printing the Cut Density that had been discarded. Returning the resolved
+    density instead of throwing it away is the whole fix.
+
+    Note which half of R0 was already right and is unchanged: a uniform render must **not** be routed
+    through the per-section path. `section_density_cleanup`'s band is section-local and is measurably
+    *not* byte-equivalent to the global `final_wave_cleanup`, so "uniform at D" has to mean "the
+    global render at D", never "a heterogeneous render that happens to agree".
+
+    Configs are derived **per distinct effective density**, memoised through
+    :func:`_density_stage4_config`, so thirteen sections with two distinct densities derive two
+    configs — never one per section and never one per beat.
 
     Returns plain immutable render-local data. No callable resolver, no module-global state, no live
-    GUI value, nothing from Stage 5.
+    GUI value, nothing from Stage 5. Total: never raises.
     """
     if not sections:
-        return None
+        return None, None
     if not isinstance(declaration, fork_freestyle.FreestyleDeclaration):
-        return None
+        return None, None
     # `is_active()`, not merely "has rules". A declaration deliberately *retains* its rules while
     # the checkbox is off, so the screen survives a toggle — which means the rules alone are not
-    # permission to use them. Stage 6 already gated on `is_active()`; checking only `isinstance`
-    # here let Freestyle OFF change the cut timeline while leaving scoring global, so the two
-    # stages disagreed about whether the feature was on at all.
+    # permission to use them. Stage 6 gates on the same one method, so the two stages cannot
+    # disagree about whether the feature is on at all.
     if not declaration.is_active():
-        return None
+        return None, None
 
     base_density = int(profile.cut_density)
     by_type = declaration.effective_cut_densities(base_density)
     if not by_type:
-        return None
+        return None, None
 
-    effective = {}
+    effective: Dict[int, int] = {}
     for section in sections:
         index = int(section.get("index", len(effective)))
         section_type = section.get("type")
         effective[index] = int(by_type.get(section_type, base_density))
 
-    # The load-bearing short-circuit: one distinct density means this is a global render.
-    if len(set(effective.values())) <= 1:
-        return None
+    # The load-bearing short-circuit: one distinct density means this is a GLOBAL render — and the
+    # density it is global *at* is the resolved one, which is the whole of the R1 fix. Returning
+    # that value rather than a bare `None` is what stops the caller falling back to the slider.
+    distinct = set(effective.values())
+    if len(distinct) <= 1:
+        return distinct.pop(), None
 
     derived: Dict[int, tuple] = {}
     cache: Dict[int, tuple] = {}
     for index, density in effective.items():
         if density not in cache:
-            # The factor comes from a real `CreativeProfile`, so the one exponential mapping in
-            # `creative.py` stays the only definition of what a Cut Density means.
-            section_profile = fork_creative.CreativeProfile(cut_density=density)
-            if section_profile.is_neutral_cuts():
-                section_cfg, section_factor = base_cfg, None
-            else:
-                section_factor = section_profile.cut_density_factor()
-                section_cfg = density_scaled_config(base_cfg, section_factor)
-            # The GLOBAL Micro Cuts policy rides on top, exactly as the global path composes it.
-            if not profile.is_neutral_micro_cuts():
-                section_cfg = micro_cut_scaled_config(section_cfg, profile)
-            cache[density] = (section_cfg, section_factor)
+            cache[density] = _density_stage4_config(base_cfg, profile, density)
         derived[index] = cache[density]
 
-    return derived
+    return None, derived
 
 
 def _interp_to_beats(curve: np.ndarray, beat_times: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
@@ -577,7 +619,6 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     else:
         density_factor = profile.cut_density_factor()
         stage4_cfg = density_scaled_config(cfg, density_factor)
-        print(f"      ✂️  Cut density {profile.cut_density} (factor {density_factor:.3f})")
 
     # [FORK] Digital-Union (Creative Controls Extra): Micro Cuts layers on top of whatever config
     # Cut Density produced, and rewrites only the rare-accent policy fields. Neutral passes the
@@ -585,6 +626,43 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     # singleton itself and `cut_density!=50, micro_cuts=50` is bit-for-bit Creative Controls Core.
     if not profile.is_neutral_micro_cuts():
         stage4_cfg = micro_cut_scaled_config(stage4_cfg, profile)
+
+    # [FORK] Digital-Union (Freestyle V1): per-section Cut Density, resolved HERE because this is
+    # the first point at which real Stage-3 sections exist. Stages 1-3 above ran on the untouched
+    # `cfg` and never saw the declaration.
+    #
+    # Micro Cuts is deliberately absent from the per-section derivation: every derived config layers
+    # the GLOBAL micro policy on top, so no section rule can rewrite `enable_rare_micro_cuts`,
+    # `max_micro_cut_ratio`, `micro_min_gap` or `micro_percentile`.
+    uniform_density, section_settings = _freestyle_stage4_plan(
+        freestyle_declaration, profile, cfg, sections)
+
+    # [FORK] Digital-Union (Freestyle V1 / R1): a Freestyle screen whose every ACTUAL section
+    # resolves to one identical density is a *global* render, and the density it is global at is the
+    # resolved one — so it replaces the slider-derived config above with the same composition at
+    # that density. R0 discarded the resolved value here and kept the slider's config, which made
+    # "every section = High Energy" render at the slider's density while Stage 6 still applied the
+    # same rules: a half-applied rule.
+    #
+    # It must take the LEGACY path, not the per-section one. `section_density_cleanup`'s band is
+    # section-local and measurably not byte-equivalent to the global `final_wave_cleanup`, so a
+    # uniform render has to be the global render at D rather than a heterogeneous render that
+    # happens to agree. `section_settings` is `None` here by construction.
+    stage4_density = int(profile.cut_density)
+    if uniform_density is not None and int(uniform_density) != stage4_density:
+        stage4_density = int(uniform_density)
+        stage4_cfg, density_factor = _density_stage4_config(cfg, profile, stage4_density)
+
+    # Printed here, beside the other Stage-4 console lines, rather than inside the resolvers: a pure
+    # resolver that prints also prints from a probe, a test or any caller whose stdout
+    # `setup_environment()` never reconfigured to UTF-8, where these emoji raise.
+    #
+    # `stage4_density`, never `profile.cut_density`: the console must not claim the slider's density
+    # ran when Freestyle resolved a different one. On every non-Freestyle render the two are equal,
+    # so these lines are character-identical to what they have always printed.
+    if density_factor is not None:
+        print(f"      ✂️  Cut density {stage4_density} (factor {density_factor:.3f})")
+    if not profile.is_neutral_micro_cuts():
         if profile.disables_micro_cuts():
             print(f"      ✨ Micro cuts {profile.micro_cuts} (rare accent layer disabled)")
         else:
@@ -592,25 +670,12 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                   f"(ratio {stage4_cfg.max_micro_cut_ratio:.4f}, "
                   f"percentile {stage4_cfg.micro_percentile:.1f})")
 
-    # [FORK] Digital-Union (Freestyle V1): per-section Cut Density, resolved HERE because this is
-    # the first point at which real Stage-3 sections exist. Stages 1-3 above ran on the untouched
-    # `cfg` and never saw the declaration.
-    #
-    # The uniform short-circuit is load-bearing, not an optimisation: `section_settings` stays
-    # `None` whenever every section resolves to the same effective density — Freestyle off, enabled
-    # with no rule, or every rule landing on one identical density — so such a render takes Stage
-    # 4's exact legacy composition (one grid, one global micro pass, one global cleanup) rather
-    # than a generalised equivalent of it. The two are measurably NOT equivalent.
-    #
-    # Micro Cuts is deliberately absent from this derivation. Its policy comes from `stage4_cfg`
-    # above, which is the global base config, so no section rule can rewrite
-    # `enable_rare_micro_cuts`, `max_micro_cut_ratio`, `micro_min_gap` or `micro_percentile`.
-    section_settings = _freestyle_section_settings(
-        freestyle_declaration, profile, cfg, stage4_cfg, density_factor, sections)
-    if section_settings:
-        # Printed here, beside the other Stage-4 console lines, rather than inside the resolver:
-        # a pure resolver that prints also prints from a probe, a test or any caller whose stdout
-        # `setup_environment()` never reconfigured to UTF-8, where this emoji raises.
+    # The two Freestyle lines are mutually exclusive by construction.
+    if uniform_density is not None and int(uniform_density) != int(profile.cut_density):
+        print(f"      🎛️  Freestyle: every section resolves to Cut Density {uniform_density} "
+              f"(global slider {profile.cut_density}); running the global path at "
+              f"{uniform_density} ({freestyle_declaration.describe()})")
+    elif section_settings:
         distinct = len({id(cfg_and_factor[0]) for cfg_and_factor in section_settings.values()})
         print(f"      🎛️  Freestyle: {distinct} distinct section densities across "
               f"{len(section_settings)} sections "

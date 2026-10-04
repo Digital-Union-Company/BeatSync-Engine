@@ -109,6 +109,30 @@ section_settings is a dict ->  per section: select_section_wave_cuts + section_d
                                then cross_section_safety -> add_rare_micro_cuts -> micro_extra_safety
 ```
 
+**`auto_mode._freestyle_stage4_plan` decides which, and it answers with a density as well as a
+dispatch** — three answers, no fourth branch at the call site:
+
+```
+(None, None)                   Freestyle does not apply   -> legacy path at the SLIDER's density
+(D, None)                      every ACTUAL section = D   -> legacy path AT D
+(None, {index: (cfg, factor)}) two or more densities      -> heterogeneous path
+```
+
+The middle row is **R1**, and it is a correctness fix rather than a refinement. R0 returned a bare
+`None` for the uniform case, so the caller configured the legacy path from `profile.cut_density`: a
+screen whose every actual section resolved to one **non-base** density silently rendered at the
+slider's density while Stage 6 still applied that same rule's four scoring controls — a half-applied
+rule, with the summary panel printing the Cut Density that had been discarded. Measured on the
+13-section fixture: base 50 with every type ruled to 100 gave 139 cuts (the density-50 render)
+instead of 204 (the density-100 render). Reachable from the GUI's most natural bulk action, setting
+all ten dropdowns to one preset, and from a single-section `body` track.
+
+**A uniform render is the global render at D — it must not be routed through the per-section path.**
+That half of R0 was already right and is unchanged. `section_density_cleanup`'s band is section-local
+and measurably *not* byte-equivalent to the global `final_wave_cleanup`, so "uniform at D" has to
+mean "the global render at D", never "a heterogeneous render that happens to agree". A mutation doing
+exactly that is killed by 33 tests.
+
 **`final_wave_cleanup` is deliberately not called on the heterogeneous path.** This is a measured
 correctness decision, not a shortcut: its density band comes from the *global* `len(beat_times)` and
 its cap ranks cuts across the whole track, so running it after per-section selection lets one
@@ -136,19 +160,56 @@ The three new Stage-4 helpers, and the one thing each owns:
   rewritten by neither derived config. Its `grid_values` filter is **redundant for the output** and
   kept for clarity — measured as an equivalent mutant; the seeded `occupied` set is the guard.
 
-**The dispatch is decided on resolved values, not on the checkbox.**
-`auto_mode._freestyle_section_settings` returns `None` whenever every section resolves to the same
-effective Cut Density — Freestyle off, on with no rule, on with a rule that sets no density, or on
-with every rule landing on the base. Those renders take the **exact legacy composition** and are
-byte-identical to pre-Freestyle `main`, rather than a generalised equivalent of it. The two paths are
-measurably **not** equivalent (a section can fall under its own local ratio floor and gain anchors
-where the global band was satisfied); do not "simplify" them into one.
+**The dispatch is decided on resolved values, not on the checkbox.** Four Stage-4 states, and the
+first three all take the *exact* legacy composition:
 
-Configs are derived **per distinct effective density**, memoised, each composed exactly as the global
-path composes: density first (`density_scaled_config`), then the **global** Micro Cuts policy on top
-(`micro_cut_scaled_config`). Thirteen sections with two distinct densities derive two configs, shared
-by identity, and a section at the base density gets the untouched base singleton with
-`density_factor=None` — never `1.0`.
+| State | Resolved | Stage 4 runs |
+|---|---|---|
+| Freestyle inactive | — | legacy at `profile.cut_density` |
+| active, resolves to the base | `(50, None)` at base 50 | legacy at 50 — byte-identical to pre-Freestyle `main` |
+| active, uniform **non-base** | `(D, None)` | legacy **at D** — byte-identical to a Freestyle-off render whose slider is D |
+| active, two or more densities | `(None, settings)` | heterogeneous |
+
+Row 2 covers Freestyle off, on with no rule, on with a rule that sets no density, and every rule
+landing on the base. Row 3 is R1. Both are the legacy body, not a generalised equivalent of it: the
+two compositions are measurably **not** equivalent (a section can fall under its own local ratio
+floor and gain anchors where the global band was satisfied), so do not "simplify" them into one.
+
+**One density→config mapping.** `_density_stage4_config(base_cfg, profile, density)` answers "what
+config does Stage 4 run under at Cut Density D, with this render's **global** Micro Cuts policy on
+top", and every Freestyle-derived config comes from it: the uniform override and each per-section
+config. Composition order is frozen — density first (`density_scaled_config`), then Micro Cuts
+(`micro_cut_scaled_config`) — so a density can never rewrite a micro field. A neutral density hands
+back the caller's `base_cfg` **object itself** with `density_factor=None`, never `1.0` and never an
+equal rebuild, because Stage 4's legacy branch is selected by exactly that pair. Configs are
+memoised per distinct density, so thirteen sections with two distinct densities derive two.
+
+`analyze_beats_auto` **keeps its own inline global composition** rather than calling that helper,
+because the preservation suites pin those literals
+(`test_micro_cuts.test_analyze_beats_auto_composes_density_then_micro_with_explicit_neutral_branches`).
+That is a deliberate, recorded duplication, and it is not left to inspection: the 35-combination
+uniform matrix compares a uniform Freestyle render against the equivalent global render for every
+(density, Micro Cuts) pair, and `test_the_density_config_helper_agrees_with_the_inline_global_composition`
+pins the two field for field. Drift fails both immediately.
+
+### The R1 oracle
+
+`tests/test_cut_density.py` carries the permanent matrix: resolved density
+`0, 10, 25, 50, 60, 75, 100` × global Micro Cuts `0, 25, 50, 75, 100` = **35 combinations**, each
+asserting `np.array_equal(freestyle_cuts, reference_cuts)` where the reference is a Freestyle-off
+render at that density and Micro Cuts. Every `D != 50` additionally asserts that the resolver really
+resolved to `D` *and* that the reference at `D` differs from the reference at the base, so no
+combination can pass by both sides quietly using the base density.
+
+**The fixture needs one relabel to express "every actual section type".** `_SECTION_TYPES` contains
+`build`, which `classify_section` **never returns** (its nine outcomes are
+intro/hook/outro/finale/drop/chorus/bridge/breakdown/verse) and which is therefore absent from
+`SECTION_TYPES` and unrulable — left as `build`, those two sections always resolve to the base and no
+uniform non-base screen exists. The uniform tests relabel it to `body`, a real Stage-3 type that sits
+in **none** of Stage 4's four section-type branch sets exactly as `build` does, so Stage 4 cannot
+tell them apart. `test_the_uniform_fixture_relabel_is_inert` proves it across all 35 combinations
+rather than asserting it. (That `build` is in the fixture and in `pipeline-core.md`'s stage table but
+not in the classifier is a pre-existing inconsistency, untouched by R1.)
 
 **Micro Cuts stays one global control on both paths.** Its policy comes from the globally derived
 config, and no section rule may rewrite `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
@@ -257,6 +318,11 @@ since it is a state with no values to project) and a read-only summary textbox.
 - **`describe()` is unlabelled.** `ui_content` adds the `Freestyle:` label for the success panel,
   exactly as it adds `Creative variation:` for `CreativeProfile.describe()`; Stage 4's console line
   prints it in parentheses after its own counts.
+- **The Stage-4 console reports the density that ran (R1).** The `✂️  Cut density` line prints
+  `stage4_density`, never `profile.cut_density`, so a uniform Freestyle render cannot claim the
+  slider's density ran; on every non-Freestyle render the two are equal and the line is
+  character-identical to what it has always printed. The uniform and heterogeneous Freestyle lines
+  are mutually exclusive by construction, so no `Freestyle: … Freestyle: …` duplication is possible.
 
 ## Deliberately not built
 

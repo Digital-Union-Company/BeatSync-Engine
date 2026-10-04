@@ -42,10 +42,15 @@ _STAGE4_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage4_select.py")
 
 #: Everything `stage4_select` imports from its package, plus the two derived-config builders
 #: (`test_micro_cuts` reuses this loader, so the micro one is exported here as well) and — since
-#: Freestyle V1 — the real `section index -> (cfg, factor)` resolver, so the per-section tests below
-#: drive production's own composition rather than a reimplementation of it.
+#: Freestyle V1 — the real Stage-4 Freestyle resolver plus the one density->config mapping, so the
+#: tests below drive production's own composition rather than a reimplementation of it.
+#:
+#: `_freestyle_stage4_plan` replaced R0's `_freestyle_section_settings` in R1: it returns
+#: `(uniform_density, section_settings)` instead of a bare `section_settings`, because the uniform
+#: case has to carry the density it resolved to rather than discarding it.
 _SHARED = ("AutoWaveConfig", "_normalize", "_safe_percentile", "_unique_sorted",
-           "density_scaled_config", "micro_cut_scaled_config", "_freestyle_section_settings")
+           "density_scaled_config", "micro_cut_scaled_config", "_density_stage4_config",
+           "_freestyle_stage4_plan")
 
 
 def _load_stage4():
@@ -160,15 +165,24 @@ def track():
     return _fixture()
 
 
-def _select(stage4, shared, track, density: int):
-    """Run Stage 4 exactly the way `analyze_beats_auto` does for one Cut Density value."""
-    beat_times, features, sections = track
-    profile = fork_creative.CreativeProfile(cut_density=density)
+def _select(stage4, shared, track, density: int, micro_cuts: int = 50, sections=None):
+    """Run Stage 4 exactly the way `analyze_beats_auto` does for one Cut Density value.
+
+    ``micro_cuts`` and ``sections`` were appended for R1's uniform matrix, both with defaults that
+    reproduce the original two-argument behaviour exactly — a neutral Micro Cuts value leaves the
+    config untouched, and ``None`` keeps the fixture's own section list — so every pre-existing
+    caller is unaffected.
+    """
+    beat_times, features, fixture_sections = track
+    sections = fixture_sections if sections is None else sections
+    profile = fork_creative.CreativeProfile(cut_density=density, micro_cuts=micro_cuts)
     if profile.is_neutral_cuts():
         cfg, factor = shared.CONFIG, None
     else:
         factor = profile.cut_density_factor()
         cfg = shared.density_scaled_config(shared.CONFIG, factor)
+    if not profile.is_neutral_micro_cuts():
+        cfg = shared.micro_cut_scaled_config(cfg, profile)
     return stage4.select_wave_cuts(
         beat_times=beat_times, sections=sections, features=features,
         tempo=_TEMPO, audio_duration=_DURATION, cfg=cfg, density_factor=factor)
@@ -616,19 +630,21 @@ def _declared(pairs: dict) -> fork_freestyle.FreestyleDeclaration:
     return fork_freestyle.FreestyleDeclaration(enabled=True, overrides=ordered)
 
 
-def _select_declared(stage4, shared, track, base_density, declaration, micro_cuts=50):
-    """Stage 4 exactly as `analyze_beats_auto` runs it for one Freestyle screen."""
-    beat_times, features, sections = track
+def _select_declared(stage4, shared, track, base_density, declaration, micro_cuts=50,
+                     sections=None):
+    """Stage 4 exactly as `analyze_beats_auto` runs it for one Freestyle screen.
+
+    Mirrors R1's ordering, which is itself load-bearing: resolve the Freestyle plan **first**, then
+    derive the Stage-4 config from `uniform_density` when one exists. Deriving the config from the
+    slider first and consulting Freestyle afterwards is precisely the R0 defect.
+    """
+    beat_times, features, fixture_sections = track
+    sections = fixture_sections if sections is None else sections
     profile = fork_creative.CreativeProfile(cut_density=base_density, micro_cuts=micro_cuts)
-    if profile.is_neutral_cuts():
-        stage4_cfg, factor = shared.CONFIG, None
-    else:
-        factor = profile.cut_density_factor()
-        stage4_cfg = shared.density_scaled_config(shared.CONFIG, factor)
-    if not profile.is_neutral_micro_cuts():
-        stage4_cfg = shared.micro_cut_scaled_config(stage4_cfg, profile)
-    settings = shared._freestyle_section_settings(
-        declaration, profile, shared.CONFIG, stage4_cfg, factor, sections)
+    uniform_density, settings = shared._freestyle_stage4_plan(
+        declaration, profile, shared.CONFIG, sections)
+    density = int(profile.cut_density) if uniform_density is None else int(uniform_density)
+    stage4_cfg, factor = shared._density_stage4_config(shared.CONFIG, profile, density)
     cuts, info = stage4.select_wave_cuts(
         beat_times=beat_times, sections=sections, features=features, tempo=_TEMPO,
         audio_duration=_DURATION, cfg=stage4_cfg, density_factor=factor,
@@ -695,6 +711,223 @@ def test_the_uniform_short_circuit_holds_at_a_non_neutral_base(stage4, shared, t
     cuts, _, settings = _select_declared(stage4, shared, track, 80, _declared({"drop": 80}))
     assert settings is None
     assert np.array_equal(cuts, legacy)
+
+
+# --- R1: a uniform NON-BASE density is the global render AT that density -----------------
+#
+# The R0 defect: the short-circuit returned a bare `None` for "every section resolves to one
+# density", and `analyze_beats_auto` then configured the legacy path from the *slider*. So a screen
+# whose every actual section resolved to one non-base density rendered at the slider's density while
+# Stage 6 still applied the same rules' four scoring controls — a half-applied rule, with the summary
+# panel printing the Cut Density that had been discarded. Measured on this fixture: base 50 with
+# every type ruled to 100 produced 139 cuts (= global 50) instead of 204 (= global 100).
+#
+# The half of R0 that was already correct and is unchanged: a uniform render must take the LEGACY
+# composition, not the per-section one. `section_density_cleanup` is section-local and measurably not
+# byte-equivalent to the global `final_wave_cleanup`, so these tests assert BOTH halves every time —
+# exact equality to the global render at D, and `section_settings is None`.
+
+
+#: The fixture's section list with its one unrulable type relabelled, so that "every ACTUAL section
+#: type resolves to D" is expressible at all.
+#:
+#: `_SECTION_TYPES` contains ``build``, which `stage3_sections.classify_section` **never returns**
+#: (its nine outcomes are intro/hook/outro/finale/drop/chorus/bridge/breakdown/verse) and which is
+#: therefore absent from `freestyle.SECTION_TYPES` and cannot carry a rule. Left as `build`, those two
+#: sections would always resolve to the base density and no uniform non-base screen could exist.
+#:
+#: ``body`` is the faithful replacement rather than a convenient one: it is a real Stage-3 type (the
+#: undividable-track label) and, like `build`, it appears in **none** of Stage 4's four section-type
+#: branch sets, so both are fallthrough types and Stage 4 cannot tell them apart. Proven, not
+#: asserted by hand: `test_the_uniform_fixture_relabel_is_inert` below pins byte-equality across all
+#: 35 density x micro combinations.
+def _rulable_sections(sections):
+    return [dict(s, type=("body" if s["type"] == "build" else s["type"])) for s in sections]
+
+
+def _uniform_declaration(sections, density):
+    """Every section type actually present, ruled to one density."""
+    return _declared({s["type"]: density for s in sections})
+
+
+def _plan_declared(shared, base_density, declaration, sections, micro_cuts=50):
+    """The real resolver's `(uniform_density, section_settings)` for one screen."""
+    profile = fork_creative.CreativeProfile(cut_density=base_density, micro_cuts=micro_cuts)
+    return shared._freestyle_stage4_plan(declaration, profile, shared.CONFIG, sections)
+
+
+def test_the_uniform_fixture_relabel_is_inert(stage4, shared, track):
+    """Calibration for every uniform test below: swapping the unrulable `build` for `body` must not
+    move a single cut, or those tests would be comparing two different tracks."""
+    _, _, sections = track
+    rulable = _rulable_sections(sections)
+    assert {s["type"] for s in rulable} <= set(fork_freestyle.SECTION_TYPES), "still unrulable"
+    assert "build" in {s["type"] for s in sections}, "the fixture no longer exercises the relabel"
+    for density in _R1_DENSITIES:
+        for micro in _R1_MICRO:
+            left = _select(stage4, shared, track, density, micro_cuts=micro, sections=sections)[0]
+            right = _select(stage4, shared, track, density, micro_cuts=micro, sections=rulable)[0]
+            assert np.array_equal(left, right), (density, micro)
+
+
+def test_all_sections_ruled_to_one_density_equals_the_global_render_at_that_density(
+        stage4, shared, track):
+    """The headline R1 regression (and the exact R0 reproduction).
+
+    Base 50, every actual section type ruled to 100: the render must be the **global density-100**
+    render, not the global density-50 one.
+    """
+    _, _, sections = track
+    rulable = _rulable_sections(sections)
+    declaration = _uniform_declaration(rulable, 100)
+
+    uniform_density, settings = _plan_declared(shared, 50, declaration, rulable)
+    assert uniform_density == 100, "the resolver did not resolve the uniform density"
+    assert settings is None, "a uniform render must not take the per-section path"
+
+    cuts = _select_declared(stage4, shared, track, 50, declaration, sections=rulable)[0]
+    reference_100 = _select(stage4, shared, track, 100, sections=rulable)[0]
+    reference_50 = _select(stage4, shared, track, 50, sections=rulable)[0]
+
+    assert not np.array_equal(reference_100, reference_50), (
+        "density 100 and 50 agree on this fixture; the test would pass vacuously")
+    assert np.array_equal(cuts, reference_100), (
+        f"uniform Freestyle 100 gave {cuts.size} cuts; global 100 gives {reference_100.size}")
+    assert not np.array_equal(cuts, reference_50), "R0 defect: rendered at the slider's density"
+
+
+#: The R1 uniform matrix axes. 7 densities x 5 Micro Cuts values = 35 combinations.
+_R1_DENSITIES = (0, 10, 25, 50, 60, 75, 100)
+_R1_MICRO = (0, 25, 50, 75, 100)
+
+
+@pytest.mark.parametrize("density", _R1_DENSITIES)
+@pytest.mark.parametrize("micro", _R1_MICRO)
+def test_the_uniform_matrix_is_exactly_the_global_render(stage4, shared, track, density, micro):
+    """**The load-bearing R1 oracle**: 35 combinations, exact array equality.
+
+    Freestyle form : base Cut Density 50, every actual section type ruled to ``density``,
+                     global Micro Cuts ``micro``.
+    Reference form : Freestyle inactive, global Cut Density ``density``, global Micro Cuts ``micro``.
+
+    These must be the same array. Not approximately — `np.array_equal`.
+
+    The trap this test is written against is comparing two calls that both quietly used the base
+    density, which would pass for every wrong reason. So for every ``density != 50`` it additionally
+    asserts that the resolver really resolved to ``density``, and that the reference at ``density``
+    actually differs from the reference at 50.
+    """
+    _, _, sections = track
+    rulable = _rulable_sections(sections)
+    declaration = _uniform_declaration(rulable, density)
+
+    uniform_density, settings = _plan_declared(shared, 50, declaration, rulable, micro_cuts=micro)
+    assert uniform_density == density, (
+        f"resolver returned {uniform_density!r}, expected {density}")
+    assert settings is None, "a uniform render must not take the per-section path"
+
+    cuts = _select_declared(stage4, shared, track, 50, declaration,
+                            micro_cuts=micro, sections=rulable)[0]
+    reference = _select(stage4, shared, track, density, micro_cuts=micro, sections=rulable)[0]
+    assert np.array_equal(cuts, reference), (
+        f"D={density} M={micro}: Freestyle {cuts.size} cuts vs global {reference.size}")
+
+    if density != 50:
+        base_reference = _select(stage4, shared, track, 50, micro_cuts=micro, sections=rulable)[0]
+        assert not np.array_equal(reference, base_reference), (
+            f"D={density} M={micro} is indistinguishable from the base density on this fixture, so "
+            f"this combination cannot detect the R0 defect")
+
+
+def test_a_single_body_section_ruled_uniformly_equals_the_global_render(stage4, shared, track):
+    """Stage 3's undividable-track fallback: one section, ``index=0``, ``type="body"``.
+
+    `body` is offered as a Freestyle dropdown, so this is a real user path and it is the narrowest
+    possible uniform screen — one section, one rule.
+    """
+    beat_times = track[0]
+    body = [{"index": 0, "type": "body", "start": 0.0, "end": _DURATION,
+             "duration": _DURATION, "energy": 0.5, "dominant_pattern": "mixed"}]
+    declaration = _declared({"body": 100})
+
+    uniform_density, settings = _plan_declared(shared, 50, declaration, body)
+    assert uniform_density == 100
+    assert settings is None
+
+    cuts = _select_declared(stage4, shared, track, 50, declaration, sections=body)[0]
+    reference_100 = _select(stage4, shared, track, 100, sections=body)[0]
+    reference_50 = _select(stage4, shared, track, 50, sections=body)[0]
+    assert not np.array_equal(reference_100, reference_50), "vacuous on this fixture"
+    assert np.array_equal(cuts, reference_100), f"{cuts.size} vs {reference_100.size}"
+
+
+def test_a_non_neutral_base_resolving_uniformly_down_equals_the_global_render(stage4, shared, track):
+    """Base 80, every actual section ruled to 30 — proves the fix is not special-cased around the
+    neutral base, and that it works downward as well as upward."""
+    _, _, sections = track
+    rulable = _rulable_sections(sections)
+    declaration = _uniform_declaration(rulable, 30)
+
+    uniform_density, settings = _plan_declared(shared, 80, declaration, rulable)
+    assert uniform_density == 30
+    assert settings is None
+
+    cuts = _select_declared(stage4, shared, track, 80, declaration, sections=rulable)[0]
+    reference_30 = _select(stage4, shared, track, 30, sections=rulable)[0]
+    reference_80 = _select(stage4, shared, track, 80, sections=rulable)[0]
+    assert not np.array_equal(reference_30, reference_80), "vacuous on this fixture"
+    assert np.array_equal(cuts, reference_30), f"{cuts.size} vs {reference_30.size}"
+
+
+def test_a_stage_6_only_rule_still_resolves_to_the_base_density(stage4, shared, track):
+    """Four of the five Freestyle controls are Stage-6 controls. A screen that varies only those must
+    resolve the Stage-4 density to the **base** — so the cut timeline stays byte-identical to the
+    global legacy render, and R1 cannot have made a Stage-6-only rule move Stage 4."""
+    _, _, sections = track
+    declaration = fork_freestyle.FreestyleDeclaration(
+        enabled=True,
+        overrides=(("drop", fork_freestyle.SectionOverride(motion_bias=90,
+                                                           semantic_emphasis=10)),))
+    uniform_density, settings = _plan_declared(shared, 50, declaration, sections)
+    assert uniform_density == 50, "a Stage-6-only rule must resolve to the base density"
+    assert settings is None
+
+    cuts = _select_declared(stage4, shared, track, 50, declaration)[0]
+    assert np.array_equal(cuts, _select(stage4, shared, track, 50)[0])
+
+
+def test_the_density_config_helper_agrees_with_the_inline_global_composition(shared):
+    """The anti-drift pin for R1's one structural compromise.
+
+    `analyze_beats_auto` keeps its inline global composition (the preservation suites pin those
+    literals), and `_density_stage4_config` reproduces it for every Freestyle-derived config. The two
+    must therefore agree exactly, field for field, at every density and Micro Cuts value — otherwise
+    a uniform Freestyle render and the equivalent global render would diverge.
+    """
+    import dataclasses as _dc
+
+    for density in _R1_DENSITIES:
+        for micro in _R1_MICRO:
+            profile = fork_creative.CreativeProfile(cut_density=density, micro_cuts=micro)
+            # the inline composition, written out exactly as `analyze_beats_auto` has it
+            if profile.is_neutral_cuts():
+                inline_cfg, inline_factor = shared.CONFIG, None
+            else:
+                inline_factor = profile.cut_density_factor()
+                inline_cfg = shared.density_scaled_config(shared.CONFIG, inline_factor)
+            if not profile.is_neutral_micro_cuts():
+                inline_cfg = shared.micro_cut_scaled_config(inline_cfg, profile)
+
+            helper_cfg, helper_factor = shared._density_stage4_config(
+                shared.CONFIG, profile, density)
+
+            assert helper_factor == inline_factor, (density, micro)
+            for field in _dc.fields(shared.CONFIG):
+                assert getattr(helper_cfg, field.name) == getattr(inline_cfg, field.name), (
+                    density, micro, field.name)
+    # and a neutral density must hand back the singleton itself, not an equal rebuild
+    neutral = fork_creative.CreativeProfile(cut_density=50, micro_cuts=50)
+    assert shared._density_stage4_config(shared.CONFIG, neutral, 50) == (shared.CONFIG, None)
 
 
 # --- heterogeneous: the rule moves its own section ---------------------------------------
