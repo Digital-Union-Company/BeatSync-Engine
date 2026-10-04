@@ -401,9 +401,26 @@ from `process_video_guarded`'s inputs, so everything from `from_widgets` down is
   malformed or out-of-range value clamps or falls back exactly as in the UI instead of aborting the run
   inside argparse. Omitting all three is today's behaviour. No new CLI mode.
 
-### Future L2 invalidation — documented, not implemented
+### L2 invalidation — V1 implemented, the rest still documented
 
-There is **no stage cache in this PR**. The intended ownership when one is built:
+**What is implemented (L2 V1).** A **process-local, one-entry, post-Stage-3** cache: changing *any*
+creative control reuses the audio front end and Stages 1–3 — measured at **~15.735 s** on the real
+Nero track — and recomputes from Stage 4 onward. All seven controls, every preset and every Freestyle
+declaration reach one identical Stage-3 key, because none of them exists before Stage 4.
+
+**What is NOT implemented**, and must not be inferred from the table below:
+
+```
+no Stage-4 cache        Stage 4 measured ~7.6 ms and ALWAYS reruns
+no Stage-6 cache        Stage 6 measured ~2.93 s and ALWAYS reruns
+no persistent cache     process-local only; a restart starts cold
+```
+
+Full contract: `.claude/rules/l2-stage-cache.md`.
+
+**The table below is the semantic future boundary, and it is deliberately broader than V1.** It
+describes the ownership a *complete* L2 would have; V1 implements only its "Stages 1–3" column, and
+reuse of the Stage-5 media library is the pre-existing Stage-5 cache rather than anything L2 added:
 
 | Control | Reuse | Rerun |
 |---|---|---|
@@ -416,7 +433,9 @@ There is **no stage cache in this PR**. The intended ownership when one is built
 | Micro Cuts | Stages 1–3 **and the Stage-5 media library** | Stage 4, Stage 6 + render |
 
 Only the two Stage-4 controls invalidate Stage 4 — and both still reuse the Stage-5 library
-completely, which is the whole reason this boundary is worth having.
+completely, which is the whole reason this boundary is worth having. In V1 that distinction is
+unobservable in the cache, because Stage 4 reruns for every row anyway; it becomes load-bearing only
+if a Stage-4 artifact is ever added.
 
 **A Freestyle rule inherits the row of whichever control it overrides**, and that is the point of
 having written this table before the feature existed: a rule that sets only `motion_bias` would reuse
@@ -424,3 +443,8 @@ Stages 1–5 and re-run Stage 6; a rule that sets `cut_density` would also re-ru
 declaration whose rules all land on the base density is *already* treated as a global render by Stage
 4's uniform short-circuit, so an L2 key derived from the **resolved** per-section values — not from
 whether the checkbox is ticked — would reuse correctly with no extra machinery.
+
+In V1 that resolved-value key is **not built**: every declaration reuses the Stage-3 artifact and
+Stage 4 reruns regardless, so there is nothing for it to key yet. It remains the design for a future
+Stage-4 artifact, and `stage_cache.py` and `auto_mode/__init__.py` deliberately contain no
+`Stage4CacheKey`, no Stage-4 artifact and no resolved-Freestyle key — a test asserts that.

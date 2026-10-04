@@ -199,10 +199,13 @@ def test_the_audio_visual_profile_carries_no_creative_state():
         assert not re.search(rf"\b{re.escape(word)}\b", body), f"the profile mentions {word!r}"
 
 
-def test_no_stage_cache_or_director_machinery_was_added():
-    """Explicitly out of scope: L2 stage caching, an AI Director inside the pipeline, Variant Lab,
-    per-section *profiles as a planner mode* and a second Qwen pass are documented future work, not
-    speculative abstraction here.
+def test_pipeline_caching_and_director_machinery_stay_in_their_own_files():
+    """Where each of these concepts is allowed to exist, and where it must not.
+
+    An AI Director inside the pipeline, Variant Lab, per-section *profiles as a planner mode* and a
+    second Qwen pass remain documented future work rather than speculative abstraction here. L2 stage
+    caching is no longer in that list — V1 implements it — so this test now pins its *scope* instead
+    of its absence.
 
     **Split by Freestyle V1, not weakened.** `freestyle` was banned in all five files as
     speculative. V1 implements it, and two of those files legitimately carry it: Stage 4's
@@ -212,6 +215,15 @@ def test_no_stage_cache_or_director_machinery_was_added():
     seven-control record with no section concept at all — and the two pipeline files that implement
     it get an explicit allow-list below instead of a rename to slip past a word check.
 
+    **Split again by L2 Stage Caching V1, by the same rule.** `stage_cache` was banned in all five
+    files as speculative. V1 implements it, and exactly one of those files legitimately carries it:
+    `auto_mode/__init__.py` looks the post-Stage-3 artifact up before the audio front end runs and
+    publishes it after Stage 3 succeeds. So the ban keeps full strength where it was always
+    load-bearing — the **Stage-5 side** (`video_analysis.py`, the Qwen worker), `stage6_av_planner.py`
+    (there is no Stage-6 cache and must not be one) and `creative.py` (a seven-control record that
+    learns no cache concept) — and the one pipeline file that implements it is allow-listed, again
+    rather than renamed to slip past a word check. See `.claude/rules/l2-stage-cache.md`.
+
     `per_section_profile` stays banned everywhere: Freestyle is a sparse *override* layer composed
     into the existing `CreativeProfile`, never a stored per-section profile object.
     """
@@ -219,16 +231,30 @@ def test_no_stage_cache_or_director_machinery_was_added():
         _AUTO_MODE,
         os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py"),
     )
+    #: L2 V1 lives in the Stage-4 orchestrator only. Listed explicitly, so a *second* stage cache
+    #: arriving in any other file is still caught.
+    stage_cache_accepted = (_AUTO_MODE,)
     for path in (_VA, _WORKER, _AUTO_MODE,
                  os.path.join(_REPO_ROOT, "src", "auto_mode", "stage6_av_planner.py"),
                  os.path.join(_REPO_ROOT, "src", "beatsync_fork", "creative.py")):
         source = _executable_source(path).lower()
         banned = ("director", "variant_lab", "creative_recipe", "master_seed",
-                  "shortlist", "stage_cache", "per_section_profile", "micro_cuts_control")
+                  "shortlist", "per_section_profile", "micro_cuts_control")
         if path not in freestyle_accepted:
             banned = banned + ("freestyle",)
+        if path not in stage_cache_accepted:
+            banned = banned + ("stage_cache",)
         for word in banned:
             assert not re.search(rf"\b{re.escape(word)}\b", source), f"{path} mentions {word!r}"
+
+    # The allow-list is a statement about what L2 V1 *is*, so it has to actually be there — and the
+    # cache must still be the post-Stage-3 one, with no Stage-4 or Stage-6 artifact alongside it.
+    for path in stage_cache_accepted:
+        source = _executable_source(path).lower()
+        assert "stage_cache" in source, f"{path} should implement the L2 Stage-3 cache"
+        for speculative in ("stage4cachekey", "stage4_cache", "stage6cachekey", "stage6_cache",
+                            "plan_cache"):
+            assert speculative not in source, f"{path} mentions {speculative!r}"
 
     # The allow-list is a statement about what Freestyle V1 *is*, so it has to actually be there.
     for path in freestyle_accepted:
@@ -808,7 +834,7 @@ def test_no_preset_randomizer_or_freestyle_control_was_added():
     honest fix is to say so out loud rather than to rename the handlers around a boundary guard.
     The prohibition is kept at **full strength where it was always load-bearing**: the pipeline,
     the planner, Stage 5 and `creative.py` still know nothing about a Director, which
-    `test_no_stage_cache_or_director_machinery_was_added` above already pins and which is the
+    `test_pipeline_caching_and_director_machinery_stay_in_their_own_files` above already pins and which is the
     architectural property this guard actually cared about. What *remains* speculative in the GUI
     — a preset button, a slider randomiser, a creative reset and Freestyle — stays banned, and the
     accepted Director surface is an explicit allow-list so a *second* director concept cannot

@@ -108,6 +108,12 @@ from beatsync_fork import creative as fork_creative
 # it into per-section Stage-4 configs after Stage 3 has produced real sections, and puts it on the
 # shared bus for Stage 6. Stages 1-3 never see it.
 from beatsync_fork import freestyle as fork_freestyle
+# [FORK] Digital-Union (L2 V1): the process-local post-Stage-3 cache. Stdlib-only, NumPy-free and
+# media-free: it owns the key, the one entry and the defensive copying, and understands nothing about
+# what the bundle contains. Measured reusable cost on the real Nero track is ~15.735 s (audio load +
+# normalize + HPSS + Stages 1-3); Stage 4 measured ~0.0076 s and is deliberately NOT cached.
+# Contract: .claude/rules/l2-stage-cache.md
+from beatsync_fork import stage_cache as fork_stage_cache
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -481,6 +487,126 @@ def _emit(event_callback, event) -> None:
     fork_progress.emit(event_callback, event)
 
 
+def _stage3_cache_key(audio_file: str, start_time, effective_duration, cfg: AutoWaveConfig,
+                      use_gpu) -> object | None:
+    """[FORK] Digital-Union (L2 V1): the Stage-3 key, or None when caching is unavailable.
+
+    Fails open on an *ordinary* failure. This cache is an optimization, never execution authority: if
+    identity cannot be proven (unreadable/unstatable audio) or anything about key construction goes
+    wrong, the answer is `None` and the render takes the existing uncached path.
+
+    **`MemoryError` is re-raised, and that is not the same statement as "`Exception` only".**
+    `MemoryError` *is* an `Exception` subclass, so a lone `except Exception` would swallow it (R1's
+    docstring claimed otherwise and was wrong). Converting memory exhaustion into a cache miss would
+    immediately start the substantially more expensive uncached audio path, making the system state
+    worse at precisely the wrong moment. `KeyboardInterrupt` and `SystemExit` propagate for a
+    different reason - they are `BaseException`, not `Exception` - and nothing here catches
+    `BaseException`.
+    """
+    try:
+        return fork_stage_cache.stage3_cache_key(
+            audio_file, start_time, effective_duration, cfg, use_gpu)
+    except MemoryError:
+        raise
+    except Exception:
+        return None
+
+
+def _stage3_cache_get(key) -> Dict | None:
+    """[FORK] Digital-Union (L2 V1): one process-local lookup, or None.
+
+    A malformed or incomplete stored bundle degrades to an ordinary miss rather than entering the
+    pipeline as half a result - the five fields are all or nothing.
+
+    **`MemoryError` is re-raised; see `_stage3_cache_key`.** This seam is the load-bearing one: the
+    hit path's deep copy is where an allocation is most likely to fail, and answering "miss" there
+    would start the ~15.7 s front end plus Stages 1-3 under memory pressure. A failed copy is a
+    reason to stop, not a reason to do more work.
+    """
+    if key is None:
+        return None
+    try:
+        bundle = fork_stage_cache.STAGE3_CACHE.get(key)
+        if bundle is None or not fork_stage_cache.bundle_is_complete(bundle):
+            return None
+        return bundle
+    except MemoryError:
+        raise
+    except Exception:
+        return None
+
+
+def _stage3_cache_put(key, bundle: Dict) -> bool:
+    """[FORK] Digital-Union (L2 V1): publish the artifact. Called ONLY after Stage 3 succeeded.
+
+    An *ordinary* failed store costs the **next** call its reuse; it must never cost the current
+    render, which has already produced every fact it needs.
+
+    **`MemoryError` is re-raised; see `_stage3_cache_key`.** That is the one case where the current
+    render is not protected, and deliberately so: the store's deep copy failing for want of memory
+    says the process is out of memory, and reporting a completed render while continuing into Stage 4
+    and a full FFmpeg render would be claiming a success the machine cannot deliver. `False` means
+    "reuse lost", not "allocation failed".
+    """
+    if key is None:
+        return False
+    try:
+        fork_stage_cache.STAGE3_CACHE.put(key, bundle)
+        return True
+    except MemoryError:
+        raise
+    except Exception:
+        return False
+
+
+def _emit_cached_stage123(event_callback, progress_callback,
+                          console_callback,
+                          beat_times, tempo, features, sections) -> None:
+    """[FORK] Digital-Union (L2 V1): truthful Stage 1-3 events for a reused artifact.
+
+    The existing event model already supports this, so `progress.py`, `progress_view.py` and
+    `gui.py` are untouched. Three rules make it honest:
+
+    * every event carries `cached=True`, so nothing here can read as freshly computed;
+    * **no `elapsed_seconds`** - there is no fresh Stage 1-3 timing to report and inventing one
+      would be a fabricated measurement, not a rounding choice;
+    * the metadata is the *cached facts themselves* (beat count, tempo, average wave, section count
+      and types), so the panel shows the real analysis it is about to use.
+
+    The legacy `progress_callback` is still advanced through 1, 2 and 3 so an old consumer sees the
+    same stage progression instead of jumping straight to Stage 4.
+    """
+    wave = np.asarray(features.get("wave", []), dtype=float) if isinstance(features, dict) else np.asarray([])
+    section_types = [str(sec.get("type", "section")) for sec in sections]
+
+    _notify_progress(progress_callback, 1)
+    _emit(event_callback, fork_progress.start(1, "Reusing cached beat grid", cached=True))
+    _notify_console(console_callback, 1,
+                    f"Beat grid (cached): {len(beat_times)} beats at {float(tempo):.1f} BPM")
+    _emit(event_callback, fork_progress.end(
+        1, f"{len(beat_times)} beats at {float(tempo):.1f} BPM (cached)",
+        cached=True, beats=int(len(beat_times)), tempo=float(tempo),
+    ))
+
+    _notify_progress(progress_callback, 2)
+    _emit(event_callback, fork_progress.start(
+        2, "Reusing cached energy and rhythm features", cached=True))
+    _notify_console(console_callback, 2, "Energy and rhythm features (cached)")
+    _emit(event_callback, fork_progress.end(
+        2, f"{len(beat_times)} beats profiled (cached)",
+        cached=True,
+        average_wave=float(np.mean(wave)) if wave.size else None,
+    ))
+
+    _notify_progress(progress_callback, 3)
+    _emit(event_callback, fork_progress.start(3, "Reusing cached musical sections", cached=True))
+    _notify_console(console_callback, 3, f"Sections (cached): {len(sections)}")
+    _emit(event_callback, fork_progress.end(
+        3, f"{len(sections)} sections (cached)",
+        cached=True, sections=int(len(sections)), section_types=section_types,
+    ))
+
+
 def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        end_time: float = None, use_gpu: bool = False,
                        video_files: List[str] = None,
@@ -530,79 +656,121 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     if end_time and end_time > start_time:
         duration = end_time - start_time
 
-    print("   🎵 Loading audio...")
-    y, sr = librosa.load(audio_file, sr=cfg.sr, offset=start_time, duration=duration, mono=True)
-    if y.size == 0:
-        raise ValueError("Audio file is empty or could not be decoded.")
+    # [FORK] Digital-Union (L2 V1): the process-local post-Stage-3 lookup, resolved here because
+    # this is the first point at which the whole key exists and the last point before the ~15.7 s of
+    # reusable work begins.
+    #
+    # The key is the *effective* load window - `duration` as the pipeline just resolved it, the same
+    # value handed to `librosa.load` below - so the end-time rule above stays the one authority and
+    # there is no second trim contract to drift. It carries the track's strong identity, the Stage
+    # 1-3 analysis config and the requested GPU mode, and it carries **no** creative state: the
+    # profile and the Freestyle declaration were resolved above and are deliberately not in it,
+    # because nothing they affect exists before Stage 4.
+    stage3_key = _stage3_cache_key(audio_file, start_time, duration, cfg, use_gpu)
+    cached_stage3 = _stage3_cache_get(stage3_key)
 
-    audio_duration = len(y) / sr
-    y = librosa.util.normalize(y)
+    if cached_stage3 is not None:
+        # Process-local only, and only Stages 1-3. Do not describe this as a disk cache, a
+        # persistent cache, or reuse of Stage 4/5/6 - none of which it is.
+        print("   ♻️  Reusing process-local audio analysis cache (Stages 1-3)")
+        audio_duration = cached_stage3["audio_duration"]
+        beat_times = cached_stage3["beat_times"]
+        tempo = cached_stage3["tempo"]
+        features = cached_stage3["features"]
+        sections = cached_stage3["sections"]
+        _emit_cached_stage123(event_callback, progress_callback, console_callback,
+                              beat_times, tempo, features, sections)
+    else:
+        # [FORK] Digital-Union (L2 V1): the MISS path is the pre-L2 body, verbatim and in order -
+        # the cache wraps this computation, it never replaces it. The raw front-end arrays (`y`,
+        # `y_harmonic`, `y_percussive`, `beat_frames`, `onset_env`) stay local to this branch
+        # because nothing after Stage 3 reads them; they are expensive, not needed, and therefore
+        # deliberately not retained.
+        print("   🎵 Loading audio...")
+        y, sr = librosa.load(audio_file, sr=cfg.sr, offset=start_time, duration=duration, mono=True)
+        if y.size == 0:
+            raise ValueError("Audio file is empty or could not be decoded.")
 
-    try:
-        y_harmonic, y_percussive = librosa.effects.hpss(y)
-    except Exception:
-        y_harmonic, y_percussive = y, y
+        audio_duration = len(y) / sr
+        y = librosa.util.normalize(y)
 
-    _notify_progress(progress_callback, 1)
-    _emit(event_callback, fork_progress.start(1, "Detecting beat grid"))
-    _stage_started = time.perf_counter()
-    print("   🥁 Step 1: Detecting stable beat grid...")
-    beat_times, tempo, beat_frames, onset_env = detect_master_beat_grid(y_percussive, sr, cfg)
-    if len(beat_times) < 2:
-        raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
-    print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
-    _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
-    _emit(event_callback, fork_progress.end(
-        1, f"{len(beat_times)} beats at {tempo:.1f} BPM",
-        elapsed_seconds=time.perf_counter() - _stage_started,
-        beats=int(len(beat_times)), tempo=float(tempo),
-    ))
+        try:
+            y_harmonic, y_percussive = librosa.effects.hpss(y)
+        except Exception:
+            y_harmonic, y_percussive = y, y
 
-    _notify_progress(progress_callback, 2)
-    _emit(event_callback, fork_progress.start(2, "Reading energy and rhythm features"))
-    _stage_started = time.perf_counter()
-    print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
-    features = analyze_wave_features(y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu)
-    wave = np.asarray(features.get("wave", []), dtype=float)
-    impact = np.asarray(features.get("impact_score", []), dtype=float)
-    rhythm = np.asarray(features.get("rhythm_score", []), dtype=float)
-    _notify_console(console_callback, 2, "Energy and rhythm features ready")
-    if wave.size:
-        _notify_console(console_callback, 2, f"Energy wave: avg {float(np.mean(wave)):.2f}, peak {float(np.max(wave)):.2f}")
-    if impact.size:
-        strong_impacts = int(np.sum(impact >= _safe_percentile(impact, 88, 0.88)))
-        _notify_console(console_callback, 2, f"Strong rhythm impacts: {strong_impacts}/{len(impact)} beats")
-    if rhythm.size:
-        _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
-    _emit(event_callback, fork_progress.end(
-        2, f"{len(beat_times)} beats profiled",
-        elapsed_seconds=time.perf_counter() - _stage_started,
-        average_wave=float(np.mean(wave)) if wave.size else None,
-    ))
+        _notify_progress(progress_callback, 1)
+        _emit(event_callback, fork_progress.start(1, "Detecting beat grid"))
+        _stage_started = time.perf_counter()
+        print("   🥁 Step 1: Detecting stable beat grid...")
+        beat_times, tempo, beat_frames, onset_env = detect_master_beat_grid(y_percussive, sr, cfg)
+        if len(beat_times) < 2:
+            raise ValueError("Auto Mode could not detect enough rhythmic events to build a cut plan.")
+        print(f"      ✓ {len(beat_times)} beats detected at {tempo:.1f} BPM")
+        _notify_console(console_callback, 1, f"Beat grid: {len(beat_times)} beats at {tempo:.1f} BPM")
+        _emit(event_callback, fork_progress.end(
+            1, f"{len(beat_times)} beats at {tempo:.1f} BPM",
+            elapsed_seconds=time.perf_counter() - _stage_started,
+            beats=int(len(beat_times)), tempo=float(tempo),
+        ))
 
-    _notify_progress(progress_callback, 3)
-    _emit(event_callback, fork_progress.start(3, "Detecting musical sections"))
-    _stage_started = time.perf_counter()
-    print("   🎼 Step 3: Detecting broad musical sections...")
-    sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg)
-    print(f"      ✓ {len(sections)} sections")
-    section_types = [str(s.get("type", "section")) for s in sections[:5]]
-    _notify_console(console_callback, 3, f"Sections: {len(sections)}")
-    if section_types:
-        _notify_console(console_callback, 3, "Section types: " + ", ".join(section_types))
-    if sections:
-        longest = max(sections, key=lambda s: float(s.get("duration", 0.0)))
-        _notify_console(
-            console_callback,
-            3,
-            f"Longest section: {longest.get('type', 'section')} ({float(longest.get('duration', 0.0)):.1f}s)",
-        )
-    _emit(event_callback, fork_progress.end(
-        3, f"{len(sections)} sections",
-        elapsed_seconds=time.perf_counter() - _stage_started,
-        sections=int(len(sections)),
-        section_types=[str(sec.get("type", "section")) for sec in sections],
-    ))
+        _notify_progress(progress_callback, 2)
+        _emit(event_callback, fork_progress.start(2, "Reading energy and rhythm features"))
+        _stage_started = time.perf_counter()
+        print("   🌊 Step 2: Reading energy waves and rhythm impacts...")
+        features = analyze_wave_features(y, y_percussive, sr, beat_times, beat_frames, onset_env, cfg, use_gpu)
+        wave = np.asarray(features.get("wave", []), dtype=float)
+        impact = np.asarray(features.get("impact_score", []), dtype=float)
+        rhythm = np.asarray(features.get("rhythm_score", []), dtype=float)
+        _notify_console(console_callback, 2, "Energy and rhythm features ready")
+        if wave.size:
+            _notify_console(console_callback, 2, f"Energy wave: avg {float(np.mean(wave)):.2f}, peak {float(np.max(wave)):.2f}")
+        if impact.size:
+            strong_impacts = int(np.sum(impact >= _safe_percentile(impact, 88, 0.88)))
+            _notify_console(console_callback, 2, f"Strong rhythm impacts: {strong_impacts}/{len(impact)} beats")
+        if rhythm.size:
+            _notify_console(console_callback, 2, f"Rhythm strength: avg {float(np.mean(rhythm)):.2f}, peak {float(np.max(rhythm)):.2f}")
+        _emit(event_callback, fork_progress.end(
+            2, f"{len(beat_times)} beats profiled",
+            elapsed_seconds=time.perf_counter() - _stage_started,
+            average_wave=float(np.mean(wave)) if wave.size else None,
+        ))
+
+        _notify_progress(progress_callback, 3)
+        _emit(event_callback, fork_progress.start(3, "Detecting musical sections"))
+        _stage_started = time.perf_counter()
+        print("   🎼 Step 3: Detecting broad musical sections...")
+        sections = analyze_sections(y, y_harmonic, y_percussive, sr, beat_times, features, cfg)
+        print(f"      ✓ {len(sections)} sections")
+        section_types = [str(s.get("type", "section")) for s in sections[:5]]
+        _notify_console(console_callback, 3, f"Sections: {len(sections)}")
+        if section_types:
+            _notify_console(console_callback, 3, "Section types: " + ", ".join(section_types))
+        if sections:
+            longest = max(sections, key=lambda s: float(s.get("duration", 0.0)))
+            _notify_console(
+                console_callback,
+                3,
+                f"Longest section: {longest.get('type', 'section')} ({float(longest.get('duration', 0.0)):.1f}s)",
+            )
+        _emit(event_callback, fork_progress.end(
+            3, f"{len(sections)} sections",
+            elapsed_seconds=time.perf_counter() - _stage_started,
+            sections=int(len(sections)),
+            section_types=[str(sec.get("type", "section")) for sec in sections],
+        ))
+
+        # [FORK] Digital-Union (L2 V1): published ONLY here, after the audio load, the normalize, the
+        # HPSS and all three stages have completed successfully. Anything raising above leaves the
+        # cache untouched, so a later call recomputes rather than inheriting a partial bundle - and
+        # a store that itself fails costs the next call its reuse, never this render.
+        _stage3_cache_put(stage3_key, fork_stage_cache.stage3_bundle(
+            audio_duration=audio_duration,
+            beat_times=beat_times,
+            tempo=tempo,
+            features=features,
+            sections=sections,
+        ))
 
     _notify_progress(progress_callback, 4)
     _emit(event_callback, fork_progress.start(4, "Selecting rhythmic cuts"))

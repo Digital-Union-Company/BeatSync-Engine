@@ -341,7 +341,7 @@ since it is a state with no values to project) and a read-only summary textbox.
 
 ## Deliberately not built
 
-No CLI flag, no new environment variable, no stage cache, **no per-section Micro Cuts**, **no
+No CLI flag, no new environment variable, **no per-section Micro Cuts**, **no
 per-section Variation Seed**, no numeric per-section sliders, no section-*instance* editor, no visual
 timeline and no pre-render "Analyze Music" workflow. Tests ban each by name (`freestyle_micro`,
 `freestyle_seed`, `freestyle_slider`, `freestyle_numeric`, `freestyle_instance`,
@@ -349,12 +349,28 @@ timeline and no pre-render "Analyze Music" workflow. Tests ban each by name (`fr
 `per_section_profile` stays banned everywhere: Freestyle is a sparse *override* composed into the
 existing `CreativeProfile`, never a stored per-section profile object.
 
-**L2 stage caching is still future work**, and `creative-controls.md`'s invalidation table already
-says how it would land: a rule inherits the row of whichever control it overrides, so a
-`motion_bias`-only rule reuses Stages 1–5, and a `cut_density` rule also re-runs Stage 4. An L2 key
-derived from the **resolved** per-section values — not from whether the checkbox is ticked — would
+## Freestyle and the L2 Stage-3 cache
+
+**Every Freestyle declaration reuses the Stage-3 artifact** whenever the track identity, the
+effective audio window, the Stage 1-3 analysis config and the `use_gpu` request match. The reason is
+structural, not a tuning choice: the declaration is resolved into per-section Stage-4 configs *after*
+Stage 3 has produced real sections, so nothing it can express exists when the Stage-3 key is built.
+Freestyle off, Freestyle on with no rule, all-Base, a Stage-6-only rule, a uniform non-base density
+and a heterogeneous one all reach **one identical key** — and
+`tests/test_l2_stage3_cache_identity.py` proves each produces a hit.
+
+**Stage 4 still reruns on every one of them**, which is the point: the artifact being reused is the
+beat grid, the feature curves and the sections, not the cut selection. Reusing Stage 3 says nothing
+about Stage-4 output, which legitimately differs per declaration.
+
+**The resolved-value Stage-4 key remains future work only.** `creative-controls.md`'s invalidation
+table already says how it would land — a rule inherits the row of whichever control it overrides, so
+a `motion_bias`-only rule reuses Stages 1–5 and a `cut_density` rule also re-runs Stage 4, and a key
+derived from the **resolved** per-section values rather than from whether the checkbox is ticked would
 reuse correctly with no extra machinery, because Stage 4's uniform short-circuit already treats an
-all-on-base declaration as a global render.
+all-on-base declaration as a global render. L2 V1 does not build it: there is no `Stage4CacheKey`, no
+Stage-4 artifact and no resolved-Freestyle key in production code. Full L2 contract:
+`.claude/rules/l2-stage-cache.md`.
 
 ## Runtime acceptance (Freestyle V1)
 

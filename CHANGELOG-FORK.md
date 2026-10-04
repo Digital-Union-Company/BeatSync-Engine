@@ -20,6 +20,102 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Performance — 2026-10-04 (L2 Stage Caching V1 — process-local post-Stage-3 reuse)
+
+**A repeated render of the same track reuses the audio front end and Stages 1–3 instead of
+recomputing them.** One entry, in this process only, holding the five facts the pipeline still needs
+after Stage 3.
+
+```
+HIT   skip librosa.load, normalize, HPSS, detect_master_beat_grid,
+      analyze_wave_features, analyze_sections  ->  continue into the existing Stage-4 code
+MISS  run the pre-L2 body verbatim             ->  publish, only after Stage 3 succeeded
+```
+
+- **The boundary is measured, not chosen for tidiness.** Medians on the real Windows track
+  (`Nero - Satisfy.mp3`): audio load 0.502 s, normalize 0.001 s, **HPSS 12.453 s**, Stage 1 0.487 s,
+  Stage 2 0.993 s, Stage 3 1.299 s — **~15.735 s** of reusable work, serialising to ~344 KB.
+  **Stage 4 measured 0.0076 s and is deliberately NOT cached**: that does not pay for the extra key,
+  the extra correctness surface or the resolved-Freestyle key it would need. **Stage 6 measured
+  2.930 s and is also uncached**, because every target scenario changes something it reads.
+- **Cached: `audio_duration`, `beat_times`, `tempo`, `features`, `sections`.** The expensive raw
+  front-end arrays (`y`, `y_harmonic`, `y_percussive`, `beat_frames`, `onset_env`) are deliberately
+  *not* retained — nothing after Stage 3 reads them, so keeping them merely because they were
+  expensive would hold megabytes of audio per entry for no reuse at all.
+- **One entry, process-local, zero persistence.** No LRU, no size knob, no dictionary of historical
+  keys, no cache directory, no cache JSON, no pickle artifact. `stage_cache.py` contains exactly one
+  `open()` and it is `"rb"`, for the fingerprint; `os.makedirs`, `json.dump`, `pickle`, `np.save` and
+  `tempfile` are banned by test. A process restart starts cold, and a hit is never described as a
+  disk or persistent cache hit.
+- **The key is `(L2_CACHE_VERSION, track identity, effective audio window, Stage 1–3 analysis
+  config, use_gpu_requested)`** — frozen and structured, never a concatenated string. Track identity
+  is absolute path + `st_size` + `st_mtime_ns` + a bounded BLAKE2b content fingerprint, the accepted
+  D2 geometry re-expressed rather than imported (`stage_cache.py` must not import
+  `video_analysis.py`). It is the same class of **accidental** stale-result prevention as Stage 5 —
+  not adversarial, and no claim is made about bytes outside a large file's sampled windows.
+  Unprovable identity means the cache is simply unavailable, never a weak key.
+- **`L2_CACHE_VERSION = "l2_stage3_v1"` is a new, independent constant.**
+  `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`. **No cache migration, no invalidation, no payload
+  change** anywhere.
+- **No creative state may enter the Stage-3 key**, and that is the whole value: the Variation Seed,
+  all six controls, every preset and every Freestyle declaration reach one identical key, so a
+  creative change reuses the ~15.7 s and recomputes only from Stage 4 onward. The video source list,
+  Stage-5 state, Qwen config, encoder, FPS, voice/SFX settings and output path are absent too — a
+  source-library change cannot invalidate cached audio analysis, and an audio change cannot
+  invalidate Stage-5 media records.
+- **The Stage 1–3 config identity is derived from the real source and guarded against drift.** The
+  seven participating fields (`sr`, `hop_length`, `n_fft`, `wave_smooth_beats`, `phrase_beats`,
+  `bar_beats`, `section_min_seconds`) are exactly what the front end and Stages 1–3 read today; a
+  permanent test re-derives that set from the live source on every run and fails if a field is read
+  that the key does not cover. The reverse is asserted too: no Stage-4-only field participates.
+- **`use_gpu` separation is conservative, not a parity claim.** Stage 2 has a CPU/CuPy branch and this
+  repository has no byte-exact parity contract, so the two *requested* modes key separately. No claim
+  is made that their outputs differ.
+- **Defensive deep copying on both sides is load-bearing.** `put` stores a `copy.deepcopy` and `get`
+  returns one, so the stored graph is never reachable from any caller and a downstream mutation of a
+  cache-hit bundle cannot corrupt a later hit. This does not rely on downstream code being careful.
+- **Fail open on an ordinary failure; propagate memory exhaustion.** Key creation, lookup, copying
+  and an ordinary store failure each degrade to the existing uncached path — no cache, a miss and
+  recompute, or reuse lost with the current render continuing. **`MemoryError` is explicitly
+  re-raised ahead of that handler**, because turning a failed allocation into a cache miss would
+  immediately start the ~15.7 s uncached audio-analysis path at the moment the process has least
+  memory for it. `KeyboardInterrupt` and `SystemExit` are not caught at all, being `BaseException`
+  subclasses; there is no `BaseException` catch and no bare `except`.
+
+  *(Corrected in R2. R1's code and prose both claimed "`Exception` only, so a `MemoryError` still
+  propagates", which is false in Python: `MemoryError` subclasses `Exception`, so the single
+  `except Exception` swallowed it. The code now matches the stated intent and the prose matches the
+  code; a permanent test asserts the subclass relationship mechanically, another pins the handler
+  order, and three behavioural tests prove `MemoryError` propagates at each seam with no Stage 1–3
+  recomputation.)*
+
+  Nothing is published before Stage 3 succeeds, so a failed stage cannot poison the entry, and an
+  entry stored before a later `MemoryError` stays reusable. Existing `librosa.load`, Stage 1/2/3 and
+  empty-audio failures keep their current behaviour exactly.
+- **The miss path is the pre-L2 body, proven rather than asserted.** A differential test extracts
+  `analyze_beats_auto` from both the authorized base and this revision, runs them against identical
+  deterministic stubs and requires array-exact equality of `beat_times`, `tempo`, `features`,
+  `sections`, `selected_beats`, `selection_info` and `audio_visual_profile`. Separately, the 39
+  statements of the miss branch are byte-identical to base apart from indentation.
+- **Truthful progress, with no file touched.** `progress.py`, `progress_view.py` and `gui.py` are
+  unmodified. A hit emits a START/END pair for each skipped stage ("Reusing cached beat grid" /
+  "… energy and rhythm features" / "… musical sections"), every event carrying `cached=True` and
+  **no `elapsed_seconds`** — there is no fresh Stage 1–3 timing and inventing one would be a
+  fabricated measurement. The metadata is the cached facts themselves, and the legacy
+  `progress_callback` still walks stages 1–3 so an old consumer does not jump to Stage 4.
+- **C3 gains reuse with no C3 code change.** `variant_lab.py`, `variant_batch.py`,
+  `render_batch.py` and the GUI's C3 orchestration are untouched. Candidate 1 populates the entry and
+  candidate 2 hits it because the cache is process-local rather than call-local; there is deliberately
+  no explicit "share with candidate 2" mechanism.
+- **Windows performance acceptance has NOT been run.** The ~15.7 s figure is the pre-implementation
+  measurement that justified the boundary, not a post-implementation claim for this candidate.
+
+Changed: `src/beatsync_fork/stage_cache.py` (new), `src/auto_mode/__init__.py`,
+`tests/test_stage_cache.py` (new), `tests/test_l2_stage3_cache_identity.py` (new),
+`.claude/rules/l2-stage-cache.md` (new), `.claude/rules/creative-controls.md`,
+`.claude/rules/freestyle.md`, `CHANGELOG-FORK.md`.
+
 ### Performance — 2026-10-04 (Stage-5 Bounded Cache Identity Parallelism R1)
 
 **The per-source Stage-5 identity scan is now bounded-parallel. Cache identity itself is unchanged.**
