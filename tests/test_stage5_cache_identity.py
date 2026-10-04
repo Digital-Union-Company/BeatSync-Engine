@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import subprocess
-from typing import Any, Dict, List
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Sequence
 
 import pytest
 
@@ -27,15 +29,17 @@ _FUNCS = (
     "_bounded_fingerprint", "_full_fingerprint", "_backend_component_token",
     "_llama_version_token", "_resolve_qwen_backend_paths", "_qwen_backend_signature_token",
     "_qwen_config_token", "_video_signature", "_cache_path",
+    "_cache_identity_workers", "_compute_cache_paths_parallel",
     "_is_count", "_stored_ai_cache_is_consistent", "_deterministic_analysis_completed",
     "_cache_entry_is_complete",
 )
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_FINGERPRINT_CHUNK",
            "_FINGERPRINT_WHOLE_FILE_LIMIT", "_FINGERPRINT_DIGEST_SIZE", "_NO_AI_CONFIG_TOKEN",
-           "_DETERMINISTIC_SCORING_KEY")
+           "_DETERMINISTIC_SCORING_KEY", "_CACHE_IDENTITY_WORKER_CAP")
 
 _QWEN_ENV = ("BEATSYNC_QWEN_MAX_WINDOWS", "BEATSYNC_QWEN_FRAME_WIDTH",
              "BEATSYNC_QWEN_MAX_NEW_TOKENS")
+_IDENTITY_WORKERS_ENV = "BEATSYNC_CACHE_IDENTITY_WORKERS"
 _SECOND = 1_700_000_000_000_000_000
 
 
@@ -49,8 +53,10 @@ def _load(root: str, cache_dir: str) -> Dict[str, Any]:
         os.makedirs(directory, exist_ok=True)
 
     namespace: Dict[str, Any] = {
-        "os": os, "json": json, "hashlib": hashlib, "subprocess": subprocess,
-        "Any": Any, "Dict": Dict, "List": List, "__builtins__": __builtins__,
+        "os": os, "json": json, "hashlib": hashlib, "subprocess": subprocess, "time": time,
+        "ThreadPoolExecutor": ThreadPoolExecutor, "as_completed": as_completed,
+        "Any": Any, "Dict": Dict, "List": List, "Sequence": Sequence,
+        "__builtins__": __builtins__,
         "ROOT_DIR": root,
         "DEFAULT_QWEN_MODEL_DIR": models,
         "DEFAULT_QWEN_GGUF_MODEL": os.path.join(models, "Qwen3VL-2B-Instruct-Q8_0.gguf"),
@@ -91,8 +97,9 @@ def _write(path: str, byte: bytes, size: int, mtime_ns: int = _SECOND) -> str:
 
 @pytest.fixture(autouse=True)
 def _clean_qwen_env():
-    saved = {name: os.environ.get(name) for name in _QWEN_ENV}
-    for name in _QWEN_ENV:
+    names = _QWEN_ENV + (_IDENTITY_WORKERS_ENV,)
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
         os.environ.pop(name, None)
     yield
     for name, value in saved.items():
@@ -598,26 +605,63 @@ def test_the_backend_token_is_computed_once_in_the_orchestrator(va):
     assigned = [n for n in ast.walk(orchestrator) if isinstance(n, ast.Assign)
                 and "invocation_backend_token" in ast.unparse(n.targets[0])]
     assert assigned, "the result must be held for the whole invocation"
-    # and threaded, not recomputed per source
-    for call in _calls_named(orchestrator, "_cache_path"):
-        rendered = ast.unparse(call)
-        assert "backend_token=" in rendered and "config_token=" in rendered, rendered
+
+    # and threaded, not recomputed per source. L1B moved the per-source call into
+    # `_compute_cache_paths_parallel`, so the orchestrator must thread the tokens into THAT and must
+    # no longer reach `_cache_path` itself — otherwise a second, untokened path could reappear.
+    assert not _calls_named(orchestrator, "_cache_path"), (
+        "the orchestrator owns the identity PHASE, not individual _cache_path calls")
+    phase_calls = _calls_named(orchestrator, "_compute_cache_paths_parallel")
+    assert len(phase_calls) == 1, f"exactly one identity phase; found {len(phase_calls)}"
+    rendered = ast.unparse(phase_calls[0])
+    assert "backend_token=invocation_backend_token" in rendered, rendered
+    assert "config_token=invocation_config_token" in rendered, rendered
+
+
+def test_no_worker_recomputes_the_backend_or_config_identity(va):
+    """L1B: the invocation-scoped tokens are *supplied* to the parallel helper, never recomputed by a
+    task. Per source that is N backend fingerprints — measured at 61.7 minutes for 702 sources — and
+    it would also let a transient per-source success re-enable caching mid-run."""
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    helper = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == "_compute_cache_paths_parallel")
+    body = ast.unparse(helper)
+    for forbidden in ("_qwen_backend_signature_token", "_qwen_config_token"):
+        assert forbidden not in body, (
+            f"{forbidden} must be computed once per invocation, never inside a worker task")
+
+    # the tokens arrive as explicit keyword-only parameters and are handed to `_cache_path` verbatim
+    assert {a.arg for a in helper.args.kwonlyargs} == {"backend_token", "config_token"}
+    calls = _calls_named(helper, "_cache_path")
+    assert calls, "the helper must call the real identity primitive"
+    for call in calls:
+        text = ast.unparse(call)
+        assert "backend_token=backend_token" in text, text
+        assert "config_token=config_token" in text, text
 
 
 def test_a_failed_backend_token_disables_ai_caching_for_the_whole_invocation(va):
     """R2's defect: the failed `None` was passed on to `_cache_path`, where `None` means "not supplied,
     compute it now" — so every source retried the fingerprinting (measured 1 + N calls) and a transient
-    later success re-enabled caching mid-run. An explicit state replaces the overloaded `None`."""
+    later success re-enabled caching mid-run. An explicit state replaces the overloaded `None`.
+
+    L1B keeps that contract and adds one clause: the disabled branch must not start a thread pool
+    merely to return `None` N times, so it constructs the ordered results directly.
+    """
     orchestrator = _orchestrator()
     body = ast.unparse(orchestrator)
     assert "ai_cache_disabled" in body, "an explicit disabled state is required"
 
-    # the cache path must be guarded by that state, not merely handed a None token
+    # the identity phase must be guarded by that state, not merely handed a None token
     guarded = [n for n in ast.walk(orchestrator)
                if isinstance(n, ast.IfExp) and "ai_cache_disabled" in ast.unparse(n.test)
                and "_cache_path" in ast.unparse(n)]
-    assert guarded, "when AI caching is disabled, _cache_path must not be called at all"
-    assert ast.unparse(guarded[0].body) == "None", ast.unparse(guarded[0])
+    assert guarded, "when AI caching is disabled, no identity work may be performed at all"
+    disabled_branch = guarded[0].body
+    assert ast.unparse(disabled_branch) == "[None] * len(existing)", ast.unparse(disabled_branch)
+    assert not [n for n in ast.walk(disabled_branch) if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) != "len"], (
+        "the disabled branch may only size the ordered None results")
 
 
 def test_the_orchestrator_keeps_the_audio_profile_out_of_identity(va):
@@ -629,7 +673,8 @@ def test_the_orchestrator_keeps_the_audio_profile_out_of_identity(va):
     orchestrator = _orchestrator()
     config_calls = _calls_named(orchestrator, "_qwen_config_token")
     assert len(config_calls) == 1, "the config token must be computed once per invocation"
-    for call in config_calls + _calls_named(orchestrator, "_cache_path"):
+    for call in (config_calls + _calls_named(orchestrator, "_cache_path")
+                 + _calls_named(orchestrator, "_compute_cache_paths_parallel")):
         assert "audio_profile" not in ast.unparse(call), ast.unparse(call)
 
     # the parameter survives for compatibility, and is used by nothing
@@ -761,3 +806,356 @@ def test_the_signature_inputs_are_the_documented_eight(va):
                      "st_size", "st_mtime_ns", "fingerprint", "backend_token", "config_token"):
         assert expected in signature, expected
     assert "int(stat.st_mtime)" not in signature, "integer-second truncation must be gone"
+
+
+# ---------------------------------------------------------------------------
+# L1B: bounded-parallel source identity — orchestration only
+#
+# The production primitives are the same ones the rest of this suite executes, so the oracle for
+# every parity test below is the REAL `_cache_path` called serially. Nothing here reimplements
+# identity; the only thing under test is concurrency and ordering.
+# ---------------------------------------------------------------------------
+
+
+def _sources(va, tmp_path, count, *, start=0):
+    """`count` distinct sources, deliberately spanning both fingerprint paths."""
+    whole = va["_FINGERPRINT_WHOLE_FILE_LIMIT"]
+    made = []
+    for i in range(start, start + count):
+        # every fourth source is large enough to take the three-window path
+        size = (whole + 3 * va["_FINGERPRINT_CHUNK"] + i) if i % 4 == 3 else (4096 + i)
+        made.append(_write(str(tmp_path / f"s{i}.mp4"), b"x", size, mtime_ns=_SECOND + i))
+    return made
+
+
+def _serial_reference(va, sources, enable_ai=False, model=None, **tokens):
+    """TEST-ONLY oracle: the real `_cache_path`, once per source, in ordinary serial order."""
+    return [va["_cache_path"](path, enable_ai, model, **tokens) for path in sources]
+
+
+def _parallel(va, sources, enable_ai=False, model=None, **tokens):
+    return va["_compute_cache_paths_parallel"](sources, enable_ai, model, **tokens)
+
+
+# --- worker policy ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("count,expected", [
+    (0, 0), (1, 1), (2, 2), (8, 8), (16, 16), (17, 16), (1000, 16),
+])
+def test_l1b_worker_policy_defaults_to_the_source_count_capped_at_sixteen(va, count, expected):
+    """16 is a HARD cap, not a tuning default: nothing above 16 workers has been measured."""
+    assert va["_CACHE_IDENTITY_WORKER_CAP"] == 16
+    assert va["_cache_identity_workers"](count) == expected
+
+
+@pytest.mark.parametrize("count", [-1, -1000])
+def test_l1b_a_nonpositive_source_count_needs_no_workers(va, count):
+    assert va["_cache_identity_workers"](count) == 0
+
+
+@pytest.mark.parametrize("requested,expected", [("1", 1), ("4", 4), ("16", 16), ("999", 16)])
+def test_l1b_the_override_is_clamped_to_the_measured_cap(va, requested, expected):
+    os.environ[_IDENTITY_WORKERS_ENV] = requested
+    assert va["_cache_identity_workers"](64) == expected
+
+
+@pytest.mark.parametrize("requested", ["", "lots", "4.5", "abc16", "None", "0x4"])
+def test_l1b_an_invalid_override_falls_back_to_the_measured_default(va, requested):
+    os.environ[_IDENTITY_WORKERS_ENV] = requested
+    assert va["_cache_identity_workers"](64) == 16
+    assert va["_cache_identity_workers"](5) == 5
+
+
+@pytest.mark.parametrize("requested", ["8", "16", "999"])
+def test_l1b_the_source_count_stays_the_upper_bound_below_the_cap(va, requested):
+    """Asking for more workers than there are sources never oversubscribes."""
+    os.environ[_IDENTITY_WORKERS_ENV] = requested
+    assert va["_cache_identity_workers"](3) == 3
+    assert va["_cache_identity_workers"](1) == 1
+    assert va["_cache_identity_workers"](0) == 0
+
+
+# --- exact parity against the serial oracle --------------------------------
+
+
+@pytest.mark.parametrize("workers", ["1", "2", "4", "8", "16"])
+def test_l1b_parity_1_no_ai_identity_is_exactly_the_serial_result(va, tmp_path, workers):
+    sources = _sources(va, tmp_path, 20)
+    expected = _serial_reference(va, sources)
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+    assert _parallel(va, sources) == expected
+    assert all(value is not None for value in expected), "the fixture must produce real keys"
+
+
+@pytest.mark.parametrize("workers", ["1", "2", "4", "8", "16"])
+def test_l1b_parity_2_ai_identity_with_supplied_tokens_matches_serially(va, tmp_path, workers):
+    model = va["DEFAULT_QWEN_MODEL_DIR"]
+    tokens = {"backend_token": va["_qwen_backend_signature_token"](model),
+              "config_token": va["_qwen_config_token"]()}
+    assert tokens["backend_token"] is not None
+    sources = _sources(va, tmp_path, 20)
+    expected = _serial_reference(va, sources, True, model, **tokens)
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+    assert _parallel(va, sources, True, model, **tokens) == expected
+
+
+def test_l1b_parity_3_small_and_large_fingerprint_paths_both_match(va, tmp_path):
+    """Both fingerprint shapes — whole-file ≤ 3 MiB and the three 1 MiB windows — must be identical
+    under concurrency, because they read different amounts of the same file."""
+    whole = va["_FINGERPRINT_WHOLE_FILE_LIMIT"]
+    chunk = va["_FINGERPRINT_CHUNK"]
+    small = [_write(str(tmp_path / f"small{i}.mp4"), b"s", 2048 + i) for i in range(6)]
+    large = [_write(str(tmp_path / f"large{i}.mp4"), b"l", whole + 4 * chunk + i) for i in range(6)]
+    sources = [path for pair in zip(small, large) for path in pair]
+    expected = _serial_reference(va, sources)
+    os.environ[_IDENTITY_WORKERS_ENV] = "8"
+    assert _parallel(va, sources) == expected
+    assert len(set(expected)) == len(expected), "distinct content must give distinct keys"
+
+
+def test_l1b_parity_4_the_real_primitive_is_called_once_per_position(va, tmp_path):
+    sources = _sources(va, tmp_path, 12)
+    duplicated = sources + sources[:3]
+    real = va["_cache_path"]
+    seen = []
+
+    def counting(path, *args, **kwargs):
+        seen.append(path)
+        return real(path, *args, **kwargs)
+
+    va["_cache_path"] = counting
+    os.environ[_IDENTITY_WORKERS_ENV] = "8"
+    results = _parallel(va, duplicated)
+
+    assert len(seen) == len(duplicated), "exactly one identity computation per submitted position"
+    assert sorted(seen) == sorted(duplicated)
+    assert len(results) == len(duplicated)
+
+
+# --- ordering is load-bearing ---------------------------------------------
+
+
+def test_l1b_order_1_results_are_in_input_order_despite_reverse_completion(va, tmp_path):
+    """Completion order is FORCED to be the exact reverse of submission order, because natural
+    scheduler ordering proves nothing: the first-submitted source is made the slowest, so any
+    implementation that returns results in completion order comes back reversed."""
+    import threading
+
+    sources = _sources(va, tmp_path, 8)
+    expected = _serial_reference(va, sources)
+
+    real = va["_cache_path"]
+    lock = threading.Lock()
+    completed = []
+
+    def staggered(path, *args, **kwargs):
+        index = sources.index(path)
+        time.sleep(0.02 * (len(sources) - index))
+        result = real(path, *args, **kwargs)
+        with lock:
+            completed.append(index)
+        return result
+
+    va["_cache_path"] = staggered
+    os.environ[_IDENTITY_WORKERS_ENV] = "8"
+    results = _parallel(va, sources)
+
+    assert completed == sorted(completed, reverse=True), (
+        f"the fixture failed to invert completion order: {completed}")
+    assert results == expected, "completion order leaked into the returned order"
+
+
+def test_l1b_order_2_duplicate_paths_stay_distinct_positions(va, tmp_path):
+    """Keying results by path instead of by position would collapse these three into one."""
+    a, b = _sources(va, tmp_path, 2)
+    sources = [a, b, a, a, b]
+    expected = _serial_reference(va, sources)
+
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    results = _parallel(va, sources)
+
+    assert len(results) == 5, "no deduplication: five positions in, five results out"
+    assert results == expected
+    assert results[0] == results[2] == results[3]
+    assert results[1] == results[4]
+    assert results[0] != results[1]
+
+
+def test_l1b_order_3_the_documented_a_b_a_shape(va, tmp_path):
+    """The exact property the contract names: [A, B, A] -> [key A, key B, key A]."""
+    a, b = _sources(va, tmp_path, 2)
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    key_a, key_b, key_a_again = _parallel(va, [a, b, a])
+    assert key_a == key_a_again != key_b
+
+
+def test_l1b_order_4_an_empty_and_a_single_submission(va, tmp_path):
+    assert _parallel(va, []) == []
+    [one] = _sources(va, tmp_path, 1)
+    assert _parallel(va, [one]) == _serial_reference(va, [one])
+
+
+# --- failure semantics -----------------------------------------------------
+
+
+def test_l1b_fail_1_an_unprovable_source_stays_a_per_source_none(va, tmp_path):
+    """An unreadable source is an ordinary `None` result, never a failed pass for the library."""
+    good = _sources(va, tmp_path, 4)
+    missing = str(tmp_path / "gone.mp4")
+    sources = [good[0], missing, good[1], missing, good[2]]
+    expected = _serial_reference(va, sources)
+
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    results = _parallel(va, sources)
+
+    assert expected[1] is None and expected[3] is None
+    assert results == expected
+    assert [r is None for r in results] == [False, True, False, True, False]
+
+
+def test_l1b_fail_2_mixed_none_and_real_results_keep_their_positions(va, tmp_path):
+    sources = []
+    for i in range(12):
+        sources.append(_write(str(tmp_path / f"m{i}.mp4"), b"m", 4096 + i, mtime_ns=_SECOND + i)
+                       if i % 3 else str(tmp_path / f"absent{i}.mp4"))
+    expected = _serial_reference(va, sources)
+    os.environ[_IDENTITY_WORKERS_ENV] = "16"
+    assert _parallel(va, sources) == expected
+    assert [i for i, v in enumerate(expected) if v is None] == [0, 3, 6, 9]
+
+
+def test_l1b_fail_3_an_unexpected_exception_is_surfaced_not_laundered(va, tmp_path):
+    """A weaker success state must never be invented. If serial `_cache_path` would raise, so does
+    the phase — `None` means "identity unprovable", and that is a different fact from "it blew up"."""
+    sources = _sources(va, tmp_path, 6)
+    real = va["_cache_path"]
+
+    class Boom(RuntimeError):
+        pass
+
+    def exploding(path, *args, **kwargs):
+        if path == sources[4]:
+            raise Boom("disk on fire")
+        return real(path, *args, **kwargs)
+
+    va["_cache_path"] = exploding
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    with pytest.raises(Boom):
+        _parallel(va, sources)
+
+    # and the same at one worker, so the two paths agree about failure too
+    os.environ[_IDENTITY_WORKERS_ENV] = "1"
+    with pytest.raises(Boom):
+        _parallel(va, sources)
+
+
+def test_l1b_fail_4_no_retry_is_invented(va, tmp_path):
+    """A `None` is final for the run. Retrying would be exactly the D2 R2 "1 + N" defect in a new
+    place, and a transient success would re-enable caching mid-phase."""
+    sources = _sources(va, tmp_path, 5)
+    missing = str(tmp_path / "never.mp4")
+    real = va["_cache_path"]
+    attempts = []
+
+    def counting(path, *args, **kwargs):
+        attempts.append(path)
+        return real(path, *args, **kwargs)
+
+    va["_cache_path"] = counting
+    os.environ[_IDENTITY_WORKERS_ENV] = "4"
+    results = _parallel(va, [missing] + sources)
+
+    assert results[0] is None
+    assert attempts.count(missing) == 1, f"the unprovable source was retried: {attempts}"
+
+
+# --- the worker count is honoured, and nothing else is parallelised --------
+
+
+@pytest.mark.parametrize("workers,sources_count", [(2, 20), (4, 20), (8, 20), (16, 20), (16, 40)])
+def test_l1b_at_most_the_policy_number_of_threads_run_concurrently(va, tmp_path, workers,
+                                                                   sources_count):
+    import threading
+
+    sources = _sources(va, tmp_path, sources_count)
+    real = va["_cache_path"]
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
+    def watched(path, *args, **kwargs):
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        try:
+            time.sleep(0.005)
+            return real(path, *args, **kwargs)
+        finally:
+            with lock:
+                state["live"] -= 1
+
+    va["_cache_path"] = watched
+    os.environ[_IDENTITY_WORKERS_ENV] = str(workers)
+    _parallel(va, sources)
+
+    assert state["peak"] <= workers, f"peak {state['peak']} exceeds the policy {workers}"
+    assert state["peak"] <= va["_CACHE_IDENTITY_WORKER_CAP"]
+    assert state["live"] == 0
+
+
+def test_l1b_the_helper_owns_only_cache_path(va):
+    """Record loading, classification and progress stay serial and stay with the caller.
+
+    The executor must own `_cache_path` and nothing else — a `_load_cache` inside a task would make
+    hit/miss accounting and job construction concurrent, which nothing downstream is written for.
+    """
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    helper = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == "_compute_cache_paths_parallel")
+    body = ast.unparse(helper)
+    for forbidden in ("_load_cache", "_cache_entry_is_complete", "_checkpoint_cache", "_save_cache",
+                      "_analyze_single_video", "fork_progress", "StageCounter", "_video_signature",
+                      "multiprocessing", "ProcessPoolExecutor", "async", "await"):
+        assert forbidden not in body, f"the identity phase must not reach {forbidden}"
+
+    # exactly one submission, and it submits the real identity primitive
+    submits = _calls_named(helper, "submit")
+    assert len(submits) == 1, f"one submission site; found {len(submits)}"
+    assert getattr(submits[0].args[0], "id", None) == "_cache_path", ast.unparse(submits[0])
+
+    # bounded by the policy, never one thread per source
+    pools = _calls_named(helper, "ThreadPoolExecutor")
+    assert len(pools) == 1
+    assert "max_workers=workers" in ast.unparse(pools[0]), ast.unparse(pools[0])
+    assert _calls_named(helper, "_cache_identity_workers"), "the bound must come from the policy"
+
+
+def test_l1b_the_worker_knob_is_execution_policy_never_identity():
+    """Changing the worker count must produce byte-identical keys, so the knob may not appear in any
+    executable identity or key function — the defect D2 fixed for `BEATSYNC_QWEN_MAX_WINDOWS`."""
+    tree = ast.parse(open(_VIDEO_ANALYSIS, encoding="utf-8").read())
+    for name in ("_video_signature", "_cache_path", "_qwen_config_token",
+                 "_qwen_backend_signature_token", "_bounded_fingerprint", "_full_fingerprint",
+                 "_backend_component_token", "_path_signature_token"):
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        body = "\n".join(
+            ast.unparse(node) for node in fn.body
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)))
+        for forbidden in (_IDENTITY_WORKERS_ENV, "_cache_identity_workers",
+                          "_CACHE_IDENTITY_WORKER_CAP", "_compute_cache_paths_parallel",
+                          "ThreadPoolExecutor"):
+            assert forbidden not in body, f"{name} must not know about {forbidden}"
+
+    with open(_VIDEO_ANALYSIS, encoding="utf-8") as handle:
+        source = handle.read()
+    assert 'CACHE_CONTRACT_VERSION = "stage5_cache_v3"' in source, "no cache invalidation"
+    assert 'ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"' in source
+
+
+@pytest.mark.parametrize("workers", ["1", "2", "4", "8", "16", "999", "garbage"])
+def test_l1b_the_worker_count_cannot_change_a_single_key(va, tmp_path, workers):
+    """The behavioural half of the guard above: every worker setting, same keys, same order."""
+    sources = _sources(va, tmp_path, 18)
+    baseline = _serial_reference(va, sources)
+    os.environ[_IDENTITY_WORKERS_ENV] = workers
+    assert _parallel(va, sources) == baseline

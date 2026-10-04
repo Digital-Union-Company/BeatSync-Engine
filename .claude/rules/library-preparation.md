@@ -33,12 +33,34 @@ now costs folder enumeration + source identity (the D2 bounded fingerprints) + c
   `tests/test_stage5_cache_identity.py` asserts that structure *inside* `analyze_video_sources`, and
   the expensive part (fingerprints, key formula) is shared through the helpers regardless. Do not
   "DRY" the six-line pattern without rewriting those assertions.
+- **Its identity phase is the same bounded-parallel helper the orchestrator uses (L1B).** The scan
+  calls `_compute_cache_paths_parallel` once, with its own invocation-scoped backend/config tokens
+  threaded in, so the measured speed-up is shared rather than reimplemented — and so is the bound
+  (hard cap 16 workers). The full contract is `.claude/rules/stage5-cache-identity.md`; three
+  consequences matter here:
+
+  * **`_load_cache` and the verdict construction stay serial**, in original source order. The
+    three-way split, `prepared_count`/`needs_analysis_count`/`unavailable_count`, `cache_lookups`
+    and the Stage-0 progress counter are all written for a single-threaded consumer, and nothing
+    measured argues for making them concurrent.
+  * **Position is the authority, so a classification still belongs to its own source.** A duplicate
+    path submitted twice stays two classifications, and completion order never reorders
+    `classifications`.
+  * **The scan is still read-only with respect to records, and the verdict vocabulary is
+    unchanged** — `prepared`, `new_or_changed`, `incomplete_or_invalid`,
+    `source_identity_unavailable`, plus the AI-disabled and unverifiable-backend states. Concurrency
+    cannot alter a verdict; tests assert every one of them is identical at 1, 2, 4, 8 and 16 workers.
+
+  `cache_identity_seconds` in the scan result is therefore the **wall-clock latency of the whole
+  bounded phase**, not a sum of per-worker task durations; `cache_lookup_seconds` keeps its original
+  serial-accumulation meaning. See `.claude/rules/scale-diagnostics.md`.
 - **Unprovable backend identity blocks preparation entirely.** When AI is available but
   `_qwen_backend_signature_token` returns `None`, Stage 5 runs with caching off — a preparation run
   would then spend GPU hours and persist nothing, and the next scan would show the same counts. The
-  classifier skips per-source work (no verdict could exist) and Analyze stays disabled. This is
+  classifier skips per-source work (no verdict could exist) and Analyze stays disabled — it returns
+  before the identity phase, so no `_cache_path` call is made and no thread pool is started. This is
   *narrower* than "no AI": a legitimately AI-disabled run uses the existing `no_ai` identity and
-  classifies normally.
+  classifies normally, through the same bounded phase.
 - **Scan is read-only with respect to cache *records*.** It creates the cache directory, because
   `_cache_path` always has; it never writes, updates or checkpoints a record. Do not "fix"
   `_cache_path`'s `os.makedirs` to make the claim tidier.
