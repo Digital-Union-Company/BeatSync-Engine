@@ -1103,23 +1103,37 @@ def _legacy_violates_floor(grid, produced, beat_times, cfg):
     return False
 
 
-_COMPAT_DENSITIES = (0, 25, 50, 75, 100)
-_COMPAT_MICRO = (0, 25, 50, 75, 100)
+def _build_pre_micro_main_grid(stage4, beat_times, features, sections, cfg, density_factor):
+    """TEST ONLY: the **pre-micro** main grid, i.e. `select_wave_cuts`' legacy loop up to but not
+    including the accent layer.
 
+    R2 exists because of this. The first version of the compatibility oracle took its "grid" from
+    `select_wave_cuts(...)[0]`, which on the legacy path is already
+    `final_wave_cleanup(add_rare_micro_cuts(main_grid))` — so the oracle applied the accent layer a
+    **second** time, to an array that had been through the whole composition, and identified "extras"
+    against the wrong baseline. It did not produce a false verdict (both sides received the same
+    doubled input, and on the 13-section fixture the second application happened to add 0 extras),
+    but it was exercising a shape the pipeline never produces, which is the wrong thing to freeze.
 
-@pytest.mark.parametrize("density", _COMPAT_DENSITIES)
-@pytest.mark.parametrize("micro", _COMPAT_MICRO)
-def test_r1_changes_nothing_except_where_the_old_behaviour_violated_the_floor(stage4, shared,
-                                                                             density, micro):
-    """The compatibility rule, on the realistic 13-section fixture: 25 density x micro combinations
-    through the FULL legacy Stage-4 path.
-
-    For every combination the pre-R1 reference and today's production must agree **exactly**, unless
-    the reference itself accepted a floor-violating extra — in which case production must be the one
-    that is safe. Measured on this fixture: zero combinations differ, because the violation needs a
-    fast tempo (the collision window is roughly 176-273 BPM) that this 123 BPM fixture never reaches.
+    This helper reproduces the loop's section walk exactly and calls the **real**
+    `select_section_wave_cuts`; it reimplements no selection logic. It deliberately calls neither
+    `add_rare_micro_cuts` nor `final_wave_cleanup`, and
+    `test_the_pre_micro_grid_builder_touches_neither_micro_nor_cleanup` enforces that by tripwire
+    rather than by inspection.
     """
-    beat_times, features, sections = _fixture()
+    selected = []
+    for section in sections:
+        beat_indices = np.where(
+            (beat_times >= section["start"]) & (beat_times < section["end"]))[0]
+        if beat_indices.size == 0:
+            continue
+        selected.extend(stage4.select_section_wave_cuts(
+            beat_indices, beat_times, features, section, cfg, density_factor))
+    return np.asarray(selected, dtype=float)
+
+
+def _stage4_cfg(shared, density, micro):
+    """`(cfg, density_factor)` exactly as `analyze_beats_auto` composes it: density then micro."""
     profile = fork_creative.CreativeProfile(cut_density=density, micro_cuts=micro)
     cfg, factor = (shared.CONFIG, None)
     if not profile.is_neutral_cuts():
@@ -1127,28 +1141,115 @@ def test_r1_changes_nothing_except_where_the_old_behaviour_violated_the_floor(st
         cfg = shared.density_scaled_config(shared.CONFIG, factor)
     if not profile.is_neutral_micro_cuts():
         cfg = shared.micro_cut_scaled_config(cfg, profile)
+    return cfg, factor
 
-    grid = stage4.select_wave_cuts(
+
+def test_the_pre_micro_grid_builder_touches_neither_micro_nor_cleanup(stage4, shared, monkeypatch):
+    """The tripwire that keeps the corrected oracle corrected.
+
+    Asserted behaviourally, not by reading the helper: both functions are replaced with raisers for
+    the duration of one build. If the builder ever reaches for either of them again — which is
+    exactly the R1 defect — this fails immediately.
+    """
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "the pre-micro grid builder called the accent layer or the final cleanup")
+
+    monkeypatch.setattr(stage4, "add_rare_micro_cuts", _forbidden)
+    monkeypatch.setattr(stage4, "final_wave_cleanup", _forbidden)
+
+    beat_times, features, sections = _fixture()
+    cfg, factor = _stage4_cfg(shared, 50, 50)
+    grid = _build_pre_micro_main_grid(stage4, beat_times, features, sections, cfg, factor)
+    assert grid.size > 0, "the builder produced nothing, so the tripwire proved nothing"
+
+
+def test_the_pre_micro_grid_is_not_the_select_wave_cuts_output(stage4, shared):
+    """Calibration for the R2 correction itself: the two really are different arrays.
+
+    If they were equal, the original oracle would have been harmless and this whole correction
+    would be ceremony. Measured on the 13-section fixture at density 50 / micro 50: both arrays
+    happen to hold 139 cuts, but they are **not** equal — `final_wave_cleanup` has moved positions.
+    """
+    beat_times, features, sections = _fixture()
+    cfg, factor = _stage4_cfg(shared, 50, 50)
+
+    pre_micro = _build_pre_micro_main_grid(
+        stage4, beat_times, features, sections, cfg, factor)
+    full_pipeline = stage4.select_wave_cuts(
         beat_times=beat_times, sections=sections, features=features, tempo=_TEMPO,
         audio_duration=_DURATION, cfg=cfg, density_factor=factor)[0]
 
-    # the main grid alone, so extras can be identified on both sides
-    bare = stage4.final_wave_cleanup(
-        stage4.add_rare_micro_cuts(grid, beat_times, features, _DURATION, cfg),
-        beat_times, features, _DURATION, cfg)
-    legacy_micro = _legacy_add_rare_micro_cuts_reference(
-        grid, beat_times, features, _DURATION, cfg)
-    legacy = stage4.final_wave_cleanup(
-        legacy_micro, beat_times, features, _DURATION, cfg)
+    assert not np.array_equal(np.sort(pre_micro), np.sort(full_pipeline)), (
+        "select_wave_cuts()[0] equals the pre-micro grid; the R2 premise no longer holds")
 
-    if _legacy_violates_floor(grid, legacy_micro, beat_times, cfg):
-        current = stage4.add_rare_micro_cuts(grid, beat_times, features, _DURATION, cfg)
-        assert not _legacy_violates_floor(grid, current, beat_times, cfg), (
-            f"d={density} m={micro}: the old behaviour violated the floor and the new one still does")
+
+#: The six Cut Density points from the **P0 measurement**, recovered from this session's P0
+#: evaluation probe (`DENS = (0, 10, 25, 50, 75, 100)`), not from the repository's own nine-point
+#: density sweep. Five Micro Cuts points x six densities x two realistic fixtures = the 60 legacy
+#: compatibility cases P0 reported.
+_P0_COMPAT_DENSITIES = (0, 10, 25, 50, 75, 100)
+_COMPAT_MICRO = (0, 25, 50, 75, 100)
+
+#: The two realistic fixtures P0 measured. Resolved lazily inside the test so module import stays
+#: cheap and the fixtures stay the committed ones.
+_COMPAT_FIXTURES = ("thirteen_section_123bpm", "micro_track_80bpm")
+
+
+def _compat_fixture(name):
+    if name == "thirteen_section_123bpm":
+        beat_times, features, sections = _fixture()
+        return beat_times, features, sections, _DURATION
+    if name == "micro_track_80bpm":
+        beat_times, features, sections = _micro_track()
+        return beat_times, features, sections, _MICRO_DURATION
+    raise AssertionError(f"unknown compatibility fixture {name!r}")
+
+
+@pytest.mark.parametrize("fixture_name", _COMPAT_FIXTURES)
+@pytest.mark.parametrize("density", _P0_COMPAT_DENSITIES)
+@pytest.mark.parametrize("micro", _COMPAT_MICRO)
+def test_r1_changes_nothing_except_where_the_old_behaviour_violated_the_floor(
+        stage4, shared, fixture_name, density, micro):
+    """**The compatibility rule**, restored to P0's 60 realistic cases: 6 Cut Density x 5 Micro Cuts
+    on each of the two realistic fixtures.
+
+    Both sides start from the **same independently constructed pre-micro main grid** and then run the
+    real composition once:
+
+        current :  add_rare_micro_cuts            -> final_wave_cleanup
+        legacy  :  _legacy_..._reference (frozen) -> final_wave_cleanup
+
+    For every case the two must agree **exactly**, unless the frozen reference itself accepted a
+    floor-violating extra — the only permitted behavioural delta — in which case production must be
+    the compliant one. Measured: 60/60 cases, zero legacy violations and zero unjustified changes,
+    because the collision needs roughly 176-273 BPM and neither 123 BPM nor 80 BPM reaches it.
+    """
+    beat_times, features, sections, duration = _compat_fixture(fixture_name)
+    cfg, factor = _stage4_cfg(shared, density, micro)
+    label = f"{fixture_name} d={density} m={micro}"
+
+    main_grid = _build_pre_micro_main_grid(
+        stage4, beat_times, features, sections, cfg, factor)
+    assert main_grid.size > 0, f"{label}: empty main grid, the comparison would be vacuous"
+
+    current_micro = stage4.add_rare_micro_cuts(
+        main_grid, beat_times, features, duration, cfg)
+    current_final = stage4.final_wave_cleanup(
+        current_micro, beat_times, features, duration, cfg)
+
+    legacy_micro = _legacy_add_rare_micro_cuts_reference(
+        main_grid, beat_times, features, duration, cfg)
+    legacy_final = stage4.final_wave_cleanup(
+        legacy_micro, beat_times, features, duration, cfg)
+
+    if _legacy_violates_floor(main_grid, legacy_micro, beat_times, cfg):
+        assert not _legacy_violates_floor(main_grid, current_micro, beat_times, cfg), (
+            f"{label}: the old behaviour violated the micro floor and the new one still does")
     else:
-        assert np.array_equal(bare, legacy), (
-            f"d={density} m={micro}: output changed with no floor violation to justify it "
-            f"({bare.size} vs {legacy.size} cuts)")
+        assert np.array_equal(current_final, legacy_final), (
+            f"{label}: output changed with no floor violation to justify it "
+            f"({current_final.size} vs {legacy_final.size} cuts)")
 
 
 def test_the_compatibility_oracle_is_not_vacuous(stage4, shared, collision):
