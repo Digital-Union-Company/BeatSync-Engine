@@ -166,11 +166,34 @@ correctness decision rather than a shortcut: its density band comes from the *gl
 selection lets one section's rule delete cuts from unrelated sections. `add_rare_micro_cuts` and
 `final_wave_cleanup` themselves are **unchanged**.
 
-The dispatch is decided by `auto_mode._freestyle_section_settings`, which returns `None` whenever
-every section resolves to the **same effective Cut Density** — Freestyle off, on with no rule, on
-with a rule that sets no density, or on with every rule landing on the base. So those renders take
-the legacy composition and are byte-identical to current `main`, rather than taking a generalised
-equivalent of it. The two are measurably not equivalent; do not "simplify" them into one path.
+**`section_settings is None` selects the legacy *composition*; it does not say which density that
+composition runs at.** That density comes from the same resolver, `auto_mode._freestyle_stage4_plan`,
+which answers with a density as well as a dispatch — three outcomes, and the caller needs no fourth
+branch:
+
+```
+(None, None)              Freestyle does not alter Stage-4 Cut Density
+                          -> exact global/legacy path at profile.cut_density
+(D, None)                 every ACTUAL detected section resolves to one density D
+                          -> exact global/legacy path AT D
+(None, section_settings)  two or more effective densities
+                          -> heterogeneous per-section path
+```
+
+So "uniform" never means "run the slider's config anyway":
+
+- **Freestyle off, or active with every actual section resolving to the global base** — rows 1 and 2
+  with `D` equal to the slider — is byte-identical to the normal render at that global Cut Density.
+  That covers Freestyle off, on with no rule, on with a rule that sets no density, and every rule
+  landing on the base.
+- **Uniform at a non-base density** — row 2 with `D` different from the slider, e.g. slider 50 with
+  every actual section resolving to 100 — is byte-identical to a normal **Freestyle-off render whose
+  global Cut Density slider is 100**, at the same global Micro Cuts value. It is *not* the slider's
+  render; reading row 2 as "legacy at `profile.cut_density`" is exactly the defect R1 corrected.
+
+Either way those renders take the legacy composition rather than a generalised equivalent of it. The
+two compositions are measurably not equivalent; do not "simplify" them into one path, and do not
+route a uniform render through the per-section path to avoid the extra config.
 
 Micro Cuts stays **one global control** on both paths: its policy comes from the globally derived
 config, and no section rule may rewrite `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
