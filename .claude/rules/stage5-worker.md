@@ -213,13 +213,18 @@ Load-bearing details:
   receives `beat_info`, sections, energy, targets, the creative seed and the candidate tags/scores, and
   its scoring and planning logic were not touched. The only difference is that Stage-5 semantics no
   longer change because Stage 1–4 resolved a different edit style.
-- **Future creative modes must not undo this.** Neutral / music-aware / hybrid / freestyle / AI
-  Director interpretation, section-specific weighting, a Master Seed, or an optional second style-aware
-  pass over a *small shortlisted* candidate set are all legitimate future work — **none of it is
-  implemented here**, and no speculative abstraction was added for it (a test asserts no
-  director/freestyle/shortlist machinery exists). The permanent constraints are: creative state never
-  enters Stage-5 cache identity; no per-render interpretation overwrites persistent semantics; and a
-  future second pass stays run-scoped rather than becoming the library's durable truth.
+- **Creative modes above Stage 5 must not undo this, and three have now shipped without doing so.**
+  A Master Seed (Variant Lab), natural-language interpretation (AI Director) and **section-specific
+  weighting (Freestyle V1)** are all implemented — entirely *above* Stage 5. None of it is
+  implemented **here**, and the guard did not weaken: `master_seed`, `director`, `proposal` and
+  `freestyle` are still banned on the **Stage-5 side** (`video_analysis.py`, the Qwen worker,
+  `library_prep.py`), which is where that ban was always load-bearing. A hybrid interpretation mode
+  and an optional second style-aware pass over a *small shortlisted* candidate set remain future work,
+  with no speculative abstraction added for either — `shortlist`, `second_pass` and
+  `interpretation_mode` are banned everywhere including the GUI. The permanent constraints are:
+  creative state never enters Stage-5 cache identity; no per-render interpretation overwrites
+  persistent semantics; and a future second pass stays run-scoped rather than becoming the library's
+  durable truth.
 
 ## The portable-Python `._pth` provenance hazard
 

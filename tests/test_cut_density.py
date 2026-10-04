@@ -34,15 +34,18 @@ import pytest
 np = pytest.importorskip("numpy", reason="Stage 4 is numpy-based")
 
 from beatsync_fork import creative as fork_creative
+from beatsync_fork import freestyle as fork_freestyle
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _AUTO_MODE_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "__init__.py")
 _STAGE4_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage4_select.py")
 
 #: Everything `stage4_select` imports from its package, plus the two derived-config builders
-#: (`test_micro_cuts` reuses this loader, so the micro one is exported here as well).
+#: (`test_micro_cuts` reuses this loader, so the micro one is exported here as well) and — since
+#: Freestyle V1 — the real `section index -> (cfg, factor)` resolver, so the per-section tests below
+#: drive production's own composition rather than a reimplementation of it.
 _SHARED = ("AutoWaveConfig", "_normalize", "_safe_percentile", "_unique_sorted",
-           "density_scaled_config", "micro_cut_scaled_config")
+           "density_scaled_config", "micro_cut_scaled_config", "_freestyle_section_settings")
 
 
 def _load_stage4():
@@ -63,7 +66,7 @@ def _load_stage4():
 
     namespace = {"np": np, "dataclass": dataclass, "replace": replace,
                  "Dict": Dict, "List": List, "fork_creative": fork_creative,
-                 "__builtins__": __builtins__}
+                 "fork_freestyle": fork_freestyle, "__builtins__": __builtins__}
     for name in _SHARED:
         exec(compile("from __future__ import annotations\n" + found[name], f"<{name}>", "exec"),
              namespace)
@@ -588,3 +591,562 @@ def test_practical_diagnostic_cut_density_sweep(stage4, shared, track, sweep):
           f"fixture, {len(_SECTION_TYPES)} sections:\n" + "\n".join(lines))
 
     assert len(lines) == 5
+
+# ===========================================================================
+# 6. FREESTYLE V1 — PER-SECTION CUT DENSITY
+# ===========================================================================
+#
+# Cut Density is the one Freestyle control that changes the cut timeline, which makes it the one
+# that needed a new composition. The accepted P0-R1 finding is the reason: `final_wave_cleanup`'s
+# density band is computed from the GLOBAL `len(beat_times)` and its cap ranks cuts across the
+# whole track, so running it after per-section selection lets one section's rule delete cuts from
+# unrelated sections. Per-section selection therefore ends at `section_density_cleanup`, and the
+# tests below pin both halves: the leak is gone, and the uniform case is still byte-identical.
+
+
+#: A rule that only sets `cut_density`, so a Stage-4 test cannot be confounded by the other four
+#: fields (which Stage 4 never reads).
+def _density_rule(density: int) -> fork_freestyle.SectionOverride:
+    return fork_freestyle.SectionOverride(cut_density=density)
+
+
+def _declared(pairs: dict) -> fork_freestyle.FreestyleDeclaration:
+    ordered = tuple((t, _density_rule(d)) for t, d in sorted(
+        pairs.items(), key=lambda kv: fork_freestyle.SECTION_TYPES.index(kv[0])))
+    return fork_freestyle.FreestyleDeclaration(enabled=True, overrides=ordered)
+
+
+def _select_declared(stage4, shared, track, base_density, declaration, micro_cuts=50):
+    """Stage 4 exactly as `analyze_beats_auto` runs it for one Freestyle screen."""
+    beat_times, features, sections = track
+    profile = fork_creative.CreativeProfile(cut_density=base_density, micro_cuts=micro_cuts)
+    if profile.is_neutral_cuts():
+        stage4_cfg, factor = shared.CONFIG, None
+    else:
+        factor = profile.cut_density_factor()
+        stage4_cfg = shared.density_scaled_config(shared.CONFIG, factor)
+    if not profile.is_neutral_micro_cuts():
+        stage4_cfg = shared.micro_cut_scaled_config(stage4_cfg, profile)
+    settings = shared._freestyle_section_settings(
+        declaration, profile, shared.CONFIG, stage4_cfg, factor, sections)
+    cuts, info = stage4.select_wave_cuts(
+        beat_times=beat_times, sections=sections, features=features, tempo=_TEMPO,
+        audio_duration=_DURATION, cfg=stage4_cfg, density_factor=factor,
+        section_settings=settings)
+    return cuts, info, settings
+
+
+def _cuts_in(cuts, section):
+    return cuts[(cuts >= section["start"]) & (cuts < section["end"])]
+
+
+def _by_section(cuts, sections):
+    return {s["type"]: _cuts_in(cuts, s).size for s in sections}
+
+
+# --- the uniform short-circuit: three screens, one byte-identical render -----------------
+
+
+def test_freestyle_off_takes_the_exact_legacy_path(stage4, shared, track):
+    legacy = _select(stage4, shared, track, 50)[0]
+    declaration = fork_freestyle.FreestyleDeclaration.from_styles(False, {"drop": "High Energy"})
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, declaration)
+    assert settings is None, "a disabled declaration must not build per-section settings"
+    assert np.array_equal(cuts, legacy)
+
+
+def test_freestyle_on_with_no_rule_takes_the_exact_legacy_path(stage4, shared, track):
+    legacy = _select(stage4, shared, track, 50)[0]
+    declaration = fork_freestyle.FreestyleDeclaration.from_styles(True, {})
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, declaration)
+    assert settings is None
+    assert np.array_equal(cuts, legacy)
+
+
+def test_freestyle_on_with_every_rule_on_the_base_density_takes_the_legacy_path(stage4, shared,
+                                                                               track):
+    """The short-circuit tests resolved *values*, not the checkbox — so a user who sets every
+    section to the density the sliders already carry gets the identical render, not a heterogeneous
+    one that happens to agree."""
+    legacy = _select(stage4, shared, track, 50)[0]
+    cuts, _, settings = _select_declared(
+        stage4, shared, track, 50,
+        _declared({t: 50 for t in ("intro", "drop", "chorus", "verse", "outro")}))
+    assert settings is None
+    assert np.array_equal(cuts, legacy)
+
+
+def test_a_rule_setting_no_density_takes_the_legacy_path(stage4, shared, track):
+    """Four of the five Freestyle controls are Stage-6 controls. A screen that varies only those
+    must leave the cut timeline bit-identical."""
+    legacy = _select(stage4, shared, track, 50)[0]
+    declaration = fork_freestyle.FreestyleDeclaration(
+        enabled=True,
+        overrides=(("drop", fork_freestyle.SectionOverride(motion_bias=90,
+                                                           semantic_emphasis=10)),))
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, declaration)
+    assert settings is None
+    assert np.array_equal(cuts, legacy)
+
+
+def test_the_uniform_short_circuit_holds_at_a_non_neutral_base(stage4, shared, track):
+    """The legacy path it falls back to is the *resolved base* path, not density 50."""
+    legacy = _select(stage4, shared, track, 80)[0]
+    cuts, _, settings = _select_declared(stage4, shared, track, 80, _declared({"drop": 80}))
+    assert settings is None
+    assert np.array_equal(cuts, legacy)
+
+
+# --- heterogeneous: the rule moves its own section ---------------------------------------
+
+
+def test_a_dense_rule_adds_cuts_to_the_sections_it_rules(stage4, shared, track):
+    """Measured on the fixture: `drop=100` takes section 7 from 11 cuts to 17 and the track from
+    139 to 147.
+
+    Section 10 is also a `drop` and does **not** move, and that is correct rather than a miss: it
+    gets the identical rule (proven by object identity below), but Cut Density steps through a
+    *discrete* beat grid, so a section whose stepping is already at its anchor-constrained limit has
+    no headroom left. That is pre-existing Cut Density behaviour — creative-controls.md records the
+    same discreteness as the 72-82 non-monotonic region — and a per-section control inherits it
+    rather than curing it. So the claim is "the ruled sections gain cuts", not "every instance
+    gains the same number".
+    """
+    _, _, sections = track
+    legacy = _select(stage4, shared, track, 50)[0]
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+
+    assert settings is not None, "two distinct densities must build per-section settings"
+    drops = [s for s in sections if s["type"] == "drop"]
+    assert len(drops) == 2, "the fixture has two drops, so repeated-type sharing is exercised"
+
+    deltas = [_cuts_in(cuts, s).size - _cuts_in(legacy, s).size for s in drops]
+    assert all(delta >= 0 for delta in deltas), f"a dense rule removed cuts: {deltas}"
+    assert sum(deltas) > 0, "a dense rule added no cuts to any section it rules"
+    assert cuts.size > legacy.size
+
+
+def test_a_sparse_rule_removes_cuts_from_the_sections_it_rules(stage4, shared, track):
+    """The sparse direction has headroom in both choruses: 11 -> 6 on each."""
+    _, _, sections = track
+    legacy = _select(stage4, shared, track, 50)[0]
+    cuts, _, _ = _select_declared(stage4, shared, track, 50, _declared({"chorus": 0}))
+    for section in [s for s in sections if s["type"] == "chorus"]:
+        assert _cuts_in(cuts, section).size < _cuts_in(legacy, section).size, section["index"]
+    assert cuts.size < legacy.size
+
+
+def test_every_instance_of_a_repeated_section_type_gets_the_identical_RULE(stage4, shared, track):
+    """`REPEATED_SECTION_POLICY = ALL_INSTANCES_SHARE_RULE` is a statement about the rule, not about
+    the outcome. Both drops receive the **same config object and the same factor**; what each then
+    produces depends on its own musical content, which is the whole point of a beat-anchored
+    selector. Asserting equal counts would be asserting that two different drops are the same drop.
+    """
+    _, _, sections = track
+    settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))[2]
+    drops = [s["index"] for s in sections if s["type"] == "drop"]
+    assert len(drops) == 2
+
+    first, second = settings[drops[0]], settings[drops[1]]
+    assert first[0] is second[0], "the two drops got different config objects"
+    assert first[1] == second[1], "the two drops got different density factors"
+
+
+# --- the P0-R1 finding: no neighbour leak ------------------------------------------------
+#
+# Stated *differentially*, which is the only form that measures the leak. Comparing a heterogeneous
+# render against the global-cleanup legacy render would not: per-section cleanup is section-scoped
+# by design, so a section with no rule can legitimately differ from the global render (the fixture's
+# intro goes 10 -> 11, because its own band judges it sparse where the global band did not). That
+# difference is the feature. The leak is something else entirely: changing ONE rule moving a section
+# that rule does not govern.
+
+
+def _differential(stage4, shared, track, baseline: dict, changed: dict):
+    first = _select_declared(stage4, shared, track, 50, _declared(baseline))[0]
+    second = _select_declared(stage4, shared, track, 50, _declared(changed))[0]
+    return first, second
+
+
+def test_changing_one_rule_leaves_every_other_section_byte_identical(stage4, shared, track):
+    """The whole reason `final_wave_cleanup` is not called on this path.
+
+    Measured on main's global cleanup with a binding density band: changing only the `drop` rule
+    mutated five non-target sections, three of them not even adjacent. Here, moving `drop` from 50
+    to 100 leaves all eleven non-drop sections identical — the same cut *times*, not merely the
+    same count.
+    """
+    _, _, sections = track
+    first, second = _differential(stage4, shared, track,
+                                  {"intro": 10, "drop": 50}, {"intro": 10, "drop": 100})
+    for section in sections:
+        if section["type"] == "drop":
+            continue
+        before, after = _cuts_in(first, section), _cuts_in(second, section)
+        assert np.array_equal(before, after), (
+            f"section {section['index']} ({section['type']}) leaked: "
+            f"{before.size} -> {after.size}")
+    assert second.size > first.size, "the differential did not actually change anything"
+
+
+def test_changing_one_rule_sparsely_also_leaks_into_no_other_section(stage4, shared, track):
+    """The sparse direction is the one a global cap would corrupt most: fewer cuts in one section
+    raises every other section's rank in a global ordering."""
+    _, _, sections = track
+    first, second = _differential(stage4, shared, track,
+                                  {"intro": 10, "chorus": 50}, {"intro": 10, "chorus": 0})
+    for section in sections:
+        if section["type"] != "chorus":
+            assert np.array_equal(_cuts_in(first, section), _cuts_in(second, section)), (
+                section["index"], section["type"])
+    assert second.size < first.size
+
+
+def test_a_non_adjacent_section_is_untouched_by_a_boundary_change(stage4, shared, track):
+    """`cross_section_safety` only judges boundary-straddling pairs, so even the sections next door
+    are affected at most at their own edge — and distant ones not at all. Both halves are asserted
+    together so this cannot pass by the rule having had no effect."""
+    _, _, sections = track
+    first, second = _differential(stage4, shared, track,
+                                  {"verse": 50}, {"verse": 10})
+    verse_indices = {s["index"] for s in sections if s["type"] == "verse"}
+    distant = [s for s in sections
+               if s["index"] not in verse_indices
+               and not any(abs(s["index"] - v) <= 1 for v in verse_indices)]
+    assert distant, "the fixture must contain a section not adjacent to any verse"
+    for section in distant:
+        assert np.array_equal(_cuts_in(first, section), _cuts_in(second, section)), section["index"]
+    assert not np.array_equal(first, second), "the rule change had no effect at all"
+
+
+def test_tightening_one_rule_leaves_the_other_ruled_sections_untouched(stage4, shared, track):
+    """Two rules, then one of them changes: the other section's cuts are identical times, not
+    merely an identical count."""
+    _, _, sections = track
+    first, _, _ = _select_declared(stage4, shared, track, 50,
+                                   _declared({"drop": 100, "intro": 10}))
+    second, _, _ = _select_declared(stage4, shared, track, 50,
+                                    _declared({"drop": 70, "intro": 10}))
+    for section in [s for s in sections if s["type"] == "intro"]:
+        assert np.array_equal(_cuts_in(first, section), _cuts_in(second, section))
+
+
+def test_the_per_section_path_never_calls_final_wave_cleanup(stage4, shared, track, monkeypatch):
+    """Structural, not inferred from counts: the global cleanup is simply not on this path."""
+    calls = []
+
+    def _tripwire(*args, **kwargs):
+        calls.append(1)
+        return np.array([], dtype=float)
+
+    monkeypatch.setattr(stage4, "final_wave_cleanup", _tripwire)
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+    assert settings is not None
+    assert calls == [], "final_wave_cleanup must not run on the heterogeneous path"
+    assert cuts.size > 0
+
+
+def test_the_legacy_path_still_calls_final_wave_cleanup(stage4, shared, track, monkeypatch):
+    """The calibration half: the guard above would pass just as happily if the whole function had
+    stopped being reachable at all."""
+    calls = []
+    real = stage4.final_wave_cleanup
+
+    def _counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(stage4, "final_wave_cleanup", _counting)
+    _select(stage4, shared, track, 50)
+    assert calls == [1]
+
+
+# --- section-local cleanup is the global policy, scoped ---------------------------------
+
+
+def test_section_density_cleanup_enforces_the_band_from_its_own_section(stage4, shared, track):
+    """`section_density_cleanup` is `final_wave_cleanup`'s density policy with every global input
+    replaced by the section's own: the band comes from THIS section's beat count, the cap ranks only
+    THIS section's cuts, and sparse-fill anchors come from THIS section's beats."""
+    beat_times, features, sections = track
+    section = next(s for s in sections if s["type"] == "chorus")
+    beat_indices = np.where((beat_times >= section["start"]) & (beat_times < section["end"]))[0]
+
+    everything = [float(beat_times[i]) for i in beat_indices]
+    cleaned = stage4.section_density_cleanup(
+        everything, beat_indices, beat_times, features, section, shared.CONFIG)
+
+    assert len(cleaned) < len(everything), "an every-beat section must be capped"
+    assert all(section["start"] <= t < section["end"] for t in cleaned), "stays inside its section"
+    ratio = len(cleaned) / beat_indices.size
+    assert ratio <= shared.CONFIG.target_cut_ratio_max + 1e-9, ratio
+
+
+def test_section_density_cleanup_leaves_a_reasonable_section_alone(stage4, shared, track):
+    beat_times, features, sections = track
+    section = next(s for s in sections if s["type"] == "verse")
+    beat_indices = np.where((beat_times >= section["start"]) & (beat_times < section["end"]))[0]
+    selected = stage4.select_section_wave_cuts(
+        beat_indices, beat_times, features, section, shared.CONFIG, None)
+    cleaned = stage4.section_density_cleanup(
+        selected, beat_indices, beat_times, features, section, shared.CONFIG)
+    assert np.array_equal(np.asarray(cleaned, dtype=float), np.asarray(selected, dtype=float))
+
+
+def test_section_density_cleanup_is_pure(stage4, shared, track):
+    beat_times, features, sections = track
+    section = next(s for s in sections if s["type"] == "drop")
+    beat_indices = np.where((beat_times >= section["start"]) & (beat_times < section["end"]))[0]
+    selected = [float(beat_times[i]) for i in beat_indices]
+    snapshot = list(selected)
+    beats_before = beat_times.copy()
+    stage4.section_density_cleanup(
+        selected, beat_indices, beat_times, features, section, shared.CONFIG)
+    assert selected == snapshot, "the input list was mutated"
+    assert np.array_equal(beat_times, beats_before)
+
+
+# --- the boundary: cross_section_safety ---------------------------------------------------
+
+
+def test_cross_section_safety_drops_the_later_cut_of_a_straddling_pair(stage4):
+    """Keep-earlier-drop-later, and only across a boundary: a within-section pair was already
+    judged by that section's own floor."""
+    cleaned = {0: [0.0, 1.0, 1.9], 1: [2.0, 3.0]}
+    gaps = {0: 0.5, 1: 0.5}
+    result = stage4.cross_section_safety(cleaned, gaps)
+    assert list(result) == [0.0, 1.0, 1.9, 3.0], "2.0 straddles the 1.9 boundary and loses"
+
+
+def test_cross_section_safety_never_judges_a_within_section_pair(stage4):
+    """Section 0's own cuts are 0.1 s apart — far under the threshold — and survive, because that
+    spacing is the section's own `peak_energy_min_interval` decision, already made."""
+    cleaned = {0: [0.0, 0.1, 0.2], 1: [5.0]}
+    result = stage4.cross_section_safety(cleaned, {0: 1.0, 1: 1.0})
+    assert list(result) == [0.0, 0.1, 0.2, 5.0]
+
+
+def test_cross_section_safety_uses_the_minimum_of_the_two_floors(stage4):
+    """`min(gapA, gapB)`: the looser of the two sections is honoured, so a dense section cannot
+    impose its tight floor on a sparse neighbour's first cut (or vice versa)."""
+    cleaned = {0: [0.0], 1: [0.30]}
+    assert list(stage4.cross_section_safety(cleaned, {0: 0.20, 1: 0.90})) == [0.0, 0.30]
+    assert list(stage4.cross_section_safety(cleaned, {0: 0.90, 1: 0.90})) == [0.0]
+
+
+def test_cross_section_safety_is_deterministic_and_sorted(stage4):
+    cleaned = {2: [9.0, 10.0], 0: [0.0, 1.0], 1: [4.0, 5.0]}
+    gaps = {0: 0.4, 1: 0.4, 2: 0.4}
+    first = stage4.cross_section_safety(cleaned, gaps)
+    second = stage4.cross_section_safety(dict(reversed(list(cleaned.items()))), gaps)
+    assert np.array_equal(first, second)
+    assert list(first) == sorted(first)
+
+
+def test_cross_section_safety_handles_empty_and_single_section_input(stage4):
+    assert stage4.cross_section_safety({}, {}).size == 0
+    assert list(stage4.cross_section_safety({0: [1.0, 2.0]}, {0: 0.4})) == [1.0, 2.0]
+    assert list(stage4.cross_section_safety({0: [], 1: [3.0]}, {0: 0.4, 1: 0.4})) == [3.0]
+
+
+def test_a_collapsing_cascade_cannot_delete_a_whole_section(stage4):
+    """Three straddling cuts in a row: each is judged against the last *kept* cut, so a run of
+    rejections cannot chain off a cut that was itself already dropped."""
+    cleaned = {0: [0.0], 1: [0.1], 2: [0.2], 3: [0.9]}
+    gaps = {i: 0.5 for i in range(4)}
+    assert list(stage4.cross_section_safety(cleaned, gaps)) == [0.0, 0.9]
+
+
+# --- the composed timeline is still safe -------------------------------------------------
+
+
+@pytest.mark.parametrize("pairs", [
+    {"drop": 100},
+    {"chorus": 0},
+    {"intro": 0, "drop": 100},
+    {"intro": 100, "verse": 0, "chorus": 100, "drop": 0, "outro": 100},
+])
+def test_every_freestyle_timeline_is_valid_sorted_and_unique(stage4, shared, track, pairs):
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, _declared(pairs))
+    assert settings is not None
+    assert cuts.size > 0
+    assert list(cuts) == sorted(cuts), "not sorted"
+    assert len(set(cuts.tolist())) == cuts.size, "duplicate cut times"
+    assert float(np.min(cuts)) >= 0.0
+    assert float(np.max(cuts)) <= _DURATION
+
+
+@pytest.mark.parametrize("pairs", [{"drop": 100}, {"intro": 100, "chorus": 100, "drop": 100},
+                                   {"chorus": 0, "drop": 100}])
+def test_every_freestyle_cut_still_lands_on_a_detected_beat(stage4, shared, track, pairs):
+    """Same tolerance as the global test above — the half-beat grid, because rare micro cuts are
+    the one deliberate exception and the global Micro Cuts layer still runs on this path."""
+    beat_times = track[0]
+    half_beats = np.sort(np.concatenate(
+        [beat_times, beat_times[:-1] + 0.5 * np.diff(beat_times)]))
+    cuts, _, _ = _select_declared(stage4, shared, track, 50, _declared(pairs))
+    for t in cuts:
+        assert float(np.min(np.abs(half_beats - t))) < 1e-9, (pairs, t)
+
+
+def test_the_minimum_gap_never_collapses_under_a_dense_rule(stage4, shared, track):
+    """A dense section may legitimately cut faster than a neutral one — the floor it must respect is
+    its OWN derived floor, not the base section's. The micro layer is the one deliberate exception:
+    its floor is `micro_min_gap`, and the legacy defect recorded in `test_micro_cuts` means two
+    extras can still finish closer than that. This bound is therefore the weaker of the two."""
+    _, _, sections = track
+    cuts, _, settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+    drop_cfg = settings[next(s["index"] for s in sections if s["type"] == "drop")][0]
+    floor = min(drop_cfg.peak_energy_min_interval, shared.CONFIG.peak_energy_min_interval)
+    gaps = np.diff(cuts)
+    assert float(np.min(gaps)) > 0.0
+    assert float(np.min(gaps)) >= min(floor, shared.CONFIG.micro_min_gap) * 0.5
+
+
+def test_the_selection_info_still_describes_every_section(stage4, shared, track):
+    _, _, sections = track
+    _, info, _ = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+    assert len(info) == len(sections)
+    assert [entry["section"]["index"] for entry in info] == [s["index"] for s in sections]
+    for entry in info:
+        assert entry["beat_count"] > 0
+        assert 0.0 <= entry["density"] <= 1.0
+        assert entry["selected_count"] / max(1, entry["beat_count"]) == entry["density"]
+
+
+# --- config derivation ------------------------------------------------------------------
+
+
+def test_one_config_is_derived_per_distinct_density_not_per_section(stage4, shared, track):
+    """Thirteen sections, two distinct densities: two configs, shared by identity."""
+    _, _, sections = track
+    settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))[2]
+    assert len(settings) == len(sections)
+    distinct = {id(cfg) for cfg, _ in settings.values()}
+    assert len(distinct) == 2, f"expected 2 derived configs, got {len(distinct)}"
+
+
+def test_a_section_at_the_base_density_reuses_the_base_config_object(stage4, shared, track):
+    _, _, sections = track
+    settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))[2]
+    verse = next(s["index"] for s in sections if s["type"] == "verse")
+    cfg, factor = settings[verse]
+    assert cfg is shared.CONFIG, "a neutral section must take the untouched singleton"
+    assert factor is None, "a neutral section must pass density_factor=None, never 1.0"
+
+
+def test_the_global_config_singleton_is_never_mutated_by_freestyle(stage4, shared, track):
+    import dataclasses as _dc
+    before = {f.name: getattr(shared.CONFIG, f.name) for f in _dc.fields(shared.CONFIG)}
+    _select_declared(stage4, shared, track, 50,
+                     _declared({"drop": 100, "intro": 0, "chorus": 90}))
+    after = {f.name: getattr(shared.CONFIG, f.name) for f in _dc.fields(shared.CONFIG)}
+    assert before == after
+
+
+def test_the_section_factor_comes_from_the_one_exponential_mapping(stage4, shared, track):
+    _, _, sections = track
+    settings = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))[2]
+    drop = next(s["index"] for s in sections if s["type"] == "drop")
+    _, factor = settings[drop]
+    assert factor == fork_creative.CreativeProfile(cut_density=100).cut_density_factor()
+
+
+def test_freestyle_cannot_rewrite_a_micro_cut_field(stage4, shared, track):
+    """Micro Cuts is global. A per-section density derives floors and ratios; all four micro fields
+    must equal the globally derived config's, on every section."""
+    profile = fork_creative.CreativeProfile(cut_density=50, micro_cuts=80)
+    global_cfg = shared.micro_cut_scaled_config(shared.CONFIG, profile)
+    settings = _select_declared(stage4, shared, track, 50,
+                                _declared({"drop": 100, "intro": 0}), micro_cuts=80)[2]
+    micro_fields = ("enable_rare_micro_cuts", "max_micro_cut_ratio", "micro_min_gap",
+                    "micro_percentile")
+    for index, (cfg, _) in settings.items():
+        for field in micro_fields:
+            assert getattr(cfg, field) == getattr(global_cfg, field), (index, field)
+
+
+def test_a_non_neutral_base_still_composes_with_per_section_rules(stage4, shared, track):
+    """The `density_factor` Stage 4 receives at the top level still describes the global base; a
+    section's own factor rides in `section_settings`."""
+    cuts, _, settings = _select_declared(stage4, shared, track, 80, _declared({"drop": 100}))
+    assert settings is not None
+    assert cuts.size > 0
+    assert list(cuts) == sorted(cuts)
+
+
+# --- isolation --------------------------------------------------------------------------
+
+
+def test_freestyle_state_cannot_leak_between_renders(stage4, shared, track):
+    legacy = _select(stage4, shared, track, 50)[0]
+    first, _, _ = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+    again = _select(stage4, shared, track, 50)[0]
+    repeat, _, _ = _select_declared(stage4, shared, track, 50, _declared({"drop": 100}))
+
+    assert np.array_equal(again, legacy), "a Freestyle render changed the next neutral render"
+    assert np.array_equal(repeat, first), "the same declaration did not reproduce"
+
+
+def test_section_settings_is_keyword_only(stage4):
+    """Positional alignment is a real hazard here: `density_factor` is positional-or-keyword and
+    sits immediately before it."""
+    import inspect
+    parameter = inspect.signature(stage4.select_wave_cuts).parameters["section_settings"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+
+
+def test_stage_4_still_holds_no_module_level_render_state_after_freestyle():
+    tree = _tree(_STAGE4_PATH)
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            rendered = ast.unparse(node)
+            assert "freestyle" not in rendered.lower(), rendered
+            assert not rendered.endswith("= {}"), rendered
+
+
+def test_stage_4_knows_nothing_about_freestyle_records_or_the_gui():
+    """Stage 4 receives resolved `(cfg, factor)` pairs. It must not import the fork record, parse a
+    style name, read a section rule or know a GUI exists."""
+    with open(_STAGE4_PATH, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source, filename=_STAGE4_PATH)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            rendered = ast.unparse(node)
+            assert "freestyle" not in rendered, rendered
+    # `beatsync_fork.creative` is a legitimate pre-existing import (Cut Density's `scale_beat_step`
+    # lives there), so the ban is on the Freestyle record specifically, not on the fork package.
+    assert "fork_freestyle" not in source
+    lowered = source.lower()
+    for forbidden in ("freestyledeclaration", "sectionoverride", "override_from_style",
+                      "gradio", "gr.update", "effective_profile", "section_style"):
+        assert forbidden not in lowered, f"stage4_select.py references {forbidden!r}"
+
+
+# ===========================================================================
+# 7. FREESTYLE DIAGNOSTIC (captured by default)
+# ===========================================================================
+
+
+def test_practical_diagnostic_freestyle_section_densities(stage4, shared, track):
+    """Readable evidence that a rule moves its own section and only its own::
+
+        python -m pytest tests/test_cut_density.py -s -k practical_diagnostic_freestyle
+    """
+    _, _, sections = track
+    legacy = _select(stage4, shared, track, 50)[0]
+    cuts, _, _ = _select_declared(stage4, shared, track, 50, _declared({"drop": 100, "intro": 0}))
+
+    lines = []
+    for section in sections:
+        kind = section["type"]
+        before = _cuts_in(legacy, section).size
+        after = _cuts_in(cuts, section).size
+        mark = "  <- ruled" if kind in ("drop", "intro") else ""
+        lines.append(f"  [{section['index']:2d}] {kind:10s} {before:3d} -> {after:3d}{mark}")
+    print(f"\nFreestyle: base density 50, drop=100, intro=0 "
+          f"({legacy.size} -> {cuts.size} cuts total):\n" + "\n".join(lines))
+
+    assert len(lines) == len(sections)

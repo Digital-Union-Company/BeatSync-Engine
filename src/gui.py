@@ -161,6 +161,13 @@ from beatsync_fork import render_batch as fork_render_batch
 # Variation Seed through the existing `variation.random_seed()`, and writes the proposal into the
 # visible execution controls only when the user presses Apply. It renders nothing.
 from beatsync_fork import director as fork_director
+# [FORK] Digital-Union (Freestyle V1): section-scoped creative modulation. The field registry, the
+# section-type vocabulary, the sparse `SectionOverride` / `FreestyleDeclaration` records, the
+# preset projection and the truthful summary all live in src/beatsync_fork/freestyle.py
+# (stdlib-only, Gradio-free, media-free). This module only builds a declaration from the LIVE
+# widgets at render-submission time and threads it down the existing render chain. It writes no
+# global creative widget, and nothing downstream of Stage 6 has heard of it.
+from beatsync_fork import freestyle as fork_freestyle
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
 # src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
@@ -677,7 +684,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        voice_files: VideoFilesInput = None,
                        audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                        sfx_root: str | None = None,
-                       smart_mix: fork_smart_mix.SmartMixConfig | None = None) -> StatusResult:
+                       smart_mix: fork_smart_mix.SmartMixConfig | None = None,
+                       # [FORK] Digital-Union (Freestyle V1): appended LAST with a default, so every
+                       # existing caller — production and test — stays valid and no positional
+                       # argument moved. `None` means no section rules, i.e. today's render.
+                       freestyle: object | None = None
+                       ) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
     # inner function as loose scalars. `None` means an all-neutral render, which is what a caller
@@ -848,6 +860,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             console_callback=lambda stage, message: console_logger.stage_line(stage, message) if console_logger else None,
             event_callback=event_callback,
             creative=creative.as_dict(),
+            # [FORK] Digital-Union (Freestyle V1): the frozen section-rule declaration for this
+            # render. Stages 1-3 ignore it; Stage 4 resolves per-section Cut Density from it after
+            # Stage 3 exists, and it rides `beat_info` to Stage 6. It reaches no cache input.
+            freestyle=freestyle,
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
@@ -979,7 +995,19 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         sections_info = beat_info.get('selection_info', [])
         total_processing_seconds = time.perf_counter() - total_started
         processing_label = gpu_encoder.upper() if use_nvenc else ("PRORES_PROXY" if is_prores else "H264_CPU")
-        
+
+        # [FORK] Digital-Union (Freestyle V1): the section rules this render actually used, read
+        # back off the bus the pipeline just returned rather than re-derived from the request.
+        # Duck-typed, and deliberately so: this function is AST-extracted and executed by a frozen
+        # seam suite against a synthesised namespace, so naming a fork module or calling a
+        # module-level helper here would break a test this feature must preserve unchanged.
+        # `None` when Freestyle had no effect, so a today-style render's panel is byte-identical.
+        resolved_freestyle = (beat_info or {}).get('freestyle')
+        freestyle_report = (
+            resolved_freestyle.describe()
+            if getattr(resolved_freestyle, 'is_active', None) and resolved_freestyle.is_active()
+            else None)
+
         status_msg = get_success_message_auto(
             total_cuts, len(beat_times),
             beat_info.get('tempo', 120), sections_info,
@@ -994,6 +1022,9 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             # worth keeping can be reproduced from the panel. Omitted entirely on a neutral render,
             # exactly as the seed-only line was.
             variation_text=None if creative.is_neutral() else creative.describe(),
+            # [FORK] Digital-Union (Freestyle V1): numeric execution truth, not the preset labels
+            # the user picked — those were UI input and are not stored. No new stage, no ETA.
+            freestyle_text=freestyle_report,
         )
         # [FORK] Digital-Union (L0.1): append the L0 baseline. The success statistics above are
         # untouched; this only adds a block the user can copy after the run, from values already
@@ -1035,7 +1066,11 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  voice_files: VideoFilesInput = None,
                  audio_mix: fork_audio_mix.AudioMixConfig | None = None,
                  sfx_root: str | None = None,
-                 smart_mix: fork_smart_mix.SmartMixConfig | None = None
+                 smart_mix: fork_smart_mix.SmartMixConfig | None = None,
+                 # [FORK] Digital-Union (Freestyle V1): appended last with a default. Freestyle adds
+                 # render intent only — this function's worker thread, its synchronous join on
+                 # generator close, the render mutex and the concurrency group are all untouched.
+                 freestyle: object | None = None
                  ) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
@@ -1082,6 +1117,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     audio_mix=audio_mix,
                     sfx_root=sfx_root,
                     smart_mix=smart_mix,
+                    freestyle=freestyle,
                 )
         except Exception as e:
             console_logger.line(f"Error: {e}")
@@ -1258,6 +1294,42 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
     """
     return fork_presets.matching_preset((cut_density, micro_cuts, semantic_emphasis,
                                          energy_response, motion_bias, source_diversity))
+
+
+# [FORK] Digital-Union (Freestyle V1): the Freestyle seam, and the whole of it.
+#
+# One handler, and it writes one read-only textbox. It is deliberately thin — every decision (the
+# five-field registry, the section vocabulary, the preset projection, `Base` semantics, the sparse
+# composition, the summary layout) lives in `beatsync_fork/freestyle.py`, so the GUI contributes no
+# Freestyle policy of its own. The render path does not come through here at all: both render
+# wrappers take the live widget values as their own arguments and `auto_mode._resolve_freestyle`
+# builds the one declaration, so a summary refresh can never be on a render's critical path.
+#
+# What Freestyle deliberately does NOT do: write the Variation Seed, write any of the six global
+# creative sliders, write `creative_preset`, touch Director or Variant Lab state, reach a source or
+# preparation widget, or render. It is a separate layer, not another Apply operation.
+
+#: The ten section-type dropdown values in :data:`fork_freestyle.SECTION_TYPES` order. One
+#: definition is the contract between the two render registrations, the two render signatures, the
+#: summary handler and `auto_mode`'s reader — which is what stops the order drifting across five
+#: places.
+_FREESTYLE_WIDGET_ORDER = fork_freestyle.SECTION_TYPES
+
+
+def _on_freestyle_change(freestyle_enabled, *styles) -> str:
+    """Re-render the Freestyle summary. Writes the summary textbox and nothing else.
+
+    Deliberately does **not** show inherited numeric values: the global controls have five
+    legitimate writers (the preset selector, Variant Lab Generate / New / Apply, and Director
+    Apply), so a number here would go stale the moment any of them fired. `Base` means "inherit the
+    live global value at render time" and stays true whatever the global sliders later become.
+
+    It takes no global slider as an input, which is what makes that guarantee structural rather
+    than a promise: there is no global value in scope to print.
+    """
+    declaration = fork_freestyle.FreestyleDeclaration.from_styles(
+        freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)))
+    return fork_freestyle.summary_text(declaration)
 
 
 # [FORK] Digital-Union (AI Director V1): two thin handlers, and the asymmetry between them IS the
@@ -1901,7 +1973,12 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     source_diversity: int, micro_cuts: int,
                                     semantic_emphasis: int,
                                     session_state: dict,
-                                    source_state) -> Iterator[GuardedResult]:
+                                    source_state,
+                                    # [FORK] Digital-Union (Freestyle V1): appended LAST with a
+                                    # default, so no existing positional argument moved and every
+                                    # existing caller stays valid.
+                                    freestyle: object | None = None
+                                    ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
     This is the gate that matters. UI disablement is a courtesy; a stale browser tab, a queued event
@@ -2036,6 +2113,7 @@ def _process_video_guarded_unlocked(audio_file: str,
         audio_mix=audio_mix,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
+        freestyle=freestyle,
     )
     try:
         for video, status, state in render_stream:
@@ -2086,7 +2164,23 @@ def process_video_guarded(audio_file: str,
                           cut_density: int, energy_response: int, motion_bias: int,
                           source_diversity: int, micro_cuts: int, semantic_emphasis: int,
                           session_state: dict,
-                          source_state) -> Iterator[GuardedResult]:
+                          source_state,
+                          # [FORK] Digital-Union (Freestyle V1): the LIVE Freestyle widgets, read at
+                          # click time and appended at the END so every existing positional index
+                          # is unchanged. They are the render's execution authority for section
+                          # rules — see the docstring below for why `gr.State` is not.
+                          freestyle_enabled: bool = False,
+                          freestyle_intro: str | None = None,
+                          freestyle_hook: str | None = None,
+                          freestyle_outro: str | None = None,
+                          freestyle_finale: str | None = None,
+                          freestyle_drop: str | None = None,
+                          freestyle_chorus: str | None = None,
+                          freestyle_bridge: str | None = None,
+                          freestyle_breakdown: str | None = None,
+                          freestyle_verse: str | None = None,
+                          freestyle_body: str | None = None,
+                          ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
     [FORK] Digital-Union (C3-R0): the gate logic itself did not move or change — it is
@@ -2097,6 +2191,13 @@ def process_video_guarded(audio_file: str,
     If another render holds the lock this refuses immediately and **touches nothing**: no source
     state, no report widgets, and `gr.skip()` for the video so the previous preview survives. A
     user who clicks twice loses nothing.
+
+    [FORK] Digital-Union (Freestyle V1): the section-rule declaration is built **here, from the
+    live widget values submitted with this click** — not from a `gr.State`. That is the same
+    reasoning the live source gate rests on: Gradio delivers widget changes as separate queued
+    events, so a `gr.State` can lag behind the widgets at click time, and a render must use the
+    rules the user is currently declaring. The readout state exists for the summary panel only and
+    is never execution authority.
     """
     if not _RENDER_LOCK.acquire(blocking=False):
         yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip()
@@ -2109,6 +2210,16 @@ def process_video_guarded(audio_file: str,
             output_filename, processing_mode, custom_fps, variation_seed,
             cut_density, energy_response, motion_bias, source_diversity,
             micro_cuts, semantic_emphasis, session_state, source_state,
+            # One frozen tuple of exactly what the user submitted, in
+            # `freestyle.SECTION_TYPES` order. A plain tuple rather than a built
+            # `FreestyleDeclaration` on purpose: this body is AST-extracted and executed by the
+            # frozen progress/guard seam suites against a synthesised namespace, so naming a fork
+            # module here would break tests this feature is required to preserve unchanged. The
+            # tuple is immutable, so it is every bit as frozen; `analyze_beats_auto` turns it into
+            # the one declaration.
+            (freestyle_enabled, freestyle_intro, freestyle_hook, freestyle_outro,
+             freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
+             freestyle_breakdown, freestyle_verse, freestyle_body),
         )
     finally:
         _RENDER_LOCK.release()
@@ -2128,7 +2239,22 @@ def render_selected_variants_guarded(
         source_mode: str, source_folder: str,
         source_recursive: bool, video_input: VideoFilesInput,
         output_filename: str, processing_mode: str, custom_fps: float,
-        session_state: dict, source_state) -> Iterator[Tuple]:
+        session_state: dict, source_state,
+        # [FORK] Digital-Union (Freestyle V1): the LIVE Freestyle widgets, appended LAST with
+        # defaults so no existing positional argument moved. Frozen once below, before the
+        # candidate loop.
+        freestyle_enabled: bool = False,
+        freestyle_intro: str | None = None,
+        freestyle_hook: str | None = None,
+        freestyle_outro: str | None = None,
+        freestyle_finale: str | None = None,
+        freestyle_drop: str | None = None,
+        freestyle_chorus: str | None = None,
+        freestyle_bridge: str | None = None,
+        freestyle_breakdown: str | None = None,
+        freestyle_verse: str | None = None,
+        freestyle_body: str | None = None,
+        ) -> Iterator[Tuple]:
     """Render exactly two selected candidates, one after the other. C3-R0.
 
     [FORK] Digital-Union (C3-R0). Three things make this safe, and all three are deliberate:
@@ -2172,6 +2298,18 @@ def render_selected_variants_guarded(
     outcomes: list = []
     stopped = False
     try:
+        # [FORK] Digital-Union (Freestyle V1): ONE declaration for the whole batch, frozen HERE —
+        # outside the candidate loop, from this handler's own submitted arguments. Both candidates
+        # therefore render under the identical section rules, and a user editing a Freestyle
+        # dropdown while the batch runs cannot reach candidate 2. Exactly the treatment audio,
+        # voice, SFX, source, output, encoder and FPS already get: Freestyle is shared render
+        # intent, not a candidate value, so C3 needed no new frozen field and `render_batch.py` is
+        # untouched. Each candidate still composes its OWN global recipe with these shared rules.
+        batch_freestyle = (
+            freestyle_enabled, freestyle_intro, freestyle_hook, freestyle_outro,
+            freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
+            freestyle_breakdown, freestyle_verse, freestyle_body)
+
         for position, candidate in enumerate(request.candidates, start=1):
             prefix = f"Rendering candidate {position} / {request.count}"
             recipe = candidate.creative_recipe
@@ -2196,7 +2334,8 @@ def render_selected_variants_guarded(
                         recipe.seed,
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
-                        session_state, source_state)
+                        session_state, source_state,
+                        batch_freestyle)
             try:
                 for video, status, state, _a_report, _s_report in candidate_stream:
                     last_status = status or ''
@@ -2922,6 +3061,93 @@ def create_ui() -> gr.Blocks:
                         elem_id='semantic-emphasis-slider',
                     )
 
+                    # [FORK] Digital-Union (Freestyle V1): section-type rules, collapsed, placed
+                    # AFTER the global controls it layers over and BEFORE Variant Lab — the layout
+                    # is the explanation: the sliders above are the base, these rules modulate it
+                    # per section, and the lab below varies the base.
+                    #
+                    # Twelve components: an enable checkbox, ten section-type dropdowns and one
+                    # read-only summary. No numeric per-section sliders, no Analyze Music button, no
+                    # section-instance timeline, and deliberately no new top-level workflow.
+                    #
+                    # These widgets write NO global creative widget. They are also live inputs to
+                    # both render events, which is what makes them execution authority rather than
+                    # the summary state.
+                    with gr.Accordion(label=LABEL_FREESTYLE, open=False):
+                        gr.Markdown(INFO_FREESTYLE)
+                        freestyle_enabled = gr.Checkbox(
+                            value=False,
+                            label=LABEL_FREESTYLE_ENABLED,
+                            info=INFO_FREESTYLE_ENABLED,
+                            elem_id='freestyle-enabled-checkbox',
+                        )
+                        # One dropdown per Stage-3 section type, declared explicitly rather than in
+                        # a loop so each widget is visible to the per-widget seam assertions — the
+                        # same reason the six slider bindings are written out one at a time.
+                        # `Base` is the default and means "inherit the live global value".
+                        freestyle_intro = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
+                            elem_id='freestyle-intro')
+                        freestyle_hook = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
+                            elem_id='freestyle-hook')
+                        freestyle_outro = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
+                            elem_id='freestyle-outro')
+                        freestyle_finale = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
+                            elem_id='freestyle-finale')
+                        freestyle_drop = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
+                            elem_id='freestyle-drop')
+                        freestyle_chorus = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
+                            elem_id='freestyle-chorus')
+                        freestyle_bridge = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
+                            elem_id='freestyle-bridge')
+                        freestyle_breakdown = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
+                            elem_id='freestyle-breakdown')
+                        freestyle_verse = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
+                            elem_id='freestyle-verse')
+                        freestyle_body = gr.Dropdown(
+                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle.BASE_STYLE,
+                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
+                            elem_id='freestyle-body')
+                        # Read-only, and formatted entirely by `freestyle.summary_text()` — one
+                        # formatter per read-out, exactly as the Variant Lab, mix and Director
+                        # reports work. It never prints an inherited number; see the handler.
+                        freestyle_summary = gr.Textbox(
+                            label=LABEL_FREESTYLE_SUMMARY,
+                            value=fork_freestyle.summary_text(
+                                fork_freestyle.FreestyleDeclaration()),
+                            lines=6,
+                            max_lines=16,
+                            interactive=False,
+                            elem_id='freestyle-summary',
+                        )
+
                     # [FORK] Digital-Union (Variant Lab V1 / C2): collapsed by default and placed
                     # below the six sliders it generates values for — the layout says what the lab
                     # does. Every widget in here is lab configuration read at click time only: none
@@ -3290,6 +3516,52 @@ def create_ui() -> gr.Blocks:
             outputs=[creative_preset],
         )
 
+        # [FORK] Digital-Union (Freestyle V1): the Freestyle wiring — eleven summary refreshes and
+        # nothing else.
+        #
+        # `freestyle_live_inputs` is the ONE definition of the live-widget order for the eleven
+        # summary handlers. The two render registrations deliberately do NOT reuse it — they write
+        # the same widgets out explicitly, because the positional seam tests read those `inputs`
+        # lists' own `.elts` and a concatenation would hide the widgets from the very assertion
+        # that keeps each list aligned with its handler signature. What keeps all four places in
+        # step is `fork_freestyle.SECTION_TYPES`: `_FREESTYLE_WIDGET_ORDER` is it, the two render
+        # signatures are pinned against it by test, and `auto_mode._resolve_freestyle` zips the
+        # submitted tuple against it.
+        freestyle_section_dropdowns = [
+            freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
+            freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
+            freestyle_verse, freestyle_body,
+        ]
+        freestyle_live_inputs = [freestyle_enabled] + freestyle_section_dropdowns
+
+        # Each widget refreshes the summary and writes NOTHING else. `.change()` is correct here
+        # (unlike the preset/slider graph, which needs `.input()` to stay acyclic): nothing ever
+        # writes a Freestyle widget programmatically, so there is no cycle to create — and a test
+        # pins that absence. Registered explicitly per widget, not in a loop, so each binding is
+        # visible to the per-widget seam assertions.
+        freestyle_enabled.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_intro.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_hook.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_outro.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_finale.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_drop.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_chorus.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_bridge.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_breakdown.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_verse.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+        freestyle_body.change(
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+
         # [FORK] Digital-Union (AI Director V1): the Director's entire wiring — two button clicks.
         #
         # Note what Generate's `outputs` does NOT contain: `variation_seed`, the six sliders,
@@ -3438,6 +3710,15 @@ def create_ui() -> gr.Blocks:
                 source_mode, source_folder, source_recursive, video_input,
                 output_filename, processing_mode, custom_fps,
                 session_state, source_state,
+                # [FORK] Digital-Union (Freestyle V1): the same live widgets, appended at the end
+                # and written out explicitly for the same inspectability reason. The batch freezes
+                # ONE declaration from them before its candidate loop, so both candidates render
+                # under identical section rules and a mid-batch dropdown edit cannot reach
+                # candidate 2 — exactly how audio, source, output, encoder and FPS already behave.
+                freestyle_enabled,
+                freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
+                freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
+                freestyle_verse, freestyle_body,
             ],
             outputs=[video_output, status_output, session_state, render_batch_summary],
             show_progress='hidden',
@@ -3512,7 +3793,19 @@ def create_ui() -> gr.Blocks:
                 output_filename, processing_mode, custom_fps, variation_seed,
                 cut_density, energy_response, motion_bias,
                 source_diversity, micro_cuts, semantic_emphasis,
-                session_state, source_state
+                session_state, source_state,
+                # [FORK] Digital-Union (Freestyle V1): the LIVE Freestyle widgets, appended at the
+                # END so every pre-existing positional index is unchanged. Written out explicitly
+                # rather than as `+ freestyle_live_inputs`: the positional seam test reads this
+                # list's own `.elts`, so a concatenation would hide the widgets from the very
+                # assertion that keeps `inputs` and the handler signature aligned.
+                #
+                # These are the render's execution authority for section rules. The summary state
+                # is a read-out and is deliberately absent here.
+                freestyle_enabled,
+                freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
+                freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
+                freestyle_verse, freestyle_body,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or

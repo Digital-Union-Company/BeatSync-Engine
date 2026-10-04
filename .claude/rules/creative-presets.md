@@ -160,7 +160,7 @@ nothing about either (a preset remains a named set of slider values with no gene
 while `gui.py` may wire the lab up. The pre-existing prohibition on a preset *button*, randomiser or
 reset for the six controls is unchanged.
 
-## The Director boundary — implemented; Freestyle still is not
+## The Director boundary — implemented; so is Freestyle now
 
 **AI Director V1 shipped, and it landed exactly where C2 said it would.** `CreativeRecipe` was
 written as the contract a future AI Director should *produce*, which is why it carries no master
@@ -176,11 +176,32 @@ leaves `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` untouched, and overwrites
 semantics — it proposes seven integers for the controls that already existed. Full contract:
 `.claude/rules/director.md`.
 
-Still not implemented, and no speculative abstraction was added for any of it: **Freestyle**
-(per-section variation of these controls), L2 stage caching, source groups, per-section profiles, a
-second style-aware Qwen pass over a shortlisted candidate set, and a **content-aware Director** that
-reads the Stage-5 library. Tests assert the absence of freestyle/shortlist/stage-cache machinery,
-and of `director_cache` / `director_history` / `director_media` / `director_render` /
-`director_transform`. The permanent constraints are unchanged: creative state never enters Stage-5
-cache identity, no per-render interpretation overwrites persistent semantics, and a future second
-pass stays run-scoped rather than becoming the library's durable truth.
+**Freestyle V1 shipped too, and a preset gained exactly one new role: it is now also a *section
+style*.** Selecting `Cinematic` for the `drop` sections projects that recipe's **five** values —
+Cut Density, Semantic Emphasis, Energy Response, Motion Bias, Source Diversity — into a
+`SectionOverride`, and leaves Micro Cuts and the Variation Seed global. Three properties keep this a
+UI convenience rather than a second recipe concept:
+
+- **`presets.py` was not modified and knows nothing about Freestyle.** A preset is still a name for
+  six numbers; `freestyle.py` imports `presets` and reads it, never the reverse.
+- **A rule stores the numbers, never the name.** `override_from_style` resolves the recipe once and
+  the label does not survive into the declaration, so a later retune of the table cannot silently
+  change what a saved rule means. Same reproducibility argument that keeps the preset name out of
+  `CreativeProfile`.
+- **`Custom` is excluded from the section-style choices**, because it is a *state* meaning "the live
+  values match no recipe" and therefore has no values to project. `Base` — meaning "inherit the live
+  global value at render time" — takes its place as the default.
+
+The pre-existing prohibition on a preset *button*, randomiser or reset for the six global controls is
+unchanged, and so is the `Custom`-is-not-a-recipe rule. Full contract: `.claude/rules/freestyle.md`.
+
+Still not implemented, and no speculative abstraction was added for any of it: L2 stage caching,
+source groups, **per-section Micro Cuts**, **a per-section Variation Seed**, a per-section*instance*
+editor (Freestyle keys on section *type*), a second style-aware Qwen pass over a shortlisted
+candidate set, and a **content-aware Director** that reads the Stage-5 library. Tests assert the
+absence of shortlist/stage-cache machinery, of `director_cache` / `director_history` /
+`director_media` / `director_render` / `director_transform`, and of `freestyle_micro` /
+`freestyle_seed` / `freestyle_timeline` / `analyze_music`. The permanent constraints are unchanged:
+creative state never enters Stage-5 cache identity, no per-render interpretation overwrites
+persistent semantics, and a future second pass stays run-scoped rather than becoming the library's
+durable truth.

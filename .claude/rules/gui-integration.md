@@ -147,6 +147,21 @@ automatically.
   only by Director handlers, and no Director handler writes `variant_report`,
   `variant_batch_status`, `variant_batch_table`, `audio_layers_report`, `smart_mix_report`,
   `render_batch_summary` or `status_output`. Their existing single writers are unchanged.
+- **Freestyle's eleven widgets are render-request inputs with exactly one read-out between them
+  (Freestyle V1).** The checkbox and the ten section dropdowns each register one `.change()`, and
+  all eleven write **only** the read-only `freestyle_summary` textbox — never a slider, the Variation
+  Seed, `creative_preset`, the lab's master seed or an audio level. They are appended
+  **explicitly** (not behind a list concatenation) and **last** to both `process_btn.click` and
+  `render_selected_variants_btn.click`, so the positional seam tests can inspect them and every
+  pre-existing parameter keeps its index.
+
+  What crosses the boundary is a **plain inline frozen tuple** `(enabled, style × 10)` in
+  `SECTION_TYPES` order, not the fork record — because the frozen preservation suites AST-extract
+  these render bodies and execute them against a synthesised namespace, so the bodies must not name
+  a fork module. `auto_mode._resolve_freestyle` is the one conversion to a `FreestyleDeclaration`,
+  and the success line reads the resolved declaration back off `beat_info` **duck-typed** for the
+  same reason. A C3 batch builds its tuple **once before the candidate loop**, so both candidates
+  provably get equal declarations. See `.claude/rules/freestyle.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -160,6 +175,7 @@ automatically.
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
 | the **AI Director** group, its instruction box, either Director button, `director_proposal_state`, or the one-shot model invocation | `.claude/rules/director.md` **+** `.claude/rules/creative-controls.md` **+** `.claude/rules/creative-presets.md` — Apply writes the seed, the six sliders and the preset label, so all three writer matrices apply |
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |
+| the **Freestyle** accordion, its checkbox, any of the ten section dropdowns, the summary textbox, or the tuple threaded through the render wrappers | `.claude/rules/freestyle.md` **+** `.claude/rules/creative-controls.md` — the rules modulate five of the six global controls, so both apply |
 | Variant Lab **visual** widgets, master seed, Spread, Generate handlers | `.claude/rules/variant-lab.md` |
 | Variant Lab **audio** subsection, or any of its three audio outputs (E2) | `.claude/rules/variant-lab.md` **+** `.claude/rules/audio-mixdown.md` |
 | Variant Lab **comparison / Apply Selected** seam, candidate count, batch state (C3) | `.claude/rules/variant-lab.md` **+** `.claude/rules/creative-presets.md` **+** `.claude/rules/audio-mixdown.md` — Apply writes both creative and audio widgets, so all three writer matrices apply |

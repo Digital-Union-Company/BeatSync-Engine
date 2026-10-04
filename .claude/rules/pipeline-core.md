@@ -56,7 +56,7 @@ Stages 1–5 live in `src/auto_mode/`; stage 6 spans the planner and the rendere
 | 1 | `stage1_audio.py` | beat grid + tempo from the percussive HPSS component |
 | 2 | `stage2_features.py` | beat-synchronous curves: wave/energy, kick/clap/bass/hihat, novelty, impact, bar & phrase anchors |
 | 3 | `stage3_sections.py` | broad musical sections (intro/verse/chorus/drop/build/outro…) |
-| 4 | `stage4_select.py` | the deliberate subset of beats that become cuts |
+| 4 | `stage4_select.py` | the deliberate subset of beats that become cuts — **two compositions** since Freestyle V1, see below |
 | 5 | `video_analysis.py` + `stage5_qwen_scene_worker.py` | the visual library: scored candidate moments per source video |
 | 6 | `stage6_av_planner.py` + `video_processor.py` | candidate→segment assignment, then FFmpeg extract/concat/mux |
 
@@ -148,6 +148,33 @@ Do not "improve" this into `os.replace`, `shutil.move`, a delete-then-rename, or
 fallback. The first three replace silently, and a copy is not atomic — an interrupted one leaves a
 partial video at the final path, which reads as a finished render. Cross-volume **fails closed**:
 destination untouched, temp retained and named in the message, `LAST_OUTPUT_PATH_KEY` empty.
+
+## Stage 4 has two compositions, and the uniform one is byte-exact (Freestyle V1)
+
+`select_wave_cuts` dispatches on a keyword-only `section_settings`:
+
+```
+section_settings is None   ->  the EXACT legacy body
+                               grid -> add_rare_micro_cuts -> final_wave_cleanup
+section_settings is a dict ->  per section: select_section_wave_cuts + section_density_cleanup
+                               then cross_section_safety -> add_rare_micro_cuts -> micro_extra_safety
+```
+
+**`final_wave_cleanup` is deliberately not called on the heterogeneous path**, and that is a measured
+correctness decision rather than a shortcut: its density band comes from the *global*
+`len(beat_times)` and its cap ranks cuts across the whole track, so running it after per-section
+selection lets one section's rule delete cuts from unrelated sections. `add_rare_micro_cuts` and
+`final_wave_cleanup` themselves are **unchanged**.
+
+The dispatch is decided by `auto_mode._freestyle_section_settings`, which returns `None` whenever
+every section resolves to the **same effective Cut Density** — Freestyle off, on with no rule, on
+with a rule that sets no density, or on with every rule landing on the base. So those renders take
+the legacy composition and are byte-identical to current `main`, rather than taking a generalised
+equivalent of it. The two are measurably not equivalent; do not "simplify" them into one path.
+
+Micro Cuts stays **one global control** on both paths: its policy comes from the globally derived
+config, and no section rule may rewrite `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
+`micro_min_gap` or `micro_percentile`. Full contract: `.claude/rules/freestyle.md`.
 
 ## The frame-lock invariant
 

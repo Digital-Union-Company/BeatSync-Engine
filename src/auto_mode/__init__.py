@@ -102,6 +102,12 @@ from beatsync_fork import progress as fork_progress
 # `beatsync_fork.variation`; `CreativeProfile` delegates to them, so this module needs only the one
 # import and the seed's meaning cannot fork.
 from beatsync_fork import creative as fork_creative
+# [FORK] Digital-Union (Freestyle V1): section-scoped creative modulation. The declaration record,
+# the sparse-override composition and the whole label vocabulary live in
+# src/beatsync_fork/freestyle.py (stdlib-only, Gradio-free, media-free). This module only resolves
+# it into per-section Stage-4 configs after Stage 3 has produced real sections, and puts it on the
+# shared bus for Stage 6. Stages 1-3 never see it.
+from beatsync_fork import freestyle as fork_freestyle
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -251,6 +257,100 @@ def micro_cut_scaled_config(cfg: AutoWaveConfig,
     )
 
 
+def _resolve_freestyle(freestyle):
+    """[FORK] Digital-Union (Freestyle V1): one `FreestyleDeclaration`, from whatever was submitted.
+
+    Accepts three shapes, and resolving them here rather than in the GUI is deliberate:
+
+    * an already-built :class:`~beatsync_fork.freestyle.FreestyleDeclaration` — used as is, which is
+      what a direct/CLI/test caller would pass;
+    * a plain sequence ``(enabled, style_for_each_SECTION_TYPES_entry...)`` — what the GUI submits,
+      because the GUI's render bodies are AST-extracted and executed by frozen seam suites against
+      a synthesised namespace, so they must not name a fork module. An immutable tuple is every bit
+      as frozen as the record built from it, and the conversion is deterministic, so two candidates
+      of one C3 batch provably receive equal declarations from the one tuple frozen before the loop;
+    * anything else, including ``None`` — an inactive declaration, so a render can never fail
+      because of this and "Freestyle off" is the default by construction.
+
+    Total: never raises.
+    """
+    if isinstance(freestyle, fork_freestyle.FreestyleDeclaration):
+        return freestyle
+    if isinstance(freestyle, (tuple, list)) and freestyle:
+        enabled = freestyle[0]
+        styles = dict(zip(fork_freestyle.SECTION_TYPES, freestyle[1:]))
+        return fork_freestyle.FreestyleDeclaration.from_styles(enabled, styles)
+    return fork_freestyle.FreestyleDeclaration()
+
+
+def _freestyle_section_settings(declaration, profile, base_cfg: AutoWaveConfig,
+                                stage4_cfg: AutoWaveConfig,
+                                density_factor: float | None,
+                                sections: List[Dict]) -> Dict | None:
+    """[FORK] Digital-Union (Freestyle V1): ``section index -> (cfg, density_factor)``, or ``None``.
+
+    ``None`` means *every section resolves to the same effective Cut Density*, so Stage 4 must take
+    its exact legacy path. That is checked on the resolved **values**, not on whether Freestyle is
+    switched on, so three cases collapse to the same byte-identical render: Freestyle off, Freestyle
+    on with no rule, and Freestyle on with every rule landing on the base density.
+
+    Configs are derived **per distinct effective density**, memoised, so a track with ten sections
+    and two distinct densities derives two configs — never one per section and never one per beat.
+    Each derived config composes exactly as `analyze_beats_auto` does for the global case: density
+    first (`density_scaled_config`), then the **global** Micro Cuts policy on top
+    (`micro_cut_scaled_config`), so a section's density can never rewrite a micro field.
+
+    Returns plain immutable render-local data. No callable resolver, no module-global state, no live
+    GUI value, nothing from Stage 5.
+    """
+    if not sections:
+        return None
+    if not isinstance(declaration, fork_freestyle.FreestyleDeclaration):
+        return None
+    # `is_active()`, not merely "has rules". A declaration deliberately *retains* its rules while
+    # the checkbox is off, so the screen survives a toggle — which means the rules alone are not
+    # permission to use them. Stage 6 already gated on `is_active()`; checking only `isinstance`
+    # here let Freestyle OFF change the cut timeline while leaving scoring global, so the two
+    # stages disagreed about whether the feature was on at all.
+    if not declaration.is_active():
+        return None
+
+    base_density = int(profile.cut_density)
+    by_type = declaration.effective_cut_densities(base_density)
+    if not by_type:
+        return None
+
+    effective = {}
+    for section in sections:
+        index = int(section.get("index", len(effective)))
+        section_type = section.get("type")
+        effective[index] = int(by_type.get(section_type, base_density))
+
+    # The load-bearing short-circuit: one distinct density means this is a global render.
+    if len(set(effective.values())) <= 1:
+        return None
+
+    derived: Dict[int, tuple] = {}
+    cache: Dict[int, tuple] = {}
+    for index, density in effective.items():
+        if density not in cache:
+            # The factor comes from a real `CreativeProfile`, so the one exponential mapping in
+            # `creative.py` stays the only definition of what a Cut Density means.
+            section_profile = fork_creative.CreativeProfile(cut_density=density)
+            if section_profile.is_neutral_cuts():
+                section_cfg, section_factor = base_cfg, None
+            else:
+                section_factor = section_profile.cut_density_factor()
+                section_cfg = density_scaled_config(base_cfg, section_factor)
+            # The GLOBAL Micro Cuts policy rides on top, exactly as the global path composes it.
+            if not profile.is_neutral_micro_cuts():
+                section_cfg = micro_cut_scaled_config(section_cfg, profile)
+            cache[density] = (section_cfg, section_factor)
+        derived[index] = cache[density]
+
+    return derived
+
+
 def _interp_to_beats(curve: np.ndarray, beat_times: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
     if len(curve) == 0 or len(beat_times) == 0:
         return np.zeros(len(beat_times), dtype=float)
@@ -348,7 +448,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        progress_callback: Callable[[str], None] | None = None,
                        console_callback: Callable[[int, str], None] | None = None,
                        event_callback: Callable[[object], None] | None = None,
-                       creative: Dict | None = None) -> Tuple[np.ndarray, Dict]:
+                       creative: Dict | None = None,
+                       freestyle: object | None = None) -> Tuple[np.ndarray, Dict]:
     """
     Build a cleaner Auto Mode cut plan.
 
@@ -373,6 +474,11 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     # keeping creative state separable from it is what stops a future control leaking into anything
     # downstream may forward.
     profile = fork_creative.CreativeProfile.from_mapping(creative)
+    # [FORK] Digital-Union (Freestyle V1): the section rules for THIS render, resolved once at the
+    # same boundary as the profile. Anything that is not a real `FreestyleDeclaration` — absent,
+    # stale, or a shape from some other caller — degrades to an inactive declaration, so a render
+    # can never fail because of it and "Freestyle off" is the default by construction.
+    freestyle_declaration = _resolve_freestyle(freestyle)
 
     print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
     print("   Rhythm-first audio cuts + semantic video moment matching")
@@ -486,6 +592,30 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                   f"(ratio {stage4_cfg.max_micro_cut_ratio:.4f}, "
                   f"percentile {stage4_cfg.micro_percentile:.1f})")
 
+    # [FORK] Digital-Union (Freestyle V1): per-section Cut Density, resolved HERE because this is
+    # the first point at which real Stage-3 sections exist. Stages 1-3 above ran on the untouched
+    # `cfg` and never saw the declaration.
+    #
+    # The uniform short-circuit is load-bearing, not an optimisation: `section_settings` stays
+    # `None` whenever every section resolves to the same effective density — Freestyle off, enabled
+    # with no rule, or every rule landing on one identical density — so such a render takes Stage
+    # 4's exact legacy composition (one grid, one global micro pass, one global cleanup) rather
+    # than a generalised equivalent of it. The two are measurably NOT equivalent.
+    #
+    # Micro Cuts is deliberately absent from this derivation. Its policy comes from `stage4_cfg`
+    # above, which is the global base config, so no section rule can rewrite
+    # `enable_rare_micro_cuts`, `max_micro_cut_ratio`, `micro_min_gap` or `micro_percentile`.
+    section_settings = _freestyle_section_settings(
+        freestyle_declaration, profile, cfg, stage4_cfg, density_factor, sections)
+    if section_settings:
+        # Printed here, beside the other Stage-4 console lines, rather than inside the resolver:
+        # a pure resolver that prints also prints from a probe, a test or any caller whose stdout
+        # `setup_environment()` never reconfigured to UTF-8, where this emoji raises.
+        distinct = len({id(cfg_and_factor[0]) for cfg_and_factor in section_settings.values()})
+        print(f"      🎛️  Freestyle: {distinct} distinct section densities across "
+              f"{len(section_settings)} sections "
+              f"({freestyle_declaration.describe()})")
+
     selected_beats, selection_info = select_wave_cuts(
         beat_times=beat_times,
         sections=sections,
@@ -494,6 +624,7 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         audio_duration=audio_duration,
         cfg=stage4_cfg,
         density_factor=density_factor,
+        section_settings=section_settings,
     )
 
     if selected_beats.size == 0:
@@ -616,6 +747,15 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
         # `stage6_av_planner.creative_profile` reads it back through `from_mapping`, so a Phase A
         # dict (seed only) still resolves correctly with the three controls left neutral.
         "creative": profile.as_dict(),
+        # [FORK] Digital-Union (Freestyle V1): the section rules this render was submitted with,
+        # on the same shared bus, as ephemeral run-scoped intent. Stage 6 is the only reader.
+        #
+        # It is a frozen `FreestyleDeclaration` of plain bools, strings, ints and tuples, so it
+        # stays deepcopy-safe and carries no mapping proxy, no path, no media and no cache handle.
+        # It reaches `video_analysis`, `audio_visual_profile`, any Qwen request, the Stage-5 prompt
+        # and every cache signature exactly never — adding a bus key is how a Stage-6 signal is
+        # added in this pipeline, which is why no analysis or cache input changed for it.
+        "freestyle": freestyle_declaration,
     }
 
     try:

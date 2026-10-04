@@ -19,7 +19,9 @@ WEAK_SCORE_THRESHOLD = fork_creative.WEAK_SCORE_THRESHOLD
 def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dict,
                      tempo: float, audio_duration: float,
                      cfg: AutoWaveConfig,
-                     density_factor: float | None = None) -> Tuple[np.ndarray, List[Dict]]:
+                     density_factor: float | None = None,
+                     *,
+                     section_settings: Dict | None = None) -> Tuple[np.ndarray, List[Dict]]:
     """Select the deliberate subset of beats that become cuts.
 
     [FORK] Digital-Union (Creative Controls Core): ``density_factor`` is the Cut Density control,
@@ -31,7 +33,24 @@ def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dic
     The caller also supplies a ``cfg`` already derived for this density (intervals and holds divided
     by the factor, the global cut-ratio band multiplied by it). Both halves are needed because
     density lives partly in the config's safety floors and partly in the selector's beat stepping.
+
+    [FORK] Digital-Union (Freestyle V1): ``section_settings`` is the **heterogeneous** path and is
+    keyword-only, so no positional caller can reach it by accident. ``None`` — the default, and what
+    `analyze_beats_auto` passes whenever every section resolves to the *same* effective Cut Density
+    — takes the exact legacy composition below: one grid, one global ``add_rare_micro_cuts``, one
+    global ``final_wave_cleanup``. That short-circuit is load-bearing rather than an optimisation:
+    the per-section cleanup is **not** a refactor-equivalent of the global one (measured: a section
+    can fall under its own local ratio floor and gain anchors even where the global count was fine,
+    so densities 10/25/50/60 differ), and "Freestyle off changes nothing" has to be exact.
+
+    When it *is* supplied it maps ``section index -> (cfg, density_factor)``: plain render-local
+    immutable data, never a callable resolver, never module-global state, never a live GUI value and
+    never anything from Stage 5.
     """
+    if section_settings:
+        return _select_wave_cuts_per_section(
+            beat_times, sections, features, audio_duration, cfg, section_settings)
+
     selected: List[float] = []
     info: List[Dict] = []
 
@@ -57,6 +76,61 @@ def select_wave_cuts(beat_times: np.ndarray, sections: List[Dict], features: Dic
     # Global cleanup: fewer cuts, exact rhythm, no jitter.
     selected_arr = final_wave_cleanup(selected_arr, beat_times, features, audio_duration, cfg)
     return selected_arr, info
+
+
+def _select_wave_cuts_per_section(beat_times: np.ndarray, sections: List[Dict], features: Dict,
+                                  audio_duration: float, cfg: AutoWaveConfig,
+                                  section_settings: Dict) -> Tuple[np.ndarray, List[Dict]]:
+    """[FORK] Digital-Union (Freestyle V1): the heterogeneous-density composition.
+
+    ::
+
+        per section:  select_section_wave_cuts(that section's cfg and factor)
+        per section:  section_density_cleanup(that section's cfg)
+        concatenate
+                      cross_section_safety           main-grid boundaries only
+                      add_rare_micro_cuts            UNCHANGED, one global pass
+                      micro_extra_safety             extras only, never the grid
+                      validity / sort
+
+    **`final_wave_cleanup` is deliberately NOT called here**, and that is the whole point. Its
+    density band is computed from the *global* ``len(beat_times)`` and its cap ranks every cut
+    across the whole track, so running it after per-section selection makes one section's override
+    delete cuts from other sections — measured on a binding-band fixture: changing only the ``drop``
+    rule mutated five non-target sections, three of them not even adjacent. The band belongs to
+    main-grid Cut Density, which is now per-section, so it is enforced per section instead.
+
+    Micro Cuts stays one global control: its policy comes from ``cfg`` (the base-derived config) and
+    nothing per-section may rewrite it.
+    """
+    cleaned: Dict[int, List[float]] = {}
+    gaps: Dict[int, float] = {}
+    info: List[Dict] = []
+
+    for section in sections:
+        index = int(section.get("index", len(cleaned)))
+        beat_indices = np.where((beat_times >= section["start"]) & (beat_times < section["end"]))[0]
+        if beat_indices.size == 0:
+            continue
+        section_cfg, section_factor = section_settings.get(index, (cfg, None))
+
+        section_selected = select_section_wave_cuts(
+            beat_indices, beat_times, features, section, section_cfg, section_factor)
+        section_cuts = section_density_cleanup(
+            section_selected, beat_indices, beat_times, features, section, section_cfg)
+        cleaned[index] = [float(t) for t in section_cuts]
+        gaps[index] = float(section_cfg.peak_energy_min_interval)
+        info.append({
+            "section": section,
+            "selected_count": len(cleaned[index]),
+            "beat_count": int(beat_indices.size),
+            "density": len(cleaned[index]) / max(1, int(beat_indices.size)),
+        })
+
+    main_grid = cross_section_safety(cleaned, gaps)
+    with_micro = add_rare_micro_cuts(main_grid, beat_times, features, audio_duration, cfg)
+    final = micro_extra_safety(main_grid, with_micro, beat_times, cfg)
+    return final, info
 
 
 def select_section_wave_cuts(beat_indices: np.ndarray, beat_times: np.ndarray,
@@ -306,6 +380,169 @@ def add_rare_micro_cuts(selected: np.ndarray, beat_times: np.ndarray, features: 
     if not extras:
         return selected
     return np.concatenate([selected, np.asarray(extras, dtype=float)])
+
+
+def section_density_cleanup(selected, beat_indices: np.ndarray, beat_times: np.ndarray,
+                            features: Dict, section: Dict,
+                            cfg: AutoWaveConfig) -> np.ndarray:
+    """[FORK] Digital-Union (Freestyle V1): ``final_wave_cleanup``'s density policy, for ONE section.
+
+    The same four steps in the same order with the same arithmetic and the same anchor scoring — but
+    scoped, which is the entire difference:
+
+    * the ratio band comes from **this section's** beat count, not ``len(beat_times)``;
+    * the cap ranks only **this section's** cuts, never the whole track;
+    * anchor insertion may draw only on **this section's** beat indices;
+    * nothing outside ``[section["start"], section["end"])`` is read or written.
+
+    That scoping is what makes a Freestyle override local. The global version cannot be reused here
+    at any density: its top-N ranking and its anchor pool both span the track, so one section's rule
+    would silently reshape the others.
+
+    Deterministic and pure: no RNG, no clock, no global state.
+    """
+    arr = np.asarray(selected, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    start = float(section["start"])
+    end = float(section["end"])
+    arr = arr[(arr >= start) & (arr < end)]
+    if arr.size == 0:
+        return arr
+
+    arr = _unique_sorted(arr, cfg.peak_energy_min_interval)
+
+    section_beats = int(np.asarray(beat_indices).size)
+    max_allowed = int(max(1, round(section_beats * cfg.target_cut_ratio_max)))
+    min_allowed = int(max(1, round(section_beats * cfg.target_cut_ratio_min)))
+
+    # Section-local ratio cap: keep the strongest/most anchored cuts of THIS section.
+    if arr.size > max_allowed:
+        keep_scores = []
+        for t in arr:
+            idx = int(np.argmin(np.abs(beat_times - t)))
+            s = float(features["impact_score"][idx])
+            if bool(features["is_phrase_anchor"][idx]):
+                s += 0.55
+            elif bool(features["is_bar_anchor"][idx]):
+                s += 0.32
+            keep_scores.append(s)
+        order = np.argsort(keep_scores)[::-1][:max_allowed]
+        arr = np.sort(arr[order])
+
+    # Section-local floor: add clean phrase/bar anchors from THIS section only.
+    if arr.size < min_allowed and section_beats > 0:
+        candidates = []
+        for idx in np.asarray(beat_indices).reshape(-1):
+            idx = int(idx)
+            if bool(features["is_phrase_anchor"][idx]) or bool(features["is_bar_anchor"][idx]):
+                candidates.append((float(features["impact_score"][idx]), float(beat_times[idx])))
+        for _, t in sorted(candidates, reverse=True):
+            if arr.size >= min_allowed:
+                break
+            if arr.size == 0 or np.min(np.abs(arr - t)) >= cfg.medium_energy_min_interval:
+                arr = np.sort(np.append(arr, t))
+
+    return _unique_sorted(arr, cfg.peak_energy_min_interval)
+
+
+def cross_section_safety(cleaned: Dict, gaps: Dict) -> np.ndarray:
+    """[FORK] Digital-Union (Freestyle V1): main-grid safety across section boundaries, only.
+
+    Each section's cuts are already internally clean, so the one thing left unchecked is a pair of
+    adjacent cuts that **straddle** a boundary. Only such pairs are examined. A single global
+    ``_unique_sorted`` over the concatenated array would instead re-apply one gap *everywhere* and
+    thin a dense section with a sparse section's policy — that is the locality leak, not a fix for
+    it.
+
+    Threshold is ``min(gap of the earlier section, gap of the later section)``: the denser side's
+    own policy already permits that spacing, so enforcing the sparser side's larger gap would delete
+    a cut the dense section legitimately produced.
+
+    Resolution is **keep the earlier cut, drop the later one** — the same rule ``_unique_sorted``
+    already documents ("V3.2 prefers stable downbeat timing over squeezing in nearby cuts"). If
+    dropping the later section's first cut exposes another violating one, the scan continues
+    deterministically, so a boundary ends safe or that section ends with no cut. Internal cuts of
+    either already-cleaned section are never thinned.
+    """
+    flat = []
+    for index in sorted(cleaned):
+        for t in cleaned[index]:
+            flat.append((float(t), int(index)))
+    flat.sort()
+    if not flat:
+        return np.asarray([], dtype=float)
+
+    kept = [flat[0]]
+    for time_s, index in flat[1:]:
+        previous_time, previous_index = kept[-1]
+        if index == previous_index:
+            kept.append((time_s, index))
+            continue
+        threshold = min(gaps.get(previous_index, 0.0), gaps.get(index, 0.0))
+        if time_s - previous_time >= threshold:
+            kept.append((time_s, index))
+        # else: drop this later cut and compare the next one against the same earlier cut, which is
+        # what makes "continue until the boundary is safe" a loop property rather than one check.
+    return np.asarray([t for t, _index in kept], dtype=float)
+
+
+def micro_extra_safety(main_grid: np.ndarray, with_micro: np.ndarray,
+                       beat_times: np.ndarray, cfg: AutoWaveConfig) -> np.ndarray:
+    """[FORK] Digital-Union (Freestyle V1): filter micro EXTRAS only. Never touches the main grid.
+
+    ``add_rare_micro_cuts`` is left exactly as it is — including a measured pre-existing hole: it
+    computes ``selected_sorted`` once, before its loop, and never adds an accepted extra back, so
+    two extras can be accepted closer to each other than the layer's own floor. On the legacy
+    uniform path that behaviour is frozen by contract and is **not** fixed here. On the
+    heterogeneous path there is no ``final_wave_cleanup`` afterwards to lean on, so this pass closes
+    it properly: extras are considered in deterministic time order against the main grid **plus the
+    extras already accepted**, and each accepted extra joins the occupied set before the next is
+    judged.
+
+    The floor is the micro layer's **own** declared floor, ``max(cfg.micro_min_gap,
+    median_beat * 0.45)`` — not an invented density floor. ``micro_min_gap`` is rewritten by neither
+    ``density_scaled_config`` nor ``micro_cut_scaled_config``, so the floor is density-independent by
+    construction.
+
+    Main-grid cuts are identified by **exact float identity against the supplied grid**. Both arrays
+    come out of the same float arithmetic, so equality is exact and a tolerance would only add a
+    way to misclassify a near-grid extra as part of the grid. The choice is defensive rather than
+    observable, and the honest reason to state it is the adjacent trap it avoids: the P0-R2 probe
+    excluded a cut from its own distance check *by value* against a rounded set, so each extra
+    matched itself and reported a zero gap. Here that cannot happen by construction — ``occupied``
+    starts as the grid alone and an accepted extra is appended only *after* its own check.
+
+    That same construction makes the ``grid_values`` filter **redundant for the output**, and it is
+    kept for clarity rather than safety: a grid cut left in ``extras`` measures zero distance to
+    itself in ``occupied`` and is rejected, while the grid is re-attached at the end regardless.
+    Measured as an equivalent mutant — emptying ``grid_values`` changes no result on any fixture.
+    Do not read the filter as a guard; the seeded ``occupied`` set is the guard.
+    """
+    grid = np.asarray(main_grid, dtype=float).reshape(-1)
+    produced = np.asarray(with_micro, dtype=float).reshape(-1)
+    if produced.size == 0:
+        return np.sort(grid)
+
+    grid_values = set(grid.tolist())
+    extras = sorted(float(t) for t in produced.tolist() if float(t) not in grid_values)
+    if not extras:
+        return np.sort(grid)
+
+    beat_diffs = np.diff(np.asarray(beat_times, dtype=float))
+    median_beat = float(np.median(beat_diffs)) if beat_diffs.size else 0.5
+    micro_floor = max(cfg.micro_min_gap, median_beat * 0.45)
+
+    occupied = np.sort(grid)
+    accepted: List[float] = []
+    for t in extras:
+        if occupied.size and float(np.min(np.abs(occupied - t))) < micro_floor:
+            continue
+        accepted.append(t)
+        occupied = np.sort(np.append(occupied, t))
+
+    if not accepted:
+        return np.sort(grid)
+    return np.sort(np.concatenate([grid, np.asarray(accepted, dtype=float)]))
 
 
 def final_wave_cleanup(selected: np.ndarray, beat_times: np.ndarray, features: Dict,
