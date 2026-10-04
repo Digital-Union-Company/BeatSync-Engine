@@ -215,17 +215,32 @@ not in the classifier is a pre-existing inconsistency, untouched by R1.)
 config, and no section rule may rewrite `enable_rare_micro_cuts`, `max_micro_cut_ratio`,
 `micro_min_gap` or `micro_percentile`.
 
-### A known legacy defect, recorded and deliberately NOT fixed
+### The legacy extra-to-extra defect — corrected by a later milestone
 
-`add_rare_micro_cuts` computes `selected_sorted` before its loop and never adds an accepted extra
-back, so two extras can land closer together than the accent layer's own floor; the post-micro
-`final_wave_cleanup` enforces only `peak_energy_min_interval` and does not close it either. **Fixing
-it would change the output of every existing uniform render, so it is out of scope.** Measured at 200
-BPM on a funded 50-cut grid: 4 extras, closest pair **0.3000 s** against a 0.3400 s floor. The
-Freestyle path does not inherit it — `micro_extra_safety` returns 2 extras, closest pair 2.4000 s —
-and `test_micro_cuts.py` asserts the legacy defect **exists**, so the fix cannot be mistaken for a
-no-op. If `add_rare_micro_cuts` is ever made self-safe on purpose, that test is the one that should
-fail and be deleted with the decision recorded.
+**Freestyle V1 shipped alongside a real defect in the shared accent layer, and recorded it rather
+than fixing it.** `add_rare_micro_cuts` built `selected_sorted` once before its loop and never
+returned an accepted extra to it, so each candidate was judged against the main grid **only** and
+two accepted extras could each clear the floor against the grid while violating it against each
+other. The post-micro `final_wave_cleanup` did not close it either, and could not: it enforces
+`peak_energy_min_interval`, a Cut Density gap that is *divided* by the density factor, while
+`micro_min_gap` is deliberately density-independent. Measured at 200 BPM on a funded 50-cut grid:
+4 extras, closest pair **0.3000 s** against a 0.3400 s floor.
+
+At the time Freestyle V1 did not inherit it, because `micro_extra_safety` cleaned the heterogeneous
+path (2 extras, closest pair 2.4000 s) — which is exactly why that helper exists.
+
+**Legacy Micro Cuts Safety R1 has since corrected the underlying layer.** `add_rare_micro_cuts` is
+now self-safe: an accepted extra joins `occupied` immediately, so every later candidate measures
+against the main grid *plus all earlier accepted extras*. The floor is unchanged, and a rejected
+candidate does not consume budget — the scan continues, so a funded render still delivers `max_extra`
+*safe* accents.
+
+**`micro_extra_safety` stays in the heterogeneous composition, deliberately.** It is now a measured
+no-op on tested inputs (40/40 heterogeneous combinations, and the funded fixture at every Micro Cuts
+value), and that redundancy is **retained** as a preserved composition guard — the structural
+tripwire that keeps the two Stage-4 compositions distinct still asserts the legacy path does not
+call it and the heterogeneous path calls it exactly once. Do not "clean it up" on the strength of the
+no-op measurement. Freestyle's heterogeneous output was pinned byte-identical across the R1 change.
 
 ## Stage 6: L1A survived the refactor it was designed for
 
