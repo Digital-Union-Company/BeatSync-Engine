@@ -325,12 +325,46 @@ class RenderBatchOutcome:
     output is deleted**. That is not a rollback decision taken lightly — the render boundary
     exposes no typed failure classification, so a batch cannot tell a shared-input failure (which
     would simply repeat) from a candidate-local one, and continuing would at best waste a render.
-    Continue-on-failure waits for C3-R1 and a typed outcome model.
+    Continue-on-failure waits for C3-R1B.
+
+    [FORK] Digital-Union (C3-R1A / R2): ``outcome_kind`` is the **batch-level** terminal cause, and
+    it exists because the candidate-level one cannot express the batch boundary case. When a
+    cancellation lands in the gap *between* candidate 1 and candidate 2:
+
+    ```
+    candidate 1   SUCCESS          (really did succeed; its output is on disk)
+    candidate 2   NOT ATTEMPTED    (no outcome record exists, and none is fabricated)
+    batch         CANCELLED        <- expressible nowhere else
+    ```
+
+    No candidate carries CANCELLED there, because no candidate was cancelled — the *batch* was. R1A
+    reported that as ``1 / 2 succeeded; stopped on candidate 1``, which is false twice over:
+    candidate 1 did not stop anything and nothing failed. A fake candidate-2 attempt labelled
+    CANCELLED would be equally false, so the shape above is recorded literally instead.
     """
 
     requested_count: int
     outcomes: tuple = ()
     stopped_on_failure: bool = False
+    outcome_kind: "RenderOutcomeKind | None" = None
+
+    def __post_init__(self) -> None:
+        """Derive the batch cause only where a candidate *proves* it; otherwise leave it unstated.
+
+        Exactly one derivation is sound: a candidate that was itself cancelled proves the top-level
+        render event was cancelled. Everything else stays ``None`` — meaning "not stated" — so every
+        pre-R2 construction keeps byte-identical `headline()` / `summary_text()` output. In
+        particular the batch-boundary case has **no** cancelled candidate to derive from, which is
+        precisely why `gui.py` must state it explicitly; nothing here can rescue a caller that
+        forgets to.
+        """
+        if self.outcome_kind is None and any(o.cancelled for o in self.outcomes):
+            object.__setattr__(self, "outcome_kind", RenderOutcomeKind.CANCELLED)
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether the top-level render event was cancelled, candidate outcomes notwithstanding."""
+        return self.outcome_kind is RenderOutcomeKind.CANCELLED
 
     @property
     def succeeded(self) -> int:
@@ -339,6 +373,20 @@ class RenderBatchOutcome:
     @property
     def attempted(self) -> int:
         return len(self.outcomes)
+
+    @property
+    def not_attempted(self) -> int:
+        """Candidates the batch never started. Never negative, even on a malformed count."""
+        return max(0, self.requested_count - self.attempted)
+
+    def _failed_candidate(self):
+        """The first candidate that genuinely FAILED — a cancelled one is not a failure.
+
+        Load-bearing for truthfulness: a cancelled candidate also has ``success is False``, so the
+        pre-R2 ``next(o for o in outcomes if not o.success)`` happily reported a user's Stop as
+        ``stopped on candidate N`` with no mention of cancellation at all.
+        """
+        return next((o for o in self.outcomes if not o.success and not o.cancelled), None)
 
     def latest_successful_preview(self) -> str:
         """The newest preview worth showing. Never blanks an earlier success for a later failure."""
@@ -352,23 +400,53 @@ class RenderBatchOutcome:
                      if o.success and o.durable_output_path)
 
     def headline(self) -> str:
+        """One truthful line. Never names a candidate as the cause of something it did not cause."""
+        base = f"{self.succeeded} / {self.requested_count} succeeded"
+        failed = self._failed_candidate()
+
+        if self.cancelled:
+            # Cancelled DURING a candidate: that candidate carries CANCELLED itself, so name it.
+            if self.outcomes and self.outcomes[-1].cancelled:
+                return (f"{base}; cancelled during candidate "
+                        f"{self.outcomes[-1].candidate_index + 1}")
+            # A real failure stopped the batch AND a cancellation landed. Both are true; say both,
+            # rather than silently letting one hide the other.
+            if failed is not None:
+                return (f"{base}; stopped on candidate {failed.candidate_index + 1}; "
+                        f"batch cancelled")
+            # The batch boundary case: everything attempted succeeded, and the batch was cancelled
+            # before the next candidate started.
+            if self.not_attempted:
+                return f"{base}; batch cancelled before candidate {self.attempted + 1}"
+            return f"{base}; batch cancelled"
+
+        if failed is not None:
+            return f"{base}; stopped on candidate {failed.candidate_index + 1}"
         if self.stopped_on_failure:
-            failed = next((o for o in self.outcomes if not o.success), None)
-            position = (failed.candidate_index + 1) if failed is not None else self.attempted
-            return (f"{self.succeeded} / {self.requested_count} succeeded; "
-                    f"stopped on candidate {position}")
-        return f"{self.succeeded} / {self.requested_count} succeeded"
+            # Stopped, nothing failed, not cancelled. Do not invent a candidate failure to explain
+            # it — the pre-R2 code did exactly that and produced "stopped on candidate 1" for a
+            # candidate that had succeeded.
+            return f"{base}; stopped after candidate {self.attempted}"
+        return base
 
     def summary_text(self) -> str:
         """The whole read-out. `gui.py` formats none of this — one formatter per panel."""
         lines = [f"Render batch · {self.headline()}", ""]
         for outcome in self.outcomes:
             lines.extend(outcome.report_lines())
-        if self.stopped_on_failure and self.attempted < self.requested_count:
-            remaining = self.requested_count - self.attempted
+
+        if self.cancelled:
             lines.append("")
-            lines.append(f"{remaining} candidate(s) not attempted. Earlier successful output "
-                         f"was kept.")
+            lines.append("Batch CANCELLED.")
+            if self.not_attempted:
+                lines.append(f"{self.not_attempted} "
+                             f"candidate{'' if self.not_attempted == 1 else 's'} not attempted.")
+            if self.durable_paths():
+                lines.append("Earlier successful output was kept.")
+        elif self.stopped_on_failure and self.not_attempted:
+            lines.append("")
+            lines.append(f"{self.not_attempted} candidate(s) not attempted. Earlier successful "
+                         f"output was kept.")
         return "\n".join(lines)
 
 

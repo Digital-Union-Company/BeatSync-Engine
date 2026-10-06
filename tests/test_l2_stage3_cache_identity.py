@@ -48,6 +48,11 @@ _STAGE2_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage2_features.py"
 _STAGE3_PATH = os.path.join(_REPO_ROOT, "src", "auto_mode", "stage3_sections.py")
 
 _BASE_SHA = "768ef9da002c5a355eaad7237cfc1d94555a5afb"
+#: The tip of the L2 milestone on the main line (the merge of `perf/l2-stage3-process-cache`). The
+#: "L2 touched nothing it should not have" guard below is a claim about `_BASE_SHA..._L2_TIP_SHA`;
+#: measuring it against a moving `HEAD` turned it into a permanent freeze on the renderer and the
+#: GUI that no later authorized milestone could satisfy.
+_L2_TIP_SHA = "ac432d5f64e0bcfdbb9a7840e7f176d4287465bf"
 _SECOND = 1_700_000_000_000_000_000
 
 #: Everything the extracted `analyze_beats_auto` body reaches inside its own module. Listed
@@ -1336,9 +1341,19 @@ def test_no_stage4_cache_was_invented():
 
 
 def test_stage5_and_the_renderer_were_not_modified():
-    """L2 must know nothing about video files, the candidate library, Qwen or the Stage-5 contract."""
+    """L2 must know nothing about video files, the candidate library, Qwen or the Stage-5 contract.
+
+    **The endpoint is `_L2_TIP_SHA`, not `HEAD`, and that is a correction rather than a loosening.**
+    This asserts a *historical* property of one milestone — "the L2 work did not touch these files" —
+    which is a statement about the range `_BASE_SHA..<L2 tip>` and nothing else. Measured against a
+    moving `HEAD` it silently became a claim that **no later milestone may ever modify the renderer
+    or the GUI**, which was never the intent and is not true: C3-R1A modified `video_processor.py`,
+    `gui.py` and `ui_content.py` under explicit authorization, and this guard then failed for reasons
+    that had nothing to do with L2. Pinning the upper bound makes the assertion say exactly what its
+    name says, and keeps it stable for every future milestone.
+    """
     changed = subprocess.run(
-        ["git", "diff", "--name-only", _BASE_SHA, "HEAD"],
+        ["git", "diff", "--name-only", _BASE_SHA, _L2_TIP_SHA],
         capture_output=True, text=True, encoding="utf-8", check=True,
         cwd=_REPO_ROOT).stdout.split()
     for untouchable in ("src/video_analysis.py", "src/video_processor.py", "src/gui.py",

@@ -68,22 +68,46 @@ BOUNDARY_ONLY_CANCEL
   two renders to avoid. The handler never takes `_RENDER_LOCK` and touches nothing but the slot.
 - **Abandonment is still not cancellation.** `process_video`'s finalizer joins its worker with no
   timeout and no kill, exactly as before; no `finally` anywhere requests a cancellation.
-- **The durable `os.rename` promotion is the ONE success commit point.** A cancellation arriving
-  during ProRes preview generation *after* promotion skips the preview and leaves the outcome
-  `SUCCESS` — the user owns that `.mov`. Verified end to end against the real `_process_video_impl`.
-- **A cancelled candidate is reported as cancelled, never as a failure.**
-  `RenderCandidateOutcome.outcome_kind` carries the typed cause, validated against `success` in
-  `__post_init__`, and the batch reads it from `session_state` rather than inferring it from
-  `durable` or from status prose. `SHARED_FATAL` exists in the vocabulary with no producer: telling
-  shared from candidate-local apart is what continue-after-failure needs, and that is **C3-R1B**.
+- **The durable `os.rename` promotion is the ONE success commit point**, and the ProRes preview is
+  post-commit convenience work. Three explicit branches: `lifecycle=None` is today's blocking call;
+  an already-pending cancellation never starts a preview child at all; and a cancellation arriving
+  **while the preview child is running** terminates, graces, kills if needed and reaps it through
+  `ffmpeg_processing.run_cancellable_media_command` — the one new public entry point to the existing
+  reviewed runner, rather than a second copy of its process logic. Either way the partial preview is
+  never selected, `preview_path` falls back to the durable `.mov`, and the outcome stays `SUCCESS`:
+  the user owns that file. This is the only place a `RenderCancelled` may be swallowed, and the
+  exemption is located structurally rather than by a token. A genuine `TimeoutExpired` is not caught
+  on either path — a stuck encode is a different fact from a user pressing Stop.
+- **A cancelled candidate is reported as cancelled, never as a failure — and so is a cancelled
+  *batch*.** `RenderCandidateOutcome.outcome_kind` carries the per-candidate typed cause, validated
+  against `success` in `__post_init__`, and the batch reads it from `session_state` rather than
+  inferring it from `durable` or from status prose. `RenderBatchOutcome.outcome_kind` carries the
+  **batch-level** cause, which exists because one shape is expressible nowhere else: a cancellation
+  landing in the gap *between* candidates leaves candidate 1 genuinely SUCCESS and candidate 2 never
+  attempted, so no candidate record is cancelled and none is fabricated. That now reads
+  `1 / 2 succeeded; batch cancelled before candidate 2` plus `Batch CANCELLED.` / `1 candidate not
+  attempted.` / `Earlier successful output was kept.` — rather than blaming a candidate that had just
+  succeeded. `SHARED_FATAL` exists in the vocabulary with no producer: telling shared from
+  candidate-local apart is what continue-after-failure needs, and that is **C3-R1B**.
 - **`RENDER_SELECTION_SIZE` is still 2, and no cache, schema or version constant moved** —
   `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION` and `L2_CACHE_VERSION` are untouched.
   `video_analysis.py`, `stage5_qwen_scene_worker.py` and `qwen_progress.py` are untouched **by
   contract**, which is what makes "an in-flight Qwen call is never hard-killed" structural.
-- `tests/test_render_worker.py` and `tests/test_render_cancellation.py` are new (135 cases), and
-  five deliberate mutations were each confirmed to fail them: dropping `cancel_futures=True`, moving
-  the re-raise inside the `with`, making the slot clear unconditional, letting the preview downgrade
-  `SUCCESS`, and moving the post-Stage-5 boundary inside that stage's broad `except`.
+- `tests/test_render_worker.py` and `tests/test_render_cancellation.py` are new, and
+  `.claude/rules/render-worker.md` is the durable contract. **Eight** deliberate mutations were each
+  confirmed to fail them: dropping `cancel_futures=True`, moving the re-raise inside the `with`,
+  making the slot clear unconditional, letting the preview downgrade `SUCCESS`, moving the
+  post-Stage-5 boundary inside that stage's broad `except`, removing the batch-level cancelled truth
+  from the model, dropping it at the `gui.py` call site, and reverting the preview to a blocking
+  `subprocess.run`.
+- **Controlled Windows runtime acceptance** (task scratch only; no production media, no Stage-5 cache
+  mutation, no user output): 4 simultaneously-live real children all reaped and gone from `tasklist`
+  at a 0.027 s max cancel-to-quiescent latency; a stale invocation id cannot reach a newer render; the
+  C3 boundary case shows a candidate-2 execution call count of 0 with a truthful summary; a
+  Stage-5 stub blocked, was cancelled mid-call, ran to **natural completion**, and the boundary
+  immediately after it fired with no fallback-sampling laundering and no Stage 6; and a real preview
+  child was confirmed alive via `tasklist`, cancelled, reaped and gone in 0.096 s while the durable
+  `.mov` survived and the outcome stayed `SUCCESS`.
 
 ### Performance — 2026-10-04 (L2 Stage Caching V1 — process-local post-Stage-3 reuse)
 

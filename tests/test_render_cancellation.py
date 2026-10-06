@@ -483,7 +483,9 @@ EXPECTED_HANDLER_COUNT = {
     _FFMPEG: 2,        # convert_to_prores_proxy, extract_clip_segment_ffmpeg_detailed
     _MIXDOWN: 1,       # build_mixed_master
     _PROCESSOR: 4,     # create_clip_parallel, the clip loop, and both assembly call sites
-    _GUI: 2,           # _process_video_impl, process_video.worker
+    # [R2] 3: _process_video_impl's translation boundary, process_video.worker's defensive one, and
+    # the new post-commit ProRes preview handler -- the only one in the codebase that may swallow.
+    _GUI: 3,
     _AUTO: 0,          # boundary checks only; it catches nothing
 }
 
@@ -515,13 +517,43 @@ def test_a_cancellation_handler_always_precedes_the_broad_one_it_protects(path):
                     f"`except {broad}` precedes `except RenderCancelled` at line {node.lineno}"
 
 
-def test_a_cancellation_handler_never_swallows_and_never_substitutes():
-    """Every one of them must end in a re-raise of the same thing, or store it to re-raise later.
+def _post_commit_preview_handlers() -> set[int]:
+    """Line numbers of the `except RenderCancelled` handlers inside the post-promotion preview block.
 
-    A handler that returned a value, or raised something else, would convert a user's Stop into a
-    normal result or an ordinary error — which is the exact failure mode this whole section exists
-    to prevent.
+    Located **structurally**, by walking the `if is_prores:` block that follows the durable
+    promotion inside `_process_video_impl` — not by matching a token a future author could sprinkle
+    anywhere to opt out of the no-swallow rule below.
     """
+    impl = _func(_GUI, "_process_video_impl")
+    preview = next(n for n in ast.walk(impl) if isinstance(n, ast.If)
+                   and ast.unparse(n.test) == "is_prores"
+                   and "preview_cmd" in ast.unparse(n))
+    # it must genuinely sit after the SUCCESS commit point, or this exception would be a loophole
+    commit = next(n for n in ast.walk(impl) if isinstance(n, ast.Assign)
+                  and ast.unparse(n) ==
+                  "session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS")
+    assert commit.lineno < preview.lineno, \
+        "the preview block no longer follows the SUCCESS commit point"
+    return {h.lineno for h in ast.walk(preview) if isinstance(h, ast.ExceptHandler)
+            and isinstance(h.type, ast.Name) and h.type.id == "RenderCancelled"}
+
+
+def test_a_cancellation_handler_never_swallows_and_never_substitutes():
+    """Every handler re-raises the same thing, stores it to re-raise, or translates it truthfully.
+
+    **One exception, added by R2 and deliberately scoped to a single structural location**: the
+    ProRes preview, which runs *after* the durable promotion already committed `SUCCESS`. There,
+    swallowing is the correct behaviour and propagating would be the bug — the render is finished,
+    the user owns the `.mov`, and cancellation is only stopping post-commit convenience work. Letting
+    `RenderCancelled` escape from there would turn a completed render into a cancelled one.
+
+    The exemption is located by walking the `is_prores` preview block (and asserting it really does
+    follow the commit point), **not** by a token match — otherwise it would be an opt-out anybody
+    could apply to a handler that genuinely must not swallow.
+    """
+    exempt = _post_commit_preview_handlers()
+    assert len(exempt) == 1, f"expected exactly one post-commit preview handler, found {exempt}"
+
     for path in sorted(EXPECTED_HANDLER_COUNT):
         for handler in ast.walk(_tree(path)):
             if not (isinstance(handler, ast.ExceptHandler)
@@ -536,12 +568,20 @@ def test_a_cancellation_handler_never_swallows_and_never_substitutes():
             deferred = "cancelled_exc = exc" in rendered
             # the two GUI translation boundaries return a truthful typed status instead
             translated = "RenderOutcomeKind.CANCELLED" in rendered
-            assert bare_reraise or deferred or translated, \
+            # the one post-commit case, identified by position in gui.py
+            post_commit = path is _GUI and handler.lineno in exempt
+            assert bare_reraise or deferred or translated or post_commit, \
                 f"{os.path.basename(path)} line {handler.lineno} swallows a cancellation:\n{rendered}"
             for substitution in ("raise Exception(", "raise ValueError(", "raise RuntimeError(",
                                  "raise AudioMixError("):
                 assert substitution not in rendered, \
                     f"{os.path.basename(path)} line {handler.lineno} re-types a cancellation"
+
+            if post_commit:
+                # and the exempt one must do exactly one thing: fall back to the durable output
+                assert rendered.strip().endswith("preview_path = output_path"), rendered
+                assert "RENDER_OUTCOME_KEY" not in rendered, \
+                    "the post-commit handler must not touch the committed outcome"
 
 
 def test_a_cancellation_is_never_narrated_as_a_failure_event():
@@ -1109,6 +1149,32 @@ def test_the_terminal_state_is_derived_from_the_typed_outcome_not_from_prose():
             assert inferred not in body, f"{wrapper} derives its terminal state from {inferred}"
 
 
+def test_the_batch_states_its_own_terminal_cause_to_the_formatter():
+    """**R2.** The boundary case is expressible nowhere else, so `gui.py` must state it.
+
+    `RenderBatchOutcome.__post_init__` can derive a cancellation from a cancelled *candidate*, but the
+    batch-boundary case has none: candidate 1 succeeded and candidate 2 was never attempted. If this
+    argument went missing, the model's own tests would still pass and the UI would quietly go back to
+    reporting ``stopped on candidate 1`` for a candidate that had just succeeded — so the call site is
+    pinned here, with the authority it reads.
+    """
+    body = _body(_GUI, "render_selected_variants_guarded")
+    assert ("batch_outcome_kind = RenderOutcomeKind.CANCELLED "
+            "if lifecycle.cancel_requested() else None") in body, body
+    assert "outcome_kind=batch_outcome_kind" in body, \
+        "the batch outcome is built without stating its terminal cause"
+
+    construction = next(n for n in ast.walk(_func(_GUI, "render_selected_variants_guarded"))
+                        if isinstance(n, ast.Call)
+                        and ast.unparse(n.func) == "fork_render_batch.RenderBatchOutcome")
+    kwargs = {kw.arg for kw in construction.keywords}
+    assert kwargs == {"requested_count", "outcomes", "stopped_on_failure", "outcome_kind"}, kwargs
+
+    # derived from the cancellation Event, never from status prose or from `stopped`
+    for inferred in ("outcome_kind=stopped", "in last_status", "'Cancelled' in"):
+        assert inferred not in body, f"the batch cause is inferred from {inferred}"
+
+
 def test_a_cancelled_batch_event_outranks_its_last_candidate_s_own_outcome():
     """The *event* was cancelled, even if the candidate that happened to be running succeeded.
 
@@ -1287,10 +1353,25 @@ def test_nothing_after_the_commit_point_can_downgrade_success():
     rendered = ast.unparse(preview)
     assert "RENDER_OUTCOME_KEY" not in rendered, \
         "the preview block touches the outcome key"
-    assert "lifecycle is None or not lifecycle.cancel_requested()" in rendered, \
-        "the preview must be skipped rather than run after a cancellation"
     assert "raise_if_cancelled" not in rendered, \
         "raising here would discard a render that already succeeded"
+
+    # [R2] three explicit branches, and all three must exist. R1A had only the first two, which is
+    # why an already-running preview could not be stopped at all.
+    assert "if lifecycle is None:" in rendered, \
+        "the no-lifecycle path must stay the original blocking call"
+    assert "subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)" in rendered, \
+        "the lifecycle-free preview call must be byte-identical to today's"
+    assert "elif lifecycle.cancel_requested():" in rendered, \
+        "an already-cancelled render must not START a preview child"
+    assert "run_cancellable_media_command(preview_cmd, 180, lifecycle=lifecycle)" in rendered, \
+        "an in-flight preview must go through the cancellable runner"
+    # the cancellation lands here and goes no further
+    assert "except RenderCancelled:" in rendered
+    assert rendered.rstrip().endswith("preview_path = output_path")
+    # and a genuine timeout stays a timeout on both paths -- never caught, never relabelled
+    assert "except subprocess.TimeoutExpired" not in rendered, \
+        "a stuck encode is a different fact from a user pressing Stop"
 
     impl = _body(_GUI, "_process_video_impl")
     assert impl.index("session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS") < \
@@ -1369,6 +1450,143 @@ def test_a_cancellation_during_the_prores_preview_still_reports_success(tmp_path
     assert preview_path == durable, \
         "with no preview generated, the durable output is what gets displayed"
     assert life.cancel_requested() is True, "the cancellation really was pending"
+
+
+#: Filled in by the in-flight preview test below so the final report can quote a real measurement.
+PREVIEW_CANCEL_LATENCY: dict = {}
+
+
+def test_an_in_flight_prores_preview_child_is_cancelled_while_the_render_stays_success(tmp_path):
+    """**The R2 defect-B case, with a REAL child process.**
+
+    R1A only handled "cancellation already pending, so do not START the preview". It did nothing for
+    the case that actually matters: the preview child is **already running**, the user clicks Cancel,
+    and `subprocess.run(..., timeout=180)` stays blocked until FFmpeg exits — up to three minutes of
+    a UI claiming the render was cancelled while an FFmpeg child kept working.
+
+    This exercises the real `_process_video_impl` preview branch over the real cancellable runner
+    from `ffmpeg_processing` (poll → terminate → grace → kill → reap) and a real long-lived child.
+    Only the argv is swapped for a portable `python -c "sleep"` stand-in, because the bare suite has
+    no FFmpeg — and the genuine preview argv is captured and asserted, so the swap cannot hide a
+    command that was never built.
+
+    `subprocess.run` is wired to a stub that fails loudly: reaching it would mean the blocking path
+    was taken, which is the mutation this test exists to catch.
+    """
+    from test_gui_guard_seam import (PROMOTION_HELPER, _gui_tree, _impl_namespace,
+                                     _no_replace_rename)
+    from conftest import write_file
+
+    calls: list[str] = []
+    namespace = _impl_namespace(tmp_path, calls, rename=_no_replace_rename,
+                               dest_appears_during_render=False)
+    life = _live("inv-preview-inflight")
+    out_dir = str(tmp_path / "output")
+
+    # The REAL cancellable runner, over a recording `subprocess` so the child can be interrogated.
+    shim = _RecordingSubprocess()
+    real_runner = _load_ffmpeg_runner(shim)
+    preview_argv: list[list[str]] = []
+
+    def preview_runner(cmd, timeout, lifecycle=None):
+        preview_argv.append(list(cmd))
+        # real runner, real lifecycle, real poll/terminate/reap — only the argv is portable
+        return real_runner(_sleep_cmd(60), timeout, lifecycle=lifecycle)
+
+    class _BlockingPathTaken:
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(*_args, **_kwargs):                  # pragma: no cover - reaching this is the bug
+            raise AssertionError(
+                "the preview took the blocking subprocess.run path while a lifecycle was active")
+
+    namespace["run_cancellable_media_command"] = preview_runner
+    namespace["subprocess"] = _BlockingPathTaken
+    namespace["RenderCancelled"] = RenderCancelled
+    namespace["RenderOutcomeKind"] = rw.RenderOutcomeKind
+    namespace["RENDER_OUTCOME_KEY"] = "render_outcome_kind"
+    namespace["FFMPEG_PATH"] = r"C:\fake\ffmpeg.exe"
+    namespace["NVENC_AVAILABLE"] = False
+
+    nodes = [n for n in _gui_tree().body
+             if isinstance(n, ast.FunctionDef)
+             and n.name in {"_as_existing_source_path", "_as_existing_source_paths",
+                            PROMOTION_HELPER, "_process_video_impl"}]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<gui>", "exec"), namespace)
+
+    observed: dict = {}
+
+    def cancel_once_the_child_is_alive():
+        """Wait for a REAL live child, prove it is running, then press Cancel."""
+        deadline = time.perf_counter() + 20
+        while time.perf_counter() < deadline:
+            if shim.children and shim.children[0].poll() is None:
+                observed["alive"] = True
+                observed["pid"] = shim.children[0].pid
+                observed["requested_at"] = time.perf_counter()
+                life.request_cancel()
+                return
+            time.sleep(0.01)
+        observed["alive"] = False                    # pragma: no cover - harness failure
+
+    canceller = threading.Thread(target=cancel_once_the_child_is_alive, daemon=True)
+    session_dir = str(tmp_path / "session")
+    os.makedirs(session_dir, exist_ok=True)
+    audio = write_file(str(tmp_path / "src" / "track.wav"), b"audio")
+    clip = write_file(str(tmp_path / "src" / "a.mp4"), b"clip")
+
+    canceller.start()
+    try:
+        preview_path, status, state = namespace["_process_video_impl"](
+            audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
+            processing_mode="prores_proxy", custom_fps=30.0, creative=None,
+            session_state={"session_dir": session_dir}, lifecycle=life)
+    finally:
+        life.request_cancel()                        # never leave a 60s child behind
+        canceller.join(timeout=25)
+
+    reaped_at = time.perf_counter()
+
+    # 1-3. the preview child really started, really was alive, and Cancel arrived while it was
+    assert observed.get("alive") is True, "the preview child was never observed alive"
+    assert len(shim.children) == 1, f"expected one preview child, got {len(shim.children)}"
+    assert life.cancel_requested() is True
+
+    # 4-5. it exited and was reaped
+    assert shim.children[0].poll() is not None, \
+        "the preview FFmpeg child was still alive after _process_video_impl returned"
+    latency = reaped_at - observed["requested_at"]
+    PREVIEW_CANCEL_LATENCY["seconds"] = latency
+    PREVIEW_CANCEL_LATENCY["pid"] = observed["pid"]
+    assert latency < 20, f"cancel-to-quiescent took {latency:.2f}s"
+
+    # the genuine preview command was built and handed to the real seam
+    assert len(preview_argv) == 1
+    assert preview_argv[0][0] == r"C:\fake\ffmpeg.exe"
+    assert "-pix_fmt" in preview_argv[0] and "yuv420p" in preview_argv[0]
+
+    # 6. the partial preview is not selected — the durable .mov is
+    produced = sorted(os.listdir(out_dir))
+    assert len(produced) == 1 and produced[0].endswith(".mov"), produced
+    durable = os.path.join(out_dir, produced[0])
+    assert preview_path == durable, \
+        "a partial/absent preview was handed back instead of the durable output"
+    assert not preview_path.endswith("_preview.mp4")
+
+    # 7. the durable output survived untouched
+    assert os.path.exists(durable)
+    assert open(durable, "rb").read() == b"NEW"
+    assert state["last_output_path"] == durable
+
+    # 8. the committed outcome is still SUCCESS
+    assert state["render_outcome_kind"] is rw.RenderOutcomeKind.SUCCESS, \
+        "cancelling post-commit convenience work downgraded a finished render"
+
+    # 9. no RenderCancelled escaped as the terminal result
+    assert status.startswith("✅"), status
+    assert "Cancelled" not in status
+    assert calls == ["analyze_beats_auto", "create_music_video"]
 
 
 def test_a_cancellation_before_the_promotion_reports_cancelled_and_promotes_nothing(tmp_path):

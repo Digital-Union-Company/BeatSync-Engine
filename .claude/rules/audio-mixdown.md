@@ -115,6 +115,51 @@ test asserts this against the real call — it is the most important test in D.
   delay) but keep its explicit type boundary; NaN/inf fall back to the default rather than clamping,
   so an infinite delay cannot become an enormous `adelay`.
 
+## Cancellation reaches the mixdown executor, and nothing else (C3-R1A)
+
+`probe_duration`, `render_mixed_master` and `build_mixed_master` each take an optional trailing
+`lifecycle`, defaulted to `None`. Full contract: `.claude/rules/render-worker.md`.
+
+- **It is ephemeral control flow only — never plan data, never identity.** The token is *read*
+  (`raise_if_cancelled()`) and passed down; it is never stored on `AudioMixPlan`, `SmartMixPlan`,
+  `AudioMixConfig`, `SmartMixConfig`, an `SfxPlacement` or any module global. `audio_mix.py` and
+  `smart_mix.py` are **untouched** and must stay that way: the pure planners know nothing about
+  cancellation, which is what keeps them deterministic and testable on a bare interpreter. Nothing
+  about cancellation reaches a cache key, a source identity or the Stage-5 contract — a cancelled
+  render invalidates nothing and re-keys nothing.
+- **This module owns and reaps its own child.** `_run` has its own small Popen-poll runner rather
+  than importing `ffmpeg_processing`'s. That is deliberate rather than duplication-for-its-own-sake:
+  a process handle belongs to the frame that created it, and sharing one runner would mean a child
+  created on behalf of the mixdown was reaped by code owned by the renderer. Each module keeps
+  exactly **one** `subprocess.Popen` call, and a test asserts neither imports the other's runner.
+  `lifecycle=None` is the original blocking `subprocess.run(..., timeout=timeout)`, as the **first**
+  statement, so every existing caller's behaviour is byte-identical.
+- **`RenderCancelled` is never converted into an `AudioMixError`.** `build_mixed_master` has an
+  `except RenderCancelled:` clause **alongside** the pre-existing `except AudioMixError:` one: both
+  call `discard_master(output_path)` so a cancelled mixdown leaves no truncated WAV in `session_dir`
+  for the next render's duration probe to read, but the cancellation then **re-raises unchanged**.
+  The distinction is load-bearing at the GUI boundary: `_process_video_impl` classifies an
+  `AudioMixError` as `CANDIDATE_LOCAL`, so re-typing a cancellation would report a user's Stop as an
+  Audio Layers failure — and in a C3 batch would describe a cancelled candidate as a mix problem
+  with their voice or SFX settings.
+- **Ordinary failure and timeout semantics are unchanged.** A real command timeout still raises
+  `subprocess.TimeoutExpired` and still becomes `Audio mixdown timed out` / the probe's own
+  `AudioMixError`; the runner measures the command's timeout independently of its 0.15 s poll
+  interval, so a cancellable command does not appear to time out on its first poll. A non-zero
+  return code, an empty output file and the ≤ 1 ms duration-drift check all behave exactly as before.
+  A timeout is a stuck encode; a cancellation is a user pressing Stop. They are different facts and
+  are never conflated.
+- **The voice/SFX preflight remains shared-input validation, before Stage 1.** `prepare_voice_inputs`
+  and `prepare_sfx_inputs` validate the *whole* selection and raise on the first unusable entry, and
+  that is unchanged — it is a statement about the user's files, not about one candidate. Cancellation
+  does not soften it, does not make it partial, and does not turn a bad voice file into a cancelled
+  render. The preflight still costs no analysis when it fails.
+- **A mix failure is the one cause R1A can prove is candidate-local.** `_process_video_impl` records
+  `RenderOutcomeKind.CANDIDATE_LOCAL` for an `AudioMixError`, because a different candidate's own
+  music-under-voice / SFX Amount / SFX Level could legitimately succeed on the same files — E2 varies
+  exactly those three. That classification is diagnostic only: C3-R1A still **stops** the batch on it,
+  and continue-after-failure remains C3-R1B. It is not permission to retry.
+
 ## Smart Mix V1 adds SFX to the same master (E)
 
 `beatsync_fork/smart_mix.py` (pure: roles, Amount mapping, percentile, five placement rules,

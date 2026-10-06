@@ -113,6 +113,26 @@ def _run_media_command(cmd: List[str], timeout: int,
                 pass
 
 
+def run_cancellable_media_command(cmd: List[str], timeout: int,
+                                  lifecycle=None) -> subprocess.CompletedProcess[str]:
+    """[FORK] Digital-Union (C3-R1A / R2): the one public entry point to the runner above.
+
+    A deliberately thin, reviewed alias rather than a second implementation. `gui.py`'s ProRes
+    preview is the only caller outside this module, and it needs exactly the behaviour
+    `_run_media_command` already has: ``lifecycle=None`` is the original blocking
+    ``subprocess.run(..., timeout=timeout)``, and a supplied lifecycle polls cancellation,
+    terminates, graces, kills if necessary and **reaps** the child before ``RenderCancelled``
+    escapes. A genuine command timeout still raises ``subprocess.TimeoutExpired``.
+
+    It exists so that `gui.py` does not reach across a module boundary for a private name, and so
+    that this module stays the single owner of media-subprocess execution: duplicating the poll /
+    terminate / grace / kill / reap logic in the GUI is exactly the kind of second process-handling
+    path that eventually diverges. The child handle still belongs entirely to the call frame
+    `_run_media_command` creates it in — nothing is stored at module scope here or anywhere else.
+    """
+    return _run_media_command(cmd, timeout, lifecycle=lifecycle)
+
+
 def _safe_remove_file(path: str | None) -> None:
     """Best-effort removal for temporary media files."""
     if path and os.path.exists(path):

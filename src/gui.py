@@ -90,7 +90,7 @@ import uuid
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
-from ffmpeg_processing import get_video_fps, FFMPEG_PATH
+from ffmpeg_processing import get_video_fps, FFMPEG_PATH, run_cancellable_media_command
 
 # Shared runtime settings
 from gpu_cpu_utils import (
@@ -1028,15 +1028,43 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             else:
                 preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
             preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
-            # [FORK] Digital-Union (C3-R1A): the durable .mov above is already SUCCESS and stays
-            # so regardless of what happens below -- a cancellation here only skips STARTING the
-            # preview subprocess; it never retroactively touches RENDER_OUTCOME_KEY, and a preview
-            # that never got generated is already an existing, non-fatal outcome (preview_path
-            # simply stays the durable output_path, read-only below).
-            if lifecycle is None or not lifecycle.cancel_requested():
+            # [FORK] Digital-Union (C3-R1A / R2): the durable .mov above is already SUCCESS and
+            # STAYS so regardless of anything below. Cancellation stops this post-commit
+            # convenience work; it never changes the render's terminal result, and nothing here
+            # touches RENDER_OUTCOME_KEY. Three explicit branches, because they are three genuinely
+            # different situations:
+            #
+            #   lifecycle is None          today's exact blocking call, byte-for-byte, including
+            #                              its existing TimeoutExpired behaviour. Every pre-R1A
+            #                              caller and the headless path take this.
+            #   already cancelled          never START a child at all. Cheaper than starting one
+            #                              and terminating it on the first poll, and it is the
+            #                              common case when Cancel landed during the render.
+            #   cancelled WHILE running    R2 fixed this: R1A only handled the branch above, so an
+            #                              already-running preview kept FFmpeg alive for up to 180s
+            #                              while the UI claimed cancellation. The cancellable runner
+            #                              terminates, graces, kills if needed and REAPS the child,
+            #                              then raises RenderCancelled -- which is caught HERE and
+            #                              goes no further, because a cancelled preview is not a
+            #                              cancelled render.
+            #
+            # A partial preview is simply never selected: `preview_path` falls back to the durable
+            # `output_path`. It is deliberately not deleted -- `session_dir` already legitimately
+            # retains non-promoted artifacts (a cross-volume promotion failure keeps the whole
+            # render there and names it in the message), and adding a destructive operation to this
+            # function to tidy session scratch is not worth the surface.
+            #
+            # A genuine `TimeoutExpired` is deliberately NOT caught on either path: a stuck encode
+            # is a different fact from a user pressing Stop, and its existing behaviour is unchanged.
+            if lifecycle is None:
                 subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
-            else:
+            elif lifecycle.cancel_requested():
                 preview_path = output_path
+            else:
+                try:
+                    run_cancellable_media_command(preview_cmd, 180, lifecycle=lifecycle)
+                except RenderCancelled:
+                    preview_path = output_path
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -2642,10 +2670,19 @@ def render_selected_variants_guarded(
         _clear_active_render(lifecycle.invocation_id)
         _RENDER_LOCK.release()
 
+    # [FORK] Digital-Union (C3-R1A / R2): the batch's OWN terminal cause, stated explicitly.
+    # `lifecycle` is still in scope and its cancellation Event survives the terminal transition
+    # above by design, so this reads the same authority the `finally` just used. It has to be stated
+    # rather than derived, because the batch-boundary case leaves no cancelled CANDIDATE to derive
+    # from: candidate 1 genuinely succeeded and candidate 2 was never attempted, so the fact that
+    # the top-level EVENT was cancelled is expressible nowhere else. Without this, the summary
+    # reported "stopped on candidate 1" for a candidate that had just succeeded.
+    batch_outcome_kind = RenderOutcomeKind.CANCELLED if lifecycle.cancel_requested() else None
     outcome = fork_render_batch.RenderBatchOutcome(
         requested_count=request.count,
         outcomes=tuple(outcomes),
         stopped_on_failure=stopped,
+        outcome_kind=batch_outcome_kind,
     )
     # The newest successful preview wins, and a later failure never blanks an earlier success.
     preview = outcome.latest_successful_preview()
