@@ -86,6 +86,7 @@ import subprocess
 import threading
 import time
 import socket
+import uuid
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
@@ -153,6 +154,15 @@ from beatsync_fork import variant_batch as fork_batch
 # supplies the request tag and performs every side effect. `variant_batch` stays generation and
 # comparison state and knows nothing about rendering — its own guard enforces that.
 from beatsync_fork import render_batch as fork_render_batch
+# [FORK] Digital-Union (C3-R1A): the pure render-lifecycle/cancellation contract. Stdlib-only,
+# Gradio-free, owns no Gradio object, Popen, filesystem path or media/cache identity -- see
+# src/beatsync_fork/render_worker.py's own docstring.
+from beatsync_fork.render_worker import (
+    RenderCancelled,
+    RenderLifecycle,
+    RenderLifecycleState,
+    RenderOutcomeKind,
+)
 # [FORK] Digital-Union (AI Director V1): a SECOND producer of the existing visual `CreativeRecipe`,
 # not a new render pipeline. The schema, both prompts, the strict machine-response parser, the
 # explanation policy, the `DirectorProposal` record and its read-out all live in
@@ -194,6 +204,26 @@ import audio_mixdown
 #: temporary file as candidate output. Nothing parses the status prose and nothing reconstructs the
 #: timestamp; the producer states the path it actually wrote.
 LAST_OUTPUT_PATH_KEY = 'last_output_path'
+
+#: [FORK] Digital-Union (C3-R1A): the typed terminal cause of one render attempt, a
+#: ``beatsync_fork.render_worker.RenderOutcomeKind`` member -- never inferred from ``status_msg``.
+#: Cleared to ``None`` at the start of every attempt (same lifecycle as ``LAST_OUTPUT_PATH_KEY``,
+#: including before the gate, so a gate refusal never carries a stale prior outcome) and written only
+#: by a boundary that actually PROVED the cause:
+#:
+#: * ``SUCCESS``         -- exactly once, immediately after the durable promotion succeeded.
+#: * ``CANCELLED``       -- only from a caught ``RenderCancelled``.
+#: * ``CANDIDATE_LOCAL`` -- an Audio Layers failure, the one cause R1A can prove is candidate-local.
+#: * ``UNKNOWN_FATAL``   -- a promotion failure, and the generic ``except Exception`` fallback.
+#:
+#: Everything else leaves it ``None``, deliberately: a plain early return (a missing audio file, an
+#: occupied destination) has proven nothing about *which* class of cause applied, and every consumer
+#: reads ``None`` conservatively — ``RenderCandidateOutcome.__post_init__`` derives
+#: ``UNKNOWN_FATAL``, and both mutex-owning wrappers derive ``FAILED``. ``SHARED_FATAL`` is part of
+#: the typed vocabulary but has no producer in R1A; distinguishing a shared-input failure is what
+#: continue-after-failure needs, and that is C3-R1B. Pure diagnostics for the batch/UI layer —
+#: nothing inside the pipeline reads it back.
+RENDER_OUTCOME_KEY = 'render_outcome_kind'
 
 AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 
@@ -688,7 +718,11 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        # [FORK] Digital-Union (Freestyle V1): appended LAST with a default, so every
                        # existing caller — production and test — stays valid and no positional
                        # argument moved. `None` means no section rules, i.e. today's render.
-                       freestyle: object | None = None
+                       freestyle: object | None = None,
+                       # [FORK] Digital-Union (C3-R1A): appended LAST with a default, same reasoning.
+                       # `None` preserves today's exact behaviour -- no boundary check anywhere
+                       # below ever fires, and RENDER_OUTCOME_KEY is still written truthfully.
+                       lifecycle: "RenderLifecycle | None" = None
                        ) -> StatusResult:
     # [FORK] Digital-Union (Creative Controls Core): one already-normalised `CreativeProfile`
     # replaces the Phase A raw `variation_seed`, so the four controls are not threaded through every
@@ -716,6 +750,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # collision, promotion failure and early return below therefore leaves it empty by
     # construction instead of by remembering to.
     session_state[LAST_OUTPUT_PATH_KEY] = ''
+    # [FORK] Digital-Union (C3-R1A): the typed terminal cause, same clear-every-attempt lifecycle
+    # as the key above. Written below only where the cause is proven -- SUCCESS after promotion,
+    # CANCELLED from a caught RenderCancelled, CANDIDATE_LOCAL for an Audio Layers failure,
+    # UNKNOWN_FATAL for a promotion failure or the generic handler. A plain early return leaves it
+    # None on purpose; see RENDER_OUTCOME_KEY's own comment for why that is the conservative answer.
+    session_state[RENDER_OUTCOME_KEY] = None
     total_started = time.perf_counter()
     try:
         parallel_workers = PARALLEL_WORKERS
@@ -864,6 +904,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             # render. Stages 1-3 ignore it; Stage 4 resolves per-section Cut Density from it after
             # Stage 3 exists, and it rides `beat_info` to Stage 6. It reaches no cache input.
             freestyle=freestyle,
+            lifecycle=lifecycle,
         )
         beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
@@ -917,10 +958,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     session_dir=session_dir,
                     sfx_placements=sfx_placements,
                     sfx_level_percent=smart_mix.sfx_level_percent,
+                    lifecycle=lifecycle,
                 )
             except audio_mixdown.AudioMixError as exc:
                 # Deliberately before any clip extraction: the user asked for voice and/or SFX, so a
                 # silent fallback to the original music would render a plausible but wrong video.
+                # [FORK] Digital-Union (C3-R1A): candidate-local -- a different candidate's own
+                # music-under-voice/SFX amount/level could legitimately succeed on these same files.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANDIDATE_LOCAL
                 return None, f'❌ Audio Layers: {exc}', session_state
             render_audio_path = mixed_master_path
             # The pure planner already produced these lines; the GUI never recomputes placement.
@@ -936,13 +981,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         if progress_callback:
             progress_callback(_stage_status(6))
 
+        # [FORK] Digital-Union (C3-R1A): the safe boundary before Stage 6 extraction/rendering
+        # begins.
+        if lifecycle is not None:
+            lifecycle.raise_if_cancelled()
+
         # Create video
         result_path = create_music_video(
             render_audio_path, local_video_paths, selected_beats,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
-            event_callback=event_callback
+            event_callback=event_callback, lifecycle=lifecycle
         )
 
         # [FORK] Digital-Union (H1): the ONE durable promotion, and it is a single no-replace OS
@@ -956,11 +1006,16 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             # Fail closed. Both files survive, the durable-output key stays empty (cleared at the
             # top of this function, and again by the gate core before the gate), and the message
             # names both paths — a promotion failure must never read as a finished render.
+            # [FORK] Digital-Union (C3-R1A): not proven candidate-local or shared -- fail closed.
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
             return None, promotion_error, session_state
         # [FORK] Digital-Union (C3-R0): the durable artifact is now on disk, so record it. Set
         # only here — after the promotion succeeded — and never from the returned display path,
         # which for ProRes is a session-temp preview rather than the real `.mov`.
         session_state[LAST_OUTPUT_PATH_KEY] = output_path
+        # [FORK] Digital-Union (C3-R1A): durable promotion is the one and only SUCCESS commit
+        # point -- nothing after this line (preview generation included) may ever downgrade it.
+        session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS
 
         # Create preview for ProRes if needed
         preview_path = output_path
@@ -973,7 +1028,15 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             else:
                 preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
             preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
-            subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
+            # [FORK] Digital-Union (C3-R1A): the durable .mov above is already SUCCESS and stays
+            # so regardless of what happens below -- a cancellation here only skips STARTING the
+            # preview subprocess; it never retroactively touches RENDER_OUTCOME_KEY, and a preview
+            # that never got generated is already an existing, non-fatal outcome (preview_path
+            # simply stays the durable output_path, read-only below).
+            if lifecycle is None or not lifecycle.cancel_requested():
+                subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
+            else:
+                preview_path = output_path
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -1044,7 +1107,19 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
+    except RenderCancelled:
+        # [FORK] Digital-Union (C3-R1A): never collapse into "❌ Error: ...". The typed cause rides
+        # on RENDER_OUTCOME_KEY so process_video's worker can publish CANCELLED without parsing
+        # this string; the string itself stays truthful on its own.
+        session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANCELLED
+        return None, STATUS_RENDER_CANCELLED, session_state
     except Exception as e:
+        # [FORK] Digital-Union (C3-R1A): conservative by construction -- this generic handler
+        # cannot prove whether the cause is candidate-local or shared, so it fails closed rather
+        # than guessing. Only a path above that already proved a more specific cause may write a
+        # different value.
+        if session_state.get(RENDER_OUTCOME_KEY) is None:
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
         error_msg = f"❌ Error: {str(e)}"
         import traceback
         traceback.print_exc()
@@ -1070,7 +1145,10 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  # [FORK] Digital-Union (Freestyle V1): appended last with a default. Freestyle adds
                  # render intent only — this function's worker thread, its synchronous join on
                  # generator close, the render mutex and the concurrency group are all untouched.
-                 freestyle: object | None = None
+                 freestyle: object | None = None,
+                 # [FORK] Digital-Union (C3-R1A): appended last with a default, same reasoning.
+                 # `None` preserves today's exact behaviour.
+                 lifecycle: "RenderLifecycle | None" = None
                  ) -> Iterator[StatusResult]:
     """Run the pipeline in a worker thread, streaming structured progress to the UI.
 
@@ -1082,6 +1160,13 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 
     Legacy string statuses are still accepted on the same queue as a compatibility fallback, so a
     caller that only supplies ``progress_callback`` keeps working.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` is constructed and installed into the active-render
+    slot by the caller (`process_video_guarded` / `render_selected_variants_guarded`) -- this
+    function only threads it down to `_process_video_impl` and reads it for nothing else. This
+    generator's own worker-thread-join lifetime and abandonment handling are completely unchanged;
+    cancellation changes *how fast* the worker reaches a terminal state, never *whether* the
+    finalizer below waits for it.
     """
     status_queue: queue.Queue[object | None] = queue.Queue()
     result_queue: queue.Queue[StatusResult] = queue.Queue(maxsize=1)
@@ -1118,12 +1203,32 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     sfx_root=sfx_root,
                     smart_mix=smart_mix,
                     freestyle=freestyle,
+                    lifecycle=lifecycle,
                 )
+        except RenderCancelled:
+            # [FORK] Digital-Union (C3-R1A): defensive only -- _process_video_impl already catches
+            # RenderCancelled internally and returns a normal tuple with RENDER_OUTCOME_KEY set, so
+            # this clause should never actually fire in practice. It exists so that if some future
+            # call path ever raised past that boundary, it still could not be stringified into
+            # "\u274c Error: ...".
+            if lifecycle is not None and session_state.get(RENDER_OUTCOME_KEY) is None:
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANCELLED
+            console_logger.line("Cancelled")
+            result = None, STATUS_RENDER_CANCELLED, session_state
         except Exception as e:
             console_logger.line(f"Error: {e}")
+            if session_state.get(RENDER_OUTCOME_KEY) is None:
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
             result = None, f"\u274c Error: {e}", session_state
         finally:
             console_logger.finish()
+        # [FORK] Digital-Union (C3-R1A): deliberately NO lifecycle.mark_terminal(...) here. This
+        # worker is reused once PER CANDIDATE inside the C3-R0 batch, which threads one SHARED
+        # lifecycle through both calls -- terminal-marking it from here would make candidate 1's
+        # outcome freeze the batch's shared lifecycle before candidate 2 ever runs. Deriving and
+        # marking the authoritative terminal state is the mutex-owning wrapper's job
+        # (`process_video_guarded` / `render_selected_variants_guarded`), done exactly once, after
+        # it has read the outcome of everything it ran.
         result_queue.put(result)
         status_queue.put(None)
 
@@ -1977,7 +2082,13 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # [FORK] Digital-Union (Freestyle V1): appended LAST with a
                                     # default, so no existing positional argument moved and every
                                     # existing caller stays valid.
-                                    freestyle: object | None = None
+                                    freestyle: object | None = None,
+                                    # [FORK] Digital-Union (C3-R1A): appended LAST with a default,
+                                    # same reasoning. Constructed and installed by the caller
+                                    # (`process_video_guarded` / `render_selected_variants_guarded`)
+                                    # -- this core only threads it down and reads its invocation_id
+                                    # to publish on every yield.
+                                    lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
 
@@ -2033,6 +2144,8 @@ def _process_video_guarded_unlocked(audio_file: str,
     # as the two read-outs above — cleared before the gate, so a refused render cannot leave the
     # previous attempt's output path behind for a batch to read as this candidate's result.
     session_state[LAST_OUTPUT_PATH_KEY] = ''
+    # [FORK] Digital-Union (C3-R1A): same lifecycle again -- cleared before the gate too.
+    session_state[RENDER_OUTCOME_KEY] = None
 
     verification_started = time.perf_counter()
     decision = resolve_for_render(
@@ -2040,8 +2153,9 @@ def _process_video_guarded_unlocked(audio_file: str,
         live_declaration(source_mode, source_folder, source_recursive, video_input),
     )
     verification_seconds = time.perf_counter() - verification_started
+    invocation_id = lifecycle.invocation_id if lifecycle is not None else ''
     if not decision.allowed:
-        yield None, f"❌ {decision.message}", session_state, '', ''
+        yield None, f"❌ {decision.message}", session_state, '', '', invocation_id
         return
 
     # [FORK] Digital-Union (Creative Controls Core): the four raw widget values are collapsed into
@@ -2114,12 +2228,14 @@ def _process_video_guarded_unlocked(audio_file: str,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
         freestyle=freestyle,
+        lifecycle=lifecycle,
     )
     try:
         for video, status, state in render_stream:
             yield (video, status, state,
                    (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''),
-                   (state or {}).get(SMART_MIX_REPORT_KEY, ''))
+                   (state or {}).get(SMART_MIX_REPORT_KEY, ''),
+                   invocation_id)
     finally:
         render_stream.close()
 
@@ -2146,10 +2262,89 @@ _RENDER_LOCK = threading.Lock()
 #: shared value is the whole contract.
 RENDER_CONCURRENCY_ID = 'beatsync-render'
 
+#: [FORK] Digital-Union (C3-R1A): the Cancel button's OWN concurrency lane -- deliberately never
+#: `RENDER_CONCURRENCY_ID`. Gradio's concurrency groups are cooperative queuing, not an execution
+#: guarantee, but queuing Cancel behind the very render it needs to signal would make it useless:
+#: it would only run after the render it was meant to interrupt had already finished.
+CANCEL_CONCURRENCY_ID = 'beatsync-cancel'
+
 RENDER_BUSY_MESSAGE = (
     "⏳ A render is already running. Wait for it to finish before starting another — "
     "BeatSync renders one video at a time."
 )
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (C3-R1A): the capacity-one active-render slot.
+# ---------------------------------------------------------------------------
+#
+# Runtime coordination state only, never persisted and never a second render authority:
+# `_RENDER_LOCK` above remains the one thing that decides whether a render may start. This slot
+# exists solely so a SEPARATE Gradio event (Cancel) can find the correct live `RenderLifecycle` to
+# signal, without ever storing a `threading.Event`, a `RenderLifecycle` or any process/thread
+# handle in `gr.State` — only the plain string invocation id crosses into Gradio state.
+#
+# Capacity exactly one, protected by its own small lock (deliberately NOT `_RENDER_LOCK`: that lock
+# is held for the whole render and installing/reading this slot must never risk contending with or
+# substituting for it). Holds only `(invocation_id, lifecycle)` or `None` — never a Popen, a
+# worker thread, or a list of past invocations.
+_ACTIVE_RENDER_SLOT_LOCK = threading.Lock()
+_active_render_slot: "tuple[str, RenderLifecycle] | None" = None
+
+
+def _install_active_render(lifecycle: "RenderLifecycle") -> None:
+    """Install the one lifecycle a Cancel click may reach. Overwrites any stale prior entry.
+
+    Only ever called by a mutex-owning wrapper that already holds `_RENDER_LOCK`, so "install"
+    never races another "install" -- but the slot's own lock is still what a concurrent Cancel
+    read/clear synchronizes against.
+    """
+    global _active_render_slot
+    with _ACTIVE_RENDER_SLOT_LOCK:
+        _active_render_slot = (lifecycle.invocation_id, lifecycle)
+
+
+def _clear_active_render(invocation_id: str) -> None:
+    """Unregister the slot, but ONLY if it still names this exact invocation.
+
+    This is what stops a stale finalizer (an abandoned render's delayed cleanup) from ever
+    clearing a NEWER render's slot -- the check and the clear are one atomic step under the lock.
+    """
+    global _active_render_slot
+    with _ACTIVE_RENDER_SLOT_LOCK:
+        if _active_render_slot is not None and _active_render_slot[0] == invocation_id:
+            _active_render_slot = None
+
+
+def _request_cancel_if_matching(invocation_id: str) -> bool:
+    """Signal the active lifecycle IFF the submitted id matches it. Returns whether it matched.
+
+    This is the ENTIRE body of work the Cancel handler performs on the slot: no lock beyond the
+    slot's own, no Popen, no thread, no Gradio component. A stale or empty id, or an id that no
+    longer matches because a newer render has since started, is a safe, silent no-op -- never an
+    error and never a signal to the wrong invocation.
+    """
+    if not invocation_id:
+        return False
+    with _ACTIVE_RENDER_SLOT_LOCK:
+        slot = _active_render_slot
+    if slot is None or slot[0] != invocation_id:
+        return False
+    slot[1].request_cancel()
+    return True
+
+
+def _on_cancel_render_click(invocation_id: str) -> str:
+    """The Cancel button's entire handler. Touches only the active-render slot, never a widget.
+
+    [FORK] Digital-Union (C3-R1A): deliberately returns a plain status string rather than
+    `gr.skip()` for a non-matching id -- a stale id (an abandoned browser tab, or a batch that has
+    since moved to its next candidate under a NEW invocation id) is reported truthfully as
+    "nothing to cancel" rather than silently doing nothing with no feedback. This never raises and
+    never touches `_RENDER_LOCK`, `session_state` or any report panel.
+    """
+    if _request_cancel_if_matching(invocation_id):
+        return STATUS_CANCEL_REQUESTED
+    return STATUS_CANCEL_NOTHING_ACTIVE
 
 
 def process_video_guarded(audio_file: str,
@@ -2200,9 +2395,19 @@ def process_video_guarded(audio_file: str,
     is never execution authority.
     """
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip()
+        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip(), ''
         return
+    # [FORK] Digital-Union (C3-R1A): ONE lifecycle for this whole render event, constructed and
+    # installed here, before any expensive work -- the mutex-owning wrapper owns
+    # installation/uninstallation, exactly as the frozen authorization requires.
+    lifecycle = RenderLifecycle(invocation_id=str(uuid.uuid4()))
+    _install_active_render(lifecycle)
     try:
+        lifecycle.mark_running()
+        # The user cannot meaningfully cancel a render before the browser/session has been told
+        # which invocation is active, so this id-publishing yield happens BEFORE the gate or any
+        # pipeline work -- it writes no execution widget and no report, only the control-plane id.
+        yield gr.skip(), 'Starting…', session_state, gr.skip(), gr.skip(), lifecycle.invocation_id
         yield from _process_video_guarded_unlocked(
             audio_file, voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
             music_under_voice, sfx_folder, sfx_roles, sfx_amount, sfx_level,
@@ -2220,8 +2425,30 @@ def process_video_guarded(audio_file: str,
             (freestyle_enabled, freestyle_intro, freestyle_hook, freestyle_outro,
              freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
              freestyle_breakdown, freestyle_verse, freestyle_body),
+            lifecycle=lifecycle,
         )
+        # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
+        # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
+        # `process_video`'s reused-per-candidate worker (see its own comment for why that would be
+        # wrong for the C3-R0 batch, which shares one lifecycle across two worker calls).
+        outcome_kind = session_state.get(RENDER_OUTCOME_KEY)
+        if outcome_kind is RenderOutcomeKind.CANCELLED:
+            lifecycle.mark_terminal(RenderLifecycleState.CANCELLED)
+        elif outcome_kind is RenderOutcomeKind.SUCCESS:
+            lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
+        else:
+            lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        # The terminal yield clears the invocation id from the session -- a render that finished
+        # normally has nothing left for a Cancel click to signal.
+        yield gr.skip(), gr.skip(), session_state, gr.skip(), gr.skip(), ''
     finally:
+        # [FORK] Digital-Union (C3-R1A): defensive terminal mark -- the normal path above already
+        # reaches a terminal lifecycle state; this only catches an abandoned-generator or truly
+        # unexpected-exception path that did not. Unregistering is conditional on THIS exact
+        # invocation id, so a slower-finishing abandoned render can never clear a newer one's slot.
+        if not lifecycle.is_terminal():
+            lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        _clear_active_render(lifecycle.invocation_id)
         _RENDER_LOCK.release()
 
 
@@ -2288,16 +2515,28 @@ def render_selected_variants_guarded(
         request_tag=_render_batch_request_tag(),
     )
     if request is None:
-        yield summary_only[0], f"❌ {refusal}", session_state, refusal
+        yield summary_only[0], f"❌ {refusal}", session_state, refusal, ''
         return
 
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE
+        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE, ''
         return
+
+    # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- both candidates share it,
+    # exactly as the frozen authorization requires ("no moment between candidates where the batch
+    # has no cancellable top-level lifecycle"). Constructed and installed here, by the mutex-owning
+    # wrapper, mirroring `process_video_guarded` exactly.
+    lifecycle = RenderLifecycle(invocation_id=str(uuid.uuid4()))
+    _install_active_render(lifecycle)
 
     outcomes: list = []
     stopped = False
     try:
+        lifecycle.mark_running()
+        # Publish the invocation id BEFORE any candidate work, same reasoning as the single-render
+        # wrapper: a Cancel click needs the id on screen before there is anything to cancel.
+        yield gr.skip(), 'Starting…', session_state, gr.skip(), lifecycle.invocation_id
+
         # [FORK] Digital-Union (Freestyle V1): ONE declaration for the whole batch, frozen HERE —
         # outside the candidate loop, from this handler's own submitted arguments. Both candidates
         # therefore render under the identical section rules, and a user editing a Freestyle
@@ -2311,6 +2550,15 @@ def render_selected_variants_guarded(
             freestyle_breakdown, freestyle_verse, freestyle_body)
 
         for position, candidate in enumerate(request.candidates, start=1):
+            # [FORK] Digital-Union (C3-R1A): checked BEFORE starting each candidate, closing the
+            # candidate-boundary race the frozen authorization calls out explicitly -- a Cancel
+            # click that lands in the gap between two candidates must stop the batch here rather
+            # than silently being honoured only on the NEXT internal safe-boundary check deep
+            # inside the candidate that is about to start.
+            if lifecycle.cancel_requested():
+                stopped = True
+                break
+
             prefix = f"Rendering candidate {position} / {request.count}"
             recipe = candidate.creative_recipe
             audio = candidate.audio_recipe
@@ -2335,9 +2583,10 @@ def render_selected_variants_guarded(
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
                         session_state, source_state,
-                        batch_freestyle)
+                        batch_freestyle,
+                        lifecycle=lifecycle)
             try:
-                for video, status, state, _a_report, _s_report in candidate_stream:
+                for video, status, state, _a_report, _s_report, _invocation_id in candidate_stream:
                     last_status = status or ''
                     if video is not None:
                         last_video = video
@@ -2346,7 +2595,8 @@ def render_selected_variants_guarded(
                     yield (gr.skip() if video is None else video,
                            f"{prefix}\n\n{last_status}",
                            state,
-                           gr.skip())
+                           gr.skip(),
+                           lifecycle.invocation_id)
             finally:
                 candidate_stream.close()
 
@@ -2354,6 +2604,11 @@ def render_selected_variants_guarded(
             # render that finished and then hit trouble generating its display preview has still
             # produced a `.mov` the user owns.
             durable = (session_state or {}).get(LAST_OUTPUT_PATH_KEY, '') or ''
+            # [FORK] Digital-Union (C3-R1A): a candidate cancelled mid-render is a typed CANCELLED
+            # outcome, never an ordinary "not durable" failure -- `session_state[RENDER_OUTCOME_KEY]`
+            # is the one authority for that, never inferred from `durable` or `last_status`.
+            candidate_cancelled = (
+                (session_state or {}).get(RENDER_OUTCOME_KEY) is RenderOutcomeKind.CANCELLED)
             outcomes.append(fork_render_batch.RenderCandidateOutcome(
                 candidate_index=candidate.candidate_index,
                 candidate_master_seed=candidate.candidate_master_seed,
@@ -2364,11 +2619,27 @@ def render_selected_variants_guarded(
                 status_text=last_status,
                 audio_layers_report=(session_state or {}).get(AUDIO_LAYERS_REPORT_KEY, '') or '',
                 smart_mix_report=(session_state or {}).get(SMART_MIX_REPORT_KEY, '') or '',
+                outcome_kind=(RenderOutcomeKind.CANCELLED if candidate_cancelled else None),
             ))
-            if not durable:
+            if candidate_cancelled or not durable:
+                # A cancelled candidate stops the batch exactly like a failure: the earlier
+                # candidate's durable output is kept, and the next candidate is never attempted.
                 stopped = True
                 break
     finally:
+        # [FORK] Digital-Union (C3-R1A): the ONE place the batch's shared lifecycle reaches a
+        # terminal state -- after everything it ran, mirroring `process_video_guarded`. A Cancel
+        # click that landed anywhere in the batch (mid-candidate or at a candidate boundary) is
+        # authoritative over the last candidate's own outcome: the top-level EVENT was cancelled.
+        if lifecycle.cancel_requested():
+            lifecycle.mark_terminal(RenderLifecycleState.CANCELLED)
+        elif (session_state or {}).get(RENDER_OUTCOME_KEY) is RenderOutcomeKind.SUCCESS:
+            lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
+        else:
+            lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        if not lifecycle.is_terminal():
+            lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        _clear_active_render(lifecycle.invocation_id)
         _RENDER_LOCK.release()
 
     outcome = fork_render_batch.RenderBatchOutcome(
@@ -2378,10 +2649,12 @@ def render_selected_variants_guarded(
     )
     # The newest successful preview wins, and a later failure never blanks an earlier success.
     preview = outcome.latest_successful_preview()
+    # The batch is fully done -- nothing left for a Cancel click to signal.
     yield (preview if preview else gr.skip(),
            outcome.headline(),
            session_state,
-           outcome.summary_text())
+           outcome.summary_text(),
+           '')
 
 
 # [FORK] Digital-Union (P V1 / P2): media library preparation.
@@ -2724,6 +2997,13 @@ def create_ui() -> gr.Blocks:
         # [FORK] Digital-Union (P V1): preparation has its OWN state object. It is never read or
         # written by the source-confirmation handlers, and it never reaches `process_video_guarded`.
         prep_state = gr.State(initial_prep_state())
+        # [FORK] Digital-Union (C3-R1A): the plain-string bridge from a render's `RenderLifecycle`
+        # into Gradio. Deliberately a bare string, never the lifecycle object itself (nor an Event,
+        # nor a lock) -- `gr.State` deep-copies and may serialize its value, and a live
+        # synchronization primitive must never cross that boundary. Written only by the two render
+        # wrappers (publish on start, clear to '' on terminal completion) and read only by the
+        # Cancel handler, which compares it against the server-side active-render slot.
+        render_invocation_state = gr.State('')
         # [FORK] Digital-Union (Variant Lab C3 V1): the candidate list awaiting selection, and
         # nothing else. Comparison/selection state: only `apply_variant_btn` ever reads it, it is
         # absent from `process_btn.click`, `source_outputs`, `prep_outputs` and `live_declaration`,
@@ -3363,6 +3643,14 @@ def create_ui() -> gr.Blocks:
                 )
                 gr.Markdown(INFO_CONFIRMATION_GATE)
 
+                # [FORK] Digital-Union (C3-R1A): deliberately ALWAYS interactive -- unlike
+                # `process_btn`, this is never gated by the source-confirmation state, because a
+                # render already in flight has nothing to do with whether a NEW one could start.
+                # It is also never disabled while a render runs: that disabling is what would make
+                # it useless, since it is the only way to reach a render already in progress.
+                cancel_render_btn = gr.Button(LABEL_CANCEL_RENDER, variant='stop', size='sm')
+                gr.Markdown(INFO_CANCEL_RENDER)
+
                 # [FORK] Digital-Union (P V1): media library preparation. A separate, collapsed
                 # section rather than a restructuring of the app into tabs - it is an occasional
                 # maintenance workflow, not part of the render flow. Nothing in here is wired to
@@ -3720,10 +4008,24 @@ def create_ui() -> gr.Blocks:
                 freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
                 freestyle_verse, freestyle_body,
             ],
-            outputs=[video_output, status_output, session_state, render_batch_summary],
+            outputs=[video_output, status_output, session_state, render_batch_summary,
+                     render_invocation_state],
             show_progress='hidden',
             concurrency_id=RENDER_CONCURRENCY_ID,
             concurrency_limit=1,
+        )
+
+        # [FORK] Digital-Union (C3-R1A): the Cancel button. Its ENTIRE input is the plain string
+        # invocation id, never `session_state` or any report widget, and its entire output is the
+        # status line -- it writes no execution widget, no report panel and no state object. A
+        # dedicated concurrency lane (never `RENDER_CONCURRENCY_ID`) is what lets it actually run
+        # while a render is in progress instead of queuing uselessly behind it.
+        cancel_render_btn.click(
+            fn=_on_cancel_render_click,
+            inputs=[render_invocation_state],
+            outputs=[status_output],
+            show_progress='hidden',
+            concurrency_id=CANCEL_CONCURRENCY_ID,
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.
@@ -3811,7 +4113,7 @@ def create_ui() -> gr.Blocks:
             # written here and nowhere else. They are outputs only — never inputs, never source or
             # preparation state, and never consulted by the pipeline.
             outputs=[video_output, status_output, session_state,
-                     audio_layers_report, smart_mix_report],
+                     audio_layers_report, smart_mix_report, render_invocation_state],
             show_progress='hidden',
             # [FORK] Digital-Union (C3-R0): the same concurrency group as the batch render event,
             # so Gradio queues them together instead of giving each listener its own lane. The

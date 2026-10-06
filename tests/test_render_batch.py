@@ -4,8 +4,9 @@
 Four properties carry this feature and each has a section:
 
 1. **Exactly two, in canonical ascending index order.** The selection contract is the whole safety
-   story — with no cancellation, a batch is an unbreakable commitment, so it must be a commitment
-   the user explicitly and unambiguously made.
+   story — a batch costs render minutes, and C3-R1A's cancellation makes it interruptible at safe
+   boundaries but never instant, so it must still be a commitment the user explicitly and
+   unambiguously made.
 2. **Candidate identity cannot rest on the Variation Seed.** C3 deduplicates candidate *masters*
    and says nothing about `CreativeRecipe.seed`; collisions are real, and the existing render path
    names its output `_seed<VariationSeed>`.
@@ -24,6 +25,7 @@ import pytest
 
 from beatsync_fork import presets as fork_presets
 from beatsync_fork import render_batch as rb
+from beatsync_fork import render_worker as rw
 from beatsync_fork import variant_batch as fork_batch
 from beatsync_fork import variant_lab as fork_lab
 
@@ -374,16 +376,30 @@ def test_the_models_are_frozen():
             setattr(target, field, value)
 
 
-def test_the_module_imports_only_stdlib():
+def test_the_module_imports_only_stdlib_and_one_named_sibling_fork_module():
+    """**Amended by C3-R1A**, and deliberately pinned tighter rather than loosened.
+
+    The hard rule in CLAUDE.md is "no upstream runtime", not "no fork sibling": `render_batch` now
+    imports `RenderOutcomeKind` from `beatsync_fork.render_worker`, which is itself stdlib-only, so
+    the bare-interpreter property this guard protects is intact. Rather than widen the allowlist to
+    "any `beatsync_fork`", the exact fork module is named — a second, unreviewed fork dependency
+    appearing here would still fail, which is what the original one-line allowlist was for.
+    """
     with open(_MODULE, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
-    imported = set()
+    stdlib, fork = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.update(a.name.split(".")[0] for a in node.names)
+            for alias in node.names:
+                (fork if alias.name.startswith("beatsync_fork") else stdlib).add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    assert imported <= {"__future__", "collections", "dataclasses", "typing"}, sorted(imported)
+            if node.module.startswith("beatsync_fork"):
+                fork.add(node.module)
+            else:
+                stdlib.add(node.module)
+    assert {m.split(".")[0] for m in stdlib} <= {
+        "__future__", "collections", "dataclasses", "typing"}, sorted(stdlib)
+    assert fork == {"beatsync_fork.render_worker"}, sorted(fork)
 
 
 def test_the_module_reaches_no_runtime_and_renders_nothing():
@@ -403,11 +419,89 @@ def test_the_module_reaches_no_runtime_and_renders_nothing():
         assert not _re.search(rf"(import|from)\s+{forbidden}", source), forbidden
 
 
-def test_no_cancellation_machinery_exists():
-    """C3-R0 ships no Stop control; a fake one would be worse than none."""
+def test_this_module_owns_no_cancellation_machinery():
+    """**Amended by C3-R1A.** It *records* a cancellation; it must never *perform* one.
+
+    C3-R0's version banned the word "cancel" outright, because C3-R0 shipped no Stop control at all
+    and a fake one would have been worse than none. R1A makes a batch genuinely cancellable, so the
+    typed cause now legitimately appears here — `outcome_kind`, `.cancelled`, the `CANCELLED` report
+    label. What has NOT changed is the division of labour this module exists to enforce: it decides
+    and reports, `gui.py` performs every side effect. So every piece of actual cancellation
+    *machinery* stays banned, and the list is widened rather than shortened — a `threading.Event`,
+    a `terminate`/`kill`, a signal or a `Popen` appearing here would mean the pure decision layer
+    had grown a runtime.
+    """
     source = _executable_source(_MODULE).lower()
-    for forbidden in ("cancel", "stop_flag", "stop_event", "threading", "terminate", "abort"):
-        assert forbidden not in source, f"render_batch references {forbidden!r}"
+    for forbidden in ("stop_flag", "stop_event", "threading", "terminate", "abort",
+                      "kill", "signal", "popen", "event(", "lock(", "is_set", "wait("):
+        assert forbidden not in source, f"render_batch performs cancellation: {forbidden!r}"
+
+    # And the cancellation surface it *does* own is exactly the typed one, nothing more.
+    assert "renderoutcomekind.cancelled" in source, \
+        "the typed cancelled cause is how this module may speak about cancellation"
+    assert not hasattr(rb, "request_cancel"), "render_batch must expose no cancel entry point"
+    assert "request_cancel" not in source
+
+
+# ---------------------------------------------------------------------------
+# C3-R1A: the typed outcome rides alongside `success` and must never disagree with it
+# ---------------------------------------------------------------------------
+
+
+def _typed(success=True, kind=None, path="C:/out/a.mp4"):
+    return rb.RenderCandidateOutcome(
+        candidate_index=0, candidate_master_seed=1, variation_seed=2,
+        durable_output_path=(path if success else ""),
+        success=success, status_text="s", outcome_kind=kind)
+
+
+def test_an_omitted_outcome_kind_is_derived_conservatively():
+    """Every call site predating C3-R1A omits it, and must not be guessed into a specific cause."""
+    assert _typed(success=True).outcome_kind is rw.RenderOutcomeKind.SUCCESS
+    assert _typed(success=False).outcome_kind is rw.RenderOutcomeKind.UNKNOWN_FATAL
+    # never a more specific class than "we do not know"
+    assert _typed(success=False).outcome_kind is not rw.RenderOutcomeKind.CANDIDATE_LOCAL
+    assert _typed(success=False).outcome_kind is not rw.RenderOutcomeKind.CANCELLED
+
+
+def test_a_supplied_outcome_kind_must_agree_with_success():
+    """The two fields are one truth. Drift between them is how a cancelled render reads as done."""
+    for kind in (rw.RenderOutcomeKind.CANCELLED, rw.RenderOutcomeKind.CANDIDATE_LOCAL,
+                 rw.RenderOutcomeKind.SHARED_FATAL, rw.RenderOutcomeKind.UNKNOWN_FATAL):
+        assert _typed(success=False, kind=kind).outcome_kind is kind
+        with pytest.raises(ValueError):
+            _typed(success=True, kind=kind)
+    assert _typed(success=True, kind=rw.RenderOutcomeKind.SUCCESS).success
+    with pytest.raises(ValueError):
+        _typed(success=False, kind=rw.RenderOutcomeKind.SUCCESS)
+
+
+def test_a_cancelled_candidate_reports_cancelled_not_failed():
+    """A user who pressed Stop must not be told their render failed."""
+    cancelled = _typed(success=False, kind=rw.RenderOutcomeKind.CANCELLED)
+    assert cancelled.cancelled is True
+    head = cancelled.report_lines()[0]
+    assert "CANCELLED" in head
+    assert "FAILED" not in head and "SUCCESS" not in head
+
+    failed = _typed(success=False)
+    assert failed.cancelled is False
+    assert "FAILED" in failed.report_lines()[0]
+
+    done = _typed(success=True)
+    assert done.cancelled is False
+    assert "SUCCESS" in done.report_lines()[0]
+
+
+def test_the_outcome_record_is_still_deepcopy_safe_with_the_enum():
+    """It crosses a Gradio event boundary; an `Enum` member is the only non-scalar allowed."""
+    cancelled = _typed(success=False, kind=rw.RenderOutcomeKind.CANCELLED)
+    clone = copy.deepcopy(cancelled)
+    assert clone == cancelled
+    # Enum identity survives deepcopy, which is what makes `is` comparisons safe downstream.
+    assert clone.outcome_kind is rw.RenderOutcomeKind.CANCELLED
+    with pytest.raises(Exception):
+        cancelled.outcome_kind = rw.RenderOutcomeKind.SUCCESS
 
 
 def test_the_public_surface_is_explicit():

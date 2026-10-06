@@ -63,12 +63,18 @@ from __future__ import annotations
 import dataclasses
 import os
 import subprocess
+import time
 import uuid
 
 from ffmpeg_processing import FFMPEG_PATH, FFPROBE_PATH
 
 from beatsync_fork import audio_mix as fork_audio_mix
 from beatsync_fork import smart_mix as fork_smart_mix
+# [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module). This
+# module keeps its own small cancellable runner below rather than importing
+# ffmpeg_processing._run_media_command -- the process handle always belongs to the call frame that
+# creates it, and the two runtime modules stay independent of each other for this.
+from beatsync_fork.render_worker import RenderCancelled
 
 #: The mixed master's format — identical to what final assembly already encodes, so the mux has no
 #: new work to do and there is no lossy intermediate.
@@ -97,8 +103,51 @@ class AudioMixError(Exception):
     """Any Audio Layers failure. Carries a short, already-bounded human-readable reason."""
 
 
-def _run(command, timeout):
-    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+#: Same shape as ffmpeg_processing's poll/grace constants, deliberately a separate pair -- each
+#: module owns its own small cancellable runner rather than sharing one.
+_CANCEL_POLL_SECONDS = 0.15
+_TERMINATE_GRACE_SECONDS = 5.0
+
+
+def _run(command, timeout, lifecycle=None):
+    """Run one FFmpeg/FFprobe command. ``lifecycle`` defaults to ``None`` (unchanged behaviour).
+
+    [FORK] Digital-Union (C3-R1A): mirrors ``ffmpeg_processing._run_media_command``'s cancellable
+    shape exactly, as its own independent implementation -- this module never imports that one, so
+    the process handle it creates stays owned entirely within this call frame. A real timeout still
+    raises ``subprocess.TimeoutExpired``; only a matching cancellation raises ``RenderCancelled``,
+    and only after the child is provably reaped.
+    """
+    if lifecycle is None:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+
+    started = time.perf_counter()
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=_CANCEL_POLL_SECONDS)
+                return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if lifecycle.cancel_requested():
+                    proc.terminate()
+                    try:
+                        proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    raise RenderCancelled("audio mixdown command cancelled")
+                if time.perf_counter() - started > timeout:
+                    proc.kill()
+                    proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    raise subprocess.TimeoutExpired(command, timeout)
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+            except Exception:
+                pass
 
 
 def _tail(text) -> str:
@@ -113,17 +162,23 @@ def _tail(text) -> str:
 # ---------------------------------------------------------------------------
 
 
-def probe_duration(path: str) -> float:
+def probe_duration(path: str, lifecycle=None) -> float:
     """Media duration in seconds, via the project's portable ffprobe.
 
     Deliberately raises rather than returning a fallback: ``ffmpeg_processing.get_video_duration``
     answers ``10.0`` when probing fails, which is right for its caller and catastrophic here — a
     guessed voice length would place speech at the wrong time and silently mis-duck the music.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour). Probes
+    are short, so this is a boundary check (raise_if_cancelled before starting) plus pass-through,
+    not fine-grained polling -- a cancelled render must not begin a new preflight unit.
     """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     command = [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", path]
     try:
-        result = _run(command, _PROBE_TIMEOUT_SECONDS)
+        result = _run(command, _PROBE_TIMEOUT_SECONDS, lifecycle=lifecycle)
     except subprocess.TimeoutExpired:
         raise AudioMixError(f"Timed out reading the duration of {os.path.basename(path)}")
     if result.returncode != 0:
@@ -334,12 +389,21 @@ def master_path_for(session_dir: str) -> str:
 
 
 def render_mixed_master(music_path: str, plan, output_path: str,
-                        sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT) -> str:
-    """Produce the mixed master and verify it. Raises :class:`AudioMixError` on any failure."""
+                        sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                        lifecycle=None) -> str:
+    """Produce the mixed master and verify it. Raises :class:`AudioMixError` on any failure.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour). A
+    matching cancellation raises ``RenderCancelled`` from ``_run`` below; this function's own
+    ``except subprocess.TimeoutExpired`` is deliberately narrow and was never broad enough to catch
+    it, so cancellation already propagates through this function unchanged.
+    """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     command = build_mix_command(music_path, plan, output_path,
                                 sfx_level_percent=sfx_level_percent)
     try:
-        result = _run(command, _MIX_TIMEOUT_SECONDS)
+        result = _run(command, _MIX_TIMEOUT_SECONDS, lifecycle=lifecycle)
     except subprocess.TimeoutExpired:
         raise AudioMixError("Audio mixdown timed out")
     if result.returncode != 0:
@@ -350,7 +414,7 @@ def render_mixed_master(music_path: str, plan, output_path: str,
     if os.path.getsize(output_path) <= 0:
         raise AudioMixError("Audio mixdown produced an empty output file")
 
-    produced = probe_duration(output_path)
+    produced = probe_duration(output_path, lifecycle=lifecycle)
     drift = abs(produced - plan.music_duration)
     if drift > DURATION_TOLERANCE_SECONDS:
         # Load-bearing: `create_music_video` derives the frame-locked timeline from this file's
@@ -375,7 +439,8 @@ def discard_master(path) -> None:
 def build_mixed_master(music_path: str, music_duration: float, beat_times, sections,
                        voices, config, session_dir: str,
                        sfx_placements=(),
-                       sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT):
+                       sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                       lifecycle=None):
     """Plan voice, attach any Smart Mix SFX, render one master. Returns ``(master_path, plan)``.
 
     The master is written into ``session_dir`` — **never** ``get_processing_dir()``, which
@@ -385,7 +450,11 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     [FORK] Digital-Union (Smart Mix V1 / E): ``sfx_placements`` are already resolved by the pure
     planner — this function never plans SFX, it only attaches them to the voice plan so one executor
     produces one master. ``sfx_level_percent`` rides alongside as execution state.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour).
     """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     plan = fork_audio_mix.plan_voice_placements(
         music_duration=music_duration,
         beat_times=fork_audio_mix.project_beat_times(beat_times),
@@ -403,8 +472,14 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     output_path = master_path_for(session_dir)
     try:
         render_mixed_master(music_path, plan, output_path,
-                            sfx_level_percent=sfx_level_percent)
+                            sfx_level_percent=sfx_level_percent, lifecycle=lifecycle)
     except AudioMixError:
+        discard_master(output_path)
+        raise
+    except RenderCancelled:
+        # [FORK] Digital-Union (C3-R1A): same partial-output cleanup as the AudioMixError path --
+        # a cancelled mixdown must not leave a stray WAV in session_dir -- but RenderCancelled must
+        # still escape unchanged so the caller sees a typed cancellation, not an AudioMixError.
         discard_master(output_path)
         raise
     return output_path, plan

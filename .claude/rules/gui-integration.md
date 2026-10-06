@@ -50,11 +50,24 @@ automatically.
   whose finalizer **joins** the worker — and only then does the mutex release. Both wrappers own
   their nested stream (`render_stream` / `candidate_stream`) and close it in a `finally` nested
   *inside* the lock-holding `try`, so the ordering is structural rather than incidental. No
-  worker is ever terminated and there is no timeout: with no cancellation, abandoning a stream
-  means waiting for the render in flight. The lock is a plain non-reentrant
+  worker is ever terminated and there is no timeout: **abandoning a stream means waiting for the
+  render in flight**, and that stays true under C3-R1A — abandonment is not an explicit Cancel, and
+  a finalizer that cancelled would turn every dropped Gradio event into a Stop nobody pressed. The
+  lock is a plain non-reentrant
   `Lock` on purpose — a batch that re-entered the single-render wrapper would refuse itself on its
   own first candidate, and an `RLock` would hide that instead of exposing it. Never wire an event
   directly to the core, and never let a wrapper rebuild the gate.
+
+  **The wrappers also own the render lifecycle (C3-R1A).** Each constructs exactly **one**
+  `RenderLifecycle` per top-level render event — the batch's one spans *both* candidates — installs
+  it in the capacity-one active-render slot, publishes its `invocation_id` in a control-plane-only
+  yield **before** the gate, and marks the lifecycle terminal exactly once after everything it ran.
+  Terminal-marking never happens inside `process_video.worker()`, which the batch calls once per
+  candidate against that shared lifecycle. Both wrappers' yields gained one trailing element, the
+  invocation id, and `process_video` keeps its 3-value contract untouched. The Cancel button is a
+  **third** event that is deliberately not a render: its own concurrency lane, no `_RENDER_LOCK`, no
+  `session_state`, no report widget, and only a plain string in `gr.State`. Full contract:
+  `.claude/rules/variant-lab.md` (C3-R1A section).
 - **Diagnostics the batch reads rather than writes.** C3-R0 records each candidate's durable
   output in `session_state[LAST_OUTPUT_PATH_KEY]` — cleared before every attempt, set only after
   the promotion into `output/` succeeds, and never the ProRes preview — and reads the two report
@@ -172,6 +185,7 @@ automatically.
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | C3-R0 render-two-candidates seam, render mutex, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
+| the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
 | the **AI Director** group, its instruction box, either Director button, `director_proposal_state`, or the one-shot model invocation | `.claude/rules/director.md` **+** `.claude/rules/creative-controls.md` **+** `.claude/rules/creative-presets.md` — Apply writes the seed, the six sliders and the preset label, so all three writer matrices apply |
 | the Creative Preset selector and its `.input()` graph | `.claude/rules/creative-presets.md` |

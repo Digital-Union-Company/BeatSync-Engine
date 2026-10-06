@@ -73,12 +73,23 @@ _L2_ONLY = ("_stage3_cache_key", "_stage3_cache_get", "_stage3_cache_put",
 
 
 def _source(revision: str | None) -> str:
+    """The module source at `revision`, or the working tree when `revision is None`.
+
+    `encoding="utf-8"` is **not** optional, and the explicit `open(..., encoding="utf-8")` above is
+    why: `auto_mode/__init__.py` contains emoji in its console strings. With `text=True` alone,
+    `subprocess` decodes with `locale.getpreferredencoding()` — `cp1252` on a default Windows shell —
+    the reader thread dies on the first non-Latin-1 byte, `result.stdout` comes back `None`, and
+    `ast.parse(None)` fails with a `TypeError` that says nothing about encoding. The repo's own
+    entry points set `PYTHONUTF8=1` (`run.bat`) or `-X utf8`, which masked this; a bare
+    `python -m pytest`, which `.claude/rules/test-harness.md` documents as the way to run the suite,
+    did not.
+    """
     if revision is None:
         with open(_AUTO_MODE_PATH, "r", encoding="utf-8") as handle:
             return handle.read()
     return subprocess.run(
         ["git", "show", f"{revision}:src/auto_mode/__init__.py"],
-        capture_output=True, text=True, check=True, cwd=_REPO_ROOT).stdout
+        capture_output=True, text=True, encoding="utf-8", check=True, cwd=_REPO_ROOT).stdout
 
 
 def _load_stage4(shared: dict):
@@ -1328,7 +1339,8 @@ def test_stage5_and_the_renderer_were_not_modified():
     """L2 must know nothing about video files, the candidate library, Qwen or the Stage-5 contract."""
     changed = subprocess.run(
         ["git", "diff", "--name-only", _BASE_SHA, "HEAD"],
-        capture_output=True, text=True, check=True, cwd=_REPO_ROOT).stdout.split()
+        capture_output=True, text=True, encoding="utf-8", check=True,
+        cwd=_REPO_ROOT).stdout.split()
     for untouchable in ("src/video_analysis.py", "src/video_processor.py", "src/gui.py",
                         "src/ui_content.py", "src/auto_mode/stage1_audio.py",
                         "src/auto_mode/stage2_features.py", "src/auto_mode/stage3_sections.py",

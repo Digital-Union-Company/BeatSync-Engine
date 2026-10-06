@@ -370,14 +370,16 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
                                                      candidate A, then candidate B
 ```
 
-- **Exactly two, sequential, no cancellation — one decision, not three.** There is no safe stop
-  channel in this architecture: a cancelled Gradio event can return its slot while the daemon
-  render worker is still alive, and the next render would wipe the live one's process-global
-  processing dir. Rather than ship a Stop button that cannot stop FFmpeg, C3-R0 ships none and
-  bounds the commitment to two renders. Three or more, continue-after-failure and real
-  cancellation are **C3-R1**, behind an explicit worker lifecycle. `RENDER_SELECTION_SIZE = 2` is
-  deliberately unrelated to `CANDIDATE_COUNT_MAX = 12`: that bound is comparison legibility and
-  costs a millisecond, this one is uninterruptible render minutes.
+- **Exactly two, sequential — cancellable since C3-R1A, and still exactly two.** C3-R0 shipped no
+  stop channel at all, for a real reason: a cancelled Gradio event could return its slot while the
+  daemon render worker was still alive, and the next render would wipe the live one's process-global
+  processing dir. Rather than ship a Stop button that could not stop FFmpeg, C3-R0 shipped none and
+  bounded the commitment to two renders. **C3-R1A added the explicit lifecycle that was missing** —
+  see the C3-R1A section below — so a batch is now interruptible at safe boundaries. The count did
+  **not** move with it: three or more, and continuing to the next candidate after a failure or a
+  cancellation, remain **C3-R1B**. `RENDER_SELECTION_SIZE = 2` is still deliberately unrelated to
+  `CANDIDATE_COUNT_MAX = 12`: that bound is comparison legibility and costs a millisecond, this one
+  is render minutes — now stoppable, but never instant.
 - **A separate selector.** The Apply `gr.Radio` stays; rendering gets its own `gr.CheckboxGroup`,
   empty by default and never pre-filled. One control cannot honestly mean both "apply this one"
   and "render these two". Neither registers a handler; the selection is validated at click time.
@@ -433,9 +435,18 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
   itself, so "empty unless a promotion succeeded" is a local property rather than one inherited
   from whichever caller happened to run.
 - **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
-  The render boundary exposes no typed failure classification, so a batch cannot tell a
-  shared-input failure (which would simply repeat) from a candidate-local one. Continue-on-failure
-  waits for C3-R1 and a typed outcome model.
+  A batch still cannot tell a shared-input failure (which would simply repeat) from a
+  candidate-local one, so it does not try: continue-on-failure waits for **C3-R1B**.
+
+  C3-R1A added the *typed outcome model* this bullet used to be waiting for, and deliberately did
+  **not** spend it on continuing. `RenderCandidateOutcome.outcome_kind` carries a
+  `RenderOutcomeKind`, which is what makes a **cancelled** candidate reportable as cancelled rather
+  than as a failure — a user who pressed Stop must not be told their render broke. R1A produces
+  exactly three of the five causes (`SUCCESS` after the durable promotion, `CANCELLED` from a caught
+  `RenderCancelled`, `CANDIDATE_LOCAL` for an Audio Layers failure) and falls back to
+  `UNKNOWN_FATAL` for everything it has not proven. `SHARED_FATAL` is in the vocabulary with **no
+  producer**: telling shared from local apart is precisely what continuing needs, and that evidence
+  does not exist yet. Do not add a producer for it to unlock R1B by the back door.
 - **Report ownership.** `audio_layers_report` and `smart_mix_report` keep `process_btn.click` as
   their **only** writer; the batch reads them from `session_state` after each candidate and the
   dedicated summary owns multi-render diagnostics. `variant_batch_table` and
@@ -448,6 +459,77 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
   stage cache, no shortlist, no rendered gallery, no Qwen or cache-contract change.
   `variant_batch.py` is untouched too and keeps its own render ban at full strength — that guard
   is what holds the generation/render module split honest.
+
+  **C3-R1A did change pipeline files**, and that supersedes this bullet for R1A only: cancellation
+  has to be *observed* where the time is spent, so `video_processor.py`, `ffmpeg_processing.py`,
+  `audio_mixdown.py` and `auto_mode/__init__.py` each gained an optional `lifecycle=None` parameter
+  and boundary checks. Everything else in this bullet still holds — no stage cache, no shortlist, no
+  gallery, no Qwen change, and `CACHE_CONTRACT_VERSION` / `ANALYSIS_VERSION` / `L2_CACHE_VERSION` are
+  untouched. `video_analysis.py` and `stage5_qwen_scene_worker.py` are untouched too, and that is a
+  contract rather than an omission: see BOUNDARY_ONLY_CANCEL below.
+
+## Cancelling a render (C3-R1A)
+
+C3-R0 bounded the commitment because it had no safe stop channel. C3-R1A builds that channel. The
+whole contract lives in `src/beatsync_fork/render_worker.py` (stdlib-only, Gradio-free), and
+`tests/test_render_worker.py` plus `tests/test_render_cancellation.py` pin it.
+
+```
+Cancel click ──► _on_cancel_render_click(invocation_id: str)      own concurrency lane
+                     └─► _request_cancel_if_matching(id)          the slot's own small lock
+                           └─► lifecycle.request_cancel()         sets ONE threading.Event
+                                 │
+render thread ───────────────────┴──► raise_if_cancelled() at safe boundaries only
+```
+
+- **BOUNDARY_ONLY_CANCEL.** FFmpeg-class subprocesses may be terminated promptly, mid-call —
+  `ffmpeg_processing._run_media_command` and `audio_mixdown._run` each poll their own child and
+  terminate → grace → kill → **reap**, and raise `RenderCancelled` only once the reap has returned,
+  never while a child may still be alive. An in-flight **Stage-5 / Qwen** call is *never* hard-killed:
+  the token is not passed into `video_analysis.py` at all, and the cancellation becomes effective at
+  the next boundary after that call returns naturally. The boundary that makes this work is in
+  `auto_mode/__init__.py`, placed **immediately after** the Stage-5 `try/except` and before Stage 6,
+  deliberately **outside** it — inside, a cancellation would be caught by that block's broad
+  `except Exception` and reinterpreted as "video analysis failed", continuing into fallback sampling.
+- **Exactly ONE `RenderLifecycle` per top-level render event.** One ordinary Create Music Video
+  click, or the **whole** two-candidate batch — never one per candidate, never one per internal
+  `process_video()` call. The two mutex-owning wrappers construct it; nothing below them constructs a
+  second.
+- **Terminal-marking belongs to the wrappers, exactly once, after everything they ran.** Never
+  inside `process_video`'s `worker()`, which the batch calls **once per candidate** against one
+  shared lifecycle: `RenderLifecycle._transition` silently no-ops once terminal (by design — no
+  reset or reuse), so marking from there would freeze the batch's reported state after candidate 1.
+- **Only a plain string crosses into Gradio.** `render_invocation_state` is a `gr.State('')` holding
+  an opaque invocation id. A live `RenderLifecycle`, `threading.Event` or `Lock` must never enter
+  `gr.State`, which deep-copies and may serialize its value. The server side keeps the live object
+  in a **capacity-one active-render slot** holding `(invocation_id, lifecycle)` or `None` — never a
+  `Popen`, a thread handle or a history of past invocations. `_clear_active_render` clears only if
+  the slot still names that exact id, so a slow abandoned finalizer cannot unregister a newer render.
+- **Cancel has its own concurrency lane** (`CANCEL_CONCURRENCY_ID`, never `RENDER_CONCURRENCY_ID`)
+  and never Gradio's built-in `cancels=`. Queuing Cancel behind the render it must signal would make
+  it useless, and `cancels=` would kill the event while leaving the daemon worker alive — the exact
+  defect C3-R0 bounded itself to avoid. The handler **never acquires `_RENDER_LOCK`** and touches
+  nothing but the slot.
+- **Abandonment is not an explicit Cancel.** `process_video`'s finalizer still joins its worker with
+  no timeout and no kill; a dropped stream keeps waiting for the render in flight exactly as before.
+  Cancel only makes the worker *reach* a terminal state sooner.
+- **The clip-extraction executor is proven quiescent before cancellation propagates.** In
+  `create_music_video`, a `RenderCancelled` from a worker calls
+  `executor.shutdown(wait=True, cancel_futures=True)` explicitly, stores the exception and `break`s —
+  never `continue`s — and re-raises only **after** the `with` block has exited. `cancel_futures`
+  stops not-yet-started futures from beginning expensive work; `wait=True` is what makes "no FFmpeg
+  child outlives this function" true rather than hoped for.
+- **`RenderCancelled` must survive every broad `except Exception` on the render path.** It is an
+  ordinary `Exception` subclass on purpose — not `BaseException` — so each catch site names it
+  explicitly *before* the generic handler. Grep `except RenderCancelled` to enumerate the covered
+  sites. Two of them re-raise with no event at all: a cancellation must not be narrated as
+  "Final assembly failed".
+- **The durable promotion is the ONE success commit point.** `session_state[RENDER_OUTCOME_KEY]` is
+  set to `SUCCESS` exactly once, immediately after `LAST_OUTPUT_PATH_KEY`, and nothing afterwards may
+  downgrade it. A cancellation arriving during the ProRes **preview** step therefore stays a success:
+  the preview is skipped (`preview_path` stays the durable output) and `RENDER_OUTCOME_KEY` is not
+  touched. The user owns that `.mov`.
+- **No cache, schema or version constant changed**, and `RENDER_SELECTION_SIZE` is still 2.
 
 ## The boundary against Freestyle (Freestyle V1)
 

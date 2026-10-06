@@ -78,6 +78,15 @@ generator, because the caller's render mutex is released the moment that generat
 changes no `ProgressEvent`, no stage, no phase and no schema — it is purely about who is still
 running when the stream ends.
 
+**C3-R1A's Cancel is a different mechanism and adds no progress protocol.** It sets one flag that
+the render thread reads at safe boundaries; it emits **no** `ProgressEvent`, adds no stage, no
+phase, no counter and no ETA, and the Cancel handler's only output is the status line. Two things
+follow that are easy to get wrong. A cancellation is **not narrated as a failure**: the two
+`concatenate_videos_ffmpeg` call sites in `create_music_video` catch `RenderCancelled` and re-raise
+it *before* the generic handler that would otherwise emit `error(6, "Final assembly failed: …")`,
+because an event must describe what actually happened. And abandonment is still not cancellation —
+`process_video`'s finalizer joins its worker with no timeout and no kill, exactly as above.
+
 **C3-R0 prefixes; it never replaces.** The two-candidate batch wrapper emits no `ProgressEvent`
 of its own, adds no stage, no phase, no counter and no ETA, and parses nothing out of the rendered
 text. It yields `f"Rendering candidate {n} / 2"`, a blank line, and then today's `ProgressView`

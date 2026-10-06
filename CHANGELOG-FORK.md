@@ -20,6 +20,71 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-07 (C3-R1A — render lifecycle and cancellation)
+
+**A render can be stopped.** One **Cancel Active Render** button stops whichever render is running —
+an ordinary Create Music Video click or the whole two-candidate C3-R0 batch — at the next safe point.
+
+```
+BOUNDARY_ONLY_CANCEL
+  FFmpeg-class subprocess   terminated, graced, killed if needed, REAPED -> then RenderCancelled
+  in-flight Stage 5 / Qwen  never hard-killed; effective at the next boundary after it returns
+```
+
+- **`src/beatsync_fork/render_worker.py` is new and stdlib-only** (CLAUDE.md's hard rule):
+  `RenderCancelled`, `RenderOutcomeKind`, `RenderLifecycleState` with a monotonic transition table,
+  the frozen `RenderOutcome`, and `RenderLifecycle` — one cancellation `threading.Event`, one
+  lock-protected state machine, one opaque invocation id. It owns no Gradio object, path, `Popen`,
+  FFmpeg command, Qwen process, stage data, media identity or cache identity, and keeps no registry
+  of lifecycles.
+- **`RenderCancelled` is an ordinary `Exception`, deliberately — not `BaseException`.** So every
+  broad `except Exception` on the render path names it explicitly *before* the generic handler:
+  nine such sites across `ffmpeg_processing.py`, `audio_mixdown.py`, `video_processor.py` and
+  `gui.py`, pinned by count and by handler order. Two of them re-raise with **no event at all**,
+  because a cancellation must not be narrated as `Final assembly failed`.
+- **`lifecycle=None` is byte-for-byte today's behaviour.** The parameter is appended **last with a
+  default** at all fourteen seams, and both media runners open with
+  `if lifecycle is None: return subprocess.run(..., timeout=timeout)` as their first statement — so
+  the headless CLI, `video_processor.main` and every existing caller are unaffected, and no
+  positional argument moved. Measured, not asserted: with no lifecycle, no `Popen` is created at all.
+- **Quiescence is proven before cancellation propagates.** Each cancellable runner polls its own
+  child and terminates → graces → kills → **reaps** it, raising only once the reap returned.
+  `create_music_video`'s clip loop calls `executor.shutdown(wait=True, cancel_futures=True)`
+  explicitly, stores the exception, `break`s, and re-raises only **after** the `with` block has
+  exited. `cancel_futures=True` is independently load-bearing: without it every already-submitted
+  future would still run, i.e. the whole extraction continuing after Stop.
+- **Exactly ONE lifecycle per top-level render event**, constructed by a mutex-owning wrapper — the
+  batch's single lifecycle spans **both** candidates, and the candidate boundary is checked first
+  thing each iteration. Terminal-marking happens only in those two wrappers, never in
+  `process_video.worker()`, which the batch calls once per candidate: `_transition` silently no-ops
+  once terminal, so marking there would freeze the shared lifecycle on candidate 1's outcome.
+- **Only a plain string crosses into Gradio.** `render_invocation_state` is a `gr.State('')` holding
+  an opaque id; the live object stays in a server-side capacity-one slot holding
+  `(invocation_id, lifecycle)` or `None`. `_clear_active_render` clears only if the slot still names
+  that id, so a slow abandoned finalizer cannot unregister a newer render.
+- **Cancel owns its own concurrency lane** (`CANCEL_CONCURRENCY_ID`), never `RENDER_CONCURRENCY_ID`
+  and never Gradio's `cancels=`. The first would queue Cancel behind the render it must signal; the
+  second kills the event while leaving the daemon worker alive — the hazard C3-R0 bounded itself to
+  two renders to avoid. The handler never takes `_RENDER_LOCK` and touches nothing but the slot.
+- **Abandonment is still not cancellation.** `process_video`'s finalizer joins its worker with no
+  timeout and no kill, exactly as before; no `finally` anywhere requests a cancellation.
+- **The durable `os.rename` promotion is the ONE success commit point.** A cancellation arriving
+  during ProRes preview generation *after* promotion skips the preview and leaves the outcome
+  `SUCCESS` — the user owns that `.mov`. Verified end to end against the real `_process_video_impl`.
+- **A cancelled candidate is reported as cancelled, never as a failure.**
+  `RenderCandidateOutcome.outcome_kind` carries the typed cause, validated against `success` in
+  `__post_init__`, and the batch reads it from `session_state` rather than inferring it from
+  `durable` or from status prose. `SHARED_FATAL` exists in the vocabulary with no producer: telling
+  shared from candidate-local apart is what continue-after-failure needs, and that is **C3-R1B**.
+- **`RENDER_SELECTION_SIZE` is still 2, and no cache, schema or version constant moved** —
+  `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION` and `L2_CACHE_VERSION` are untouched.
+  `video_analysis.py`, `stage5_qwen_scene_worker.py` and `qwen_progress.py` are untouched **by
+  contract**, which is what makes "an in-flight Qwen call is never hard-killed" structural.
+- `tests/test_render_worker.py` and `tests/test_render_cancellation.py` are new (135 cases), and
+  five deliberate mutations were each confirmed to fail them: dropping `cancel_futures=True`, moving
+  the re-raise inside the `with`, making the slot clear unconditional, letting the preview downgrade
+  `SUCCESS`, and moving the post-Stage-5 boundary inside that stage's broad `except`.
+
 ### Performance — 2026-10-04 (L2 Stage Caching V1 — process-local post-Stage-3 reuse)
 
 **A repeated render of the same track reuses the audio front end and Stages 1–3 instead of

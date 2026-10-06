@@ -9,12 +9,15 @@ loop::
     generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
                                                          candidate A, then candidate B
 
-**Exactly two, sequential, no cancellation.** Those three are one decision, not three. There is no
-safe stop channel in this architecture today — a cancelled Gradio event can return its slot while
-the daemon render worker is still alive, and the next render would then wipe the live one's
-*process-global* processing directory — so C3-R0 ships no Stop control at all and instead bounds
-the commitment to two renders. Three or more, continue-after-failure and real cancellation are
-C3-R1, behind an explicit worker lifecycle.
+**Exactly two, sequential — with cancellation since C3-R1A.** C3-R0 shipped with no cancellation at
+all: a cancelled Gradio event could return its slot while the daemon render worker was still alive,
+and the next render would then wipe the live one's *process-global* processing directory — so
+C3-R0 shipped no Stop control and instead bounded the commitment to two renders. C3-R1A closed that
+gap with an explicit, shared ``beatsync_fork.render_worker.RenderLifecycle`` spanning the whole
+batch, so a Cancel click is observed at the next safe boundary instead of tearing down a live
+worker — BOUNDARY_ONLY_CANCEL: an FFmpeg-class subprocess stops within moments, an in-progress
+Stage-5 call is never hard-killed. The count is still bounded to exactly two. Three or more, and
+continuing to the next candidate after a cancellation or failure, remain C3-R1B.
 
 ===============================================================================
 This module decides; it never renders
@@ -70,17 +73,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+# [FORK] Digital-Union (C3-R1A): the pure cancellation/outcome contract (stdlib-only fork module).
+from beatsync_fork.render_worker import RenderOutcomeKind
+
 # ---------------------------------------------------------------------------
 # Selection contract
 # ---------------------------------------------------------------------------
 
 #: C3-R0 renders **exactly** two. Not a range with equal ends by accident — the number is the whole
-#: safety argument. With no cancellation, a batch is an unbreakable commitment, and two is the
-#: smallest commitment that delivers the thing C3's comparison was for: an A/B you can watch.
+#: safety argument. Cancellation since C3-R1A makes a batch interruptible at safe boundaries, but
+#: never instant, and two is still the smallest commitment that delivers the thing C3's comparison
+#: was for: an A/B you can watch.
 #:
 #: Deliberately unrelated to ``variant_batch.CANDIDATE_COUNT_MAX`` (12). That bound is comparison
-#: legibility and costs about a millisecond; this one is render minutes you cannot interrupt. Do not
-#: let the two numbers learn about each other.
+#: legibility and costs about a millisecond; this one is render minutes, still bounded to two even
+#: with cancellation available. Do not let the two numbers learn about each other.
 RENDER_SELECTION_SIZE = 2
 
 
@@ -239,13 +246,20 @@ def build_request(batch: Any, selection: Any, user_base: str, request_tag: str):
 
 @dataclass(frozen=True)
 class RenderCandidateOutcome:
-    """What one candidate actually produced. Deepcopy-safe; strings and ints only.
+    """What one candidate actually produced. Deepcopy-safe; strings, ints and one enum only.
 
     **`durable_output_path` is the success authority**, not the preview and not the status prose.
     That distinction is load-bearing for ProRes, where the durable artifact is the ``.mov`` moved
     into `output/` while the path handed back for display is a session-temp ``_preview.mp4``: a
     preview step that fails afterwards must not retroactively turn a finished render into a
     failure.
+
+    [FORK] Digital-Union (C3-R1A): ``outcome_kind`` carries the typed cause. ``success`` is kept for
+    compatibility and must always agree with it (``SUCCESS`` iff ``success`` is ``True``) --
+    enforced in ``__post_init__`` rather than left to drift. A caller that omits ``outcome_kind``
+    (every call site that predates this field) gets a conservative derivation: ``SUCCESS`` when
+    ``success`` is ``True``, ``UNKNOWN_FATAL`` otherwise -- never a more specific class, because an
+    omitted outcome_kind has proven nothing about which specific cause applied.
     """
 
     candidate_index: int
@@ -257,11 +271,32 @@ class RenderCandidateOutcome:
     status_text: str = ""
     audio_layers_report: str = ""
     smart_mix_report: str = ""
+    outcome_kind: "RenderOutcomeKind | None" = None
+
+    def __post_init__(self) -> None:
+        if self.outcome_kind is None:
+            object.__setattr__(
+                self, "outcome_kind",
+                RenderOutcomeKind.SUCCESS if self.success else RenderOutcomeKind.UNKNOWN_FATAL)
+            return
+        agrees = (self.outcome_kind is RenderOutcomeKind.SUCCESS) == bool(self.success)
+        if not agrees:
+            raise ValueError(
+                f"success={self.success!r} disagrees with outcome_kind={self.outcome_kind!r}")
+
+    @property
+    def cancelled(self) -> bool:
+        return self.outcome_kind is RenderOutcomeKind.CANCELLED
 
     def report_lines(self) -> list:
+        if self.cancelled:
+            label = "CANCELLED"
+        elif self.success:
+            label = "SUCCESS"
+        else:
+            label = "FAILED"
         head = (f"Candidate {self.candidate_index + 1} · master {self.candidate_master_seed} · "
-                f"Variation Seed {self.variation_seed} · "
-                f"{'SUCCESS' if self.success else 'FAILED'}")
+                f"Variation Seed {self.variation_seed} · {label}")
         lines = [head]
         if self.success and self.durable_output_path:
             lines.append(f"    output: {self.durable_output_path}")

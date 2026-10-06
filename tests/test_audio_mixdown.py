@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import types
 import wave
 from typing import Any
@@ -30,6 +31,7 @@ from typing import Any
 import pytest
 
 from beatsync_fork import audio_mix as fork_audio_mix
+from beatsync_fork import render_worker as fork_render_worker
 from beatsync_fork import smart_mix as fork_smart_mix
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +80,14 @@ def load_mixdown(subprocess_module=None, uuid_module=None):
         "fork_audio_mix": fork_audio_mix,
         "fork_smart_mix": fork_smart_mix,
         "dataclasses": dataclasses,
+        # [C3-R1A] `_run`'s cancellable branch needs a clock and the typed exception, and
+        # `build_mixed_master` names `RenderCancelled` in an except clause. Both were *accidentally*
+        # unnecessary before — Python only resolves an except expression when something propagates to
+        # it, and no case here reached the lifecycle path — so this harness would have raised
+        # `NameError` the moment one did. That contradicts this file's own claim that the extraction
+        # list is the contract, so the namespace is completed rather than left to luck.
+        "time": time,
+        "RenderCancelled": fork_render_worker.RenderCancelled,
         "__name__": "audio_mixdown_under_test",
     }
     exec(compile(ast.Module(body=wanted, type_ignores=[]), _MIXDOWN, "exec"), namespace)

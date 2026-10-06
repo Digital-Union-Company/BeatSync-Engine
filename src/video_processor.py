@@ -47,6 +47,9 @@ from ffmpeg_processing import (
     seconds_to_frame_count,
     frame_count_to_seconds,
 )
+# [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module).
+from beatsync_fork.render_worker import RenderCancelled
+
 from auto_mode.stage6_av_planner import (
     build_planned_clip_sequence,
     creative_profile,
@@ -305,17 +308,30 @@ def create_clip_parallel(args):
 
     Auto Mode usually passes a planned source moment. If visual planning is not
     available, this worker samples forward source content as a fallback.
+
+    [FORK] Digital-Union (C3-R1A): an optional ``lifecycle`` may ride as a 10th positional element,
+    absent for every existing caller -- the plain 8- and 9-element forms are unchanged. When
+    present, it is only ever read (``raise_if_cancelled()``), never stored, and the same shared
+    instance is handed to every clip worker in one batch.
     """
     clip_started = time.perf_counter()
     planned_clip = None
-    if len(args) >= 9:
+    lifecycle = None
+    if len(args) >= 10:
+        (i, video_file, final_duration, target_size,
+         use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, lifecycle) = args
+    elif len(args) >= 9:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps, planned_clip) = args
     else:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps) = args
-    
+
     try:
+        # [FORK] Digital-Union (C3-R1A): a pending future that has not yet begun expensive work
+        # (duration probe + extraction) must not begin it once cancellation is already requested.
+        if lifecycle is not None:
+            lifecycle.raise_if_cancelled()
         if planned_clip:
             video_file = planned_clip.get('video_file') or video_file
             video_duration = get_video_duration(video_file)
@@ -350,6 +366,7 @@ def create_clip_parallel(args):
             'target_size': target_size,
             'use_nvenc': use_nvenc,
             'gpu_encoder': gpu_encoder,
+            'lifecycle': lifecycle,
         }
 
         # [FORK] Digital-Union (Phase 3B): same extraction, but a failure now carries the bounded
@@ -365,7 +382,12 @@ def create_clip_parallel(args):
             return (i, None, target_size, None, detail, elapsed)
         
         return (i, temp_clip_path, target_size, temp_clip_path, None, elapsed)
-        
+
+    except RenderCancelled:
+        # [FORK] Digital-Union (C3-R1A): never collapse a typed cancellation into an ordinary
+        # (success=False, reason) failure tuple -- it must propagate out of this worker unchanged,
+        # before the generic handler below would otherwise stringify it.
+        raise
     except Exception as e:
         elapsed = time.perf_counter() - clip_started
         return (i, None, target_size, None, str(e), elapsed)
@@ -376,18 +398,25 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       start_time: float = 0.0, end_time: float = None,
                       max_workers: int = None,
                       beat_info: dict = None,
-                      lossless_mode: bool = False, use_gpu: bool = False, 
+                      lossless_mode: bool = False, use_gpu: bool = False,
                       gpu_encoder: str = 'h264_nvenc', fps: float = None,
-                      event_callback=None) -> str:
+                      event_callback=None, lifecycle=None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
-    
+
     **PURE FFMPEG IMPLEMENTATION - FRAME-ACCURATE**
-    
+
     ✅ NO BATCH PROCESSING: FFmpeg handles memory independently
     ✅ FRAME-ACCURATE: Uses exact frame counts for zero drift
     ✅ NO CUMULATIVE ERROR: Each segment is precisely timed
-    
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` is an optional
+    ``beatsync_fork.render_worker.RenderLifecycle``, defaulting to ``None`` -- every existing caller
+    (the headless CLI included) is unaffected. When supplied it reaches the ProRes conversion loop,
+    ordinary clip extraction (all workers share the same instance) and final assembly; see the
+    quiescence proof around the ``ThreadPoolExecutor`` block below for why no child can outlive this
+    function returning or raising.
+
     Args:
         audio_file: Path to audio file
         video_files: List of video file paths
@@ -407,6 +436,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     """
     if len(beat_times) == 0:
         raise ValueError("No beats were detected. Cannot create video.")
+
+    # [FORK] Digital-Union (C3-R1A): the safe boundary before Stage 6 extraction begins.
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
 
     video_creation_started = time.perf_counter()
 
@@ -581,8 +614,11 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             6, f"ProRes conversion started ({len(video_files)} source(s))",
             phase="prores_convert"))
         for idx, video_file in enumerate(video_files, 1):
+            if lifecycle is not None:
+                lifecycle.raise_if_cancelled()
             print(f"Converting {idx}/{len(video_files)}...")
-            prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps)
+            prores_file = convert_to_prores_proxy(video_file, prores_dir, prores_fps,
+                                                  lifecycle=lifecycle)
             prores_files.append(prores_file)
             prores_map[os.path.abspath(video_file)] = prores_file
             fork_progress.emit(event_callback, convert_counter.advance(
@@ -609,6 +645,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             phase="prores_extract"))
         
         for i, exact_duration in enumerate(segment_durations):
+            if lifecycle is not None:
+                lifecycle.raise_if_cancelled()
             # Duration comes from the absolute frame-locked timeline.
             frame_count = int(segment_frames[i])
             planned_clip = planned_clip_sequence[i] if planned_clip_sequence else None
@@ -625,7 +663,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             # Extract segment
             segment_file = extract_prores_segment_random(
                 prores_file, exact_duration, prores_fps, segments_dir, i,
-                start_time=segment_start
+                start_time=segment_start, lifecycle=lifecycle
             )
             segment_files.append(segment_file)
             fork_progress.emit(event_callback, extract_counter.advance(
@@ -643,6 +681,9 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         
         fork_progress.emit(event_callback, fork_progress.state(
             6, "Final assembly started", phase="assembly"))
+        # [FORK] Digital-Union (C3-R1A): the safe boundary before final assembly begins.
+        if lifecycle is not None:
+            lifecycle.raise_if_cancelled()
         try:
             concatenate_videos_ffmpeg(
                 video_files=segment_files,
@@ -651,8 +692,16 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 start_time=start_time,
                 end_time=end_time,
                 use_nvenc=False,  # ProRes uses stream copy
-                temp_dir=session_temp_dir
+                temp_dir=session_temp_dir,
+                lifecycle=lifecycle
             )
+        except RenderCancelled:
+            # [FORK] Digital-Union (C3-R1A): a cancellation is not an assembly failure. The generic
+            # handler below re-raises with a bare `raise`, so the TYPE already survived it — but it
+            # would first emit a Stage 6 `error` event saying "Final assembly failed", and the
+            # progress contract is that an event describes what actually happened. Re-raise with no
+            # event: the cancellation's own reporting happens at the GUI boundary.
+            raise
         except Exception as exc:
             fork_progress.emit(event_callback, fork_progress.error(
                 6, f"Final assembly failed: {_short_error(exc)}", phase="assembly"))
@@ -733,7 +782,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             video_file = planned_clip.get('video_file') if planned_clip else random.choice(video_files)
             clip_args.append((i, video_file, final_duration,
                             target_size, use_nvenc, gpu_encoder, session_temp_dir, fps,
-                            planned_clip))
+                            planned_clip, lifecycle))
         
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []
@@ -746,12 +795,18 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         clip_failures: List[str] = []
         
         # Process all clips in parallel
+        # [FORK] Digital-Union (C3-R1A): cancelled_exc is set (and only set) inside the loop below
+        # when a worker observes the shared lifecycle token, and re-raised AFTER the `with` block
+        # has fully exited -- never inside it -- so the executor's own `shutdown(wait=True)` (both
+        # the explicit call below and its implicit one on exit) has already reaped every submitted
+        # future, running or pending, before cancellation ever leaves this function.
+        cancelled_exc = None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
-                executor.submit(create_clip_parallel, args): idx 
+                executor.submit(create_clip_parallel, args): idx
                 for idx, args in enumerate(clip_args)
             }
-            
+
             completed = 0
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
@@ -800,6 +855,19 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                                 f"[{_fmt_seconds(elapsed)}, {rate:.2f} clips/s]"
                             )
                     
+                except RenderCancelled as exc:
+                    # [FORK] Digital-Union (C3-R1A): never collapse into an ordinary clip-worker
+                    # error and never `continue` consuming further futures. Every other
+                    # already-running worker shares this same lifecycle instance and is
+                    # independently racing to notice it and terminate its own live FFmpeg child;
+                    # cancel_futures=True additionally stops any not-yet-started future from ever
+                    # beginning expensive work. wait=True blocks until that is ALL true -- the
+                    # explicit call here and the `with` block's own implicit shutdown on exit are
+                    # both safe, idempotent calls to the same stdlib primitive.
+                    print("⏹️  Clip extraction cancelled; waiting for active FFmpeg children to stop...")
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    cancelled_exc = exc
+                    break
                 except Exception as e:
                     print(f"⚠️  Warning: Error processing clip: {str(e)}")
                     clip_failures.append(_short_error(e))
@@ -808,7 +876,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                         failed_clips=len(clip_failures),
                     ))
                     continue
-        
+
+        if cancelled_exc is not None:
+            # Raised only after the `with` block above has fully exited, so the executor (and
+            # every FFmpeg child it owned) is already quiescent -- never while any child or
+            # pending future could still be alive.
+            raise cancelled_exc
+
         clip_stage_seconds = time.perf_counter() - clip_stage_started
         _summarize_clip_timings(clip_timings, clip_stage_seconds)
         # The final state is always published, even if throttling suppressed the last advance.
@@ -843,6 +917,9 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         assembly_started = time.perf_counter()
         fork_progress.emit(event_callback, fork_progress.state(
             6, "Final assembly started", phase="assembly"))
+        # [FORK] Digital-Union (C3-R1A): the safe boundary before final assembly begins.
+        if lifecycle is not None:
+            lifecycle.raise_if_cancelled()
         try:
             concatenate_videos_ffmpeg(
                 video_files=clip_files,
@@ -853,8 +930,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 use_nvenc=use_nvenc,
                 gpu_encoder=gpu_encoder,
                 fps=fps,
-                temp_dir=session_temp_dir
+                temp_dir=session_temp_dir,
+                lifecycle=lifecycle
             )
+        except RenderCancelled:
+            # [FORK] Digital-Union (C3-R1A): same as the ProRes assembly above — a cancellation must
+            # not be reported as "Final assembly failed". Re-raised untouched and un-narrated.
+            raise
         except Exception as exc:
             fork_progress.emit(event_callback, fork_progress.error(
                 6, f"Final assembly failed: {_short_error(exc)}", phase="assembly"))
