@@ -31,6 +31,8 @@ from gpu_cpu_utils import MAX_THREADS
 
 # [FORK] Digital-Union (Phase 3B): bounded FFmpeg failure summaries (stdlib-only fork module).
 from beatsync_fork import ffmpeg_diagnostics as fork_diagnostics
+# [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module).
+from beatsync_fork.render_worker import RenderCancelled
 
 # Initialize environment
 setup_environment()
@@ -43,16 +45,92 @@ NVENC_QUALITY_CQ = '1'
 NVENC_LOOKAHEAD = '32'
 NVENC_AQ_STRENGTH = '12'
 
+#: Poll interval while a cancellable command runs, and the bounded grace given to a terminated
+#: child before escalating to a kill. Short enough that Cancel-to-quiescent stays in the
+#: measured ~tens-of-milliseconds class for a single ffmpeg.exe child; long enough that it does
+#: not become a busy loop.
+_CANCEL_POLL_SECONDS = 0.15
+_TERMINATE_GRACE_SECONDS = 5.0
 
-def _run_media_command(cmd: List[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    """Run an FFmpeg/FFprobe command with consistent capture settings."""
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+
+def _run_media_command(cmd: List[str], timeout: int,
+                       lifecycle=None) -> subprocess.CompletedProcess[str]:
+    """Run an FFmpeg/FFprobe command with consistent capture settings.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` is optional and defaults to ``None``, which is
+    every existing caller today -- that path is byte-for-byte the original blocking
+    ``subprocess.run(..., timeout=timeout)`` call, unchanged.
+
+    When a :class:`~beatsync_fork.render_worker.RenderLifecycle` is supplied, the child is polled
+    cooperatively: ``Popen.communicate(timeout=...)`` is the stdlib's own documented safe-to-retry
+    pattern for exactly this (it accumulates output across repeated calls rather than losing any).
+    On a matching cancellation request the child is terminated, given a bounded grace, escalated to
+    a kill only if still alive, and reaped -- ``RenderCancelled`` is raised only once that reap has
+    actually completed, never while the child may still be alive. A real command timeout (the
+    ``timeout`` argument, measured independently of the poll interval) still raises
+    ``subprocess.TimeoutExpired`` exactly as before; a timeout is never reported as cancellation.
+    """
+    if lifecycle is None:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    started = time.perf_counter()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=_CANCEL_POLL_SECONDS)
+                return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if lifecycle.cancel_requested():
+                    proc.terminate()
+                    try:
+                        proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    # The process is now provably reaped (communicate() returned), so quiescence
+                    # is proven before this raises -- never while the child may still be alive.
+                    raise RenderCancelled(
+                        f"ffmpeg command cancelled: {os.path.basename(cmd[0]) if cmd else ''}")
+                if time.perf_counter() - started > timeout:
+                    proc.kill()
+                    proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+    finally:
+        # Defensive only: every return/raise above already reaps the child first. This exists so
+        # an unforeseen exception inside the loop can never leave a live orphan behind it.
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+            except Exception:
+                pass
+
+
+def run_cancellable_media_command(cmd: List[str], timeout: int,
+                                  lifecycle=None) -> subprocess.CompletedProcess[str]:
+    """[FORK] Digital-Union (C3-R1A / R2): the one public entry point to the runner above.
+
+    A deliberately thin, reviewed alias rather than a second implementation. `gui.py`'s ProRes
+    preview is the only caller outside this module, and it needs exactly the behaviour
+    `_run_media_command` already has: ``lifecycle=None`` is the original blocking
+    ``subprocess.run(..., timeout=timeout)``, and a supplied lifecycle polls cancellation,
+    terminates, graces, kills if necessary and **reaps** the child before ``RenderCancelled``
+    escapes. A genuine command timeout still raises ``subprocess.TimeoutExpired``.
+
+    It exists so that `gui.py` does not reach across a module boundary for a private name, and so
+    that this module stays the single owner of media-subprocess execution: duplicating the poll /
+    terminate / grace / kill / reap logic in the GUI is exactly the kind of second process-handling
+    path that eventually diverges. The child handle still belongs entirely to the call frame
+    `_run_media_command` creates it in — nothing is stored at module scope here or anywhere else.
+    """
+    return _run_media_command(cmd, timeout, lifecycle=lifecycle)
 
 
 def _safe_remove_file(path: str | None) -> None:
@@ -238,11 +316,15 @@ def frame_count_to_seconds(frames: int, fps: float) -> float:
     return frames / fps
 
 
-def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None) -> str:
+def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None,
+                            lifecycle=None) -> str:
     """
     Convert video to ProRes 422 Proxy for lossless editing.
     All frames are I-frames (keyframes) for frame-accurate cutting.
     STRIPS AUDIO - we'll add the music track at the end.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour); see
+    ``_run_media_command``.
     """
     filename = os.path.basename(video_file)
     name, _ = os.path.splitext(filename)
@@ -277,15 +359,19 @@ def convert_to_prores_proxy(video_file: str, output_dir: str, fps: float = None)
     ]
     
     try:
-        result = _run_media_command(cmd, timeout=600)  # 10 minute timeout
-        
+        result = _run_media_command(cmd, timeout=600, lifecycle=lifecycle)  # 10 minute timeout
+
         if result.returncode != 0:
             print(f"   ⚠️  FFmpeg error: {result.stderr}")
             raise Exception(f"ProRes conversion failed for {filename}")
-        
+
         print(f"   ✓ ProRes conversion complete: {name}_prores.mov (video only, no audio)")
         return output_file
-        
+
+    except RenderCancelled:
+        # [FORK] Digital-Union (C3-R1A): must escape unchanged -- the two except clauses below
+        # would otherwise re-wrap it as a plain Exception and destroy its type.
+        raise
     except subprocess.TimeoutExpired:
         raise Exception(f"ProRes conversion timeout for {filename}")
     except Exception as e:
@@ -317,13 +403,19 @@ def extract_clip_segment_ffmpeg(video_file: str, start_time: float, duration: fl
 def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, duration: float,
                                          output_file: str, fps: float,
                                          target_size: Tuple[int, int], use_nvenc: bool,
-                                         gpu_encoder: str = 'h264_nvenc') -> Tuple[bool, str]:
+                                         gpu_encoder: str = 'h264_nvenc',
+                                         lifecycle=None) -> Tuple[bool, str]:
     """[FORK] Digital-Union (Phase 3B): the same extraction, plus a bounded failure reason.
 
     Returns ``(success, reason)`` where ``reason`` is ``""`` on success. The FFmpeg command, the
     frame-accurate arithmetic, the encoder arguments and the success/failure conditions are all
     identical to the boolean version — the only addition is that a failure now carries the short
     explanation FFmpeg already printed, so Stage 6 can show it instead of a generic string.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` is optional and defaults to ``None`` -- absent, the
+    FFmpeg call below is the original blocking call, byte-identical to today. A matching
+    cancellation raises :class:`~beatsync_fork.render_worker.RenderCancelled`, which this function's
+    own ``except Exception`` must never collapse into an ordinary ``(False, reason)`` failure tuple.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
@@ -393,7 +485,7 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
             output_file
         ])
         
-        result = _run_media_command(cmd, timeout=120)
+        result = _run_media_command(cmd, timeout=120, lifecycle=lifecycle)
 
         if result.returncode != 0:
             print(f"   ⚠️  FFmpeg error: {result.stderr}")
@@ -410,6 +502,11 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
 
         return True, ""
 
+    except RenderCancelled:
+        # [FORK] Digital-Union (C3-R1A): never collapse a typed cancellation into an ordinary
+        # (False, reason) clip-failure tuple -- the caller's except-order depends on this escaping
+        # unchanged, before the generic handler below ever sees it.
+        raise
     except Exception as e:
         print(f"   ⚠️  Error extracting clip: {e}")
         return False, fork_diagnostics.describe_exception(e)
@@ -417,7 +514,7 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
 
 def extract_prores_segment_random(video_file: str, duration: float, fps: float,
                                   temp_dir: str, segment_index: int,
-                                  start_time: float = None) -> str:
+                                  start_time: float = None, lifecycle=None) -> str:
     """
     Extract a segment from a ProRes proxy with frame-perfect precision.
 
@@ -487,7 +584,7 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
         ('safe accurate seek retry', False, 360),
     ]:
         _safe_remove_file(output_file)
-        result = _run_media_command(build_cmd(fast_seek), timeout=timeout)
+        result = _run_media_command(build_cmd(fast_seek), timeout=timeout, lifecycle=lifecycle)
         if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
             return output_file
         last_error = _short_ffmpeg_error(result.stderr)
@@ -495,15 +592,20 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
 
     raise Exception(f"ProRes segment extraction error: {last_error}")
 
-def concatenate_videos_ffmpeg(video_files: List[str], output_file: str, 
+def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
                               gpu_encoder: str = 'h264_nvenc', fps: float = 30.0,
-                              temp_dir: str = None) -> str:
+                              temp_dir: str = None, lifecycle=None) -> str:
     """
     Concatenate video files using FFmpeg concat demuxer.
-    
+
     ✅ FRAME-ACCURATE: Maintains precise timing through concatenation
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour) and is
+    threaded to every ``_run_media_command`` call below. This function's own ``finally`` only
+    cleans up temp files -- it has no ``except Exception``, so a ``RenderCancelled`` raised from any
+    branch already propagates unchanged; nothing here may add a catch that would swallow it.
     """
     if temp_dir is None:
         temp_dir = os.path.dirname(output_file)
@@ -536,7 +638,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 temp_video
             ]
             
-            result = _run_media_command(cmd, timeout=300)
+            result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
             
             if result.returncode != 0:
                 raise Exception(f"Concatenation failed: {result.stderr}")
@@ -562,7 +664,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     temp_audio
                 ])
                 
-                result = _run_media_command(audio_cmd, timeout=120)
+                result = _run_media_command(audio_cmd, timeout=120, lifecycle=lifecycle)
                 
                 if result.returncode != 0:
                     raise Exception(f"Audio extraction failed: {result.stderr}")
@@ -582,7 +684,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     output_file
                 ]
                 
-                result = _run_media_command(cmd, timeout=300)
+                result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
                 
                 if result.returncode != 0:
                     raise Exception(f"Audio merging failed: {result.stderr}")
@@ -630,7 +732,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
                 cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
 
-                result = _run_media_command(cmd, timeout=300)
+                result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
                 if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                     print(f"   ✓ Fast concat-copy complete in {_fmt_seconds(time.perf_counter() - copy_started)}")
                     return output_file
@@ -678,7 +780,7 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 output_file
             ])
             
-            result = _run_media_command(cmd, timeout=600)
+            result = _run_media_command(cmd, timeout=600, lifecycle=lifecycle)
             
             if result.returncode != 0:
                 raise Exception(f"Encoding failed: {result.stderr}")

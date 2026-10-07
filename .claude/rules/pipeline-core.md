@@ -113,6 +113,21 @@ per-session to "allow" parallel renders — the NVENC clip-extraction cap
 (`_effective_clip_workers`) exists because one hardware encoder is already saturated by a single
 render, so parallelism would buy nothing it did not also cost.
 
+**C3-R1A is the one thing that did reach the pipeline files**, and only for cancellation
+observation: `video_processor.py`, `ffmpeg_processing.py`, `audio_mixdown.py` and
+`auto_mode/__init__.py` each gained an optional trailing `lifecycle=None`. **`lifecycle is None` is
+byte-for-byte today's behaviour on every path** — `_run_media_command` and `audio_mixdown._run` fall
+straight through to the original blocking `subprocess.run(..., timeout=timeout)`, and no boundary
+check fires — so the headless CLI and every existing caller are unaffected. What changes when one is
+supplied: the two media runners poll their own child and terminate → grace → kill → **reap** before
+raising `RenderCancelled`; `create_music_video`'s clip executor is shut down with
+`shutdown(wait=True, cancel_futures=True)` and the exception re-raised only after the `with` block
+exits, so no FFmpeg child outlives the call; and `analyze_beats_auto` checks at four boundaries, one
+of them deliberately **after** the Stage-5 `try/except` so a cancellation cannot be reinterpreted as
+"video analysis failed". `video_analysis.py` and `stage5_qwen_scene_worker.py` are **untouched by
+contract** — an in-flight Qwen call is never hard-killed. Full contract:
+`.claude/rules/variant-lab.md` (C3-R1A).
+
 **C3-R0 changed no pipeline file.** It renders two candidates by calling the existing path twice,
 sequentially; `video_processor.py`, `ffmpeg_processing.py`, `video_analysis.py` and
 `src/auto_mode/*` are untouched, and no stage cache was invented. Stages 1–3 and a warm Stage-5

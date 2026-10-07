@@ -617,7 +617,8 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                        console_callback: Callable[[int, str], None] | None = None,
                        event_callback: Callable[[object], None] | None = None,
                        creative: Dict | None = None,
-                       freestyle: object | None = None) -> Tuple[np.ndarray, Dict]:
+                       freestyle: object | None = None,
+                       lifecycle=None) -> Tuple[np.ndarray, Dict]:
     """
     Build a cleaner Auto Mode cut plan.
 
@@ -625,7 +626,18 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     - small waves: longer holds, mainly phrase/bar anchors;
     - medium waves: cuts every 2-4 beats;
     - big waves: tighter 1-2 beat rhythm, but only on strong musical impacts.
+
+    [FORK] Digital-Union (C3-R1A): ``lifecycle`` is an optional
+    ``beatsync_fork.render_worker.RenderLifecycle``, defaulting to ``None`` -- every existing caller,
+    headless CLI included, is unaffected. Checked only at safe boundaries (before Stage 1, after the
+    reusable Stage 1-3 region, before Stage 5, and immediately after Stage 5 returns) -- never
+    inside Stage 1-3/5's own work, and never passed into ``video_analysis.py``. The post-Stage-5
+    check sits OUTSIDE the existing broad Stage-5 ``except Exception`` below on purpose: a
+    cancellation must never be read as "video analysis failed" and continue toward fallback
+    sampling.
     """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     cfg = CONFIG
 
     # [FORK] Digital-Union (Creative Controls Core): the whole Creative Profile is resolved ONCE
@@ -772,6 +784,10 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
             sections=sections,
         ))
 
+    # [FORK] Digital-Union (C3-R1A): the safe boundary after the reusable Stage 1-3 region, before
+    # Stage 4 begins.
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     _notify_progress(progress_callback, 4)
     _emit(event_callback, fork_progress.start(4, "Selecting rhythmic cuts"))
     _stage_started = time.perf_counter()
@@ -904,6 +920,13 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     should_analyze_video = bool(
         cfg.enable_video_analysis and enable_video_analysis and video_files
     )
+    # [FORK] Digital-Union (C3-R1A): the safe boundary before Stage 5 begins -- a cancellation
+    # requested earlier must prevent Stage 5 (and any Qwen work it might launch) from ever
+    # starting. Deliberately OUTSIDE the try/except below, and video_analysis.py never receives
+    # this token: BOUNDARY_ONLY_CANCEL means an already-running Stage-5 call always runs to its
+    # own natural completion.
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
     if should_analyze_video:
         try:
             _notify_progress(progress_callback, 5)
@@ -932,6 +955,13 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                 5, f"Video analysis failed; renderer will use fallback sampling: {e}"
             ))
             _emit(event_callback, fork_progress.end(5, "Video analysis unavailable"))
+
+    # [FORK] Digital-Union (C3-R1A): the safe boundary immediately AFTER Stage 5 returns --
+    # outside and after the try/except above, so this can NEVER be caught by it and read as an
+    # ordinary Stage-5 failure. A cancellation requested while Stage 5 was running (and therefore
+    # not observed above) becomes effective here, before Stage 6 ever sees a plan.
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
 
     energy_profile = {
         "beat_energy": features["energy"],

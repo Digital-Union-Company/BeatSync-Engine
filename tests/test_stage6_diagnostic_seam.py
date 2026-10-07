@@ -84,9 +84,11 @@ def test_detailed_function_returns_success_and_reason(ffmpeg_tree):
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
 
     assert ast.unparse(fn.returns) == "Tuple[bool, str]"
+    # [C3-R1A] `lifecycle` was appended LAST with a default, so no existing positional argument
+    # moved and the `(bool, str)` return contract is untouched. Pinned as an exact list, in order.
     assert [a.arg for a in fn.args.args] == [
         "video_file", "start_time", "duration", "output_file", "fps",
-        "target_size", "use_nvenc", "gpu_encoder"]
+        "target_size", "use_nvenc", "gpu_encoder", "lifecycle"]
     returns = {ast.unparse(n.value) for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value}
     # Every exit carries a reason, and success carries an empty one.
     assert "(True, '')" in returns
@@ -136,13 +138,36 @@ def test_missing_and_empty_output_use_the_dedicated_describer(ffmpeg_tree):
 
 
 def test_exception_path_produces_a_bounded_reason_and_cannot_escape(ffmpeg_tree):
+    """**Amended by C3-R1A**, and the amendment is the point rather than an exception to it.
+
+    Phase 3B's property is unchanged: an ordinary extraction error stays a *failed clip* — bounded
+    reason, `(False, reason)`, never an escape. R1A adds exactly one thing that must escape, and it
+    is not an error: a `RenderCancelled`. Collapsing that into `(False, reason)` would report a
+    user's Stop as "1 of 1216 clips failed" and let the consumer loop `continue` extracting.
+
+    So the guard is now stated per handler instead of over all of them: the broad handler must still
+    never re-raise, and the typed one must do nothing else.
+    """
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
 
     handlers = [n for n in ast.walk(fn) if isinstance(n, ast.ExceptHandler)]
     assert handlers, "the broad except must remain"
     assert len(_calls(fn, "describe_exception")) == 1
-    # A failed clip stays a failed clip; the handler must not re-raise.
-    assert not any(isinstance(n, ast.Raise) for h in handlers for n in ast.walk(h))
+
+    broad = [h for h in handlers
+             if h.type is None or ast.unparse(h.type) in ("Exception", "BaseException")]
+    assert broad, "the broad except must remain"
+    for handler in broad:
+        assert not any(isinstance(n, ast.Raise) for n in ast.walk(handler)), \
+            "a failed clip must stay a failed clip"
+
+    typed = [h for h in handlers
+             if h.type is not None and ast.unparse(h.type) == "RenderCancelled"]
+    assert len(typed) == 1, "exactly one typed cancellation handler"
+    assert ast.unparse(typed[0]).strip().endswith("raise"), \
+        "the cancellation handler must re-raise and do nothing else"
+    # ...and it is positioned FIRST, or the broad handler would reach it first and swallow it
+    assert handlers.index(typed[0]) < min(handlers.index(h) for h in broad)
 
 
 def test_full_stderr_still_reaches_the_console_unchanged(ffmpeg_tree):
@@ -191,8 +216,16 @@ def test_the_failure_tuple_carries_the_reason(processor_tree):
     assert "reason" in assigns[0]
 
 
-def test_the_extract_kwargs_bundle_is_unchanged(processor_tree):
-    """Any change here would change the FFmpeg command, which this phase must not do."""
+def test_the_extract_kwargs_bundle_carries_only_the_command_plus_the_cancellation_token(
+        processor_tree):
+    """**Amended by C3-R1A.** The eight command-shaping keys are frozen, in order.
+
+    Phase 3B's reason for pinning this list stands: any change to those eight would change the
+    FFmpeg command, and the diagnostics work was explicitly not allowed to. R1A appends exactly one
+    key, and it is deliberately **not** command-shaping — `lifecycle` reaches
+    `_run_media_command`'s poll loop and never the argv. Pinned by exact list and position so a
+    ninth *command* key cannot arrive disguised as a token.
+    """
     fn = _func(processor_tree, "create_clip_parallel")
 
     bundles = [n for n in ast.walk(fn)
@@ -201,7 +234,10 @@ def test_the_extract_kwargs_bundle_is_unchanged(processor_tree):
     assert len(bundles) == 1
     keys = [k.value for k in bundles[0].value.keys if isinstance(k, ast.Constant)]
     assert keys == ["video_file", "start_time", "duration", "output_file", "fps",
-                    "target_size", "use_nvenc", "gpu_encoder"]
+                   "target_size", "use_nvenc", "gpu_encoder", "lifecycle"]
+    assert keys[:8] == ["video_file", "start_time", "duration", "output_file", "fps",
+                        "target_size", "use_nvenc", "gpu_encoder"], \
+        "the command-shaping keys must keep their exact identity and order"
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +288,11 @@ def test_the_frame_arithmetic_filters_and_encoder_selection_are_untouched(ffmpeg
     assert "get_cpu_h264_quality_args(include_pix_fmt=True)" in source
     # frame-accurate output flags
     assert "'-vframes'" in source and "'-fps_mode', 'cfr'" in source
-    assert "_run_media_command(cmd, timeout=120)" in source
+    # [C3-R1A] the command and its timeout are byte-identical; only the cancellation token was
+    # threaded alongside. With `lifecycle=None` — every pre-R1A caller — the runner falls straight
+    # through to the original blocking `subprocess.run`, which `tests/test_render_cancellation.py`
+    # pins structurally.
+    assert "_run_media_command(cmd, timeout=120, lifecycle=lifecycle)" in source
 
 
 def test_nvenc_extraction_does_not_request_cuda_input_decoding(ffmpeg_tree):

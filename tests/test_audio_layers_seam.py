@@ -25,6 +25,7 @@ import os
 import pytest
 
 from beatsync_fork import audio_mix as fork_audio_mix
+from beatsync_fork import render_worker as fork_render_worker
 from beatsync_fork import smart_mix as fork_smart_mix
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -611,9 +612,16 @@ def _audio_region_statements() -> list:
     return picked
 
 
+#: [C3-R1A] `lifecycle` joins the list because the extracted region now *reads* that name — it is
+#: threaded into `build_mixed_master`. The cases below all pass `None`, which is deliberate: these
+#: tests are about the Audio Layers report's lifecycle, and `None` is the path every pre-R1A caller
+#: takes, so they keep asserting unchanged behaviour rather than quietly starting to test
+#: cancellation. The cancellation behaviour of this same region is covered in
+#: `tests/test_render_cancellation.py`.
 _AUDIO_BLOCK_ARGS = ("voice_files", "session_state", "local_audio_path", "beat_info", "beat_times",
                      "audio_mix", "session_dir", "console_logger", "audio_mixdown",
-                     "fork_audio_mix", "AUDIO_LAYERS_REPORT_KEY", "smart_mix")
+                     "fork_audio_mix", "AUDIO_LAYERS_REPORT_KEY", "smart_mix", "lifecycle",
+                     "RENDER_OUTCOME_KEY", "RenderOutcomeKind")
 
 
 def _compile_audio_block():
@@ -678,6 +686,12 @@ def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None):
         audio_mixdown=FakeMixdown,
         fork_audio_mix=fork_audio_mix,
         AUDIO_LAYERS_REPORT_KEY="audio_layers_report",
+        lifecycle=None,
+        # [C3-R1A] the REAL enum: an Audio Layers failure is the one cause R1A can prove is
+        # candidate-local, and the region records it on the typed outcome key. A stub enum here
+        # would let that classification drift without this harness noticing.
+        RENDER_OUTCOME_KEY="render_outcome_kind",
+        RenderOutcomeKind=fork_render_worker.RenderOutcomeKind,
         # A real normalised config, exactly as `_process_video_impl` resolves before this region.
         # Smart Mix is still inactive for these cases — no root is given, so `sfx_placements` stays
         # `()` and the mixdown guard behaves exactly as D's did. This harness proves the *voice*
@@ -754,25 +768,31 @@ def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():
 
 
 def test_a_refused_render_yields_a_blank_report():
-    """The gate's own refusal is a yield, so it has to carry the fourth value itself."""
+    """The gate's own refusal is a yield, so it has to carry the report values itself.
+
+    6 since C3-R1A: video, status, state, Audio Layers report, Smart Mix report, invocation id. The
+    property this test exists for is untouched — a refused render must blank **both** reports rather
+    than leave the previous attempt's text on screen — and the two report slots are still pinned by
+    index, so the appended element cannot shift what they mean.
+    """
     refusal = next(node for node in ast.walk(func(GATE_CORE))
                    if isinstance(node, ast.If)
                    and ast.unparse(node.test) == "not decision.allowed")
     yielded = next(n for n in ast.walk(refusal) if isinstance(n, ast.Yield))
     assert isinstance(yielded.value, ast.Tuple)
-    # 5 since Smart Mix V1 / E: video, status, state, Audio Layers report, Smart Mix report
-    assert len(yielded.value.elts) == 5, ast.unparse(yielded)
+    assert len(yielded.value.elts) == 6, ast.unparse(yielded)
     for index in (3, 4):
         assert isinstance(yielded.value.elts[index], ast.Constant)
         assert yielded.value.elts[index].value == ""
 
 
-def test_the_guard_projects_the_three_value_stream_onto_five_outputs():
+def test_the_guard_projects_the_three_value_stream_onto_six_outputs():
     """`process_video` keeps its 3-value contract; only the outermost handler projects.
 
-    **Amended by Smart Mix V1 / E**: the projection gained the Smart Mix read-out. The invariant
-    the test exists for is untouched and is the stronger half — the *inner* generator's streaming
-    contract did not change, so the worker thread still carries nothing but `session_state`.
+    **Amended by Smart Mix V1 / E**: the projection gained the Smart Mix read-out. **Amended again
+    by C3-R1A**: it gained the control-plane invocation id. The invariant the test exists for is
+    untouched both times, and is the stronger half — the *inner* generator's streaming contract did
+    not change, so the worker thread still carries nothing but `session_state`.
     """
     guarded = body_source(GATE_CORE)
     # **C3-R0 R1**: the stream is owned so it can be closed deterministically — the worker
@@ -781,8 +801,8 @@ def test_the_guard_projects_the_three_value_stream_onto_five_outputs():
     assert "for video, status, state in render_stream:" in guarded
     assert "render_stream.close()" in guarded
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
-            "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in guarded
-    # the inner generator's 3-value contract is unchanged; only the outer handler is 5-valued
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id)") in guarded
+    # the inner generator's 3-value contract is unchanged; only the outer handler is 6-valued
     assert ast.unparse(func("process_video").returns) == "Iterator[StatusResult]"
     assert ast.unparse(func("process_video_guarded").returns) == "Iterator[GuardedResult]"
 
@@ -823,8 +843,10 @@ def test_the_report_is_an_output_only_and_never_a_render_input():
     assert "audio_layers_report" not in names_in(kwargs["inputs"])
     assert "smart_mix_report" not in names_in(kwargs["inputs"])
     outputs = names_in(kwargs["outputs"])
+    # [C3-R1A] `render_invocation_state` appended LAST — a control-plane string, not a read-out. The
+    # two report panels keep their positions and `process_btn.click` is still their only writer.
     assert outputs == ["video_output", "status_output", "session_state",
-                       "audio_layers_report", "smart_mix_report"]
+                       "audio_layers_report", "smart_mix_report", "render_invocation_state"]
 
 
 def test_the_report_is_absent_from_the_live_source_declaration():

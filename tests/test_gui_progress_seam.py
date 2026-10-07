@@ -358,14 +358,33 @@ def test_the_batch_never_blanks_a_preview_on_a_status_only_yield():
 
 
 def test_the_inner_render_stream_is_unchanged():
-    """`process_video` keeps its 3-value contract and the core keeps the 5-value projection."""
+    """`process_video` keeps its 3-value contract; the core's projection gained one control-plane id.
+
+    **Amended by C3-R1A**, and the amendment is deliberately the *smallest* one available. The
+    property this guard exists for is that the batch wraps a stream it does not reshape:
+    `process_video` still yields exactly `(video, status, state)` — unchanged — and the core still
+    projects it positionally with the two report keys read off `state`, never recomputed.
+
+    R1A appends exactly one element, `invocation_id`, and it is a **plain string** rather than a
+    live object: `gr.State` deep-copies and may serialize what it holds, so a `RenderLifecycle`, a
+    `threading.Event` or a `Lock` must never cross this boundary. That is asserted here as part of
+    the yield's shape, because this is the line where the value is produced.
+    """
     source = open(_GUI_PATH, encoding="utf-8").read()
     assert source.count("def process_video(") == 1
     core = _gui_body("_process_video_guarded_unlocked")
     assert "render_stream = process_video(" in core
-    assert "for video, status, state in render_stream:" in core
+    assert "for video, status, state in render_stream:" in core, \
+        "process_video's 3-value contract must be untouched"
     assert ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
-            "(state or {}).get(SMART_MIX_REPORT_KEY, ''))") in core
+            "(state or {}).get(SMART_MIX_REPORT_KEY, ''), invocation_id)") in core
+
+    # The id is derived once, as a string, and nothing live is ever yielded in its place.
+    assert "invocation_id = lifecycle.invocation_id if lifecycle is not None else ''" in core
+    for live in ("yield (video, status, state, (state or {}).get(AUDIO_LAYERS_REPORT_KEY, ''), "
+                 "(state or {}).get(SMART_MIX_REPORT_KEY, ''), lifecycle)",
+                 "lifecycle._cancel_event", "lifecycle._state_lock"):
+        assert live not in core, f"a live object crosses the Gradio boundary: {live}"
 
 
 # ===========================================================================
@@ -418,9 +437,25 @@ class _RenderHarness:
             def __getattr__(self, _name):
                 return lambda *_a, **_k: None
 
+        # [C3-R1A] The REAL cancellation contract, not stubs: `beatsync_fork.render_worker` is
+        # stdlib-only and imports cleanly on a bare interpreter, so the extracted gui.py bodies run
+        # against the genuine `RenderLifecycle`, the genuine transition table and the genuine
+        # exception type. Stubbing any of them here would let this harness pass while the real
+        # lifecycle contract drifted underneath it.
+        import beatsync_fork.render_worker as _render_worker
+
         return {
             "threading": threading, "queue": queue, "contextlib": __import__("contextlib"),
-            "sys": __import__("sys"), "os": os, "time": _time,
+            "sys": __import__("sys"), "os": os, "time": _time, "uuid": __import__("uuid"),
+            "RenderCancelled": _render_worker.RenderCancelled,
+            "RenderLifecycle": _render_worker.RenderLifecycle,
+            "RenderLifecycleState": _render_worker.RenderLifecycleState,
+            "RenderOutcomeKind": _render_worker.RenderOutcomeKind,
+            "RENDER_OUTCOME_KEY": "render_outcome_kind",
+            # the real capacity-one active-render slot's own lock and (initially empty) slot; the
+            # three slot helpers are extracted from gui.py by the tests that need them
+            "_ACTIVE_RENDER_SLOT_LOCK": threading.Lock(),
+            "_active_render_slot": None,
             "ProgressEvent": ProgressEvent, "ProgressView": ProgressView,
             "EventKind": _EventKind, "_fmt_stage_seconds": lambda v: f"{v:.1f}s",
             "QuietConsole": _Quiet, "StageConsoleLogger": _Logger,
@@ -496,6 +531,8 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
     lock = threading.Lock()
     ns = harness.extract(
         "process_video", "_process_video_guarded_unlocked", "process_video_guarded",
+        # [C3-R1A] the real slot helpers, so the wrapper installs into and clears a genuine slot
+        "_install_active_render", "_clear_active_render", "_request_cancel_if_matching",
         extra={
             "_RENDER_LOCK": lock,
             "RENDER_BUSY_MESSAGE": "busy",
@@ -520,6 +557,16 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
         "Local folder", "folder", False, None, "o.mp4", "cpu", None,
         0, 50, 50, 50, 50, 50, 50, {}, object())
     try:
+        # [C3-R1A] the wrapper now publishes its invocation id BEFORE the gate and before any
+        # pipeline work — a Cancel click needs an id on screen before there is anything to cancel.
+        # So the first yield is control-plane only, and no render work may have begun yet.
+        published = next(gen)
+        assert isinstance(published[-1], str) and published[-1], \
+            "the first yield must publish a non-empty invocation id"
+        assert not harness.started.is_set(), \
+            "render work began before the invocation id was published"
+        assert lock.locked(), "the mutex is taken before the id yield, not after"
+
         next(gen)                                        # drives through the gate into the render
         assert harness.started.wait(5), "the worker never started"
         assert lock.locked(), "the wrapper must hold the mutex while rendering"
@@ -563,6 +610,8 @@ def test_closing_the_batch_mid_candidate_waits_for_that_candidate_worker():
     ns = harness.extract(
         "process_video", "_process_video_guarded_unlocked",
         "_render_batch_request_tag", "render_selected_variants_guarded",
+        # [C3-R1A] the real slot helpers, as above
+        "_install_active_render", "_clear_active_render", "_request_cancel_if_matching",
         extra={
             "_RENDER_LOCK": lock,
             "RENDER_BUSY_MESSAGE": "busy",
@@ -589,6 +638,12 @@ def test_closing_the_batch_mid_candidate_waits_for_that_candidate_worker():
         batch, [0, 2], "a.wav", None, 2.0, 1.0, True, "", [],
         "Local folder", "folder", False, None, "o.mp4", "cpu", None, {}, object())
     try:
+        # [C3-R1A] same as the single-render wrapper: the batch publishes ONE invocation id for the
+        # whole batch before the first candidate starts.
+        published = next(gen)
+        assert isinstance(published[-1], str) and published[-1]
+        assert not harness.started.is_set(), "candidate 1 began before the id was published"
+
         next(gen)
         assert harness.started.wait(5), "candidate 1's worker never started"
         assert lock.locked()
@@ -615,9 +670,14 @@ def test_process_video_owns_a_finalizer_that_joins_its_worker():
     joiner = next((t for t in tries if "thread.join()" in ast.unparse(t.finalbody)), None)
     assert joiner is not None, "the finalizer must join the worker thread"
 
-    # the finalizer must not try to kill or time out the worker — C3-R0 has no cancellation
+    # The finalizer must not try to kill or time out the worker. **Still true under C3-R1A**, and
+    # now load-bearing for a second reason: abandonment is NOT the same thing as an explicit Cancel.
+    # A dropped stream must keep waiting for the render in flight exactly as it always did —
+    # cancellation only makes the worker *reach* its terminal state sooner, by setting a flag the
+    # worker reads at safe boundaries. A finalizer that cancelled on abandonment would silently
+    # convert every closed Gradio event into a Stop the user never pressed.
     final = ast.unparse(joiner.finalbody)
-    for forbidden in ("terminate(", "kill(", "timeout=", "cancel", "Event("):
+    for forbidden in ("terminate(", "kill(", "timeout=", "cancel", "Event(", "request_cancel"):
         assert forbidden not in final, f"the finalizer {forbidden}"
 
     # every yield after thread.start() is inside that try. Compared by line number against the

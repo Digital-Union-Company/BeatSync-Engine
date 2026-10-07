@@ -136,6 +136,13 @@ These apply in almost every session. Each has a scoped rule with the full contra
 - **Creative state is a render request, never source or media identity.** The seven resolved controls
   ride on `beat_info["creative"]`; changing one re-plans and never re-analyses. →
   `.claude/rules/creative-controls.md`
+- **Cancellation is boundary-only (C3-R1A).** Exactly one `RenderLifecycle` per top-level render
+  event — one Create Music Video click, or the **whole** two-candidate batch. FFmpeg-class children
+  are terminated *and reaped* before `RenderCancelled` propagates; an in-flight Stage-5/Qwen call is
+  never hard-killed. `RenderCancelled` is an ordinary `Exception`, so every broad `except Exception`
+  on the render path must name it **before** the generic handler. Abandoning a stream is **not** a
+  Cancel, only a plain string enters `gr.State`, and the durable promotion is the one SUCCESS commit
+  point. → `.claude/rules/variant-lab.md` (C3-R1A), `.claude/rules/pipeline-core.md`
 - **Progress is structured, not printed.** In GUI runs stdout/stderr go to a discarded `QuietConsole`,
   so a plain `print()` inside the pipeline is invisible in the UI — emit a `ProgressEvent`. Never
   touch a Gradio component from a worker thread, and never invent an ETA. →

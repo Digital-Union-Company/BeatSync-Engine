@@ -737,8 +737,9 @@ PLACEHOLDER_VARIANT_BATCH_STATUS = (
 # ============================================================================
 # [FORK] Digital-Union: C3-R0 — render exactly two compared candidates
 # See src/beatsync_fork/render_batch.py. This copy has two jobs: make clear that rendering is a
-# real, uninterruptible commitment of two renders, and make clear that it uses the *stored*
-# candidate settings rather than whatever the Variant Lab controls happen to say now.
+# real commitment of up to two renders (C3-R1A added a Cancel button, see below — it is NOT
+# instant), and make clear that it uses the *stored* candidate settings rather than whatever the
+# Variant Lab controls happen to say now.
 # ============================================================================
 
 LABEL_RENDER_CANDIDATES = "🎬 Candidates to render"
@@ -761,12 +762,39 @@ INFO_RENDER_SELECTED = (
     "rendered. Everything that is *not* a candidate setting — your audio, voice clips, SFX "
     "folder, source videos, output name, encoder and FPS — is taken as it stands the moment you "
     "press the button, and later edits do not affect the batch already running.\n\n"
-    "There is **no Stop button in this version**, so treat it as a commitment to two renders. If "
-    "the first one fails the second is not attempted; if the second fails the first video is "
-    "still yours. Each file is named for its candidate, so neither can overwrite the other or "
-    "anything already in your output folder. The comparison list is not used up — you can still "
-    "apply a candidate, or render the same pair again."
+    "**Cancel Active Render** can stop this batch, but not instantly: video encoding stops within "
+    "moments, while an in-progress AI scene-analysis step is never interrupted mid-call and finishes "
+    "naturally first. Either way, cancelling stops at the next safe point — whatever candidate has "
+    "already durably rendered is kept, and the remaining candidate is never attempted. If the first "
+    "candidate fails (rather than being cancelled) the second is not attempted either; if the second "
+    "fails the first video is still yours. Each file is named for its candidate, so neither can "
+    "overwrite the other or anything already in your output folder. The comparison list is not used "
+    "up — you can still apply a candidate, or render the same pair again."
 )
+
+LABEL_CANCEL_RENDER = "⏹️ Cancel Active Render"
+INFO_CANCEL_RENDER = (
+    "Stops whichever render is currently running — Create Music Video or Render Selected "
+    "Variants. **Not instant.** Video encoding (clip extraction, assembly, audio mixdown) stops "
+    "within moments. An in-progress AI scene-analysis step is never interrupted mid-call — it is "
+    "never force-killed — and the render stops only once that call returns naturally. A candidate "
+    "already durably rendered before you pressed Cancel is kept; nothing already written to your "
+    "output folder is deleted. Pressing this with no render running does nothing."
+)
+STATUS_CANCEL_REQUESTED = (
+    "⏹️ Cancel requested — stopping at the next safe point. This is not instant: an in-progress "
+    "AI scene-analysis step finishes naturally first; video encoding stops within moments."
+)
+STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
+
+#: The status one cancelled render attempt reports. Deliberately **neutral about candidates**: the
+#: pipeline function that emits it (`gui._process_video_impl`) is shared by an ordinary Create Music
+#: Video click, which has no candidates at all, and by one candidate of a C3 batch. Naming a
+#: candidate here would be wrong for the single render — and would also make a render-path function
+#: reference Variant Lab's vocabulary, which `tests/test_variant_lab.py` forbids on purpose, because
+#: that is how batch state would start leaking toward the renderer. The batch wrapper adds its own
+#: "Rendering candidate N / 2" prefix above this line, which is where that context belongs.
+STATUS_RENDER_CANCELLED = "⏹️ Cancelled. Nothing was rendered."
 
 INFO_VARIANT_APPLY = (
     "**Apply Selected Variant** writes that candidate's Variation Seed, six sliders and three "

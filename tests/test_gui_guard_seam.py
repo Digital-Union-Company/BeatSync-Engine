@@ -678,25 +678,46 @@ def test_the_batch_reads_candidate_values_from_recipes_not_from_the_screen():
         assert field in body, f"{field} is not read from the candidate"
 
 
-def test_the_batch_renders_nothing_of_its_own_and_adds_no_cancellation():
+def test_the_batch_renders_nothing_and_implements_no_cancellation_of_its_own():
+    """**Amended by C3-R1A**, and widened rather than relaxed.
+
+    The batch still renders nothing itself — it reaches the pipeline only through the shared gate
+    core. R1A makes it *cancellable*, which it expresses solely by holding one `RenderLifecycle` and
+    reading it; it must still implement no cancellation mechanism. So `cancels` (Gradio's built-in,
+    which would kill the event and orphan the daemon worker), a raw `threading.Event`, a stop flag
+    and `terminate(`/`kill(` all stay banned, and `Popen`/`signal` are added — the batch wrapper is
+    not where a process gets stopped.
+    """
     body = _gui_body("render_selected_variants_guarded")
     for forbidden in ("create_music_video", "analyze_beats_auto", "_process_video_impl(",
-                      "cancels", "threading.Event", "stop_flag", "terminate("):
+                      "cancels", "threading.Event", "threading.Lock", "stop_flag",
+                      "terminate(", "kill(", "Popen", "signal.", "os.kill"):
         assert forbidden not in body, f"the batch references {forbidden}"
+    # It holds and reads a lifecycle; it never builds a second one per candidate.
+    assert body.count("RenderLifecycle(") == 1, "exactly one lifecycle for the whole batch"
 
 
-def test_the_batch_stops_on_the_first_failed_candidate():
-    """**§46-F.** Fail fast: the render boundary exposes no typed failure classification, so a
-    batch cannot tell a shared-input failure — which would simply repeat — from a candidate-local
-    one. A failure therefore stops the batch, and nothing already produced is deleted.
+def test_the_batch_stops_on_the_first_failed_or_cancelled_candidate():
+    """**§46-F, extended by C3-R1A.** Fail fast — and stop fast.
+
+    C3-R0's reasoning stands unchanged for *failures*: the render boundary exposes no typed
+    classification that could tell a shared-input failure (which would simply repeat) from a
+    candidate-local one, so a failure stops the batch and nothing already produced is deleted.
+    Continue-after-failure is still C3-R1B.
+
+    C3-R1A adds exactly one more way to stop, and the guard is widened by precisely that one:
+    a candidate that was CANCELLED also stops the batch. It is pinned as a **typed** cause read
+    from `RENDER_OUTCOME_KEY`, never inferred from `durable` or from the status prose — that
+    distinction is the whole point, because a cancelled candidate is *also* not durable, and
+    reporting it as an ordinary failure would tell a user who pressed Stop that their render broke.
     """
     node = _gui_func("render_selected_variants_guarded")
     loop = next(n for n in ast.walk(node) if isinstance(n, ast.For))
 
     failure = next(n for n in ast.walk(loop) if isinstance(n, ast.If)
-                   and ast.unparse(n.test) == "not durable")
+                   and ast.unparse(n.test) == "candidate_cancelled or not durable")
     rendered = ast.unparse(failure)
-    assert "break" in rendered, "a failed candidate must stop the batch"
+    assert "break" in rendered, "a failed or cancelled candidate must stop the batch"
     assert "stopped = True" in rendered, "and the outcome must say so"
 
     # success is decided by the durable file, never by the preview or the status prose
@@ -706,6 +727,14 @@ def test_the_batch_stops_on_the_first_failed_candidate():
     for forbidden in ("success=bool(last_video)", "success=bool(last_status)",
                       "'error' in last_status", "status.startswith"):
         assert forbidden not in body, f"success inferred from {forbidden}"
+
+    # [C3-R1A] the cancelled cause is typed, and read from the one key that carries it
+    assert ("candidate_cancelled = (session_state or {}).get(RENDER_OUTCOME_KEY) "
+            "is RenderOutcomeKind.CANCELLED") in body.replace("\n", "").replace("    ", ""), body
+    assert "outcome_kind=RenderOutcomeKind.CANCELLED if candidate_cancelled else None" in body
+    for inferred in ("'Cancelled' in last_status", "'⏹' in last_status",
+                     "last_status.startswith", "cancelled = not durable"):
+        assert inferred not in body, f"cancellation inferred from {inferred}"
 
     # nothing deletes an earlier candidate's output
     for destructive in ("os.remove(", "shutil.rmtree(", "os.unlink("):
@@ -1041,6 +1070,7 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
     """The real module globals `_process_video_impl` closes over, stubbed at the runtime edge."""
     import beatsync_fork.audio_mix as fork_audio_mix
     import beatsync_fork.creative as fork_creative
+    import beatsync_fork.render_worker as fork_render_worker
     import beatsync_fork.smart_mix as fork_smart_mix
 
     out_dir = str(tmp_path / "output")
@@ -1083,6 +1113,12 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
         "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
         "SMART_MIX_REPORT_KEY": "smart_mix_report",
         "LAST_OUTPUT_PATH_KEY": "last_output_path",
+        # [C3-R1A] The REAL cancellation contract, not a stub: `render_worker` is a stdlib-only fork
+        # module and imports cleanly on a bare interpreter, so the extracted body gets the genuine
+        # enum and the genuine exception type. A stub here would let `RENDER_OUTCOME_KEY` drift.
+        "RENDER_OUTCOME_KEY": "render_outcome_kind",
+        "RenderOutcomeKind": fork_render_worker.RenderOutcomeKind,
+        "RenderCancelled": fork_render_worker.RenderCancelled,
         "PARALLEL_WORKERS": 1, "CPU_COUNT": 1, "MAX_THREADS": 1,
         "GPU_AVAILABLE": False, "NVENC_AVAILABLE": False, "GPU_INFO": {"name": "cpu"},
         "USING_PORTABLE_PYTHON": False, "USING_PORTABLE_CUDA": False, "USING_CUPY_CTK": False,
@@ -1135,6 +1171,9 @@ def test_an_existing_output_is_refused_before_any_expensive_work(tmp_path):
     assert open(os.path.join(out_dir, produced[0]), "rb").read() == b"OLD", \
         "the user's existing output was replaced"
     assert state["last_output_path"] == "", "a refusal must not record a durable output"
+    # [C3-R1A] and it must not record a SUCCESS either. `None` is the conservative answer: this
+    # boundary proved an occupied destination, not which class of cause that belongs to.
+    assert state["render_outcome_kind"] is None
 
 
 def test_a_destination_that_appears_during_the_render_is_not_overwritten(tmp_path):
@@ -1155,6 +1194,9 @@ def test_a_destination_that_appears_during_the_render_is_not_overwritten(tmp_pat
     assert destination in status and os.path.join(session_dir, retained[0]) in status, \
         "the failure must name both the occupied destination and the retained render"
     assert state["last_output_path"] == ""
+    # [C3-R1A] a promotion failure is a proven fatal, classified conservatively — never SUCCESS.
+    import beatsync_fork.render_worker as _rw
+    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.UNKNOWN_FATAL
 
 
 def test_a_clean_promotion_moves_the_render_and_records_it(tmp_path):
@@ -1168,6 +1210,10 @@ def test_a_clean_promotion_moves_the_render_and_records_it(tmp_path):
     assert not [f for f in os.listdir(session_dir) if f.endswith(".mp4")], \
         "a successful promotion must consume the temp, not copy it"
     assert state["last_output_path"] == destination
+    # [C3-R1A] the durable promotion IS the success commit point, and it is the only producer of
+    # SUCCESS anywhere on the render path.
+    import beatsync_fork.render_worker as _rw
+    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.SUCCESS
     assert preview == destination
     assert status.startswith("✅")
     # the shipped filename contract, unchanged
@@ -1189,6 +1235,8 @@ def test_a_cross_volume_destination_fails_closed_without_copying(tmp_path):
         open(os.path.join(session_dir, retained[0]), "rb").read() == b"NEW"
     assert "volume" in status.lower()
     assert state["last_output_path"] == ""
+    import beatsync_fork.render_worker as _rw
+    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.UNKNOWN_FATAL
 
 
 def test_a_variation_seed_still_names_its_own_file(tmp_path):

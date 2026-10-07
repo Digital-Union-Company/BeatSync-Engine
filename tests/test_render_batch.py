@@ -4,8 +4,9 @@
 Four properties carry this feature and each has a section:
 
 1. **Exactly two, in canonical ascending index order.** The selection contract is the whole safety
-   story — with no cancellation, a batch is an unbreakable commitment, so it must be a commitment
-   the user explicitly and unambiguously made.
+   story — a batch costs render minutes, and C3-R1A's cancellation makes it interruptible at safe
+   boundaries but never instant, so it must still be a commitment the user explicitly and
+   unambiguously made.
 2. **Candidate identity cannot rest on the Variation Seed.** C3 deduplicates candidate *masters*
    and says nothing about `CreativeRecipe.seed`; collisions are real, and the existing render path
    names its output `_seed<VariationSeed>`.
@@ -24,6 +25,7 @@ import pytest
 
 from beatsync_fork import presets as fork_presets
 from beatsync_fork import render_batch as rb
+from beatsync_fork import render_worker as rw
 from beatsync_fork import variant_batch as fork_batch
 from beatsync_fork import variant_lab as fork_lab
 
@@ -374,16 +376,30 @@ def test_the_models_are_frozen():
             setattr(target, field, value)
 
 
-def test_the_module_imports_only_stdlib():
+def test_the_module_imports_only_stdlib_and_one_named_sibling_fork_module():
+    """**Amended by C3-R1A**, and deliberately pinned tighter rather than loosened.
+
+    The hard rule in CLAUDE.md is "no upstream runtime", not "no fork sibling": `render_batch` now
+    imports `RenderOutcomeKind` from `beatsync_fork.render_worker`, which is itself stdlib-only, so
+    the bare-interpreter property this guard protects is intact. Rather than widen the allowlist to
+    "any `beatsync_fork`", the exact fork module is named — a second, unreviewed fork dependency
+    appearing here would still fail, which is what the original one-line allowlist was for.
+    """
     with open(_MODULE, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
-    imported = set()
+    stdlib, fork = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.update(a.name.split(".")[0] for a in node.names)
+            for alias in node.names:
+                (fork if alias.name.startswith("beatsync_fork") else stdlib).add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    assert imported <= {"__future__", "collections", "dataclasses", "typing"}, sorted(imported)
+            if node.module.startswith("beatsync_fork"):
+                fork.add(node.module)
+            else:
+                stdlib.add(node.module)
+    assert {m.split(".")[0] for m in stdlib} <= {
+        "__future__", "collections", "dataclasses", "typing"}, sorted(stdlib)
+    assert fork == {"beatsync_fork.render_worker"}, sorted(fork)
 
 
 def test_the_module_reaches_no_runtime_and_renders_nothing():
@@ -403,11 +419,246 @@ def test_the_module_reaches_no_runtime_and_renders_nothing():
         assert not _re.search(rf"(import|from)\s+{forbidden}", source), forbidden
 
 
-def test_no_cancellation_machinery_exists():
-    """C3-R0 ships no Stop control; a fake one would be worse than none."""
+def test_this_module_owns_no_cancellation_machinery():
+    """**Amended by C3-R1A.** It *records* a cancellation; it must never *perform* one.
+
+    C3-R0's version banned the word "cancel" outright, because C3-R0 shipped no Stop control at all
+    and a fake one would have been worse than none. R1A makes a batch genuinely cancellable, so the
+    typed cause now legitimately appears here — `outcome_kind`, `.cancelled`, the `CANCELLED` report
+    label. What has NOT changed is the division of labour this module exists to enforce: it decides
+    and reports, `gui.py` performs every side effect. So every piece of actual cancellation
+    *machinery* stays banned, and the list is widened rather than shortened — a `threading.Event`,
+    a `terminate`/`kill`, a signal or a `Popen` appearing here would mean the pure decision layer
+    had grown a runtime.
+    """
     source = _executable_source(_MODULE).lower()
-    for forbidden in ("cancel", "stop_flag", "stop_event", "threading", "terminate", "abort"):
-        assert forbidden not in source, f"render_batch references {forbidden!r}"
+    for forbidden in ("stop_flag", "stop_event", "threading", "terminate", "abort",
+                      "kill", "signal", "popen", "event(", "lock(", "is_set", "wait("):
+        assert forbidden not in source, f"render_batch performs cancellation: {forbidden!r}"
+
+    # And the cancellation surface it *does* own is exactly the typed one, nothing more.
+    assert "renderoutcomekind.cancelled" in source, \
+        "the typed cancelled cause is how this module may speak about cancellation"
+    assert not hasattr(rb, "request_cancel"), "render_batch must expose no cancel entry point"
+    assert "request_cancel" not in source
+
+
+# ---------------------------------------------------------------------------
+# C3-R1A: the typed outcome rides alongside `success` and must never disagree with it
+# ---------------------------------------------------------------------------
+
+
+def _typed(success=True, kind=None, path="C:/out/a.mp4"):
+    return rb.RenderCandidateOutcome(
+        candidate_index=0, candidate_master_seed=1, variation_seed=2,
+        durable_output_path=(path if success else ""),
+        success=success, status_text="s", outcome_kind=kind)
+
+
+def test_an_omitted_outcome_kind_is_derived_conservatively():
+    """Every call site predating C3-R1A omits it, and must not be guessed into a specific cause."""
+    assert _typed(success=True).outcome_kind is rw.RenderOutcomeKind.SUCCESS
+    assert _typed(success=False).outcome_kind is rw.RenderOutcomeKind.UNKNOWN_FATAL
+    # never a more specific class than "we do not know"
+    assert _typed(success=False).outcome_kind is not rw.RenderOutcomeKind.CANDIDATE_LOCAL
+    assert _typed(success=False).outcome_kind is not rw.RenderOutcomeKind.CANCELLED
+
+
+def test_a_supplied_outcome_kind_must_agree_with_success():
+    """The two fields are one truth. Drift between them is how a cancelled render reads as done."""
+    for kind in (rw.RenderOutcomeKind.CANCELLED, rw.RenderOutcomeKind.CANDIDATE_LOCAL,
+                 rw.RenderOutcomeKind.SHARED_FATAL, rw.RenderOutcomeKind.UNKNOWN_FATAL):
+        assert _typed(success=False, kind=kind).outcome_kind is kind
+        with pytest.raises(ValueError):
+            _typed(success=True, kind=kind)
+    assert _typed(success=True, kind=rw.RenderOutcomeKind.SUCCESS).success
+    with pytest.raises(ValueError):
+        _typed(success=False, kind=rw.RenderOutcomeKind.SUCCESS)
+
+
+def test_a_cancelled_candidate_reports_cancelled_not_failed():
+    """A user who pressed Stop must not be told their render failed."""
+    cancelled = _typed(success=False, kind=rw.RenderOutcomeKind.CANCELLED)
+    assert cancelled.cancelled is True
+    head = cancelled.report_lines()[0]
+    assert "CANCELLED" in head
+    assert "FAILED" not in head and "SUCCESS" not in head
+
+    failed = _typed(success=False)
+    assert failed.cancelled is False
+    assert "FAILED" in failed.report_lines()[0]
+
+    done = _typed(success=True)
+    assert done.cancelled is False
+    assert "SUCCESS" in done.report_lines()[0]
+
+
+# ---------------------------------------------------------------------------
+# C3-R1A / R2: the BATCH-level terminal cause, and the boundary case it exists for
+# ---------------------------------------------------------------------------
+
+
+def _batch_outcome(*outcomes, requested=2, stopped=False, kind=None):
+    return rb.RenderBatchOutcome(requested_count=requested, outcomes=tuple(outcomes),
+                                 stopped_on_failure=stopped, outcome_kind=kind)
+
+
+def _success(index, durable="C:/out/a.mov"):
+    return rb.RenderCandidateOutcome(
+        candidate_index=index, candidate_master_seed=100 + index, variation_seed=200 + index,
+        success=True, durable_output_path=durable, preview_path=durable, status_text="✅ done")
+
+
+def _cancelled_candidate(index):
+    return rb.RenderCandidateOutcome(
+        candidate_index=index, candidate_master_seed=100 + index, variation_seed=200 + index,
+        success=False, status_text="⏹️ Cancelled. Nothing was rendered.",
+        outcome_kind=rw.RenderOutcomeKind.CANCELLED)
+
+
+def _failed_candidate(index, reason="FFmpeg extraction failed"):
+    return rb.RenderCandidateOutcome(
+        candidate_index=index, candidate_master_seed=100 + index, variation_seed=200 + index,
+        success=False, status_text=reason)
+
+
+def test_a_cancellation_between_candidates_reports_the_batch_as_cancelled():
+    """**The R2 defect-A case, behaviourally.** Candidate 1 succeeded; the BATCH was cancelled.
+
+    This is the one shape that cannot be expressed at candidate level: candidate 1 really did
+    succeed, candidate 2 was never attempted so no record of it exists, and the thing that was
+    cancelled is the top-level render event. R1A reported it as
+    ``1 / 2 succeeded; stopped on candidate 1`` — false twice over, since candidate 1 neither failed
+    nor stopped anything.
+    """
+    outcome = _batch_outcome(_success(0), stopped=True, kind=rw.RenderOutcomeKind.CANCELLED)
+
+    assert outcome.succeeded == 1
+    assert outcome.attempted == 1
+    assert outcome.not_attempted == 1
+    assert outcome.cancelled is True
+
+    # candidate 1 is untouched and still a success; no candidate 2 record was fabricated
+    assert len(outcome.outcomes) == 1, "a fake candidate-2 attempt was invented"
+    assert outcome.outcomes[0].success is True
+    assert outcome.outcomes[0].outcome_kind is rw.RenderOutcomeKind.SUCCESS
+    assert outcome.outcomes[0].cancelled is False
+
+    headline = outcome.headline()
+    assert "cancelled" in headline.lower(), headline
+    assert "1 / 2 succeeded" in headline
+    assert "batch cancelled before candidate 2" in headline, headline
+    # and it must not blame candidate 1 for anything
+    assert "stopped on candidate 1" not in headline, headline
+    assert "failed" not in headline.lower(), headline
+
+    summary = outcome.summary_text()
+    assert "SUCCESS" in summary
+    assert "Batch CANCELLED." in summary
+    assert "1 candidate not attempted." in summary, summary
+    assert "Earlier successful output was kept." in summary
+    assert "C:/out/a.mov" in summary, "the earlier durable output must still be named"
+    assert "FAILED" not in summary, summary
+    assert outcome.durable_paths() == ("C:/out/a.mov",)
+    assert outcome.latest_successful_preview() == "C:/out/a.mov"
+
+
+def test_a_cancellation_during_a_candidate_is_both_candidate_and_batch_cancelled():
+    """The other cancellation shape: that candidate carries CANCELLED **and** so does the batch."""
+    outcome = _batch_outcome(_success(0), _cancelled_candidate(1), stopped=True,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    assert outcome.cancelled is True
+    assert outcome.outcomes[1].cancelled is True
+    headline = outcome.headline()
+    assert "cancelled during candidate 2" in headline, headline
+    assert "stopped on candidate 2" not in headline, "a cancelled candidate is not a failure"
+    summary = outcome.summary_text()
+    assert "CANCELLED" in summary and "FAILED" not in summary
+    assert "Earlier successful output was kept." in summary
+
+
+def test_a_cancelled_candidate_alone_derives_the_batch_cause():
+    """The one sound derivation: a cancelled candidate proves the event was cancelled.
+
+    Stated or derived, the read-out must agree — so a caller that forgets the batch-level field in
+    the mid-candidate case still cannot report a cancellation as a failure.
+    """
+    derived = _batch_outcome(_cancelled_candidate(0), stopped=True)
+    assert derived.outcome_kind is rw.RenderOutcomeKind.CANCELLED
+    assert derived.cancelled is True
+    assert "cancelled during candidate 1" in derived.headline()
+    # the boundary case has no such candidate, which is exactly why gui.py must state it
+    unstated = _batch_outcome(_success(0), stopped=True)
+    assert unstated.outcome_kind is None
+    assert unstated.cancelled is False
+
+
+def test_a_genuine_failure_still_reads_exactly_as_it_did():
+    """R2 must not relabel ordinary failures. These are the pre-R2 strings, unchanged."""
+    first = _batch_outcome(_failed_candidate(0), stopped=True)
+    assert first.headline() == "0 / 2 succeeded; stopped on candidate 1"
+    assert "not attempted" in first.summary_text()
+    assert "Batch CANCELLED." not in first.summary_text()
+
+    second = _batch_outcome(_success(0), _failed_candidate(1, "no legal placement"), stopped=True)
+    assert second.headline() == "1 / 2 succeeded; stopped on candidate 2"
+    assert second.durable_paths() == ("C:/out/a.mov",)
+
+    clean = _batch_outcome(_success(0), _success(1, "C:/out/b.mov"))
+    assert clean.headline() == "2 / 2 succeeded"
+    assert clean.cancelled is False
+    assert "Batch CANCELLED." not in clean.summary_text()
+
+
+def test_a_failure_and_a_cancellation_together_report_both_truths():
+    """Rare, but neither fact may hide the other: the batch was cancelled AND a candidate failed."""
+    outcome = _batch_outcome(_failed_candidate(0), stopped=True,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    headline = outcome.headline()
+    assert "stopped on candidate 1" in headline
+    assert "batch cancelled" in headline
+    assert "Batch CANCELLED." in outcome.summary_text()
+    # nothing succeeded, so nothing is claimed to have been kept
+    assert "Earlier successful output was kept." not in outcome.summary_text()
+
+
+def test_stopped_with_nothing_failed_and_nothing_cancelled_invents_no_failure():
+    """The exact bug R2 fixed, isolated: `stopped_on_failure` with no failed candidate.
+
+    Pre-R2 this returned `stopped on candidate 1` by falling back to `attempted` when its
+    `next(... if not o.success)` search found nothing. If a future caller reaches this state, it must
+    still not name an innocent candidate.
+    """
+    outcome = _batch_outcome(_success(0), stopped=True)
+    headline = outcome.headline()
+    assert "stopped on candidate 1" not in headline, headline
+    assert headline == "1 / 2 succeeded; stopped after candidate 1"
+
+
+def test_the_batch_outcome_is_still_deepcopy_safe_with_the_batch_level_enum():
+    outcome = _batch_outcome(_success(0), stopped=True, kind=rw.RenderOutcomeKind.CANCELLED)
+    clone = copy.deepcopy(outcome)
+    assert clone == outcome
+    assert clone.outcome_kind is rw.RenderOutcomeKind.CANCELLED
+    assert clone.headline() == outcome.headline()
+    with pytest.raises(Exception):
+        outcome.outcome_kind = rw.RenderOutcomeKind.SUCCESS
+
+
+def test_not_attempted_never_goes_negative():
+    outcome = _batch_outcome(_success(0), _success(1), requested=1)
+    assert outcome.not_attempted == 0
+
+
+def test_the_outcome_record_is_still_deepcopy_safe_with_the_enum():
+    """It crosses a Gradio event boundary; an `Enum` member is the only non-scalar allowed."""
+    cancelled = _typed(success=False, kind=rw.RenderOutcomeKind.CANCELLED)
+    clone = copy.deepcopy(cancelled)
+    assert clone == cancelled
+    # Enum identity survives deepcopy, which is what makes `is` comparisons safe downstream.
+    assert clone.outcome_kind is rw.RenderOutcomeKind.CANCELLED
+    with pytest.raises(Exception):
+        cancelled.outcome_kind = rw.RenderOutcomeKind.SUCCESS
 
 
 def test_the_public_surface_is_explicit():
