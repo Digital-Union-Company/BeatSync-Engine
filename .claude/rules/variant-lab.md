@@ -330,6 +330,8 @@ microseconds. Those two do not belong in one feature, and the deferred milestone
 - **Count: min 2, max 12, default 5.** The cap is **comparison legibility and a typo guard**, not a
   resource bound — twelve candidates cost about a millisecond. **Do not reuse this number as a
   future batch-render limit**; generating and rendering differ by roughly six orders of magnitude.
+  (C3-R1B-b set the render cap independently at `RENDER_SELECTION_MAX = 4`, from measured render
+  wall-clock. The two numbers still do not know about each other.)
   Normalisation mirrors `_normalize_endpoint`: `bool` rejected first, whole floats accepted,
   fractional / `NaN` / `inf` / string → default, out of range clamped.
 - **GUI: six components** inside the *existing* Variant Lab accordion — a count `gr.Number`, a
@@ -359,27 +361,46 @@ microseconds. Those two do not belong in one feature, and the deferred milestone
   `analyze_beats_auto` or `create_music_video`. A rename cannot evade that the way a word list
   would.
 
-## Rendering exactly two compared candidates (C3-R0)
+## Rendering 2–4 compared candidates (C3-R0 → C3-R1B-b)
 
 C3 V1 let the user generate N candidates, compare them and apply one. The payoff of a comparison
 is watching the videos, and getting two meant two manual round-trips — with the batch consumed by
-the first Apply and the base moved out from under the rest. C3-R0 closes that loop:
+the first Apply and the base moved out from under the rest. C3-R0 closed that loop; **C3-R1B-b
+completed it, and C3-R1B is finished with that milestone.**
 
 ```
-generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
-                                                     candidate A, then candidate B
+generate N  ->  compare N  ->  tick 2 to 4  ->  Render Selected Variants
+                                                candidate A, then B, then C, then D
 ```
 
-- **Exactly two, sequential — cancellable since C3-R1A, and still exactly two.** C3-R0 shipped no
-  stop channel at all, for a real reason: a cancelled Gradio event could return its slot while the
-  daemon render worker was still alive, and the next render would wipe the live one's process-global
-  processing dir. Rather than ship a Stop button that could not stop FFmpeg, C3-R0 shipped none and
-  bounded the commitment to two renders. **C3-R1A added the explicit lifecycle that was missing** —
-  see the C3-R1A section below — so a batch is now interruptible at safe boundaries. The count did
-  **not** move with it: three or more, and continuing to the next candidate after a failure or a
-  cancellation, remain **C3-R1B**. `RENDER_SELECTION_SIZE = 2` is still deliberately unrelated to
+- **A bounded range of 2 to 4, sequential, cancellable, and it continues past a candidate-local
+  failure.** Each milestone bought the next, and the order matters:
+
+  ```
+  C3-R0      exactly 2, no stop channel at all -- a cancelled Gradio event could return its slot
+             while the daemon worker was still alive and the next render would wipe the live one's
+             process-global processing dir. Rather than ship a Stop that could not stop FFmpeg,
+             C3-R0 shipped none and bounded the commitment to two renders.
+  C3-R1A     the explicit shared lifecycle -- a batch becomes interruptible at safe boundaries.
+  C3-R1B-a   every failure cause truthfully typed, and deliberately NO policy change.
+  C3-R1B-b   the range, and the one continuation that classification earned.
+  ```
+
+- **MIN 2 / MAX 4 is a product contract, not a tunable.** Two is the floor because one candidate is
+  not a comparison (ordinary Create Music Video already covers that). Four is the ceiling because
+  past candidate 1 the cost is **linear with no economy of scale** — the only real shared saving,
+  the ~15.7 s of Stage 1-3, is already fully banked at candidate 2 by the L2 process cache, so every
+  later candidate costs the same again. C3-R1B/P0 measured ≈67 s for the first candidate and ≈51 s
+  for each subsequent one on the NVENC path at ~150 clips (materially more on the serial ProRes
+  path), which puts four in the same order as the single render a user already accepts. Do **not**
+  raise it, make it configurable, add an "advanced" override, or derive it from machine speed.
+  `RENDER_SELECTION_MIN` / `RENDER_SELECTION_MAX` are still deliberately unrelated to
   `CANDIDATE_COUNT_MAX = 12`: that bound is comparison legibility and costs a millisecond, this one
-  is render minutes — now stoppable, but never instant.
+  is render minutes — now stoppable, but never instant. The exact-size `RENDER_SELECTION_SIZE`
+  constant is **gone**, with no alias, and a test fails if it returns.
+- **An over-long selection is refused, never truncated.** Five ticks answers `()` rather than
+  rendering the first four — silently dropping a candidate the user explicitly chose would render
+  something they did not ask for, after they committed to the wait.
 - **A separate selector.** The Apply `gr.Radio` stays; rendering gets its own `gr.CheckboxGroup`,
   empty by default and never pre-filled. One control cannot honestly mean both "apply this one"
   and "render these two". Neither registers a handler; the selection is validated at click time.
@@ -434,23 +455,34 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
   (a gate refusal never reaches the pipeline function) and `_process_video_impl` clears it for
   itself, so "empty unless a promotion succeeded" is a local property rather than one inherited
   from whichever caller happened to run.
-- **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
-  Since **C3-R1B-a** the batch *can* tell a shared-input failure from a candidate-local one — every
-  reachable producer names its class and the loop records it — and it deliberately still does not
-  **act** on the distinction: continue-after-`CANDIDATE_LOCAL` waits for **C3-R1B-b**. The loop's
-  stop condition is `candidate_cancelled or not durable`, class-blind by design, and a test asserts
-  the loop contains no `continue` and no test against a specific failure class.
+- **Exactly one class continues; everything else stops. Prior success is never rolled back.**
+  This is the whole of C3-R1B-b's behavioural change, and the matrix is the contract:
 
-  C3-R1A added the *typed outcome model* this bullet used to be waiting for, and deliberately did
-  **not** spend it on continuing. `RenderCandidateOutcome.outcome_kind` carries a
-  `RenderOutcomeKind`, which is what makes a **cancelled** candidate reportable as cancelled rather
-  than as a failure — a user who pressed Stop must not be told their render broke.
+  ```
+  SUCCESS           -> render the next selected candidate
+  CANDIDATE_LOCAL   -> record the failure, then CONTINUE
+  SHARED_FATAL      -> STOP; remaining candidates NOT ATTEMPTED
+  UNKNOWN_FATAL     -> STOP; remaining candidates NOT ATTEMPTED
+  CANCELLED         -> STOP; remaining candidates NOT ATTEMPTED
+  ```
 
-  **C3-R1B-a then made the causes truthful, and still did not spend them on continuing.** Two
-  statements that used to live here are now false and are corrected below: `SHARED_FATAL` has real
-  producers, and the batch no longer discards the class. The full producer matrix is
-  `.claude/rules/render-worker.md`; the audio half is `.claude/rules/audio-mixdown.md`. What matters
-  here is the shape:
+  Three properties make it safe rather than merely implemented:
+
+  - **The decision is read off `candidate_outcome.outcome_kind`, never the raw `candidate_kind`
+    local.** A producer that classified nothing leaves `candidate_kind` as `None`, and only the
+    *model* decides what `None` means (`SUCCESS` with a durable path, `UNKNOWN_FATAL` without).
+    Branching on the raw value would let an unclassified failure continue as
+    "not `CANDIDATE_LOCAL`, therefore carry on".
+  - **The loop-head cancellation check still comes first in every iteration**, so a `continue`
+    cannot outrun a Stop. A Cancel arriving in the gap after a local failure leaves the remaining
+    candidates NOT ATTEMPTED — there is no lifecycle gap, because one lifecycle spans all 2–4.
+  - **Nothing is retried and nothing is reclassified.** A candidate is attempted at most once.
+
+  Tests pin both halves: measured execution call order through the real handler body for every
+  scenario, plus a structural guard that the loop contains **exactly one** `continue`, guarded by
+  exactly `CANDIDATE_LOCAL`, and branches on no other class.
+
+  The lineage of this bullet is worth keeping, because each step was deliberately *not* the next:
 
   ```
   R1A    every AudioMixError        -> CANDIDATE_LOCAL   (wrong for both reachable causes)
@@ -459,14 +491,26 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
          SHARED_FATAL               -> no producer at all
 
   R1B-a  every reachable producer names its class; SHARED_FATAL has five;
-         the batch loop threads the FULL class into RenderCandidateOutcome
-         -- and the batch STILL STOPS after every non-success candidate.
+         the batch threads the FULL class into RenderCandidateOutcome
+         -- and still stopped after every non-success candidate.
+
+  R1B-b  2..4 candidates, and CANDIDATE_LOCAL continues. C3-R1B is complete.
   ```
 
-  So the fail-fast behaviour above is unchanged and remains the contract. Continue-after-
-  `CANDIDATE_LOCAL`, rendering three or four candidates, and the selection range are **C3-R1B-b**,
-  separately authorized. `RENDER_SELECTION_SIZE` is still `2`, and a test fails if
-  `RENDER_SELECTION_MIN` / `_MAX` ever appear in `render_batch.py` before that milestone.
+  The full producer matrix is `.claude/rules/render-worker.md`; the audio half is
+  `.claude/rules/audio-mixdown.md`.
+- **"A candidate failed" and "the batch stopped" are now independent facts**, which reshaped the
+  outcome model. `RenderBatchOutcome.stopped_on_failure` is **gone** — a boolean meaning "something
+  failed, therefore we stopped" cannot be true once a local failure is continued past — and
+  `_failed_candidate()` became `_terminal_candidate()`, which names only the **last attempted**
+  candidate, only if it genuinely failed, and only when work was actually left unrun. A failure on
+  the *final* selected candidate stopped nothing, so it reads as a count. Early termination is read
+  from the typed batch cause plus `not_attempted`, never from the existence of any failure.
+- **A completed batch has `outcome_kind is None`, even carrying local failures.** It is deliberately
+  not batch-`CANDIDATE_LOCAL`: that cause belongs to the candidate that suffered it, and the batch
+  carried out its policy to the end. Only `CANCELLED`, `SHARED_FATAL` and `UNKNOWN_FATAL` are
+  batch-terminal causes, and `failed` / `cancelled_count` are single-source counts that never come
+  from status prose.
 - **Report ownership.** `audio_layers_report` and `smart_mix_report` keep `process_btn.click` as
   their **only** writer; the batch reads them from `session_state` after each candidate and the
   dedicated summary owns multi-render diagnostics. `variant_batch_table` and
@@ -549,7 +593,10 @@ render thread ───────────────────┴──
   downgrade it. A cancellation arriving during the ProRes **preview** step therefore stays a success:
   the preview is skipped (`preview_path` stays the durable output) and `RENDER_OUTCOME_KEY` is not
   touched. The user owns that `.mov`.
-- **No cache, schema or version constant changed**, and `RENDER_SELECTION_SIZE` is still 2.
+- **No cache, schema or version constant changed.** (The render count did move, in C3-R1B-b: the
+  selection is now a 2..4 range. Raising the number of candidates reaches no cache identity --
+  `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION` and `L2_CACHE_VERSION` are untouched, and a test
+  pins the cap alongside them for exactly that reason.)
 
 ## The boundary against Freestyle (Freestyle V1)
 

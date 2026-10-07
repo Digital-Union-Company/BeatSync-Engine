@@ -137,7 +137,7 @@ These apply in almost every session. Each has a scoped rule with the full contra
   ride on `beat_info["creative"]`; changing one re-plans and never re-analyses. →
   `.claude/rules/creative-controls.md`
 - **Cancellation is boundary-only (C3-R1A).** Exactly one `RenderLifecycle` per top-level render
-  event — one Create Music Video click, or the **whole** two-candidate batch. FFmpeg-class children
+  event — one Create Music Video click, or the **whole** 2–4-candidate batch. FFmpeg-class children
   are terminated *and reaped* before `RenderCancelled` propagates; an in-flight Stage-5/Qwen call is
   never hard-killed. `RenderCancelled` is an ordinary `Exception`, so every broad `except Exception`
   on the render path must name it **before** the generic handler. Abandoning a stream is **not** a

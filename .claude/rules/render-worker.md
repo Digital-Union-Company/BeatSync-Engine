@@ -157,18 +157,23 @@ abandoned stream into a Stop the user never pressed. `request_cancel` has exactl
 Cancel only makes the worker *reach* a terminal state sooner. It never changes *whether* the finalizer
 waits for it.
 
-## Truthful producers (C3-R1B-a), and what is still deferred
+## Truthful producers (C3-R1B-a) and the one continuation they bought (C3-R1B-b)
 
 ```
-RENDER_SELECTION_SIZE = 2        unchanged
-3+ candidates                    NOT IMPLEMENTED       <- C3-R1B-b
-continue-after-failure           NOT IMPLEMENTED       <- C3-R1B-b
-continue-after-cancellation      NOT IMPLEMENTED       (and not planned)
+RENDER_SELECTION_MIN = 2         C3-R1B-b
+RENDER_SELECTION_MAX = 4         C3-R1B-b -- frozen product contract, not a tunable
+continue-after-CANDIDATE_LOCAL   IMPLEMENTED (C3-R1B-b); it is the ONLY class that continues
+continue-after-cancellation      NOT IMPLEMENTED, and not planned
 ```
 
-**R1A left `SHARED_FATAL` with no producer. C3-R1B-a gave it real ones**, and that is the whole of
-that milestone — it changed **no** continuation policy. The batch still stops after every
-non-success candidate, including `CANDIDATE_LOCAL`.
+**C3-R1B is complete as of C3-R1B-b.** One lifecycle still spans the whole batch, however many
+candidates it holds -- that property needed no change, which is the clearest evidence the R1A
+design generalised. `render_worker.py` itself was **not modified** by either R1B milestone.
+
+**R1A left `SHARED_FATAL` with no producer. C3-R1B-a gave it real ones**, and that was the whole of
+that milestone — it changed **no** continuation policy. **C3-R1B-b then spent the classification on
+exactly one continuation**: `CANDIDATE_LOCAL` is recorded and the batch carries on; `SHARED_FATAL`,
+`UNKNOWN_FATAL` and `CANCELLED` stop it.
 
 ```
 SHARED_FATAL      the live source-gate refusal; the six primary audio/video selection failures;

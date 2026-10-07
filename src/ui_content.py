@@ -735,16 +735,19 @@ PLACEHOLDER_VARIANT_BATCH_STATUS = (
 )
 
 # ============================================================================
-# [FORK] Digital-Union: C3-R0 — render exactly two compared candidates
-# See src/beatsync_fork/render_batch.py. This copy has two jobs: make clear that rendering is a
-# real commitment of up to two renders (C3-R1A added a Cancel button, see below — it is NOT
-# instant), and make clear that it uses the *stored* candidate settings rather than whatever the
-# Variant Lab controls happen to say now.
+# [FORK] Digital-Union: C3-R0 → C3-R1B-b — render 2 to 4 compared candidates
+# See src/beatsync_fork/render_batch.py. This copy has three jobs: make clear that rendering is a
+# real commitment of up to FOUR renders (Cancel exists since C3-R1A, see below — it is NOT
+# instant); make clear that it uses the *stored* candidate settings rather than whatever the
+# Variant Lab controls happen to say now; and, since C3-R1B-b, explain in the user's own terms
+# which failures let the batch carry on and which stop it. Deliberately phrased as *what happens*
+# — a user does not need the words CANDIDATE_LOCAL or SHARED_FATAL to understand "specific to that
+# candidate" versus "affects every candidate".
 # ============================================================================
 
 LABEL_RENDER_CANDIDATES = "🎬 Candidates to render"
 INFO_RENDER_CANDIDATES = (
-    "Tick exactly two candidates from the list above. Nothing happens until you press Render "
+    "Tick 2 to 4 candidates from the list above. Nothing happens until you press Render "
     "Selected Variants."
 )
 
@@ -752,24 +755,31 @@ LABEL_RENDER_SELECTED = "🎞️ Render Selected Variants"
 
 LABEL_RENDER_BATCH_SUMMARY = "Render batch result"
 PLACEHOLDER_RENDER_BATCH_SUMMARY = (
-    "No batch rendered yet. Tick two candidates above and press Render Selected Variants."
+    "No batch rendered yet. Tick 2 to 4 candidates above and press Render Selected Variants."
 )
 
 INFO_RENDER_SELECTED = (
-    "**This makes two real videos**, one after the other — it is the only button here that "
-    "renders anything other than Create Music Video. Each candidate uses the settings it was "
+    "**This makes 2 to 4 real videos**, one after the other — it is the only button here that "
+    "renders anything other than Create Music Video. Tick between two and four candidates; they "
+    "render in list order, not the order you ticked them. Each candidate uses the settings it was "
     "generated with, so editing the Variant Lab controls afterwards does not change what gets "
     "rendered. Everything that is *not* a candidate setting — your audio, voice clips, SFX "
     "folder, source videos, output name, encoder and FPS — is taken as it stands the moment you "
     "press the button, and later edits do not affect the batch already running.\n\n"
+    "**Four videos is four times the wait**, so pick the number you actually want to watch.\n\n"
+    "**If one candidate fails, the rest may still run.** When the problem is specific to that "
+    "candidate's own settings — say its SFX amount, or an output name already taken — that one is "
+    "recorded as failed and the batch moves on to the next. When the problem affects every "
+    "candidate equally — a missing source video, an unusable voice clip, a full disk — the batch "
+    "stops and the remaining candidates are not attempted. Either way, every video that already "
+    "finished is yours to keep, and the summary says exactly what happened to each candidate.\n\n"
     "**Cancel Active Render** can stop this batch, but not instantly: video encoding stops within "
     "moments, while an in-progress AI scene-analysis step is never interrupted mid-call and finishes "
-    "naturally first. Either way, cancelling stops at the next safe point — whatever candidate has "
-    "already durably rendered is kept, and the remaining candidate is never attempted. If the first "
-    "candidate fails (rather than being cancelled) the second is not attempted either; if the second "
-    "fails the first video is still yours. Each file is named for its candidate, so neither can "
-    "overwrite the other or anything already in your output folder. The comparison list is not used "
-    "up — you can still apply a candidate, or render the same pair again."
+    "naturally first. Cancelling stops at the next safe point — whatever has already durably "
+    "rendered is kept, and no further candidate is started, including after a candidate that just "
+    "failed. Each file is named for its candidate, so none can overwrite another or anything "
+    "already in your output folder. The comparison list is not used up — you can still apply a "
+    "candidate, or render the same selection again."
 )
 
 LABEL_CANCEL_RENDER = "⏹️ Cancel Active Render"

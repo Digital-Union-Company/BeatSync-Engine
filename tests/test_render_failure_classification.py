@@ -877,31 +877,50 @@ class _BatchRun:
     reconstructions. That distinction is the whole point of this harness: a test that builds its own
     outcome afterwards and asserts on *that* passes even when the loop discarded the class, which is
     exactly the gap R2 closes.
+
+    [FORK] Digital-Union (C3-R1B-b): `order` records the candidate index of every render the batch
+    actually STARTED, so "candidate 3 was never attempted" is a measured call order rather than an
+    inference from a count. `batch_outcome` is the real `RenderBatchOutcome` the body built.
     """
 
     def __init__(self):
         self.captured = []
-        self.attempted = 0
+        self.order = []
         self.final = None
+        self.batch_outcome = None
+
+    @property
+    def attempted(self):
+        return len(self.order)
 
     @property
     def kinds(self):
         return [o.outcome_kind for o in self.captured]
 
 
-def _run_batch(kinds, durables):
+def _run_batch(kinds, durables, cancel_after=None):
     """Execute the REAL `render_selected_variants_guarded`, capturing every outcome it constructs.
 
     Each entry of `kinds` is the class the candidate's render writes onto `RENDER_OUTCOME_KEY`, and
-    `durables` whether it produced a durable file. The namespace receives a thin PROXY around
-    `fork_render_batch` whose `RenderCandidateOutcome` records each constructed instance and then
-    delegates to the real class unchanged -- so the model's own `__post_init__` validation still
-    runs, and a contradiction still raises out of this call.
+    `durables` whether it produced a durable file. The selection size follows `len(kinds)`, so the
+    same harness drives 2, 3 and 4 candidates.
+
+    The namespace receives a thin PROXY around `fork_render_batch` whose `RenderCandidateOutcome`
+    records each constructed instance and then delegates to the real class unchanged -- so the
+    model's own `__post_init__` validation still runs, and a contradiction still raises out of this
+    call. `RenderBatchOutcome` is captured the same way.
+
+    ``cancel_after=k`` requests cancellation on the lifecycle immediately after candidate ``k``
+    (0-based) finishes, which is how the loop-head boundary check is exercised: the user's Stop
+    lands in the gap between two candidates, exactly as it does in production.
     """
     import threading
     import uuid as _uuid
 
     run = _BatchRun()
+    count = len(kinds)
+    assert count == len(durables)
+    lifecycle_box = {}
 
     class _Skip:
         def __repr__(self):
@@ -914,33 +933,48 @@ def _run_batch(kinds, durables):
         run.captured.append(outcome)
         return outcome
 
+    def capturing_batch_outcome(*args, **kwargs):
+        run.batch_outcome = fork_render_batch.RenderBatchOutcome(*args, **kwargs)
+        return run.batch_outcome
+
     proxy = types.SimpleNamespace(
         RenderCandidateOutcome=capturing_outcome,
-        RenderBatchOutcome=fork_render_batch.RenderBatchOutcome,
+        RenderBatchOutcome=capturing_batch_outcome,
         build_request=fork_render_batch.build_request,
     )
 
     def guarded_unlocked(*args, **kwargs):
-        index = run.attempted
-        run.attempted += 1
+        index = len(run.order)
+        run.order.append(index)
         session_state = args[24]
 
         def stream():
+            durable = f"C:/output/candidate{index}.mp4" if durables[index] else ""
             session_state["render_outcome_kind"] = kinds[index]
-            session_state["last_output_path"] = (
-                f"C:/output/candidate{index}.mp4" if durables[index] else "")
+            session_state["last_output_path"] = durable
             session_state["audio_layers_report"] = ""
             session_state["smart_mix_report"] = ""
-            yield (None, f"status {index}", session_state, "", "", "inv")
+            # A successful render yields its display path, exactly as production does -- which is
+            # what `preview_path` (and therefore `latest_successful_preview()`) is built from.
+            yield (durable or None, f"status {index}", session_state, "", "", "inv")
+            if cancel_after is not None and index == cancel_after:
+                # The user presses Stop as this candidate finishes. The loop head must observe it
+                # before the next candidate starts -- a `continue` must not race past it.
+                lifecycle_box["lifecycle"].request_cancel()
         return stream()
 
-    batch = _root_92_batch(count=2)
+    def tracking_lifecycle(invocation_id):
+        lifecycle_box["lifecycle"] = fork_render_worker.RenderLifecycle(
+            invocation_id=invocation_id)
+        return lifecycle_box["lifecycle"]
+
+    batch = _root_92_batch(count=max(count, 2))
     namespace = {
         "gr": types.SimpleNamespace(skip=_Skip),
         "uuid": _uuid,
         "threading": threading,
         "fork_render_batch": proxy,
-        "RenderLifecycle": fork_render_worker.RenderLifecycle,
+        "RenderLifecycle": tracking_lifecycle,
         "RenderLifecycleState": fork_render_worker.RenderLifecycleState,
         "RenderOutcomeKind": KIND,
         "RenderCancelled": RenderCancelled,
@@ -961,7 +995,8 @@ def _run_batch(kinds, durables):
 
     session_state = {}
     stream = namespace["render_selected_variants_guarded"](
-        batch, [0, 1], "track.mp3", None, 2.0, 1.0, True, "", fork_smart_mix.ROLE_ORDER,
+        batch, list(range(count)), "track.mp3", None, 2.0, 1.0, True, "",
+        fork_smart_mix.ROLE_ORDER,
         "folder", "C:/src", False, None, "music_video", "h264", 30.0, session_state, None)
     for run.final in stream:
         pass
@@ -990,12 +1025,16 @@ def test_the_batch_preserves_every_failure_class_on_the_candidate_outcome(kind):
     captured object, so neither shape can pass.
     """
     run = _run_batch([kind, None], [False, False])
-    assert run.attempted == 1, "the batch must stop after the first failed candidate"
-    assert len(run.captured) == 1
+    assert len(run.captured) >= 1
     assert run.captured[0].outcome_kind is kind, \
         f"the batch published {run.captured[0].outcome_kind} instead of the producer's {kind}"
     assert run.captured[0].success is False
-    assert "not attempted" in run.final[3], run.final[3]
+    if kind is KIND.CANDIDATE_LOCAL:
+        # [C3-R1B-b] this one CONTINUES, so the second candidate really did run
+        assert run.attempted == 2, "CANDIDATE_LOCAL must continue to the next candidate"
+    else:
+        assert run.attempted == 1, f"{kind} must stop the batch"
+        assert "not attempted" in run.final[3], run.final[3]
 
 
 def test_the_batch_preserves_cancelled_on_the_candidate_outcome():
@@ -1081,56 +1120,281 @@ def test_no_explicit_classification_falls_back_to_the_conservative_derivation():
     assert all(o.success for o in run.captured)
 
 
+# ---------------------------------------------------------------------------
+# C3-R1B-b: EXACTLY ONE class may continue
+# ---------------------------------------------------------------------------
+#
+# These replace R1B-a's "every failure stops the batch" guards. They are deliberately the same
+# shape -- measured call order through the real handler body -- because the risk did not go away,
+# it inverted: the hazard is now a class *other than* CANDIDATE_LOCAL continuing.
+
+
 @pytest.mark.parametrize("kind", [
-    KIND.CANDIDATE_LOCAL,
     KIND.SHARED_FATAL,
     KIND.UNKNOWN_FATAL,
     KIND.CANCELLED,
 ])
-def test_every_failure_class_still_stops_the_batch(kind):
-    """**The R1B-a negative guard, measured.** Classification changed; policy did not.
+def test_only_candidate_local_continues_everything_else_stops(kind):
+    """**The R1B-b negative guard, measured.** The next candidate must never be started.
 
-    A CANDIDATE_LOCAL candidate must NOT be followed by another render. If this ever passes with
-    `attempted == 2`, continue-after-failure arrived without authorization.
+    SHARED_FATAL would fail identically for every remaining candidate; UNKNOWN_FATAL is unproven
+    and fails closed; CANCELLED is a Stop the user pressed. None of them may continue.
     """
-    run = _run_batch([kind, None], [False, False])
-    assert run.attempted == 1, f"{kind} did not stop the batch -- R1B-b arrived early"
+    run = _run_batch([kind, None, None, None], [False, False, False, False])
+    assert run.order == [0], f"{kind} did not stop the batch -- candidates {run.order[1:]} ran"
     assert len(run.captured) == 1, "a second candidate outcome was recorded"
+    assert run.batch_outcome.not_attempted == 3
 
 
-def test_the_batch_loop_does_not_branch_on_the_candidate_class():
-    """Structural half of the same guard: the stop condition must be class-blind.
+def test_candidate_local_continues_to_the_next_candidate():
+    """The one class that continues, and the whole point of R1B-b."""
+    run = _run_batch([KIND.CANDIDATE_LOCAL, KIND.SUCCESS, KIND.SUCCESS, KIND.SUCCESS],
+                     [False, True, True, True])
+    assert run.order == [0, 1, 2, 3], "the batch did not continue past a local failure"
+    assert run.batch_outcome.attempted == 4
+    assert run.batch_outcome.succeeded == 3
+    assert run.batch_outcome.failed == 1
+    assert run.batch_outcome.not_attempted == 0
+    assert run.batch_outcome.outcome_kind is None, \
+        "a completed batch must not take its candidate's local cause"
 
-    The loop reads the class to RECORD it. The moment it reads the class to DECIDE whether to carry
-    on, that is R1B-b.
+
+def test_the_batch_loop_continues_on_candidate_local_only():
+    """Structural half of the same guard, so a rename cannot smuggle a second `continue` in.
+
+    The loop may branch on exactly ONE class -- CANDIDATE_LOCAL -- and the `continue` must be
+    guarded by it. Everything else reaches the success-based stop.
     """
     node = _gui_func("render_selected_variants_guarded")
     loop = next(n for n in ast.walk(node) if isinstance(n, ast.For))
+    rendered = ast.unparse(loop)
+
+    # exactly one `continue`, and it is guarded by CANDIDATE_LOCAL
+    continues = [n for n in ast.walk(loop) if isinstance(n, ast.Continue)]
+    assert len(continues) == 1, f"expected one continue, found {len(continues)}"
+    guard = next(
+        n for n in ast.walk(loop) if isinstance(n, ast.If)
+        and any(isinstance(s, ast.Continue) for s in n.body))
+    assert ast.unparse(guard.test) == \
+        "candidate_outcome.outcome_kind is RenderOutcomeKind.CANDIDATE_LOCAL", \
+        ast.unparse(guard.test)
+    assert not guard.orelse, "the continue guard must not carry an else branch"
+
+    # the stop branch is class-blind and uses the MODEL's success, not the raw producer value
     stop = next(n for n in ast.walk(loop) if isinstance(n, ast.If)
-                and ast.unparse(n.test) == "candidate_cancelled or not durable")
+                and ast.unparse(n.test) == "not candidate_outcome.success")
     assert "break" in ast.unparse(stop)
     assert "stopped = True" in ast.unparse(stop)
-    # no `continue` anywhere in the candidate loop, and no test against a specific failure class
-    rendered = ast.unparse(loop)
-    assert "continue" not in rendered, "a continue policy was added to the candidate loop"
-    for forbidden in ("is RenderOutcomeKind.CANDIDATE_LOCAL",
-                      "is RenderOutcomeKind.SHARED_FATAL",
-                      "is RenderOutcomeKind.UNKNOWN_FATAL"):
-        assert forbidden not in rendered, \
-            f"the loop branches on {forbidden} -- that is R1B-b"
+
+    # no other class may be branched on -- that would be a second continuation policy
+    for forbidden in ("is RenderOutcomeKind.SHARED_FATAL",
+                      "is RenderOutcomeKind.UNKNOWN_FATAL",
+                      "is RenderOutcomeKind.SUCCESS"):
+        assert forbidden not in rendered, f"the loop branches on {forbidden}"
+    # and the continuation decision is read off the MODEL, never the raw local
+    assert "candidate_kind is RenderOutcomeKind.CANDIDATE_LOCAL" not in rendered, \
+        "the policy must read candidate_outcome.outcome_kind, so the model decides what None means"
 
 
-def test_render_selection_size_is_still_exactly_two():
-    """R1B-a must not move the count, introduce a range, or add min/max."""
-    assert fork_render_batch.RENDER_SELECTION_SIZE == 2
+# ---------------------------------------------------------------------------
+# C3-R1B-b §30: the whole continuation matrix, driven through the real handler
+# ---------------------------------------------------------------------------
+
+_L, _S = KIND.CANDIDATE_LOCAL, KIND.SUCCESS
+
+
+def _four(*kinds):
+    """Run four candidates, deriving `durable` from the class (SUCCESS iff durable)."""
+    return _run_batch(list(kinds), [k is _S for k in kinds])
+
+
+@pytest.mark.parametrize("label,kinds,order,succeeded,failed,not_attempted", [
+    ("A all success",            (_S, _S, _S, _S),              [0, 1, 2, 3], 4, 0, 0),
+    ("B local then successes",   (_L, _S, _S, _S),              [0, 1, 2, 3], 3, 1, 0),
+    ("C alternating",            (_S, _L, _S, _L),              [0, 1, 2, 3], 2, 2, 0),
+    ("D two locals then two ok", (_L, _L, _S, _S),              [0, 1, 2, 3], 2, 2, 0),
+    ("E shared fatal at 2",      (_S, KIND.SHARED_FATAL, _S, _S), [0, 1],     1, 1, 2),
+    ("F unknown fatal at 2",     (_S, KIND.UNKNOWN_FATAL, _S, _S), [0, 1],    1, 1, 2),
+    ("G cancelled at 2",         (_S, KIND.CANCELLED, _S, _S),  [0, 1],       1, 0, 2),
+    ("J local on final",         (_S, _S, _S, _L),              [0, 1, 2, 3], 3, 1, 0),
+])
+def test_the_continuation_matrix(label, kinds, order, succeeded, failed, not_attempted):
+    """Every §30 scenario, measured on the REAL batch body: call order and the real outcome."""
+    run = _four(*kinds)
+    assert run.order == order, f"{label}: execution order was {run.order}"
+    outcome = run.batch_outcome
+    assert outcome.requested_count == 4
+    assert outcome.attempted == len(order)
+    assert outcome.succeeded == succeeded, label
+    assert outcome.failed == failed, label
+    assert outcome.not_attempted == not_attempted, label
+    # the counting invariant, at every shape
+    assert outcome.succeeded + outcome.failed + outcome.cancelled_count == outcome.attempted
+    # no fabricated record for an unattempted candidate
+    assert [o.candidate_index for o in outcome.outcomes] == order
+    # every captured class is exactly what the producer wrote
+    assert run.kinds == list(kinds[:len(order)])
+
+
+def test_a_cancel_between_candidates_stops_even_after_a_local_failure():
+    """[§30 case H] **The race §9 calls out.** A `continue` must not outrun the loop-head check.
+
+    Candidate 1 fails locally, the user presses Stop as it finishes, and candidate 2 is about to
+    start. The loop head re-checks the shared lifecycle first, so candidate 2 is NOT ATTEMPTED.
+    """
+    run = _run_batch([KIND.CANDIDATE_LOCAL, _S, _S, _S], [False, True, True, True],
+                     cancel_after=0)
+    assert run.order == [0], f"candidates {run.order[1:]} started after an explicit Cancel"
+    assert run.batch_outcome.not_attempted == 3
+    assert run.batch_outcome.outcome_kind is KIND.CANCELLED
+    assert "cancel" in run.final[1].lower(), run.final[1]
+
+
+def test_a_cancel_after_a_success_then_a_local_failure_also_stops():
+    """[§30 case I] The same race one candidate later, so it is not an artefact of position."""
+    run = _run_batch([_S, KIND.CANDIDATE_LOCAL, _S, _S], [True, False, True, True],
+                     cancel_after=1)
+    assert run.order == [0, 1], f"candidate 3+ started after an explicit Cancel: {run.order}"
+    assert run.batch_outcome.not_attempted == 2
+    assert run.batch_outcome.outcome_kind is KIND.CANCELLED
+    # the earlier durable output survives
+    assert run.batch_outcome.durable_paths() == ("C:/output/candidate0.mp4",)
+
+
+def test_an_unclassified_failure_derives_unknown_fatal_and_stops():
+    """[§11] `None` + no durable is the model's conservative UNKNOWN_FATAL -- never CANDIDATE_LOCAL.
+
+    If an unclassified failure were ever treated as local, the batch would continue on a cause
+    nobody proved. The decision is read off `candidate_outcome.outcome_kind`, so the model's
+    derivation -- not the raw `None` -- is what the policy sees.
+    """
+    run = _run_batch([None, _S, _S, _S], [False, True, True, True])
+    assert run.order == [0], f"an unclassified failure continued: {run.order}"
+    assert run.captured[0].outcome_kind is KIND.UNKNOWN_FATAL
+    assert run.batch_outcome.not_attempted == 3
+
+
+def test_an_unclassified_success_derives_success_and_continues():
+    """The other half of the `None` contract: a durable path still means SUCCESS."""
+    run = _run_batch([None, None], [True, True])
+    assert run.order == [0, 1]
+    assert run.kinds == [KIND.SUCCESS, KIND.SUCCESS]
+    assert run.batch_outcome.succeeded == 2
+
+
+# ---------------------------------------------------------------------------
+# C3-R1B-b §31: the summary says what actually happened
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kinds,expected_headline", [
+    ((_S, _S, _S, _S), "4 / 4 succeeded"),
+    ((_L, _S, _S, _S), "3 / 4 succeeded; 1 failed"),
+    ((_S, _L, _S, _L), "2 / 4 succeeded; 2 failed"),
+])
+def test_a_completed_batch_reports_counts_not_blame(kinds, expected_headline):
+    run = _four(*kinds)
+    headline = run.batch_outcome.headline()
+    assert headline == expected_headline, headline
+    assert "stopped on" not in headline, \
+        "a local failure the batch continued past must never be named as the stop cause"
+    assert "not attempted" not in run.batch_outcome.summary_text()
+
+
+def test_a_fatal_stop_names_the_terminal_candidate_and_counts_the_rest():
+    run = _four(_L, _S, KIND.SHARED_FATAL, _S)
+    outcome = run.batch_outcome
+    headline = outcome.headline()
+    assert "1 / 4 succeeded" in headline, headline
+    assert "1 failed" in headline, "the continued-past local failure is counted"
+    assert "stopped on candidate 3" in headline, headline
+    assert "stopped on candidate 1" not in headline
+    assert outcome.outcome_kind is KIND.SHARED_FATAL
+    summary = outcome.summary_text()
+    assert "1 candidate not attempted." in summary, summary
+    assert "Earlier successful output was kept." in summary
+
+
+def test_an_unknown_fatal_stop_reads_the_same_way():
+    run = _four(_S, _S, KIND.UNKNOWN_FATAL, _S)
+    outcome = run.batch_outcome
+    assert "2 / 4 succeeded" in outcome.headline()
+    assert "stopped on candidate 3" in outcome.headline()
+    assert outcome.outcome_kind is KIND.UNKNOWN_FATAL
+
+
+def test_cancel_during_a_candidate_reads_as_cancelled_during():
+    run = _four(_S, KIND.CANCELLED, _S, _S)
+    headline = run.batch_outcome.headline()
+    assert "1 / 4 succeeded" in headline
+    assert "cancelled during candidate 2" in headline, headline
+    assert "failed" not in headline.lower(), "a Stop is not a failure"
+    assert "Batch CANCELLED." in run.batch_outcome.summary_text()
+
+
+def test_cancel_between_candidates_reads_as_cancelled_before_the_next():
+    run = _run_batch([_S, _S, _S, _S], [True, True, True, True], cancel_after=1)
+    outcome = run.batch_outcome
+    assert run.order == [0, 1]
+    headline = outcome.headline()
+    assert "2 / 4 succeeded" in headline
+    assert "batch cancelled before candidate 3" in headline, headline
+    assert "stopped on" not in headline, "nothing failed, so nothing may be blamed"
+    assert "2 candidates not attempted." in outcome.summary_text()
+
+
+def test_the_summary_keeps_one_block_per_attempted_candidate():
+    run = _four(_S, _L, _S, _L)
+    summary = run.batch_outcome.summary_text()
+    for position in (1, 2, 3, 4):
+        assert f"Candidate {position} ·" in summary, f"candidate {position} block missing"
+    assert summary.count("SUCCESS") == 2
+    assert summary.count("FAILED") == 2
+    # the durable outputs of the successes are named
+    assert "C:/output/candidate0.mp4" in summary
+    assert "C:/output/candidate2.mp4" in summary
+
+
+def test_the_summary_fabricates_no_block_for_an_unattempted_candidate():
+    run = _four(_S, KIND.SHARED_FATAL, _S, _S)
+    summary = run.batch_outcome.summary_text()
+    assert "Candidate 1 ·" in summary and "Candidate 2 ·" in summary
+    assert "Candidate 3 ·" not in summary, "a record was invented for an unattempted candidate"
+    assert "Candidate 4 ·" not in summary
+
+
+def test_the_latest_successful_preview_survives_a_later_local_failure():
+    run = _four(_S, _L, _S, _L)
+    # candidate 3 is the newest success; the trailing local failure must not blank it
+    assert run.batch_outcome.latest_successful_preview() == "C:/output/candidate2.mp4"
+
+
+def test_earlier_durable_outputs_are_never_rolled_back():
+    """No cleanup path may delete a promoted output, whatever happens afterwards."""
+    for kinds in ((_S, _L, _S, KIND.SHARED_FATAL), (_S, _S, KIND.CANCELLED, _S),
+                  (_S, KIND.UNKNOWN_FATAL, _S, _S)):
+        outcome = _four(*kinds).batch_outcome
+        assert "C:/output/candidate0.mp4" in outcome.durable_paths(), kinds
+    # and the handler body contains no deletion at all
+    body = _gui_body("render_selected_variants_guarded")
+    for destructive in ("os.remove(", "os.unlink(", "shutil.rmtree(", "os.rmdir("):
+        assert destructive not in body, f"the batch calls {destructive}"
+
+
+def test_the_render_selection_range_is_two_to_four():
+    """[C3-R1B-b] The range replaced the exact size, and MAX is frozen at 4."""
+    assert fork_render_batch.RENDER_SELECTION_MIN == 2
+    assert fork_render_batch.RENDER_SELECTION_MAX == 4
+    assert not hasattr(fork_render_batch, "RENDER_SELECTION_SIZE"), \
+        "the ambiguous exact-size constant came back"
     source = open(os.path.join(os.path.dirname(_MIXDOWN), "beatsync_fork", "render_batch.py"),
                   encoding="utf-8").read()
-    for forbidden in ("RENDER_SELECTION_MIN", "RENDER_SELECTION_MAX", "RENDER_SELECTION_DEFAULT"):
-        assert forbidden not in source, f"render_batch.py declares {forbidden} -- that is R1B-b"
-    # the selection contract still refuses any count other than two
-    assert fork_render_batch.normalize_selection([0, 1], 4) == (0, 1)
-    for rejected in ([0], [0, 1, 2], [0, 1, 2, 3], []):
-        assert fork_render_batch.normalize_selection(rejected, 4) == ()
+    assert "RENDER_SELECTION_SIZE =" not in source
+    # the whole authorized range normalises, and nothing outside it does
+    for valid in ([0, 1], [0, 1, 2], [0, 1, 2, 3]):
+        assert fork_render_batch.normalize_selection(valid, 5) == tuple(valid)
+    for rejected in ([], [0], [0, 1, 2, 3, 4]):
+        assert fork_render_batch.normalize_selection(rejected, 5) == ()
 
 
 # ===========================================================================

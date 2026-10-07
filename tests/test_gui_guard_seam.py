@@ -715,11 +715,25 @@ def test_the_batch_stops_on_the_first_failed_or_cancelled_candidate():
     node = _gui_func("render_selected_variants_guarded")
     loop = next(n for n in ast.walk(node) if isinstance(n, ast.For))
 
+    # [C3-R1B-b] the stop condition reads the MODEL's success, and only CANDIDATE_LOCAL continues.
     failure = next(n for n in ast.walk(loop) if isinstance(n, ast.If)
-                   and ast.unparse(n.test) == "candidate_cancelled or not durable")
+                   and ast.unparse(n.test) == "not candidate_outcome.success")
     rendered = ast.unparse(failure)
     assert "break" in rendered, "a failed or cancelled candidate must stop the batch"
     assert "stopped = True" in rendered, "and the outcome must say so"
+    # exactly one continuation, guarded by exactly one class
+    continues = [n for n in ast.walk(loop) if isinstance(n, ast.Continue)]
+    assert len(continues) == 1, f"expected one continue, found {len(continues)}"
+    guard = next(n for n in ast.walk(loop) if isinstance(n, ast.If)
+                 and any(isinstance(s, ast.Continue) for s in n.body))
+    assert ast.unparse(guard.test) == \
+        "candidate_outcome.outcome_kind is RenderOutcomeKind.CANDIDATE_LOCAL", \
+        ast.unparse(guard.test)
+    # the loop-head cancellation check still comes FIRST, so a continue cannot outrun a Stop
+    head = loop.body[0]
+    assert isinstance(head, ast.If), ast.unparse(head)
+    assert ast.unparse(head.test) == "lifecycle.cancel_requested()", ast.unparse(head.test)
+    assert "break" in ast.unparse(head)
 
     # success is decided by the durable file, never by the preview or the status prose
     body = _gui_body("render_selected_variants_guarded")
@@ -735,7 +749,11 @@ def test_the_batch_stops_on_the_first_failed_or_cancelled_candidate():
     # SHARED_FATAL and UNKNOWN_FATAL survive instead of collapsing to None.
     flat = body.replace("\n", "").replace("    ", "")
     assert "candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)" in flat, body
-    assert "candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED" in flat, body
+    # [C3-R1B-b] cancellation is still TYPED, never inferred -- but R1A's `candidate_cancelled`
+    # local is gone rather than left unused: the class rides into `outcome_kind` and the model's
+    # `cancelled` property is the reader. What must never return is inference from prose.
+    assert "candidate_cancelled" not in flat, \
+        "a dead cancellation local came back; the model owns that property"
     # [C3-R1B-a / R2] the explicit class must reach the model UNCONDITIONALLY. Exactly this form --
     # not "outcome_kind=candidate_kind if ...", which is how R1 quietly substituted `None` on a
     # success/kind disagreement and let the conservative derivation publish a different class than
