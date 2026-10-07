@@ -157,23 +157,46 @@ abandoned stream into a Stop the user never pressed. `request_cancel` has exactl
 Cancel only makes the worker *reach* a terminal state sooner. It never changes *whether* the finalizer
 waits for it.
 
-## What is explicitly deferred to C3-R1B
+## Truthful producers (C3-R1B-a), and what is still deferred
 
 ```
 RENDER_SELECTION_SIZE = 2        unchanged
-3+ candidates                    NOT IMPLEMENTED
-continue-after-failure           NOT IMPLEMENTED
-continue-after-cancellation      NOT IMPLEMENTED
+3+ candidates                    NOT IMPLEMENTED       <- C3-R1B-b
+continue-after-failure           NOT IMPLEMENTED       <- C3-R1B-b
+continue-after-cancellation      NOT IMPLEMENTED       (and not planned)
 ```
 
-`RenderOutcomeKind.SHARED_FATAL` is in the vocabulary with **no producer**, and that is deliberate:
-telling a shared-input failure from a candidate-local one is exactly the evidence continuing would
-need, and it does not exist yet. Do not add a producer for it to unlock R1B by the back door.
+**R1A left `SHARED_FATAL` with no producer. C3-R1B-a gave it real ones**, and that is the whole of
+that milestone — it changed **no** continuation policy. The batch still stops after every
+non-success candidate, including `CANDIDATE_LOCAL`.
 
-R1A produces three causes — `SUCCESS` after the durable promotion, `CANCELLED` from a caught
-`RenderCancelled`, `CANDIDATE_LOCAL` for an Audio Layers failure — and falls back to `UNKNOWN_FATAL`
-for anything it has not proven. A plain early return leaves the key `None`, which every consumer reads
-conservatively.
+```
+SHARED_FATAL      the live source-gate refusal; the six primary audio/video selection failures;
+                  the voice preflight; AudioMixPlanError; an errno.EXDEV durable promotion
+CANDIDATE_LOCAL   the early output collision; a FileExistsError promotion; the SFX preflight;
+                  SmartMixStructureError
+UNKNOWN_FATAL     AudioMixExecutionError; the defensive music-duration fallback probe; any other
+                  promotion OSError; Stage 1-3/4 failures; extraction and encode failures;
+                  MemoryError; the generic except Exception
+SUCCESS           exactly once, immediately after the durable promotion
+CANCELLED         only from a caught RenderCancelled
+```
+
+Two rules decide every row, and both are mechanical rather than editorial:
+
+- **`SHARED_FATAL` requires proof that nothing the candidate resolves is an input to the outcome.**
+  Not "it would probably fail again" — the batch-frozen values have to be the only inputs.
+- **`CANDIDATE_LOCAL` requires only that the failure does *not* prove every remaining candidate must
+  fail.** Reachability counts: the SFX preflight's root and roles are frozen, but whether it runs at
+  all depends on the candidate's own `sfx_amount`, so a broken library does not condemn the batch.
+
+Everything else fails closed as `UNKNOWN_FATAL`. **Classification is by exception type and by
+batch-frozen values, never by parsing a message** — `tests/test_render_failure_classification.py`
+asserts that every assignment to `RENDER_OUTCOME_KEY` names an enum member explicitly, and that
+`gui.py` contains no status-text inspection.
+
+The vocabulary itself is unchanged: `render_worker.py` was **not modified** by R1B-a. Five members
+were always enough; what was missing were producers.
 
 No cache, schema or version constant participates in any of this: `CACHE_CONTRACT_VERSION`,
 `ANALYSIS_VERSION` and `L2_CACHE_VERSION` are untouched, and a test asserts the fork's creative, cache

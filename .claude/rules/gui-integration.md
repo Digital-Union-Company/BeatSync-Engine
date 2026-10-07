@@ -73,6 +73,36 @@ automatically.
   the promotion into `output/` succeeds, and never the ProRes preview — and reads the two report
   keys after each candidate. It becomes a writer of **neither** report panel; the batch summary
   owns multi-render diagnostics so no panel can describe a candidate the user is not looking at.
+
+  **Since C3-R1B-a the batch also reads the FULL typed class** off
+  `session_state[RENDER_OUTCOME_KEY]` and passes it to `RenderCandidateOutcome.outcome_kind`
+  **unchanged** — `outcome_kind=candidate_kind`, with no filter in between. R1A read that key only
+  to spot `CANCELLED`, so `CANDIDATE_LOCAL` was produced and discarded and every other class
+  collapsed to `None`. The class comes **only** from that key: never from the status text, the
+  durable path, a message prefix or an emoji.
+
+  **An explicit contradiction must be loud, and the batch must not sanitize it.** `durable` remains
+  the sole success authority, and `RenderCandidateOutcome.__post_init__` raises `ValueError` when
+  `success` and `outcome_kind` disagree. A draft of R1B-a wrapped the hand-off in an agreement test
+  and substituted `None` on disagreement; that defeated the very invariant the model exists to
+  enforce *and* then let the conservative derivation publish a different class than the producer
+  named — laundering a broken producer contract into a plausible-looking outcome, and leaving
+  C3-R1B-b to decide continuation on a class nobody verified. The filter is gone and a structural
+  test forbids it returning. Conservative derivation is reserved for the one case that proves
+  nothing: `candidate_kind is None`, a producer that never classified itself.
+
+  **The stop condition is deliberately class-blind** (`candidate_cancelled or not durable`): R1B-a
+  records the cause and changes no policy, so the batch still stops after every non-success
+  candidate. A `continue` keyed on `CANDIDATE_LOCAL` is C3-R1B-b, and a test fails if one appears.
+- **`_promote_output_no_replace()` returns `(message, outcome_kind)`** since C3-R1B-a — `('', None)`
+  on success, otherwise the unchanged user-facing text plus the typed cause
+  (`FileExistsError` → `CANDIDATE_LOCAL`, `errno.EXDEV` → `SHARED_FATAL`, any other `OSError` →
+  `UNKNOWN_FATAL`). Those three branches were already structurally separate, so this added no logic:
+  it only stops the caller recovering the cause by reading prose. Everything else about the helper is
+  untouched — one atomic no-replace `os.rename`, no deletion, no copy fallback, no `exists()`
+  pre-check — and the SUCCESS commit point did **not** move: it is still written only after the
+  promotion returned success. The call site reads `promotion_kind or UNKNOWN_FATAL`, so a future
+  branch that forgets to name a class still fails closed.
 - **One universal durable-output policy: no GUI render may ever replace an existing file (H1).**
   There is exactly one promotion into `output/`, `_promote_output_no_replace()`, and it is a single
   no-replace `os.rename` — not `shutil.move`, not `os.replace`, and not an `os.path.exists` check

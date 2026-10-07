@@ -322,10 +322,17 @@ class RenderBatchOutcome:
     """The whole batch's truthful record, and the one formatter for it.
 
     Fail-fast with prior success preserved: a failed candidate stops the batch and **no earlier
-    output is deleted**. That is not a rollback decision taken lightly — the render boundary
-    exposes no typed failure classification, so a batch cannot tell a shared-input failure (which
-    would simply repeat) from a candidate-local one, and continuing would at best waste a render.
-    Continue-on-failure waits for C3-R1B.
+    output is deleted**.
+
+    [FORK] Digital-Union (C3-R1B-a): this used to say the render boundary exposed no typed failure
+    classification, so a batch could not tell a shared-input failure from a candidate-local one.
+    That half is no longer true — C3-R1B-a gave every reachable producer an explicit
+    `RenderOutcomeKind`, `SHARED_FATAL` has real proven producers, and `gui.py` now threads the
+    **full** class into every :class:`RenderCandidateOutcome` instead of preserving only
+    ``CANCELLED``. What has **not** changed is the behaviour: the batch still stops after every
+    non-success candidate, ``CANDIDATE_LOCAL`` included, and `RENDER_SELECTION_SIZE` is still 2.
+    Continue-after-``CANDIDATE_LOCAL`` and rendering three or four candidates are C3-R1B-b, which
+    will consume this classification; nothing in this module branches on it.
 
     [FORK] Digital-Union (C3-R1A / R2): ``outcome_kind`` is the **batch-level** terminal cause, and
     it exists because the candidate-level one cannot express the batch boundary case. When a

@@ -211,17 +211,44 @@ LAST_OUTPUT_PATH_KEY = 'last_output_path'
 #: including before the gate, so a gate refusal never carries a stale prior outcome) and written only
 #: by a boundary that actually PROVED the cause:
 #:
+#: [FORK] Digital-Union (C3-R1B-a): every reachable producer on the render path now names its class,
+#: and ``SHARED_FATAL`` has real producers for the first time. The full matrix, and the one question
+#: each row answers -- *can a candidate recipe change this outcome?*:
+#:
 #: * ``SUCCESS``         -- exactly once, immediately after the durable promotion succeeded.
 #: * ``CANCELLED``       -- only from a caught ``RenderCancelled``.
-#: * ``CANDIDATE_LOCAL`` -- an Audio Layers failure, the one cause R1A can prove is candidate-local.
-#: * ``UNKNOWN_FATAL``   -- a promotion failure, and the generic ``except Exception`` fallback.
+#: * ``SHARED_FATAL``    -- proven identical for every remaining candidate, because nothing the
+#:                          candidate resolves is an input to the outcome:
+#:                            - the live source-gate refusal (gate inputs are all batch-frozen);
+#:                            - the six primary audio/video selection failures;
+#:                            - the voice preflight (``voice_files`` is frozen; no ``AudioRecipe``
+#:                              field changes whether it runs or what it validates);
+#:                            - ``AudioMixPlanError`` (voice placement reads only frozen config, and
+#:                              is unreachable with an empty voice selection);
+#:                            - an ``errno.EXDEV`` durable promotion (``session_dir`` and
+#:                              ``output/`` are process-global, so the volume pair cannot change).
+#: * ``CANDIDATE_LOCAL`` -- proven NOT to force every remaining candidate to fail:
+#:                            - the early output-path collision and a ``FileExistsError`` promotion
+#:                              (the destination name carries the candidate index and master, and
+#:                              `RenderBatchRequest.__post_init__` asserts stems are distinct);
+#:                            - the SFX preflight and ``SmartMixStructureError``, which run only
+#:                              inside the ``smart_mix_active`` branch -- gated on
+#:                              ``sfx_amount > 0``, a per-candidate ``AudioRecipe`` value, so a
+#:                              candidate resolving 0 never performs the failing operation.
+#: * ``UNKNOWN_FATAL``   -- fail closed, wherever the cause is not proven: ``AudioMixExecutionError``
+#:                          (FFmpeg/disk/driver are indistinguishable here), the defensive
+#:                          music-duration fallback probe, any other promotion ``OSError``, a
+#:                          Stage 1-3/4 failure, extraction and encode failures, ``MemoryError`` and
+#:                          the generic ``except Exception``.
 #:
-#: Everything else leaves it ``None``, deliberately: a plain early return (a missing audio file, an
-#: occupied destination) has proven nothing about *which* class of cause applied, and every consumer
-#: reads ``None`` conservatively — ``RenderCandidateOutcome.__post_init__`` derives
-#: ``UNKNOWN_FATAL``, and both mutex-owning wrappers derive ``FAILED``. ``SHARED_FATAL`` is part of
-#: the typed vocabulary but has no producer in R1A; distinguishing a shared-input failure is what
-#: continue-after-failure needs, and that is C3-R1B. Pure diagnostics for the batch/UI layer —
+#: **Classification is by exception TYPE and by batch-frozen values, never by reading a message.**
+#: A plain early return may still leave it ``None``, and every consumer reads that conservatively --
+#: ``RenderCandidateOutcome.__post_init__`` derives ``UNKNOWN_FATAL`` and both mutex-owning wrappers
+#: derive ``FAILED``.
+#:
+#: **R1B-a records; it does not act.** The batch still stops after *every* non-success candidate,
+#: exactly as before. Continue-after-``CANDIDATE_LOCAL`` and rendering more than two candidates are
+#: C3-R1B-b and are deliberately not implemented here. Pure diagnostics for the batch/UI layer --
 #: nothing inside the pipeline reads it back.
 RENDER_OUTCOME_KEY = 'render_outcome_kind'
 
@@ -660,12 +687,25 @@ def _as_existing_source_paths(file_paths: VideoFilesInput) -> list[str]:
     return [path for path in (_as_existing_source_path(p) for p in file_paths) if path]
 
 
-def _promote_output_no_replace(temp_output: str, output_path: str) -> str:
+def _promote_output_no_replace(temp_output: str, output_path: str):
     """Promote a finished render into `output/`, and **never** replace what is already there.
 
     [FORK] Digital-Union (H1): this one OS call is what makes a render durable, and it is the whole
-    no-overwrite guarantee. Returns `''` on success, or the user-facing failure text. It never
-    raises, and on no path does it remove anything.
+    no-overwrite guarantee. It never raises, and on no path does it remove anything.
+
+    [FORK] Digital-Union (C3-R1B-a): returns ``(message, outcome_kind)`` instead of a bare string --
+    ``('', None)`` on success, otherwise the **unchanged** user-facing text plus the typed cause. The
+    three failure branches were already structurally separate here, so this adds no logic and no new
+    branch; it only stops the caller having to recover the cause by reading the prose:
+
+        destination occupied (FileExistsError)  ->  CANDIDATE_LOCAL
+        cross-volume        (errno.EXDEV)       ->  SHARED_FATAL
+        anything else       (OSError)           ->  UNKNOWN_FATAL
+
+    ``CANDIDATE_LOCAL`` for the collision is sound because the destination name carries the
+    candidate index and master, and no other selected candidate can compute it. ``SHARED_FATAL`` for
+    EXDEV is sound because `session_dir` and `get_output_dir()` are process-global, so every
+    remaining candidate promotes between the identical pair of volumes.
 
     **Why not `shutil.move` + `os.path.exists`.** The previous promotion was `shutil.move`, which
     silently replaced an existing destination — measured on the supported Windows environment: the
@@ -691,16 +731,19 @@ def _promote_output_no_replace(temp_output: str, output_path: str) -> str:
         os.rename(temp_output, output_path)
     except FileExistsError:
         return (f"❌ Output already exists and was preserved: {output_path}\n"
-                f"Nothing was overwritten. The new render is kept at: {temp_output}")
+                f"Nothing was overwritten. The new render is kept at: {temp_output}",
+                RenderOutcomeKind.CANDIDATE_LOCAL)
     except OSError as exc:
         if getattr(exc, 'errno', None) == errno.EXDEV:
             return (f"❌ Durable promotion failed: the render folder and the output folder are on "
                     f"different volumes, so the move cannot be atomic and was not attempted by "
                     f"copying. The destination was not replaced: {output_path}\n"
-                    f"The new render is kept at: {temp_output}")
+                    f"The new render is kept at: {temp_output}",
+                    RenderOutcomeKind.SHARED_FATAL)
         return (f"❌ Durable promotion failed ({exc}). The destination was not replaced: "
-                f"{output_path}\nThe new render is kept at: {temp_output}")
-    return ''
+                f"{output_path}\nThe new render is kept at: {temp_output}",
+                RenderOutcomeKind.UNKNOWN_FATAL)
+    return '', None
 
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
@@ -752,9 +795,11 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     session_state[LAST_OUTPUT_PATH_KEY] = ''
     # [FORK] Digital-Union (C3-R1A): the typed terminal cause, same clear-every-attempt lifecycle
     # as the key above. Written below only where the cause is proven -- SUCCESS after promotion,
-    # CANCELLED from a caught RenderCancelled, CANDIDATE_LOCAL for an Audio Layers failure,
-    # UNKNOWN_FATAL for a promotion failure or the generic handler. A plain early return leaves it
-    # None on purpose; see RENDER_OUTCOME_KEY's own comment for why that is the conservative answer.
+    # CANCELLED from a caught RenderCancelled, and -- since C3-R1B-a -- an explicitly named class at
+    # every other reachable producer below, including the six shared primary-input returns, both
+    # preflights, the output collision and the three promotion branches. A producer that still
+    # proves nothing leaves it None on purpose; see RENDER_OUTCOME_KEY's own comment for the full
+    # matrix and for why None stays the conservative answer.
     session_state[RENDER_OUTCOME_KEY] = None
     total_started = time.perf_counter()
     try:
@@ -768,6 +813,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             session_state['session_dir'] = tempfile.mkdtemp(prefix='beatsync_', dir=GRADIO_TEMP_DIR)
         session_dir = session_state['session_dir']
 
+        # [FORK] Digital-Union (C3-R1B-a): the six primary-input failures below are all
+        # SHARED_FATAL, and the proof is the same for each of them: `audio_file` and `video_files`
+        # are frozen for the whole C3 batch (the batch handler passes its own submitted arguments,
+        # and the video paths come from the one shared source gate), while a candidate contributes
+        # only its output stem, seven creative values and three audio levels. None of those is an
+        # input to "can this file be reached", so every remaining candidate fails identically.
+        # The messages are unchanged.
+
         # Handle audio by referencing the selected file path directly.
         if audio_file:
             if audio_file != session_state.get('original_audio_path'):
@@ -776,10 +829,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     session_state['local_audio_path'] = local_audio_path
                     session_state['original_audio_path'] = audio_file
                 else:
+                    session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
                     return None, '❌ Error: Could not access audio file', session_state
             else:
                 local_audio_path = session_state.get('local_audio_path')
         else:
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
             return None, '❌ Error: No audio file selected', session_state
 
         # Handle videos by referencing selected file paths directly.
@@ -790,16 +845,20 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     session_state['local_video_paths'] = local_video_paths
                     session_state['original_video_paths'] = video_files
                 else:
+                    session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
                     return None, '❌ Error: Could not access video files', session_state
             else:
                 local_video_paths = session_state.get('local_video_paths')
         else:
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
             return None, '❌ Error: No video files selected', session_state
 
         # Verify files exist
         if not local_audio_path or not os.path.exists(local_audio_path):
+             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
              return None, f"❌ Error: Audio file is missing or inaccessible.", session_state
         if not local_video_paths or not all(p and os.path.exists(p) for p in local_video_paths):
+             session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
              return None, f"❌ Error: Video files are missing or inaccessible.", session_state
         
         # [FORK] Digital-Union (Audio Layers V1 / D): voice preflight, deliberately BEFORE Stage 1.
@@ -823,6 +882,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             try:
                 prepared_voices = audio_mixdown.prepare_voice_inputs(voice_files)
             except audio_mixdown.AudioMixError as exc:
+                # [FORK] Digital-Union (C3-R1B-a): SHARED_FATAL, proven. The gate is a bare
+                # `if voice_files:` with no candidate condition, `voice_files` is frozen for the
+                # whole batch, and the call takes that selection and nothing else -- so every
+                # candidate validates the identical file list and fails identically. (The
+                # `music_under_voice_percent` a candidate does vary never reaches this call.)
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
                 return None, f'❌ Audio Layers: {exc}', session_state
 
         # [FORK] Digital-Union (Smart Mix V1 / E): the SFX library preflight, also BEFORE Stage 1
@@ -842,6 +907,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                 sfx_assets, sfx_diagnostics = audio_mixdown.prepare_sfx_inputs(
                     sfx_root, smart_mix.enabled_roles)
             except audio_mixdown.AudioMixError as exc:
+                # [FORK] Digital-Union (C3-R1B-a): CANDIDATE_LOCAL, and this is the row that forced
+                # the local-cause / batch-outcome split. The SFX root and the enabled roles are
+                # batch-frozen, so it is tempting to call this shared -- but REACHABILITY is not.
+                # `smart_mix_active` above requires `smart_mix.plans_anything`, i.e.
+                # `sfx_amount > 0`, and `sfx_amount` is per-candidate `AudioRecipe` state. A
+                # candidate resolving 0 never calls `prepare_sfx_inputs` at all, so a broken library
+                # does NOT prove every remaining candidate must fail. Measured on the real
+                # resolvers: root master 92, spread 100, base 50, full range, 4 candidates ->
+                # amounts 87 / 87 / 0 / 79, so candidate 3 renders fine with the library broken.
+                #
+                # R1B-a nevertheless STILL STOPS here. This value is foundation for R1B-b only.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANDIDATE_LOCAL
                 return None, f'❌ Smart Mix: {exc}', session_state
 
         # Set GPU mode
@@ -888,6 +965,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # run or a manual copy can occupy the path for a single render. Refusing here costs
         # nothing; refusing after Stage 5 would waste the whole run.
         if os.path.exists(output_path):
+            # [FORK] Digital-Union (C3-R1B-a): CANDIDATE_LOCAL. `output_path` is built from the
+            # candidate's own stem -- request tag + `_cNN_m<master>` -- and
+            # `RenderBatchRequest.__post_init__` asserts the stems in one batch are distinct, so no
+            # other selected candidate can compute this name. The collision is a fact about one
+            # candidate's destination, not about the batch. Still stops, as every R1B-a class does.
+            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANDIDATE_LOCAL
             return None, (f"❌ Output already exists and was preserved: {output_path}\n"
                           f"Nothing was rendered. Rename the output, or move the existing file, "
                           f"and run again."), session_state
@@ -930,6 +1013,13 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             try:
                 structure = fork_smart_mix.project_structure(beat_info)
             except fork_smart_mix.SmartMixStructureError as exc:
+                # [FORK] Digital-Union (C3-R1B-a): CANDIDATE_LOCAL, for the same reachability reason
+                # as the SFX preflight -- this sits inside the identical `smart_mix_active` branch.
+                # The `beat_info` structure it reads IS shared, and that is deliberately not enough:
+                # shared *data* does not make a shared *failure* when a candidate resolving
+                # `sfx_amount == 0` never performs the failing operation. `smart_mix.py` is
+                # untouched; only this mapping is new. Still stops.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANDIDATE_LOCAL
                 return None, f'❌ Smart Mix: {exc}', session_state
             # The scan's diagnostics ride along untouched: the GUI never formats a warning of its
             # own, so `SmartMixPlan.report_lines()` stays the single source of the report.
@@ -946,11 +1036,32 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # identical-but-re-encoded WAV would be pure cost. The zero-placement report survives to
         # explain why.
         if prepared_voices or sfx_placements:
+            # [FORK] Digital-Union (C3-R1B-a): the defensive music-duration fallback, hoisted out of
+            # the `build_mixed_master(...)` argument list for exactly one reason -- an exception
+            # raised inside an argument expression cannot be caught separately from the call it
+            # feeds, so the probe's cause was previously indistinguishable from a mixdown failure.
+            #
+            # Semantically identical to the `float(...) or probe_duration(...)` it replaces:
+            # `if not music_duration` reproduces the `or` short-circuit exactly, and the call takes
+            # no `lifecycle` here, just as it never did.
+            #
+            # The fallback is **unreachable in current production**: `analyze_beats_auto` guards
+            # `y.size == 0` and then sets `audio_duration = len(y) / sr`, which is strictly
+            # positive, and the L2 cache can only store a value from such a run. It is classified
+            # UNKNOWN_FATAL as a frozen product decision -- conservative and forward-safe, so a
+            # future change that made this reachable gets a fresh review rather than inheriting a
+            # stale conditional.
+            music_duration = float(beat_info.get('audio_duration') or 0.0)
+            if not music_duration:
+                try:
+                    music_duration = audio_mixdown.probe_duration(local_audio_path)
+                except audio_mixdown.AudioProbeError as exc:
+                    session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
+                    return None, f'❌ Audio Layers: {exc}', session_state
             try:
                 mixed_master_path, audio_plan = audio_mixdown.build_mixed_master(
                     music_path=local_audio_path,
-                    music_duration=float(beat_info.get('audio_duration') or 0.0)
-                    or audio_mixdown.probe_duration(local_audio_path),
+                    music_duration=music_duration,
                     beat_times=beat_times,
                     sections=fork_audio_mix.project_sections(beat_info.get('sections')),
                     voices=prepared_voices,
@@ -960,12 +1071,34 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                     sfx_level_percent=smart_mix.sfx_level_percent,
                     lifecycle=lifecycle,
                 )
+            # Deliberately before any clip extraction: the user asked for voice and/or SFX, so a
+            # silent fallback to the original music would render a plausible but wrong video.
+            #
+            # [FORK] Digital-Union (C3-R1B-a): two clauses, ordered, split by TYPE and never by
+            # message. R1A mapped every `AudioMixError` here to CANDIDATE_LOCAL on the grounds that
+            # "a different candidate's music-under-voice / SFX amount / level could succeed on these
+            # same files". That was wrong for both causes that actually reach this point:
+            #
+            #   AudioMixPlanError       voice placement reads only avoid_drops / start_delay_seconds
+            #                           / min_gap_seconds -- all batch-frozen -- and is unreachable
+            #                           with an empty voice selection. `music_under_voice_percent`,
+            #                           the one value a candidate varies, touches only the duck
+            #                           floor, AFTER placement has already succeeded. So no
+            #                           candidate recipe can rescue it: SHARED_FATAL.
+            #
+            #   anything else           an FFmpeg timeout, a non-zero return, a missing or empty
+            #                           master, a failed verification probe or a duration drift are
+            #                           indistinguishable here from a bad binary, a full disk or a
+            #                           driver fault, and this repository has no structured FFmpeg
+            #                           diagnostic classification to tell them apart. Fail closed:
+            #                           UNKNOWN_FATAL. This clause also catches a bare
+            #                           AudioProbeError or AudioMixInputError, which cannot reach
+            #                           here today, for the same fail-closed reason.
+            except audio_mixdown.AudioMixPlanError as exc:
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
+                return None, f'❌ Audio Layers: {exc}', session_state
             except audio_mixdown.AudioMixError as exc:
-                # Deliberately before any clip extraction: the user asked for voice and/or SFX, so a
-                # silent fallback to the original music would render a plausible but wrong video.
-                # [FORK] Digital-Union (C3-R1A): candidate-local -- a different candidate's own
-                # music-under-voice/SFX amount/level could legitimately succeed on these same files.
-                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANDIDATE_LOCAL
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
                 return None, f'❌ Audio Layers: {exc}', session_state
             render_audio_path = mixed_master_path
             # The pure planner already produced these lines; the GUI never recomputes placement.
@@ -1001,13 +1134,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # an earlier candidate of this same batch, or by the user. `os.rename` decides and acts
         # atomically, so no window remains for anything to appear in; it is deliberately NOT
         # preceded by another `os.path.exists`, which would only re-open the race it closes.
-        promotion_error = _promote_output_no_replace(result_path, output_path)
+        promotion_error, promotion_kind = _promote_output_no_replace(result_path, output_path)
         if promotion_error:
             # Fail closed. Both files survive, the durable-output key stays empty (cleared at the
             # top of this function, and again by the gate core before the gate), and the message
             # names both paths — a promotion failure must never read as a finished render.
-            # [FORK] Digital-Union (C3-R1A): not proven candidate-local or shared -- fail closed.
-            session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
+            # [FORK] Digital-Union (C3-R1B-a): the helper's three already-separate branches now
+            # carry their own cause, so this no longer collapses all of them into UNKNOWN_FATAL --
+            # CANDIDATE_LOCAL for an occupied candidate-unique destination, SHARED_FATAL for a
+            # cross-volume pair that cannot differ between candidates, UNKNOWN_FATAL otherwise. The
+            # `or UNKNOWN_FATAL` keeps this fail-closed if a future branch forgets to name one.
+            session_state[RENDER_OUTCOME_KEY] = (
+                promotion_kind or RenderOutcomeKind.UNKNOWN_FATAL)
             return None, promotion_error, session_state
         # [FORK] Digital-Union (C3-R0): the durable artifact is now on disk, so record it. Set
         # only here — after the promotion succeeded — and never from the returned display path,
@@ -2183,6 +2321,13 @@ def _process_video_guarded_unlocked(audio_file: str,
     verification_seconds = time.perf_counter() - verification_started
     invocation_id = lifecycle.invocation_id if lifecycle is not None else ''
     if not decision.allowed:
+        # [FORK] Digital-Union (C3-R1B-a): SHARED_FATAL. The gate's only inputs are `source_state`
+        # and `live_declaration(source_mode, source_folder, source_recursive, video_input)` -- every
+        # one of them an argument the C3 batch handler froze before its candidate loop, identical
+        # for every candidate. A candidate contributes its output stem, seven creative values and
+        # three audio levels, none of which the gate reads, so a refusal cannot be rescued by a
+        # different recipe. This is the first producer `SHARED_FATAL` ever had.
+        session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SHARED_FATAL
         yield None, f"❌ {decision.message}", session_state, '', '', invocation_id
         return
 
@@ -2635,8 +2780,32 @@ def render_selected_variants_guarded(
             # [FORK] Digital-Union (C3-R1A): a candidate cancelled mid-render is a typed CANCELLED
             # outcome, never an ordinary "not durable" failure -- `session_state[RENDER_OUTCOME_KEY]`
             # is the one authority for that, never inferred from `durable` or `last_status`.
-            candidate_cancelled = (
-                (session_state or {}).get(RENDER_OUTCOME_KEY) is RenderOutcomeKind.CANCELLED)
+            #
+            # [FORK] Digital-Union (C3-R1B-a): read the FULL typed class, not just CANCELLED. R1A
+            # recorded `CANCELLED if candidate_cancelled else None`, which threw away every other
+            # class the producers had proven -- `CANDIDATE_LOCAL` was written by
+            # `_process_video_impl` and read by nobody, and `None` then derived to `UNKNOWN_FATAL`
+            # in `RenderCandidateOutcome.__post_init__`. The class is still taken ONLY from
+            # `RENDER_OUTCOME_KEY`; nothing is inferred from the status text, the durable path, a
+            # message prefix or an emoji. `durable` remains the success authority.
+            candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)
+            candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED
+            # [FORK] Digital-Union (C3-R1B-a / R2): the explicit class is passed through
+            # **unchanged**. R1 wrapped it in a `success`/`kind` agreement filter and substituted
+            # `None` on disagreement, which was wrong twice over: it defeated the invariant
+            # `RenderCandidateOutcome.__post_init__` exists to enforce, and it then let the
+            # conservative derivation publish a DIFFERENT class than the producer named -- laundering
+            # a broken producer contract into a plausible-looking outcome.
+            #
+            # A disagreement here is not a runtime situation to absorb. Either shape --
+            # SUCCESS with no durable path, or a failure class WITH one -- means a producer violated
+            # its contract, and the durable promotion remains the sole success authority. So it must
+            # be LOUD: the model raises `ValueError`, and that is correct. Hiding it would leave
+            # C3-R1B-b making a continuation decision on a class nobody verified.
+            #
+            # Conservative derivation is reserved for the one case that genuinely proves nothing:
+            # `candidate_kind is None`, i.e. a producer that never classified itself. The model then
+            # derives SUCCESS from a durable path and UNKNOWN_FATAL otherwise.
             outcomes.append(fork_render_batch.RenderCandidateOutcome(
                 candidate_index=candidate.candidate_index,
                 candidate_master_seed=candidate.candidate_master_seed,
@@ -2647,11 +2816,17 @@ def render_selected_variants_guarded(
                 status_text=last_status,
                 audio_layers_report=(session_state or {}).get(AUDIO_LAYERS_REPORT_KEY, '') or '',
                 smart_mix_report=(session_state or {}).get(SMART_MIX_REPORT_KEY, '') or '',
-                outcome_kind=(RenderOutcomeKind.CANCELLED if candidate_cancelled else None),
+                outcome_kind=candidate_kind,
             ))
             if candidate_cancelled or not durable:
                 # A cancelled candidate stops the batch exactly like a failure: the earlier
                 # candidate's durable output is kept, and the next candidate is never attempted.
+                #
+                # [FORK] Digital-Union (C3-R1B-a): this condition is deliberately UNCHANGED. The
+                # typed class above is now truthful, and it is recorded rather than acted on -- the
+                # batch still stops after EVERY non-success candidate, including CANDIDATE_LOCAL.
+                # Continue-after-CANDIDATE_LOCAL is C3-R1B-b and must not appear here: there is no
+                # branch on `candidate_kind`, and adding one is the whole of the next milestone.
                 stopped = True
                 break
     finally:

@@ -138,10 +138,13 @@ test asserts this against the real call — it is the most important test in D.
   `except RenderCancelled:` clause **alongside** the pre-existing `except AudioMixError:` one: both
   call `discard_master(output_path)` so a cancelled mixdown leaves no truncated WAV in `session_dir`
   for the next render's duration probe to read, but the cancellation then **re-raises unchanged**.
-  The distinction is load-bearing at the GUI boundary: `_process_video_impl` classifies an
-  `AudioMixError` as `CANDIDATE_LOCAL`, so re-typing a cancellation would report a user's Stop as an
-  Audio Layers failure — and in a C3 batch would describe a cancelled candidate as a mix problem
-  with their voice or SFX settings.
+  The distinction is load-bearing at the GUI boundary: re-typing a cancellation would report a
+  user's Stop as an Audio Layers failure — and in a C3 batch would describe a cancelled candidate as
+  a mix problem with their voice or SFX settings. Since C3-R1B-a the same rule governs **every**
+  wrapping catch in this module: each one is `except AudioProbeError`, never `except AudioMixError`
+  and never `except Exception`, precisely so a cancellation raised inside `probe_duration` cannot be
+  re-typed. `tests/test_render_failure_classification.py` pins the exact handler list of
+  `probe_duration`, `prepare_voice_inputs`, `prepare_sfx_inputs` and `render_mixed_master`.
 - **Ordinary failure and timeout semantics are unchanged.** A real command timeout still raises
   `subprocess.TimeoutExpired` and still becomes `Audio mixdown timed out` / the probe's own
   `AudioMixError`; the runner measures the command's timeout independently of its 0.15 s poll
@@ -154,11 +157,61 @@ test asserts this against the real call — it is the most important test in D.
   that is unchanged — it is a statement about the user's files, not about one candidate. Cancellation
   does not soften it, does not make it partial, and does not turn a bad voice file into a cancelled
   render. The preflight still costs no analysis when it fails.
-- **A mix failure is the one cause R1A can prove is candidate-local.** `_process_video_impl` records
-  `RenderOutcomeKind.CANDIDATE_LOCAL` for an `AudioMixError`, because a different candidate's own
-  music-under-voice / SFX Amount / SFX Level could legitimately succeed on the same files — E2 varies
-  exactly those three. That classification is diagnostic only: C3-R1A still **stops** the batch on it,
-  and continue-after-failure remains C3-R1B. It is not permission to retry.
+## The local cause types, and why they are not batch classifications (C3-R1B-a)
+
+R1A recorded `CANDIDATE_LOCAL` for **any** `AudioMixError`, on the grounds that a different
+candidate's own music-under-voice / SFX Amount / SFX Level could succeed on the same files. That
+was wrong for both causes that actually reach the mixdown handler, and C3-R1B-a corrects it.
+
+`AudioMixError` is **retained as the base** — every pre-existing catch still catches — with four
+subclasses that name *what failed locally*:
+
+```
+AudioProbeError          duration/media probing failed          probe_duration ONLY
+AudioMixInputError       a user voice/SFX input is unusable     both preflights
+AudioMixPlanError        no legal voice placement exists        build_mixed_master
+AudioMixExecutionError   producing/verifying the master failed  render_mixed_master
+```
+
+**None of them implies a `RenderOutcomeKind`, and that separation is the whole point.** This module
+cannot know whether it is running a single render, candidate 1 or candidate 4, so it cannot answer
+"would every remaining candidate fail the same way?". `gui.py` owns that mapping per call site. The
+measured reason it has to: `probe_duration` has four production call sites and the *same four*
+internal failures resolve to **three different** classes depending on the caller.
+
+```
+voice preflight      prepare_voice_inputs  -> AudioMixInputError      -> SHARED_FATAL
+SFX preflight        prepare_sfx_inputs    -> AudioMixInputError      -> CANDIDATE_LOCAL
+voice placement      build_mixed_master    -> AudioMixPlanError       -> SHARED_FATAL
+mix execution        render_mixed_master   -> AudioMixExecutionError  -> UNKNOWN_FATAL
+generated-master probe  (wrapped)          -> AudioMixExecutionError  -> UNKNOWN_FATAL
+the defensive shared-music fallback probe  -> AudioProbeError (bare)  -> UNKNOWN_FATAL
+```
+
+Two of those are worth the detail, because they are the corrections:
+
+- **The voice preflight is SHARED, not candidate-local.** Its gate is a bare `if voice_files:` with
+  no candidate condition, `voice_files` is frozen for the whole batch, and the call takes that
+  selection and nothing else. No `AudioRecipe` field changes whether it runs or what it validates.
+- **The SFX preflight is CANDIDATE_LOCAL, even though its root and roles are frozen.** The *inputs*
+  are shared; **reachability** is not. `smart_mix_active` requires `SmartMixConfig.plans_anything`,
+  i.e. `sfx_amount > 0`, and `sfx_amount` is per-candidate `AudioRecipe` state. Measured through
+  the real resolvers: root master 92 at spread 100 over the full range resolves a four-candidate
+  batch with amounts **87 / 87 / 0 / 79**, so with a broken library candidate 3 renders fine. A
+  broken library therefore does *not* prove every remaining candidate must fail. The same gate
+  governs `SmartMixStructureError`, which is CANDIDATE_LOCAL for the identical reason — shared
+  `beat_info` data does not make a shared *failure* when a candidate can avoid the operation.
+- **A voice `PlacementFailure` is SHARED, unconditionally.** `plan_voice_placements` reads only
+  `avoid_drops`, `start_delay_seconds` and `min_gap_seconds` — all batch-frozen — while
+  `music_under_voice_percent` reaches only `config.music_floor`, in the duck model, *after*
+  placement succeeded. A test re-derives that attribute set from the real source on every run. And
+  `PlacementFailure` is returned only from inside the `for voice in voices:` loop, so it cannot fire
+  with an empty selection; it is reachable only when the frozen voice selection is non-empty, which
+  is what makes SHARED_FATAL unconditional rather than context-dependent.
+
+**R1B-a records; it does not act.** Every one of these still **stops** the batch, `RENDER_SELECTION_SIZE`
+is still 2, and there is no continue-after-`CANDIDATE_LOCAL`. The classification exists so C3-R1B-b
+can consume it; `audio_mix.py` and `smart_mix.py` were **not** modified.
 
 ## Smart Mix V1 adds SFX to the same master (E)
 
