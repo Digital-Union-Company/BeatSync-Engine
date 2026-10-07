@@ -56,6 +56,25 @@ render stops **before** any video clip is extracted. Falling back to the origina
 produce a plausible-looking video that silently lacks the voice the user asked for. The only path
 that legitimately uses the original music untouched is "no voice files at all", and that branch
 never reaches this module.
+
+===============================================================================
+Local cause, not batch classification (C3-R1B-a)
+===============================================================================
+
+:class:`AudioMixError` remains the base of everything this module raises, and four subclasses now
+name *what* failed:
+
+    AudioProbeError          media/duration probing failed
+    AudioMixInputError       a user-supplied voice/SFX input is unusable
+    AudioMixPlanError        voice placement could not produce a legal plan
+    AudioMixExecutionError   producing or verifying the mixed master failed
+
+**None of them implies a ``RenderOutcomeKind``**, and that separation is deliberate rather than
+fastidious. This module does not know whether it is executing a single Create Music Video click,
+candidate 1 of a C3 batch or candidate 4, and it must never learn -- so it cannot answer "would
+every remaining candidate fail the same way?". `gui.py` owns that mapping, per call site, from
+values it has frozen for the whole batch. Nothing here imports `RenderOutcomeKind`, and no caller
+may recover a cause by reading an exception's message.
 """
 
 from __future__ import annotations
@@ -100,7 +119,68 @@ _STDERR_TAIL = 1200
 
 
 class AudioMixError(Exception):
-    """Any Audio Layers failure. Carries a short, already-bounded human-readable reason."""
+    """Any Audio Layers failure. Carries a short, already-bounded human-readable reason.
+
+    [FORK] Digital-Union (C3-R1B-a): **retained as the base**, so every pre-existing
+    ``except audio_mixdown.AudioMixError`` keeps catching exactly what it caught before. The four
+    subclasses below name *what failed locally*; they deliberately do **not** imply a
+    ``RenderOutcomeKind``. See the module docstring section below for why that separation is
+    load-bearing.
+    """
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (C3-R1B-a): local cause types. NOT batch classifications.
+# ---------------------------------------------------------------------------
+#
+# A subclass here says what broke *in this module*. Whether that break is shared across a C3 batch,
+# specific to one candidate, or simply unproven is a question about the *batch*, and this module has
+# no way to answer it -- it does not know whether it is running a single render, candidate 1 or
+# candidate 4, and it must not learn. So `gui.py` owns the mapping and nothing here imports
+# `RenderOutcomeKind`.
+#
+# The measured reason this is not over-engineering: `probe_duration` has four production call sites,
+# and the *same* four internal failures resolve to three *different* `RenderOutcomeKind`s depending
+# on which caller invoked it --
+#
+#     prepare_voice_inputs   probing a selected voice clip     -> SHARED_FATAL
+#     prepare_sfx_inputs     probing a selected SFX asset      -> CANDIDATE_LOCAL
+#     render_mixed_master    probing the GENERATED master      -> UNKNOWN_FATAL
+#     the gui.py defensive music fallback                      -> UNKNOWN_FATAL
+#
+# No exception type raised by `probe_duration` itself could carry that, which is exactly why
+# `AudioProbeError` carries none and the wrapping callers re-type it instead.
+
+
+class AudioProbeError(AudioMixError):
+    """Media/duration probing failed. Context-neutral: carries no batch classification.
+
+    Raised by :func:`probe_duration` for its own four failures (timeout, non-zero ffprobe,
+    unparseable duration, unusable duration) and **nowhere else**. Callers that know what they were
+    probing narrow it into one of the types below; the one caller that deliberately does not is
+    `gui.py`'s defensive music-duration fallback, which maps it conservatively.
+    """
+
+
+class AudioMixInputError(AudioMixError):
+    """A user-supplied voice or SFX input is unusable. Raised by the two preflights."""
+
+
+class AudioMixPlanError(AudioMixError):
+    """Voice placement could not produce a legal plan.
+
+    Reachable only when voice clips exist, and placement feasibility reads only batch-frozen
+    configuration -- see :func:`build_mixed_master`.
+    """
+
+
+class AudioMixExecutionError(AudioMixError):
+    """Producing or verifying the mixed master failed.
+
+    The artifact in question is this render's **own output**, never a user input -- which is why a
+    failure probing the generated master is this type and explicitly not
+    :class:`AudioMixInputError`.
+    """
 
 
 #: Same shape as ffmpeg_processing's poll/grace constants, deliberately a separate pair -- each
@@ -172,6 +252,12 @@ def probe_duration(path: str, lifecycle=None) -> float:
     [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour). Probes
     are short, so this is a boundary check (raise_if_cancelled before starting) plus pass-through,
     not fine-grained polling -- a cancelled render must not begin a new preflight unit.
+
+    [FORK] Digital-Union (C3-R1B-a): all four failures raise :class:`AudioProbeError` -- a *narrower*
+    type than before, so every pre-existing ``except AudioMixError`` still catches them and the
+    messages are unchanged character for character. ``RenderCancelled`` from the boundary check or
+    from ``_run`` still escapes untouched: the only ``except`` here remains the narrow
+    ``subprocess.TimeoutExpired``, which a cancellation is not.
     """
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
@@ -180,16 +266,16 @@ def probe_duration(path: str, lifecycle=None) -> float:
     try:
         result = _run(command, _PROBE_TIMEOUT_SECONDS, lifecycle=lifecycle)
     except subprocess.TimeoutExpired:
-        raise AudioMixError(f"Timed out reading the duration of {os.path.basename(path)}")
+        raise AudioProbeError(f"Timed out reading the duration of {os.path.basename(path)}")
     if result.returncode != 0:
-        raise AudioMixError(
+        raise AudioProbeError(
             f"Could not read {os.path.basename(path)}: {_tail(result.stderr) or 'ffprobe failed'}")
     try:
         duration = float(result.stdout.strip())
     except (TypeError, ValueError):
-        raise AudioMixError(f"Could not read a duration from {os.path.basename(path)}")
+        raise AudioProbeError(f"Could not read a duration from {os.path.basename(path)}")
     if duration != duration or duration in (float("inf"), float("-inf")) or duration <= 0.0:
-        raise AudioMixError(
+        raise AudioProbeError(
             f"{os.path.basename(path)} reports an unusable duration ({result.stdout.strip()})")
     return duration
 
@@ -223,6 +309,13 @@ def prepare_voice_inputs(voice_paths) -> tuple:
     Ordering is applied only once the selection has been validated as a selection, and it is the
     pure module's deterministic path order rather than the browser's. Catching all of this before
     Stage 1 means a fixable input problem costs no analysis.
+
+    [FORK] Digital-Union (C3-R1B-a): every failure is an :class:`AudioMixInputError` -- a statement
+    about the user's selected files, which is what lets `gui.py` map this preflight to
+    ``SHARED_FATAL`` for a C3 batch (the voice selection is frozen for the whole batch and no
+    ``AudioRecipe`` field changes whether this runs or what it validates). A probe failure is
+    wrapped **narrowly** so a ``RenderCancelled`` from inside ``probe_duration`` cannot be re-typed
+    as the user's file being broken.
     """
     selected = _selected_voice_paths(voice_paths)
     if not selected:
@@ -232,7 +325,7 @@ def prepare_voice_inputs(voice_paths) -> tuple:
         if isinstance(raw, os.PathLike):
             raw = os.fspath(raw)
         if not isinstance(raw, str) or not raw.strip():
-            raise AudioMixError(
+            raise AudioMixInputError(
                 f"Voice clip {position} of {len(selected)} is not a usable file path")
 
     usable = [os.fspath(p) if isinstance(p, os.PathLike) else p for p in selected]
@@ -241,19 +334,27 @@ def prepare_voice_inputs(voice_paths) -> tuple:
         # Defensive: the loop above already guarantees every entry is a non-empty string, so this
         # can only fire if the ordering contract changes underneath us. Failing loudly is still
         # better than returning fewer clips than the user chose.
-        raise AudioMixError(
+        raise AudioMixInputError(
             f"Could not order all {len(usable)} selected voice clips")
 
     prepared = []
     for index, path in enumerate(ordered):
         if not fork_audio_mix.has_supported_voice_extension(path):
-            raise AudioMixError(
+            raise AudioMixInputError(
                 f"Voice clip {os.path.basename(path)} is not a supported type "
                 f"({', '.join(fork_audio_mix.SUPPORTED_VOICE_EXTENSIONS)})")
         if not os.path.isfile(path):
-            raise AudioMixError(f"Voice clip is missing or unreadable: {path}")
+            raise AudioMixInputError(f"Voice clip is missing or unreadable: {path}")
+        # [FORK] Digital-Union (C3-R1B-a): `except AudioProbeError`, never `except AudioMixError`
+        # and never `except Exception`. A wide catch here would swallow a cancellation and report
+        # the user's Stop as an unusable voice clip. The message is preserved verbatim and the
+        # original cause is chained.
+        try:
+            duration = probe_duration(path)
+        except AudioProbeError as exc:
+            raise AudioMixInputError(str(exc)) from exc
         prepared.append(fork_audio_mix.VoiceInput(
-            index=index, path=path, duration=probe_duration(path)))
+            index=index, path=path, duration=duration))
     return tuple(prepared)
 
 
@@ -397,6 +498,13 @@ def render_mixed_master(music_path: str, plan, output_path: str,
     matching cancellation raises ``RenderCancelled`` from ``_run`` below; this function's own
     ``except subprocess.TimeoutExpired`` is deliberately narrow and was never broad enough to catch
     it, so cancellation already propagates through this function unchanged.
+
+    [FORK] Digital-Union (C3-R1B-a): every failure is an :class:`AudioMixExecutionError`, including
+    the duration probe of the **generated** master -- that artifact is this render's own output, so
+    a failure reading it is never a statement about a user input. `gui.py` maps this type to
+    ``UNKNOWN_FATAL``: a timeout, a non-zero FFmpeg, a missing/empty file or a drift could all be
+    systemic (binary, disk, driver), and this repository has no structured FFmpeg diagnostic
+    classification to prove otherwise. Nothing is inferred from stderr prose.
     """
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
@@ -405,21 +513,29 @@ def render_mixed_master(music_path: str, plan, output_path: str,
     try:
         result = _run(command, _MIX_TIMEOUT_SECONDS, lifecycle=lifecycle)
     except subprocess.TimeoutExpired:
-        raise AudioMixError("Audio mixdown timed out")
+        raise AudioMixExecutionError("Audio mixdown timed out")
     if result.returncode != 0:
-        raise AudioMixError(f"Audio mixdown failed: {_tail(result.stderr) or 'FFmpeg failed'}")
+        raise AudioMixExecutionError(
+            f"Audio mixdown failed: {_tail(result.stderr) or 'FFmpeg failed'}")
 
     if not os.path.isfile(output_path):
-        raise AudioMixError("Audio mixdown produced no output file")
+        raise AudioMixExecutionError("Audio mixdown produced no output file")
     if os.path.getsize(output_path) <= 0:
-        raise AudioMixError("Audio mixdown produced an empty output file")
+        raise AudioMixExecutionError("Audio mixdown produced an empty output file")
 
-    produced = probe_duration(output_path, lifecycle=lifecycle)
+    # [FORK] Digital-Union (C3-R1B-a): `except AudioProbeError` only. `probe_duration` is handed the
+    # lifecycle here (unchanged from R1A), so a wide catch would convert a user's Stop into an
+    # execution failure -- and in a C3 batch would report a cancelled candidate as a broken mix.
+    try:
+        produced = probe_duration(output_path, lifecycle=lifecycle)
+    except AudioProbeError as exc:
+        raise AudioMixExecutionError(
+            f"Could not verify the mixed master: {exc}") from exc
     drift = abs(produced - plan.music_duration)
     if drift > DURATION_TOLERANCE_SECONDS:
         # Load-bearing: `create_music_video` derives the frame-locked timeline from this file's
         # duration, so a master that is not the music's length would shift every cut.
-        raise AudioMixError(
+        raise AudioMixExecutionError(
             f"Mixed audio is {produced:.3f}s but the music is {plan.music_duration:.3f}s "
             f"({drift * 1000:.1f} ms drift)")
     return output_path
@@ -452,6 +568,17 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     produces one master. ``sfx_level_percent`` rides alongside as execution state.
 
     [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour).
+
+    [FORK] Digital-Union (C3-R1B-a): a :class:`~beatsync_fork.audio_mix.PlacementFailure` becomes an
+    :class:`AudioMixPlanError`, which `gui.py` maps to ``SHARED_FATAL``. That is proven rather than
+    assumed, in two parts. Placement feasibility reads only ``avoid_drops``,
+    ``start_delay_seconds`` and ``min_gap_seconds`` -- all frozen for a whole C3 batch -- while the
+    one candidate-varied ``AudioMixConfig`` field, ``music_under_voice_percent``, reaches only
+    ``config.music_floor`` in the duck model, *after* placement has already succeeded. And
+    ``PlacementFailure`` is returned only from inside ``plan_voice_placements``'s
+    ``for voice in voices:`` loop, so it is unreachable with an empty selection -- meaning it can
+    only fire when the batch-frozen voice selection is non-empty. No candidate recipe can change
+    the outcome.
     """
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
@@ -463,7 +590,7 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
         config=config,
     )
     if isinstance(plan, fork_audio_mix.PlacementFailure):
-        raise AudioMixError(plan.reason)
+        raise AudioMixPlanError(plan.reason)
 
     sfx_placements = tuple(sfx_placements or ())
     if sfx_placements:
@@ -520,14 +647,23 @@ def prepare_sfx_inputs(root, enabled_roles):
     Classification is the pure module's exact alias table on the **first** component under the root.
     Unknown folders, root-level files, disabled roles and unsupported extensions are counted for the
     report and **never probed**.
+
+    [FORK] Digital-Union (C3-R1B-a): every failure is an :class:`AudioMixInputError` -- the same
+    local cause type the voice preflight uses, because both are statements about user-supplied
+    files. The *batch* classification is nevertheless different: `gui.py` maps this preflight to
+    ``CANDIDATE_LOCAL``, because it runs only when ``smart_mix_active``, which requires
+    ``SmartMixConfig.plans_anything``, which requires ``sfx_amount > 0`` -- and ``sfx_amount`` is
+    candidate-specific ``AudioRecipe`` state. A candidate resolving 0 never calls this function at
+    all, so a broken library does not prove every remaining candidate must fail. That is precisely
+    the asymmetry that stops the local cause type from carrying the classification itself.
     """
     if not isinstance(root, str) or not root.strip():
-        raise AudioMixError("Smart Mix: no SFX library folder was given")
+        raise AudioMixInputError("Smart Mix: no SFX library folder was given")
     root = os.path.abspath(root)
     if not os.path.exists(root):
-        raise AudioMixError(f"Smart Mix: SFX library folder does not exist: {root}")
+        raise AudioMixInputError(f"Smart Mix: SFX library folder does not exist: {root}")
     if not os.path.isdir(root):
-        raise AudioMixError(f"Smart Mix: SFX library path is not a folder: {root}")
+        raise AudioMixInputError(f"Smart Mix: SFX library path is not a folder: {root}")
 
     wanted = fork_smart_mix.normalize_roles(enabled_roles)
     unknown_folders = []
@@ -558,7 +694,7 @@ def prepare_sfx_inputs(root, enabled_roles):
                     continue
                 by_role.setdefault(role, []).append(full)
     except OSError as exc:
-        raise AudioMixError(f"Smart Mix: could not read the SFX library: {exc}")
+        raise AudioMixInputError(f"Smart Mix: could not read the SFX library: {exc}")
 
     assets = []
     per_role = []
@@ -567,9 +703,14 @@ def prepare_sfx_inputs(root, enabled_roles):
         per_role.append((role, len(ordered)))
         for path in ordered:
             if not os.path.isfile(path):
-                raise AudioMixError(f"Smart Mix: SFX asset is missing or unreadable: {path}")
+                raise AudioMixInputError(f"Smart Mix: SFX asset is missing or unreadable: {path}")
+            # [FORK] Digital-Union (C3-R1B-a): narrow, same reasoning as the voice preflight's wrap.
+            try:
+                duration = probe_duration(path)
+            except AudioProbeError as exc:
+                raise AudioMixInputError(str(exc)) from exc
             assets.append(fork_smart_mix.SfxAsset(
-                role=role, path=path, duration=probe_duration(path)))
+                role=role, path=path, duration=duration))
 
     diagnostics = fork_smart_mix.SfxLibraryDiagnostics(
         root=root,
@@ -582,7 +723,7 @@ def prepare_sfx_inputs(root, enabled_roles):
     )
 
     if not assets:
-        raise AudioMixError(
+        raise AudioMixInputError(
             "Smart Mix: the SFX library has no usable audio in any enabled role "
             f"({', '.join(sorted(wanted)) or 'none enabled'})")
     return tuple(assets), diagnostics
@@ -603,6 +744,11 @@ __all__ = [
     "MASTER_CODEC",
     "MASTER_SAMPLE_RATE",
     "AudioMixError",
+    # [FORK] Digital-Union (C3-R1B-a): the four local cause types, under the retained base above.
+    "AudioMixExecutionError",
+    "AudioMixInputError",
+    "AudioMixPlanError",
+    "AudioProbeError",
     "build_duck_expression",
     "build_mix_command",
     "build_mixed_master",

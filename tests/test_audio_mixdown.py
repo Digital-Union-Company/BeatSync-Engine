@@ -39,7 +39,13 @@ _MIXDOWN = os.path.join(_REPO_ROOT, "src", "audio_mixdown.py")
 
 #: Everything the suite executes. Module-level constants come along so the bodies see them.
 _EXTRACTED = (
-    "AudioMixError", "_run", "_tail", "probe_duration", "_selected_voice_paths",
+    "AudioMixError",
+    # [FORK] Digital-Union (C3-R1B-a): the four local cause types. Listed here because this tuple
+    # IS the harness's contract -- the `missing` assertion below now also pins that all four exist
+    # at module level, so deleting or renaming one fails loudly instead of resolving to a NameError
+    # the first time some case happens to propagate through an except clause.
+    "AudioProbeError", "AudioMixInputError", "AudioMixPlanError", "AudioMixExecutionError",
+    "_run", "_tail", "probe_duration", "_selected_voice_paths",
     "prepare_voice_inputs", "build_duck_expression", "escape_filter_expression",
     "build_mix_command", "master_path_for", "render_mixed_master", "discard_master",
     "build_mixed_master",

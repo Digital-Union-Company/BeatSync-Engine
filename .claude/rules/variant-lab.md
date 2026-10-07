@@ -435,18 +435,38 @@ generate N  ->  compare N  ->  tick exactly TWO  ->  Render Selected Variants
   itself, so "empty unless a promotion succeeded" is a local property rather than one inherited
   from whichever caller happened to run.
 - **Fail fast, preserve prior success.** A failed candidate stops the batch and deletes nothing.
-  A batch still cannot tell a shared-input failure (which would simply repeat) from a
-  candidate-local one, so it does not try: continue-on-failure waits for **C3-R1B**.
+  Since **C3-R1B-a** the batch *can* tell a shared-input failure from a candidate-local one — every
+  reachable producer names its class and the loop records it — and it deliberately still does not
+  **act** on the distinction: continue-after-`CANDIDATE_LOCAL` waits for **C3-R1B-b**. The loop's
+  stop condition is `candidate_cancelled or not durable`, class-blind by design, and a test asserts
+  the loop contains no `continue` and no test against a specific failure class.
 
   C3-R1A added the *typed outcome model* this bullet used to be waiting for, and deliberately did
   **not** spend it on continuing. `RenderCandidateOutcome.outcome_kind` carries a
   `RenderOutcomeKind`, which is what makes a **cancelled** candidate reportable as cancelled rather
-  than as a failure — a user who pressed Stop must not be told their render broke. R1A produces
-  exactly three of the five causes (`SUCCESS` after the durable promotion, `CANCELLED` from a caught
-  `RenderCancelled`, `CANDIDATE_LOCAL` for an Audio Layers failure) and falls back to
-  `UNKNOWN_FATAL` for everything it has not proven. `SHARED_FATAL` is in the vocabulary with **no
-  producer**: telling shared from local apart is precisely what continuing needs, and that evidence
-  does not exist yet. Do not add a producer for it to unlock R1B by the back door.
+  than as a failure — a user who pressed Stop must not be told their render broke.
+
+  **C3-R1B-a then made the causes truthful, and still did not spend them on continuing.** Two
+  statements that used to live here are now false and are corrected below: `SHARED_FATAL` has real
+  producers, and the batch no longer discards the class. The full producer matrix is
+  `.claude/rules/render-worker.md`; the audio half is `.claude/rules/audio-mixdown.md`. What matters
+  here is the shape:
+
+  ```
+  R1A    every AudioMixError        -> CANDIDATE_LOCAL   (wrong for both reachable causes)
+         eleven producers           -> key left None     -> derived UNKNOWN_FATAL
+         the batch loop             -> CANCELLED or None -> every other class discarded
+         SHARED_FATAL               -> no producer at all
+
+  R1B-a  every reachable producer names its class; SHARED_FATAL has five;
+         the batch loop threads the FULL class into RenderCandidateOutcome
+         -- and the batch STILL STOPS after every non-success candidate.
+  ```
+
+  So the fail-fast behaviour above is unchanged and remains the contract. Continue-after-
+  `CANDIDATE_LOCAL`, rendering three or four candidates, and the selection range are **C3-R1B-b**,
+  separately authorized. `RENDER_SELECTION_SIZE` is still `2`, and a test fails if
+  `RENDER_SELECTION_MIN` / `_MAX` ever appear in `render_batch.py` before that milestone.
 - **Report ownership.** `audio_layers_report` and `smart_mix_report` keep `process_btn.click` as
   their **only** writer; the batch reads them from `session_state` after each candidate and the
   dedicated summary owns multi-render diagnostics. `variant_batch_table` and

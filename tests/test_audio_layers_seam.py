@@ -644,21 +644,49 @@ def _compile_audio_block():
     return namespace["_audio_block"]
 
 
-def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None):
-    """Execute the REAL extracted audio region; return (state, calls, error_message)."""
+def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None,
+                          mix_error_type="execution"):
+    """Execute the REAL extracted audio region; return (state, calls, error_message).
+
+    [FORK] Digital-Union (C3-R1B-a): the stub module now carries the **real shape** of the audio
+    exception hierarchy, because the extracted region names `AudioMixPlanError` and
+    `AudioProbeError` in `except` clauses and the whole point of those clauses is that they are
+    discriminated by TYPE. A stub exposing only `AudioMixError` would let the region's mapping drift
+    without this harness noticing -- exactly the reasoning already recorded below for using the real
+    `RenderOutcomeKind` rather than a stub enum.
+
+    ``mix_error_type`` selects which type `build_mixed_master` raises: ``"plan"`` for a voice
+    placement failure (mapped SHARED_FATAL) or ``"execution"`` for anything else (UNKNOWN_FATAL).
+    """
     calls = []
 
     class Err(Exception):
         pass
 
+    class ProbeErr(Err):
+        pass
+
+    class InputErr(Err):
+        pass
+
+    class PlanErr(Err):
+        pass
+
+    class ExecErr(Err):
+        pass
+
     class FakeMixdown:
         AudioMixError = Err
+        AudioProbeError = ProbeErr
+        AudioMixInputError = InputErr
+        AudioMixPlanError = PlanErr
+        AudioMixExecutionError = ExecErr
 
         @staticmethod
         def prepare_voice_inputs(selection):
             calls.append(("prepare", selection))
             if isinstance(voice_result, BaseException):
-                raise Err(str(voice_result))
+                raise InputErr(str(voice_result))
             return voice_result
 
         @staticmethod
@@ -670,7 +698,7 @@ def _run_report_lifecycle(voice_files, voice_result, plan=None, mix_error=None):
         def build_mixed_master(**kwargs):
             calls.append(("mix", kwargs))
             if mix_error is not None:
-                raise Err(str(mix_error))
+                raise (PlanErr if mix_error_type == "plan" else ExecErr)(str(mix_error))
             return "C:/session/mix.wav", plan
 
     state = {"audio_layers_report": "STALE REPORT FROM A PREVIOUS RENDER"}
@@ -755,6 +783,32 @@ def test_a_mix_failure_leaves_no_stale_report():
     assert state["audio_layers_report"] == ''
     assert "mixdown failed" in error
     assert "mix" in [kind for kind, _ in calls]
+    # [C3-R1B-a] an execution failure is systemic-or-unproven: FFmpeg, disk and driver faults are
+    # indistinguishable here, so it fails closed. R1A recorded CANDIDATE_LOCAL for every
+    # AudioMixError, which was wrong for this cause.
+    assert state["render_outcome_kind"] is fork_render_worker.RenderOutcomeKind.UNKNOWN_FATAL
+
+
+def test_a_voice_placement_failure_is_shared_not_candidate_local():
+    """[C3-R1B-a] The correction R1A got wrong, pinned at the real seam.
+
+    Placement feasibility reads only `avoid_drops`, `start_delay_seconds` and `min_gap_seconds` --
+    all frozen for a whole C3 batch -- while the one value a candidate varies,
+    `music_under_voice_percent`, reaches only the duck floor *after* placement succeeded. And
+    `PlacementFailure` is returned only from inside `plan_voice_placements`'s `for voice in voices:`
+    loop, so it cannot fire with an empty (batch-frozen) voice selection. No candidate recipe can
+    change the outcome, so continuing to the next candidate could only waste a render.
+    """
+    state, calls, error = _run_report_lifecycle(
+        ["a.wav"], ("v1",),
+        mix_error=AssertionError("Voice 1 (50.0s) has no legal placement after 2.0s"),
+        mix_error_type="plan")
+    assert state["audio_layers_report"] == ''
+    assert "no legal placement" in error
+    assert "mix" in [kind for kind, _ in calls]
+    assert state["render_outcome_kind"] is fork_render_worker.RenderOutcomeKind.SHARED_FATAL
+    assert state["render_outcome_kind"] is not \
+        fork_render_worker.RenderOutcomeKind.CANDIDATE_LOCAL
 
 
 def test_the_report_is_cleared_before_the_gate_and_before_the_attempt():

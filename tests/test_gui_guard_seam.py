@@ -25,6 +25,7 @@ import sys
 import pytest
 from conftest import write_file
 
+import beatsync_fork.render_worker as fork_render_worker
 from beatsync_fork.input_confirmation import SourceMode
 from beatsync_fork.input_session import (
     confirm_action,
@@ -728,10 +729,17 @@ def test_the_batch_stops_on_the_first_failed_or_cancelled_candidate():
                       "'error' in last_status", "status.startswith"):
         assert forbidden not in body, f"success inferred from {forbidden}"
 
-    # [C3-R1A] the cancelled cause is typed, and read from the one key that carries it
-    assert ("candidate_cancelled = (session_state or {}).get(RENDER_OUTCOME_KEY) "
-            "is RenderOutcomeKind.CANCELLED") in body.replace("\n", "").replace("    ", ""), body
-    assert "outcome_kind=RenderOutcomeKind.CANCELLED if candidate_cancelled else None" in body
+    # [C3-R1A] the cancelled cause is typed, and read from the one key that carries it.
+    # [C3-R1B-a] and the loop now preserves the FULL class rather than only CANCELLED: the class is
+    # read once off RENDER_OUTCOME_KEY and threaded into the outcome, so CANDIDATE_LOCAL,
+    # SHARED_FATAL and UNKNOWN_FATAL survive instead of collapsing to None.
+    flat = body.replace("\n", "").replace("    ", "")
+    assert "candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)" in flat, body
+    assert "candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED" in flat, body
+    assert "outcome_kind=candidate_kind if" in flat, body
+    # the R1A shape must be GONE -- it is what discarded every class except CANCELLED
+    assert "outcome_kind=RenderOutcomeKind.CANCELLED if candidate_cancelled else None" not in flat, \
+        "the batch reverted to preserving only CANCELLED and discarding the other typed classes"
     for inferred in ("'Cancelled' in last_status", "'⏹' in last_status",
                      "last_status.startswith", "cancelled = not durable"):
         assert inferred not in body, f"cancellation inferred from {inferred}"
@@ -821,7 +829,10 @@ def test_the_exact_output_path_is_checked_before_any_analysis():
 def test_the_final_promotion_is_one_owned_no_replace_helper():
     """One helper owns durable promotion, and the destructive primitives are gone from gui.py."""
     impl = _gui_body("_process_video_impl")
-    assert f"promotion_error = {PROMOTION_HELPER}(result_path, output_path)" in impl
+    # [FORK] Digital-Union (C3-R1B-a): the helper returns (message, outcome_kind), so the call site
+    # unpacks a pair. Still exactly ONE call site and ONE definition, asserted below.
+    assert (f"promotion_error, promotion_kind = {PROMOTION_HELPER}"
+            f"(result_path, output_path)") in impl
 
     # exactly one promotion call site, and exactly one helper definition
     source = _gui_source()
@@ -865,7 +876,7 @@ def test_the_promotion_is_not_preceded_by_an_exists_check():
     """The rename IS the authority. `exists()` then `rename()` would be the old TOCTOU pair with
     a new primitive — correct-looking and still racy."""
     body = _gui_body("_process_video_impl")
-    between = body[body.index("create_music_video("):body.index("promotion_error = ")]
+    between = body[body.index("create_music_video("):body.index("promotion_error, promotion_kind")]
     assert "os.path.exists(output_path)" not in between, \
         "a second exists() check reappeared immediately before the promotion"
     # exactly one exists() check against the final path survives: the early one
@@ -942,9 +953,15 @@ class _OsShim:
 
 
 def _load_promotion_helper(rename):
-    """Execute the REAL `_promote_output_no_replace` body from `gui.py` over a controlled `os`."""
+    """Execute the REAL `_promote_output_no_replace` body from `gui.py` over a controlled `os`.
+
+    [FORK] Digital-Union (C3-R1B-a): the helper now names `RenderOutcomeKind`, so the synthesised
+    namespace supplies the REAL enum from the fork module -- never a stub, so these cases pin the
+    actual members the GUI will store.
+    """
     node = _gui_func(PROMOTION_HELPER)
-    namespace = {"os": _OsShim(rename), "errno": errno}
+    namespace = {"os": _OsShim(rename), "errno": errno,
+                 "RenderOutcomeKind": fork_render_worker.RenderOutcomeKind}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<gui>", "exec"), namespace)
     return namespace[PROMOTION_HELPER]
 
@@ -971,7 +988,10 @@ def test_the_helper_promotes_and_reports_success_when_the_destination_is_free(tm
     dest = str(tmp_path / "out" / "clip.mp4")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-    assert promote(temp, dest) == "", "success is the empty string, never prose"
+    # [FORK] Digital-Union (C3-R1B-a): success is ('', None) -- no prose AND no failure class, so a
+    # successful promotion can never contribute an outcome kind of its own. SUCCESS is still
+    # written by the caller, after this returns.
+    assert promote(temp, dest) == ("", None), "success is empty message + no kind, never prose"
     assert open(dest, "rb").read() == b"NEW"
     assert not os.path.exists(temp), "a successful promotion consumes the temp"
 
@@ -981,13 +1001,17 @@ def test_the_helper_refuses_a_collision_and_preserves_both_files(tmp_path):
     temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
     dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
 
-    message = promote(temp, dest)
+    message, kind = promote(temp, dest)
     assert message, "a collision must report failure"
     assert open(dest, "rb").read() == b"OLD", "the existing durable output was replaced"
     assert open(temp, "rb").read() == b"NEW", "the new render was discarded"
     assert dest in message and temp in message, \
         "the message must name both the occupied destination and the retained render"
     assert "preserved" in message.lower()
+    # [FORK] Digital-Union (C3-R1B-a): the destination name carries the candidate index and master,
+    # and `RenderBatchRequest.__post_init__` asserts stems are distinct, so no other selected
+    # candidate can compute this path -- the collision is candidate-local.
+    assert kind is fork_render_worker.RenderOutcomeKind.CANDIDATE_LOCAL
 
 
 def test_the_helper_fails_closed_on_a_cross_volume_destination(tmp_path):
@@ -996,12 +1020,16 @@ def test_the_helper_fails_closed_on_a_cross_volume_destination(tmp_path):
     temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
     dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
 
-    message = promote(temp, dest)
+    message, kind = promote(temp, dest)
     assert message
     assert open(dest, "rb").read() == b"OLD", "the destination was touched"
     assert open(temp, "rb").read() == b"NEW", "the temp render must be retained"
     assert temp in message and dest in message
     assert "volume" in message.lower()
+    # [FORK] Digital-Union (C3-R1B-a): `session_dir` and `get_output_dir()` are process-global, so
+    # every remaining candidate promotes between the identical volume pair and fails identically.
+    # This is one of SHARED_FATAL's real producers.
+    assert kind is fork_render_worker.RenderOutcomeKind.SHARED_FATAL
 
 
 def test_the_helper_fails_closed_on_any_other_os_error(tmp_path):
@@ -1013,11 +1041,14 @@ def test_the_helper_fails_closed_on_any_other_os_error(tmp_path):
     temp = write_file(str(tmp_path / "session" / "clip.mp4"), b"NEW")
     dest = write_file(str(tmp_path / "out" / "clip.mp4"), b"OLD")
 
-    message = promote(temp, dest)
+    message, kind = promote(temp, dest)
     assert message
     assert open(dest, "rb").read() == b"OLD"
     assert open(temp, "rb").read() == b"NEW"
     assert temp in message
+    # [FORK] Digital-Union (C3-R1B-a): a permission or I/O error proves nothing about the other
+    # candidates, so it fails closed rather than claiming either specific class.
+    assert kind is fork_render_worker.RenderOutcomeKind.UNKNOWN_FATAL
 
 
 @pytest.mark.skipif(sys.platform != "win32",
@@ -1033,16 +1064,19 @@ def test_the_real_windows_rename_refuses_an_existing_destination(tmp_path):
     free_temp = write_file(str(tmp_path / "s" / "a.mp4"), b"NEW")
     free_dest = str(tmp_path / "o" / "a.mp4")
     os.makedirs(os.path.dirname(free_dest), exist_ok=True)
-    assert promote(free_temp, free_dest) == ""
+    assert promote(free_temp, free_dest) == ("", None)
     assert open(free_dest, "rb").read() == b"NEW"
     assert not os.path.exists(free_temp)
 
     occupied_temp = write_file(str(tmp_path / "s" / "b.mp4"), b"NEW")
     occupied_dest = write_file(str(tmp_path / "o" / "b.mp4"), b"OLD")
-    message = promote(occupied_temp, occupied_dest)
+    message, kind = promote(occupied_temp, occupied_dest)
     assert message, "real Windows os.rename did not refuse an existing destination"
     assert open(occupied_dest, "rb").read() == b"OLD"
     assert open(occupied_temp, "rb").read() == b"NEW"
+    # [FORK] Digital-Union (C3-R1B-a): the REAL platform FileExistsError, not a stand-in, classified
+    # CANDIDATE_LOCAL -- so the one Windows-only case pins the typed cause too.
+    assert kind is fork_render_worker.RenderOutcomeKind.CANDIDATE_LOCAL
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1094,14 @@ def test_the_real_windows_rename_refuses_an_existing_destination(tmp_path):
 
 class _StubAudioMixdown:
     AudioMixError = type("AudioMixError", (Exception,), {})
+    # [FORK] Digital-Union (C3-R1B-a): the extracted body names these in `except` clauses. None of
+    # the cases below reaches them, so Python would never resolve the names -- which is exactly how
+    # the C3-R1A harness nearly shipped a latent NameError. Completed deliberately rather than left
+    # to luck, mirroring `test_audio_mixdown.py`'s own note on the same hazard.
+    AudioProbeError = type("AudioProbeError", (AudioMixError,), {})
+    AudioMixInputError = type("AudioMixInputError", (AudioMixError,), {})
+    AudioMixPlanError = type("AudioMixPlanError", (AudioMixError,), {})
+    AudioMixExecutionError = type("AudioMixExecutionError", (AudioMixError,), {})
 
     @staticmethod
     def discard_master(path):
@@ -1171,9 +1213,13 @@ def test_an_existing_output_is_refused_before_any_expensive_work(tmp_path):
     assert open(os.path.join(out_dir, produced[0]), "rb").read() == b"OLD", \
         "the user's existing output was replaced"
     assert state["last_output_path"] == "", "a refusal must not record a durable output"
-    # [C3-R1A] and it must not record a SUCCESS either. `None` is the conservative answer: this
-    # boundary proved an occupied destination, not which class of cause that belongs to.
-    assert state["render_outcome_kind"] is None
+    # [C3-R1A] and it must not record a SUCCESS either.
+    # [C3-R1B-a] R1A left this `None`, which derived to UNKNOWN_FATAL downstream. The cause IS
+    # provable: `output_path` is built from this candidate's own stem (request tag + `_cNN_m<master>`)
+    # and `RenderBatchRequest.__post_init__` asserts the stems in a batch are distinct, so no other
+    # selected candidate can compute this name. CANDIDATE_LOCAL is stricter than `None`.
+    assert state["render_outcome_kind"] is fork_render_worker.RenderOutcomeKind.CANDIDATE_LOCAL
+    assert state["render_outcome_kind"] is not fork_render_worker.RenderOutcomeKind.SUCCESS
 
 
 def test_a_destination_that_appears_during_the_render_is_not_overwritten(tmp_path):
@@ -1194,9 +1240,13 @@ def test_a_destination_that_appears_during_the_render_is_not_overwritten(tmp_pat
     assert destination in status and os.path.join(session_dir, retained[0]) in status, \
         "the failure must name both the occupied destination and the retained render"
     assert state["last_output_path"] == ""
-    # [C3-R1A] a promotion failure is a proven fatal, classified conservatively — never SUCCESS.
+    # [C3-R1A] a promotion failure is a proven fatal — never SUCCESS.
+    # [C3-R1B-a] and the three promotion branches no longer share one conservative class. A
+    # destination that appeared DURING the render is a `FileExistsError` on a candidate-unique
+    # name, so it is CANDIDATE_LOCAL. Stricter than the previous UNKNOWN_FATAL.
     import beatsync_fork.render_worker as _rw
-    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.UNKNOWN_FATAL
+    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.CANDIDATE_LOCAL
+    assert state["render_outcome_kind"] is not _rw.RenderOutcomeKind.SUCCESS
 
 
 def test_a_clean_promotion_moves_the_render_and_records_it(tmp_path):
@@ -1235,8 +1285,12 @@ def test_a_cross_volume_destination_fails_closed_without_copying(tmp_path):
         open(os.path.join(session_dir, retained[0]), "rb").read() == b"NEW"
     assert "volume" in status.lower()
     assert state["last_output_path"] == ""
+    # [C3-R1B-a] EXDEV is SHARED_FATAL: `session_dir` and `get_output_dir()` are process-global, so
+    # every remaining candidate promotes between the identical volume pair. Stricter than the
+    # previous UNKNOWN_FATAL, and one of SHARED_FATAL's real producers.
     import beatsync_fork.render_worker as _rw
-    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.UNKNOWN_FATAL
+    assert state["render_outcome_kind"] is _rw.RenderOutcomeKind.SHARED_FATAL
+    assert state["render_outcome_kind"] is not _rw.RenderOutcomeKind.SUCCESS
 
 
 def test_a_variation_seed_still_names_its_own_file(tmp_path):

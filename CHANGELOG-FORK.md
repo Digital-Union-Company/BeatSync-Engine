@@ -20,6 +20,89 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-07 (C3-R1B-a — truthful failure classification)
+
+**The render path now names why it failed, and that is *all* it does.** C3-R1A shipped the
+five-member `RenderOutcomeKind` vocabulary with producers that were not truthful. R1B-a fixes the
+foundation and changes **no** continuation policy:
+
+```
+before R1B-a    failure -> stop
+after  R1B-a    failure -> record the truthful cause -> still stop
+```
+
+That zero-policy-change property is load-bearing. `RENDER_SELECTION_SIZE` is still **2**, there is no
+3+ candidate rendering, and there is no continue-after-`CANDIDATE_LOCAL`. Those are **C3-R1B-b**,
+separately authorized.
+
+What R1A actually did, and why each part was wrong:
+
+```
+every AudioMixError   -> CANDIDATE_LOCAL   wrong for BOTH causes that reach that handler
+eleven producers      -> key left None     -> silently derived UNKNOWN_FATAL downstream
+the batch loop        -> CANCELLED or None -> every other proven class discarded
+SHARED_FATAL          -> no producer at all
+```
+
+- **`src/audio_mixdown.py` gained four local cause types under the retained `AudioMixError` base** —
+  `AudioProbeError`, `AudioMixInputError`, `AudioMixPlanError`, `AudioMixExecutionError`. Every
+  pre-existing `except audio_mixdown.AudioMixError` still catches exactly what it caught before, and
+  every message is unchanged character for character: `tests/test_audio_mixdown.py`'s 125 cases pass
+  with **no assertion changed**.
+- **The cause types deliberately carry no `RenderOutcomeKind`.** The module cannot know whether it
+  is running a single render, candidate 1 or candidate 4, so it cannot answer "would every remaining
+  candidate fail the same way?". The measured reason this matters: `probe_duration` has four
+  production call sites, and the *same four* internal failures resolve to **three different**
+  classes depending on the caller. A test asserts the module's executable code never references
+  `RenderOutcomeKind`, `RENDER_OUTCOME_KEY` or `session_state`.
+- **`SHARED_FATAL` has five real producers**, each proven by showing nothing the candidate resolves
+  is an input to the outcome: the live source-gate refusal, the six primary audio/video selection
+  failures, the voice preflight, `AudioMixPlanError`, and an `errno.EXDEV` durable promotion.
+- **Two R1A classifications were corrected, in opposite directions.** A voice `PlacementFailure` is
+  **SHARED**, not candidate-local: `plan_voice_placements` reads only `avoid_drops`,
+  `start_delay_seconds` and `min_gap_seconds`, all batch-frozen, while the one candidate-varied
+  field reaches the duck floor *after* placement succeeded — and it is unreachable with an empty
+  voice selection. Conversely the **SFX preflight is CANDIDATE_LOCAL** even though its root and roles
+  are frozen, because *reachability* is candidate state: `smart_mix_active` requires
+  `sfx_amount > 0`. Measured through the real resolvers — root master 92, spread 100, full range,
+  four candidates — amounts resolve **87 / 87 / 0 / 79**, so with a broken SFX library candidate 3
+  renders fine. `SmartMixStructureError` is CANDIDATE_LOCAL for the identical reason; shared
+  `beat_info` data does not make a shared *failure* when a candidate can avoid the operation.
+- **Every wrapping catch is narrow — `except AudioProbeError`, never `AudioMixError` or `Exception`.**
+  A wide catch would swallow a `RenderCancelled` from inside `probe_duration` and report a user's
+  Stop as a broken voice clip or a failed mix. `RenderCancelled` is still not an `AudioMixError`,
+  `build_mixed_master` keeps both cleanup clauses, and the original probe cause is chained with
+  `from exc` so nothing downstream has to read a message.
+- **`_promote_output_no_replace()` returns `(message, outcome_kind)`.** Its three branches were
+  already structurally separate, so this added no logic: `FileExistsError` → `CANDIDATE_LOCAL` (the
+  destination name carries the candidate index and master), `errno.EXDEV` → `SHARED_FATAL`
+  (`session_dir` and `output/` are process-global), any other `OSError` → `UNKNOWN_FATAL`. One
+  atomic no-replace `os.rename`, no deletion, no copy fallback, no `exists()` pre-check — all
+  unchanged — and **the SUCCESS commit point did not move.**
+- **The batch loop preserves the full class** instead of only `CANCELLED`, taken solely from
+  `RENDER_OUTCOME_KEY` and passed through only when it agrees with `bool(durable)`, which remains
+  the sole success authority. **The stop condition is unchanged and class-blind.**
+- **The defensive original-music fallback probe is `UNKNOWN_FATAL`, unconditionally.** It is
+  unreachable in current production — `analyze_beats_auto` guards `y.size == 0` and then sets
+  `audio_duration = len(y) / sr`, strictly positive — so this is a frozen forward-safe decision
+  rather than a measurement. It was hoisted out of the `build_mixed_master(...)` argument list only
+  because an exception inside an argument expression cannot be caught separately from the call it
+  feeds; the short-circuit is reproduced exactly and the call still takes no `lifecycle`.
+- **No class is ever derived from prose.** Every assignment to `RENDER_OUTCOME_KEY` names an enum
+  member explicitly, and a test asserts `gui.py` contains no status-text inspection.
+- **`tests/test_render_failure_classification.py` is new** (70 cases) and pins the whole
+  producer → class matrix, including the root-92 reachability fixture, the real `_process_video_impl`
+  executed end to end for the collision / shared-input / success rows, and the real batch loop
+  executed to prove each class survives into `RenderCandidateOutcome` **and** that every class still
+  stops the batch. Six mutations were demonstrated to fail the permanent guards and restored
+  byte-exactly (SHA-256 verified).
+- **Not modified:** `render_worker.py` (five members were always enough; producers were what was
+  missing), `smart_mix.py`, `audio_mix.py`, `video_processor.py`, `ffmpeg_processing.py`,
+  `auto_mode/*`, `video_analysis.py`, `ui_content.py`, `stage_cache.py`, `variant_batch.py`.
+  `render_batch.py` received a docstring correction only — no executable change.
+  `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION` and `L2_CACHE_VERSION` are untouched, and
+  cancellation behaviour is byte-for-byte unchanged.
+
 ### Added — 2026-10-07 (C3-R1A — render lifecycle and cancellation)
 
 **A render can be stopped.** One **Cancel Active Render** button stops whichever render is running —

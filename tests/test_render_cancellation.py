@@ -1335,7 +1335,12 @@ def test_success_is_written_exactly_once_and_only_after_the_promotion():
         "the key must be cleared before anything else"
     assert impl.index("session_state[LAST_OUTPUT_PATH_KEY] = output_path") < \
         impl.index("session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS")
-    assert impl.index("promotion_error = _promote_output_no_replace(result_path, output_path)") < \
+    # [C3-R1B-a] the helper returns (message, outcome_kind), so the call site unpacks a pair. The
+    # invariant under test is unchanged and still the point: SUCCESS is written only AFTER the
+    # promotion returned, so the commit point did not move.
+    assert impl.index(
+        "promotion_error, promotion_kind = _promote_output_no_replace"
+        "(result_path, output_path)") < \
         impl.index("session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS")
 
 
