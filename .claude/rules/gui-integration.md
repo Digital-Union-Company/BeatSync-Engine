@@ -75,13 +75,22 @@ automatically.
   owns multi-render diagnostics so no panel can describe a candidate the user is not looking at.
 
   **Since C3-R1B-a the batch also reads the FULL typed class** off
-  `session_state[RENDER_OUTCOME_KEY]` and threads it into `RenderCandidateOutcome.outcome_kind`.
-  R1A read that key only to spot `CANCELLED`, so `CANDIDATE_LOCAL` was produced and discarded and
-  every other class collapsed to `None`. Two properties hold together and must stay that way: the
-  class comes **only** from that key (never from the status text, the durable path, a message prefix
-  or an emoji), and `durable` remains the sole success authority — the loop passes the class through
-  only when it *agrees* with `bool(durable)`, otherwise falling back to the conservative derivation,
-  because `RenderCandidateOutcome.__post_init__` treats a disagreement as a real contradiction.
+  `session_state[RENDER_OUTCOME_KEY]` and passes it to `RenderCandidateOutcome.outcome_kind`
+  **unchanged** — `outcome_kind=candidate_kind`, with no filter in between. R1A read that key only
+  to spot `CANCELLED`, so `CANDIDATE_LOCAL` was produced and discarded and every other class
+  collapsed to `None`. The class comes **only** from that key: never from the status text, the
+  durable path, a message prefix or an emoji.
+
+  **An explicit contradiction must be loud, and the batch must not sanitize it.** `durable` remains
+  the sole success authority, and `RenderCandidateOutcome.__post_init__` raises `ValueError` when
+  `success` and `outcome_kind` disagree. A draft of R1B-a wrapped the hand-off in an agreement test
+  and substituted `None` on disagreement; that defeated the very invariant the model exists to
+  enforce *and* then let the conservative derivation publish a different class than the producer
+  named — laundering a broken producer contract into a plausible-looking outcome, and leaving
+  C3-R1B-b to decide continuation on a class nobody verified. The filter is gone and a structural
+  test forbids it returning. Conservative derivation is reserved for the one case that proves
+  nothing: `candidate_kind is None`, a producer that never classified itself.
+
   **The stop condition is deliberately class-blind** (`candidate_cancelled or not durable`): R1B-a
   records the cause and changes no policy, so the batch still stops after every non-success
   candidate. A `continue` keyed on `CANDIDATE_LOCAL` is C3-R1B-b, and a test fails if one appears.

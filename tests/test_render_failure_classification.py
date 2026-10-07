@@ -502,7 +502,13 @@ def test_an_empty_master_is_an_execution_error(tmp_path):
 
 def test_a_generated_master_probe_failure_is_an_execution_error_not_an_input_error(tmp_path):
     """**Explicitly not `AudioMixInputError`.** The artifact is this render's own output, so a
-    failure reading it is never a statement about something the user supplied."""
+    failure reading it is never a statement about something the user supplied.
+
+    [C3-R1B-a / R2] And the **displayed reason is byte-equivalent to the cause**. R1B-a is
+    classification-only: the type changes, the text the user reads must not. R1 prefixed this with
+    "Could not verify the mixed master: " while the milestone claimed no user-facing message
+    changed; R2 restores the probe's own wording. The cause stays chained for diagnostics.
+    """
     out = tmp_path / "out.wav"
     out.write_bytes(b"RIFF")
     mix = load_mixdown(FakeSubprocess([
@@ -511,8 +517,41 @@ def test_a_generated_master_probe_failure_is_an_execution_error_not_an_input_err
     ]))
     with pytest.raises(mix.AudioMixExecutionError) as excinfo:
         mix.render_mixed_master("m.mp3", _mix_plan(), str(out))
-    assert isinstance(excinfo.value.__cause__, mix.AudioProbeError)
-    assert not isinstance(excinfo.value, mix.AudioMixInputError)
+    wrapper = excinfo.value
+    cause = wrapper.__cause__
+    assert isinstance(cause, mix.AudioProbeError)
+    assert not isinstance(wrapper, mix.AudioMixInputError)
+    # the whole of §9: same reason, different type
+    assert str(wrapper) == str(cause), \
+        f"the displayed reason changed: {str(wrapper)!r} != {str(cause)!r}"
+    assert "Could not read" in str(wrapper), str(wrapper)
+    assert "verify the mixed master" not in str(wrapper), \
+        "R1's added prefix is back -- that is a user-facing change in a classification-only milestone"
+
+
+def test_no_audio_wrapper_alters_the_reason_the_user_reads():
+    """All three narrow wraps must preserve their cause's text exactly.
+
+    A wrap exists to change the *type* so `gui.py` can classify. The moment one also rewrites the
+    message, R1B-a stops being classification-only — and a reader comparing the panel against the
+    base would see a difference this milestone promised not to introduce.
+    """
+    fn_source = open(_MIXDOWN, encoding="utf-8").read()
+    tree = ast.parse(fn_source)
+    wrapped = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if node.type is None or "AudioProbeError" not in ast.unparse(node.type):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Raise) and inner.exc is not None:
+                wrapped.append(ast.unparse(inner))
+    assert len(wrapped) == 3, wrapped
+    for rendered in wrapped:
+        assert "str(exc)" in rendered, \
+            f"a wrap rewrites its cause's message instead of forwarding it: {rendered}"
+        assert "from exc" in rendered, f"the cause is not chained: {rendered}"
 
 
 def test_a_duration_drift_is_an_execution_error(tmp_path):
@@ -831,24 +870,59 @@ def test_the_real_impl_records_success_only_after_a_clean_promotion(tmp_path):
 # ===========================================================================
 
 
+class _BatchRun:
+    """What one real batch execution actually produced.
+
+    `captured` holds the genuine `RenderCandidateOutcome` objects the batch body constructed -- not
+    reconstructions. That distinction is the whole point of this harness: a test that builds its own
+    outcome afterwards and asserts on *that* passes even when the loop discarded the class, which is
+    exactly the gap R2 closes.
+    """
+
+    def __init__(self):
+        self.captured = []
+        self.attempted = 0
+        self.final = None
+
+    @property
+    def kinds(self):
+        return [o.outcome_kind for o in self.captured]
+
+
 def _run_batch(kinds, durables):
-    """Execute the REAL `render_selected_variants_guarded` over stub runtime globals.
+    """Execute the REAL `render_selected_variants_guarded`, capturing every outcome it constructs.
 
     Each entry of `kinds` is the class the candidate's render writes onto `RENDER_OUTCOME_KEY`, and
-    `durables` whether it produced a durable file. Returns (RenderBatchOutcome, attempted_count).
+    `durables` whether it produced a durable file. The namespace receives a thin PROXY around
+    `fork_render_batch` whose `RenderCandidateOutcome` records each constructed instance and then
+    delegates to the real class unchanged -- so the model's own `__post_init__` validation still
+    runs, and a contradiction still raises out of this call.
     """
     import threading
     import uuid as _uuid
 
-    attempted = []
+    run = _BatchRun()
 
     class _Skip:
         def __repr__(self):
             return "<skip>"
 
+    def capturing_outcome(*args, **kwargs):
+        # The REAL class, constructed with the REAL arguments the batch body passed. If
+        # `__post_init__` raises, it raises here and propagates -- nothing is swallowed.
+        outcome = fork_render_batch.RenderCandidateOutcome(*args, **kwargs)
+        run.captured.append(outcome)
+        return outcome
+
+    proxy = types.SimpleNamespace(
+        RenderCandidateOutcome=capturing_outcome,
+        RenderBatchOutcome=fork_render_batch.RenderBatchOutcome,
+        build_request=fork_render_batch.build_request,
+    )
+
     def guarded_unlocked(*args, **kwargs):
-        index = len(attempted)
-        attempted.append(index)
+        index = run.attempted
+        run.attempted += 1
         session_state = args[24]
 
         def stream():
@@ -865,7 +939,7 @@ def _run_batch(kinds, durables):
         "gr": types.SimpleNamespace(skip=_Skip),
         "uuid": _uuid,
         "threading": threading,
-        "fork_render_batch": fork_render_batch,
+        "fork_render_batch": proxy,
         "RenderLifecycle": fork_render_worker.RenderLifecycle,
         "RenderLifecycleState": fork_render_worker.RenderLifecycleState,
         "RenderOutcomeKind": KIND,
@@ -889,11 +963,18 @@ def _run_batch(kinds, durables):
     stream = namespace["render_selected_variants_guarded"](
         batch, [0, 1], "track.mp3", None, 2.0, 1.0, True, "", fork_smart_mix.ROLE_ORDER,
         "folder", "C:/src", False, None, "music_video", "h264", 30.0, session_state, None)
-    final = None
-    for final in stream:
+    for run.final in stream:
         pass
-    # rebuild the outcome from the batch's own formatter inputs: the last yield carries the summary
-    return final, len(attempted)
+    return run
+
+
+def test_the_capture_harness_really_observes_the_batch_body():
+    """Self-check. If the proxy were never reached, every assertion below would be vacuous."""
+    run = _run_batch([KIND.SUCCESS, KIND.SUCCESS], [True, True])
+    assert run.attempted == 2, "both candidates must have been rendered"
+    assert len(run.captured) == 2, "the batch body must have constructed two outcomes"
+    assert all(isinstance(o, fork_render_batch.RenderCandidateOutcome) for o in run.captured)
+    assert "2 / 2 succeeded" in run.final[1], run.final[1]
 
 
 @pytest.mark.parametrize("kind", [
@@ -902,26 +983,102 @@ def _run_batch(kinds, durables):
     KIND.UNKNOWN_FATAL,
 ])
 def test_the_batch_preserves_every_failure_class_on_the_candidate_outcome(kind):
-    """R1A recorded `CANCELLED if cancelled else None`, so these three were thrown away."""
-    final, attempted = _run_batch([kind, None], [False, False])
-    summary = final[3]
-    assert attempted == 1, "the batch must stop after the first failed candidate"
-    assert "1 candidate(s) not attempted" in summary or "not attempted" in summary, summary
-    # the class really reached the outcome record
-    outcome = fork_render_batch.RenderCandidateOutcome(
-        candidate_index=0, candidate_master_seed=1, variation_seed=2,
-        success=False, outcome_kind=kind)
-    assert outcome.outcome_kind is kind
+    """The producer's class must arrive on the ACTUAL outcome the batch body built.
+
+    R1A recorded `CANCELLED if cancelled else None`, so these three were thrown away; R1 then
+    re-introduced a disagreement filter that could substitute `None` again. This asserts the
+    captured object, so neither shape can pass.
+    """
+    run = _run_batch([kind, None], [False, False])
+    assert run.attempted == 1, "the batch must stop after the first failed candidate"
+    assert len(run.captured) == 1
+    assert run.captured[0].outcome_kind is kind, \
+        f"the batch published {run.captured[0].outcome_kind} instead of the producer's {kind}"
+    assert run.captured[0].success is False
+    assert "not attempted" in run.final[3], run.final[3]
 
 
-def test_the_batch_preserves_success_and_cancelled_too():
-    final, attempted = _run_batch([KIND.SUCCESS, KIND.SUCCESS], [True, True])
-    assert attempted == 2
-    assert "2 / 2 succeeded" in final[1], final[1]
+def test_the_batch_preserves_cancelled_on_the_candidate_outcome():
+    run = _run_batch([KIND.CANCELLED, None], [False, False])
+    assert run.attempted == 1
+    assert run.captured[0].outcome_kind is KIND.CANCELLED
+    assert run.captured[0].cancelled is True
+    assert "CANCELLED" in run.final[3], run.final[3]
 
-    final, attempted = _run_batch([KIND.CANCELLED, None], [False, False])
-    assert attempted == 1
-    assert "CANCELLED" in final[3], final[3]
+
+def test_the_batch_preserves_success_on_the_candidate_outcome():
+    run = _run_batch([KIND.SUCCESS, KIND.SUCCESS], [True, True])
+    assert run.attempted == 2
+    assert run.kinds == [KIND.SUCCESS, KIND.SUCCESS]
+    assert all(o.success for o in run.captured)
+    assert [o.durable_output_path for o in run.captured] == \
+        ["C:/output/candidate0.mp4", "C:/output/candidate1.mp4"]
+
+
+# ---------------------------------------------------------------------------
+# An explicit contradiction must be LOUD, not laundered
+# ---------------------------------------------------------------------------
+#
+# None of these can occur on a normal production path: the durable promotion is the sole success
+# authority and every producer is required to write a matching class. If one DOES occur, a producer
+# has violated its contract -- and silently replacing its class with a derived one would hide that
+# and could make C3-R1B-b continue (or stop) on a class nobody verified.
+#
+#     explicit contradiction          ->  ValueError, out of the batch
+#     no explicit classification      ->  conservative derivation by the model
+#
+# That asymmetry is the contract, and these cases are what hold it.
+
+
+def test_an_explicit_success_without_a_durable_path_raises():
+    """CASE 1. SUCCESS is written only after the promotion, so this means a broken producer."""
+    with pytest.raises(ValueError, match="disagrees with outcome_kind"):
+        _run_batch([KIND.SUCCESS, None], [False, False])
+
+
+@pytest.mark.parametrize("kind", [
+    KIND.CANDIDATE_LOCAL,
+    KIND.SHARED_FATAL,
+    KIND.UNKNOWN_FATAL,
+    KIND.CANCELLED,
+])
+def test_an_explicit_failure_class_with_a_durable_path_raises(kind):
+    """CASE 2 and its siblings. A durable file under a failure class is a contradiction."""
+    with pytest.raises(ValueError, match="disagrees with outcome_kind"):
+        _run_batch([kind, None], [True, False])
+
+
+def test_the_contradiction_is_not_swallowed_into_a_derived_class():
+    """The negative that matters: the batch must NOT answer with a plausible outcome instead.
+
+    R1's filter made case 1 publish `UNKNOWN_FATAL` and case 2 publish `SUCCESS` -- both of them
+    classes the producer never named.
+    """
+    for kinds, durables in (([KIND.SUCCESS, None], [False, False]),
+                            ([KIND.CANDIDATE_LOCAL, None], [True, False])):
+        try:
+            run = _run_batch(kinds, durables)
+        except ValueError:
+            continue
+        raise AssertionError(
+            f"a contradiction was laundered into {run.kinds!r} instead of raising")
+
+
+def test_no_explicit_classification_falls_back_to_the_conservative_derivation():
+    """The one case that genuinely proves nothing: the producer never classified itself.
+
+    Here -- and only here -- the model's derivation is correct, and it is the model's, not the
+    batch's: SUCCESS from a durable path, UNKNOWN_FATAL otherwise.
+    """
+    run = _run_batch([None, None], [False, False])
+    assert run.attempted == 1
+    assert run.captured[0].outcome_kind is KIND.UNKNOWN_FATAL
+    assert run.captured[0].success is False
+
+    run = _run_batch([None, None], [True, True])
+    assert run.attempted == 2
+    assert run.kinds == [KIND.SUCCESS, KIND.SUCCESS]
+    assert all(o.success for o in run.captured)
 
 
 @pytest.mark.parametrize("kind", [
@@ -936,8 +1093,9 @@ def test_every_failure_class_still_stops_the_batch(kind):
     A CANDIDATE_LOCAL candidate must NOT be followed by another render. If this ever passes with
     `attempted == 2`, continue-after-failure arrived without authorization.
     """
-    _final, attempted = _run_batch([kind, None], [False, False])
-    assert attempted == 1, f"{kind} did not stop the batch -- R1B-b arrived early"
+    run = _run_batch([kind, None], [False, False])
+    assert run.attempted == 1, f"{kind} did not stop the batch -- R1B-b arrived early"
+    assert len(run.captured) == 1, "a second candidate outcome was recorded"
 
 
 def test_the_batch_loop_does_not_branch_on_the_candidate_class():

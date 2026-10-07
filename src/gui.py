@@ -2790,12 +2790,22 @@ def render_selected_variants_guarded(
             # message prefix or an emoji. `durable` remains the success authority.
             candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)
             candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED
-            # `outcome_kind` and `success` must agree or `__post_init__` raises, and the two
-            # authorities are independent by design: a SUCCESS that somehow left no durable path, or
-            # a durable path under a failure class, is a real contradiction rather than something to
-            # paper over. Pass the class only when it agrees, and otherwise fall back to the
-            # conservative derivation (SUCCESS from a durable path, else UNKNOWN_FATAL).
-            agrees = (candidate_kind is RenderOutcomeKind.SUCCESS) == bool(durable)
+            # [FORK] Digital-Union (C3-R1B-a / R2): the explicit class is passed through
+            # **unchanged**. R1 wrapped it in a `success`/`kind` agreement filter and substituted
+            # `None` on disagreement, which was wrong twice over: it defeated the invariant
+            # `RenderCandidateOutcome.__post_init__` exists to enforce, and it then let the
+            # conservative derivation publish a DIFFERENT class than the producer named -- laundering
+            # a broken producer contract into a plausible-looking outcome.
+            #
+            # A disagreement here is not a runtime situation to absorb. Either shape --
+            # SUCCESS with no durable path, or a failure class WITH one -- means a producer violated
+            # its contract, and the durable promotion remains the sole success authority. So it must
+            # be LOUD: the model raises `ValueError`, and that is correct. Hiding it would leave
+            # C3-R1B-b making a continuation decision on a class nobody verified.
+            #
+            # Conservative derivation is reserved for the one case that genuinely proves nothing:
+            # `candidate_kind is None`, i.e. a producer that never classified itself. The model then
+            # derives SUCCESS from a durable path and UNKNOWN_FATAL otherwise.
             outcomes.append(fork_render_batch.RenderCandidateOutcome(
                 candidate_index=candidate.candidate_index,
                 candidate_master_seed=candidate.candidate_master_seed,
@@ -2806,7 +2816,7 @@ def render_selected_variants_guarded(
                 status_text=last_status,
                 audio_layers_report=(session_state or {}).get(AUDIO_LAYERS_REPORT_KEY, '') or '',
                 smart_mix_report=(session_state or {}).get(SMART_MIX_REPORT_KEY, '') or '',
-                outcome_kind=(candidate_kind if (candidate_kind is not None and agrees) else None),
+                outcome_kind=candidate_kind,
             ))
             if candidate_cancelled or not durable:
                 # A cancelled candidate stops the batch exactly like a failure: the earlier

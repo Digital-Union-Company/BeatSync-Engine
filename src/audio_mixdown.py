@@ -526,11 +526,17 @@ def render_mixed_master(music_path: str, plan, output_path: str,
     # [FORK] Digital-Union (C3-R1B-a): `except AudioProbeError` only. `probe_duration` is handed the
     # lifecycle here (unchanged from R1A), so a wide catch would convert a user's Stop into an
     # execution failure -- and in a C3 batch would report a cancelled candidate as a broken mix.
+    #
+    # [FORK] Digital-Union (C3-R1B-a / R2): `str(exc)`, NOT a new prefixed sentence. R1B-a is
+    # classification-only, so the *type* changes and the displayed reason must not: the reason the
+    # user saw before was the probe's own message, reached through the pre-existing
+    # `except AudioMixError` at the GUI boundary. R1 added "Could not verify the mixed master: "
+    # in front of it, which was a real user-facing change in a milestone that claimed none. The
+    # cause is still chained, so nothing is lost for diagnostics.
     try:
         produced = probe_duration(output_path, lifecycle=lifecycle)
     except AudioProbeError as exc:
-        raise AudioMixExecutionError(
-            f"Could not verify the mixed master: {exc}") from exc
+        raise AudioMixExecutionError(str(exc)) from exc
     drift = abs(produced - plan.music_duration)
     if drift > DURATION_TOLERANCE_SECONDS:
         # Load-bearing: `create_music_video` derives the frame-locked timeline from this file's

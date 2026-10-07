@@ -48,7 +48,11 @@ SHARED_FATAL          -> no producer at all
   `AudioProbeError`, `AudioMixInputError`, `AudioMixPlanError`, `AudioMixExecutionError`. Every
   pre-existing `except audio_mixdown.AudioMixError` still catches exactly what it caught before, and
   every message is unchanged character for character: `tests/test_audio_mixdown.py`'s 125 cases pass
-  with **no assertion changed**.
+  with **no assertion changed**. Each of the three narrow wraps forwards its cause's text with
+  `str(exc)` rather than rewriting it, so the *type* changes and the reason the user reads does not
+  — a test asserts that for all three, and asserts byte-equality between the generated-master
+  wrapper and its `AudioProbeError` cause. (A first draft prefixed that one with "Could not verify
+  the mixed master: ", which really was a user-facing change in a classification-only milestone.)
 - **The cause types deliberately carry no `RenderOutcomeKind`.** The module cannot know whether it
   is running a single render, candidate 1 or candidate 4, so it cannot answer "would every remaining
   candidate fail the same way?". The measured reason this matters: `probe_duration` has four
@@ -80,8 +84,14 @@ SHARED_FATAL          -> no producer at all
   atomic no-replace `os.rename`, no deletion, no copy fallback, no `exists()` pre-check — all
   unchanged — and **the SUCCESS commit point did not move.**
 - **The batch loop preserves the full class** instead of only `CANCELLED`, taken solely from
-  `RENDER_OUTCOME_KEY` and passed through only when it agrees with `bool(durable)`, which remains
-  the sole success authority. **The stop condition is unchanged and class-blind.**
+  `RENDER_OUTCOME_KEY` and passed to `RenderCandidateOutcome.outcome_kind` **unchanged**, with no
+  filter in between. `durable` remains the sole success authority, and an explicit
+  `success`/`outcome_kind` contradiction **raises** — `RenderCandidateOutcome.__post_init__` owns
+  that validation and the batch must not sanitize it. A first draft wrapped the hand-off in an
+  agreement test and substituted `None` on disagreement; that defeated the invariant the model
+  exists to enforce and then published a derived class the producer never named, which would have
+  hidden a broken producer contract from C3-R1B-b. Conservative derivation applies only when the key
+  is `None`. **The stop condition is unchanged and class-blind.**
 - **The defensive original-music fallback probe is `UNKNOWN_FATAL`, unconditionally.** It is
   unreachable in current production — `analyze_beats_auto` guards `y.size == 0` and then sets
   `audio_duration = len(y) / sr`, strictly positive — so this is a frozen forward-safe decision

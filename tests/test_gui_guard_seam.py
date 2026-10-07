@@ -736,10 +736,22 @@ def test_the_batch_stops_on_the_first_failed_or_cancelled_candidate():
     flat = body.replace("\n", "").replace("    ", "")
     assert "candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)" in flat, body
     assert "candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED" in flat, body
-    assert "outcome_kind=candidate_kind if" in flat, body
+    # [C3-R1B-a / R2] the explicit class must reach the model UNCONDITIONALLY. Exactly this form --
+    # not "outcome_kind=candidate_kind if ...", which is how R1 quietly substituted `None` on a
+    # success/kind disagreement and let the conservative derivation publish a different class than
+    # the producer named. `RenderCandidateOutcome.__post_init__` owns agreement validation and must
+    # be allowed to raise.
+    assert "outcome_kind=candidate_kind)" in flat, body
     # the R1A shape must be GONE -- it is what discarded every class except CANCELLED
     assert "outcome_kind=RenderOutcomeKind.CANCELLED if candidate_cancelled else None" not in flat, \
         "the batch reverted to preserving only CANCELLED and discarding the other typed classes"
+    # and no filter may conditionally discard an explicit class on its way to the model
+    for laundering in ("outcome_kind=candidate_kind if", "outcome_kind=(candidate_kind if",
+                       "agrees", "if candidate_kind is not None else",
+                       "candidate_kind or None"):
+        assert laundering not in flat, \
+            f"an explicit outcome class is conditionally discarded via {laundering!r} -- " \
+            f"that bypasses RenderCandidateOutcome.__post_init__"
     for inferred in ("'Cancelled' in last_status", "'⏹' in last_status",
                      "last_status.startswith", "cancelled = not durable"):
         assert inferred not in body, f"cancellation inferred from {inferred}"
