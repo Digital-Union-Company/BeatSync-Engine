@@ -91,9 +91,14 @@ automatically.
   test forbids it returning. Conservative derivation is reserved for the one case that proves
   nothing: `candidate_kind is None`, a producer that never classified itself.
 
-  **The stop condition is deliberately class-blind** (`candidate_cancelled or not durable`): R1B-a
-  records the cause and changes no policy, so the batch still stops after every non-success
-  candidate. A `continue` keyed on `CANDIDATE_LOCAL` is C3-R1B-b, and a test fails if one appears.
+  **Since C3-R1B-b exactly one class continues.** The handler constructs the outcome, appends that
+  exact object, and then reads the policy off `candidate_outcome.outcome_kind` — never the raw
+  `candidate_kind`, so the *model* decides what an unclassified `None` means. `CANDIDATE_LOCAL`
+  `continue`s; `SHARED_FATAL`, `UNKNOWN_FATAL` and `CANCELLED` reach `if not
+  candidate_outcome.success:` and stop. The **loop-head cancellation check still comes first in
+  every iteration**, so a `continue` cannot outrun a Stop: a Cancel landing after a local failure
+  leaves the remaining candidates NOT ATTEMPTED. Tests pin exactly one `continue`, guarded by
+  exactly that one class, plus measured call order for every scenario.
 - **`_promote_output_no_replace()` returns `(message, outcome_kind)`** since C3-R1B-a — `('', None)`
   on success, otherwise the unchanged user-facing text plus the typed cause
   (`FileExistsError` → `CANDIDATE_LOCAL`, `errno.EXDEV` → `SHARED_FATAL`, any other `OSError` →

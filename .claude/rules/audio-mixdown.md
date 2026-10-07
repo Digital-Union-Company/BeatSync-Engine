@@ -209,9 +209,12 @@ Two of those are worth the detail, because they are the corrections:
   with an empty selection; it is reachable only when the frozen voice selection is non-empty, which
   is what makes SHARED_FATAL unconditional rather than context-dependent.
 
-**R1B-a records; it does not act.** Every one of these still **stops** the batch, `RENDER_SELECTION_SIZE`
-is still 2, and there is no continue-after-`CANDIDATE_LOCAL`. The classification exists so C3-R1B-b
-can consume it; `audio_mix.py` and `smart_mix.py` were **not** modified.
+**R1B-a recorded; C3-R1B-b acts — on exactly one row.** A `CANDIDATE_LOCAL` candidate is now
+recorded and the batch **continues** to the next selected one, which is why the SFX-preflight and
+`SmartMixStructureError` classifications above are load-bearing rather than diagnostic: they are the
+rows that decide whether a user's remaining candidates still render. `SHARED_FATAL`,
+`UNKNOWN_FATAL` and `CANCELLED` still stop the batch. The selection is a 2..4 range.
+`audio_mix.py` and `smart_mix.py` were **not** modified by either milestone.
 
 ## Smart Mix V1 adds SFX to the same master (E)
 

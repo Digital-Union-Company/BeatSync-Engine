@@ -2789,7 +2789,12 @@ def render_selected_variants_guarded(
             # `RENDER_OUTCOME_KEY`; nothing is inferred from the status text, the durable path, a
             # message prefix or an emoji. `durable` remains the success authority.
             candidate_kind = (session_state or {}).get(RENDER_OUTCOME_KEY)
-            candidate_cancelled = candidate_kind is RenderOutcomeKind.CANCELLED
+            # [FORK] Digital-Union (C3-R1B-b): R1A's `candidate_cancelled` local is gone rather than
+            # left unused. Cancellation is still **typed, never inferred** -- it rides
+            # `RENDER_OUTCOME_KEY` into `outcome_kind` below, and the model exposes it as
+            # `RenderCandidateOutcome.cancelled`. A cancelled candidate has `success is False`, so
+            # the stop branch below covers it; what it is NOT is `CANDIDATE_LOCAL`, which is the only
+            # class that continues.
             # [FORK] Digital-Union (C3-R1B-a / R2): the explicit class is passed through
             # **unchanged**. R1 wrapped it in a `success`/`kind` agreement filter and substituted
             # `None` on disagreement, which was wrong twice over: it defeated the invariant
@@ -2806,7 +2811,14 @@ def render_selected_variants_guarded(
             # Conservative derivation is reserved for the one case that genuinely proves nothing:
             # `candidate_kind is None`, i.e. a producer that never classified itself. The model then
             # derives SUCCESS from a durable path and UNKNOWN_FATAL otherwise.
-            outcomes.append(fork_render_batch.RenderCandidateOutcome(
+            # [FORK] Digital-Union (C3-R1B-b): construct the outcome FIRST, append that exact
+            # object, and then read the continuation policy off `candidate_outcome.outcome_kind` --
+            # never off the raw `candidate_kind` local. The difference is load-bearing: a producer
+            # that classified nothing leaves `candidate_kind` as `None`, and only the MODEL decides
+            # what `None` means (SUCCESS with a durable path, UNKNOWN_FATAL without). Branching on
+            # the raw value would let an unclassified failure slip past as "not CANDIDATE_LOCAL,
+            # therefore keep going" -- or worse, be mistaken for a local one.
+            candidate_outcome = fork_render_batch.RenderCandidateOutcome(
                 candidate_index=candidate.candidate_index,
                 candidate_master_seed=candidate.candidate_master_seed,
                 variation_seed=candidate.variation_seed(),
@@ -2817,29 +2829,71 @@ def render_selected_variants_guarded(
                 audio_layers_report=(session_state or {}).get(AUDIO_LAYERS_REPORT_KEY, '') or '',
                 smart_mix_report=(session_state or {}).get(SMART_MIX_REPORT_KEY, '') or '',
                 outcome_kind=candidate_kind,
-            ))
-            if candidate_cancelled or not durable:
-                # A cancelled candidate stops the batch exactly like a failure: the earlier
-                # candidate's durable output is kept, and the next candidate is never attempted.
-                #
-                # [FORK] Digital-Union (C3-R1B-a): this condition is deliberately UNCHANGED. The
-                # typed class above is now truthful, and it is recorded rather than acted on -- the
-                # batch still stops after EVERY non-success candidate, including CANDIDATE_LOCAL.
-                # Continue-after-CANDIDATE_LOCAL is C3-R1B-b and must not appear here: there is no
-                # branch on `candidate_kind`, and adding one is the whole of the next milestone.
+            )
+            outcomes.append(candidate_outcome)
+
+            # [FORK] Digital-Union (C3-R1B-b): the continuation matrix, and the whole of it.
+            #
+            #   SUCCESS           -> fall through, render the next selected candidate
+            #   CANDIDATE_LOCAL   -> recorded above, then CONTINUE -- the failure is proven not to
+            #                        condemn the rest (a different candidate's resolved SFX Amount
+            #                        can skip the failing operation entirely, and an output
+            #                        collision is on a candidate-unique name)
+            #   SHARED_FATAL      -> STOP; every remaining candidate would fail identically
+            #   UNKNOWN_FATAL     -> STOP; fail closed, the cause is not proven
+            #   CANCELLED         -> STOP; a Stop is never continued past
+            #
+            # `continue` is NOT a free pass over a Cancel: the loop head re-checks
+            # `lifecycle.cancel_requested()` before the next candidate starts, so a Cancel arriving
+            # after a local failure still leaves the remaining candidates NOT ATTEMPTED. One
+            # lifecycle spans all of them, so there is no gap to slip through.
+            if candidate_outcome.outcome_kind is RenderOutcomeKind.CANDIDATE_LOCAL:
+                continue
+            if not candidate_outcome.success:
+                # Every other non-success class -- SHARED_FATAL, UNKNOWN_FATAL, CANCELLED, and the
+                # model's conservative UNKNOWN_FATAL derivation -- ends the batch. Earlier durable
+                # outputs are kept; nothing is deleted and no candidate is retried.
                 stopped = True
                 break
     finally:
         # [FORK] Digital-Union (C3-R1A): the ONE place the batch's shared lifecycle reaches a
         # terminal state -- after everything it ran, mirroring `process_video_guarded`. A Cancel
         # click that landed anywhere in the batch (mid-candidate or at a candidate boundary) is
-        # authoritative over the last candidate's own outcome: the top-level EVENT was cancelled.
+        # authoritative over everything else: the top-level EVENT was cancelled.
+        #
+        # [FORK] Digital-Union (C3-R1B-b / R2): the completion test is **selection exhaustion**, not
+        # the last candidate's outcome. R1A read `session_state[RENDER_OUTCOME_KEY]`, which holds
+        # whatever the final candidate happened to write -- sufficient while every candidate failure
+        # stopped the batch, and order-dependent nonsense once CANDIDATE_LOCAL continues:
+        #
+        #     CANDIDATE_LOCAL, SUCCESS  -> FINISHED
+        #     SUCCESS, CANDIDATE_LOCAL  -> FAILED     <- same batch result, different state
+        #
+        # Both batches attempted their whole selection, both report `1 / 2 succeeded; 1 failed`, and
+        # both have batch `outcome_kind is None`. Only the order differed.
+        #
+        # `RenderLifecycle` belongs to the TOP-LEVEL render event, so its terminal state answers
+        # "what happened to the event", not "did every candidate succeed":
+        #
+        #     CANCELLED  an explicit cancellation request won
+        #     FINISHED   the batch exhausted its full selected list under the authorized policy,
+        #                however many attempted candidates failed locally along the way
+        #     FAILED     the event ended BEFORE exhausting its selection -- an early fatal stop, an
+        #                unexpected exception, or an invariant ValueError
+        #
+        # Candidate failures stay represented where they belong: on their own
+        # `RenderCandidateOutcome` and in the summary. Nothing is erased or reclassified -- a
+        # candidate that carried SHARED_FATAL still carries it even when it was the final one and
+        # the lifecycle therefore reads FINISHED.
         if lifecycle.cancel_requested():
             lifecycle.mark_terminal(RenderLifecycleState.CANCELLED)
-        elif (session_state or {}).get(RENDER_OUTCOME_KEY) is RenderOutcomeKind.SUCCESS:
+        elif len(outcomes) == request.count:
             lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
         else:
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        # Unchanged defensive backstop for a path that never reached the derivation above at all
+        # (an abandoned generator, an exception before the loop). Abandonment is still NOT an
+        # explicit Cancel -- nothing here calls `request_cancel()`.
         if not lifecycle.is_terminal():
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
         _clear_active_render(lifecycle.invocation_id)
@@ -2852,11 +2906,37 @@ def render_selected_variants_guarded(
     # from: candidate 1 genuinely succeeded and candidate 2 was never attempted, so the fact that
     # the top-level EVENT was cancelled is expressible nowhere else. Without this, the summary
     # reported "stopped on candidate 1" for a candidate that had just succeeded.
-    batch_outcome_kind = RenderOutcomeKind.CANCELLED if lifecycle.cancel_requested() else None
+    #
+    # [FORK] Digital-Union (C3-R1B-b): the batch cause is now a three-way decision, because
+    # "a candidate failed" no longer implies "the batch stopped".
+    #
+    #   cancellation requested anywhere   -> CANCELLED, authoritative over everything else
+    #   the batch STOPPED on a candidate  -> that candidate's exact fatal class
+    #   the whole selection was attempted -> None, even with CANDIDATE_LOCAL failures in it
+    #
+    # The last line is the one worth being explicit about: a completed batch carrying one or two
+    # local failures is **not** batch-`CANDIDATE_LOCAL`. That cause belongs to the candidate that
+    # suffered it; the batch executed its policy to the end and has no terminal cause of its own.
+    # Only the candidate that actually ended the run contributes one, which is why this reads the
+    # LAST appended outcome rather than searching for the first failure.
+    # `stopped and len(outcomes) < request.count` is the precise test for "a candidate ended the
+    # run with work still outstanding". A fatal on the FINAL selected candidate left nothing
+    # unattempted, so the batch completed its selection and has no terminal cause -- the candidate
+    # owns its failure, exactly as a CANDIDATE_LOCAL one does.
+    if lifecycle.cancel_requested():
+        batch_outcome_kind = RenderOutcomeKind.CANCELLED
+    elif stopped and outcomes and len(outcomes) < request.count:
+        terminal = outcomes[-1]
+        batch_outcome_kind = (
+            terminal.outcome_kind
+            if terminal.outcome_kind in (RenderOutcomeKind.SHARED_FATAL,
+                                         RenderOutcomeKind.UNKNOWN_FATAL)
+            else None)
+    else:
+        batch_outcome_kind = None
     outcome = fork_render_batch.RenderBatchOutcome(
         requested_count=request.count,
         outcomes=tuple(outcomes),
-        stopped_on_failure=stopped,
         outcome_kind=batch_outcome_kind,
     )
     # The newest successful preview wins, and a later failure never blanks an earlier success.
@@ -3832,8 +3912,14 @@ def create_ui() -> gr.Blocks:
                             label=LABEL_RENDER_BATCH_SUMMARY,
                             value='',
                             placeholder=PLACEHOLDER_RENDER_BATCH_SUMMARY,
-                            lines=10,
-                            max_lines=20,
+                            # [FORK] Digital-Union (C3-R1B-b): widened from 10/20 because four
+                            # candidates overflow it. `report_lines()` yields up to 4 lines per
+                            # ATTEMPTED candidate, plus a 2-line header and a trailer of up to 3 --
+                            # so 4 candidates reach ~21 lines and 20 would scroll a complete batch
+                            # summary. A one-number widening, deliberately not a layout redesign:
+                            # no gallery, no new component, one block per candidate as before.
+                            lines=12,
+                            max_lines=28,
                             interactive=False,
                             elem_id='render-batch-summary',
                         )

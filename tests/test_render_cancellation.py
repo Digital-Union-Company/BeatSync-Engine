@@ -1159,8 +1159,13 @@ def test_the_batch_states_its_own_terminal_cause_to_the_formatter():
     pinned here, with the authority it reads.
     """
     body = _body(_GUI, "render_selected_variants_guarded")
-    assert ("batch_outcome_kind = RenderOutcomeKind.CANCELLED "
-            "if lifecycle.cancel_requested() else None") in body, body
+    # [C3-R1B-b] the cause became a three-way decision, because "a candidate failed" no longer
+    # implies "the batch stopped". Cancellation still outranks everything, and a *completed* batch
+    # -- even one carrying local failures -- still ends up with `None`.
+    assert "if lifecycle.cancel_requested():" in body, body
+    assert "batch_outcome_kind = RenderOutcomeKind.CANCELLED" in body, body
+    assert "len(outcomes) < request.count" in body, \
+        "the fatal branch must require that work was actually left unattempted"
     assert "outcome_kind=batch_outcome_kind" in body, \
         "the batch outcome is built without stating its terminal cause"
 
@@ -1168,11 +1173,16 @@ def test_the_batch_states_its_own_terminal_cause_to_the_formatter():
                         if isinstance(n, ast.Call)
                         and ast.unparse(n.func) == "fork_render_batch.RenderBatchOutcome")
     kwargs = {kw.arg for kw in construction.keywords}
-    assert kwargs == {"requested_count", "outcomes", "stopped_on_failure", "outcome_kind"}, kwargs
+    # [C3-R1B-b] `stopped_on_failure` is gone from the model: a boolean meaning "something failed,
+    # therefore we stopped" cannot be true once CANDIDATE_LOCAL continues.
+    assert kwargs == {"requested_count", "outcomes", "outcome_kind"}, kwargs
 
-    # derived from the cancellation Event, never from status prose or from `stopped`
+    # derived from the cancellation Event and the typed candidate cause, never from status prose
     for inferred in ("outcome_kind=stopped", "in last_status", "'Cancelled' in"):
         assert inferred not in body, f"the batch cause is inferred from {inferred}"
+    # a completed batch must never inherit its candidate's local cause
+    assert "RenderOutcomeKind.CANDIDATE_LOCAL" not in body.split("batch_outcome_kind")[-1], \
+        "the batch cause may not be set to CANDIDATE_LOCAL"
 
 
 def test_a_cancelled_batch_event_outranks_its_last_candidate_s_own_outcome():
@@ -1656,8 +1666,11 @@ def test_no_cache_schema_or_version_constant_moved():
             in _source(_ANALYSIS))
     assert 'L2_CACHE_VERSION = "l2_stage3_v1"' in _source(_src("beatsync_fork", "stage_cache.py"))
 
+    # [C3-R1B-b] the render cap moved to a 2..4 range, and the cap itself is now what is pinned
+    # here: raising the number of candidates must never be a reason to touch a cache identity.
     from beatsync_fork import render_batch as fork_render_batch
-    assert fork_render_batch.RENDER_SELECTION_SIZE == 2, "R1A must not have unlocked R1B"
+    assert fork_render_batch.RENDER_SELECTION_MIN == 2
+    assert fork_render_batch.RENDER_SELECTION_MAX == 4, "the frozen render cap moved"
 
 
 def test_cancellation_reaches_no_cache_identity_or_creative_state():

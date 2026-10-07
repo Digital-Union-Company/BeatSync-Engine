@@ -20,6 +20,126 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-07 (C3-R1B-b — render 2–4 candidates, continue past a local failure)
+
+**C3-R1B is complete.** C3-R1B-a made every failure cause truthfully typed and deliberately spent
+none of it; R1B-b spends it on exactly two changes and nothing else.
+
+```
+selection      exactly 2            ->  a bounded range, MIN 2 .. MAX 4
+on failure     every class stops    ->  CANDIDATE_LOCAL continues; everything else still stops
+```
+
+- **`RENDER_SELECTION_MIN = 2` / `RENDER_SELECTION_MAX = 4`**, and the exact-size
+  `RENDER_SELECTION_SIZE` constant is **gone** with no alias (every consumer was internal to
+  `render_batch.py`, verified across `src/` and `tests/`; an ambiguous alias beside a range is how a
+  future caller silently reintroduces the two-candidate rule). **Four is a product contract, not a
+  tunable:** past candidate 1 the cost is linear with no economy of scale — the only real shared
+  saving, the ~15.7 s of Stage 1-3, is already fully banked at candidate 2 by the L2 process cache —
+  and C3-R1B/P0 measured ≈67 s for the first candidate and ≈51 s for each subsequent one on the
+  NVENC path at ~150 clips, materially more on the serial ProRes path. That puts four in the same
+  order as the single render a user already accepts. Still unrelated to
+  `CANDIDATE_COUNT_MAX = 12`, which is comparison legibility and costs a millisecond.
+- **An over-long selection is refused, never truncated.** Five ticks answers `()`. Silently
+  rendering the first four would deliver something the user did not ask for, after they committed to
+  the wait. Canonical ascending index order is unchanged — `[3,1,0,2]` renders as `(0,1,2,3)`.
+- **The continuation matrix, and the whole of it:**
+
+  ```
+  SUCCESS           -> render the next selected candidate
+  CANDIDATE_LOCAL   -> record the failure, then CONTINUE
+  SHARED_FATAL      -> STOP; remaining candidates NOT ATTEMPTED
+  UNKNOWN_FATAL     -> STOP; remaining candidates NOT ATTEMPTED
+  CANCELLED         -> STOP; remaining candidates NOT ATTEMPTED
+  ```
+
+  Three properties make it safe rather than merely implemented. The decision is read off
+  `candidate_outcome.outcome_kind` — **never** the raw `candidate_kind` local — so the *model*
+  decides what an unclassified `None` means (`SUCCESS` with a durable path, `UNKNOWN_FATAL`
+  without); branching on the raw value would let an unclassified failure continue as "not
+  CANDIDATE_LOCAL, therefore carry on". The **loop-head cancellation check still comes first in
+  every iteration**, so a `continue` cannot outrun a Stop: a Cancel arriving in the gap after a local
+  failure leaves the remaining candidates NOT ATTEMPTED. And nothing is retried or reclassified.
+- **"A candidate failed" and "the batch stopped" became independent facts**, which reshaped the
+  outcome model. `stopped_on_failure` is **removed** — a boolean meaning "something failed, therefore
+  we stopped" cannot be true once a local failure is continued past. `_failed_candidate()` became
+  `_terminal_candidate()`, which names only the **last attempted** candidate, only if it genuinely
+  failed, and only when work was actually left unrun; a failure on the *final* selected candidate
+  stopped nothing and now reads as a count. New single-source `failed` and `cancelled_count`
+  properties exclude successes and (for `failed`) cancellations, so a user's Stop is never counted as
+  their render breaking.
+- **A completed batch has `outcome_kind is None`, even carrying local failures** — deliberately not
+  batch-`CANDIDATE_LOCAL`, because that cause belongs to the candidate and the batch carried out its
+  policy to the end. Only `CANCELLED`, `SHARED_FATAL` and `UNKNOWN_FATAL` are batch-terminal, and the
+  fatal branch additionally requires `len(outcomes) < request.count`.
+- **Truthful N-candidate summaries.** `4 / 4 succeeded` · `3 / 4 succeeded; 1 failed` ·
+  `2 / 4 succeeded; 2 failed` · `1 / 4 succeeded; 1 failed; stopped on candidate 3` ·
+  `1 / 4 succeeded; cancelled during candidate 2` ·
+  `2 / 4 succeeded; batch cancelled before candidate 3`. A local failure the batch continued past is
+  a **count**, never "stopped on candidate N". One block per **attempted** candidate, and no record
+  is fabricated for one that was not attempted; a completed batch never claims any candidate went
+  unattempted.
+- **Earlier durable outputs are never rolled back** — whatever happens later, local or fatal or
+  cancelled. No cleanup path deletes a promoted output, and a later local failure never blanks an
+  earlier successful preview.
+- **UI: range copy plus one widened textbox.** `INFO_RENDER_CANDIDATES`,
+  `PLACEHOLDER_RENDER_BATCH_SUMMARY` and `INFO_RENDER_SELECTED` now say "2 to 4", state that renders
+  run in list order, and explain the continuation policy in the user's own terms ("specific to that
+  candidate's own settings" vs "affects every candidate equally") without exposing a single internal
+  class name. The summary textbox went `lines=10, max_lines=20` → `12 / 28`, because a four-candidate
+  summary measures 20–21 lines. **No gallery, no new component, no layout redesign**, and the
+  selector is still empty by default — quadrupling the possible commitment makes that more
+  load-bearing, not less.
+- **The top-level lifecycle terminal state is read from selection exhaustion, not from the last
+  candidate** (corrected post-review). The derivation is `CANCELLED` when a cancellation won,
+  `FINISHED` when `len(outcomes) == request.count`, `FAILED` otherwise. A first draft kept R1A's
+  `session_state[RENDER_OUTCOME_KEY]` read — whatever the final candidate happened to write — which
+  was sufficient while every candidate failure stopped the batch and became order-dependent the
+  moment `CANDIDATE_LOCAL` continued: `CANDIDATE_LOCAL, SUCCESS` gave `FINISHED` while
+  `SUCCESS, CANDIDATE_LOCAL` gave `FAILED`, for two batches with identical counts, identical
+  headline and identical batch cause. `RenderLifecycle` belongs to the render **event**, so its
+  state answers "what happened to the event", not "did every candidate succeed" — a `SHARED_FATAL`
+  on the *final* selected candidate therefore leaves the lifecycle `FINISHED` while the candidate
+  keeps its own fatal cause and the summary still reports the failure. The mirrored pair is pinned
+  as a regression against the **actual** shared lifecycle the wrapper installed, and the defensive
+  `is_terminal()` backstop and abandonment handling are unchanged.
+- **A continued-past local failure is never named as the stop cause** (corrected post-review).
+  `_terminal_candidate()` still carried one pre-R1B-b assumption: it read *any* non-success,
+  non-cancelled last candidate as the one that ended the run — i.e. it read *failure* as *terminal*,
+  which since R1B-b are different things. The visible consequence was one false phrase:
+
+  ```
+  CANDIDATE_LOCAL, then Cancel before candidate 2
+    "0 / 4 succeeded; stopped on candidate 1; batch cancelled"       <- candidate 1 stopped nothing
+    "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2"  <- true
+  ```
+
+  Terminality is now a **class** test against the new `_CANDIDATE_TERMINAL_CAUSES` —
+  `_BATCH_TERMINAL_CAUSES` minus `CANCELLED`, so exactly `SHARED_FATAL` and `UNKNOWN_FATAL`, the two
+  the continuation policy actually stops on. `CANDIDATE_LOCAL` is counted as a failure and never
+  blamed; `CANCELLED` keeps its own wording; `SUCCESS` stopped nothing. The **dual-truth case is
+  unchanged** — a genuine fatal plus a cancellation still reports both, because that fatal really
+  was terminal — and the fix is a definition change rather than a formatter special case, so no
+  candidate index is treated specially anywhere.
+- **The batch-level cause domain is now enforced, not just documented.**
+  `RenderBatchOutcome.__post_init__` rejects `SUCCESS` and `CANDIDATE_LOCAL` with `ValueError`:
+  `SUCCESS` is a candidate outcome (a finished batch reports counts and has no terminal cause —
+  that is what `None` means), and `CANDIDATE_LOCAL` belongs to the candidate the batch *continued
+  past*, so it cannot have terminated the run. Allowed explicit values are `None`, `CANCELLED`,
+  `SHARED_FATAL`, `UNKNOWN_FATAL`. The sound cancelled-candidate derivation is preserved and the
+  model still derives no fatal cause from candidate records.
+- **Cancellation and the taxonomy are untouched.** `render_worker.py` and `audio_mixdown.py` are
+  byte-identical: one lifecycle already spanned the whole batch, however many candidates, which is
+  the clearest evidence the C3-R1A design generalised. `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION`
+  and `L2_CACHE_VERSION` are unchanged — rendering four candidates is the same candidate render
+  repeated sequentially.
+- **Verification.** Controlled 4-candidate acceptance over the real handler body, all eight §35
+  scenarios PASS with measured execution call order (no media, no portable runtime, nothing in
+  `output/` or the production cache touched). Eight mutations demonstrated to fail the permanent
+  guards and restored byte-exactly: MAX→5, exact-two cardinality restored, continuation removed,
+  continue-after-SHARED_FATAL, continue-after-UNKNOWN_FATAL, continue-after-CANCELLED, loop-head
+  cancellation check removed, and the summary blaming the first failure for stopping the batch.
+
 ### Changed — 2026-10-07 (C3-R1B-a — truthful failure classification)
 
 **The render path now names why it failed, and that is *all* it does.** C3-R1A shipped the

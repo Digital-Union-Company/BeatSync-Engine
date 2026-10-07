@@ -2827,3 +2827,134 @@ def test_no_freestyle_widget_registers_a_handler_that_writes_an_execution_widget
     assert found == 1 + len(fork_freestyle.SECTION_TYPES), (
         f"{found} Freestyle widget registrations; expected "
         f"{1 + len(fork_freestyle.SECTION_TYPES)}")
+
+
+# ===========================================================================
+# C3-R1B-b: the render selector is a 2–4 range, and the UI changed by exactly
+# one widened textbox
+# ===========================================================================
+
+
+def _gui_call_kwargs(elem_id):
+    """The keyword arguments of the single Gradio construction carrying this `elem_id`."""
+    for node in ast.walk(_tree(_GUI)):
+        if not isinstance(node, ast.Call):
+            continue
+        kwargs = _kwargs(node)
+        value = kwargs.get("elem_id")
+        if isinstance(value, ast.Constant) and value.value == elem_id:
+            return kwargs
+    raise AssertionError(f"no construction found with elem_id={elem_id!r}")
+
+
+def test_the_render_selector_is_still_empty_by_default():
+    """Committing up to FOUR renders must stay something the user actively chose.
+
+    R1B-b quadrupled the possible commitment, which makes an empty default more load-bearing than
+    before, not less: a pre-filled selector would offer to spend render minutes nobody asked for.
+    """
+    kwargs = _gui_call_kwargs("variant-render-selector")
+    assert ast.unparse(kwargs["choices"]) == "[]"
+    assert ast.unparse(kwargs["value"]) == "[]"
+    assert ast.unparse(kwargs["label"]) == "LABEL_RENDER_CANDIDATES"
+    assert ast.unparse(kwargs["info"]) == "INFO_RENDER_CANDIDATES"
+
+
+def test_the_render_summary_textbox_was_widened_for_four_candidates():
+    """[C3-R1B-b §22] Exact values pinned: 10/20 overflowed at four candidates.
+
+    `report_lines()` yields up to 4 lines per attempted candidate, plus a 2-line header and a
+    trailer of up to 3 — so four candidates reach ~21 lines. A one-number widening, deliberately
+    not a layout change.
+    """
+    kwargs = _gui_call_kwargs("render-batch-summary")
+    assert ast.unparse(kwargs["lines"]) == "12"
+    assert ast.unparse(kwargs["max_lines"]) == "28"
+    assert ast.unparse(kwargs["interactive"]) == "False"
+    assert ast.unparse(kwargs["label"]) == "LABEL_RENDER_BATCH_SUMMARY"
+    assert ast.unparse(kwargs["placeholder"]) == "PLACEHOLDER_RENDER_BATCH_SUMMARY"
+
+
+def test_a_four_candidate_summary_fits_the_widened_textbox():
+    """Measured against the real formatter rather than assumed from the comment above."""
+    from beatsync_fork import render_batch as _rb
+    from beatsync_fork import render_worker as _rw
+
+    def candidate(index, success):
+        return _rb.RenderCandidateOutcome(
+            candidate_index=index, candidate_master_seed=100 + index, variation_seed=200 + index,
+            success=success,
+            durable_output_path=(f"C:/output/music_video_batchT_c0{index + 1}.mp4"
+                                 if success else ""),
+            status_text="Smart Mix: SFX library folder does not exist" if not success else "done",
+            audio_layers_report="Music + 2 voice clips",
+            smart_mix_report="19 SFX placed (3 risers, 5 impacts)",
+            outcome_kind=(None if success else _rw.RenderOutcomeKind.CANDIDATE_LOCAL))
+
+    shapes = {
+        # completed with failures: 2 header + 4x4 candidate + 2 trailer
+        "completed": _rb.RenderBatchOutcome(
+            requested_count=4,
+            outcomes=tuple(candidate(i, i % 2 == 0) for i in range(4))),
+        # cancelled after all four ran: the longest trailer the formatter produces
+        "cancelled": _rb.RenderBatchOutcome(
+            requested_count=4,
+            outcomes=tuple(candidate(i, i % 2 == 0) for i in range(4)),
+            outcome_kind=_rw.RenderOutcomeKind.CANCELLED),
+    }
+    measured = {name: len(o.summary_text().splitlines()) for name, o in shapes.items()}
+    for name, count in measured.items():
+        assert count <= 28, f"the {name} 4-candidate summary is {count} lines, max_lines is 28"
+    assert max(measured.values()) > 20, \
+        f"all shapes fit in the old 20 ({measured}); the widening would be unnecessary"
+
+
+def _ui_content_constants():
+    """`ui_content.py`'s module-level string constants, without importing the Gradio runtime."""
+    path = os.path.join(_REPO_ROOT, "src", "ui_content.py")
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        try:
+            values[target.id] = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            continue
+    return values
+
+
+def test_the_render_copy_describes_a_range_and_the_continuation_policy():
+    """User copy must say what happens, in the user's terms — not expose the enum names."""
+    copy_text = _ui_content_constants()
+
+    for name in ("INFO_RENDER_CANDIDATES", "PLACEHOLDER_RENDER_BATCH_SUMMARY",
+                 "INFO_RENDER_SELECTED"):
+        text = copy_text[name]
+        assert "2 to 4" in text, f"{name} does not state the range: {text!r}"
+
+    # the stale C3-R0 language is gone from every render-copy constant
+    render_copy = " ".join(copy_text[name] for name in (
+        "LABEL_RENDER_CANDIDATES", "INFO_RENDER_CANDIDATES", "LABEL_RENDER_SELECTED",
+        "LABEL_RENDER_BATCH_SUMMARY", "PLACEHOLDER_RENDER_BATCH_SUMMARY",
+        "INFO_RENDER_SELECTED")).lower()
+    for stale in ("exactly two", "two real videos", "remaining candidate is never attempted",
+                  "tick two candidates", "render the same pair",
+                  "the second is not attempted"):
+        assert stale not in render_copy, f"stale C3-R0 copy survived: {stale!r}"
+
+    # the continuation policy is explained in plain terms, both halves of it
+    policy = copy_text["INFO_RENDER_SELECTED"].lower()
+    assert "specific to that" in policy, "the candidate-local half is not explained"
+    assert "moves on to the next" in policy, "continuation is not explained"
+    assert "affects every" in policy, "the shared half is not explained"
+    assert "stops" in policy
+    assert "keep" in policy, "surviving earlier outputs are not promised"
+    assert "list order" in policy, "canonical render order is not stated"
+    # and it does not leak internal class names at the user
+    for internal in ("candidate_local", "shared_fatal", "unknown_fatal", "renderoutcomekind"):
+        assert internal not in policy, f"user copy exposes {internal!r}"
