@@ -20,6 +20,56 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Maintenance — 2026-10-07 (post-C3 contract/documentation consistency)
+
+**Prose only. No runtime behaviour, constant, signature, wiring, assertion, UI copy or cache version
+changed.** C3-R1B-b and L2 V1 made a number of *current-state* statements false, and those statements
+live in the path-scoped `.claude/rules/*.md` files that `CLAUDE.md` directs every future session to
+read before modifying matching source. That made the drift compounding rather than cosmetic.
+
+Corrected to current truth — rendering is **2–4** candidates, sequential, canonical ascending index,
+one lifecycle spanning the whole selection, and only `CANDIDATE_LOCAL` continues:
+
+- `.claude/rules/variant-lab.md` — the C2-section line claiming "batch rendering is still deferred
+  and a split guard asserts none of that machinery exists" (batch rendering ships; the guard now
+  keeps `variant_lab.py` / `creative_recipe.py` free of batch concepts, which is the half that was
+  always load-bearing), and the C3-R1A lifecycle line "the whole two-candidate batch".
+- `.claude/rules/fork-package.md` — the `render_batch.py` module row, which described "rendering
+  exactly two compared candidates" and a selection contract of "exactly two". Now states MIN 2 /
+  MAX 4, that over-long selections are refused rather than truncated, that `RENDER_SELECTION_SIZE`
+  no longer exists, and that the batch-level cause domain and terminal-candidate restriction are
+  R1B-b additions — while keeping the module's purity contract intact.
+- `.claude/rules/gui-integration.md` — the wrapper bullet, the Freestyle-tuple cardinality, and the
+  routing-table row "C3-R0 render-two-candidates seam".
+- `.claude/rules/input-gate.md` — `render_selected_variants_guarded` described as the "two-candidate
+  batch wrapper". The gate contract itself is unchanged: every selected candidate still reaches the
+  same authoritative live-source gate.
+- `.claude/rules/progress-events.md` — the prefix was documented as `Rendering candidate {n} / 2`;
+  it is `Rendering candidate {position} / {request.count}`. No batch-owned `ProgressEvent` was
+  introduced and no stage/phase/counter semantics changed.
+- `.claude/rules/render-worker.md` — the lifecycle example "the WHOLE two-candidate C3-R0 batch ->
+  spanning BOTH candidates".
+- `.claude/rules/creative-presets.md` — "Still not implemented … L2 stage caching" was globally
+  false. The passage now separates **implemented elsewhere but banned in this surface** (L2 Stage-3
+  caching and Freestyle V1 both ship; a preset still acquires neither a cache concept nor a section
+  mechanism) from **genuinely unimplemented** (source groups, per-section Micro Cuts, a per-section
+  Variation Seed, a per-section-instance editor, a shortlisted second Qwen pass, a content-aware
+  Director) — recorded so the bans have a stated reason, explicitly **not** as a roadmap.
+- `src/gui.py` — six comment/docstring sites. **Comments and docstrings only**: the executable AST is
+  proven equivalent to the base after stripping docstring expressions.
+- `tests/test_creative_presets.py` — one comment. `_STILL_SPECULATIVE`,
+  `_FREESTYLE_ACCEPTED_IN_GUI`, `_FREESTYLE_STILL_SPECULATIVE`, `_PRESETS_ONLY_SPECULATIVE` and
+  `_DIRECTOR_ACCEPTED_IN_GUI` are untouched; the file's **full AST is byte-identical**.
+
+**Correct "two" counts were deliberately retained** — they describe architecture, not candidate
+cardinality: `gui.py` has exactly **two** `RenderLifecycle` construction sites, there are exactly
+**two** mutex-owning render wrappers, and `variant_batch_state` has exactly **two** readers. No blind
+`two → 2–4` replacement was performed; every edit was reviewed in context.
+
+**Historical entries below are intentionally preserved.** Phase 2A saying live Qwen progress was not
+yet implemented, and C3 V1 saying batch rendering was deferred, were both true when written. History
+is not rewritten to look current; this entry records the cleanup instead.
+
 ### Added — 2026-10-07 (C3-R1B-b — render 2–4 candidates, continue past a local failure)
 
 **C3-R1B is complete.** C3-R1B-a made every failure cause truthfully typed and deliberately spent

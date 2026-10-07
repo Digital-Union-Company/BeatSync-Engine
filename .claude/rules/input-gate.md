@@ -48,11 +48,12 @@ Any source change clears the confirmation (mode switch, folder path, recursive t
 list change). Non-source settings — FPS, encoder, output filename, audio — must **not**: they are not
 wired to these transitions, and a test asserts the confirmation survives them.
 
-**One gate core, two mutex-owning wrappers (C3-R0).** The authoritative gate is
+**One gate core, two mutex-owning wrappers (C3-R0 → C3-R1B-b).** The authoritative gate is
 `_process_video_guarded_unlocked()` in `gui.py`; `process_video_guarded()` is the single-render
-wrapper that `process_btn.click` calls and `render_selected_variants_guarded()` is the C3-R0
-two-candidate batch wrapper. Both take the process-global render mutex and then reach the **same**
-core — the batch once per candidate, so every candidate is freshly re-verified:
+wrapper that `process_btn.click` calls and `render_selected_variants_guarded()` is the **2–4**-candidate
+batch wrapper. (Two *wrappers* counts entry points, not candidates.) Both take the process-global
+render mutex and then reach the **same** core — the batch once per candidate, so **every** selected
+candidate is freshly re-verified, however many were chosen:
 
 ```
 _process_video_guarded_unlocked   = the ONE live source gate + render core

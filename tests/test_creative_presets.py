@@ -514,12 +514,21 @@ def test_the_preset_module_names_no_pipeline_or_ui_machinery():
         assert not re.search(rf"\b{re.escape(word)}\b", source), f"presets.py mentions {word!r}"
 
 
-#: Still speculative everywhere, including the GUI: Freestyle, L2 stage caching, source groups,
-#: per-section profiles, and any remembered preset state.
+#: Banned in every file this suite governs, **including** the GUI: `shortlist`, `stage_cache`,
+#: source groups, per-section profiles, and any remembered preset state.
 #:
-#: **`director` left this tuple with AI Director V1**, which implements it in `gui.py` — see
-#: `_DIRECTOR_ACCEPTED_IN_GUI` below for the split. `presets.py` keeps the full prohibition
-#: through `_PRESETS_ONLY_SPECULATIVE`.
+#: Read `stage_cache` here as a *scope* ban, not a claim that the feature is missing. **L2 Stage-3
+#: caching ships** (`beatsync_fork/stage_cache.py`, `L2_CACHE_VERSION = "l2_stage3_v1"`) — it simply
+#: lives in `auto_mode`, and nothing in the preset/creative-controls surface may acquire a cache
+#: concept. The same distinction applies to the two names that have *left* this tuple:
+#:
+#: * **`director` left with AI Director V1**, which implements it in `gui.py` — see
+#:   `_DIRECTOR_ACCEPTED_IN_GUI` below for the split.
+#: * **`freestyle` left with Freestyle V1**, which implements it in `gui.py` and
+#:   `beatsync_fork/freestyle.py` — see `_FREESTYLE_ACCEPTED_IN_GUI`.
+#:
+#: In both cases `presets.py` keeps the full prohibition through `_PRESETS_ONLY_SPECULATIVE`: a
+#: preset stays a name for six slider values.
 _STILL_SPECULATIVE = ("shortlist", "stage_cache", "source_group",
                       "per_section_profile", "preset_history", "last_preset", "preset_state")
 

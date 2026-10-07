@@ -47,8 +47,11 @@ Generating writes the **existing** Variation Seed, the six sliders and — only 
 something under Audio variation — the three audio level widgets. Nothing else. No Variant Lab state
 reaches `CreativeProfile`, `beat_info["creative"]`, `process_video_guarded`, `render_info`, the
 filename or any stage — the planner has never heard of recipes. **It renders nothing**; the user
-still presses Create Music Video. **Multi-variant generation and comparison shipped as C3 V1** (bottom of this file);
-**batch rendering is still deferred** and a split guard asserts none of that machinery exists.
+still presses Create Music Video. **Multi-variant generation and comparison shipped as C3 V1**, and
+**batch rendering of 2–4 selected candidates shipped as C3-R0 → C3-R1B-b** — both are documented in
+the sections below. What this *module* still knows nothing about is either of them: the split guard
+keeps `variant_lab.py` and `creative_recipe.py` free of every batch and render concept, which is the
+half that was always load-bearing.
 
 - **The base is always the live sliders.** No base control inside the lab and no cached snapshot:
   the six current values are read at click time, so Balanced explores around Balanced and a
@@ -608,9 +611,10 @@ render thread ───────────────────┴──
   deliberately **outside** it — inside, a cancellation would be caught by that block's broad
   `except Exception` and reinterpreted as "video analysis failed", continuing into fallback sampling.
 - **Exactly ONE `RenderLifecycle` per top-level render event.** One ordinary Create Music Video
-  click, or the **whole** two-candidate batch — never one per candidate, never one per internal
-  `process_video()` call. The two mutex-owning wrappers construct it; nothing below them constructs a
-  second.
+  click, or the **whole** 2–4-candidate batch — never one per candidate, never one per internal
+  `process_video()` call. The **two mutex-owning wrappers** construct it (`process_video_guarded`
+  and `render_selected_variants_guarded` — that count is wrapper sites, not candidates); nothing
+  below them constructs a second.
 - **Terminal-marking belongs to the wrappers, exactly once, after everything they ran.** Never
   inside `process_video`'s `worker()`, which the batch calls **once per candidate** against one
   shared lifecycle: `RenderLifecycle._transition` silently no-ops once terminal (by design — no

@@ -87,12 +87,14 @@ it *before* the generic handler that would otherwise emit `error(6, "Final assem
 because an event must describe what actually happened. And abandonment is still not cancellation —
 `process_video`'s finalizer joins its worker with no timeout and no kill, exactly as above.
 
-**C3-R0 prefixes; it never replaces.** The two-candidate batch wrapper emits no `ProgressEvent`
-of its own, adds no stage, no phase, no counter and no ETA, and parses nothing out of the rendered
-text. It yields `f"Rendering candidate {n} / 2"`, a blank line, and then today's `ProgressView`
-output verbatim — so the panel reads exactly as it always has, with one line of context above it.
-A status-only yield uses `gr.skip()` for the video so a finished candidate's preview is never
-blanked by the next candidate's progress. Re-adding prose parsing at this seam would repeat the
+**The C3 batch prefixes; it never replaces.** The 2–4-candidate batch wrapper emits no
+`ProgressEvent` of its own, adds no stage, no phase, no counter and no ETA, and parses nothing out of
+the rendered text. It yields `f"Rendering candidate {position} / {request.count}"` — the count is the
+user's own selection, 2 to 4 — then a blank line, and then today's `ProgressView` output verbatim, so
+the panel reads exactly as it always has with one line of context above it. A status-only yield uses
+`gr.skip()` for the video so a finished candidate's preview is never blanked by the next candidate's
+progress, which also keeps an earlier success visible when a later candidate fails locally and the
+batch carries on. Re-adding prose parsing at this seam would repeat the
 mistake Phase 2A deleted, one layer up.
 
 The legacy `progress_callback` / `console_callback` remain for CLI and headless callers;
