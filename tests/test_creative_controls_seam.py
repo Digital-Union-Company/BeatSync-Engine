@@ -765,7 +765,7 @@ def test_all_four_controls_are_live_render_request_inputs():
 #: and added a second render entry point, so the gate, the config normalisation and the delegation
 #: moved into one core that BOTH mutex-owning wrappers call. Asserting these properties there is
 #: strictly stronger than before: they now hold for the single render *and* for every candidate of
-#: a two-candidate batch. What stays pinned to the public wrapper is its positional Gradio
+#: a 2–4-candidate batch. What stays pinned to the public wrapper is its positional Gradio
 #: signature and its `fn=` registration.
 GATE_CORE = "_process_video_guarded_unlocked"
 

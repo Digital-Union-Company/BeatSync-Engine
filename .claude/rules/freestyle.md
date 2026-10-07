@@ -326,8 +326,9 @@ since it is a state with no values to project) and a read-only summary textbox.
 - **Appended explicitly and last** to both `process_btn.click` and
   `render_selected_variants_btn.click` — not behind a list concatenation, because the positional
   seam tests read those lists' own `.elts`. Every pre-existing parameter keeps its index.
-- **A C3 batch builds its tuple once, before the candidate loop**, so both candidates provably get
-  equal declarations and a mid-batch dropdown edit cannot reach candidate 2. Freestyle is shared
+- **A C3 batch builds its tuple once, before the candidate loop**, so **all selected candidates**
+  provably get equal declarations and a mid-batch dropdown edit cannot reach **any later candidate**.
+  Freestyle is shared
   render intent, so it gets exactly the treatment audio, voice, SFX, source, output, encoder and FPS
   already get; `render_batch.py` is untouched.
 - **`describe()` is unlabelled.** `ui_content` adds the `Freestyle:` label for the success panel,

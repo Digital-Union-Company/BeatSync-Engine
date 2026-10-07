@@ -1063,10 +1063,12 @@ WRAPPERS = ("process_video_guarded", "render_selected_variants_guarded")
 
 
 def test_exactly_two_lifecycles_are_ever_constructed_and_both_by_a_mutex_owning_wrapper():
-    """One per top-level render EVENT — and the batch's one spans BOTH candidates.
+    """One per top-level render EVENT — and the batch's one spans ALL selected candidates.
 
     A lifecycle per candidate would make the Cancel button a per-candidate control the UI never
-    offered: stopping candidate 1 would leave candidate 2 to start under a fresh, uncancelled token.
+    offered: stopping candidate 1 would leave the remaining candidates to start under a fresh,
+    uncancelled token. The "exactly two" in this test's name counts CONSTRUCTION SITES — the two
+    mutex-owning wrappers — not candidates.
     """
     source = _source(_GUI)
     assert source.count("RenderLifecycle(invocation_id=") == 2, \
@@ -1087,7 +1089,7 @@ def test_exactly_two_lifecycles_are_ever_constructed_and_both_by_a_mutex_owning_
 def test_the_batch_threads_one_shared_instance_into_both_candidates():
     body = _body(_GUI, "render_selected_variants_guarded")
     assert body.count("lifecycle=lifecycle") == 1, \
-        "the single core call inside the loop is what both candidates go through"
+        "the single core call inside the loop is what every selected candidate goes through"
     loop = next(n for n in ast.walk(_func(_GUI, "render_selected_variants_guarded"))
                 if isinstance(n, ast.For))
     rendered = ast.unparse(loop)

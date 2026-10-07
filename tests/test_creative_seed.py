@@ -512,8 +512,8 @@ def test_the_gui_normalises_the_seed_before_it_reaches_the_pipeline():
     the four raw widget values into one already-normalised ``CreativeProfile``, so what reaches the
     pipeline is a profile rather than a scalar the implementation has to re-clean.
     **Re-pointed by C3-R0.** The normalisation moved one function inward, into the shared
-    live-source-gate + render core that both the single-render wrapper and the two-candidate batch
-    wrapper call. The seam is unchanged; it is now the seam for *both* render paths.
+    live-source-gate + render core that both the single-render wrapper and the multi-candidate
+    batch wrapper call. The seam is unchanged; it is now the seam for *both* render paths.
     """
     tree = _gui_tree()
     guarded = ast.unparse(_func(tree, "_process_video_guarded_unlocked"))

@@ -82,7 +82,7 @@ VARIANT_LAB_WRITERS = ["generate_variant_btn.click", "new_variant_btn.click",
 #: it up there. C3-R0 made rendering mutually exclusive and added a second render entry point, so
 #: the body moved into one shared core that BOTH mutex-owning wrappers call —
 #: `process_video_guarded` for a single render and `render_selected_variants_guarded` for the
-#: two-candidate batch. Every property in this section is therefore a property of the core, and
+#: 2–4-candidate batch. Every property in this section is therefore a property of the core, and
 #: asserting it there is strictly stronger: it now covers both execution paths at once rather than
 #: only the single-render one.
 #:
