@@ -916,6 +916,119 @@ def test_the_model_derives_no_fatal_cause_from_candidate_records():
         assert f'object.__setattr__(self, "outcome_kind", {derived})' not in source
 
 
+# ---------------------------------------------------------------------------
+# C3-R1B-b / R3: a CONTINUED-PAST local failure is never the stop cause
+# ---------------------------------------------------------------------------
+#
+# The last pre-R1B-b assumption in this module read *failure* as *terminal*. Since R1B-b those are
+# different things: a CANDIDATE_LOCAL is a real failure the policy CONTINUES past, so it can never
+# have ended the run -- whatever arrives afterwards.
+
+
+def test_a_local_failure_then_a_boundary_cancel_blames_the_cancel_not_the_candidate():
+    """[§9 case A] The defect R3 fixes, at the model.
+
+    Candidate 1 failed locally and the batch *would have continued*; the user's Cancel is what
+    ended the event. "stopped on candidate 1" was false in exactly one material phrase.
+    """
+    outcome = _batch_outcome(_local_failure(0), requested=4,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    assert (outcome.succeeded, outcome.failed, outcome.cancelled_count) == (0, 1, 0)
+    assert outcome.attempted == 1 and outcome.not_attempted == 3
+    headline = outcome.headline()
+    assert headline == "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2", headline
+    assert "stopped on candidate 1" not in headline, \
+        "a local failure the batch would have continued past was blamed for stopping it"
+    assert "stopped on" not in headline
+    # the failure is still COUNTED and still visible
+    assert "FAILED" in outcome.summary_text()
+    assert "Batch CANCELLED." in outcome.summary_text()
+    assert "3 candidates not attempted." in outcome.summary_text()
+
+
+def test_two_local_failures_then_a_boundary_cancel_count_both_and_blame_neither():
+    """[§9 case B] Scaling the same truth: every local failure is counted, none is blamed."""
+    outcome = _batch_outcome(_local_failure(0), _local_failure(1), requested=4,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    headline = outcome.headline()
+    assert headline == "0 / 4 succeeded; 2 failed; batch cancelled before candidate 3", headline
+    assert outcome.failed == 2
+    assert outcome.not_attempted == 2
+    for blamed in ("stopped on candidate 1", "stopped on candidate 2", "stopped on"):
+        assert blamed not in headline, blamed
+
+
+def test_a_local_failure_then_a_real_fatal_then_a_cancel_names_only_the_fatal():
+    """[§9 case C] The local failure is counted; the fatal is named; the cancel is reported."""
+    outcome = _batch_outcome(_local_failure(0), _shared_failure(1), requested=4,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    headline = outcome.headline()
+    assert "1 failed" in headline, "the continued-past local failure must still be counted"
+    assert "stopped on candidate 2" in headline, headline
+    assert "batch cancelled" in headline, headline
+    assert "stopped on candidate 1" not in headline, "candidate 1 stopped nothing"
+    assert outcome.failed == 2, "both failures count"
+
+
+def test_a_fatal_plus_a_cancel_still_reports_both_truths():
+    """[§9 case D] The dual-truth contract R3 must NOT weaken to make the local case pass.
+
+    An `UNKNOWN_FATAL` genuinely did terminate the remaining work, so naming it is correct even
+    though a cancellation also landed.
+    """
+    outcome = _batch_outcome(_unknown_failure(0), requested=4,
+                             kind=rw.RenderOutcomeKind.CANCELLED)
+    headline = outcome.headline()
+    assert "stopped on candidate 1" in headline, headline
+    assert "batch cancelled" in headline, headline
+    # the fatal is represented by the stop phrase, so it is not double-counted as "1 failed"
+    assert outcome.failed == 1
+    assert "1 failed" not in headline, headline
+
+
+@pytest.mark.parametrize("kind,terminal", [
+    (rw.RenderOutcomeKind.SHARED_FATAL, True),
+    (rw.RenderOutcomeKind.UNKNOWN_FATAL, True),
+    (rw.RenderOutcomeKind.CANDIDATE_LOCAL, False),
+    (rw.RenderOutcomeKind.CANCELLED, False),
+    (rw.RenderOutcomeKind.SUCCESS, False),
+])
+def test_only_a_genuinely_terminal_class_can_be_named_as_the_stop(kind, terminal):
+    """[§12] Behavioural domain guard over the whole candidate vocabulary.
+
+    `_terminal_candidate()` may name only the two classes the R1B-b policy actually stops on.
+    `CANDIDATE_LOCAL` is continued past; `CANCELLED` has its own wording; `SUCCESS` stopped nothing.
+    """
+    candidate = rb.RenderCandidateOutcome(
+        candidate_index=0, candidate_master_seed=100, variation_seed=200,
+        success=(kind is rw.RenderOutcomeKind.SUCCESS),
+        durable_output_path=("C:/out/a.mov" if kind is rw.RenderOutcomeKind.SUCCESS else ""),
+        status_text="x", outcome_kind=kind)
+    # `requested=4` with one attempted candidate leaves work outstanding, so the only thing that
+    # can disqualify it from being terminal is its CLASS.
+    outcome = _batch_outcome(candidate, requested=4)
+    named = outcome._terminal_candidate()
+    assert (named is not None) is terminal, f"{kind} terminality is {named is not None}"
+    assert ("stopped on candidate 1" in outcome.headline()) is terminal, outcome.headline()
+
+
+def test_the_candidate_terminal_cause_domain_is_exactly_two_members():
+    """[§12] Pinned as an exact set: widening it must be a deliberate decision.
+
+    It is the batch-cause domain minus CANCELLED — a cancellation is a batch-level fact with its
+    own wording, never a candidate blamed for stopping the run.
+    """
+    assert rb._CANDIDATE_TERMINAL_CAUSES == frozenset((
+        rw.RenderOutcomeKind.SHARED_FATAL,
+        rw.RenderOutcomeKind.UNKNOWN_FATAL,
+    ))
+    assert rw.RenderOutcomeKind.CANDIDATE_LOCAL not in rb._CANDIDATE_TERMINAL_CAUSES
+    assert rw.RenderOutcomeKind.CANCELLED not in rb._CANDIDATE_TERMINAL_CAUSES
+    assert rw.RenderOutcomeKind.SUCCESS not in rb._CANDIDATE_TERMINAL_CAUSES
+    assert rb._CANDIDATE_TERMINAL_CAUSES == (
+        rb._BATCH_TERMINAL_CAUSES - {rw.RenderOutcomeKind.CANCELLED})
+
+
 def test_the_batch_terminal_cause_domain_is_exactly_three_members():
     """Pinned as an exact set, so widening it is a decision someone has to make deliberately."""
     assert rb._BATCH_TERMINAL_CAUSES == frozenset((

@@ -1282,6 +1282,74 @@ def test_a_cancel_after_a_success_then_a_local_failure_also_stops():
     assert run.batch_outcome.durable_paths() == ("C:/output/candidate0.mp4",)
 
 
+# ---------------------------------------------------------------------------
+# C3-R1B-b / R3: a continued-past local failure is never named as the stop,
+# measured end to end through the real handler body
+# ---------------------------------------------------------------------------
+
+
+def test_one_local_failure_then_a_boundary_cancel_reads_truthfully_end_to_end():
+    """[§10] The R3 defect, on the REAL batch-produced outcome rather than a reconstruction.
+
+    Candidate 1 fails locally; the user presses Stop as it finishes; candidate 2 never starts. The
+    batch *would* have continued, so the Cancel is what ended the event — and the summary must say
+    so, while still counting the failure.
+    """
+    run = _run_batch([KIND.CANDIDATE_LOCAL, _S, _S, _S], [False, True, True, True],
+                     cancel_after=0)
+    o = run.batch_outcome
+
+    assert run.order == [0], f"candidate 2+ started after an explicit Cancel: {run.order}"
+    assert o.attempted == 1
+    assert o.succeeded == 0
+    assert o.failed == 1
+    assert o.cancelled_count == 0, "nothing was cancelled mid-render; the boundary check fired"
+    assert o.not_attempted == 3
+    assert o.outcome_kind is KIND.CANCELLED
+    assert run.lifecycle_state is STATE.CANCELLED
+
+    headline = o.headline()
+    assert headline == "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2", headline
+    assert "stopped on candidate 1" not in headline, \
+        "the local failure was blamed for stopping a batch that would have continued"
+    assert "stopped on" not in headline
+    # the failure is still reported on its own candidate record
+    assert run.captured[0].outcome_kind is KIND.CANDIDATE_LOCAL
+    assert "FAILED" in o.summary_text()
+
+
+def test_two_local_failures_then_a_boundary_cancel_count_both_and_blame_neither():
+    """[§11] Same truth with two of them, so the fix is not position-specific."""
+    run = _run_batch([KIND.CANDIDATE_LOCAL, KIND.CANDIDATE_LOCAL, _S, _S],
+                     [False, False, True, True], cancel_after=1)
+    o = run.batch_outcome
+
+    assert run.order == [0, 1], f"candidate 3+ started after an explicit Cancel: {run.order}"
+    assert (o.attempted, o.succeeded, o.failed, o.not_attempted) == (2, 0, 2, 2)
+    assert o.outcome_kind is KIND.CANCELLED
+    assert run.lifecycle_state is STATE.CANCELLED
+
+    headline = o.headline()
+    assert headline == "0 / 4 succeeded; 2 failed; batch cancelled before candidate 3", headline
+    for blamed in ("stopped on candidate 1", "stopped on candidate 2", "stopped on"):
+        assert blamed not in headline, blamed
+    assert [c.outcome_kind for c in run.captured] == [KIND.CANDIDATE_LOCAL, KIND.CANDIDATE_LOCAL]
+
+
+def test_a_real_fatal_is_still_named_even_when_a_cancellation_also_landed():
+    """[§5] The dual-truth case must survive R3 — a fatal genuinely did end the remaining work."""
+    run = _run_batch([KIND.CANDIDATE_LOCAL, _S, KIND.SHARED_FATAL, _S],
+                     [False, True, False, True])
+    o = run.batch_outcome
+    assert run.order == [0, 1, 2]
+    headline = o.headline()
+    assert "1 failed" in headline, "the continued-past local failure is still counted"
+    assert "stopped on candidate 3" in headline, headline
+    assert "stopped on candidate 1" not in headline
+    assert o.outcome_kind is KIND.SHARED_FATAL
+    assert run.lifecycle_state is STATE.FAILED
+
+
 def test_an_unclassified_failure_derives_unknown_fatal_and_stops():
     """[§11] `None` + no durable is the model's conservative UNKNOWN_FATAL -- never CANDIDATE_LOCAL.
 

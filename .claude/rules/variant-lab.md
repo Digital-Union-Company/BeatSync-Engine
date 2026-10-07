@@ -502,10 +502,45 @@ generate N  ->  compare N  ->  tick 2 to 4  ->  Render Selected Variants
 - **"A candidate failed" and "the batch stopped" are now independent facts**, which reshaped the
   outcome model. `RenderBatchOutcome.stopped_on_failure` is **gone** — a boolean meaning "something
   failed, therefore we stopped" cannot be true once a local failure is continued past — and
-  `_failed_candidate()` became `_terminal_candidate()`, which names only the **last attempted**
-  candidate, only if it genuinely failed, and only when work was actually left unrun. A failure on
-  the *final* selected candidate stopped nothing, so it reads as a count. Early termination is read
-  from the typed batch cause plus `not_attempted`, never from the existence of any failure.
+  `_failed_candidate()` became `_terminal_candidate()`. Early termination is read from the typed
+  batch cause plus `not_attempted`, never from the existence of any failure.
+
+  **`_terminal_candidate()` may name a candidate only when all three hold**, and each condition
+  rules out a false reading:
+
+  ```
+  1. it is the LAST attempted candidate     (R1A searched for the FIRST failure, which under
+                                             R1B-b names one the batch continued past)
+  2. work was actually left unrun           (a failure on the FINAL selected candidate ended
+                                             nothing -- that reads as a count)
+  3. its class is SHARED_FATAL or
+     UNKNOWN_FATAL                          (the only two the policy actually stops on)
+  ```
+
+  Condition 3 is the one worth stating loudly, because it is the last pre-R1B-b assumption this
+  module carried: it read *failure* as *terminal*, and since R1B-b those are different things.
+  `_CANDIDATE_TERMINAL_CAUSES` is `_BATCH_TERMINAL_CAUSES` **minus** `CANCELLED`, pinned as an exact
+  two-member set:
+
+  ```
+  SHARED_FATAL     terminal -- every remaining candidate would fail identically
+  UNKNOWN_FATAL    terminal -- unproven, so the batch fails closed
+  CANDIDATE_LOCAL  NEVER terminal -- the policy CONTINUES past it
+  CANCELLED        NEVER terminal -- cancellation has its own wording
+  SUCCESS          NEVER terminal -- it stopped nothing
+  ```
+
+  So a **continued-past local failure is counted and never blamed**, whatever arrives afterwards:
+
+  ```
+  CANDIDATE_LOCAL, then Cancel before candidate 2
+    "0 / 4 succeeded; stopped on candidate 1; batch cancelled"       <- FALSE; it stopped nothing
+    "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2"  <- true
+  ```
+
+  The **dual-truth case survives unchanged**: a genuine fatal *plus* a cancellation still reports
+  both — `1 / 4 succeeded; 1 failed; stopped on candidate 3; batch cancelled` — because that fatal
+  really was terminal. Only the mistaken reading of a local failure was removed.
 - **A completed batch has `outcome_kind is None`, even carrying local failures.** It is deliberately
   not batch-`CANDIDATE_LOCAL`: that cause belongs to the candidate that suffered it, and the batch
   carried out its policy to the end. `failed` / `cancelled_count` are single-source counts that never

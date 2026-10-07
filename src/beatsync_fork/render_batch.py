@@ -364,6 +364,20 @@ _BATCH_TERMINAL_CAUSES = frozenset((
     RenderOutcomeKind.UNKNOWN_FATAL,
 ))
 
+#: [FORK] Digital-Union (C3-R1B-b / R3): the candidate classes that can be named as having **ended**
+#: the batch — the two the R1B-b continuation policy actually stops on.
+#:
+#: This is :data:`_BATCH_TERMINAL_CAUSES` minus ``CANCELLED``, and the subtraction is the point: a
+#: cancellation is a batch-level fact with its own wording ("cancelled during candidate N" /
+#: "batch cancelled before candidate N"), never a candidate blamed for stopping the run.
+#: ``CANDIDATE_LOCAL`` is absent because the policy **continues** past it — so it is a failure the
+#: summary counts, never a stop cause, whatever arrives afterwards. See
+#: :meth:`RenderBatchOutcome._terminal_candidate`.
+_CANDIDATE_TERMINAL_CAUSES = frozenset((
+    RenderOutcomeKind.SHARED_FATAL,
+    RenderOutcomeKind.UNKNOWN_FATAL,
+))
+
 
 @dataclass(frozen=True)
 class RenderBatchOutcome:
@@ -502,16 +516,46 @@ class RenderBatchOutcome:
         * Only the **last attempted** candidate can have terminated the run. R1A searched for the
           *first* failure, which under R1B-b would name a candidate the batch cheerfully continued
           past — reporting "stopped on candidate 1" for a run that went on to render 2, 3 and 4.
-        * It must be a genuine non-cancelled failure. A cancelled candidate is a Stop, not a break
-          (the reason R2 established), and a success stopped nothing.
         * **Something must actually have been left unrun.** A failure on the *final* selected
           candidate ended nothing — the batch completed its whole selection and simply had a
           failure in it, so that reads as a count, not as "stopped on candidate 4".
+        * **Its class must be one that genuinely stops the batch**, i.e. one of
+          :data:`_BATCH_TERMINAL_CAUSES` minus ``CANCELLED`` — see below.
+
+        [FORK] Digital-Union (C3-R1B-b / R3): the class test replaced "any non-success,
+        non-cancelled failure", which was the last surviving pre-R1B-b assumption in this module.
+        It read *failure* as *terminal*, and since R1B-b those are different things:
+
+        ```
+        candidate 1   CANDIDATE_LOCAL      (a real failure -- and the batch would have CONTINUED)
+        Cancel arrives before candidate 2
+        -> "0 / 4 succeeded; stopped on candidate 1; batch cancelled"      <- FALSE
+        -> "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2"  <- true
+        ```
+
+        Candidate 1 did not stop anything; the user's Cancel did. A `CANDIDATE_LOCAL` is counted as
+        a failure and **never** named as the stop cause, whatever arrives afterwards.
+
+        So exactly two candidate classes can be terminal, and they are the two the R1B-b policy
+        actually stops on:
+
+        ```
+        SHARED_FATAL     -> terminal; every remaining candidate would fail identically
+        UNKNOWN_FATAL    -> terminal; unproven, so the batch fails closed
+        CANDIDATE_LOCAL  -> NEVER terminal; the policy continues past it
+        CANCELLED        -> NEVER terminal; cancellation has its own wording ("cancelled during
+                            candidate N" / "batch cancelled before candidate N")
+        SUCCESS          -> NEVER terminal; it stopped nothing
+        ```
+
+        The dual-truth case survives unchanged: a genuine fatal **plus** a cancellation still
+        reports both — "stopped on candidate 3; batch cancelled" — because the fatal really was
+        terminal. Only a *continued-past* local failure stops being mistaken for one.
         """
         if not self.outcomes or not self.not_attempted:
             return None
         last = self.outcomes[-1]
-        if last.success or last.cancelled:
+        if last.outcome_kind not in _CANDIDATE_TERMINAL_CAUSES:
             return None
         return last
 

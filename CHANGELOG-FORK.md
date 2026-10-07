@@ -103,6 +103,24 @@ on failure     every class stops    ->  CANDIDATE_LOCAL continues; everything el
   keeps its own fatal cause and the summary still reports the failure. The mirrored pair is pinned
   as a regression against the **actual** shared lifecycle the wrapper installed, and the defensive
   `is_terminal()` backstop and abandonment handling are unchanged.
+- **A continued-past local failure is never named as the stop cause** (corrected post-review).
+  `_terminal_candidate()` still carried one pre-R1B-b assumption: it read *any* non-success,
+  non-cancelled last candidate as the one that ended the run — i.e. it read *failure* as *terminal*,
+  which since R1B-b are different things. The visible consequence was one false phrase:
+
+  ```
+  CANDIDATE_LOCAL, then Cancel before candidate 2
+    "0 / 4 succeeded; stopped on candidate 1; batch cancelled"       <- candidate 1 stopped nothing
+    "0 / 4 succeeded; 1 failed; batch cancelled before candidate 2"  <- true
+  ```
+
+  Terminality is now a **class** test against the new `_CANDIDATE_TERMINAL_CAUSES` —
+  `_BATCH_TERMINAL_CAUSES` minus `CANCELLED`, so exactly `SHARED_FATAL` and `UNKNOWN_FATAL`, the two
+  the continuation policy actually stops on. `CANDIDATE_LOCAL` is counted as a failure and never
+  blamed; `CANCELLED` keeps its own wording; `SUCCESS` stopped nothing. The **dual-truth case is
+  unchanged** — a genuine fatal plus a cancellation still reports both, because that fatal really
+  was terminal — and the fix is a definition change rather than a formatter special case, so no
+  candidate index is treated specially anywhere.
 - **The batch-level cause domain is now enforced, not just documented.**
   `RenderBatchOutcome.__post_init__` rejects `SUCCESS` and `CANDIDATE_LOCAL` with `ValueError`:
   `SUCCESS` is a candidate outcome (a finished batch reports counts and has no terminal cause —
