@@ -411,7 +411,8 @@ def test_the_invocation_id_is_coerced_to_a_plain_string():
 
 
 def test_two_lifecycles_share_no_state():
-    """The batch shares ONE object across both candidates; two objects must be independent."""
+    """The batch shares ONE object across all selected candidates; the two distinct lifecycle
+    objects this test builds must remain independent."""
     first, second = _running("a"), _running("b")
     first.request_cancel()
     assert first.cancel_requested() is True

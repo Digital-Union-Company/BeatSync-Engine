@@ -148,7 +148,8 @@ from beatsync_fork import variant_lab as fork_lab
 # vector can move. Stdlib-only and Gradio-free like the rest of the package; this module only wires
 # it to widgets. It renders nothing and knows nothing about rendering.
 from beatsync_fork import variant_batch as fork_batch
-# [FORK] Digital-Union (C3-R0): rendering exactly two compared candidates. The selection contract,
+# [FORK] Digital-Union (C3-R0 -> C3-R1B-b): rendering 2-4 compared candidates. The selection
+# contract (MIN 2 / MAX 4, canonical ascending index),
 # the candidate output identity and the batch summary all live in
 # src/beatsync_fork/render_batch.py (stdlib-only, Gradio-free, renders nothing); this module
 # supplies the request tag and performs every side effect. `variant_batch` stays generation and
@@ -2275,7 +2276,7 @@ def _process_video_guarded_unlocked(audio_file: str,
     [FORK] Digital-Union (C3-R0): this is the **unlocked core** — the one authoritative live
     source-gate-plus-render body — and it is **not** a public render entry point. Exactly two
     mutex-owning wrappers may call it in production: `process_video_guarded` (single render) and
-    `render_selected_variants_guarded` (the two-candidate batch). The batch must reach *this*
+    `render_selected_variants_guarded` (the 2-4-candidate batch). The batch must reach *this*
     rather than the single-render wrapper, because it already holds the render mutex for the whole
     batch and calling a wrapper that acquires the same non-reentrant lock would make the batch
     refuse itself on its own first candidate.
@@ -2655,7 +2656,7 @@ def render_selected_variants_guarded(
         freestyle_verse: str | None = None,
         freestyle_body: str | None = None,
         ) -> Iterator[Tuple]:
-    """Render exactly two selected candidates, one after the other. C3-R0.
+    """Render the 2-4 selected candidates, one after the other. C3-R0 -> C3-R1B-b.
 
     [FORK] Digital-Union (C3-R0). Three things make this safe, and all three are deliberate:
 
@@ -2695,7 +2696,8 @@ def render_selected_variants_guarded(
         yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE, ''
         return
 
-    # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- both candidates share it,
+    # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- every selected candidate
+    # shares it,
     # exactly as the frozen authorization requires ("no moment between candidates where the batch
     # has no cancellable top-level lifecycle"). Constructed and installed here, by the mutex-owning
     # wrapper, mirroring `process_video_guarded` exactly.
@@ -3886,9 +3888,9 @@ def create_ui() -> gr.Blocks:
                             elem_id='variant-batch-status',
                         )
                         gr.Markdown(INFO_VARIANT_APPLY)
-                        # [FORK] Digital-Union (C3-R0): render exactly two of the compared
+                        # [FORK] Digital-Union (C3-R0 -> C3-R1B-b): render 2 to 4 of the compared
                         # candidates. A SEPARATE selector from the Apply Radio above — one control
-                        # cannot honestly mean both "apply this one" and "render these two", and
+                        # cannot honestly mean both "apply this one" and "render these", and
                         # overloading it is how a user ends up rendering what they meant to apply.
                         # Like every other lab widget it registers nothing; the selection is read
                         # and validated at click time.
@@ -4274,7 +4276,7 @@ def create_ui() -> gr.Blocks:
                 variant_batch_status],
         )
 
-        # [FORK] Digital-Union (C3-R0): render exactly two compared candidates, sequentially.
+        # [FORK] Digital-Union (C3-R0 -> C3-R1B-b): render 2-4 compared candidates, sequentially.
         #
         # Its `inputs` are deliberately the batch state, the render selection and the
         # NON-candidate render intent only. The six creative sliders and the three audio levels
@@ -4298,9 +4300,9 @@ def create_ui() -> gr.Blocks:
                 session_state, source_state,
                 # [FORK] Digital-Union (Freestyle V1): the same live widgets, appended at the end
                 # and written out explicitly for the same inspectability reason. The batch freezes
-                # ONE declaration from them before its candidate loop, so both candidates render
-                # under identical section rules and a mid-batch dropdown edit cannot reach
-                # candidate 2 — exactly how audio, source, output, encoder and FPS already behave.
+                # ONE declaration from them before its candidate loop, so every selected candidate
+                # renders under identical section rules and a mid-batch dropdown edit cannot reach
+                # a later candidate — exactly how audio, source, output, encoder and FPS behave.
                 freestyle_enabled,
                 freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
                 freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,

@@ -88,7 +88,7 @@ def test_the_render_selection_range_is_two_to_four_and_is_not_the_comparison_bou
     assert rb.RENDER_SELECTION_MIN < rb.RENDER_SELECTION_MAX, "it must be a real range"
     # the exact-size constant is GONE -- no ambiguous alias beside the range
     assert not hasattr(rb, "RENDER_SELECTION_SIZE"), \
-        "RENDER_SELECTION_SIZE survived; a future caller will reintroduce the two-candidate rule"
+        "RENDER_SELECTION_SIZE survived; a future caller will reintroduce the retired exact-size rule"
     # still unrelated to the comparison bound: generating costs a millisecond, rendering costs
     # minutes, and the two numbers must not learn about each other
     assert rb.RENDER_SELECTION_MAX != fork_batch.CANDIDATE_COUNT_MAX

@@ -364,7 +364,7 @@ def test_the_live_declaration_is_built_in_the_one_shared_gate_core():
     """**Re-pointed by C3-R0.** The property is unchanged; it moved into the shared core.
 
     This is strictly stronger than before: the assertion now covers *both* the single render and
-    the two-candidate batch, because both reach the gate through this one function.
+    the 2–4-candidate batch, because every path reaches the gate through this one function.
     """
     body = _gui_body(GATE_CORE)
     assert "live_declaration(" in body, "the core still resolves the gate from state alone"

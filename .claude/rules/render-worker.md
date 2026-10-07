@@ -70,13 +70,15 @@ that `video_analysis.py`, `stage5_qwen_scene_worker.py` and `qwen_progress.py` n
 ## One lifecycle per top-level render event
 
 ```
-one Create Music Video click        -> one RenderLifecycle
-the WHOLE two-candidate C3-R0 batch -> one RenderLifecycle, spanning BOTH candidates
+one Create Music Video click         -> one RenderLifecycle
+the WHOLE 2-4-candidate C3 batch     -> one RenderLifecycle, spanning ALL selected candidates
 ```
 
 Never one per candidate, never one per internal `process_video()` call. A per-candidate lifecycle
-would make Cancel a per-candidate control the UI never offered: stopping candidate 1 would leave
-candidate 2 to start under a fresh, uncancelled token.
+would make Cancel a per-candidate control the UI never offered: stopping candidate 1 would leave the
+remaining candidates to start under a fresh, uncancelled token. It is also what closes the
+continue-after-local-failure race — a `continue` cannot outrun a Stop when one shared token spans
+the whole selection.
 
 Only the two mutex-owning wrappers construct one. `tests/test_render_cancellation.py` pins that
 `gui.py` contains exactly two constructions and that no module below them contains any.

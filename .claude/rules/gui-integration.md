@@ -32,10 +32,11 @@ automatically.
 - **Stage identity is `event.stage`, an integer.** The old
   `re.search(r"Stage (\d+) is processing", message)` recovery is gone from `gui.py` and must not come
   back; a test asserts its absence.
-- **One render gate core, two mutex-owning wrappers, one render at a time (C3-R0).**
+- **One render gate core, two mutex-owning wrappers, one render at a time (C3-R0 → C3-R1B-b).**
   `_process_video_guarded_unlocked()` is the single authoritative live-source-gate + render body;
   `process_video_guarded()` wraps it for a single render and `render_selected_variants_guarded()`
-  for the two-candidate batch. Both acquire the **process-global `_RENDER_LOCK`** non-blockingly
+  for the **2–4-candidate** batch. (Two *wrappers* is a count of entry points and is unrelated to
+  the candidate count, which is 2–4.) Both acquire the **process-global `_RENDER_LOCK`** non-blockingly
   and refuse cleanly when it is held — `create_music_video` clears one process-global processing
   dir per render, so two overlapping renders would delete each other's in-flight clips. Both
   events also share one `concurrency_id` with `concurrency_limit=1`, but that is cooperative: the
@@ -208,8 +209,8 @@ automatically.
   these render bodies and execute them against a synthesised namespace, so the bodies must not name
   a fork module. `auto_mode._resolve_freestyle` is the one conversion to a `FreestyleDeclaration`,
   and the success line reads the resolved declaration back off `beat_info` **duck-typed** for the
-  same reason. A C3 batch builds its tuple **once before the candidate loop**, so both candidates
-  provably get equal declarations. See `.claude/rules/freestyle.md`.
+  same reason. A C3 batch builds its tuple **once before the candidate loop**, so every selected
+  candidate provably gets an equal declaration. See `.claude/rules/freestyle.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -219,7 +220,7 @@ automatically.
 |---|---|
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
-| C3-R0 render-two-candidates seam, render mutex, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
+| the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |
 | the six creative sliders, Variation Seed, Randomize | `.claude/rules/creative-controls.md` |
 | the **AI Director** group, its instruction box, either Director button, `director_proposal_state`, or the one-shot model invocation | `.claude/rules/director.md` **+** `.claude/rules/creative-controls.md` **+** `.claude/rules/creative-presets.md` — Apply writes the seed, the six sliders and the preset label, so all three writer matrices apply |

@@ -195,13 +195,23 @@ UI convenience rather than a second recipe concept:
 The pre-existing prohibition on a preset *button*, randomiser or reset for the six global controls is
 unchanged, and so is the `Custom`-is-not-a-recipe rule. Full contract: `.claude/rules/freestyle.md`.
 
-Still not implemented, and no speculative abstraction was added for any of it: L2 stage caching,
-source groups, **per-section Micro Cuts**, **a per-section Variation Seed**, a per-section*instance*
+Two different things are easy to conflate here, and the tests encode both separately:
+
+**Implemented elsewhere, but `presets.py` must still know nothing about it.** **L2 Stage-3 caching**
+(`beatsync_fork/stage_cache.py`, `L2_CACHE_VERSION = "l2_stage3_v1"`) and **Freestyle V1**
+(`beatsync_fork/freestyle.py`) both ship. A preset stays a *name for six slider values*: it acquires
+no cache concept and no section mechanism. `stage_cache` therefore remains in the globally-speculative
+ban list for the files this rule governs, and `freestyle` moved to `_PRESETS_ONLY_SPECULATIVE` —
+accepted in `gui.py`, still forbidden inside `presets.py`. That split is the point; do not read either
+ban as a claim that the feature does not exist.
+
+**Genuinely not implemented anywhere, and no speculative abstraction was added for any of it:**
+source groups, **per-section Micro Cuts**, **a per-section Variation Seed**, a per-section *instance*
 editor (Freestyle keys on section *type*), a second style-aware Qwen pass over a shortlisted
 candidate set, and a **content-aware Director** that reads the Stage-5 library. Tests assert the
-absence of shortlist/stage-cache machinery, of `director_cache` / `director_history` /
-`director_media` / `director_render` / `director_transform`, and of `freestyle_micro` /
-`freestyle_seed` / `freestyle_timeline` / `analyze_music`. The permanent constraints are unchanged:
-creative state never enters Stage-5 cache identity, no per-render interpretation overwrites
-persistent semantics, and a future second pass stays run-scoped rather than becoming the library's
-durable truth.
+absence of shortlist machinery, of `director_cache` / `director_history` / `director_media` /
+`director_render` / `director_transform`, and of `freestyle_micro` / `freestyle_seed` /
+`freestyle_timeline` / `analyze_music`. None of these is scheduled: they are recorded so the bans have
+a stated reason, not as a roadmap. The permanent constraints are unchanged: creative state never
+enters Stage-5 cache identity, no per-render interpretation overwrites persistent semantics, and a
+future second pass would stay run-scoped rather than becoming the library's durable truth.

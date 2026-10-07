@@ -647,7 +647,7 @@ def test_h_verification_is_timed_around_the_existing_gate_call():
     """**Re-pointed by C3-R0.** Gate timing is a property of the gate, not of the wrapper's name.
 
     C3-R0 moved the source gate into one shared core that both the single-render wrapper and the
-    two-candidate batch wrapper call, so the timer moved with it. That makes this assertion
+    multi-candidate batch wrapper call, so the timer moved with it. That makes this assertion
     stronger rather than weaker: every batch candidate is independently re-verified and gets its
     own `verification_seconds`, measured by this one timed call.
     """
