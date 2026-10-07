@@ -881,6 +881,11 @@ class _BatchRun:
     [FORK] Digital-Union (C3-R1B-b): `order` records the candidate index of every render the batch
     actually STARTED, so "candidate 3 was never attempted" is a measured call order rather than an
     inference from a count. `batch_outcome` is the real `RenderBatchOutcome` the body built.
+
+    [FORK] Digital-Union (C3-R1B-b / R2): `lifecycle` is the ACTUAL shared `RenderLifecycle` the
+    wrapper constructed and threaded through every candidate -- captured, never reconstructed. Its
+    terminal state is a property of the top-level render event, and asserting on a lifecycle built
+    afterwards would prove nothing about the one the handler used.
     """
 
     def __init__(self):
@@ -888,6 +893,11 @@ class _BatchRun:
         self.order = []
         self.final = None
         self.batch_outcome = None
+        self.lifecycle = None
+
+    @property
+    def lifecycle_state(self):
+        return self.lifecycle.state if self.lifecycle is not None else None
 
     @property
     def attempted(self):
@@ -950,6 +960,12 @@ def _run_batch(kinds, durables, cancel_after=None):
 
         def stream():
             durable = f"C:/output/candidate{index}.mp4" if durables[index] else ""
+            if kinds[index] is fork_render_worker.RenderOutcomeKind.CANCELLED:
+                # Faithfulness, not convenience: in production a candidate can only reach
+                # CANCELLED because `RenderCancelled` was raised, which only happens because the
+                # shared lifecycle's cancel Event was set. A harness that fabricated the class
+                # without the flag would be testing a state the app cannot produce.
+                lifecycle_box["lifecycle"].request_cancel()
             session_state["render_outcome_kind"] = kinds[index]
             session_state["last_output_path"] = durable
             session_state["audio_layers_report"] = ""
@@ -964,8 +980,13 @@ def _run_batch(kinds, durables, cancel_after=None):
         return stream()
 
     def tracking_lifecycle(invocation_id):
+        # The REAL RenderLifecycle, recorded so its TERMINAL STATE can be asserted afterwards.
+        # Exactly one is ever constructed per batch, which this also demonstrates.
+        assert "lifecycle" not in lifecycle_box, \
+            "the wrapper constructed a second RenderLifecycle for one batch"
         lifecycle_box["lifecycle"] = fork_render_worker.RenderLifecycle(
             invocation_id=invocation_id)
+        run.lifecycle = lifecycle_box["lifecycle"]
         return lifecycle_box["lifecycle"]
 
     batch = _root_92_batch(count=max(count, 2))
@@ -1280,6 +1301,110 @@ def test_an_unclassified_success_derives_success_and_continues():
     assert run.order == [0, 1]
     assert run.kinds == [KIND.SUCCESS, KIND.SUCCESS]
     assert run.batch_outcome.succeeded == 2
+
+
+# ---------------------------------------------------------------------------
+# C3-R1B-b / R2: the top-level lifecycle state must not depend on candidate ORDER
+# ---------------------------------------------------------------------------
+#
+# `RenderLifecycle` belongs to the top-level render EVENT, so its terminal state answers "what
+# happened to the event", not "did every candidate succeed":
+#
+#     CANCELLED  an explicit cancellation request won
+#     FINISHED   the batch exhausted its full selected list under the authorized policy, however
+#                many attempted candidates failed locally along the way
+#     FAILED     the event ended BEFORE exhausting its selection
+#
+# Candidate failures stay on their own outcomes and in the summary. R1 derived this from
+# `session_state[RENDER_OUTCOME_KEY]` -- whatever the LAST candidate happened to write -- which was
+# fine while every failure stopped the batch and became order-dependent the moment CANDIDATE_LOCAL
+# continued.
+
+STATE = fork_render_worker.RenderLifecycleState
+
+
+def test_a_completed_batch_has_the_same_lifecycle_state_whatever_the_candidate_order():
+    """**The load-bearing R2 regression pair.** Same batch result, mirrored candidate order.
+
+    Before R2: A was FINISHED and B was FAILED, purely because B's last candidate was the failing
+    one. Every batch-level fact below is identical across the two, so the lifecycle state must be
+    too.
+    """
+    a = _run_batch([KIND.CANDIDATE_LOCAL, _S], [False, True])
+    b = _run_batch([_S, KIND.CANDIDATE_LOCAL], [True, False])
+
+    for label, run in (("local-then-success", a), ("success-then-local", b)):
+        o = run.batch_outcome
+        assert run.order == [0, 1], label
+        assert (o.attempted, o.succeeded, o.failed, o.not_attempted) == (2, 1, 1, 0), label
+        assert o.outcome_kind is None, label
+        assert o.headline() == "1 / 2 succeeded; 1 failed", label
+        assert run.lifecycle_state is STATE.FINISHED, \
+            f"{label}: the event exhausted its selection but the lifecycle reads " \
+            f"{run.lifecycle_state}"
+
+    assert a.lifecycle_state is b.lifecycle_state, \
+        "the lifecycle state depends on which candidate happened to fail last"
+
+
+@pytest.mark.parametrize("label,kinds,cancel_after,expected", [
+    # the complete selection was attempted -> FINISHED, local failures notwithstanding
+    ("four success",            (_S, _S, _S, _S),                None, STATE.FINISHED),
+    ("local first",             (_L, _S, _S, _S),                None, STATE.FINISHED),
+    ("local last",              (_S, _S, _S, _L),                None, STATE.FINISHED),
+    ("alternating locals",      (_L, _S, _L, _S),                None, STATE.FINISHED),
+    # a fatal on the FINAL candidate also left nothing unattempted -> FINISHED
+    ("shared fatal last",       (_S, _S, _S, KIND.SHARED_FATAL),  None, STATE.FINISHED),
+    ("unknown fatal last",      (_S, _S, _S, KIND.UNKNOWN_FATAL), None, STATE.FINISHED),
+    # the event ended with candidates still unattempted -> FAILED
+    ("shared fatal early",      (_S, KIND.SHARED_FATAL, _S, _S),  None, STATE.FAILED),
+    ("unknown fatal early",     (_S, KIND.UNKNOWN_FATAL, _S, _S), None, STATE.FAILED),
+    ("local then fatal early",  (_L, _S, KIND.UNKNOWN_FATAL, _S), None, STATE.FAILED),
+    # cancellation always wins
+    ("cancel during",           (_S, KIND.CANCELLED, _S, _S),     None, STATE.CANCELLED),
+    ("cancel between",          (_S, _S, _S, _S),                 1,    STATE.CANCELLED),
+    ("local then cancel",       (_L, _S, _S, _S),                 0,    STATE.CANCELLED),
+])
+def test_the_lifecycle_terminal_matrix(label, kinds, cancel_after, expected):
+    """Every §8 row, asserted on the ACTUAL shared lifecycle the wrapper installed."""
+    run = _run_batch(list(kinds), [k is _S for k in kinds], cancel_after=cancel_after)
+    assert run.lifecycle_state is expected, \
+        f"{label}: expected {expected}, got {run.lifecycle_state}"
+    assert run.lifecycle.is_terminal(), label
+
+
+def test_a_fatal_on_the_final_candidate_keeps_its_own_cause_while_the_event_finished():
+    """FINISHED at event level must not erase or reclassify the candidate's failure."""
+    run = _run_batch([_S, _S, _S, KIND.SHARED_FATAL], [True, True, True, False])
+    assert run.lifecycle_state is STATE.FINISHED, "the selection was exhausted"
+    assert run.captured[-1].outcome_kind is KIND.SHARED_FATAL, \
+        "the candidate's own cause was rewritten"
+    assert run.captured[-1].success is False
+    assert run.batch_outcome.failed == 1
+    assert run.batch_outcome.not_attempted == 0
+    assert "FAILED" in run.batch_outcome.summary_text()
+
+
+def test_the_lifecycle_derivation_reads_selection_exhaustion_not_the_last_candidate():
+    """Structural half: the old `session_state[RENDER_OUTCOME_KEY]` read must be gone."""
+    body = _gui_body("render_selected_variants_guarded")
+    assert "len(outcomes) == request.count" in body, \
+        "the completion test is not selection exhaustion"
+    marking = body.split("if lifecycle.cancel_requested():")[-1]
+    assert "RENDER_OUTCOME_KEY" not in marking.split("_clear_active_render")[0], \
+        "the terminal state is still derived from the last candidate's session_state outcome"
+    # the defensive backstop survives, and nothing here requests a cancellation
+    assert "if not lifecycle.is_terminal():" in body
+    assert "request_cancel" not in body, \
+        "a finalizer that cancelled would turn abandonment into a Stop"
+
+
+def test_exactly_one_lifecycle_is_constructed_for_a_whole_batch():
+    """Re-pinned behaviourally: the harness asserts it, so a second construction fails loudly."""
+    run = _run_batch([_S, _S, _S, _S], [True, True, True, True])
+    assert run.lifecycle is not None
+    assert run.order == [0, 1, 2, 3]
+    assert run.lifecycle.invocation_id
 
 
 # ---------------------------------------------------------------------------

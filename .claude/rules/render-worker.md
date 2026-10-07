@@ -89,6 +89,54 @@ once per candidate against one shared lifecycle, and `_transition` silently no-o
 marking from there would freeze the batch's reported state on candidate 1's outcome and candidate 2's
 real result would never reach the lifecycle.
 
+### What the three terminal states mean for a batch (C3-R1B-b / R2)
+
+A `RenderLifecycle` belongs to the **top-level render event**, so its terminal state answers *what
+happened to the event* — not *did every candidate succeed*:
+
+```
+CANCELLED   an explicit cancellation request won
+FINISHED    the batch exhausted its FULL selected candidate list under the authorized policy,
+            however many attempted candidates failed locally along the way
+FAILED      the event ended BEFORE exhausting its selection -- an early fatal stop, an unexpected
+            exception, or an invariant ValueError
+```
+
+```python
+if lifecycle.cancel_requested():        CANCELLED     # always wins
+elif len(outcomes) == request.count:    FINISHED      # selection exhausted
+else:                                   FAILED        # ended early
+```
+
+**The completion test is selection exhaustion, never the last candidate's outcome.** R1 derived it
+from `session_state[RENDER_OUTCOME_KEY]`, which holds whatever the final candidate happened to
+write. That was sufficient while every candidate failure stopped the batch, and became
+order-dependent the moment `CANDIDATE_LOCAL` started continuing:
+
+```
+CANDIDATE_LOCAL, SUCCESS  ->  FINISHED
+SUCCESS, CANDIDATE_LOCAL  ->  FAILED      <- same batch result, different state
+```
+
+Both attempted their whole selection, both report `1 / 2 succeeded; 1 failed`, and both carry batch
+`outcome_kind is None`. Only the order differed. `tests/test_render_failure_classification.py`
+pins that mirrored pair as a regression, asserting on the **actual** shared lifecycle the wrapper
+installed rather than a reconstruction.
+
+Two consequences worth stating, because they look surprising and are correct:
+
+- **A `SHARED_FATAL` or `UNKNOWN_FATAL` on the FINAL selected candidate leaves the lifecycle
+  FINISHED.** Nothing was left unattempted, so the event completed. The candidate still truthfully
+  carries its own fatal cause and the summary still reports its failure — lifecycle state is not an
+  aggregate candidate success counter, and nothing is erased or reclassified.
+- **Candidate failures are represented by their candidate outcomes and the summary, not by the
+  lifecycle.** Do not reach for lifecycle state to answer "did anything fail"; that is
+  `RenderBatchOutcome.failed`.
+
+The defensive `if not lifecycle.is_terminal(): mark_terminal(FAILED)` backstop is unchanged, for a
+path that never reached the derivation at all (an abandoned generator, an exception before the
+loop). **Abandonment is still not an explicit Cancel** — no finalizer calls `request_cancel()`.
+
 ## Monotonic state, and why terminal is a silent no-op
 
 ```

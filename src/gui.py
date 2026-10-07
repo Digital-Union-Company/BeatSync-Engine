@@ -2859,13 +2859,41 @@ def render_selected_variants_guarded(
         # [FORK] Digital-Union (C3-R1A): the ONE place the batch's shared lifecycle reaches a
         # terminal state -- after everything it ran, mirroring `process_video_guarded`. A Cancel
         # click that landed anywhere in the batch (mid-candidate or at a candidate boundary) is
-        # authoritative over the last candidate's own outcome: the top-level EVENT was cancelled.
+        # authoritative over everything else: the top-level EVENT was cancelled.
+        #
+        # [FORK] Digital-Union (C3-R1B-b / R2): the completion test is **selection exhaustion**, not
+        # the last candidate's outcome. R1A read `session_state[RENDER_OUTCOME_KEY]`, which holds
+        # whatever the final candidate happened to write -- sufficient while every candidate failure
+        # stopped the batch, and order-dependent nonsense once CANDIDATE_LOCAL continues:
+        #
+        #     CANDIDATE_LOCAL, SUCCESS  -> FINISHED
+        #     SUCCESS, CANDIDATE_LOCAL  -> FAILED     <- same batch result, different state
+        #
+        # Both batches attempted their whole selection, both report `1 / 2 succeeded; 1 failed`, and
+        # both have batch `outcome_kind is None`. Only the order differed.
+        #
+        # `RenderLifecycle` belongs to the TOP-LEVEL render event, so its terminal state answers
+        # "what happened to the event", not "did every candidate succeed":
+        #
+        #     CANCELLED  an explicit cancellation request won
+        #     FINISHED   the batch exhausted its full selected list under the authorized policy,
+        #                however many attempted candidates failed locally along the way
+        #     FAILED     the event ended BEFORE exhausting its selection -- an early fatal stop, an
+        #                unexpected exception, or an invariant ValueError
+        #
+        # Candidate failures stay represented where they belong: on their own
+        # `RenderCandidateOutcome` and in the summary. Nothing is erased or reclassified -- a
+        # candidate that carried SHARED_FATAL still carries it even when it was the final one and
+        # the lifecycle therefore reads FINISHED.
         if lifecycle.cancel_requested():
             lifecycle.mark_terminal(RenderLifecycleState.CANCELLED)
-        elif (session_state or {}).get(RENDER_OUTCOME_KEY) is RenderOutcomeKind.SUCCESS:
+        elif len(outcomes) == request.count:
             lifecycle.mark_terminal(RenderLifecycleState.FINISHED)
         else:
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
+        # Unchanged defensive backstop for a path that never reached the derivation above at all
+        # (an abandoned generator, an exception before the loop). Abandonment is still NOT an
+        # explicit Cancel -- nothing here calls `request_cancel()`.
         if not lifecycle.is_terminal():
             lifecycle.mark_terminal(RenderLifecycleState.FAILED)
         _clear_active_render(lifecycle.invocation_id)

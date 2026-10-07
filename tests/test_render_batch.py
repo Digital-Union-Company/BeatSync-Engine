@@ -854,6 +854,83 @@ def test_the_batch_cause_is_never_candidate_local():
     assert completed.outcomes[0].outcome_kind is rw.RenderOutcomeKind.CANDIDATE_LOCAL
 
 
+# ---------------------------------------------------------------------------
+# C3-R1B-b / R2: the BATCH-level cause DOMAIN is only three members wide
+# ---------------------------------------------------------------------------
+#
+# The field was documented as a batch-terminal cause while the type still accepted any
+# `RenderOutcomeKind`. Two members are not batch facts at all, and a model that accepts them is a
+# model a future orchestrator can quietly misuse.
+
+
+@pytest.mark.parametrize("kind", [
+    rw.RenderOutcomeKind.SUCCESS,
+    rw.RenderOutcomeKind.CANDIDATE_LOCAL,
+])
+def test_an_invalid_batch_level_cause_is_rejected(kind):
+    """`SUCCESS` is a candidate outcome; `CANDIDATE_LOCAL` is the candidate's, and is continued past.
+
+    Neither can terminate a batch, so neither may be stated as one. A finished batch reports counts
+    and carries `None`.
+    """
+    with pytest.raises(ValueError, match="not a batch-level terminal cause"):
+        _batch_outcome(_success(0), _success(1), kind=kind)
+    # and the rejection does not depend on what the candidates happen to be
+    with pytest.raises(ValueError, match="not a batch-level terminal cause"):
+        rb.RenderBatchOutcome(requested_count=2, outcomes=(), outcome_kind=kind)
+
+
+@pytest.mark.parametrize("kind", [
+    rw.RenderOutcomeKind.CANCELLED,
+    rw.RenderOutcomeKind.SHARED_FATAL,
+    rw.RenderOutcomeKind.UNKNOWN_FATAL,
+])
+def test_every_real_batch_terminal_cause_is_accepted(kind):
+    outcome = _batch_outcome(_success(0), requested=4, kind=kind)
+    assert outcome.outcome_kind is kind
+    assert outcome.stopped_early is True
+
+
+def test_none_remains_accepted_and_is_what_a_completed_batch_carries():
+    outcome = _batch_outcome(_success(0), _success(1), requested=2, kind=None)
+    assert outcome.outcome_kind is None
+    assert outcome.stopped_early is False
+
+
+def test_the_cancelled_candidate_derivation_still_works_from_none():
+    """The one sound model derivation survives the new domain check, which runs before it."""
+    derived = _batch_outcome(_cancelled_candidate(0), requested=2)
+    assert derived.outcome_kind is rw.RenderOutcomeKind.CANCELLED
+    assert derived.cancelled is True
+
+
+def test_the_model_derives_no_fatal_cause_from_candidate_records():
+    """Whether a fatal candidate ENDED the run depends on whether work remained — the
+    orchestrator's knowledge, not the model's. So the model must leave it unstated."""
+    for failure in (_shared_failure(1), _unknown_failure(1)):
+        unstated = _batch_outcome(_success(0), failure, requested=4)
+        assert unstated.outcome_kind is None, \
+            "the model invented a batch cause from a candidate record"
+    source = _executable_source(_MODULE)
+    for derived in ("RenderOutcomeKind.SHARED_FATAL", "RenderOutcomeKind.UNKNOWN_FATAL"):
+        assert f'object.__setattr__(self, "outcome_kind", {derived})' not in source
+
+
+def test_the_batch_terminal_cause_domain_is_exactly_three_members():
+    """Pinned as an exact set, so widening it is a decision someone has to make deliberately."""
+    assert rb._BATCH_TERMINAL_CAUSES == frozenset((
+        rw.RenderOutcomeKind.CANCELLED,
+        rw.RenderOutcomeKind.SHARED_FATAL,
+        rw.RenderOutcomeKind.UNKNOWN_FATAL,
+    ))
+    assert rw.RenderOutcomeKind.SUCCESS not in rb._BATCH_TERMINAL_CAUSES
+    assert rw.RenderOutcomeKind.CANDIDATE_LOCAL not in rb._BATCH_TERMINAL_CAUSES
+    # the candidate-level field keeps the FULL five-member vocabulary
+    for kind in rw.RenderOutcomeKind:
+        assert _typed(success=(kind is rw.RenderOutcomeKind.SUCCESS),
+                      kind=kind).outcome_kind is kind
+
+
 def test_cancelled_candidates_are_not_counted_as_failures():
     outcome = _batch_outcome(_success(0, "C:/out/a.mov"), _cancelled_candidate(1), requested=4,
                              kind=rw.RenderOutcomeKind.CANCELLED)

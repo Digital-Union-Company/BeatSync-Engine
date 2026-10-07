@@ -351,6 +351,20 @@ def _one_line(text: str, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+#: [FORK] Digital-Union (C3-R1B-b / R2): the **only** causes that can terminate a batch early.
+#:
+#: Deliberately a subset of ``RenderOutcomeKind``, because the two members left out are not batch
+#: facts at all: ``SUCCESS`` is a candidate outcome (a finished batch reports counts, and has no
+#: terminal cause — that is what ``None`` means), and ``CANDIDATE_LOCAL`` belongs to the candidate
+#: that suffered it, which since R1B-b the batch *continues* past. See
+#: :meth:`RenderBatchOutcome.__post_init__`, which rejects both.
+_BATCH_TERMINAL_CAUSES = frozenset((
+    RenderOutcomeKind.CANCELLED,
+    RenderOutcomeKind.SHARED_FATAL,
+    RenderOutcomeKind.UNKNOWN_FATAL,
+))
+
+
 @dataclass(frozen=True)
 class RenderBatchOutcome:
     """The whole batch's truthful record, and the one formatter for it.
@@ -402,15 +416,37 @@ class RenderBatchOutcome:
     outcome_kind: "RenderOutcomeKind | None" = None
 
     def __post_init__(self) -> None:
-        """Derive the batch cause only where a candidate *proves* it; otherwise leave it unstated.
+        """Validate the batch-level cause domain, then derive only what a candidate *proves*.
 
-        Exactly one derivation is sound: a candidate that was itself cancelled proves the top-level
-        render event was cancelled. Everything else stays ``None`` — meaning "not stated" — so every
-        pre-R2 construction keeps byte-identical `headline()` / `summary_text()` output. In
+        [FORK] Digital-Union (C3-R1B-b / R2): the **domain check comes first**, because the field
+        was documented as a batch-terminal cause while the type still accepted any
+        ``RenderOutcomeKind``. Two members are not batch causes at all and are now rejected:
+
+        * ``SUCCESS`` is a *candidate* outcome. A batch's success is its counts
+          (``succeeded`` / ``failed`` / ``not_attempted``), not a terminal cause — a batch that
+          finished has no cause to report, which is what ``None`` means here.
+        * ``CANDIDATE_LOCAL`` belongs to the candidate that suffered it. Since C3-R1B-b the batch
+          **continues** past one, so by definition it did not terminate the run. If the selection
+          was exhausted the batch cause is ``None``; if something fatal stopped it later, the cause
+          is that later terminal class.
+
+        So the only legal non-``None`` values are the three that can actually end a batch early:
+        ``CANCELLED``, ``SHARED_FATAL``, ``UNKNOWN_FATAL``.
+
+        Exactly one derivation is then sound: a candidate that was itself cancelled proves the
+        top-level render event was cancelled. Everything else stays ``None`` — meaning "not stated" —
+        so every pre-R2 construction keeps byte-identical `headline()` / `summary_text()` output. In
         particular the batch-boundary case has **no** cancelled candidate to derive from, which is
         precisely why `gui.py` must state it explicitly; nothing here can rescue a caller that
-        forgets to.
+        forgets to. The model deliberately does **not** derive ``SHARED_FATAL`` or ``UNKNOWN_FATAL``
+        from candidate records: whether a fatal candidate actually ended the run depends on whether
+        work remained, which is the orchestrator's knowledge, not the model's.
         """
+        if self.outcome_kind is not None and self.outcome_kind not in _BATCH_TERMINAL_CAUSES:
+            raise ValueError(
+                f"{self.outcome_kind!r} is not a batch-level terminal cause; "
+                f"expected None or one of "
+                f"{sorted(k.name for k in _BATCH_TERMINAL_CAUSES)}")
         if self.outcome_kind is None and any(o.cancelled for o in self.outcomes):
             object.__setattr__(self, "outcome_kind", RenderOutcomeKind.CANCELLED)
 

@@ -508,9 +508,26 @@ generate N  ->  compare N  ->  tick 2 to 4  ->  Render Selected Variants
   from the typed batch cause plus `not_attempted`, never from the existence of any failure.
 - **A completed batch has `outcome_kind is None`, even carrying local failures.** It is deliberately
   not batch-`CANDIDATE_LOCAL`: that cause belongs to the candidate that suffered it, and the batch
-  carried out its policy to the end. Only `CANCELLED`, `SHARED_FATAL` and `UNKNOWN_FATAL` are
-  batch-terminal causes, and `failed` / `cancelled_count` are single-source counts that never come
-  from status prose.
+  carried out its policy to the end. `failed` / `cancelled_count` are single-source counts that never
+  come from status prose.
+
+  **The batch-level cause domain is exactly three members wide**, enforced in
+  `RenderBatchOutcome.__post_init__` since C3-R1B-b / R2 — `CANCELLED`, `SHARED_FATAL`,
+  `UNKNOWN_FATAL`, or `None`. The two it rejects are not batch facts at all: `SUCCESS` is a
+  *candidate* outcome (a finished batch reports counts and has no terminal cause, which is what
+  `None` means), and `CANDIDATE_LOCAL` belongs to the candidate the batch **continued past** — so by
+  definition it did not terminate the run. The field was documented this way while the type still
+  accepted any `RenderOutcomeKind`; stating an invalid cause now raises `ValueError`. The model
+  still derives only what a candidate *proves* — a cancelled candidate implies a cancelled event —
+  and deliberately derives **no** fatal cause from candidate records, because whether a fatal
+  candidate actually ended the run depends on whether work remained, which is the orchestrator's
+  knowledge rather than the model's.
+- **The top-level lifecycle state is not a candidate success counter.** `CANCELLED` when a
+  cancellation won, `FINISHED` when the batch exhausted its full selected list under the authorized
+  policy (local failures notwithstanding), `FAILED` when the event ended before exhausting it. It is
+  read from **selection exhaustion**, never from the last candidate's outcome — which R1 did, making
+  it order-dependent once `CANDIDATE_LOCAL` continued. Full contract and the mirrored regression
+  pair: `.claude/rules/render-worker.md`.
 - **Report ownership.** `audio_layers_report` and `smart_mix_report` keep `process_btn.click` as
   their **only** writer; the batch reads them from `session_state` after each candidate and the
   dedicated summary owns multi-render diagnostics. `variant_batch_table` and

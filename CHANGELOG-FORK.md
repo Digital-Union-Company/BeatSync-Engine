@@ -90,6 +90,26 @@ on failure     every class stops    ->  CANDIDATE_LOCAL continues; everything el
   summary measures 20–21 lines. **No gallery, no new component, no layout redesign**, and the
   selector is still empty by default — quadrupling the possible commitment makes that more
   load-bearing, not less.
+- **The top-level lifecycle terminal state is read from selection exhaustion, not from the last
+  candidate** (corrected post-review). The derivation is `CANCELLED` when a cancellation won,
+  `FINISHED` when `len(outcomes) == request.count`, `FAILED` otherwise. A first draft kept R1A's
+  `session_state[RENDER_OUTCOME_KEY]` read — whatever the final candidate happened to write — which
+  was sufficient while every candidate failure stopped the batch and became order-dependent the
+  moment `CANDIDATE_LOCAL` continued: `CANDIDATE_LOCAL, SUCCESS` gave `FINISHED` while
+  `SUCCESS, CANDIDATE_LOCAL` gave `FAILED`, for two batches with identical counts, identical
+  headline and identical batch cause. `RenderLifecycle` belongs to the render **event**, so its
+  state answers "what happened to the event", not "did every candidate succeed" — a `SHARED_FATAL`
+  on the *final* selected candidate therefore leaves the lifecycle `FINISHED` while the candidate
+  keeps its own fatal cause and the summary still reports the failure. The mirrored pair is pinned
+  as a regression against the **actual** shared lifecycle the wrapper installed, and the defensive
+  `is_terminal()` backstop and abandonment handling are unchanged.
+- **The batch-level cause domain is now enforced, not just documented.**
+  `RenderBatchOutcome.__post_init__` rejects `SUCCESS` and `CANDIDATE_LOCAL` with `ValueError`:
+  `SUCCESS` is a candidate outcome (a finished batch reports counts and has no terminal cause —
+  that is what `None` means), and `CANDIDATE_LOCAL` belongs to the candidate the batch *continued
+  past*, so it cannot have terminated the run. Allowed explicit values are `None`, `CANCELLED`,
+  `SHARED_FATAL`, `UNKNOWN_FATAL`. The sound cancelled-candidate derivation is preserved and the
+  model still derives no fatal cause from candidate records.
 - **Cancellation and the taxonomy are untouched.** `render_worker.py` and `audio_mixdown.py` are
   byte-identical: one lifecycle already spanned the whole batch, however many candidates, which is
   the clearest evidence the C3-R1A design generalised. `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION`
