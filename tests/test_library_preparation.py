@@ -25,6 +25,7 @@ style anywhere in the workflow.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import fields as dataclasses_fields
 from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
@@ -918,11 +920,17 @@ def test_g_no_preparation_call_forwards_an_audio_profile():
 
 
 def test_g_preparation_state_carries_no_audio_or_style_field():
-    """The state machine's whole surface, checked against the dataclasses themselves."""
+    """The state machine's whole surface, checked against the dataclasses themselves.
+
+    **`media_summary` added by Director V2.** It is the one aggregate the scan keeps, and it is
+    four scalars whose field count does not grow with the library — the boundedness assertion is
+    `test_the_media_summary_is_bounded_by_field_count_not_library_size` below. It is still not an
+    audio or style field: nothing about a track, a tempo, a preset or an edit style reaches it.
+    """
     assert set(lp.PrepScanResult.__dataclass_fields__) == {
         "folder", "recursive", "runtime", "classifications", "supported_count",
         "folder_scan_seconds", "classify_seconds", "cache_identity_seconds",
-        "cache_lookup_seconds",
+        "cache_lookup_seconds", "media_summary",
     }
     assert set(lp.PrepSessionState.__dataclass_fields__) == {
         "folder", "recursive", "scan", "report_text", "notice", "batch_size",
@@ -1567,7 +1575,10 @@ def test_real_handlers_forward_the_resolved_runtime_to_both_calls(gui, tmp_path)
 
 
 def test_k_library_prep_imports_only_stdlib_and_fork():
-    allowed = {"__future__", "dataclasses", "enum", "os", "typing", "beatsync_fork"}
+    # `statistics` arrived with Director V2's prepared-media summary: the median of the per-source
+    # candidate counts. Still stdlib, and deliberately not numpy — the fork package's hard rule is
+    # unchanged, and `test_k_the_dependency_runs_one_way_only` below still forbids it by name.
+    allowed = {"__future__", "dataclasses", "enum", "os", "statistics", "typing", "beatsync_fork"}
     imported: set[str] = set()
     for node in ast.walk(_tree(_PREP)):
         if isinstance(node, ast.Import):
@@ -2605,3 +2616,275 @@ def test_l1b_the_no_ai_scan_is_parallelised_too(va, tmp_path):
 
     assert parallel == serial
     assert set(parallel.values()) == {NEW_OR_CHANGED}
+
+
+# ===========================================================================
+# M. PREPARED MEDIA SUMMARY (Director V2)
+#
+# The scan already loads every reusable record to decide PREPARED, so the per-source moment counts
+# are accumulated there and nowhere else. These tests pin that the summary is bounded, generic,
+# order-independent, and -- above all -- that it cannot influence a classification verdict.
+# ===========================================================================
+
+
+def _record_with(ns, video_file: str, moments: int) -> Dict[str, Any]:
+    payload = _complete_record(ns, video_file)
+    payload["candidates"] = [{"id": f"c{i}", "ai_analyzed": True} for i in range(moments)]
+    payload["timings"]["qwen_frame_count"] = moments
+    payload["timings"]["qwen_tag_count"] = moments
+    return payload
+
+
+def test_m_the_summary_is_built_only_from_prepared_reusable_records(va, tmp_path):
+    warm = _source(tmp_path, "warm.mp4")
+    cold = _source(tmp_path, "cold.mp4")
+    _put_record(va, warm, _record_with(va, warm, 7))
+
+    result = _classify(va, [warm, cold])
+    counts = result["source_candidate_counts"]
+
+    assert set(counts) == {os.path.normcase(warm)}, "a cold source must contribute nothing"
+    assert counts[os.path.normcase(warm)] == 7
+    assert lp.media_summary_from_source_counts(counts).candidate_moments == 7
+
+
+def test_m_candidate_moments_come_straight_from_the_records(va, tmp_path):
+    sources = []
+    for index, moments in enumerate((3, 5, 11)):
+        source = _source(tmp_path, f"s{index}.mp4")
+        _put_record(va, source, _record_with(va, source, moments))
+        sources.append(source)
+
+    counts = _classify(va, sources)["source_candidate_counts"]
+    assert sorted(counts.values()) == [3, 5, 11]
+    assert lp.media_summary_from_source_counts(counts).candidate_moments == 19
+
+
+def test_m_no_raw_record_is_returned_or_retained(va, tmp_path):
+    source = _source(tmp_path, "warm.mp4")
+    _put_record(va, source, _record_with(va, source, 4))
+    result = _classify(va, [source])
+
+    rendered = json.dumps(result, default=str)
+    for leaked in ("ai_enabled", "qwen_frame_count", "analysis_version", "cache_contract",
+                   "candidates"):
+        assert leaked not in rendered, f"the scan result leaked {leaked!r}"
+    assert result["source_candidate_counts"] == {os.path.normcase(source): 4}
+
+
+@pytest.mark.parametrize("moments", [None, "many", 0, [], {}, True, [{"id": "c1"}]])
+def test_m_a_malformed_candidate_list_cannot_change_a_verdict(va, tmp_path, moments):
+    """The completion rule decides PREPARED. Counting is reporting and may not second-guess it.
+
+    Whatever verdict `_cache_entry_is_complete` reaches for each shape, the accumulation must not
+    alter it and must not raise out of the scan.
+    """
+    source = _source(tmp_path, "warm.mp4")
+    payload = _complete_record(va, source)
+    payload["candidates"] = moments
+    _put_record(va, source, payload)
+
+    result = _classify(va, [source])
+    verdict = _verdicts(result)[source]
+    assert verdict in (PREPARED, INCOMPLETE)
+    for value in result["source_candidate_counts"].values():
+        assert isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def test_m_the_summary_is_unavailable_rather_than_fabricated(va, tmp_path):
+    cold = _source(tmp_path, "cold.mp4")
+    result = _classify(va, [cold])
+    assert result["source_candidate_counts"] == {}
+    assert lp.media_summary_from_source_counts(result["source_candidate_counts"]) is None
+
+
+# -- the pure summary arithmetic --------------------------------------------
+
+@pytest.mark.parametrize("counts,expected_effective", [
+    ({"a": 50}, 1.0),
+    ({"a": 10, "b": 10}, 2.0),
+    ({"a": 7, "b": 7, "c": 7, "d": 7}, 4.0),
+    ({"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1}, 8.0),
+])
+def test_m_equal_shares_give_exactly_the_source_count(counts, expected_effective):
+    summary = lp.media_summary_from_source_counts(counts)
+    assert summary.effective_sources == pytest.approx(expected_effective)
+
+
+def test_m_unequal_shares_give_the_expected_inverse_hhi():
+    summary = lp.media_summary_from_source_counts({"a": 90, "b": 10})
+    expected = 1.0 / (0.9 ** 2 + 0.1 ** 2)
+    assert summary.effective_sources == pytest.approx(expected)
+    assert summary.effective_sources < 2.0, "a dominated library is not two effective sources"
+
+
+def test_m_top_source_share_and_median_are_exact():
+    summary = lp.media_summary_from_source_counts({"a": 60, "b": 30, "c": 10})
+    assert summary.candidate_moments == 100
+    assert summary.top_source_share == pytest.approx(0.6)
+    assert summary.median_moments_per_source == 30.0
+
+
+def test_m_the_summary_is_invariant_to_source_and_record_order():
+    counts = {"a": 5, "b": 17, "c": 3, "d": 40}
+    first = lp.media_summary_from_source_counts(counts)
+    for ordering in (("d", "c", "b", "a"), ("b", "a", "d", "c")):
+        shuffled = {key: counts[key] for key in ordering}
+        assert lp.media_summary_from_source_counts(shuffled) == first
+
+
+@pytest.mark.parametrize("counts", [
+    None, {}, "a", 5, {"a": 0}, {"a": -3}, {"a": None}, {"a": "7"}, {"a": True}, {"a": 1.5},
+])
+def test_m_an_unprovable_count_mapping_summarises_to_unavailable(counts):
+    assert lp.media_summary_from_source_counts(counts) is None
+
+
+def test_m_a_malformed_entry_is_skipped_rather_than_poisoning_the_summary():
+    summary = lp.media_summary_from_source_counts({"a": 10, "b": None, "c": 10, "d": "x"})
+    assert summary is not None
+    assert summary.candidate_moments == 20
+    assert summary.effective_sources == pytest.approx(2.0)
+
+
+def test_m_the_media_summary_is_bounded_by_field_count_not_library_size():
+    """One scalar record however large the library -- this rides in `gr.State`, which deep-copies."""
+    small = lp.media_summary_from_source_counts({"a": 1, "b": 1})
+    large = lp.media_summary_from_source_counts({f"s{i}": i + 1 for i in range(5000)})
+    assert len(dataclasses_fields(small)) == len(dataclasses_fields(large)) == 4
+    assert lp.MEDIA_SUMMARY_FIELDS == tuple(f.name for f in dataclasses_fields(large))
+    for field in dataclasses_fields(large):
+        assert isinstance(getattr(large, field.name), (int, float))
+
+
+def test_m_the_summary_is_deepcopy_safe():
+    summary = lp.media_summary_from_source_counts({"a": 3, "b": 9})
+    assert copy.deepcopy(summary) == summary
+
+
+# -- the full-prepared gate -------------------------------------------------
+
+def _summary_scan(**kw) -> lp.PrepScanResult:
+    defaults = dict(
+        folder="F", recursive=True,
+        runtime=lp.RuntimeIdentity(qwen_enabled=True, ai_available=True,
+                                   ai_cache_disabled=False, backend_token="b",
+                                   config_token="c", model_path="m"),
+        classification_items=[], supported_count=0,
+    )
+    defaults.update(kw)
+    return lp.build_scan_result(**defaults)
+
+
+def _summary_items(prepared=0, needs=0, unavailable=0):
+    items = [{"path": f"p{i}.mp4", "status": lp.PrepStatus.PREPARED.value, "reason": ""}
+             for i in range(prepared)]
+    items += [{"path": f"n{i}.mp4", "status": lp.PrepStatus.NEEDS_ANALYSIS.value,
+               "reason": lp.NeedReason.NEW_OR_CHANGED.value} for i in range(needs)]
+    items += [{"path": f"u{i}.mp4",
+               "status": lp.PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value, "reason": ""}
+              for i in range(unavailable)]
+    return items
+
+
+def test_m_a_fully_prepared_library_exposes_its_summary():
+    scan = _summary_scan(classification_items=_summary_items(prepared=3), supported_count=3,
+                         source_candidate_counts={"a": 10, "b": 10, "c": 10})
+    assert scan.is_fully_prepared() is True
+    assert scan.usable_media_summary() is not None
+    assert scan.usable_media_summary().effective_sources == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(classification_items=_summary_items(prepared=2, needs=1), supported_count=3),
+    dict(classification_items=_summary_items(prepared=2, unavailable=1), supported_count=3),
+    dict(classification_items=_summary_items(prepared=0), supported_count=0),
+])
+def test_m_a_partial_scan_never_exposes_a_summary(kwargs):
+    """A partial scan's aggregate describes a subset; extrapolating from it is not authorized."""
+    scan = _summary_scan(source_candidate_counts={"a": 10, "b": 10}, **kwargs)
+    assert scan.is_fully_prepared() is False
+    assert scan.usable_media_summary() is None
+
+
+def test_m_an_unusable_runtime_never_exposes_a_summary():
+    scan = _summary_scan(
+        runtime=lp.RuntimeIdentity(qwen_enabled=True, ai_available=True,
+                                   ai_cache_disabled=True, backend_token="",
+                                   config_token="", model_path=""),
+        classification_items=_summary_items(prepared=2), supported_count=2,
+        source_candidate_counts={"a": 10, "b": 10})
+    assert scan.usable_media_summary() is None
+
+
+def test_m_a_fully_prepared_library_with_no_counts_exposes_nothing():
+    scan = _summary_scan(classification_items=_summary_items(prepared=2), supported_count=2,
+                         source_candidate_counts={})
+    assert scan.is_fully_prepared() is True
+    assert scan.media_summary is None
+    assert scan.usable_media_summary() is None
+
+
+def test_m_folder_and_recursive_changes_drop_the_scan_and_its_summary():
+    scan = _summary_scan(classification_items=_summary_items(prepared=1), supported_count=1,
+                         source_candidate_counts={"a": 5})
+    state = lp.record_scan(lp.initial_state(), scan)
+    assert state.scan.usable_media_summary() is not None
+    assert lp.set_folder(state, "other").scan is None
+    assert lp.set_recursive(state, False).scan is None
+
+
+def test_m_a_batch_size_change_preserves_the_scan_and_its_summary():
+    scan = _summary_scan(classification_items=_summary_items(prepared=1), supported_count=1,
+                         source_candidate_counts={"a": 5})
+    state = lp.record_scan(lp.initial_state(), scan)
+    retuned = lp.set_batch_size(state, 50)
+    assert retuned.scan is state.scan
+    assert retuned.scan.usable_media_summary() is not None
+
+
+def test_m_recording_an_analysis_run_drops_the_scan_and_its_summary():
+    scan = _summary_scan(classification_items=_summary_items(prepared=1), supported_count=1,
+                         source_candidate_counts={"a": 5})
+    state = lp.record_scan(lp.initial_state(), scan)
+    assert lp.record_analysis_complete(state, "done").scan is None
+
+
+# -- the Stage-5 boundary ---------------------------------------------------
+
+def test_m_the_summary_adds_no_cache_write_to_the_classifier():
+    body = ast.unparse(_func(_tree(_VA), "classify_library_sources"))
+    for forbidden in ("_save_cache", "_checkpoint_cache", "json.dump"):
+        assert forbidden not in body, f"classify_library_sources now calls {forbidden}"
+
+
+def test_m_the_summary_name_reaches_no_cache_identity_function():
+    tree = _tree(_VA)
+    for name in ("_video_signature", "_cache_path", "_qwen_config_token",
+                 "_cache_entry_is_complete", "_checkpoint_cache", "_save_cache",
+                 "_load_cache", "_bounded_fingerprint"):
+        body = ast.unparse(_func(tree, name))
+        for forbidden in ("source_candidate_counts", "media_summary", "effective_sources"):
+            assert forbidden not in body, f"{name} mentions {forbidden!r}"
+
+
+def test_m_the_classifier_reads_each_record_exactly_once():
+    """The one authorized record-read point. No second pass, and none in the GUI."""
+    body = ast.unparse(_func(_tree(_VA), "classify_library_sources"))
+    assert body.count("_load_cache(") == 1
+    gui_tree = _tree(_GUI)
+    for fn_name in ("_prep_scan_impl", "_prep_analyze_impl"):
+        gui_body = ast.unparse(_func(gui_tree, fn_name))
+        for forbidden in ("_load_cache", "_cache_path", "json.load"):
+            assert forbidden not in gui_body, f"{fn_name} reads a cache record"
+
+
+def test_m_the_stage5_side_learned_no_consumer_vocabulary():
+    """The P2 boundary, unchanged: the preparation side knows concentration, not a consumer."""
+    for path in (_VA, _PREP):
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=path)
+        defined = {n.name.lower() for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        for speculative in ("director", "proposal", "master_seed", "freestyle"):
+            assert not any(speculative in name for name in defined), (path, speculative)

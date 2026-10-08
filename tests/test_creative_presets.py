@@ -967,6 +967,36 @@ def test_the_director_never_outputs_a_preset_label_and_apply_recomputes_it():
     assert "fork_presets.CREATIVE_CONTROL_FIELDS" in body
 
 
+def _intent_for(controls: dict):
+    """A `SemanticIntent` that resolves to exactly `controls`.
+
+    **Updated by Director V2.** This test used to hand `build_proposal` a dense six-control
+    payload, because V1's model emitted the controls directly. V2's model emits a *semantic
+    intent* and deterministic code maps it onto the controls, so the proposal is constructed
+    through that mapping here instead. The assertion itself is unchanged and so is its point:
+    `matching_preset` is total, and the Director still adds no second answer to "which preset is
+    this?".
+
+    Every preset value is reachable: a control at exactly 50 means the axis is simply omitted, and
+    otherwise `strength = 2 * |value - 50|` inverts `magnitude_for_strength` exactly.
+    """
+    from beatsync_fork import director as fork_director
+
+    requests = []
+    for control, value in controls.items():
+        delta = value - 50
+        if delta == 0:
+            continue  # no expressed preference; V2 has no neutral direction by design
+        axis = fork_director.CONTROL_TO_AXIS[control]
+        negative, positive = fork_director.directions(axis)
+        requests.append(fork_director.SemanticAxisRequest(
+            axis=axis,
+            direction=positive if delta > 0 else negative,
+            strength=2 * abs(delta),
+        ))
+    return fork_director.SemanticIntent(requests=tuple(requests))
+
+
 @pytest.mark.parametrize("name", list(_ACCEPTED) + ["Custom"])
 def test_the_director_projection_reports_the_same_label_the_selector_would(name):
     """Executable: `matching_preset` is total and the Director adds no second answer."""
@@ -975,7 +1005,7 @@ def test_the_director_projection_reports_the_same_label_the_selector_would(name)
     controls = (dict(_ACCEPTED[name]) if name in _ACCEPTED
                 else dict(zip(_FIELDS, (30, 10, 70, 60, 25, 55))))
     values = tuple(controls[field] for field in _FIELDS)
-    proposal = fork_director.build_proposal("x", {**controls, "explanation": ""}, 7)
+    proposal = fork_director.build_proposal("x", _intent_for(controls), "", 7)
 
     assert proposal is not None
     assert proposal.recipe.as_mapping() == {"seed": 7, **controls}

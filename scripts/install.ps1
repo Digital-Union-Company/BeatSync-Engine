@@ -19,8 +19,25 @@ $PythonZipUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$Python
 $UvZipUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 $FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$FfmpegVersion/ffmpeg-$FfmpegVersion-essentials_build.zip"
 $LlamaZipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/llama-$LlamaBuild-bin-win-vulkan-x64.zip"
+# Stage 5 semantic analysis: the VISION model plus its multimodal projector. Unchanged.
 $QwenModelUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf?download=true"
 $QwenMmprojUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true"
+# AI Director V2: a SEPARATE text-only intent model. It does not replace Stage 5 and has no mmproj,
+# because the Director never looks at a frame. The Stage-5 2B model was measured against the V2
+# intent contract and failed it, so this is a third asset rather than a reuse of the first.
+#
+# PINNED TO AN IMMUTABLE REVISION, AND HASH-VERIFIED, FOR A SPECIFIC REASON.
+# The Director's whole behavioural evidence -- 100% strict-schema validity, 14/14 concepts, 6/6 on
+# the energy cluster, 12/12 on an unseen holdout -- was measured against EXACTLY these bytes. That
+# evidence does not transfer to arbitrary future bytes published under the same filename, so
+# `/resolve/main/` is the wrong reference: upstream may replace or requantise the file at any time
+# and the product would keep claiming validated behaviour it no longer has. The revision below is
+# the repository commit containing the measured artifact.
+$DirectorModelRevision = "e6f794d44f9395d0184a966c27b5ae99ea356fcb"
+$DirectorModelUrl = "https://huggingface.co/ggml-org/Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/$DirectorModelRevision/qwen3-4b-instruct-2507-q8_0.gguf"
+$DirectorModelFile = "qwen3-4b-instruct-2507-q8_0.gguf"
+$DirectorModelExpectedBytes = 4280403520
+$DirectorModelSha256 = "ae916ede1c010a26955ee8ae2e908bf8815a3f135ec860439ab924701c69d5f1"
 
 function Step($Message) {
     Write-Host ""
@@ -150,6 +167,69 @@ function Download-File($Url, $Path, [long]$MinimumBytes = 1) {
     Move-Item -LiteralPath $TempPath -Destination $Path -Force
 }
 
+function Test-FileSha256($Path, $ExpectedSha256) {
+    $Actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    return $Actual.Equals($ExpectedSha256, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Install-VerifiedModel($Url, $Path, [long]$ExpectedBytes, $ExpectedSha256, $Label) {
+    <#
+        A Director-specific ensure/verify wrapper around the shared `Download-File`.
+
+        The generic downloader treats any existing file of at least `MinimumBytes` as reusable,
+        which is the right policy for an archive that is about to be expanded and validated by its
+        own contents -- and the wrong policy for a 4.28 GB model whose exact bytes ARE the contract.
+        A locally corrupted, truncated-then-resumed, hand-swapped or differently-quantised file over
+        the size floor would be silently accepted and then reported as a valid Director model.
+
+        So this path is EXACT rather than "big enough", at both ends:
+
+          A. existing file, exact size AND matching hash  -> reuse, no download
+          B. existing file, wrong size                    -> remove, download pinned artifact
+          C. existing file, exact size but wrong hash      -> remove, download pinned artifact
+          D. downloaded artifact                           -> exact size AND hash, or FAIL loudly
+          E. any failed verification                       -> the bad file is REMOVED first, so a
+                                                              later `Test-RequiredFile` can never
+                                                              report it as a valid model
+
+        Deliberately narrow: it changes no other asset's policy, adds no dependency, and reuses
+        `Download-File` for the transfer itself (curl, resume, retries) rather than reimplementing it.
+    #>
+    Ensure-Dir (Split-Path -Parent $Path)
+
+    if (Test-Path $Path) {
+        $Existing = Get-Item -LiteralPath $Path
+        if ($Existing.Length -ne $ExpectedBytes) {
+            Write-Host "$Label has the wrong size ($($Existing.Length) bytes, expected $ExpectedBytes); replacing it." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $Path -Force
+        } elseif (-not (Test-FileSha256 $Path $ExpectedSha256)) {
+            Write-Host "$Label has the expected size but the wrong SHA256; replacing it." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $Path -Force
+        } else {
+            Write-Host "$Label verified (exact size and SHA256): $Path"
+            return
+        }
+    }
+
+    # `MinimumBytes` is the exact size here: a short transfer must not even reach verification.
+    Download-File $Url $Path $ExpectedBytes
+
+    if (-not (Test-Path $Path)) {
+        throw "$Label download reported success but produced no file: $Path"
+    }
+    $Downloaded = Get-Item -LiteralPath $Path
+    if ($Downloaded.Length -ne $ExpectedBytes) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "$Label has the wrong size: got $($Downloaded.Length) bytes, expected $ExpectedBytes."
+    }
+    if (-not (Test-FileSha256 $Path $ExpectedSha256)) {
+        $Actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "$Label failed SHA256 verification: got $Actual, expected $ExpectedSha256."
+    }
+    Write-Host "$Label verified (exact size and SHA256): $Path"
+}
+
 function Expand-Zip($ZipPath, $Destination) {
     Ensure-Dir $Destination
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
@@ -251,7 +331,12 @@ function Install-LlamaCppVulkan {
     $ServerExe = Join-Path $LlamaDir "llama-server.exe"
     $MtmdExe = Join-Path $LlamaDir "llama-mtmd-cli.exe"
     $CliExe = Join-Path $LlamaDir "llama-cli.exe"
-    if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe)) {
+    # AI Director V2 runs one-shot through llama-completion.exe, not llama-cli.exe -- see
+    # .claude/rules/director.md for why that choice is measured rather than stylistic. It ships in
+    # the same archive, but it was not previously named here, so an otherwise "ready" install could
+    # satisfy this check and still have no Director runtime.
+    $CompletionExe = Join-Path $LlamaDir "llama-completion.exe"
+    if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe) -and (Test-Path $CompletionExe)) {
         try {
             $CurrentVersion = (& $CliExe --version 2>$null | Select-Object -First 1)
             if ($CurrentVersion -match "version:\s+9842\b") {
@@ -315,10 +400,15 @@ function Remove-LegacyPythonPackages($UvExe) {
 }
 
 function Install-QwenGgufModels {
-    Step "Installing Qwen3-VL GGUF models"
+    Step "Installing Qwen GGUF models (Stage 5 vision + Director intent)"
     Ensure-Dir $ModelsDir
+    # Stage 5 semantic analysis.
     Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") 104857600
     Download-File $QwenMmprojUrl (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") 104857600
+    # AI Director V2. Exact size AND SHA256, from a pinned immutable revision -- see the constants
+    # at the top of this file for why "big enough" is not a sufficient check for this one asset.
+    Install-VerifiedModel $DirectorModelUrl (Join-Path $ModelsDir $DirectorModelFile) `
+        $DirectorModelExpectedBytes $DirectorModelSha256 "AI Director GGUF model"
 }
 
 function Ensure-AppFolders {
@@ -401,8 +491,10 @@ if ($LASTEXITCODE -ne 0) {
 Test-RequiredFile (Join-Path $LlamaDir "llama-server.exe") "llama-server.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-mtmd-cli.exe") "llama-mtmd-cli.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-cli.exe") "llama-cli.exe"
-Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Qwen GGUF model"
-Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Qwen mmproj model"
+Test-RequiredFile (Join-Path $LlamaDir "llama-completion.exe") "llama-completion.exe"
+Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Stage 5 Qwen GGUF model"
+Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Stage 5 Qwen mmproj model"
+Test-RequiredFile (Join-Path $ModelsDir $DirectorModelFile) "AI Director GGUF model"
 
 & (Join-Path $LlamaDir "llama-cli.exe") --version
 if ($LASTEXITCODE -ne 0) {

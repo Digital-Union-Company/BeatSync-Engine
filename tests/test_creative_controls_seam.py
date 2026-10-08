@@ -889,25 +889,40 @@ def _registration_kwargs(tree, widget: str, attr: str = "click") -> dict:
     return _kwargs(calls[0])
 
 
-def test_generate_proposal_reads_the_instruction_and_nothing_else():
+def test_generate_proposal_reads_no_creative_state():
     """`DIRECTOR_READS_CURRENT_SLIDERS = NO`, and no hidden creative base.
 
     The handler's parameter order is pinned against the `inputs` list too, because Gradio passes
     them positionally.
+
+    **Amended by Director V2, and the amendment is narrow.** V1's `inputs` was exactly
+    `[director_instruction]`, so "reads the instruction and nothing else" was the whole truth. V2
+    adds the three *preparation* inputs — `prep_folder`, `prep_recursive`, `prep_state` — because
+    the deterministic Source Diversity step may only run from a current, live-declared, fully
+    prepared scan, and a queued `change` event means the stored scan can lag the screen.
+
+    The property this test actually protects is untouched and is now stated exactly: **no creative
+    state reaches Generate.** Not a slider, not the Variation Seed, not the preset, not a Variant
+    Lab widget, not an audio level — so the instruction is still an absolute editing intention
+    rather than a transformation of what is on screen, and the Director still cannot drift from its
+    own last answer. `source_state` and `session_state` also stay banned; only the preparation
+    trio moved, and `test_generate_proposal_writes_only_the_director_surfaces` below still pins
+    that Generate *writes* none of them.
     """
     tree = _gui_tree()
     kwargs = _registration_kwargs(tree, "generate_director_btn")
 
     assert ast.unparse(kwargs["fn"]) == "_on_generate_director_proposal"
-    assert _names(kwargs["inputs"]) == ["director_instruction"]
+    assert _names(kwargs["inputs"]) == ["director_instruction", "prep_folder",
+                                        "prep_recursive", "prep_state"]
     assert [a.arg for a in _func(tree, "_on_generate_director_proposal").args.args] == [
-        "director_instruction"]
+        "director_instruction", "prep_folder", "prep_recursive", "prep_state"]
 
     reachable = set(_names(kwargs["inputs"]))
     for forbidden in _ALL_CREATIVE_WIDGETS + ("creative_preset", "variant_master_seed",
                                               "variation_spread", "variant_batch_state",
                                               "variant_candidate_selector", "source_state",
-                                              "prep_state", "session_state", "audio_input",
+                                              "session_state", "audio_input",
                                               "music_under_voice", "sfx_amount", "sfx_level"):
         assert forbidden not in reachable, f"Generate Proposal reads {forbidden}"
 

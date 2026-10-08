@@ -153,7 +153,7 @@ subsequent identical warm run should show 845/845 cache hits and launch no Qwen 
 
 ```
 STAGE 5                      = INTRINSIC MEDIA TRUTH      (persistent)
-STAGE 6 / FUTURE DIRECTOR    = CREATIVE INTERPRETATION    (ephemeral, per render)
+STAGE 6 / THE AI DIRECTOR    = CREATIVE INTERPRETATION    (ephemeral, per render)
 ```
 
 Stage 5 records what is visually present — motion, character focus, visual quality, beauty, action
@@ -215,7 +215,17 @@ Load-bearing details:
   longer change because Stage 1–4 resolved a different edit style.
 - **Creative modes above Stage 5 must not undo this, and three have now shipped without doing so.**
   A Master Seed (Variant Lab), natural-language interpretation (AI Director) and **section-specific
-  weighting (Freestyle V1)** are all implemented — entirely *above* Stage 5. None of it is
+  weighting (Freestyle V1)** are all implemented — entirely *above* Stage 5.
+
+  **Director V2 is the closest call so far, and it did not cross the line.** It became narrowly
+  content-aware, but in the one direction this boundary permits: the preparation *scan* counts
+  usable moments from records it had already loaded, and a deterministic local step reads that
+  concentration figure **after** the model has answered. No semantic intent, axis name, direction
+  word or creative value reaches a Qwen request, the prompt, a persisted record or cache identity;
+  the Stage-5 model, request format, prompt, schema and both generation constants are untouched; and
+  the Director's own 4B text model is a *separate* asset that appears nowhere in Stage-5 identity.
+  The scan gained no write path. `tests/test_media_neutral_semantics.py` pins every one of those
+  halves. None of it is
   implemented **here**, and the guard did not weaken: `master_seed`, `director`, `proposal` and
   `freestyle` are still banned on the **Stage-5 side** (`video_analysis.py`, the Qwen worker,
   `library_prep.py`), which is where that ban was always load-bearing. A hybrid interpretation mode

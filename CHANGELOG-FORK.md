@@ -70,6 +70,98 @@ cardinality: `gui.py` has exactly **two** `RenderLifecycle` construction sites, 
 yet implemented, and C3 V1 saying batch rendering was deferred, were both true when written. History
 is not rewritten to look current; this entry records the cleanup instead.
 
+### Added — 2026-10-08 (Content-aware AI Director V2 — semantic intent IR + narrow media adaptation)
+
+**The model no longer speaks BeatSync's control vocabulary.** Director V1 asked the local model for
+the six internal creative controls directly. That shape was measured three ways — dense six values,
+sparse absolute values, and direction+strength on the internal names — and all three failed the same
+ordinary sentence, *"Keep scene choice relatively even across sections."*, which a 2B, a 4B and an 8B
+model all read as neutral. The problem was not model size: the language task included "which way
+does the `energy_response` slider move?", which the user never said.
+
+V2 replaces that with a **user-semantic intent IR**. The model classifies meaning on six ordinary
+editing dimensions — `cut_pacing` (sparser/denser), `impact_accents` (fewer/more), `scene_reading`
+(visual/semantic), `section_reactivity` (steadier/responsive), `motion_preference` (calmer/dynamic),
+`source_variety` (reuse/diverse) — each with a `direction` and a `strength` of 1..100, and
+deterministic code alone maps those onto the controls. None of the six execution control names may
+appear in the model-facing prompt or schema; an import-time assertion and a permanent test both
+enforce it, and both surfaces are hash-pinned to the exact bytes the evidence was produced against.
+
+There is deliberately **no `0` strength and no `neutral` direction**: both are indistinguishable from
+omitting the dimension, and the sparse experiment measured exactly that failure — a model given a
+neutral option emitted no-op entries, and a model asked for absolute values collapsed every downward
+request onto 50. Omission is the only way to say "leave this alone", and it maps to exactly 50.
+
+**Selected intent model: `Qwen3-4B-Instruct-2507 Q8_0`, text-only.** On the frozen matrices it
+reached 100 % strict-schema validity, 14/14 concepts, 10/10 media-control concepts, 0 wrong-direction
+answers, 6/6 on the energy cluster that defeated every earlier contract, and **12/12 on an unseen
+holdout**, deterministically, at a ~3.5 s median one-shot cost. It is a **third** model asset, not a
+replacement: Stage 5 keeps `Qwen3VL-2B-Instruct-Q8_0.gguf` plus its `mmproj` for media semantics, and
+there is **no fallback** from the Director to that 2B model — it was measured against this contract
+and failed it (8/14 overall, 0/4 downward requests), so a missing Director model reports honestly and
+points at the installer instead.
+
+**One narrow media-aware adaptation, and only one.** A prototype proposed four; a value study put all
+four through the real Stage-6 planner on real candidate pools across eight fixed Variation Seeds, and
+three earned DROP despite being pure, bounded, deterministic and cheap:
+
+- *Semantic Emphasis* is **execution-inert** without Qwen coverage — at 0 % coverage attenuation
+  changed no render outcome at all (measured character effect exactly 0.00000);
+- *Energy Response* **changed the sign** of its benefit with the direction of the request;
+- *Motion Bias* discarded 71–78 % of the requested character for a sign-inconsistent ±0.1 % score
+  change, i.e. noise.
+
+Only **Source Diversity** survived, and only upward. On a prepared library with ~4 effective sources
+a strong diversity request cannot buy a single extra source, so the extra reuse pressure is pure
+score cost; relaxing it recovered **+1.2353 %** mean legacy score across 8/8 seeds with the
+unique-source count identical every time. **It is a trade-off, not a free win** —
+`adjacent_source_repeats` rose from 19.6 to 28.8 mean — and the proposal says both halves in one
+breath. Reuse-direction requests are **never** attenuated: on the same library that was consistently
+harmful (4/4 cases, mean −0.4352 %), while diverse-direction requests were consistently positive
+(7/7, mean +0.8653 %). The support function measures leverage and is direction-agnostic; the value is
+directional, so the direction gate lives in the adapter.
+
+**The model never receives media.** It gets the instruction, the system prompt and the schema — no
+frames, filenames, Stage-5 records, counts or summary — so there is no media prompt-injection
+surface. The one media fact is read by deterministic local code *after* the model has answered. A
+test inspects the real argv and asserts no summary field, no measured number and no `mmproj`/image
+argument appears.
+
+**Media adaptation requires a current, fully prepared scan, or it does not happen.** The gate is: a
+recorded scan exists; the **live** preparation declaration still describes it (the same cheap check
+Analyze uses, because a queued widget change can leave the stored scan behind the screen); the
+library is fully prepared; and the summary is provable. Anything else produces the ordinary
+semantic-IR proposal with a truthful note naming the reason — *not* a failure, and never described as
+a fallback. A partial scan's aggregate describes a subset, and the value evidence was produced on
+complete pools.
+
+**Preparation gained one bounded aggregate, at no extra cost.** The scan already loads every reusable
+record to decide PREPARED, so it now also counts that source's usable moments there — the one
+authorized record-read point — and `build_scan_result` turns the result into the frozen four-scalar
+`PreparedMediaSummary` (`candidate_moments`, `effective_sources`, `top_source_share`,
+`median_moments_per_source`), with `effective_sources` as inverse-HHI over candidate shares. The
+counting sits inside the already-decided PREPARED branch and is exception-guarded, so no shape of
+stored candidate data can change a classification verdict; `_cache_entry_is_complete` remains the one
+completion rule. No second cache read, no retained record, no write path, and a field count
+independent of library size — the record rides in `gr.State`, which deep-copies.
+
+**`DirectorProposal` now carries BASE and FINAL.** BASE is what the intent resolved to and is
+provenance only; FINAL is what Apply writes and what the preset label derives from. Both share the
+one minted Variation Seed, so the media step cannot look like it re-rolled the clip selection, and
+the read-out visibly separates the Director's own reading from the deterministic adjustment —
+the model is never credited with the media change.
+
+Unchanged: Generate still writes **zero** execution widgets and Apply is still the one Director
+writer of the Variation Seed, the six sliders and the preset label; Create Music Video remains the
+only thing that renders; Apply is still not stale-gated, including across a later media change;
+`CreativeRecipe.from_mapping` is reused unmodified as the trust boundary for BASE and FINAL alike;
+the seed is still minted last, and an invalid answer consumes none. Stage 5 is untouched —
+`CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`, and the worker, prompt, schema and request format are
+unmodified. llama.cpp stays at build `b9842`; the installer now also requires `llama-completion.exe`
+by name, which shipped in the same archive but was never verified, so an otherwise "ready" install
+could have had no Director runtime at all.
+
 ### Added — 2026-10-07 (C3-R1B-b — render 2–4 candidates, continue past a local failure)
 
 **C3-R1B is complete.** C3-R1B-a made every failure cause truthfully typed and deliberately spent

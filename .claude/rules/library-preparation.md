@@ -89,8 +89,39 @@ now costs folder enumeration + source identity (the D2 bounded fingerprints) + c
   no overlap with `source_state` / `source_outputs` / `confirm_action` / `process_btn`. Local folder
   only: browser uploads live under `input/gradio_uploads/`, which `cleanup_on_startup` clears, so a
   path-keyed preparation of them would be worthless.
+- **The scan also accumulates a tiny concentration summary (Director V2).** While the serial
+  verdict loop already holds each reusable record — the **one** authorized record-read point — it
+  counts that source's usable moments, and `build_scan_result` turns the resulting
+  `{source: count}` mapping into the frozen four-scalar `PreparedMediaSummary`
+  (`candidate_moments`, `effective_sources`, `top_source_share`, `median_moments_per_source`).
+  `effective_sources` is inverse-HHI over candidate *shares*, so it is order-independent, and a
+  library whose moments nearly all come from a handful of sources reads as concentrated however
+  many files it nominally contains.
+
+  Four boundaries are load-bearing, and all four are tested:
+
+  * **It cannot change a verdict.** `_cache_entry_is_complete` remains the one completion rule; the
+    counting sits inside the already-decided PREPARED branch and is exception-guarded, so no shape
+    of stored `candidates` data can retire a prepared source. This adds no second completion rule.
+  * **No second cache read, ever.** The GUI never re-opens a record to build the summary — a test
+    asserts `_prep_scan_impl` and `_prep_analyze_impl` mention no `_load_cache`, `_cache_path` or
+    `json.load`, and that the classifier calls `_load_cache` exactly once.
+  * **The record is never retained.** It does not outlive its loop iteration, is not returned, and
+    is not stored on `PrepScanResult`. The summary's field count is a constant independent of
+    library size, which is what keeps `gr.State` — which deep-copies — from carrying megabytes of
+    candidate data.
+  * **`None` means unavailable, never fabricated.** An empty or unprovable count mapping summarises
+    to `None`, and `PrepScanResult.usable_media_summary()` additionally returns `None` unless the
+    runtime is usable **and** `is_fully_prepared()` — a partial scan's aggregate describes a subset,
+    so extrapolating from it would be reading a statistic the user never finished producing.
+
+  **Preparation knows concentration; it does not know what concentration means.** The record and its
+  builder live here and name no consumer — interpreting it as support for a creative request is a
+  separate decision in `beatsync_fork/director_media.py`, which is why `director`, `proposal`,
+  `master_seed` and `freestyle` stay banned on this side.
 - **Nothing new in identity.** Preparation adds no field to any cache payload and no input to any
-  key; a test asserts the identity and completion functions never mention it. (P2's `v2 → v3`
+  key; a test asserts the identity and completion functions never mention it — including the new
+  summary, whose name must appear in none of them. (P2's `v2 → v3`
   contract bump is about the Qwen prompt, not about preparation.)
 - **Progress:** a trackless scan has no Stages 1–4 to report, so it shows only Stage 0 under the
   `library_classify` phase; Analyze uses the existing Stage 5 events. Do not fake the removed stages.

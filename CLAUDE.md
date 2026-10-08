@@ -130,7 +130,7 @@ These apply in almost every session. Each has a scoped rule with the full contra
   owns candidate scoring, window building and the candidate schema. Bump the right one, never a new
   constant. → `.claude/rules/stage5-cache-identity.md`, `.claude/rules/stage5-cache-durability.md`
 - **Persisted Stage-5 semantics are media-neutral.** Stage 5 records intrinsic media truth
-  (persistent); Stage 6 and any future director own creative interpretation (ephemeral, per render).
+  (persistent); Stage 6 and the Director layers own creative interpretation (ephemeral, per render).
   Nothing about the music, the edit style or any creative control may reach a Qwen request, the
   prompt, a persisted record or Stage-5 cache identity. → `.claude/rules/stage5-worker.md`
 - **Creative state is a render request, never source or media identity.** The seven resolved controls
