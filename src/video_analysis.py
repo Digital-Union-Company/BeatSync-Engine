@@ -1609,6 +1609,9 @@ def classify_library_sources(
         "cache_lookup_seconds": 0.0,
         "cache_lookups": 0,
         "classify_seconds": 0.0,
+        # Present even on the `ai_cache_disabled` early return, so the caller never has to tell
+        # "no counts" apart from "key absent": an empty mapping summarises to UNAVAILABLE.
+        "source_candidate_counts": {},
     }
 
     if ai_cache_disabled:
@@ -1627,6 +1630,12 @@ def classify_library_sources(
     classifications: List[Dict[str, str]] = []
     cache_lookup_seconds = 0.0
     cache_lookups = 0
+    # [FORK] Digital-Union: per-source usable moment counts, accumulated ONLY from records this scan
+    # already loaded and already proved reusable. The scan's one `_load_cache` call is the only
+    # authorized record-read point for this; nothing re-opens a record later, and the record itself
+    # is never retained past its loop iteration. The counts are non-authoritative reporting metadata
+    # -- they cannot reach a verdict, a cache key, a payload or the completion rule.
+    source_candidate_counts: Dict[str, int] = {}
 
     # [FORK] Digital-Union (L1B): the same bounded identity phase the orchestrator uses - the one
     # shared piece, so the measured speed-up is not reimplemented here. `ai_cache_disabled` already
@@ -1660,6 +1669,17 @@ def classify_library_sources(
             if cached:
                 status = fork_prep.PrepStatus.PREPARED.value
                 reason = ""
+                # The verdict above is already decided and is never revisited below. Counting is
+                # wrapped so that no shape of stored `candidates` data can turn a PREPARED source
+                # into anything else: a malformed record contributes nothing and stays PREPARED,
+                # because `_cache_entry_is_complete` is the one completion rule and this is not a
+                # second one.
+                try:
+                    moments = cached.get("candidates")
+                    if isinstance(moments, list) and moments:
+                        source_candidate_counts[os.path.normcase(video_file)] = len(moments)
+                except Exception:
+                    pass
             else:
                 status = fork_prep.PrepStatus.NEEDS_ANALYSIS.value
                 reason = fork_prep.NeedReason.INCOMPLETE_OR_INVALID.value
@@ -1684,6 +1704,11 @@ def classify_library_sources(
         "cache_lookup_seconds": float(cache_lookup_seconds),
         "cache_lookups": int(cache_lookups),
         "classify_seconds": float(elapsed),
+        # [FORK] Digital-Union: the small per-source moment counts, for the caller to summarise.
+        # A mapping of ints, bounded by source count rather than by moment count, and deliberately
+        # not a summary object: deciding what a concentration figure *means* is not preparation's
+        # job, so this side ships the facts and nothing else.
+        "source_candidate_counts": dict(source_candidate_counts),
     })
 
     print(

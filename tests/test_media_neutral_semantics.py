@@ -840,3 +840,117 @@ def test_e_stage_6_scoring_and_planning_are_untouched():
         assert forbidden not in source, f"the planner must not learn about {forbidden}"
     # the planner still receives the music-aware bus it always did
     assert "beat_info" in source and "sections" in source
+
+
+# ===========================================================================
+# F. DIRECTOR V2 DID NOT TOUCH STAGE 5 (narrow content-aware Director)
+#
+# V2 gives the Director a *local deterministic* media signal: per-source moment counts, accumulated
+# by the preparation scan from records it had already loaded. That is one step away from the exact
+# leak this file exists to prevent, so every half of the boundary is pinned here rather than argued.
+# ===========================================================================
+
+#: The two generation constants. V2 changed neither: it adds no field to a payload, no input to a
+#: key, and no new meaning to a stored record.
+_FROZEN_CACHE_CONTRACT = "stage5_cache_v3"
+_FROZEN_ANALYSIS_VERSION = "auto_av_analysis_v8_llama_vulkan_batched"
+
+
+def _constant(path: str, name: str):
+    for node in _tree(path).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def test_f_the_two_generation_constants_are_unchanged():
+    assert _constant(_VA, "CACHE_CONTRACT_VERSION") == _FROZEN_CACHE_CONTRACT
+    assert _constant(_VA, "ANALYSIS_VERSION") == _FROZEN_ANALYSIS_VERSION
+
+
+def test_f_the_identity_and_persistence_functions_learned_nothing_about_the_media_summary():
+    """The summary is ephemeral reporting metadata. It may not reach a key, a payload or a write."""
+    tree = _tree(_VA)
+    for name in ("_video_signature", "_cache_path", "_qwen_config_token",
+                 "_qwen_backend_signature_token", "_cache_entry_is_complete",
+                 "_stored_ai_cache_is_consistent", "_checkpoint_cache", "_save_cache",
+                 "_load_cache", "_bounded_fingerprint"):
+        body = ast.unparse(_func(tree, name)).lower()
+        # Whole words only. `_save_cache`'s docstring says "same-directory temp file", and
+        # `director` is a substring of `directory` -- the exact trap `_identifier_parts` exists
+        # for elsewhere in this file.
+        for forbidden in ("source_candidate_counts", "media_summary", "effective_sources",
+                          "top_source_share", "prepared_media", "semantic_intent",
+                          "director", "proposal"):
+            assert not re.search(rf"\b{re.escape(forbidden)}\b", body), \
+                f"{name} mentions {forbidden!r}"
+
+
+def test_f_the_director_model_never_enters_stage_5_identity():
+    """Stage 5 keeps its own 2B vision model; the Director's 4B text model is a separate asset."""
+    tree = _tree(_VA)
+    for name in ("_video_signature", "_cache_path", "_qwen_config_token",
+                 "_qwen_backend_signature_token"):
+        body = ast.unparse(_func(tree, name)).lower()
+        for forbidden in ("qwen3-4b", "4b-instruct", "2507", "director"):
+            assert not re.search(rf"{re.escape(forbidden)}", body),                 f"{name} mentions {forbidden!r}"
+
+
+def test_f_the_stage5_models_are_still_the_two_vision_assets():
+    source = _executable_source(_VA)
+    assert "Qwen3VL-2B-Instruct-Q8_0.gguf" in source
+    assert "mmproj-Qwen3VL-2B-Instruct-F16.gguf" in source
+    # and the Director's model is not resolved anywhere on the Stage-5 side
+    assert "qwen3-4b-instruct-2507-q8_0.gguf" not in source.lower()
+
+
+def test_f_no_semantic_intent_reaches_a_qwen_request_or_the_worker():
+    """A semantic *intent* is creative interpretation; Stage 5 records intrinsic media truth."""
+    for path in (_VA, _WORKER):
+        source = _executable_source(path).lower()
+        for forbidden in ("semantic_intent", "semanticintent", "cut_pacing", "impact_accents",
+                          "scene_reading", "section_reactivity", "motion_preference",
+                          "source_variety", "steadier", "responsive"):
+            assert forbidden not in source, f"{path} mentions {forbidden!r}"
+
+
+def test_f_the_classifier_added_no_write_path():
+    body = ast.unparse(_func(_tree(_VA), "classify_library_sources"))
+    for forbidden in ("_save_cache", "_checkpoint_cache", "json.dump"):
+        assert forbidden not in body, f"classify_library_sources now calls {forbidden}"
+
+
+def test_f_the_accumulation_cannot_reach_a_classification_verdict():
+    """Structural: the counting statement is inside the already-decided PREPARED branch.
+
+    Written as an AST assertion rather than a behavioural one because the behavioural half is in
+    `tests/test_library_preparation.py` -- this half pins that no future edit can move the counting
+    *before* a verdict and make a malformed record retire a prepared source.
+    """
+    body = _func(_tree(_VA), "classify_library_sources")
+    assignments = [node for node in ast.walk(body)
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(t, ast.Subscript)
+                           and isinstance(t.value, ast.Name)
+                           and t.value.id == "source_candidate_counts" for t in node.targets)]
+    assert assignments, "the accumulation disappeared"
+    # every write sits under a Try, which is what makes a malformed record non-fatal
+    for node in ast.walk(body):
+        if isinstance(node, ast.Try):
+            guarded = [n for n in ast.walk(node) if n in assignments]
+            if len(guarded) == len(assignments):
+                break
+    else:
+        raise AssertionError("the accumulation is not exception-guarded")
+
+
+def test_f_the_scan_result_carries_counts_not_records():
+    """The scan returns a mapping of ints. Nothing downstream may receive a cache record."""
+    body = ast.unparse(_func(_tree(_VA), "classify_library_sources"))
+    assert "'source_candidate_counts': dict(source_candidate_counts)" in body.replace('"', "'")
+    # the loaded record is never stored into the result or the classifications
+    assert "'record': cached" not in body.replace('"', "'")
+    assert "classifications.append({'path': video_file, 'status': status, 'reason': reason})" in \
+        body.replace('"', "'")
