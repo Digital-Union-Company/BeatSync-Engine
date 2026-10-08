@@ -60,7 +60,7 @@ old render reproduces from *its recorded values* instead of from a historical la
       generate_variant_btn.click
       new_variant_btn.click
       apply_variant_btn.click      (Variant Lab C3 V1 — Apply Selected Variant)
-      apply_director_btn.click     (AI Director V1 — Apply Proposal)
+      apply_director_btn.click     (AI Director V2 — Apply Proposal)
 
   PERMITTED WRITERS of `creative_preset`, exactly these ten:
       the six <slider>.input handlers
@@ -78,7 +78,7 @@ old render reproduces from *its recorded values* instead of from a historical la
   label is still recomputed from all six values, and a programmatic write still does not fire
   `.input()`, which is why both projection helpers compute `matching_preset` themselves.
 
-- **A Director never outputs a preset label (AI Director V1).** Which named recipe six numbers
+- **A Director never outputs a preset label.** Which named recipe six numbers
   happen to match is a GUI read-out, not something a model may assert — so the Director's JSON
   schema has no preset property, `director.py` contains no label concept at all, and Apply
   recomputes `presets.matching_preset(...)` from the proposal's six numbers and returns it

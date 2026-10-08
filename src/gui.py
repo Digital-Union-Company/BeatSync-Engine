@@ -1620,8 +1620,8 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
     return fork_freestyle.summary_text(declaration)
 
 
-# [FORK] Digital-Union (AI Director V1): two thin handlers, and the asymmetry between them IS the
-# product.
+# [FORK] Digital-Union (AI Director — V1 introduced the split; V2 added the media step): two thin
+# handlers, and the asymmetry between them IS the product.
 #
 #   Generate Proposal  runs one bounded text-only model invocation and writes **no execution
 #                      widget at all** — only the proposal state, the read-out and the status. So
@@ -1633,8 +1633,19 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
 #                      label — and nothing else. No audio widget, no source widget, no Variant Lab
 #                      master seed, no batch state, no render.
 #
-# Neither renders, neither reads the current sliders, and neither touches a source, preparation or
-# render widget. `director_proposal_state` has exactly one reader: `apply_director_btn.click`.
+# The read/write asymmetry is worth stating exactly, because V2 made the read side wider:
+#
+#   * neither handler renders;
+#   * neither reads any current CREATIVE state — no slider, no Variation Seed, no preset, no
+#     Variant Lab widget — so an instruction is an absolute intention, never a transform of what is
+#     on screen;
+#   * Generate READS the preparation declaration and state (`prep_folder`, `prep_recursive`,
+#     `prep_state`), read-only, solely so `_eligible_media_summary` can tell a current fully
+#     prepared scan from a stale or partial one;
+#   * neither handler WRITES any source or preparation widget or state, so generating or applying
+#     intent cannot invalidate a scan or a confirmed source set;
+#   * Apply reads only `director_proposal_state`, which has exactly one reader:
+#     `apply_director_btn.click`.
 
 #: How many execution widgets Apply writes: the Variation Seed, the six sliders, the preset label.
 #: Deliberately a derived count rather than a literal 8, so adding a creative control moves it.
@@ -1654,9 +1665,9 @@ def _director_apply_outputs(proposal) -> Tuple:
 
     `_variant_apply_outputs` is deliberately **not** reused. It is the right projection for Variant
     Lab and the wrong one here: it also writes the Variant Lab Master Seed (generator provenance
-    the Director never had), the three `AudioRecipe` levels (which Director V1 does not generate)
-    and the lab's own report. Reusing it would have made the Director claim audio values it never
-    produced. What *is* shared is the semantic helper that matters —
+    the Director never had), the three `AudioRecipe` levels (which the Director does not generate —
+    V2 is visual-only, exactly as V1 was) and the lab's own report. Reusing it would have made the
+    Director claim audio values it never produced. What *is* shared is the semantic helper that matters —
     `fork_presets.matching_preset` — so there is still exactly one preset-label path.
 
     The label is computed explicitly because programmatic slider writes do not fire the sliders'
@@ -3380,13 +3391,20 @@ def create_ui() -> gr.Blocks:
         # `VariantBatch` of plain ints, strings and tuples — Gradio deep-copies state, so a config
         # or resolution object (which carry `MappingProxyType`) could not live here.
         variant_batch_state = gr.State(None)
-        # [FORK] Digital-Union (AI Director V1): the last generated proposal awaiting an explicit
+        # [FORK] Digital-Union (AI Director): the last generated proposal awaiting an explicit
         # Apply, and nothing else. Exactly ONE reader — `apply_director_btn.click` — and it is
         # absent from `process_btn.click`, `source_outputs`, `prep_outputs`, `live_declaration`,
-        # `CreativeProfile`, `beat_info["creative"]` and both mix configs. Its value is a frozen
-        # `DirectorProposal` of a seven-integer `CreativeRecipe` plus two strings: Gradio
-        # deep-copies state, so a model object, a process handle or anything carrying
-        # `MappingProxyType` could not live here.
+        # `CreativeProfile`, `beat_info["creative"]` and both mix configs.
+        #
+        # Its value is a frozen `DirectorProposal`, and V2 widened it: a BASE `CreativeRecipe` and
+        # a FINAL `CreativeRecipe` (seven ints each, sharing the one minted seed), the validated
+        # `SemanticIntent` as a tuple of frozen axis records, the bounded explanation and
+        # instruction strings, an optional plain `MediaAdjustment` (four numbers and two strings)
+        # and a short media note. Every reachable value is an int, float, str or a frozen record of
+        # those, which is a contract rather than a nicety: Gradio deep-copies state, so a cache
+        # record, a `PreparedMediaSummary` holding candidate data, a model object, a process handle
+        # or anything carrying `MappingProxyType` could not live here. A test walks the whole object
+        # graph and asserts `copy.deepcopy(proposal) == proposal`.
         director_proposal_state = gr.State(None)
 
         gr.Markdown(f"# {UI_TITLE}")
@@ -4233,15 +4251,26 @@ def create_ui() -> gr.Blocks:
         # a proposal writes the proposal and the two read-outs, and that absence is what makes
         # "generating is not applying" structural rather than careful.
         #
-        # Note also what Generate's `inputs` does not contain: everything except the instruction.
-        # There is no hidden creative base, so the Director cannot drift from its own last answer
-        # the way a transform-the-current-settings mode would.
-        # [FORK] Digital-Union (Director V2): three preparation inputs joined the instruction, and
-        # they are LIVE widget values rather than `prep_state` alone — the same reason
-        # `prep_analyze_btn` takes them. A queued `change` event may not have run yet, so the stored
-        # scan can lag the screen; comparing the live declaration is what stops a proposal adapting
-        # to the *previous* library's concentration while the screen declares another folder.
-        # They are read only by `_eligible_media_summary` and never reach the model.
+        # Generate's `inputs` are exactly four, in this order:
+        #
+        #     director_instruction, prep_folder, prep_recursive, prep_state
+        #
+        # and Gradio passes them positionally, so the list and the handler signature are pinned
+        # against each other by test. The preparation trio exists for ONE purpose — letting
+        # `_eligible_media_summary` decide whether a current, fully prepared scan is available for
+        # the deterministic Source Diversity step — and **none of it reaches the model**: no
+        # summary, count, filename or record is interpolated into the argv, which a seam test
+        # asserts against the real command line.
+        #
+        # They are LIVE widget values rather than `prep_state` alone, for the same reason
+        # `prep_analyze_btn` takes them: a queued `change` event may not have run yet, so the stored
+        # scan can lag the screen, and comparing the live declaration is what stops a proposal
+        # adapting to the *previous* library's concentration while the screen declares another
+        # folder.
+        #
+        # The invariant is therefore NOT "the instruction and nothing else" — it is that Generate
+        # reads **no current creative state**. There is no hidden creative base, so the Director
+        # cannot drift from its own last answer the way a transform-the-current-settings mode would.
         generate_director_btn.click(
             fn=_on_generate_director_proposal,
             inputs=[director_instruction, prep_folder, prep_recursive, prep_state],

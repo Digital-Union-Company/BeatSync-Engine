@@ -1868,6 +1868,32 @@ def _installer_source() -> str:
         return handle.read()
 
 
+def _ps_function(source: str, name: str) -> str:
+    """One PowerShell function body, by brace balance.
+
+    Scoping the assertions to the function means a matching string elsewhere in the installer
+    cannot satisfy a claim about *this* function's policy.
+    """
+    start = source.index(f"function {name}(")
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"unbalanced braces in {name}")
+
+
+#: The exact artifact every behavioural claim about the Director was measured against. These are
+#: not "a model that will do"; they are the identity of the evidence.
+DIRECTOR_MODEL_REVISION = "e6f794d44f9395d0184a966c27b5ae99ea356fcb"
+DIRECTOR_MODEL_BYTES = 4280403520
+DIRECTOR_MODEL_SHA256 = "ae916ede1c010a26955ee8ae2e908bf8815a3f135ec860439ab924701c69d5f1"
+
+
 def test_v2_the_installer_declares_three_role_specific_model_assets():
     source = _installer_source()
     # Stage 5 keeps both vision assets, unchanged
@@ -1876,15 +1902,96 @@ def test_v2_the_installer_declares_three_role_specific_model_assets():
     assert "Qwen/Qwen3-VL-2B-Instruct-GGUF" in source
     # the Director model is a separate variable, not a reuse of either
     assert '$DirectorModelFile = "qwen3-4b-instruct-2507-q8_0.gguf"' in source
-    assert ("https://huggingface.co/ggml-org/Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/main/"
-            "qwen3-4b-instruct-2507-q8_0.gguf?download=true") in source
 
 
-def test_v2_the_installer_downloads_and_verifies_the_director_model():
+def test_v2_the_director_model_url_is_pinned_to_an_immutable_revision():
+    """`/resolve/main/` would let upstream replace the bytes the evidence was measured against.
+
+    The behavioural record — 100 % strict-schema validity, 14/14 concepts, 6/6 on the energy
+    cluster, 12/12 on an unseen holdout — is a statement about *these* bytes, and it does not
+    transfer to a future requantisation published under the same filename.
+    """
     source = _installer_source()
-    assert "Download-File $DirectorModelUrl (Join-Path $ModelsDir $DirectorModelFile)" in source
+    assert f'$DirectorModelRevision = "{DIRECTOR_MODEL_REVISION}"' in source
+    assert ("https://huggingface.co/ggml-org/Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/"
+            "$DirectorModelRevision/qwen3-4b-instruct-2507-q8_0.gguf") in source
+    # the mutable reference must be gone from the Director URL
+    assert "Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/main/" not in source
+
+
+def test_v2_the_installer_pins_the_director_models_exact_size_and_hash():
+    source = _installer_source()
+    assert f"$DirectorModelExpectedBytes = {DIRECTOR_MODEL_BYTES}" in source
+    assert f'$DirectorModelSha256 = "{DIRECTOR_MODEL_SHA256}"' in source
+
+
+def test_v2_the_installer_actually_hash_verifies_the_director_model():
+    """The assertion this test's name claims — not merely that a download was attempted.
+
+    A previous version of this test only proved `Download-File` and `Test-RequiredFile` were
+    mentioned, which a wrong-but-large local file would have satisfied.
+    """
+    source = _installer_source()
+    # a real hash computation, via a built-in rather than a new dependency
+    assert "Get-FileHash" in source
+    assert "-Algorithm SHA256" in source
+    # the Director download goes through the verifying wrapper, with both constants
+    assert "Install-VerifiedModel $DirectorModelUrl (Join-Path $ModelsDir $DirectorModelFile)" \
+        in source
+    assert "$DirectorModelExpectedBytes $DirectorModelSha256" in source
+    # and the final file is still required at the end of the run
     assert 'Test-RequiredFile (Join-Path $ModelsDir $DirectorModelFile) "AI Director GGUF model"' \
         in source
+
+
+def test_v2_a_wrong_director_model_cannot_be_accepted_as_cached():
+    """Both rejection branches exist, and both remove the file before re-downloading.
+
+    The generic `Download-File` reuses anything at or above a size floor, which is the wrong policy
+    for an asset whose exact bytes are the contract: a corrupted, truncated-then-resumed,
+    hand-swapped or differently-quantised file over the floor would be silently accepted.
+    """
+    source = _installer_source()
+    fn = _ps_function(source, "Install-VerifiedModel")
+
+    # exact size, not a floor
+    assert "$Existing.Length -ne $ExpectedBytes" in fn
+    # and a hash check for the same-size case
+    assert "-not (Test-FileSha256 $Path $ExpectedSha256)" in fn
+    # both existing-file rejections remove before replacing
+    assert fn.count("Remove-Item -LiteralPath $Path -Force") >= 2
+    # a bad download fails loudly rather than being kept
+    assert "throw" in fn
+    assert "$Downloaded.Length -ne $ExpectedBytes" in fn
+
+
+def test_v2_a_failed_director_verification_leaves_no_file_behind():
+    """`Test-RequiredFile` runs later, so a rejected artifact must not survive to satisfy it."""
+    fn = _ps_function(_installer_source(), "Install-VerifiedModel")
+    # every throw on the download path is preceded by a removal
+    for marker in ("has the wrong size: got", "failed SHA256 verification"):
+        assert marker in fn, marker
+    before_throws = fn.split("throw")
+    assert len(before_throws) >= 4, "expected the size and hash failures to throw separately"
+    assert fn.count("Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue") >= 2
+
+
+def test_v2_the_stage_5_asset_policy_was_not_changed():
+    """R1 is a Director-specific correction, not a broad package-integrity rewrite."""
+    source = _installer_source()
+    # the two Stage-5 models still use the plain downloader with its size floor
+    assert ('Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") '
+            "104857600") in source
+    assert ('Download-File $QwenMmprojUrl (Join-Path $ModelsDir '
+            '"mmproj-Qwen3VL-2B-Instruct-F16.gguf") 104857600') in source
+    # and they are NOT routed through the verifying wrapper
+    assert "Install-VerifiedModel $QwenModelUrl" not in source
+    assert "Install-VerifiedModel $QwenMmprojUrl" not in source
+    # no Stage-5 URL was pinned or altered
+    assert ("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/"
+            "Qwen3VL-2B-Instruct-Q8_0.gguf?download=true") in source
+    assert ("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/"
+            "mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true") in source
 
 
 def test_v2_the_installer_requires_llama_completion():
