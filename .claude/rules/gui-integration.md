@@ -154,7 +154,7 @@ automatically.
   Only `apply_variant_btn.click` writes execution widgets, and only after re-deriving the live
   declaration and requiring it to equal the one its batch was generated from.
 
-  **AI Director V1 repeats that split exactly**, and the symmetry is deliberate rather than
+  **The AI Director repeats that split exactly**, and the symmetry is deliberate rather than
   stylistic:
 
   ```
@@ -168,6 +168,16 @@ automatically.
   `creative_preset`), exactly as `generate_variants_btn.click` is. `apply_director_btn.click` is
   the **one** Director execution-widget writer, and each of those three matrices was extended by
   precisely that one entry — by exact list, never relaxed to containment.
+
+  **Director V2 widened Generate's `inputs`, and only its `inputs`.** They are now
+  `[director_instruction, prep_folder, prep_recursive, prep_state]`, matched positionally against
+  the handler's parameter order. The three preparation values are **read** so the eligibility gate
+  can tell a current, live-declared, fully prepared scan from a stale or partial one — the same
+  queued-widget hazard `prep_analyze_btn` already takes live values for. Generate's `outputs` are
+  unchanged, so it is still a reader and never a preparation or source writer: intent cannot
+  invalidate a scan or a confirmed source set. No creative state reaches Generate — not a slider,
+  not the Variation Seed, not the preset, not a Variant Lab widget — so the instruction stays an
+  absolute intention rather than a transform of the screen.
 - **`director_proposal_state` has exactly one reader**, `apply_director_btn.click`, pinned as an
   exact list (the same contract `variant_batch_state` carries, which now has exactly two). It is
   absent from `process_btn.click`, `render_selected_variants_btn.click`, `source_outputs`,

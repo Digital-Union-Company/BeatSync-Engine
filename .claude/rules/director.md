@@ -1,324 +1,430 @@
 ---
 paths:
   - "src/beatsync_fork/director.py"
+  - "src/beatsync_fork/director_media.py"
   - "tests/test_director.py"
+  - "tests/test_director_media.py"
 ---
 
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
 > `.claude/rules/operating-policies.md`.
 
-# AI Director V1
+# AI Director V2 — semantic intent IR + one narrow media adaptation
 
 ```
 natural-language editing intent
-    -> local text-only Qwen generation        (gui.py runs the subprocess)
-    -> strictly validated visual proposal     (beatsync_fork/director.py)
-    -> the user reviews it
+    -> local text-only Qwen3-4B generation      (gui.py runs the subprocess)
+    -> strictly validated SemanticIntent        (beatsync_fork/director.py)
+    -> deterministic semantic -> six-control BASE mapping
+    -> optional narrow Source Diversity attenuation   (beatsync_fork/director_media.py)
+    -> FINAL six controls
+    -> the user reviews BASE, the adjustment and FINAL
     -> the user explicitly presses Apply Proposal
     -> the existing Variation Seed + six Creative Controls
     -> the user may edit, use Variant Lab, or render normally
 ```
 
 **The Director proposes. It never renders, and it is not a second execution path.** It is a
-*second producer* of the artifact Variant Lab already produces — which is exactly what
-`creative_recipe.py` anticipated when it refused to carry a master seed, a spread or any other
-generator provenance:
+*second producer* of the artifact Variant Lab already produces:
 
 ```
-VARIANT LAB    = a recipe from a master seed, ranges and a spread
-AI DIRECTOR    = a recipe from one sentence
+VARIANT LAB     = a recipe from a master seed, ranges and a spread
+AI DIRECTOR     = a recipe from one sentence (+ one local media fact)
 CREATIVE RECIPE = what WILL be rendered   (seven integers, the VISUAL execution artifact)
 THE SIX SLIDERS + THE SEED = where it lands (unchanged execution truth)
 ```
 
-Existing visible execution controls stay authoritative. No stage, planner, profile or cache has
-heard of a Director.
+## Why V2 exists: the model must not speak control names
 
-## Visual only
+V1 asked the model for the six internal controls directly. That shape was then measured three ways —
+dense six values, sparse absolute values, and direction+strength on the internal names — and all
+three failed the *same* ordinary sentence:
 
-V1 produces one `CreativeRecipe` and nothing else:
+> "Keep scene choice relatively even across sections."
 
-```
-DIRECTOR_V1_OUTPUT_SCOPE           = VISUAL_ONLY
-DIRECTOR_WRITES_RESOURCE_IDENTITY  = NO
-```
+read as **neutral** by a 2B model, a 4B model and an 8B model, across all three contracts: six
+measurements, one answer. The problem was never model size. The language-understanding task included
+"which way does the `energy_response` slider move?", which is implementation trivia the user never
+said.
 
-It does **not** generate or modify `music_under_voice`, `sfx_amount`, `sfx_level`, voice files,
-voice timing, `avoid_drops`, the SFX folder or roles, the source folder or files, FPS, the encoder,
-the output filename, the source confirmation or the Media Library Preparation state. Those are
-resource identity and physical render intent; a text prompt is not an authority on them.
+V2 removes that from the model's job. The model classifies the user's meaning on six ordinary
+**editing dimensions**, each with its own meaningful direction pair, and deterministic code alone
+knows the mapping. With that one change the same 4B model read the sentence correctly.
 
-## The model emits six controls; the GUI mints the seed
-
-```
-DIRECTOR_VARIATION_SEED_POLICY = GUI_MINTS
-MODEL_SCHEMA_INCLUDES_SEED     = NO
-```
-
-The schema's properties are **derived** from `presets.CREATIVE_CONTROL_FIELDS` — there is no second
-six-field registry, and `director.py` carries an import-time assertion to that effect plus a second
-one pairing every field with a semantic description. Each control is `integer`, `0..100`, required;
-`explanation` is optional; `additionalProperties` is `false`. No schema-version machinery.
-
-With `additionalProperties` false the grammar cannot emit a `seed`, and the strict parser rejects
-one that arrives anyway — not ignores it, because a producer that thinks it owns the seed is a
-producer worth failing. Order is the contract:
+**The frozen evidence this feature was authorized on** (selected model
+`Qwen3-4B-Instruct-2507 Q8_0`, SHA256 `ae916ede…d5f1`, 4,280,403,520 bytes):
 
 ```
-model output -> strict six-control validation -> mint the Variation Seed
-             -> CreativeRecipe.from_mapping   -> DirectorProposal
+SCHEMA_VALID_RATE               100 %
+ENERGY_CLUSTER                  6 / 6     (all six paraphrases, incl. the sentence above)
+CONCEPT_PASS_COUNT              14 / 14
+MEDIA_CONTROL_CONCEPT_PASS      10 / 10
+WRONG_DIRECTION_TOTAL           0
+UNSEEN_SINGLE_AXIS_HOLDOUT      12 / 12   (a matrix the model had never seen)
+NON_TARGET_AXIS_EMISSION        2.50 %
+DETERMINISM                     PASS      (byte-identical repeats)
+MEDIAN_LATENCY                  ~3.5 s
 ```
 
-The mint is the existing `variation.random_seed()`, called in `gui.py` because the pure module owns
-no randomness. There is no second seed implementation. A test counts the draws: an invalid response
-must consume **zero**, so a malformed answer cannot produce a plausible-looking half proposal.
+**The prompt and the schema are hash-pinned to those exact bytes.**
+`SEMANTIC_IR_SYSTEM_PROMPT_SHA256 = 2ef076e1693f08e0ac7a9d4f055fad88cf0ed3f5913b107882c52fd821e58ddd`
+and `SEMANTIC_IR_SCHEMA_SHA256 = 411615315546af8707127d506375033c48369188b2b985b8df0fbab13889df35`,
+asserted by `tests/test_director.py`. Drifting off them invalidates the evidence above, so a change
+there is a re-measurement, not an edit.
 
-## The CreativeRecipe trust boundary is reused, unmodified
-
-`creative_recipe.py` was **not touched** and `from_mapping` was **not weakened**. The whole
-all-or-nothing contract still holds: missing field, extra field, wrong type, `bool`, `float`, out of
-range or seed 0 rejects the *whole* recipe. No coercion, no clamping, no partial application, no
-silent defaults, no fallback to Balanced. `CREATIVE_RECIPE_STRICT_BOUNDARY_PRESERVED = YES`.
-
-## Strict execution, tolerant explanation
-
-Two trust contracts, deliberately opposite, and conflating them is the mistake worth naming:
+## The model-facing surface carries no execution vocabulary
 
 ```
-valid six controls + missing explanation      -> valid proposal, explanation ""
-valid six controls + non-string explanation   -> valid proposal, explanation ""
-valid six controls + overlong explanation     -> valid proposal, explanation bounded
-invalid execution control                     -> the WHOLE proposal is rejected
+MODEL_FACING_INTERNAL_CONTROL_NAMES = 0
 ```
 
-`DIRECTOR_EXPLANATION_POLICY = TOLERANT_NON_LOAD_BEARING_BOUNDED`. The explanation is normalised
-for display only (whitespace collapse, `EXPLANATION_MAX_CHARS = 280`) and never enters
-`CreativeRecipe`, `CreativeProfile`, `beat_info`, `render_info`, Stage 4/5/6, cache identity, a
-Stage-5 Qwen request or the planner. Failing a good recipe because the prose was ugly would be
-strictness pointed at the one field where it buys nothing.
+| semantic axis | directions | execution control |
+|---|---|---|
+| `cut_pacing` | `sparser` / `denser` | `cut_density` |
+| `impact_accents` | `fewer` / `more` | `micro_cuts` |
+| `scene_reading` | `visual` / `semantic` | `semantic_emphasis` |
+| `section_reactivity` | `steadier` / `responsive` | `energy_response` |
+| `motion_preference` | `calmer` / `dynamic` | `motion_bias` |
+| `source_variety` | `reuse` / `diverse` | `source_diversity` |
 
-**The schema's `maxLength` is advisory on the installed build, and that is measured.** llama.cpp
-does not compile `maxLength` into its JSON-schema grammar there: declared limits of 60, 160 and 280
-all produced identical ~460-character strings. So the schema asks and `normalize_explanation`
-guarantees. The reason a bound is wanted at all is Stage 5's documented truncation defect — an
-*unbounded* string ate the token budget so the JSON never closed
-(`.claude/rules/stage5-worker.md`) — and the mitigation is the same shape: ask for one short
-sentence, budget `MAX_NEW_TOKENS = 320` at roughly three times the measured ~115-token need, and
-bound what reaches the screen.
+None of the six right-hand names may appear in `system_prompt()` or `model_schema_json()` — enforced
+by an import-time assertion in `director.py` **and** by a permanent test, because this is the whole
+architectural distinction V2 rests on. Generic `up`/`down` are deliberately absent from the enums
+too: the model classifies a *meaning*, not a slider direction.
 
-## Parse the whole of stdout strictly
+**`SEMANTIC_AXES` is the one registry.** The schema properties, the prompt text and
+`AXIS_TO_CONTROL` all derive from it, and import-time assertions pin that it has the same six
+members as `presets.CREATIVE_CONTROL_FIELDS` and twelve distinct direction words.
 
-No regex fishes a `{...}` out of surrounding prose. A broad `\{.*\}` search is how a truncated
-object, a code fence or a chatty preamble gets silently half-accepted, and Stage 5's own truncation
-defect lived exactly there. The parse is: strip, remove the one fixed `[end of text]` marker,
-`json.loads` the entire remainder, require a mapping, require the exact key set, require six plain
-in-range `int`s. `--json-schema` is defence in depth; **the parser is the authority**.
+**V1's control descriptions could not be reused.** They literally name `cut_density` /
+`energy_response` / etc., so reusing them would leak exactly the vocabulary V2 removes. The axis
+descriptions are written in ordinary editing language instead. That is the one place V2 could not
+share text with V1, and it is deliberate.
 
-`_END_OF_GENERATION_MARKER` is the one deliberate exception and it is a *constant, not a pattern*:
-llama.cpp appends `" [end of text]"` to its own output when generation stops on end-of-sequence.
-Stripping exactly that, exactly once, from exactly the end leaves every failure mode intact — a
-marker in the middle, a different suffix and real trailing commentary all still fail. Do not
-generalise it into a regex or a list of tolerated suffixes.
+## Strength is 1..100, and there is no neutral direction
 
-## Media-blind, slider-blind, cacheless
+Each reported axis carries `direction` plus `strength` (plain `int`, `1..100`). There is **no `0`**
+and **no `neutral`** direction, because both are indistinguishable from omitting the axis — and the
+sparse experiment measured exactly that failure mode: given a neutral option the model emitted no-op
+entries (`{"source_diversity": 50}`) instead of omitting, and given absolute values it collapsed
+every downward request onto 50.
 
 ```
-DIRECTOR_INSPECTS_MEDIA        = NO
-DIRECTOR_READS_CURRENT_SLIDERS = NO
-DIRECTOR_CACHE                 = NONE
+omitted axis      -> that control is EXACTLY 50
+reported axis     -> 50 ± magnitude_for_strength(strength)
+{"intent": {}}    -> all six neutral; a valid answer, not an error
 ```
 
-The invocation receives the instruction, the system prompt and the schema. It receives no frames,
-no source filenames, no Stage-5 semantic records, no `beat_info`, no sections, no tempo, no music
-features and no current source state. A content-aware Director is a later milestone, and no dormant
-abstraction was added for it.
+`magnitude_for_strength` is `(strength + 1) // 2` — explicit integer half-up, **never** `round()`.
+Banker's rounding sends `0.5` to `0`, which would make the smallest possible request a silent no-op,
+and sends `24.5` to `24`, breaking monotonicity at every half point. `director_media.half_up` is the
+same discipline for the float product in the adapter.
+
+## BASE and FINAL are two different truths
+
+```
+BASE  = what the user's semantic intent resolves to
+FINAL = what will be proposed, after the optional media step
+```
+
+`DirectorProposal` carries **both**, plus the `SemanticIntent`, the model's explanation, the
+instruction, an optional `MediaAdjustment` and a truthful `media_note`. `proposal.recipe` is always
+FINAL — that is what Apply writes and what the preset label is derived from. BASE is **provenance
+only** and is never overwritten in place. Both recipes share the one minted Variation Seed, so the
+read-out cannot imply the media step re-rolled the clip selection.
+
+Still frozen and deepcopy-safe: `gr.State` deep-copies its value, so every reachable value is an
+`int`, `float`, `str` or a frozen record of those. A test walks the whole object graph.
+
+## The one authorized media adaptation
+
+```
+MEDIA_ADAPTER_CONTROLS   = [source_diversity]
+MEDIA_ADAPTER_DIRECTION  = BASE > 50 only
+SUPPORT_FLOOR            = 0.20
+EFFECTIVE_SOURCES_FULL   = 24.0
+```
+
+`support = 0.20 + 0.80 * clamp01(effective_sources / 24)`, then
+`FINAL = 50 + half_up((BASE - 50) * support)`.
+
+The invariant `50 <= FINAL <= BASE` holds for every reachable input and is asserted, not hoped for:
+media may attenuate an unsupported request **toward** neutral, but never reverse intent, never
+amplify it, and never invent a direction from a neutral BASE.
+
+**Three of P1's four prototype adapters were measured and DROPPED.** All four were pure, bounded,
+deterministic and cheap — necessary but, it turned out, not sufficient. P3 put each through the real
+Stage-6 planner on real candidate pools across eight fixed Variation Seeds:
+
+- *Semantic Emphasis* — **execution-inert** where it would matter. The control blends
+  `det + factor * (full - det)`, and `full - det` is non-zero only where Stage 5 fused a Qwen
+  reading, so at 0 % coverage attenuation changed no render outcome at all (character effect exactly
+  `0.00000`). At 50 % coverage neither direction cleared the bar.
+- *Energy Response* — the benefit **changed sign with the direction** of the request: `responsive`
+  lost legacy score on all three target mixes while `steadier` gained.
+- *Motion Bias* — discarded 71–78 % of the requested character for a +0.04–0.13 % score change whose
+  sign was inconsistent across seeds, i.e. noise.
+
+Only Source Diversity survived. On a prepared library with ~4 effective sources a strong diversity
+request cannot buy a single extra source — the plan already uses all four at neutral — so the extra
+reuse pressure is pure score cost. Relaxing it recovered **+1.2353 %** mean legacy score across
+**8/8** seeds with the unique-source count identical every time.
+
+**It is a trade-off, not a free win, and the UI must say so.** `adjacent_source_repeats` rose
+(19.6 → 28.8 mean), so this is a P3 "meaningful trade-off" and explicitly **not** strict dominance.
+Never describe it as better, optimal, free or a Pareto improvement; a test pins the absence of all of
+those words from the provenance line, which states the benefit and the cost in one breath.
+
+**Downward requests are never attenuated**, and that is measured too: on the same library,
+attenuating reuse-direction requests was consistently *harmful* (4/4 cases, mean −0.4352 %), while
+diverse-direction requests were consistently positive (7/7, mean +0.8653 %). The support function
+measures *leverage* and is direction-agnostic; the **value** is directional, so the direction gate
+lives in the adapter. Do not "simplify" it away.
+
+**Do not implement the three rejected adapters, and do not ship their inputs.** `motion_spread`,
+`action_spread`, `soft_spread`, `tension_spread`, the motion percentiles and the two Qwen coverage
+fractions are absent from the production summary, and a test asserts they did not arrive as dead
+weight.
+
+## Media eligibility: a current, fully prepared scan or nothing
+
+```
+PARTIAL_SCAN_ADAPTATION = NO
+STALE_SCAN_ADAPTATION   = NO
+```
+
+`gui._eligible_media_summary` gates on four things, in cheapening order: a recorded scan exists; the
+**live** `LivePrepDeclaration` still `describes` it; `PrepScanResult.is_fully_prepared()`; and the
+summary is provable. Anything else returns `None` plus a truthful note.
+
+The live-declaration check is the same cheap one Analyze uses — practical equality on the normalised
+folder and the exact recursive flag. It stats nothing, rescans nothing and probes no runtime
+identity. It exists because Gradio delivers widget changes as separate queued events, so a user can
+retype the folder and press Generate before the `change` handler has run; without it a proposal could
+adapt to the *previous* library's concentration while the screen declared another folder.
+
+The full-prepared requirement is not fussiness: P3's value evidence was produced on complete
+candidate pools, so a partial scan's aggregate describes a subset and extrapolating from it is
+reading a statistic the user never finished producing.
+
+**An ineligible scan is not a failure and must never be called a fallback.** The semantic-IR proposal
+is produced normally; only the deterministic step is skipped, and the read-out says which reason
+applied (`MEDIA_NOTE_NO_SCAN`, `_STALE_SCAN`, `_NOT_PREPARED`, `_NO_SUMMARY`). It is still Director
+V2 intent interpretation — simply `MEDIA_ADJUSTMENT_APPLIED = NO`.
+
+## The model never receives media
+
+```
+DIRECTOR_MODEL_SEES_MEDIA = NO
+```
+
+The invocation receives the instruction, the system prompt and the schema. It receives no frames, no
+filenames, no Stage-5 records, no `beat_info`, no sections, no tempo, no music features, no current
+source state and **no media summary** — so there is no media prompt-injection surface at all. A test
+inspects the real argv and asserts no summary field, no measured number and no `mmproj`/`--image`
+argument appears.
 
 It also does not read the Variation Seed, the six sliders, the preset or any Variant Lab state, so
 the instruction is an **absolute** editing intention rather than a transformation of what is on
-screen. A transform-current-settings mode is out of scope, not half-built. There is no Stage-5 cache
-use, no proposal cache, no prompt history and no conversation state: every press is independent.
+screen. There is no cache, no proposal history and no conversation state: every press is independent.
 
-## Model assets are reused; the Stage-5 worker is not
+## Parse the whole of stdout strictly
+
+Unchanged in philosophy from V1, and extended to the new shape. No regex fishes a `{...}` out of
+prose — a broad `\{.*\}` search is how a truncated object, a code fence or a chatty preamble gets
+half-accepted, and Stage 5's own truncation defect lived exactly there. The parse is: strip, remove
+the one fixed `[end of text]` marker, `json.loads` the entire remainder, require a mapping, require
+the exact top-level key set, require `intent` to be a mapping of known axes only, and require every
+**present** axis to carry exactly `{direction, strength}` with an axis-specific enum value and a
+plain in-range `int`.
+
+**A malformed present axis rejects the whole intent.** It is not dropped and not salvaged: a producer
+emitting `{"motion_preference": {"direction": "sideways"}}` disagrees with this contract about what
+an intent is, and that disagreement is what is worth failing on. Missing axes are not malformed —
+absence *is* the contract's way of saying "no preference".
+
+`_END_OF_GENERATION_MARKER` remains a **constant, not a pattern**. Do not generalise it into a regex
+or a list of tolerated suffixes.
+
+## Strict execution, tolerant explanation
+
+Two trust contracts, deliberately opposite:
 
 ```
-MODEL_ASSETS_REUSED  = YES
-STAGE5_WORKER_REUSED = NO
+valid intent + missing explanation      -> valid proposal, explanation ""
+valid intent + non-string explanation   -> valid proposal, explanation ""
+valid intent + overlong explanation     -> valid proposal, explanation bounded (280 chars)
+one malformed present axis              -> the WHOLE proposal is rejected
 ```
 
-The same installed `Qwen3VL-2B-Instruct-Q8_0.gguf`, **text-only**: no `mmproj` is loaded and no
-image argument is passed. `stage5_qwen_scene_worker.py` is deliberately not invoked and
-`beatsync_fork.qwen_progress` is not used — those exist to batch frames through a persistent
-`llama-server` and write a semantic response file, which is a different contract from one bounded
-JSON answer. Reusing them would have meant teaching a media-semantics worker about creative intent,
-which is exactly the leak `.claude/rules/stage5-worker.md` forbids. The worker is also not imported
-for its paths: `gui.py` derives both from the one general `ROOT_DIR` constant.
+The explanation is display-only and never enters `CreativeRecipe`, `CreativeProfile`, `beat_info`,
+`render_info`, Stage 4/5/6, cache identity, a Stage-5 Qwen request or the planner. **It must never be
+rewritten to pretend the model made the deterministic media change** — the model explains its own
+intent reading, and the `MediaAdjustment` explains itself.
+
+`maxLength` is advisory on the installed build (measured: declared limits of 60/160/280 all produced
+identical ~460-character strings), so the schema asks and `normalize_explanation` guarantees.
+
+## The model asset
+
+```
+DIRECTOR_MODEL          = bin\models\qwen3-4b-instruct-2507-q8_0.gguf   (text-only, no mmproj)
+STAGE_5_MODEL           = bin\models\Qwen3VL-2B-Instruct-Q8_0.gguf + mmproj   (UNCHANGED)
+LLAMA_CPP_BUILD         = b9842 (unchanged)
+DIRECTOR_MODEL_FALLBACK = NONE
+```
+
+There are now **two** Qwen assets with two different jobs, and conflating them is the mistake worth
+naming. Stage 5 keeps the vision model plus its projector for media semantics; the Director gets a
+separate text-only 4B for intent. `DEFAULT_QWEN_GGUF_MODEL`, `DEFAULT_QWEN_MMPROJ_MODEL`, the Stage-5
+request format, prompt, schema and cache identity are all untouched — `CACHE_CONTRACT_VERSION` stays
+`stage5_cache_v3` and `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`.
+
+**There is deliberately no fallback to the 2B model.** It was measured against this contract and
+failed it (8/14 overall, 0/4 downward requests). A missing Director model produces
+`missing_runtime_status`, which names the file and points at the installer; silently substituting a
+model that failed would produce confident wrong recipes instead of an honest error.
 
 ## One bounded, one-shot subprocess — and the binary is `llama-completion.exe`
 
-```
-DIRECTOR_MODEL_STRATEGY = REUSE_QWEN3VL_TEXT_ONLY_ONE_SHOT
-TIMEOUT_SECONDS         = 60
-```
+Unchanged from V1, including both measured deviations. No `llama-server`, no port, no readiness
+polling, no persistent model process, no session. One `subprocess.run` with a timeout,
+`CREATE_NO_WINDOW`, stdout and stderr captured separately; `run` rather than `Popen` precisely so a
+timeout kills and reaps the child.
 
-No `llama-server`, no port, no readiness polling, no persistent model process, no session. One
-`subprocess.run` with a timeout, `CREATE_NO_WINDOW`, stdout and stderr captured separately. Success
-requires `returncode == 0` **and** a strictly valid stdout payload. Every failure — executable
-missing, model missing, timeout, non-zero exit, empty stdout, malformed JSON, invalid controls,
-unexpected properties — produces a Director status and changes no execution widget. `run` rather
-than `Popen` is the reason no process is left alive: it kills and reaps the child before raising,
-and a test forbids `Popen` in the Director's call graph.
-
-**Two measured deviations from the obvious invocation. Do not "simplify" either back.**
-
-1. **`llama-completion.exe`, not `llama-cli.exe`.** On the installed build (`b9842-6f4f53f2b`)
-   `llama-cli` is the interactive chat front end: it *rejects* `-no-cnv` outright
-   (`--no-conversation is not supported by llama-cli / please use llama-completion instead`),
-   ignores `--no-display-prompt`, and prints its banner, its command list, the echoed prompt and a
-   timings line **into stdout** alongside the answer. Parsing that would mean the very regex the
-   strict parser exists to refuse. `llama-completion.exe` ships in the same `bin` layout, is the
-   binary `llama-cli` itself names, takes every argument, and emits the JSON object alone on stdout
-   with the banner, logs and timings on stderr.
-2. **`-cnv -st`, not `-no-cnv`.** `-cnv` is what applies the model's own chat template; `-st` runs
-   exactly one turn and exits (non-interactively, because the turn is predefined by `-p`). There is
-   still no chat history — the process dies. Raw completion mode skips the template, and on an
-   *Instruct* model that is not a small difference: measured over five intents, `-no-cnv` collapsed
-   every control to 0 or 1 and rambled past the token budget, while `-cnv -st` produced coherent,
-   well-separated recipes (`20/10/70/60/30/50` for a cinematic intention against
-   `100/100/50/100/50/50` for an aggressive one). The retained P0 probes could not distinguish the
-   two: the server probe went through `/v1/chat/completions` (template applied) and the `llama-cli`
-   probe's `-no-cnv` was silently rejected by the binary, so **both** measured template-applied
-   output while one of them looked like a raw-completion result.
+1. **`llama-completion.exe`, not `llama-cli.exe`.** On build `b9842` `llama-cli` is the interactive
+   chat front end: it rejects `-no-cnv`, ignores `--no-display-prompt`, and prints its banner, its
+   command list, the echoed prompt and a timings line **into stdout**. Parsing that would mean the
+   very regex the strict parser exists to refuse. The installer now requires
+   `llama-completion.exe` by name, because it shipped in the same archive but was not previously
+   verified — an otherwise "ready" install could satisfy the old check with no Director runtime.
+2. **`-cnv -st`, not `-no-cnv`.** `-cnv` applies the model's own chat template; `-st` runs exactly
+   one turn and exits. Raw completion mode skips the template, and on an *Instruct* model that is not
+   a small difference — measured, `-no-cnv` collapsed every control to 0 or 1 and rambled past the
+   token budget.
 
 The rest: `-ngl 99`, `-c 2048`, `-n 320`, `--no-display-prompt`, `--no-perf`, `-co off`,
-`--temp 0.0 --top-k 1`, `-sys`, `-p`, `--json-schema`. Greedy decoding matches the repository's
-existing Qwen convention, so the same instruction proposes the same six controls — the honest
-product, since the Director reads *words*. The Variation Seed is freshly minted every press
-regardless, so two proposals from one instruction are still two different edits.
-
-Generation settings are **hard-coded, not environment variables**, for the reason
-`.claude/rules/stage5-worker.md` records for the recovery constants: a knob that changes a result
-belongs under contract. They reach no cache key, and the Director has no cache at all.
-
-The system prompt is asserted to be **pure ASCII** — it is a process argument to a native binary,
-so a decorative em dash is a mojibake risk for no gain. UI copy is free to use them.
+`--temp 0.0 --top-k 1`, `-sys`, `-p`, `--json-schema`. Greedy decoding, so the same instruction
+proposes the same intent; the Variation Seed is minted fresh every press regardless. Generation
+settings stay **hard-coded, not environment variables** — a knob that changes a result belongs under
+contract. The system prompt is asserted pure ASCII: it is a process argument to a native binary.
 
 ## Propose, then apply
 
 ```
-DIRECTOR_APPLY_MODEL     = PROPOSE_THEN_APPLY
+DIRECTOR_APPLY_MODEL       = PROPOSE_THEN_APPLY
 GENERATING_IS_NOT_APPLYING = YES
-DIRECTOR_AUTO_RENDER     = NO
+DIRECTOR_AUTO_RENDER       = NO
 ```
 
-- **Generate Proposal** reads only the instruction and writes **zero** execution widgets — only
-  `director_proposal_state`, the proposal read-out and the status. That absence is what makes
-  generating-is-not-applying structural rather than careful, exactly as it is for
-  `generate_variants_btn`. A failure clears the state rather than leaving the previous proposal
-  behind a status line that contradicts it, and never replaces it with a fake valid object.
+- **Generate Proposal** takes `[director_instruction, prep_folder, prep_recursive, prep_state]` and
+  writes **zero** execution widgets — only `director_proposal_state`, the read-out and the status.
+  The three preparation inputs are *read* by the eligibility gate and reach deterministic local code
+  only; Generate writes no preparation or source widget, so intent can never invalidate a scan or a
+  confirmed source set. A failure clears the state rather than leaving a stale proposal behind a
+  contradicting status line.
 - **Apply Proposal** reads only `director_proposal_state` and writes exactly `variation_seed`, the
-  six sliders, `creative_preset` and the Director status. No audio widget, no source widget, no
-  Variant Lab master seed, no batch state, no report panel, no render.
+  six sliders, `creative_preset` and the Director status. It runs **no media logic at all** — a test
+  pins that it mentions neither the eligibility helper nor the adapter.
 - **Neither handler can reach a render entry point or the source gate**, walked structurally from
   both buttons so a rename cannot evade it.
 
+### Order is the contract, and the seed is minted last
+
+```
+1. normalize instruction          7. resolve FINAL deterministically
+2. verify runtime + model         8. validate the final controls
+3. invoke the 4B model            9. mint the Variation Seed
+4. strictly parse SemanticIntent  10. build BASE + FINAL with the SAME seed
+5. resolve BASE six controls      11. build DirectorProposal
+6. evaluate eligible media        12. return proposal / read-out / status
+```
+
+No seed is drawn before every execution-control truth is valid. A test counts the draws: an invalid
+response must consume **zero**, so a malformed answer cannot produce a plausible half proposal.
+
 ### Apply is deliberately NOT stale-gated
 
-Variant Lab's Apply has a live-declaration gate because a candidate describes a *base* the screen
-may have moved away from. A Director proposal is an absolute set of seven values, as valid now as
-when it was generated — so `director_proposal_state` survives an apply and the same explicit
-proposal may be re-applied after manual experiments. **Do not add Apply-staleness semantics here,
-and do not weaken Variant Lab's.** Generate Proposal replaces the prior proposal.
+Variant Lab's Apply has a live-declaration gate because a candidate describes a *base* the screen may
+have moved away from. A Director proposal is an absolute set of seven values, as valid now as when it
+was generated — so `director_proposal_state` survives an apply and may be re-applied after manual
+experiments. **This is also true across a media change:** if the prepared library changes after
+Generate, Apply remains allowed and the provenance tells the user what happened *at Generate time*.
+Do not add media-snapshot staleness to Apply, and do not weaken Variant Lab's gate.
+
+## The display contract
+
+When an adjustment happened the read-out **visibly separates** the two authors, because they are
+different and the user is entitled to know which is which:
 
 ```
-DIRECTOR_STATE_READER_COUNT = 1     # apply_director_btn.click, and nothing else
+Instruction: Showcase everything I have and keep the edit varied.
+
+Base:  Clip seed … · Cut 50 · Micro 50 · Semantic 50 · Energy 50 · Motion 50 · Diversity 100
+Director: <the model's own one-sentence reading>
+
+Media adjustment: Source Diversity 100 -> 67 - this prepared library has only 4.0 effective
+source(s), so stronger diversity pressure cannot spread the edit across any more of them.
+Relaxing it may allow more adjacent source reuse.
+
+Final: Clip seed … · … · Diversity 67
+Proposal only - press Apply Proposal to move the controls. Nothing has been rendered.
 ```
 
-### `_variant_apply_outputs` is deliberately not reused
+Both halves are mandatory: the **benefit** (more pressure cannot buy more variety) and the
+**trade-off** (relaxing it may allow more adjacent source reuse). With a fully prepared library and
+nothing to change, the proposal says so concisely; with no eligible scan it names the reason.
 
-It is the right projection for Variant Lab and the wrong one here: it also writes the lab's Master
-Seed (generator provenance the Director never had), the three `AudioRecipe` levels (which V1 does
-not generate) and the lab report. Reusing it would have made the Director claim audio values it
-never produced. `_director_apply_outputs` is a small Director-specific projection that reuses the
-one semantic helper that matters — `presets.matching_preset` — so there is still exactly one
-preset-label path. `DIRECTOR_PRESET_MATCHING_REUSED = YES`.
+## UI copy must not over-claim
 
-The Director **never emits a preset label**: which named recipe six numbers happen to match is a
-GUI read-out, not something a model may assert. Programmatic slider writes do not fire `.input()`,
-so Apply recomputes `matching_preset` from the proposal's numbers and returns it explicitly —
-`50×6 -> Balanced`, anything unmatched `-> Custom`.
-
-## Writer matrices, extended by exact list
+Three claims the copy may never make: that the instruction **reproduces** a result (a prompt is not a
+recipe identifier, and the seed is minted fresh every press); that the Director has **watched the
+footage** or understands the media library; and that the adjustment is an **improvement**. The
+distinction the copy must draw is between the two halves:
 
 ```
-the six creative sliders:  creative_preset.input, generate_variant_btn.click,
-                           new_variant_btn.click, apply_variant_btn.click,
-                           apply_director_btn.click
-variation_seed:            randomize_btn.click, generate_variant_btn.click,
-                           new_variant_btn.click, apply_variant_btn.click,
-                           apply_director_btn.click
-creative_preset:           the six <slider>.input handlers, generate_variant_btn.click,
-                           new_variant_btn.click, apply_variant_btn.click,
-                           apply_director_btn.click
+THE MODEL      reads the user's words only — no footage, frames, filenames, summary or record
+LOCAL BEATSYNC may read one small aggregate a CURRENT FULLY PREPARED scan already produced
 ```
 
-Pinned as **exact sorted lists with list indirection resolved**, never relaxed to containment.
-`generate_director_btn.click` is absent from all three, for exactly the reason
-`generate_variants_btn.click` is. See `.claude/rules/creative-presets.md` and
-`.claude/rules/creative-controls.md`.
+No "perfect", "best edit", "understands your footage", "fully automatic", "better" or "optimal". A
+test pins the absence of all of them.
 
 ## Isolation
 
 `DIRECTOR_CHANGES_STAGE5_CACHE_IDENTITY = NO`,
-`DIRECTOR_CHANGES_PERSISTED_MEDIA_SEMANTICS = NO`. `CACHE_CONTRACT_VERSION` stays
-`stage5_cache_v3` and `ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`;
-`video_analysis.py`, `stage5_qwen_scene_worker.py`, `src/auto_mode/*`, `video_processor.py`,
-`ffmpeg_processing.py`, `creative.py`, `presets.py`, `creative_recipe.py`, `variant_lab.py`,
-`variant_batch.py`, `render_batch.py`, `audio_mix.py` and `smart_mix.py` are **untouched**.
+`DIRECTOR_CHANGES_PERSISTED_MEDIA_SEMANTICS = NO`. `stage5_qwen_scene_worker.py`,
+`stage6_av_planner.py`, `creative.py`, `creative_recipe.py`, `presets.py`, `freestyle.py`,
+`variant_lab.py`, `variant_batch.py`, `render_batch.py`, `render_worker.py`, `audio_mix.py`,
+`smart_mix.py` and `stage_cache.py` are **untouched**. `video_analysis.py` changed only at the
+preparation classifier seam, to count moments from records it had already loaded — no cache write, no
+second completion rule, no identity input.
 
-Director widgets are absent from `source_outputs`, `prep_outputs`, `live_declaration`,
-`confirm_action`, `process_btn.click`, `render_selected_variants_btn.click`, `prep_scan_btn` and
-`prep_analyze_btn`; Director events write neither `source_state` nor `prep_state`. Changing,
-generating or applying Director intent cannot invalidate a source confirmation. The Director also
-borrows no existing read-out: `variant_report`, `variant_batch_status`, `variant_batch_table`,
-`audio_layers_report`, `smart_mix_report` and `render_batch_summary` keep their existing single
-writers.
-
-```
-VARIANT_LAB_INTEROP                 = VIA_LIVE_SLIDERS_ONLY
-DIRECTOR_DIRECT_C3_R0_INTEGRATION   = NO
-```
-
-There is no direct Director → Variant Lab wiring. After Apply, the recipe is on the visible
-sliders, and Variant Lab reads those sliders as its base exactly as it always has — so
-Director → Apply → Generate Variant(s) → C3-R0 works through existing execution truth.
-`variant_lab.resolve`, `variant_lab.resolve_audio` and `variant_batch.resolve_batch` were not
-modified, and the Director populates no `VariantBatch`, no render selector and no batch summary.
+`CreativeRecipe.from_mapping` is reused **unmodified** as the trust boundary for both BASE and FINAL,
+and `presets.matching_preset` remains the one preset-label path. The Director never emits a preset
+label: which named recipe six numbers happen to match is a GUI read-out, not something a model may
+assert.
 
 ## No CLI flag
 
 The CLI already exposes all seven resolved visual values, which are the reproducible execution
 contract for the edit. A `--director "make it cinematic"` flag would add a non-deterministic,
-model-dependent step to a headless entry point whose whole value is that its seven numbers *are*
-the contract.
-
-## UI copy must not over-claim
-
-Two claims the copy may never make: that the instruction **reproduces** a result (a prompt is not a
-recipe identifier, and the seed is minted fresh every press), and that the Director has **looked at
-the footage** (V1 is media-blind). No "perfect", "best edit", "understands your footage" or "fully
-automatic". A test pins the absence of all of them in the proposal read-out.
+model-dependent step to a headless entry point whose whole value is that its seven numbers *are* the
+contract — and the media half would additionally need a prepared-library scan the CLI does not have.
 
 ## Real-runtime acceptance
 
 Out of scope for the portable suite, by the same rule as every other real-model path. The pure half
-and the GUI runtime seam are both covered without a model: `tests/test_director.py` imports
-`director.py` normally and AST-extracts the real `gui.py` handlers over a controlled `subprocess`
-seam, so a timeout, a non-zero exit, a launch `OSError`, a missing asset and every malformed
-payload are all exercised. The real-model run belongs in
-`C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...` against read-only assets.
+and the GUI runtime seam are both covered without a model: `tests/test_director.py` imports the pure
+module normally, `tests/test_director_media.py` covers the adapter exhaustively, and
+`tests/test_gui_guard_seam.py` AST-extracts the real `gui.py` handlers and executes them over a
+controlled `subprocess` seam — so every media-eligibility branch, a timeout, a non-zero exit, a
+launch `OSError`, a missing asset and every malformed payload are exercised.
 
-Measured on the installed build, no mmproj, text-only: **2.54–2.57 s** per proposal end to end
-(cold model load every time, because the process exits), `rc=0`, strict payload valid, recipe
-`20/10/70/60/30/50` for the cinematic acceptance instruction, Variation Seed minted by the GUI,
-`matching_preset -> Custom`, no orphan process, and the applied six sliders accepted unchanged as a
-Variant Lab and `variant_batch` base. Well inside the 60-second bound.
+Measured against the real 4B asset through the **production** `system_prompt()`,
+`model_schema_json()`, `parse_semantic_intent()` and `resolve_semantic_intent()`: 3/3 on the frozen
+smoke set (the A1 energy-down sentence → `section_reactivity: steadier/80`; the kinetic sentence →
+`motion_preference: dynamic/100`; the cinematic broad instruction → a coherent three-axis intent),
+3.54–4.00 s per proposal, with the concentrated-library adjustment firing correctly (Source Diversity
+88 → 63). The real-model run belongs in `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...` against
+read-only assets.

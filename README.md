@@ -88,8 +88,9 @@ BeatSync Engine/
 │   ├── ffmpeg/ffprobe.exe                   # Portable FFprobe
 │   ├── llama-bin-win-vulkan-x64/            # llama.cpp Vulkan backend
 │   └── models/
-│       ├── Qwen3VL-2B-Instruct-Q8_0.gguf    # Local Qwen3-VL GGUF model
-│       └── mmproj-Qwen3VL-2B-Instruct-F16.gguf
+│       ├── Qwen3VL-2B-Instruct-Q8_0.gguf    # Stage 5 semantic analysis (vision)
+│       ├── mmproj-Qwen3VL-2B-Instruct-F16.gguf   # its multimodal projector
+│       └── qwen3-4b-instruct-2507-q8_0.gguf # AI Director V2 intent model (text-only)
 ├── src/
 │   ├── gui.py                               # Gradio web UI
 │   ├── video_processor.py                   # Rendering pipeline
@@ -289,12 +290,18 @@ The renderer creates a frame-accurate cut timeline, chooses source moments for e
 
 BeatSync does not require PyTorch, Transformers, or a separately installed CUDA Toolkit. The installer uses `cupy-cuda13x[ctk]`, which downloads the CUDA runtime libraries CuPy needs into the portable Python environment.
 
-Qwen3-VL semantic tagging uses the bundled llama.cpp Vulkan backend and these GGUF files:
+The bundled llama.cpp Vulkan backend serves **two separate local models with two different
+jobs**. The Director model does not replace Stage 5, and Stage 5's model is not used for intent:
 
 ```text
 bin/llama-bin-win-vulkan-x64/
+
+# Stage 5 semantic analysis - looks at video frames
 bin/models/Qwen3VL-2B-Instruct-Q8_0.gguf
 bin/models/mmproj-Qwen3VL-2B-Instruct-F16.gguf
+
+# AI Director V2 - reads your sentence only, text-only, no projector
+bin/models/qwen3-4b-instruct-2507-q8_0.gguf
 ```
 
 For Qwen3-VL acceleration, install current GPU drivers with Vulkan support. NVIDIA NVENC export still requires an NVIDIA GPU with NVENC support.

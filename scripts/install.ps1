@@ -19,8 +19,14 @@ $PythonZipUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$Python
 $UvZipUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 $FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$FfmpegVersion/ffmpeg-$FfmpegVersion-essentials_build.zip"
 $LlamaZipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/llama-$LlamaBuild-bin-win-vulkan-x64.zip"
+# Stage 5 semantic analysis: the VISION model plus its multimodal projector. Unchanged.
 $QwenModelUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf?download=true"
 $QwenMmprojUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true"
+# AI Director V2: a SEPARATE text-only intent model. It does not replace Stage 5 and has no mmproj,
+# because the Director never looks at a frame. The Stage-5 2B model was measured against the V2
+# intent contract and failed it, so this is a third asset rather than a reuse of the first.
+$DirectorModelUrl = "https://huggingface.co/ggml-org/Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/main/qwen3-4b-instruct-2507-q8_0.gguf?download=true"
+$DirectorModelFile = "qwen3-4b-instruct-2507-q8_0.gguf"
 
 function Step($Message) {
     Write-Host ""
@@ -251,7 +257,12 @@ function Install-LlamaCppVulkan {
     $ServerExe = Join-Path $LlamaDir "llama-server.exe"
     $MtmdExe = Join-Path $LlamaDir "llama-mtmd-cli.exe"
     $CliExe = Join-Path $LlamaDir "llama-cli.exe"
-    if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe)) {
+    # AI Director V2 runs one-shot through llama-completion.exe, not llama-cli.exe -- see
+    # .claude/rules/director.md for why that choice is measured rather than stylistic. It ships in
+    # the same archive, but it was not previously named here, so an otherwise "ready" install could
+    # satisfy this check and still have no Director runtime.
+    $CompletionExe = Join-Path $LlamaDir "llama-completion.exe"
+    if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe) -and (Test-Path $CompletionExe)) {
         try {
             $CurrentVersion = (& $CliExe --version 2>$null | Select-Object -First 1)
             if ($CurrentVersion -match "version:\s+9842\b") {
@@ -315,10 +326,15 @@ function Remove-LegacyPythonPackages($UvExe) {
 }
 
 function Install-QwenGgufModels {
-    Step "Installing Qwen3-VL GGUF models"
+    Step "Installing Qwen GGUF models (Stage 5 vision + Director intent)"
     Ensure-Dir $ModelsDir
+    # Stage 5 semantic analysis.
     Download-File $QwenModelUrl (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") 104857600
     Download-File $QwenMmprojUrl (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") 104857600
+    # AI Director V2. ~4.28 GB (4,280,403,520 bytes); the floor below is the same conservative
+    # shape the two Stage-5 downloads use -- large enough to catch a truncated or error-page
+    # download, not an exact-size assertion the upstream repository could invalidate.
+    Download-File $DirectorModelUrl (Join-Path $ModelsDir $DirectorModelFile) 1073741824
 }
 
 function Ensure-AppFolders {
@@ -401,8 +417,10 @@ if ($LASTEXITCODE -ne 0) {
 Test-RequiredFile (Join-Path $LlamaDir "llama-server.exe") "llama-server.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-mtmd-cli.exe") "llama-mtmd-cli.exe"
 Test-RequiredFile (Join-Path $LlamaDir "llama-cli.exe") "llama-cli.exe"
-Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Qwen GGUF model"
-Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Qwen mmproj model"
+Test-RequiredFile (Join-Path $LlamaDir "llama-completion.exe") "llama-completion.exe"
+Test-RequiredFile (Join-Path $ModelsDir "Qwen3VL-2B-Instruct-Q8_0.gguf") "Stage 5 Qwen GGUF model"
+Test-RequiredFile (Join-Path $ModelsDir "mmproj-Qwen3VL-2B-Instruct-F16.gguf") "Stage 5 Qwen mmproj model"
+Test-RequiredFile (Join-Path $ModelsDir $DirectorModelFile) "AI Director GGUF model"
 
 & (Join-Path $LlamaDir "llama-cli.exe") --version
 if ($LASTEXITCODE -ne 0) {

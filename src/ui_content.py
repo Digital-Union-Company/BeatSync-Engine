@@ -519,12 +519,25 @@ INFO_MICRO_CUTS = (
 )
 
 # ============================================================================
-# [FORK] Digital-Union: AI Director V1
-# See src/beatsync_fork/director.py. Two claims this copy must never make: that the instruction
-# reproduces a result (a prompt is not a recipe identifier, and the Variation Seed is minted fresh
-# every time), and that the Director has looked at the user's footage (V1 is media-blind — it reads
-# the sentence and nothing else). Applying moves the existing Creative Controls below; Create Music
-# Video is still the only thing that renders.
+# [FORK] Digital-Union: AI Director V2
+# See src/beatsync_fork/director.py and src/beatsync_fork/director_media.py.
+#
+# V1's copy said the Director "has not watched your footage" and stopped there, which was complete
+# while V1 was wholly media-blind. V2 needs a sharper distinction, because one half changed and the
+# other did not:
+#
+#   THE MODEL        reads the user's words only. It never receives footage, frames, filenames, a
+#                    media summary, a Stage-5 record or any count — so there is no media
+#                    prompt-injection surface at all.
+#   LOCAL BEATSYNC   may read one small aggregate that a CURRENT, FULLY PREPARED Media Library scan
+#                    already produced, and use it to relax an over-strong Source Diversity request.
+#                    Deterministic code, no model involved, no re-analysis.
+#
+# Three claims this copy must never make: that the instruction reproduces a result (a prompt is not
+# a recipe identifier, and the Variation Seed is minted fresh every time); that the Director has
+# watched the footage or understands the media library; and that the adjustment is an improvement —
+# it is a measured trade-off that may allow more adjacent source reuse. Applying moves the existing
+# Creative Controls below; Create Music Video is still the only thing that renders.
 # ============================================================================
 
 LABEL_AI_DIRECTOR = "🎬 AI Director"
@@ -534,9 +547,15 @@ INFO_AI_DIRECTOR = (
     "and nothing else. It never renders automatically, never re-analyses your videos and never "
     "touches your confirmed source files. Afterwards you can edit any control by hand, explore "
     "from there with Variant Lab, or press Create Music Video.\n\n"
-    "The Director reads your words only: it has not watched your footage, it does not know the "
-    "track, and it does not look at the settings currently on screen — each instruction is read as "
-    "a fresh description of the edit you want."
+    "The model reads your words only: it has not watched your footage, it does not know the track, "
+    "and it does not look at the settings currently on screen — each instruction is read as a fresh "
+    "description of the edit you want.\n\n"
+    "If you have a **fully prepared** Media Library, BeatSync may then relax a very strong Source "
+    "Diversity request on its own: when a prepared library has only a few effective sources, extra "
+    "diversity pressure cannot spread the edit any wider, so it only costs clip quality. That check "
+    "is ordinary local arithmetic over the counts your scan already produced — nothing is sent to "
+    "the model and nothing is re-analysed — and relaxing it may allow more adjacent source reuse. "
+    "The proposal shows the original value, the adjusted value and the reason."
 )
 
 LABEL_DIRECTOR_INSTRUCTION = "📝 Instruction"

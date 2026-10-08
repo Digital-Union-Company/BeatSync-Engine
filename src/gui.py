@@ -260,14 +260,15 @@ AUDIO_LAYERS_REPORT_KEY = 'audio_layers_report'
 #: the generator projects it onto the widget. Pure diagnostics: nothing downstream reads it.
 SMART_MIX_REPORT_KEY = 'smart_mix_report'
 
-# [FORK] Digital-Union (AI Director V1): the Director's runtime assets.
+# [FORK] Digital-Union (AI Director V2): the Director's runtime assets.
 #
-# The SAME installed GGUF Stage 5 uses, invoked **text-only** — no `mmproj` is loaded and no image
-# argument is passed, because the Director V1 is media-blind by design. Stage 5's worker is
-# deliberately NOT reused: it exists to batch frames through a persistent `llama-server` and to
-# write a semantic response file, which is a different contract from one bounded 320-token JSON
-# answer. Reusing it would have meant teaching a media-semantics worker about creative intent —
-# exactly the leak `.claude/rules/stage5-worker.md` forbids.
+# A SEPARATE text-only GGUF from Stage 5's — see `DIRECTOR_MODEL` below for why the shared 2B model
+# could not stay. No `mmproj` is loaded and no image argument is passed: **the model** is blind to
+# the footage, and V2's one media fact never travels through it. Stage 5's worker is deliberately
+# NOT reused either: it exists to batch frames through a persistent `llama-server` and to write a
+# semantic response file, which is a different contract from one bounded 320-token JSON answer.
+# Reusing it would have meant teaching a media-semantics worker about creative intent — exactly the
+# leak `.claude/rules/stage5-worker.md` forbids.
 #
 # Resolved from the one general `ROOT_DIR` constant rather than from `video_analysis` or the
 # worker's own module constants, so obtaining a path costs no import of either: the Director has no
@@ -285,7 +286,22 @@ DIRECTOR_LLAMA_DIR = os.path.join(ROOT_DIR, 'bin', 'llama-bin-win-vulkan-x64')
 #: stdout with the banner, the logs and the timings on stderr. Same build, same model asset, same
 #: one-shot process — only a correctly-chosen entry point.
 DIRECTOR_LLAMA_EXE = os.path.join(DIRECTOR_LLAMA_DIR, 'llama-completion.exe')
-DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'Qwen3VL-2B-Instruct-Q8_0.gguf')
+#: **Director V2's own model, and deliberately not Stage 5's.** V1 reused the installed
+#: `Qwen3VL-2B-Instruct-Q8_0.gguf` text-only, and that model was then measured against the V2 intent
+#: contract and **failed** it: on the frozen 14-intention matrix it reached 8/14 with 0/4 of the
+#: downward requests understood, and it could not read an ordinary sentence like "Keep scene choice
+#: relatively even across sections" as a request at all. `Qwen3-4B-Instruct-2507` reached 14/14
+#: concepts, 6/6 on that cluster and 12/12 on an unseen holdout, at a ~3.5 s median one-shot cost.
+#:
+#: So there are now two Qwen assets with two different jobs, and they must not be conflated:
+#: Stage 5 keeps the **vision** model plus its `mmproj` for media semantics, and the Director gets
+#: this **text-only** 4B. There is no `mmproj` here and no image argument: the Director is blind to
+#: the footage, and the one media fact V2 uses never travels through the model at all.
+#:
+#: There is deliberately **no fallback to the 2B model** when this file is missing — see
+#: `director.missing_runtime_status`. Silently substituting a model that failed the contract would
+#: produce confident wrong recipes instead of an honest "run the installer".
+DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'qwen3-4b-instruct-2507-q8_0.gguf')
 
 # [FORK] Digital-Union (P V1): media library preparation. All state, classification vocabulary and
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
@@ -1679,8 +1695,12 @@ def _run_director_model(instruction: str) -> Tuple[str, str]:
 
     `--no-display-prompt` keeps the echoed prompt out of stdout, `--no-perf` and `-co off` keep
     timings and ANSI colour out of it, and `--json-schema` is defence in depth behind
-    `director.parse_model_payload`, which remains the authority. No image argument and no `mmproj`:
-    the Director is media-blind.
+    `director.parse_semantic_intent`, which remains the authority.
+
+    **No image argument and no `mmproj`: this invocation is media-blind, and that remains exactly
+    true under V2.** The Director as a whole is now narrowly content-aware, but the one media fact
+    reaches deterministic local code *after* this call returns — nothing about the prepared library
+    is interpolated into the argv, so there is no media prompt-injection surface here at all.
     """
     env = dict(os.environ)
     env['PATH'] = DIRECTOR_LLAMA_DIR + os.pathsep + env.get('PATH', '')
@@ -1725,20 +1745,67 @@ def _run_director_model(instruction: str) -> Tuple[str, str]:
     return completed.stdout or '', ''
 
 
-def _on_generate_director_proposal(director_instruction) -> Tuple:
+def _eligible_media_summary(prep_folder, prep_recursive, prep_state) -> Tuple:
+    """`(summary_or_None, truthful_note)` — may this proposal use the prepared media facts?
+
+    Returns the summary **only** from a current, live-declared, *fully prepared* scan. Every other
+    outcome returns `None` plus a note naming the actual reason, because the alternative is silently
+    claiming content awareness the user has not earned by preparing their library.
+
+    Four gates, in cheapening order:
+
+    1. **a scan exists at all** — a `gr.State` with no recorded scan has no facts;
+    2. **the live declaration still describes it** — Gradio delivers widget changes as separate
+       queued events, so the user can retype the folder or toggle recursive and press Generate
+       before the `change` handler has run. The same `LivePrepDeclaration.describes` check the
+       Analyze button uses answers that **without** stat-ing the folder, rescanning or probing
+       runtime identity: it is practical equality on the normalised folder and the exact flag;
+    3. **the library is fully prepared** — P3's value evidence was produced on complete candidate
+       pools, so a partial scan's aggregate describes a subset and extrapolating from it would be
+       reading a statistic the user never finished producing;
+    4. **the summary is provable** — an empty or unusable one is UNAVAILABLE, never fabricated.
+
+    This is deliberately **not** a generation failure. The semantic-IR proposal is produced either
+    way; only the deterministic media step is skipped, and the read-out says so.
+    """
+    state = prep_state
+    scan = getattr(state, 'scan', None)
+    if scan is None:
+        return None, fork_director.MEDIA_NOTE_NO_SCAN
+
+    live = fork_prep.LivePrepDeclaration.from_widgets(prep_folder, prep_recursive)
+    if not live.describes(scan):
+        return None, fork_director.MEDIA_NOTE_STALE_SCAN
+
+    if not scan.is_fully_prepared():
+        return None, fork_director.MEDIA_NOTE_NOT_PREPARED
+
+    summary = scan.usable_media_summary()
+    if summary is None:
+        return None, fork_director.MEDIA_NOTE_NO_SUMMARY
+
+    return summary, fork_director.MEDIA_NOTE_CHECKED_NO_CHANGE
+
+
+def _on_generate_director_proposal(director_instruction, prep_folder, prep_recursive,
+                                   prep_state) -> Tuple:
     """Turn one instruction into a reviewable proposal. Writes no execution widget.
 
-    Its only input is the instruction: the Director deliberately does not read the Variation Seed,
-    the six sliders, the preset, the Variant Lab state or anything else on screen, so the sentence
-    is interpreted as an absolute editing intention rather than as a transformation of the current
-    settings. There is no cache and no history either — every press is independent.
+    **What the model sees is still only the instruction.** The three preparation inputs are read by
+    `_eligible_media_summary` and reach deterministic local code alone — no media summary, filename,
+    frame, record or count is ever interpolated into the prompt, so there is no media
+    prompt-injection surface and `DIRECTOR_MODEL_SEES_MEDIA` stays `NO`. The Director still does not
+    read the Variation Seed, the six sliders, the preset or any Variant Lab state, so the sentence
+    is an absolute editing intention rather than a transformation of what is on screen. There is no
+    cache and no history: every press is independent.
 
-    **The seed is minted last, and only for a valid payload (the ordering is the contract).**
-    Strict six-control validation happens first, and the mint is the existing
-    `fork_variation.random_seed()` — the one implementation every seed in this application comes
-    from, called here in the GUI because the pure Director owns no randomness. Minting before
-    validation would have turned a malformed response into a plausible-looking half proposal,
-    which is the exact outcome `CreativeRecipe`'s all-or-nothing boundary exists to prevent.
+    **The ordering is the contract, and the seed is minted last.** Instruction, runtime, model,
+    strict intent parse, BASE resolution and the media step all complete before
+    `fork_variation.random_seed()` is called — the one implementation every seed in this application
+    comes from, called here because the pure Director owns no randomness. Minting earlier would turn
+    a malformed response into a plausible-looking half proposal, which is exactly what
+    `CreativeRecipe`'s all-or-nothing boundary exists to prevent. BASE and FINAL then share that one
+    seed, so the media step cannot look like it re-rolled the clip selection.
 
     Outputs: the proposal state, the read-out, the status. A failure clears the state rather than
     leaving the previous proposal behind a status line that contradicts it.
@@ -1755,12 +1822,16 @@ def _on_generate_director_proposal(director_instruction) -> Tuple:
     if failure:
         return None, '', failure
 
-    payload = fork_director.parse_model_payload(stdout)
-    if payload is None:
+    parsed = fork_director.parse_semantic_intent(stdout)
+    if parsed is None:
         return None, '', fork_director.STATUS_INVALID_PAYLOAD
+    intent, explanation = parsed
+
+    summary, media_note = _eligible_media_summary(prep_folder, prep_recursive, prep_state)
 
     proposal = fork_director.build_proposal(
-        instruction, payload, fork_variation.random_seed())
+        instruction, intent, explanation, fork_variation.random_seed(),
+        summary=summary, media_note=media_note)
     if proposal is None:
         return None, '', fork_director.STATUS_INVALID_PAYLOAD
 
@@ -3081,6 +3152,10 @@ def _prep_scan_impl(folder_path: str, recursive: bool, state,
         classify_seconds=classification.get("classify_seconds") or 0.0,
         cache_identity_seconds=classification.get("cache_identity_seconds") or 0.0,
         cache_lookup_seconds=classification.get("cache_lookup_seconds") or 0.0,
+        # [FORK] Digital-Union: the small per-source moment counts the classifier accumulated while
+        # it already held each reusable record. Converted to the frozen summary inside
+        # `build_scan_result`; the GUI never re-reads a cache record to build it.
+        source_candidate_counts=classification.get("source_candidate_counts"),
     )
     return fork_prep.record_scan(state, scan)
 
@@ -4161,9 +4236,15 @@ def create_ui() -> gr.Blocks:
         # Note also what Generate's `inputs` does not contain: everything except the instruction.
         # There is no hidden creative base, so the Director cannot drift from its own last answer
         # the way a transform-the-current-settings mode would.
+        # [FORK] Digital-Union (Director V2): three preparation inputs joined the instruction, and
+        # they are LIVE widget values rather than `prep_state` alone — the same reason
+        # `prep_analyze_btn` takes them. A queued `change` event may not have run yet, so the stored
+        # scan can lag the screen; comparing the live declaration is what stops a proposal adapting
+        # to the *previous* library's concentration while the screen declares another folder.
+        # They are read only by `_eligible_media_summary` and never reach the model.
         generate_director_btn.click(
             fn=_on_generate_director_proposal,
-            inputs=[director_instruction],
+            inputs=[director_instruction, prep_folder, prep_recursive, prep_state],
             outputs=[director_proposal_state, director_proposal, director_status],
         )
 

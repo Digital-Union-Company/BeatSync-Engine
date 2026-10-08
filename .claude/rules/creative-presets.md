@@ -171,10 +171,13 @@ slider values with no generator concept), while `gui.py` may wire one up, and th
 surface is an explicit allow-list so a *second* director concept cannot drift in beside it.
 
 The accepted direction is preserved and was not spent: **persistent media truth + ephemeral
-Creative Profile.** Director V1 is media-blind, has no cache, requires no Stage-5 re-analysis,
-leaves `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` untouched, and overwrites no persistent
-semantics — it proposes seven integers for the controls that already existed. Full contract:
-`.claude/rules/director.md`.
+Creative Profile.** The Director has no cache, requires no Stage-5 re-analysis, leaves
+`CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` untouched, and overwrites no persistent semantics —
+it proposes seven integers for the controls that already existed. **Director V2 kept that boundary
+while becoming narrowly content-aware:** the *model* is still media-blind (it receives no footage,
+frames, filenames, records or summary), and the one media fact it uses — the prepared library's
+effective-source concentration — reaches deterministic local code only, after the model has already
+answered. Full contract: `.claude/rules/director.md`.
 
 **Freestyle V1 shipped too, and a preset gained exactly one new role: it is now also a *section
 style*.** Selecting `Cinematic` for the `drop` sections projects that recipe's **five** values —
@@ -207,11 +210,20 @@ ban as a claim that the feature does not exist.
 
 **Genuinely not implemented anywhere, and no speculative abstraction was added for any of it:**
 source groups, **per-section Micro Cuts**, **a per-section Variation Seed**, a per-section *instance*
-editor (Freestyle keys on section *type*), a second style-aware Qwen pass over a shortlisted
-candidate set, and a **content-aware Director** that reads the Stage-5 library. Tests assert the
-absence of shortlist machinery, of `director_cache` / `director_history` / `director_media` /
-`director_render` / `director_transform`, and of `freestyle_micro` / `freestyle_seed` /
-`freestyle_timeline` / `analyze_music`. None of these is scheduled: they are recorded so the bans have
+editor (Freestyle keys on section *type*), and a second style-aware Qwen pass over a shortlisted
+candidate set. Tests assert the absence of shortlist machinery, of `director_cache` /
+`director_history` / `director_render` / `director_transform`, and of `freestyle_micro` /
+`freestyle_seed` / `freestyle_timeline` / `analyze_music`.
+
+**`director_media` left that list with Director V2 — and the `gui.py` ban on the token stays.** A
+narrow content-aware Director now exists, in `beatsync_fork/director_media.py`: one control
+(`source_diversity`), one direction (`BASE > 50`), one media fact (prepared-library effective-source
+concentration), and only from a current fully prepared scan. What remains forbidden in `gui.py` is
+the *token*, for a reason that survived the change: the GUI must grow no media machinery of its own.
+It hands the prepared summary to the Director's own pure boundary and never imports the adapter, so
+the ban is a live layering guard rather than a claim that the feature is unbuilt. It is also **not**
+the three adapters P3 measured and rejected — Semantic Emphasis, Energy Response and Motion Bias
+have no media adaptation and must not acquire one. None of these is scheduled: they are recorded so the bans have
 a stated reason, not as a roadmap. The permanent constraints are unchanged: creative state never
 enters Stage-5 cache identity, no per-render interpretation overwrites persistent semantics, and a
 future second pass would stay run-scoped rather than becoming the library's durable truth.

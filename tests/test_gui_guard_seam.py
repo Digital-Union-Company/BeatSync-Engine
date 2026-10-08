@@ -566,13 +566,27 @@ def test_no_director_handler_can_reach_the_render_chain_or_the_gate():
 
 def test_the_director_never_touches_the_render_mutex_or_the_processing_dir():
     """One render at a time is a property of the two render wrappers. A proposal is not a render,
-    so it must neither take the mutex nor clear the process-global processing directory."""
+    so it must neither take the mutex nor clear the process-global processing directory.
+
+    **`prep_state` split off by Director V2, not dropped.** V1 had no reason to read preparation
+    state, so banning it here cost nothing. V2's Generate reads it deliberately — it is one of the
+    four authorized Generate inputs — to decide whether a *current, fully prepared* scan exists
+    before the deterministic Source Diversity step. That read is the whole eligibility gate, so the
+    honest fix is to say so rather than rename the parameter around a boundary guard.
+
+    What the split does **not** weaken: `prep_state` stays banned in every other Director function
+    (Apply in particular runs no media logic at all), `session_state` and `source_state` stay banned
+    everywhere, and Generate remains a *reader* only — `test_v2_generate_does_not_write_prep_or_
+    source_state` pins that no preparation or source widget is in its `outputs`, so intent can never
+    invalidate a confirmed source set or a recorded scan.
+    """
+    base = ("_RENDER_LOCK", "RENDER_CONCURRENCY_ID", "RENDER_BUSY_MESSAGE",
+            "get_processing_dir", "LAST_OUTPUT_PATH_KEY", "session_state", "source_state")
     for name in ("_on_generate_director_proposal", "_on_apply_director_proposal",
                  "_run_director_model", "_director_apply_outputs", "_director_apply_skips"):
         body = _gui_body(name)
-        for forbidden in ("_RENDER_LOCK", "RENDER_CONCURRENCY_ID", "RENDER_BUSY_MESSAGE",
-                          "get_processing_dir", "LAST_OUTPUT_PATH_KEY", "session_state",
-                          "source_state", "prep_state"):
+        forbidden_here = base if name == "_on_generate_director_proposal" else base + ("prep_state",)
+        for forbidden in forbidden_here:
             assert forbidden not in body, f"{name} references {forbidden}"
 
 
@@ -1351,3 +1365,546 @@ def test_a_variation_seed_still_names_its_own_file(tmp_path):
 
     produced = os.listdir(str(tmp_path / "output"))
     assert len(produced) == 1 and produced[0].endswith("_seed381944.mp4"), produced
+
+
+# ===========================================================================
+# AI DIRECTOR V2: THE GUI RUNTIME SEAM
+#
+# `gui.py` cannot be imported on a bare interpreter, so the REAL handler bodies are extracted and
+# executed against a synthesised namespace. Only the runtime edge is substituted: the three path
+# constants, a `gr.skip()` sentinel and a `subprocess` shim. Every policy decision below -- which
+# media context is eligible, what Apply writes, what the read-out claims -- is production code.
+# ===========================================================================
+
+import json as _json
+import subprocess as _subprocess
+from typing import Tuple as _Tuple
+
+from beatsync_fork import director as fork_director
+from beatsync_fork import library_prep as fork_prep
+from beatsync_fork import presets as fork_presets
+from beatsync_fork import variation as fork_variation
+
+_DIRECTOR_GUI_FUNCTIONS = (
+    "_director_apply_skips", "_director_apply_outputs", "_run_director_model",
+    "_eligible_media_summary", "_on_generate_director_proposal",
+    "_on_apply_director_proposal",
+)
+
+
+class _Skip:
+    """Stands in for `gr.skip()`; identity is what the assertions check."""
+
+
+class _FakeGr:
+    @staticmethod
+    def skip():
+        return _Skip()
+
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _SubprocessShim:
+    """Records the argv and returns a scripted result. The only runtime edge replaced."""
+
+    TimeoutExpired = _subprocess.TimeoutExpired
+    CREATE_NO_WINDOW = 0x08000000
+
+    def __init__(self):
+        self.calls = []
+        self.result = _FakeCompleted(0, "")
+        self.raises = None
+
+    def run(self, command, **kwargs):
+        self.calls.append({"command": list(command), "kwargs": kwargs})
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+def _director_namespace(tmp_path, shim=None):
+    """The real Director handler bodies, executed against a synthesised namespace."""
+    tree = _gui_tree()
+    wanted = {name: _gui_func(name) for name in _DIRECTOR_GUI_FUNCTIONS}
+    module = ast.Module(body=[wanted[name] for name in _DIRECTOR_GUI_FUNCTIONS], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    llama_dir = tmp_path / "bin" / "llama-bin-win-vulkan-x64"
+    models = tmp_path / "bin" / "models"
+    llama_dir.mkdir(parents=True, exist_ok=True)
+    models.mkdir(parents=True, exist_ok=True)
+    exe = llama_dir / "llama-completion.exe"
+    model = models / "qwen3-4b-instruct-2507-q8_0.gguf"
+    exe.write_bytes(b"x")
+    model.write_bytes(b"y")
+
+    namespace = {
+        "os": os, "json": _json, "Tuple": _Tuple,
+        "gr": _FakeGr(), "subprocess": shim if shim is not None else _SubprocessShim(),
+        "fork_director": fork_director, "fork_prep": fork_prep,
+        "fork_presets": fork_presets, "fork_variation": fork_variation,
+        "DIRECTOR_LLAMA_DIR": str(llama_dir),
+        "DIRECTOR_LLAMA_EXE": str(exe),
+        "DIRECTOR_MODEL": str(model),
+        "_DIRECTOR_APPLY_OUTPUT_COUNT": 2 + len(fork_presets.CREATIVE_CONTROL_FIELDS),
+    }
+    exec(compile(module, "<gui-director>", "exec"), namespace)
+    return namespace
+
+
+def _answer(intent: dict, explanation: str | None = None) -> str:
+    payload: dict = {"intent": intent}
+    if explanation is not None:
+        payload["explanation"] = explanation
+    return _json.dumps(payload) + " [end of text]"
+
+
+_DIVERSE_ANSWER = _answer({"source_variety": {"direction": "diverse", "strength": 100}})
+
+
+def _scan(prepared=2, needs=0, unavailable=0, counts=None, folder="F", recursive=True,
+          usable_runtime=True):
+    items = [{"path": f"p{i}.mp4", "status": fork_prep.PrepStatus.PREPARED.value, "reason": ""}
+             for i in range(prepared)]
+    items += [{"path": f"n{i}.mp4", "status": fork_prep.PrepStatus.NEEDS_ANALYSIS.value,
+               "reason": fork_prep.NeedReason.NEW_OR_CHANGED.value} for i in range(needs)]
+    items += [{"path": f"u{i}.mp4",
+               "status": fork_prep.PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value, "reason": ""}
+              for i in range(unavailable)]
+    runtime = fork_prep.RuntimeIdentity(
+        qwen_enabled=True, ai_available=True, ai_cache_disabled=not usable_runtime,
+        backend_token="b", config_token="c", model_path="m")
+    return fork_prep.build_scan_result(
+        folder=folder, recursive=recursive, runtime=runtime,
+        classification_items=items, supported_count=prepared + needs + unavailable,
+        source_candidate_counts=counts if counts is not None else {"a": 10, "b": 10})
+
+
+def _state_with(scan):
+    return fork_prep.record_scan(fork_prep.initial_state(), scan) if scan is not None \
+        else fork_prep.initial_state()
+
+
+#: A genuinely concentrated prepared library: 4 equal sources -> 4.0 effective sources.
+_CONCENTRATED_COUNTS = {"a": 10, "b": 10, "c": 10, "d": 10}
+#: Past the full-support edge: 24 equal sources -> support exactly 1.0, so nothing is attenuated.
+_DIVERSE_COUNTS = {f"s{i}": 10 for i in range(24)}
+
+
+# -- s50 the pinned event surface ------------------------------------------
+
+def test_v2_generate_inputs_are_the_instruction_plus_the_live_prep_declaration():
+    """Pinned as an exact ordered list, matched against the handler's parameter order.
+
+    Gradio passes positionally, so a silent reordering would hand the folder to the instruction.
+    """
+    tree = _gui_tree()
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "click"
+                and getattr(node.func.value, "id", None) == "generate_director_btn")
+    kwargs = {kw.arg: kw.value for kw in call.keywords}
+    inputs = [ast.unparse(item) for item in kwargs["inputs"].elts]
+    assert inputs == ["director_instruction", "prep_folder", "prep_recursive", "prep_state"]
+
+    params = [arg.arg for arg in _gui_func("_on_generate_director_proposal").args.args]
+    assert params == ["director_instruction", "prep_folder", "prep_recursive", "prep_state"]
+
+
+def test_v2_generate_outputs_are_unchanged_and_write_no_execution_widget():
+    tree = _gui_tree()
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "click"
+                and getattr(node.func.value, "id", None) == "generate_director_btn")
+    kwargs = {kw.arg: kw.value for kw in call.keywords}
+    outputs = [ast.unparse(item) for item in kwargs["outputs"].elts]
+    assert outputs == ["director_proposal_state", "director_proposal", "director_status"]
+
+
+def test_v2_apply_input_and_outputs_are_unchanged():
+    tree = _gui_tree()
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "click"
+                and getattr(node.func.value, "id", None) == "apply_director_btn")
+    kwargs = {kw.arg: kw.value for kw in call.keywords}
+    assert [ast.unparse(item) for item in kwargs["inputs"].elts] == ["director_proposal_state"]
+    assert ast.unparse(kwargs["outputs"]) == "director_apply_outputs"
+    source = _gui_source()
+    assert ("director_apply_outputs = [variation_seed] + creative_control_sliders + [\n"
+            "            creative_preset, director_status,\n        ]") in source
+
+
+def test_v2_generate_does_not_write_prep_or_source_state():
+    """Reading the live preparation widgets must not make Generate a preparation writer."""
+    tree = _gui_tree()
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "click"
+                and getattr(node.func.value, "id", None) == "generate_director_btn")
+    outputs = ast.unparse(next(kw.value for kw in call.keywords if kw.arg == "outputs"))
+    for forbidden in ("prep_state", "prep_outputs", "prep_report", "prep_status",
+                      "prep_analyze_btn", "source_state", "source_outputs", "session_state"):
+        assert forbidden not in outputs, forbidden
+
+
+def test_v2_the_director_reads_no_cache_record_and_never_rescans():
+    """The one authorized record-read point is the classifier. The GUI must not add a second."""
+    for name in ("_eligible_media_summary", "_on_generate_director_proposal",
+                 "_on_apply_director_proposal"):
+        body = ast.unparse(_gui_func(name))
+        for forbidden in ("_load_cache", "_cache_path", "classify_library_sources",
+                          "_prep_scan_impl", "os.stat", "os.scandir", "os.listdir",
+                          "os.walk", "scan_folder", "json.load"):
+            assert forbidden not in body, f"{name} uses {forbidden!r}"
+
+
+# -- s51 the media eligibility matrix --------------------------------------
+
+def test_v2_no_scan_produces_a_base_proposal_with_an_explicit_note(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+
+    state, read_out, status = ns["_on_generate_director_proposal"](
+        "spread it out", "F", True, _state_with(None))
+
+    assert isinstance(state, fork_director.DirectorProposal)
+    assert state.media_adjusted is False
+    assert state.recipe.source_diversity == 100
+    assert fork_director.MEDIA_NOTE_NO_SCAN in read_out
+    assert "rendered" in status.lower()
+
+
+def test_v2_a_stale_live_declaration_blocks_the_media_step(tmp_path):
+    """The queued-widget hazard: the user retyped the folder before pressing Generate."""
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS, folder="F"))
+
+    for folder, recursive in (("OTHER", True), ("F", False)):
+        state, read_out, _status = ns["_on_generate_director_proposal"](
+            "spread it out", folder, recursive, state_obj)
+        assert state.media_adjusted is False
+        assert state.recipe.source_diversity == 100
+        assert fork_director.MEDIA_NOTE_STALE_SCAN in read_out
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(prepared=2, needs=1),
+    dict(prepared=2, unavailable=1),
+    dict(prepared=0),
+])
+def test_v2_a_partial_scan_blocks_the_media_step(tmp_path, kwargs):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS, **kwargs))
+
+    state, read_out, _status = ns["_on_generate_director_proposal"](
+        "spread it out", "F", True, state_obj)
+    assert state.media_adjusted is False
+    assert state.recipe.source_diversity == 100
+    assert fork_director.MEDIA_NOTE_NOT_PREPARED in read_out
+
+
+def test_v2_an_unusable_runtime_blocks_the_media_step(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS, usable_runtime=False))
+
+    state, read_out, _status = ns["_on_generate_director_proposal"](
+        "spread it out", "F", True, state_obj)
+    assert state.media_adjusted is False
+    assert fork_director.MEDIA_NOTE_NOT_PREPARED in read_out \
+        or fork_director.MEDIA_NOTE_NO_SUMMARY in read_out
+
+
+def test_v2_a_fully_prepared_library_with_no_usable_summary_blocks_the_media_step(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts={}))
+
+    state, read_out, _status = ns["_on_generate_director_proposal"](
+        "spread it out", "F", True, state_obj)
+    assert state.media_adjusted is False
+    assert fork_director.MEDIA_NOTE_NO_SUMMARY in read_out
+
+
+def test_v2_a_well_supported_library_is_checked_and_left_alone(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_DIVERSE_COUNTS))
+
+    state, read_out, _status = ns["_on_generate_director_proposal"](
+        "spread it out", "F", True, state_obj)
+    assert state.media_adjusted is False
+    assert state.recipe.source_diversity == 100
+    assert fork_director.MEDIA_NOTE_CHECKED_NO_CHANGE in read_out
+
+
+@pytest.mark.parametrize("direction,strength,expected", [
+    ("diverse", 100, 100),   # BASE 100 -> stays, support is 1.0 only on a diverse library
+])
+def test_v2_a_neutral_or_reuse_request_is_never_adjusted(tmp_path, direction, strength, expected):
+    shim = _SubprocessShim()
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS))
+
+    # reuse direction: BASE lands below neutral and must be returned untouched
+    shim.result = _FakeCompleted(
+        0, _answer({"source_variety": {"direction": "reuse", "strength": 100}}))
+    state, _read_out, _status = ns["_on_generate_director_proposal"](
+        "a few heroes", "F", True, state_obj)
+    assert state.recipe.source_diversity == 0
+    assert state.media_adjusted is False
+
+    # an empty intent leaves every control neutral, and neutral is never moved
+    shim.result = _FakeCompleted(0, _answer({}))
+    state, _read_out, _status = ns["_on_generate_director_proposal"](
+        "make a video", "F", True, state_obj)
+    assert state.recipe.source_diversity == 50
+    assert state.media_adjusted is False
+
+
+def test_v2_a_concentrated_prepared_library_attenuates_and_shows_its_provenance(tmp_path):
+    """The one case the whole feature exists for, end to end through the real handler."""
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS))
+
+    state, read_out, status = ns["_on_generate_director_proposal"](
+        "Showcase everything I have", "F", True, state_obj)
+
+    assert state.media_adjusted is True
+    assert state.base_recipe.source_diversity == 100
+    assert state.final_recipe.source_diversity == 67
+    assert state.base_recipe.seed == state.final_recipe.seed
+    assert state.adjustment.field == "source_diversity"
+    assert state.adjustment.effective_sources == pytest.approx(4.0)
+
+    assert "Media adjustment:" in read_out
+    assert "100" in read_out and "67" in read_out
+    assert "adjacent source reuse" in read_out.lower()
+    for overclaim in ("better", "optimal", "pareto", "watched your footage"):
+        assert overclaim not in read_out.lower(), overclaim
+    assert "relaxed" in status.lower()
+
+
+def test_v2_the_media_summary_never_reaches_the_model(tmp_path):
+    """`DIRECTOR_MODEL_SEES_MEDIA = NO`, asserted against the real argv."""
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    state_obj = _state_with(_scan(counts=_CONCENTRATED_COUNTS))
+
+    ns["_on_generate_director_proposal"]("Showcase everything", "F", True, state_obj)
+
+    assert len(shim.calls) == 1
+    command = [str(part) for part in shim.calls[0]["command"]]
+    # Scan only the model-facing VALUES, not the two filesystem paths: pytest's `tmp_path` embeds
+    # this test's own name, which itself contains "media_summary" -- scanning the whole argv made
+    # the test fail on its own identity rather than on a leak.
+    model_facing = [part for part in command
+                    if part not in (ns["DIRECTOR_LLAMA_EXE"], ns["DIRECTOR_MODEL"])]
+    argv = " ".join(model_facing)
+    for forbidden in ("effective_sources", "candidate_moments", "top_source_share",
+                      "media_summary", "prepared_media", "p0.mp4", "mmproj", "--image",
+                      "--mmproj"):
+        assert forbidden not in argv, f"the argv leaked {forbidden!r}"
+    # the one measured media number must not appear in any form
+    assert "4.0" not in argv and "67" not in argv
+    # and the prompt it DID send is the frozen one
+    assert fork_director.system_prompt() in shim.calls[0]["command"]
+    assert fork_director.model_schema_json() in shim.calls[0]["command"]
+
+
+def test_v2_the_argv_names_the_four_b_model_and_no_mmproj(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    ns["_on_generate_director_proposal"]("x", "F", True, _state_with(None))
+
+    argv = shim.calls[0]["command"]
+    assert any("qwen3-4b-instruct-2507-q8_0.gguf" in str(part) for part in argv)
+    assert not any("Qwen3VL-2B" in str(part) for part in argv)
+    assert not any("mmproj" in str(part).lower() for part in argv)
+    assert any("llama-completion.exe" in str(part) for part in argv)
+
+
+def test_v2_a_missing_director_model_fails_truthfully_without_a_fallback(tmp_path):
+    shim = _SubprocessShim()
+    ns = _director_namespace(tmp_path, shim)
+    os.remove(ns["DIRECTOR_MODEL"])
+
+    state, read_out, status = ns["_on_generate_director_proposal"](
+        "x", "F", True, _state_with(None))
+    assert state is None and read_out == ""
+    assert "qwen3-4b-instruct-2507-q8_0.gguf" in status
+    assert "install" in status.lower()
+    for forbidden in ("qwen3vl", "fallback"):
+        assert forbidden not in status.lower(), forbidden
+    assert shim.calls == [], "nothing may be launched once an asset is known missing"
+
+
+@pytest.mark.parametrize("stdout", [
+    "", "not json", '{"intent": {"nonsense": {"direction": "up", "strength": 50}}}',
+    '{"intent": {}, "seed": 7}',
+    '{"intent": {"source_variety": {"direction": "diverse", "strength": 0}}}',
+    '```json\n{"intent": {}}\n```',
+])
+def test_v2_an_invalid_answer_clears_the_state_and_reports_it(tmp_path, stdout):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, stdout)
+    ns = _director_namespace(tmp_path, shim)
+
+    state, read_out, status = ns["_on_generate_director_proposal"](
+        "x", "F", True, _state_with(_scan(counts=_CONCENTRATED_COUNTS)))
+    assert state is None and read_out == ""
+    assert status == fork_director.STATUS_INVALID_PAYLOAD
+
+
+def test_v2_the_seed_is_minted_only_after_everything_else_validated(tmp_path, monkeypatch):
+    draws = []
+
+    def counting_seed():
+        draws.append(1)
+        return 4242
+
+    shim = _SubprocessShim()
+    ns = _director_namespace(tmp_path, shim)
+    monkeypatch.setattr(fork_variation, "random_seed", counting_seed)
+
+    shim.result = _FakeCompleted(0, "not json")
+    ns["_on_generate_director_proposal"]("x", "F", True, _state_with(None))
+    assert draws == [], "a malformed answer must consume no seed"
+
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    state, _r, _s = ns["_on_generate_director_proposal"]("x", "F", True, _state_with(None))
+    assert draws == [1]
+    assert state.recipe.seed == 4242
+
+
+def test_v2_generate_writes_no_execution_value_at_all(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    returned = ns["_on_generate_director_proposal"](
+        "x", "F", True, _state_with(_scan(counts=_CONCENTRATED_COUNTS)))
+    assert len(returned) == 3
+    state, read_out, status = returned
+    assert isinstance(state, fork_director.DirectorProposal)
+    assert isinstance(read_out, str) and isinstance(status, str)
+
+
+# -- s52 Apply writes FINAL -------------------------------------------------
+
+def test_v2_apply_writes_the_final_recipe_not_the_base(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    proposal, _read_out, _status = ns["_on_generate_director_proposal"](
+        "Showcase everything", "F", True, _state_with(_scan(counts=_CONCENTRATED_COUNTS)))
+    assert proposal.base_recipe.source_diversity == 100
+
+    written = ns["_on_apply_director_proposal"](proposal)
+    seed, *controls, preset, status = written
+
+    fields = list(fork_presets.CREATIVE_CONTROL_FIELDS)
+    values = dict(zip(fields, controls))
+    assert seed == proposal.final_recipe.seed
+    assert values["source_diversity"] == 67, "Apply must write FINAL"
+    assert values["source_diversity"] != proposal.base_recipe.source_diversity
+    # the preset label is derived from the FINAL numbers
+    assert preset == fork_presets.matching_preset(tuple(controls))
+    assert str(seed) in status
+
+
+def test_v2_apply_runs_no_media_logic(tmp_path):
+    body = ast.unparse(_gui_func("_on_apply_director_proposal"))
+    for forbidden in ("_eligible_media_summary", "usable_media_summary", "media_summary",
+                      "LivePrepDeclaration", "prep_state", "adapt_source_diversity"):
+        assert forbidden not in body, f"Apply mentions {forbidden!r}"
+
+
+def test_v2_apply_without_a_real_proposal_changes_nothing(tmp_path):
+    ns = _director_namespace(tmp_path)
+    for bad in (None, "proposal", 42, {}):
+        written = ns["_on_apply_director_proposal"](bad)
+        assert written[-1] == fork_director.STATUS_NOTHING_TO_APPLY
+        assert all(isinstance(item, _Skip) for item in written[:-1])
+
+
+def test_v2_apply_is_repeatable_and_does_not_consume_the_proposal(tmp_path):
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    proposal, _r, _s = ns["_on_generate_director_proposal"](
+        "x", "F", True, _state_with(_scan(counts=_CONCENTRATED_COUNTS)))
+    first = ns["_on_apply_director_proposal"](proposal)
+    second = ns["_on_apply_director_proposal"](proposal)
+    assert first == second
+
+
+# -- s53 the installer static gate -----------------------------------------
+
+_INSTALLER = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "install.ps1")
+
+
+def _installer_source() -> str:
+    with open(_INSTALLER, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_v2_the_installer_declares_three_role_specific_model_assets():
+    source = _installer_source()
+    # Stage 5 keeps both vision assets, unchanged
+    assert "Qwen3VL-2B-Instruct-Q8_0.gguf" in source
+    assert "mmproj-Qwen3VL-2B-Instruct-F16.gguf" in source
+    assert "Qwen/Qwen3-VL-2B-Instruct-GGUF" in source
+    # the Director model is a separate variable, not a reuse of either
+    assert '$DirectorModelFile = "qwen3-4b-instruct-2507-q8_0.gguf"' in source
+    assert ("https://huggingface.co/ggml-org/Qwen3-4B-Instruct-2507-Q8_0-GGUF/resolve/main/"
+            "qwen3-4b-instruct-2507-q8_0.gguf?download=true") in source
+
+
+def test_v2_the_installer_downloads_and_verifies_the_director_model():
+    source = _installer_source()
+    assert "Download-File $DirectorModelUrl (Join-Path $ModelsDir $DirectorModelFile)" in source
+    assert 'Test-RequiredFile (Join-Path $ModelsDir $DirectorModelFile) "AI Director GGUF model"' \
+        in source
+
+
+def test_v2_the_installer_requires_llama_completion():
+    """The Director's binary. It shipped in the archive but was not previously named."""
+    source = _installer_source()
+    assert 'Test-RequiredFile (Join-Path $LlamaDir "llama-completion.exe") "llama-completion.exe"' \
+        in source
+    assert '$CompletionExe = Join-Path $LlamaDir "llama-completion.exe"' in source
+    assert "(Test-Path $CompletionExe)" in source
+
+
+def test_v2_the_installer_did_not_change_the_llama_build():
+    source = _installer_source()
+    assert '$LlamaBuild = "b9842"' in source
+    assert 'version:\\s+9842\\b' in source or "version:\\s+9842" in source
+
+
+def test_v2_no_gguf_was_committed():
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in {".git", "bin", "__pycache__"}]
+        for name in files:
+            assert not name.lower().endswith(".gguf"), os.path.join(root, name)
