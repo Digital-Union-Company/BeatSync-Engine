@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
+from statistics import median
 from typing import Any, Iterable, Mapping
 
 from beatsync_fork.input_report import format_seconds
@@ -274,12 +275,104 @@ class LivePrepDeclaration:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedMediaSummary:
+    """Bounded plain-data **concentration facts** about the prepared library.
+
+    Generic preparation truth, not Director policy. This record answers "how concentrated is this
+    prepared library?" and nothing else: it carries no opinion about any creative control, and
+    ``library_prep`` deliberately knows of no consumer. Interpreting a concentration fact as support
+    for a creative request is a separate decision that lives outside the preparation side.
+
+    **Four scalars, and the field count is a constant independent of library size.** That is the
+    whole point of summarising during the scan: this record rides on :class:`PrepScanResult` into
+    ``gr.State``, which deep-copies its value, so a scan of the real 1297-source library must not
+    put megabytes of candidate data into session state. There are therefore no candidate lists, no
+    video records, no paths, no cache keys, no hashes, no semantic descriptions, no model objects
+    and no runtime handles here.
+
+    ``effective_sources`` is inverse-HHI over per-source **candidate shares** rather than a raw
+    source count: a library whose moments nearly all come from a handful of sources is concentrated
+    however many files it nominally contains.
+    """
+
+    candidate_moments: int = 0
+    effective_sources: float = 0.0
+    top_source_share: float = 0.0
+    median_moments_per_source: float = 0.0
+
+    def is_usable(self) -> bool:
+        """Are these facts provable enough to be read at all?
+
+        Requires real candidate moments and a real effective-source count. An unusable summary must
+        never be silently replaced by a fabricated one — a consumer gets ``is_usable() is False``
+        and decides for itself what to do with that.
+        """
+        return (isinstance(self.candidate_moments, int)
+                and not isinstance(self.candidate_moments, bool)
+                and self.candidate_moments > 0
+                and _finite_positive(self.effective_sources))
+
+    def describe(self) -> str:
+        """One short human line for a read-out. Never an authority on anything."""
+        if not self.is_usable():
+            return "Prepared library diversity: not available."
+        return (f"Prepared library diversity: {self.effective_sources:.1f} effective source(s) "
+                f"across {self.candidate_moments} candidate moment(s); "
+                f"largest source {self.top_source_share * 100:.0f}%.")
+
+
+#: The exact field set, pinned so a future field cannot be added without revisiting the
+#: deepcopy-safety and boundedness contract above. A test asserts the count, not the library size.
+MEDIA_SUMMARY_FIELDS = ("candidate_moments", "effective_sources", "top_source_share",
+                        "median_moments_per_source")
+
+
+def _finite_positive(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and value not in (float("inf"), float("-inf"))
+            and float(value) > 0.0)
+
+
+def media_summary_from_source_counts(counts: Any) -> PreparedMediaSummary | None:
+    """Build a summary from ``{canonical_source: usable_candidate_count}``. Never raises.
+
+    Order-independent by construction — only the multiset of positive counts is read — so neither
+    filesystem order nor classification completion order can change the result. A malformed
+    individual entry is skipped rather than poisoning the whole summary, because this runs inside
+    the preparation scan and **must not be able to affect a classification verdict**.
+
+    Returns ``None`` when no positive count can be proved, which is the UNAVAILABLE signal.
+    """
+    if not isinstance(counts, Mapping):
+        return None
+    usable: list[int] = []
+    for value in counts.values():
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value > 0:
+            usable.append(value)
+    total = sum(usable)
+    if not usable or total <= 0:
+        return None
+    shares = [count / total for count in usable]
+    hhi = sum(share * share for share in shares)
+    if not _finite_positive(hhi):
+        return None
+    return PreparedMediaSummary(
+        candidate_moments=int(total),
+        effective_sources=float(1.0 / hhi),
+        top_source_share=float(max(shares)),
+        median_moments_per_source=float(median(sorted(usable))),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class PrepScanResult:
     """Everything the Analyze click needs, and nothing that belongs on disk.
 
     Only paths and identity metadata are retained. Cached video records are never held here: a scan
     of the real 902-source library would otherwise put tens of megabytes of candidate data into
-    Gradio session state.
+    Gradio session state. :attr:`media_summary` is the one aggregate, and it is four scalars.
     """
 
     folder: str
@@ -291,6 +384,35 @@ class PrepScanResult:
     classify_seconds: float = 0.0
     cache_identity_seconds: float = 0.0
     cache_lookup_seconds: float = 0.0
+    media_summary: PreparedMediaSummary | None = None
+    """Concentration facts accumulated while the scan already held each reusable record.
+
+    ``None`` when the scan could not prove any, which is a normal outcome rather than an error:
+    nothing downstream may invent one.
+    """
+
+    def is_fully_prepared(self) -> bool:
+        """Is **every** supported source in this library prepared, right now?
+
+        The whole library, not a usable majority: ``supported_count > 0`` and every supported source
+        prepared, with nothing outstanding and nothing unreadable. A consumer that adapts its
+        behaviour to library-wide aggregate facts may only do so when the aggregate actually
+        describes the whole library — a partial scan's summary describes a subset, and extrapolating
+        from it would be reading a statistic the user never finished producing.
+        """
+        return (self.supported_count > 0
+                and self.prepared_count == self.supported_count
+                and self.needs_analysis_count == 0
+                and self.unavailable_count == 0)
+
+    def usable_media_summary(self) -> PreparedMediaSummary | None:
+        """The summary, but only from a **fully prepared** library. Otherwise ``None``."""
+        if not self.runtime.is_usable() or not self.is_fully_prepared():
+            return None
+        summary = self.media_summary
+        if isinstance(summary, PreparedMediaSummary) and summary.is_usable():
+            return summary
+        return None
 
     @property
     def prepared_count(self) -> int:
@@ -595,11 +717,18 @@ def build_scan_result(
     classify_seconds: float = 0.0,
     cache_identity_seconds: float = 0.0,
     cache_lookup_seconds: float = 0.0,
+    source_candidate_counts: Any = None,
 ) -> PrepScanResult:
     """Assemble a scan result from the runtime classifier's plain output.
 
     Kept here rather than in the GUI so the whole shape is constructible — and testable — without
     Gradio.
+
+    ``source_candidate_counts`` is the small ``{source: candidate_count}`` mapping the classifier
+    accumulated **while it already held each reusable record**, and it is converted to the frozen
+    :class:`PreparedMediaSummary` here. The GUI never sees the mapping and never re-reads a cache
+    record to build it: the one authorized record-read point is the classifier's existing serial
+    verdict loop.
     """
     return PrepScanResult(
         folder=str(folder),
@@ -613,6 +742,7 @@ def build_scan_result(
         classify_seconds=float(classify_seconds),
         cache_identity_seconds=float(cache_identity_seconds),
         cache_lookup_seconds=float(cache_lookup_seconds),
+        media_summary=media_summary_from_source_counts(source_candidate_counts),
     )
 
 
@@ -682,9 +812,11 @@ __all__ = [
     "DEFAULT_ANALYZE_BATCH_SIZE",
     "DEFAULT_RECURSIVE",
     "INTRO_TEXT",
+    "MEDIA_SUMMARY_FIELDS",
     "LivePrepDeclaration",
     "NeedReason",
     "PrepScanResult",
+    "PreparedMediaSummary",
     "PrepSessionState",
     "PrepStatus",
     "RESCAN_HINT",
@@ -696,6 +828,7 @@ __all__ = [
     "build_scan_result",
     "declaration_refusal",
     "initial_state",
+    "media_summary_from_source_counts",
     "normalize_batch_size",
     "record_analysis_complete",
     "record_failure",

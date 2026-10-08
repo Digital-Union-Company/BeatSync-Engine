@@ -113,6 +113,10 @@ def test_fork_modules_import_only_stdlib():
         "random",
         "re",
         "stat",
+        # `statistics` arrived with Director V2: `library_prep.media_summary_from_source_counts`
+        # takes the median of the per-source candidate counts. Still stdlib, still no runtime
+        # dependency — and deliberately not numpy, which remains forbidden for the fork package.
+        "statistics",
         "subprocess",
         "threading",
         "time",

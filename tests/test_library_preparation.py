@@ -918,11 +918,17 @@ def test_g_no_preparation_call_forwards_an_audio_profile():
 
 
 def test_g_preparation_state_carries_no_audio_or_style_field():
-    """The state machine's whole surface, checked against the dataclasses themselves."""
+    """The state machine's whole surface, checked against the dataclasses themselves.
+
+    **`media_summary` added by Director V2.** It is the one aggregate the scan keeps, and it is
+    four scalars whose field count does not grow with the library — the boundedness assertion is
+    `test_the_media_summary_is_bounded_by_field_count_not_library_size` below. It is still not an
+    audio or style field: nothing about a track, a tempo, a preset or an edit style reaches it.
+    """
     assert set(lp.PrepScanResult.__dataclass_fields__) == {
         "folder", "recursive", "runtime", "classifications", "supported_count",
         "folder_scan_seconds", "classify_seconds", "cache_identity_seconds",
-        "cache_lookup_seconds",
+        "cache_lookup_seconds", "media_summary",
     }
     assert set(lp.PrepSessionState.__dataclass_fields__) == {
         "folder", "recursive", "scan", "report_text", "notice", "batch_size",
@@ -1567,7 +1573,10 @@ def test_real_handlers_forward_the_resolved_runtime_to_both_calls(gui, tmp_path)
 
 
 def test_k_library_prep_imports_only_stdlib_and_fork():
-    allowed = {"__future__", "dataclasses", "enum", "os", "typing", "beatsync_fork"}
+    # `statistics` arrived with Director V2's prepared-media summary: the median of the per-source
+    # candidate counts. Still stdlib, and deliberately not numpy — the fork package's hard rule is
+    # unchanged, and `test_k_the_dependency_runs_one_way_only` below still forbids it by name.
+    allowed = {"__future__", "dataclasses", "enum", "os", "statistics", "typing", "beatsync_fork"}
     imported: set[str] = set()
     for node in ast.walk(_tree(_PREP)):
         if isinstance(node, ast.Import):

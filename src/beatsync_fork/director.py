@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""[FORK] Digital-Union: AI Director V1 — the pure proposal boundary.
+"""[FORK] Digital-Union: AI Director V2 — the pure semantic-intent boundary.
 
 The Director turns one sentence of editing intent into **one visual**
 :class:`~beatsync_fork.creative_recipe.CreativeRecipe`, which the user then reviews and explicitly
 applies::
 
     natural-language intent
-        -> local text-only Qwen generation          (gui.py performs the subprocess)
-        -> strictly validated six-control payload   (this module)
+        -> local text-only Qwen3-4B generation      (gui.py performs the subprocess)
+        -> strictly validated SEMANTIC INTENT       (this module)
+        -> deterministic semantic -> six-control BASE mapping   (this module)
+        -> optional narrow prepared-media Source Diversity attenuation  (director_media.py)
+        -> FINAL six controls
         -> GUI mints the Variation Seed             (variation.random_seed, in gui.py)
         -> CreativeRecipe.from_mapping              (the existing, unweakened trust boundary)
         -> DirectorProposal                         (this module)
@@ -15,65 +18,68 @@ applies::
         -> the existing Variation Seed + six Creative Controls
 
 **The Director proposes; it never renders, and it is not a second execution path.** It is a *second
-producer* of the artifact Variant Lab already produces — which is exactly what
-``creative_recipe.py``'s docstring anticipated when it refused to carry a master seed, a spread or
-any other generator provenance. Nothing here is a new interpretation of a recipe: the visible
-Variation Seed and the six sliders remain the sole execution truth, and every stage below them is
-unchanged and has never heard of a Director.
+producer* of the artifact Variant Lab already produces.
 
 ===============================================================================
-What V1 produces, and what it deliberately does not
+V2: the model speaks USER language, not BeatSync's control names
 ===============================================================================
 
-V1 is **visual only**. The model emits exactly the six 0..100 creative controls in
-``presets.CREATIVE_CONTROL_FIELDS`` order and nothing else. It does **not** generate or modify the
-three audio levels, voice clips, voice timing, ``avoid_drops``, the SFX folder or roles, the source
-folder or files, FPS, the encoder, the output filename, the source confirmation or the Media Library
-Preparation state. Those are resource identity and physical render intent; a text prompt is not an
-authority on them.
+V1 asked the model for the six internal controls directly — dense in V1, and later measured in
+sparse and direction+strength variants. All three made the language-understanding task include
+"which way does the ``energy_response`` slider move?", and all three failed the same way: the
+natural sentence *"Keep scene choice relatively even across sections."* was read as neutral by the
+2B model, by a 4B model and by an 8B model, across three different output contracts — six
+measurements, one answer.
+
+V2 removes the implementation vocabulary from the model's job entirely. The model classifies the
+user's meaning on six ordinary **editing dimensions**, each with its own meaningful direction pair,
+and deterministic code alone knows that ``section_reactivity: steadier`` means
+``energy_response < 50``. With that one change the same 4B model read that sentence correctly, and
+the frozen measurement set came out at 6/6 on the energy cluster, 14/14 concepts, 10/10
+media-control concepts, 0 wrong-direction answers, 12/12 on a held-out matrix it had never seen,
+2.50 % non-target emission and byte-identical repeats.
+
+So the separation is load-bearing, not cosmetic:
+
+* :data:`SEMANTIC_AXES` is the **model-facing** vocabulary. None of the six execution control names
+  may appear in :func:`system_prompt` or :func:`model_schema_json`, and an import-time assertion
+  plus a permanent test both enforce that.
+* :func:`resolve_semantic_intent` is the **only** place the two vocabularies meet.
+
+===============================================================================
+Strength, and why there is no neutral direction
+===============================================================================
+
+Each reported dimension carries a ``direction`` and a ``strength`` of ``1..100``. There is
+deliberately **no** ``0`` and **no** ``neutral`` direction: both would be indistinguishable from
+simply omitting the dimension, and the sparse experiment measured exactly that failure — a model
+given a neutral option emitted no-op entries (``{"source_diversity": 50}``) instead of omitting,
+and a model asked for absolute values collapsed every downward request onto 50. Omission is the
+only way to say "leave this alone", and it means *no expressed preference*.
+
+===============================================================================
+What V2 still deliberately does not do
+===============================================================================
+
+V2 is **visual only**: the six creative controls in ``presets.CREATIVE_CONTROL_FIELDS`` order and
+nothing else. It does not generate or modify the three audio levels, voice clips, voice timing,
+``avoid_drops``, the SFX folder or roles, the source folder or files, FPS, the encoder, the output
+filename, the source confirmation or the Media Library Preparation state.
 
 **The model never chooses the Variation Seed.** The schema has no ``seed`` property and — because
 ``additionalProperties`` is ``false`` — an emitted one is a grammar violation; a ``seed`` key that
-somehow arrives anyway is rejected by :func:`parse_model_payload`. The seed is minted in the GUI by
-the existing ``variation.random_seed()`` *after* a valid six-control payload exists, so there is no
-second seed implementation and an invalid model response cannot produce a plausible partial
-proposal.
+somehow arrives anyway is rejected by :func:`parse_semantic_intent`. The seed is minted in the GUI
+by the existing ``variation.random_seed()`` *after* a valid intent has resolved to valid controls.
 
-===============================================================================
-Two trust contracts, deliberately opposite — again
-===============================================================================
-
-The execution half is strict and the explanation is not, and conflating them is the mistake worth
-naming:
-
-* **The six controls are a contract boundary.** One malformed field rejects the *whole* proposal.
-  Nothing is coerced, clamped, defaulted or partially applied, and there is no fallback to Balanced
-  — a mixture of three model values and three silent 50s looks deliberate and is not.
-  :meth:`CreativeRecipe.from_mapping` is the authority and is reused **unmodified**.
-* **``explanation`` is non-load-bearing UI text.** A missing one, a non-string one and an overlong
-  one all still yield a valid proposal; the explanation is simply blank or bounded. It never enters
-  the recipe, ``CreativeProfile``, ``beat_info``, ``render_info``, any stage, cache identity, a
-  Stage-5 Qwen request or the planner. Failing a whole proposal because the prose was ugly would be
-  strictness pointed at the one field where it buys nothing.
-
-===============================================================================
-Media-blind, cacheless, and out of the Stage-5 world entirely
-===============================================================================
-
-The Director invocation receives the instruction, the system prompt and the schema. It receives no
-video frames, no source filenames, no Stage-5 semantic records, no ``beat_info``, no sections, no
-tempo, no music features and no current source state — so it cannot perturb Stage-5 cache identity
-or persisted media semantics, and ``CACHE_CONTRACT_VERSION`` / ``ANALYSIS_VERSION`` are untouched. A
-content-aware Director is a later milestone, not a dormant abstraction here.
-
-There is **no cache of any kind**: no Stage-5 cache use, no proposal cache, no prompt history and no
-conversation state. Every Generate Proposal is independent, and the Director deliberately does not
-read the current sliders either — the instruction is an *absolute* editing intention, so a
-transform-what-I-have mode is out of scope rather than half-built.
+**The model remains media-blind.** It receives the instruction, the system prompt and the schema —
+no frames, no filenames, no Stage-5 records, no ``beat_info``, no sections, no tempo, no music
+features, no current source state and **no media summary**. V2's content awareness is entirely a
+local deterministic step that happens *after* the model has answered; see ``director_media.py``.
 
 Kept in ``beatsync_fork`` and stdlib-only (CLAUDE.md's hard rule): a schema, two prompts, a parser,
-one frozen record and the text it formats. No subprocess, no model path, no filesystem, no clock and
-no randomness live here — this module decides, and ``gui.py`` performs every side effect.
+a deterministic mapping, two frozen records and the text they format. No subprocess, no model path,
+no filesystem, no clock and no randomness live here — this module decides, and ``gui.py`` performs
+every side effect.
 """
 
 from __future__ import annotations
@@ -84,18 +90,21 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 from beatsync_fork import creative as fork_creative
+from beatsync_fork import director_media as fork_media
 from beatsync_fork import presets as fork_presets
 from beatsync_fork.creative_recipe import CreativeRecipe
 
-#: The exact properties the model emits, **derived** from the one creative-control registry rather
-#: than restated. A second hard-coded six-field tuple is how the Director's schema and the sliders
-#: would eventually disagree about what "the six controls" are; the equality below is load-bearing
-#: rather than decorative.
+#: The exact execution controls a resolved intent produces, **derived** from the one creative-control
+#: registry rather than restated. A second hard-coded six-field tuple is how the Director and the
+#: sliders would eventually disagree about what "the six controls" are.
 DIRECTOR_CONTROL_FIELDS = fork_presets.CREATIVE_CONTROL_FIELDS
 
 #: The optional, non-execution field. Named once so the parser, the schema and the display text
 #: cannot drift onto two spellings.
 EXPLANATION_KEY = "explanation"
+
+#: The model-facing container for the reported dimensions.
+INTENT_KEY = "intent"
 
 #: Bound on the explanation, in characters. Declared in the model schema *and* — load-bearingly —
 #: enforced again by :func:`normalize_explanation` on the way to the screen.
@@ -103,18 +112,16 @@ EXPLANATION_KEY = "explanation"
 #: **The schema half is advisory on the installed build, measured rather than assumed.**
 #: `maxLength` is not compiled into llama.cpp's JSON-schema grammar there: generations at declared
 #: limits of 60, 160 and 280 produced identical ~460-character strings. So this constant is a
-#: request in the schema and a guarantee only in the normaliser, which is why the normaliser exists
-#: rather than trusting the grammar. The reason a bound is wanted at all is Stage 5's documented
-#: truncation defect — an **unbounded** string ate the token budget so the JSON never closed
-#: (`.claude/rules/stage5-worker.md`) — and the mitigation here is the same shape: ask for one short
-#: sentence in the prompt, budget :data:`MAX_NEW_TOKENS` at roughly three times the measured need,
-#: and bound what reaches the screen.
+#: request in the schema and a guarantee only in the normaliser.
 EXPLANATION_MAX_CHARS = 280
 
-#: Bound on the instruction accepted from the textbox. Not a safety claim — it is the same
-#: reasoning as the explanation bound, applied to the input: a prompt long enough to exhaust the
-#: context window produces a failure that looks like a model fault.
+#: Bound on the instruction accepted from the textbox. Not a safety claim — a prompt long enough to
+#: exhaust the context window produces a failure that looks like a model fault.
 INSTRUCTION_MAX_CHARS = 2000
+
+#: The inclusive strength range. ``0`` is excluded on purpose: see the module docstring.
+STRENGTH_MIN = 1
+STRENGTH_MAX = 100
 
 # ---------------------------------------------------------------------------
 # Generation settings
@@ -125,27 +132,88 @@ INSTRUCTION_MAX_CHARS = 2000
 # result belongs under contract, not in an env var nobody audits. These are *not* Stage-5
 # settings, they reach no cache key, and they re-key nothing — the Director has no cache at all.
 
-#: Context window for the one-shot invocation. The whole conversation is one system prompt plus one
-#: short instruction, so this is generous rather than tuned.
+#: Context window for the one-shot invocation.
 CONTEXT_TOKENS = 2048
 
-#: Generation budget. Measured: the real six-field answer plus a one-sentence explanation is about
-#: 115 tokens, so this is roughly three times the need — deliberate headroom, because exhausting
-#: the budget mid-string is exactly how the JSON fails to close.
+#: Generation budget. Deliberate headroom, because exhausting the budget mid-string is exactly how
+#: the JSON fails to close.
 MAX_NEW_TOKENS = 320
 
-#: Greedy decoding, matching the repository's existing Qwen convention
-#: (`stage5_qwen_scene_worker` uses temperature 0 / top-k 1). So the same instruction proposes the
-#: same six controls — which is the honest product: the Director reads *words*, and a reworded
-#: instruction is the way to get a different reading. The Variation Seed is freshly minted every
-#: time regardless, so two proposals from one instruction are still two different edits.
+#: Greedy decoding, matching the repository's existing Qwen convention. The same instruction
+#: therefore proposes the same intent — which is the honest product, since the Director reads
+#: *words*. The Variation Seed is freshly minted every press regardless.
 TEMPERATURE = 0.0
 TOP_K = 1
 
-#: The hard wall on one Director generation. A proposal is an interactive action, so an unbounded
-#: wait is not an option, and the bound is deliberately generous against the measured one-shot cost
-#: (cold model load every time, because the process exits).
+#: The hard wall on one Director generation. Measured median end-to-end cost on the selected 4B
+#: model is ~3.5 s, so this is deliberately generous (cold model load every time, because the
+#: process exits).
 TIMEOUT_SECONDS = 60
+
+
+# ---------------------------------------------------------------------------
+# The six model-facing semantic axes
+# ---------------------------------------------------------------------------
+#
+# Each entry is (negative_direction, positive_direction, execution_control, meaning). "negative"
+# means the resolved control lands BELOW 50, "positive" above. The meanings are written in ordinary
+# editing language on purpose: reusing the V1 control descriptions is impossible here, because those
+# strings literally name `cut_density` / `energy_response` / etc., and leaking the implementation
+# vocabulary is the one thing V2 exists to prevent.
+
+SEMANTIC_AXES: dict[str, tuple[str, str, str, str]] = {
+    "cut_pacing": (
+        "sparser", "denser", "cut_density",
+        "how often the edit changes shot. \"sparser\" means fewer changes, holding each shot "
+        "longer; \"denser\" means changing shot more often."),
+    "impact_accents": (
+        "fewer", "more", "micro_cuts",
+        "the brief extra accent cuts placed on the biggest musical impacts. \"fewer\" means less "
+        "of that accenting; \"more\" means stronger accenting on the big hits."),
+    "scene_reading": (
+        "visual", "semantic", "semantic_emphasis",
+        "what makes a moment worth using. \"visual\" means judging moments mainly by measurable "
+        "picture qualities such as movement, sharpness, colour and exposure; \"semantic\" means "
+        "judging them mainly by what the scene is understood to contain."),
+    "section_reactivity": (
+        "steadier", "responsive", "energy_response",
+        "how much the choice of imagery follows the song's structure. \"steadier\" means keeping "
+        "the character of the scene selection fairly consistent as the music moves between drops, "
+        "builds, quiet passages and other section types; \"responsive\" means changing the scene "
+        "preference strongly with each section's intensity."),
+    "motion_preference": (
+        "calmer", "dynamic", "motion_bias",
+        "how much movement the chosen moments should have. \"calmer\" prefers steadier, "
+        "less-moving moments; \"dynamic\" prefers stronger movement."),
+    "source_variety": (
+        "reuse", "diverse", "source_diversity",
+        "how widely the edit draws on the available source videos. \"reuse\" concentrates on a "
+        "smaller recurring set; \"diverse\" spreads usage across more of them."),
+}
+
+#: Axis -> execution control, and the inverse. The only bridge between the two vocabularies.
+AXIS_TO_CONTROL = {axis: spec[2] for axis, spec in SEMANTIC_AXES.items()}
+CONTROL_TO_AXIS = {control: axis for axis, control in AXIS_TO_CONTROL.items()}
+
+#: The six internal names that must never reach the model.
+_INTERNAL_CONTROL_NAMES = tuple(DIRECTOR_CONTROL_FIELDS)
+
+# Structural guards rather than comments: the axes and the control registry are the same six, and
+# every axis has a distinct direction pair. A control added to `presets.CREATIVE_CONTROL_FIELDS`
+# without a semantic axis fails at import time instead of being silently left for the model to guess.
+assert len(SEMANTIC_AXES) == len(DIRECTOR_CONTROL_FIELDS) == 6
+assert sorted(AXIS_TO_CONTROL.values()) == sorted(DIRECTOR_CONTROL_FIELDS)
+assert len({d for spec in SEMANTIC_AXES.values() for d in spec[:2]}) == 12
+
+
+def axis_for_control(control: str) -> str:
+    return CONTROL_TO_AXIS[control]
+
+
+def directions(axis: str) -> tuple[str, str]:
+    """``(negative, positive)`` for one axis — the only legal values of its ``direction``."""
+    spec = SEMANTIC_AXES[axis]
+    return spec[0], spec[1]
 
 
 # ---------------------------------------------------------------------------
@@ -156,34 +224,46 @@ TIMEOUT_SECONDS = 60
 def model_schema() -> dict:
     """The JSON schema the model is constrained to, as a **fresh** plain ``dict``.
 
-    Exactly the six execution controls — required, integer, 0..100 — plus an optional bounded
-    ``explanation``, with ``additionalProperties`` false. Fresh each call so a caller may serialise
-    or mutate the result without reaching a shared object.
+    Six **optional** axes inside a closed ``intent`` object; each present axis requires both
+    ``direction`` (an axis-specific two-value enum) and ``strength`` (integer ``1..100``). Fresh
+    each call so a caller may serialise or mutate the result without reaching a shared object.
+
+    ``{"intent": {}}`` is valid and means "the user expressed no actionable editing preference" —
+    the Director must not invent one. Verified reachable on the installed llama.cpp build.
 
     ``seed`` is **absent**, and that absence is the contract: with ``additionalProperties`` false
-    the grammar cannot emit one, so the GUI remains the only place a Variation Seed is minted.
-    There is deliberately no schema-version machinery in V1 — a version field is migration
-    machinery for a migration that has not happened.
+    the grammar cannot emit one, so the GUI remains the only place a Variation Seed is minted. No
+    execution control name appears anywhere in this document.
     """
-    properties: dict[str, dict] = {
-        name: {
-            "type": "integer",
-            "minimum": fork_creative.CONTROL_MIN,
-            "maximum": fork_creative.CONTROL_MAX,
+    axis_properties: dict[str, dict] = {}
+    for axis, spec in SEMANTIC_AXES.items():
+        negative, positive = spec[0], spec[1]
+        axis_properties[axis] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["direction", "strength"],
+            "properties": {
+                "direction": {"type": "string", "enum": [negative, positive]},
+                "strength": {"type": "integer", "minimum": STRENGTH_MIN, "maximum": STRENGTH_MAX},
+            },
         }
-        for name in DIRECTOR_CONTROL_FIELDS
-    }
-    properties[EXPLANATION_KEY] = {"type": "string", "maxLength": EXPLANATION_MAX_CHARS}
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": list(DIRECTOR_CONTROL_FIELDS),
-        "properties": properties,
+        "required": [INTENT_KEY],
+        "properties": {
+            INTENT_KEY: {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": axis_properties,
+            },
+            EXPLANATION_KEY: {"type": "string", "maxLength": EXPLANATION_MAX_CHARS},
+        },
     }
 
 
 def model_schema_json() -> str:
-    """The schema as the compact string ``llama-cli --json-schema`` takes.
+    """The schema as the compact string ``llama-completion --json-schema`` takes.
 
     Serialised here rather than in ``gui.py`` so the schema has exactly one owner — including its
     wire form — and the GUI needs no JSON dependency of its own.
@@ -194,71 +274,58 @@ def model_schema_json() -> str:
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-#
-# The control descriptions are the current repository semantics and nothing more. Describing a
-# control with behaviour the implementation does not have is worse than describing it vaguely: the
-# model would confidently answer a question BeatSync is not asking. In particular Semantic Emphasis
-# re-weights STAGE 6's reading of an already-analysed library — it does not change Stage-5 tagging,
-# and it does not switch analysis off.
-
-_CONTROL_SEMANTICS = (
-    ("cut_density",
-     "Sparse <-> Dense. How many of the detected beats become cuts. "
-     "0 = fewer, longer cuts that hold each shot; 50 = current neutral behaviour; "
-     "100 = denser, more frequent cuts. Cuts always land on the detected beat grid."),
-    ("micro_cuts",
-     "Fewer <-> More accents. Only the rare extra half-beat cut on the biggest impacts. "
-     "0 = no micro-cut accent layer at all; 50 = current neutral baseline accents; "
-     "100 = stronger accents, still bounded so the edit cannot become flickery."),
-    ("semantic_emphasis",
-     "Visual metrics <-> Semantic context. How the planner weights an already-analysed library. "
-     "Lower leans on measured visual metrics (motion, sharpness, colour, exposure); "
-     "higher gives more weight to what the scene was understood to contain. "
-     "50 = current neutral behaviour. This never changes how the videos were analysed."),
-    ("energy_response",
-     "Weak <-> Strong target matching. Lower scores moments on generic visual flow; "
-     "higher follows the musical segment's own target (drop, build, soft) harder. "
-     "50 = current neutral behaviour."),
-    ("motion_bias",
-     "Calm <-> Dynamic. Lower prefers calmer, steadier source moments; "
-     "higher prefers more dynamic, moving ones. 50 = current neutral behaviour."),
-    ("source_diversity",
-     "Reuse <-> Diverse. Lower concentrates the edit on fewer source videos and reuses them more; "
-     "higher spreads it across more of them. 50 = current neutral behaviour."),
-)
-
-# A structural guard rather than a comment: the described controls and the registry are the same
-# six, in the same order, so a control added to `presets.CREATIVE_CONTROL_FIELDS` without a
-# semantic description fails at import time instead of being silently left for the model to guess.
-assert tuple(name for name, _text in _CONTROL_SEMANTICS) == DIRECTOR_CONTROL_FIELDS
 
 
 def system_prompt() -> str:
-    """The Director's system prompt: what the six controls actually mean in this application.
+    """The Director's system prompt: the six editing dimensions, in the user's language.
 
-    Built from :data:`_CONTROL_SEMANTICS`, so the prompt and the schema enumerate one list.
+    Built from :data:`SEMANTIC_AXES`, so the prompt and the schema enumerate one list. Asserted to
+    be pure ASCII — it is a process argument to a native binary, so a decorative em dash is a
+    mojibake risk for no gain — and asserted to contain none of the six internal control names.
     """
     lines = [
-        "You are BeatSync's AI Director. You translate one editing intention into exactly six "
-        "integer creative controls for a beat-synchronised music video.",
+        "You are BeatSync's AI Director. You read one editing intention and describe what the "
+        "user is asking for, using a small fixed set of editing dimensions, for a "
+        "beat-synchronised music video.",
         "",
-        "All six values are integers from "
-        f"{fork_creative.CONTROL_MIN} to {fork_creative.CONTROL_MAX}. "
-        f"{fork_creative.DEFAULT_CONTROL} is neutral: it means exactly what BeatSync does by "
-        "default, so only move a control as far as the intention actually asks for.",
+        "There are six dimensions. For each one you report, give a direction and a strength:",
+        f"  strength is a whole number from {STRENGTH_MIN} to {STRENGTH_MAX}, where "
+        f"{STRENGTH_MIN} is a very slight preference and {STRENGTH_MAX} is as strong as possible.",
         "",
     ]
-    lines.extend(f"{name}: {text}" for name, text in _CONTROL_SEMANTICS)
+    for axis, spec in SEMANTIC_AXES.items():
+        negative, positive, _control, meaning = spec
+        lines.append(f"{axis} ({negative} / {positive}): {meaning}")
     lines.extend([
+        "",
+        "Report a dimension ONLY when the user's words directly support it. Omit every dimension "
+        "the instruction does not speak to, and omit any dimension you are unsure about. There is "
+        "no neutral option and no way to say \"leave this alone\" other than leaving it out: "
+        "omitting a dimension simply means the user expressed no preference about it.",
+        "",
+        "Do not turn a specific request into a generally more intense or more extreme edit. Do "
+        "not add a second dimension to reinforce, balance or compensate for the one actually "
+        "asked about. If the instruction speaks to one dimension, report only that one.",
+        "",
+        "A broad instruction about overall style may genuinely speak to several dimensions at "
+        "once. Report each dimension you can justify from the user's own words, and no others.",
+        "",
+        "If the instruction expresses no actionable editing preference at all, report an empty "
+        "set of dimensions.",
         "",
         f"You may add one short sentence of reasoning in an optional \"{EXPLANATION_KEY}\" field, "
         f"at most {EXPLANATION_MAX_CHARS} characters. It is shown to the user for review and "
-        "changes nothing.",
+        "changes nothing. Describe only the dimensions you actually reported.",
         "You do not choose the clip variation seed, the audio levels, the source videos or any "
-        "output setting. Answer with one JSON object only: no prose outside it, and no code "
-        "fences.",
+        "output setting. Answer with one JSON object only, with the dimensions you report inside "
+        f"an \"{INTENT_KEY}\" object: no prose outside it, and no code fences.",
     ])
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    assert text.isascii(), "the system prompt is a native process argument; keep it ASCII"
+    lowered = text.lower()
+    for name in _INTERNAL_CONTROL_NAMES:
+        assert name not in lowered, f"internal control name {name!r} leaked into the system prompt"
+    return text
 
 
 def user_prompt(instruction: str) -> str:
@@ -285,12 +352,7 @@ def _collapse(text: str, limit: int) -> str:
 
 
 def normalize_instruction(value: Any) -> str:
-    """The instruction as a single bounded line, or ``""`` when there is no instruction at all.
-
-    ``""`` is the one answer for "nothing was typed", so the caller needs a single branch: ``None``,
-    a non-string, whitespace only and an empty box all produce it. Total — this runs on a live
-    widget value and may not raise.
-    """
+    """The instruction as a single bounded line, or ``""`` when there is no instruction at all."""
     if not isinstance(value, str):
         return ""
     return _collapse(value, INSTRUCTION_MAX_CHARS)
@@ -301,11 +363,67 @@ def normalize_explanation(value: Any) -> str:
 
     Deliberately tolerant, and deliberately **display only**: a missing field, a non-string field
     and an overlong field are all survivable, because this value reaches a read-only textbox and
-    nothing else. See the module docstring for why the execution half is the opposite.
+    nothing else. The execution half is the opposite.
     """
     if not isinstance(value, str):
         return ""
     return _collapse(value, EXPLANATION_MAX_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# The validated semantic intent
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAxisRequest:
+    """One reported dimension: a direction from that axis's own pair, and a strength ``1..100``."""
+
+    axis: str
+    direction: str
+    strength: int
+
+    def __post_init__(self) -> None:
+        if self.axis not in SEMANTIC_AXES:
+            raise ValueError(f"unknown semantic axis {self.axis!r}")
+        if self.direction not in directions(self.axis):
+            raise ValueError(f"{self.axis!r} cannot be {self.direction!r}")
+        if isinstance(self.strength, bool) or not isinstance(self.strength, int):
+            raise ValueError(f"strength must be a plain int, got {self.strength!r}")
+        if not STRENGTH_MIN <= self.strength <= STRENGTH_MAX:
+            raise ValueError(f"strength {self.strength} outside {STRENGTH_MIN}..{STRENGTH_MAX}")
+
+    @property
+    def is_positive(self) -> bool:
+        return self.direction == directions(self.axis)[1]
+
+    def describe(self) -> str:
+        return f"{self.axis} {self.direction} ({self.strength})"
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticIntent:
+    """Zero to six validated axis requests. Deepcopy-safe: a tuple of frozen scalars-only records.
+
+    An **empty** intent is valid and resolves to the all-neutral recipe. That is the honest answer
+    to an instruction expressing no actionable editing preference, and inventing a direction for it
+    would be the Director guessing.
+    """
+
+    requests: tuple[SemanticAxisRequest, ...] = ()
+
+    def __post_init__(self) -> None:
+        seen = [r.axis for r in self.requests]
+        if len(seen) != len(set(seen)):
+            raise ValueError("one axis may be reported at most once")
+
+    def by_axis(self) -> dict[str, SemanticAxisRequest]:
+        return {r.axis: r for r in self.requests}
+
+    def describe(self) -> str:
+        if not self.requests:
+            return "no specific editing preference expressed"
+        return ", ".join(r.describe() for r in self.requests)
 
 
 # ---------------------------------------------------------------------------
@@ -317,14 +435,10 @@ def normalize_explanation(value: Any) -> str:
 #: than on the token budget. It is the **tool's** framing of its own output, not model prose, and it
 #: is a fixed string rather than a pattern — so stripping exactly it, exactly once, from exactly the
 #: end leaves every failure mode the strict parse exists to catch fully intact: a truncated object,
-#: a code fence, a chatty preamble and real trailing commentary all still fail, because anything
-#: other than this one constant remains in the text handed to ``json.loads``.
+#: a code fence, a chatty preamble and real trailing commentary all still fail.
 #:
-#: Measured on the installed build (``b9842-6f4f53f2b``, text-only, no mmproj): with
-#: ``--no-display-prompt`` and ``--no-perf``, stdout is the JSON object followed by
-#: ``" [end of text]"`` and trailing newlines; the banner, the timings and every log line go to
-#: stderr. Deliberately **not** generalised into a regex or a list of tolerated suffixes — that is
-#: the slope this constant exists at the bottom of.
+#: Deliberately **not** generalised into a regex or a list of tolerated suffixes — that is the slope
+#: this constant exists at the bottom of.
 _END_OF_GENERATION_MARKER = "[end of text]"
 
 
@@ -332,35 +446,28 @@ def _is_plain_int(value: Any) -> bool:
     """A real ``int``, never a ``bool``.
 
     The same explicit boundary ``creative_recipe`` draws, for the same reason: ``bool`` subclasses
-    ``int``, so ``cut_density: true`` would otherwise be accepted as the control value 1.
+    ``int``, so ``strength: true`` would otherwise be accepted as the strength 1.
     """
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_valid_control(value: Any) -> bool:
-    return (_is_plain_int(value)
-            and fork_creative.CONTROL_MIN <= value <= fork_creative.CONTROL_MAX)
-
-
-def parse_model_payload(stdout: Any) -> dict | None:
+def parse_semantic_intent(stdout: Any) -> tuple[SemanticIntent, str] | None:
     """The **whole** of the model's stdout, parsed strictly, or ``None``.
 
-    Returns a fresh ``dict`` of the six validated controls plus a normalised ``explanation`` string
-    — i.e. the payload the caller may mint a seed for. Never raises.
+    Returns ``(intent, explanation)``. Never raises.
 
-    **The entire output is the machine payload.** There is deliberately no regex fishing a
-    ``{...}`` out of surrounding prose: a broad `\\{.*\\}` search is how a truncated object, a code
-    fence or a chatty preamble gets silently half-accepted, and Stage 5's own documented truncation
-    defect lived exactly there. So: strip, remove the one fixed
+    **The entire output is the machine payload.** There is deliberately no regex fishing an
+    ``{...}`` out of surrounding prose: a broad ``\\{.*\\}`` search is how a truncated object, a
+    code fence or a chatty preamble gets silently half-accepted, and Stage 5's own documented
+    truncation defect lived exactly there. So: strip, remove the one fixed
     :data:`_END_OF_GENERATION_MARKER` llama.cpp appends to its own output, ``json.loads`` the lot,
     require a mapping. Prose, a fence, trailing commentary, an empty output and a JSON array all
-    fail the proposal. The ``--json-schema`` grammar is defence in depth; this parser is the
-    authority.
+    fail. The ``--json-schema`` grammar is defence in depth; this parser is the authority.
 
-    The key set must be the six controls, optionally plus ``explanation``, and nothing else. An
-    unexpected property — including ``seed``, which the Director must never receive from a model —
-    means the producer and this contract disagree about what a proposal is, which is precisely the
-    disagreement worth failing on.
+    A malformed **present** axis rejects the whole intent rather than being dropped — a producer
+    that emits ``{"motion_preference": {"direction": "sideways"}}`` disagrees with this contract
+    about what an intent is, and that disagreement is precisely what is worth failing on. Missing
+    axes are not malformed: absence is the contract's way of saying "no preference".
     """
     if not isinstance(stdout, str):
         return None
@@ -377,18 +484,110 @@ def parse_model_payload(stdout: Any) -> dict | None:
         return None
 
     keys = set(payload)
-    required = set(DIRECTOR_CONTROL_FIELDS)
-    if not required <= keys:
+    if INTENT_KEY not in keys:
         return None
-    if not keys <= required | {EXPLANATION_KEY}:
+    if not keys <= {INTENT_KEY, EXPLANATION_KEY}:
         return None
-    for name in DIRECTOR_CONTROL_FIELDS:
-        if not _is_valid_control(payload[name]):
-            return None
 
-    controls = {name: payload[name] for name in DIRECTOR_CONTROL_FIELDS}
-    controls[EXPLANATION_KEY] = normalize_explanation(payload.get(EXPLANATION_KEY))
-    return controls
+    raw_intent = payload[INTENT_KEY]
+    if not isinstance(raw_intent, Mapping):
+        return None
+    if not set(raw_intent) <= set(SEMANTIC_AXES):
+        return None
+
+    requests: list[SemanticAxisRequest] = []
+    for axis in SEMANTIC_AXES:
+        if axis not in raw_intent:
+            continue
+        spec = raw_intent[axis]
+        if not isinstance(spec, Mapping):
+            return None
+        if set(spec) != {"direction", "strength"}:
+            return None
+        direction = spec["direction"]
+        strength = spec["strength"]
+        if not isinstance(direction, str) or direction not in directions(axis):
+            return None
+        if not _is_plain_int(strength) or not STRENGTH_MIN <= strength <= STRENGTH_MAX:
+            return None
+        requests.append(SemanticAxisRequest(axis=axis, direction=direction, strength=strength))
+
+    try:
+        intent = SemanticIntent(requests=tuple(requests))
+    except ValueError:
+        return None
+    return intent, normalize_explanation(payload.get(EXPLANATION_KEY))
+
+
+# ---------------------------------------------------------------------------
+# The deterministic semantic -> control mapping
+# ---------------------------------------------------------------------------
+
+
+def magnitude_for_strength(strength: int) -> int:
+    """``half_up(strength / 2)`` as exact integer arithmetic: ``(strength + 1) // 2``.
+
+    Explicitly **not** ``round()``: banker's rounding sends ``0.5`` to ``0``, which would make a
+    strength of 1 a silent no-op, and sends ``24.5`` to ``24``, which would break monotonicity at
+    every half point. For a positive integer numerator over 2 the shift identity is exact.
+    """
+    if isinstance(strength, bool) or not isinstance(strength, int):
+        raise ValueError(f"strength must be a plain int, got {strength!r}")
+    if not STRENGTH_MIN <= strength <= STRENGTH_MAX:
+        raise ValueError(f"strength {strength} outside {STRENGTH_MIN}..{STRENGTH_MAX}")
+    return (strength + 1) // 2
+
+
+def resolve_semantic_intent(intent: Any) -> dict[str, int] | None:
+    """One validated :class:`SemanticIntent` -> the complete six-control BASE mapping, or ``None``.
+
+    The **only** place the model-facing vocabulary and the execution vocabulary meet.
+
+    * an **omitted** axis leaves its control at exactly ``50`` — never a previous slider value,
+      never a preset value, never a model default, never a guess;
+    * a reported axis lands at ``50 ± magnitude_for_strength(strength)``, below neutral for the
+      axis's negative direction and above it for the positive one.
+
+    Every result is six plain ``int``s in ``0..100``, which the final assertion checks rather than
+    assumes.
+    """
+    if not isinstance(intent, SemanticIntent):
+        return None
+    resolved = {control: fork_creative.DEFAULT_CONTROL for control in DIRECTOR_CONTROL_FIELDS}
+    for request in intent.requests:
+        magnitude = magnitude_for_strength(request.strength)
+        control = AXIS_TO_CONTROL[request.axis]
+        value = (fork_creative.DEFAULT_CONTROL + magnitude if request.is_positive
+                 else fork_creative.DEFAULT_CONTROL - magnitude)
+        if not fork_creative.CONTROL_MIN <= value <= fork_creative.CONTROL_MAX:
+            return None
+        resolved[control] = value
+    assert all(_is_plain_int(v) and fork_creative.CONTROL_MIN <= v <= fork_creative.CONTROL_MAX
+               for v in resolved.values()), resolved
+    return resolved
+
+
+def apply_media_adaptation(
+    base: Any, summary: Any,
+) -> tuple[dict[str, int], fork_media.MediaAdjustment | None]:
+    """``(final_controls, adjustment_or_None)`` — the one narrow media-aware step.
+
+    Only ``source_diversity`` may change, only when the BASE asks for *more* diversity than
+    neutral, and only from a prepared library whose effective-source count cannot support it. Every
+    other control is copied through untouched: ``cut_density`` and ``micro_cuts`` are Stage-4
+    decisions that media interpretation never sees, and the other three media-adjustable candidates
+    were measured and dropped (see ``director_media``).
+
+    BASE is **not** mutated — the caller keeps it for provenance.
+    """
+    if not isinstance(base, Mapping):
+        return {}, None
+    final = dict(base)
+    value, adjustment = fork_media.adapt_source_diversity(
+        base.get(fork_media.ADJUSTABLE_FIELD), summary)
+    if adjustment is not None:
+        final[fork_media.ADJUSTABLE_FIELD] = value
+    return final, adjustment
 
 
 # ---------------------------------------------------------------------------
@@ -398,70 +597,109 @@ def parse_model_payload(stdout: Any) -> dict | None:
 
 @dataclass(frozen=True)
 class DirectorProposal:
-    """One reviewed-but-not-applied answer: a valid recipe, the prose beside it, and its cause.
+    """One reviewed-but-not-applied answer: BASE, FINAL, the prose beside them, and their cause.
 
-    Frozen, and every reachable value is a plain deepcopy-safe one — ``CreativeRecipe`` is seven
-    ``int``s and the other two fields are ``str``. That is a real constraint rather than a style
-    note: ``gr.State`` deep-copies its value, so a ``MappingProxyType``, a model object, a process
-    handle, a filesystem object, source state, a ``VariantLabConfig``, an ``AudioVariantConfig`` or
-    a cache object could not live here. ``copy.deepcopy(proposal) == proposal`` is asserted by test.
+    Frozen, and every reachable value is a plain deepcopy-safe one — the two recipes are seven
+    ``int``s each, ``intent`` is a tuple of frozen scalar records, ``adjustment`` is six scalars,
+    and the other two fields are ``str``. That is a real constraint rather than a style note:
+    ``gr.State`` deep-copies its value, so a ``MappingProxyType``, a model object, a process
+    handle, source state, a ``VariantLabConfig``, a ``PreparedMediaSummary`` holding candidate data
+    or a cache object could not live here. ``copy.deepcopy(proposal) == proposal`` is asserted by
+    test.
 
-    ``instruction`` is carried for the read-out only, so the user can see *which* sentence produced
-    the numbers on screen. Like ``explanation``, it reaches no stage, no profile and no cache.
+    ``base_recipe`` is carried for **provenance only**. :meth:`recipe` — what Apply writes — is
+    always FINAL. Both share the one minted Variation Seed, so the read-out cannot imply that the
+    media step re-rolled the clip selection.
     """
 
-    recipe: CreativeRecipe
+    final_recipe: CreativeRecipe
+    base_recipe: CreativeRecipe
+    intent: SemanticIntent
     explanation: str
     instruction: str
+    adjustment: fork_media.MediaAdjustment | None = None
+    media_note: str = ""
+    """One truthful line about why media adaptation did or did not apply. Never an authority."""
+
+    @property
+    def recipe(self) -> CreativeRecipe:
+        """What Apply writes: the FINAL recipe, always."""
+        return self.final_recipe
+
+    @property
+    def media_adjusted(self) -> bool:
+        return self.adjustment is not None
 
     # -- reporting ----------------------------------------------------------
 
     def display_text(self) -> str:
         """The whole Director proposal read-out. ``gui.py`` formats none of it.
 
-        One formatter per read-out, exactly as the Variant Lab and mix reports work. The recipe's
-        own ``describe()`` supplies the numbers, so the Director does not restate them in a second
-        format that could drift.
+        When a media adjustment happened the read-out **visibly separates** the Director's
+        interpretation from the deterministic media change, because they have different authors and
+        the user is entitled to know which is which. The model is never credited with the media
+        step, and the media step is never described as an improvement — P3 measured it as a
+        trade-off, and :meth:`MediaAdjustment.describe` states both halves.
         """
-        lines = [
-            f"Instruction: {self.instruction}",
-            self.recipe.describe(),
-        ]
-        if self.explanation:
-            lines.append(f"Director: {self.explanation}")
-        lines.append("Proposal only — press Apply Proposal to move the controls. "
+        lines = [f"Instruction: {self.instruction}"]
+        if self.media_adjusted:
+            lines.append("")
+            lines.append(f"Base:  {self.base_recipe.describe()}")
+            if self.explanation:
+                lines.append(f"Director: {self.explanation}")
+            lines.append("")
+            lines.append(f"Media adjustment: {self.adjustment.describe()}")
+            lines.append("")
+            lines.append(f"Final: {self.final_recipe.describe()}")
+        else:
+            lines.append(self.final_recipe.describe())
+            if self.explanation:
+                lines.append(f"Director: {self.explanation}")
+            if self.media_note:
+                lines.append(self.media_note)
+        lines.append("Proposal only - press Apply Proposal to move the controls. "
                      "Nothing has been rendered.")
         return "\n".join(lines)
 
 
-def build_proposal(instruction: Any, payload: Any, seed: Any) -> DirectorProposal | None:
-    """Assemble a proposal from a parsed payload and a **GUI-minted** seed, or ``None``.
+def build_proposal(
+    instruction: Any,
+    intent: Any,
+    explanation: Any,
+    seed: Any,
+    summary: Any = None,
+    media_note: str = "",
+) -> DirectorProposal | None:
+    """Assemble a proposal from a validated intent and a **GUI-minted** seed, or ``None``.
 
     The seed arrives as an argument because minting it is the one non-deterministic step and it
     lives in the GUI with every other draw in this application — ``variation.random_seed()`` is the
     only implementation, and this module owns no randomness.
 
-    The recipe is built by handing the exact seven-key mapping to
-    :meth:`CreativeRecipe.from_mapping`, which is reused **unmodified** and remains the authority:
-    a bad seed, a bad control, a wrong key set or seed 0 rejects the whole proposal and returns
+    Order is the contract: resolve BASE, adapt to FINAL, then build **both** recipes through
+    :meth:`CreativeRecipe.from_mapping`, which is reused **unmodified** and remains the authority.
+    A bad seed, a bad control, a wrong key set or seed 0 rejects the whole proposal and returns
     ``None``. Nothing is coerced and nothing is half-applied, so an invalid model response cannot
     produce a plausible partial proposal.
     """
-    if not isinstance(payload, Mapping):
+    base_controls = resolve_semantic_intent(intent)
+    if base_controls is None:
         return None
-    if not set(DIRECTOR_CONTROL_FIELDS) <= set(payload):
-        return None
+    final_controls, adjustment = apply_media_adaptation(base_controls, summary)
 
-    mapping: dict[str, Any] = {"seed": seed}
-    mapping.update({name: payload[name] for name in DIRECTOR_CONTROL_FIELDS})
-    recipe = CreativeRecipe.from_mapping(mapping)
-    if recipe is None:
+    base_recipe = CreativeRecipe.from_mapping({"seed": seed, **base_controls})
+    final_recipe = CreativeRecipe.from_mapping({"seed": seed, **final_controls})
+    if base_recipe is None or final_recipe is None:
         return None
 
     return DirectorProposal(
-        recipe=recipe,
-        explanation=normalize_explanation(payload.get(EXPLANATION_KEY)),
+        final_recipe=final_recipe,
+        base_recipe=base_recipe,
+        intent=intent,
+        explanation=normalize_explanation(explanation),
         instruction=normalize_instruction(instruction),
+        adjustment=adjustment,
+        media_note=str(media_note or ""),
     )
 
 
@@ -479,7 +717,7 @@ STATUS_NO_INSTRUCTION = (
 )
 
 STATUS_INVALID_PAYLOAD = (
-    "The model did not return a usable set of six creative controls, so no proposal was created "
+    "The model did not return a usable editing intent, so no proposal was created "
     "and no control changed. Try rephrasing the instruction."
 )
 
@@ -492,11 +730,36 @@ STATUS_NOTHING_TO_APPLY = (
     "There is no proposal to apply. Press Generate Proposal first. Nothing changed."
 )
 
+# -- the media-eligibility notes (s19): truthful, and never called a fallback ----------------
+MEDIA_NOTE_NO_SCAN = (
+    "Media adjustment not used: there is no current Media Library scan."
+)
+MEDIA_NOTE_STALE_SCAN = (
+    "Media adjustment not used: the Media Library controls changed since the scan."
+)
+MEDIA_NOTE_NOT_PREPARED = (
+    "Media adjustment not used: the library is not fully prepared yet."
+)
+MEDIA_NOTE_NO_SUMMARY = (
+    # Deliberately does not say "candidate": `tests/test_media_neutral_semantics.py` bans that word
+    # in this module because a Stage-5 candidate must have nowhere here to enter, and a status
+    # string is not worth weakening that guard for.
+    "Media adjustment not used: the prepared library has no usable moments to measure."
+)
+MEDIA_NOTE_CHECKED_NO_CHANGE = (
+    "Prepared media checked - no Source Diversity adjustment was needed."
+)
+
 
 def missing_runtime_status(path: Any) -> str:
-    """A required local asset is absent, named so the user can see which one."""
-    return (f"The Director needs a local model runtime that is not installed: {path}. "
-            "No proposal was created and no control changed.")
+    """A required local asset is absent, named so the user can see which one.
+
+    There is deliberately **no** fallback to the Stage-5 2B model: it was measured against this
+    intent contract and failed it, so silently substituting it would produce confident wrong
+    recipes instead of an honest error.
+    """
+    return (f"The Director needs a local model that is not installed: {path}. "
+            "Run install.bat to download it. No proposal was created and no control changed.")
 
 
 def launch_failure_status(detail: Any) -> str:
@@ -515,49 +778,77 @@ def exit_failure_status(returncode: Any, detail: Any = "") -> str:
 
 def ready_status(proposal: DirectorProposal) -> str:
     """A proposal exists and is waiting for an explicit Apply."""
-    return (f"Proposal ready (Variation Seed {proposal.recipe.seed}). Review it above, then press "
-            "Apply Proposal to move the Creative Controls. Nothing has been applied or rendered "
-            "yet.")
+    media = " Source Diversity was relaxed for this prepared library." if proposal.media_adjusted \
+        else ""
+    return (f"Proposal ready (Variation Seed {proposal.recipe.seed}).{media} Review it above, then "
+            "press Apply Proposal to move the Creative Controls. Nothing has been applied or "
+            "rendered yet.")
 
 
 def applied_status(proposal: DirectorProposal) -> str:
     """The proposal was written into the visible execution controls — and only those."""
     return (f"Applied the proposal: Variation Seed {proposal.recipe.seed} and the six Creative "
-            "Controls. Edit them, use Variant Lab, or press Create Music Video when ready — "
+            "Controls. Edit them, use Variant Lab, or press Create Music Video when ready - "
             "nothing has been rendered.")
 
 
-# The dataclass fields and the record this module documents are the same three, so adding a field
+# The dataclass fields and the record this module documents are the same seven, so adding a field
 # without revisiting the deepcopy-safety contract fails at import time.
-assert tuple(f.name for f in fields(DirectorProposal)) == ("recipe", "explanation", "instruction")
+assert tuple(f.name for f in fields(DirectorProposal)) == (
+    "final_recipe", "base_recipe", "intent", "explanation", "instruction", "adjustment",
+    "media_note")
+
+# The model-facing surface must never mention an execution control. Checked at import, and again by
+# a permanent test, because this is the whole architectural distinction V2 rests on.
+_SCHEMA_TEXT = model_schema_json().lower()
+for _name in _INTERNAL_CONTROL_NAMES:
+    assert _name not in _SCHEMA_TEXT, f"internal control name {_name!r} leaked into the schema"
 
 
 __all__ = [
+    "AXIS_TO_CONTROL",
     "CONTEXT_TOKENS",
+    "CONTROL_TO_AXIS",
     "DIRECTOR_CONTROL_FIELDS",
     "DirectorProposal",
     "EXPLANATION_KEY",
     "EXPLANATION_MAX_CHARS",
     "INSTRUCTION_MAX_CHARS",
+    "INTENT_KEY",
     "MAX_NEW_TOKENS",
+    "MEDIA_NOTE_CHECKED_NO_CHANGE",
+    "MEDIA_NOTE_NOT_PREPARED",
+    "MEDIA_NOTE_NO_SCAN",
+    "MEDIA_NOTE_NO_SUMMARY",
+    "MEDIA_NOTE_STALE_SCAN",
+    "SEMANTIC_AXES",
     "STATUS_INVALID_PAYLOAD",
-    "STATUS_NO_INSTRUCTION",
     "STATUS_NOTHING_TO_APPLY",
+    "STATUS_NO_INSTRUCTION",
     "STATUS_TIMEOUT",
+    "STRENGTH_MAX",
+    "STRENGTH_MIN",
+    "SemanticAxisRequest",
+    "SemanticIntent",
     "TEMPERATURE",
     "TIMEOUT_SECONDS",
     "TOP_K",
     "applied_status",
+    "apply_media_adaptation",
+    "axis_for_control",
     "build_proposal",
+    "directions",
     "exit_failure_status",
     "launch_failure_status",
+    "magnitude_for_strength",
     "missing_runtime_status",
     "model_schema",
     "model_schema_json",
     "normalize_explanation",
     "normalize_instruction",
-    "parse_model_payload",
+    "parse_semantic_intent",
     "ready_status",
+    "resolve_semantic_intent",
     "system_prompt",
     "user_prompt",
 ]
