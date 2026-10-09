@@ -20,7 +20,30 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
-_Nothing yet._
+### Maintenance — 2026-10-10 (Freestyle V1 Windows runtime acceptance)
+
+No code change. Closes the `FREESTYLE_WINDOWS_ACCEPTANCE` debt that v0.1.0 shipped with — the one
+recorded under *Added — 2026-10-04 (Freestyle V1)* below, which states that the acceptance run "was
+**not** re-run against the reconstructed module, and could not be". That entry is left exactly as
+written; it was true when written, and this entry supersedes it rather than rewriting history.
+
+Freestyle V1 was re-verified on Windows against the **published v0.1.0 source**
+(`fe84ef3a2c1c72cc1758bf9afaffd440637f6fd5`, tree `7b9b2c46`), exported clean and imported with an
+isolation and module-provenance guard, on the RC1-verified portable runtime. The **original fixture
+was recovered** from retained task evidence — the same 72 s track and the same three sources, hash
+verified — so the historical cut counts are directly comparable rather than re-baselined.
+
+All of it reproduced exactly: OFF **47**, every section `Base` **47**, `drop=High Energy` +
+`intro=Cinematic` **43**, and a repeat run **43** with the identical timeline and plan hash. The
+per-section counts matched too (OFF `intro 9 / drop 17 / verse 7 / finale 14`; ruled
+`8 / 14 / 7 / 14`). OFF and all-`Base` produced an array-equal timeline, changing only the `drop`
+rule left every other section untouched, each of the four real FFmpeg renders came out at 72.000 s
+and exactly 2160 frames, and every post-warm-up condition hit the Stage-5 cache 3/3 with zero Qwen
+jobs — a Freestyle change never invalidates media truth. 48/48 acceptance checks passed.
+
+The reconstructed `freestyle.py` therefore behaves as the original implementation did, and
+`.claude/rules/freestyle.md` no longer carries its "not re-verified for the current `freestyle.py`"
+caveat. The historical 0.1.0 entries are unchanged.
 
 ## 0.1.0 — 2026-10-09
 

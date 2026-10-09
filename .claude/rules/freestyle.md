@@ -375,13 +375,69 @@ Stage-4 artifact and no resolved-Freestyle key in production code. Full L2 contr
 
 ## Runtime acceptance (Freestyle V1)
 
-**Not re-verified for the current `freestyle.py`.** That module, this rule and
-`tests/test_freestyle.py` were absent from the tree when the feature was otherwise finished, so the
-module was **reconstructed** against its existing call surface and test assertions; the full suite
-passes, but the run below is the **original** implementation's evidence and was not repeated. It
-cannot be repeated off-Windows — no portable runtime, no FFmpeg, no models. Repeat it on the Windows
-machine before citing the cut counts as current, and record the result here. See `CHANGELOG-FORK.md`
-under *Added — 2026-10-04 (Freestyle V1)* for the full status.
+**Re-verified on Windows against the published v0.1.0 code (H1, 2026-10-10), and the numbers below
+are now current.** The module had been **reconstructed** against its existing call surface and test
+assertions after it, this rule and `tests/test_freestyle.py` turned out to be absent from the tree,
+so the figures here described the *original* implementation and were explicitly not citable as
+current. H1 closed that gap.
+
+What makes the comparison exact rather than merely equivalent: the **original fixture was
+recovered** from retained task evidence (`tasks/freestyle-v1-impl/media`) — the same 72 s
+`track.wav` and the same three sources `src_calm` / `src_medium` / `src_busy` — so the historical
+counts are directly comparable instead of being re-baselined against new material.
+
+```
+TESTED_COMMIT        fe84ef3a2c1c72cc1758bf9afaffd440637f6fd5  (tag v0.1.0, tree 7b9b2c46)
+RUNTIME              the RC1-verified portable runtime (Python 3.13.14 embed, portable FFmpeg,
+                     llama.cpp Vulkan on an RTX 3080, Qwen3VL-2B-Instruct-Q8_0 for Stage 5).
+                     use_gpu=False, so CuPy was not on this path.
+FIXTURE              RECOVERED historical (72.000 s, three sources)
+  track.wav          7ce0cdf84b638b210dac1ad274e425a1d1567c9e909ebd62209e1496ad384853
+  src_calm.mp4       0fb5d2d793d726314fd9c175e32638f48094cd40b19a83b46123e8673fe0cb3c
+  src_medium.mp4     c3925b9e3d3a515b704467ac66be460aa8e42e1dc221b19ddf668123945f3f38
+  src_busy.mp4       e53ed1f9586a4932432d3c7da789ada208dc233ad7397c91949a1dcd9e5de61f
+REAL_STAGE3          169 beats @ 143.5547 BPM; 4 sections
+                     intro 0.000-18.506 · drop 18.506-36.037 · verse 36.037-48.506 ·
+                     finale 48.506-72.000
+GLOBAL_BASE          creative=None (legacy profile), use_gpu=False, fps 30.0 — the historical
+                     harness's own configuration; Micro Cuts and the Variation Seed stayed global
+
+OFF                      47 cuts        (historical 47)
+ON, every section Base   47 cuts        (historical 47)   timeline hash d0105aa165738a16
+ON, drop=High Energy +
+   intro=Cinematic       43 cuts        (historical 43)   timeline hash aab85328ff072bef
+repeat of the above      43 cuts        (historical 43)   same timeline AND plan hash
+
+per section   OFF   intro 9 · drop 17 · verse 7 · finale 14   (historical: identical)
+per section RULED   intro 8 · drop 14 · verse 7 · finale 14   (historical: identical)
+
+OFF vs all-Base      np.array_equal TRUE and identical canonical timeline hash
+drop-rule-only       non-drop sections changed: ZERO (intro 9→9, verse 7→7, finale 14→14);
+                     the drop itself 17→14
+renders              all four conditions: 72.000 s, exactly 2160 frames @ 30 fps,
+                     h264 + pcm_s24le, video and audio streams present
+                     OFF and all-Base byte-identical in size; active and its repeat likewise
+STAGE5 REUSE         cold warm-up analysed 3/3 sources with real Qwen; every later condition
+                     reported cache_hits 3/3, sources_analyzed_this_run 0, qwen_jobs_this_run 0 —
+                     a Freestyle change never invalidated media truth
+CONTROL              Qwen enabled vs disabled produced the identical Stage-4 timeline, so the
+                     historical Qwen-disabled run is comparable on cut counts by measurement
+                     rather than by assumption
+H1_CHECKS            48/48 passed
+FOCUSED_TESTS        1063 passed, 6 skipped (the skips are by-design parametrize skips in
+                     test_micro_cuts.py for base/rule pairs that resolve uniformly)
+```
+
+The evidence applies to the **current shipped** module because the run imported
+`beatsync_fork.freestyle` from a clean `git archive` of the published commit, with an isolation
+guard asserting `logger.ROOT_DIR`, the Stage-5 cache directory and the processing directory all
+resolve inside that export, and a provenance check that every loaded BeatSync module came from it.
+The figures above are the durable record; the run logs sit in task scratch under
+`post-v0.1.0-h1-freestyle-windows-acceptance`. See `CHANGELOG-FORK.md` under
+*Maintenance — 2026-10-10 (Freestyle V1 Windows runtime acceptance)*.
+
+The paragraph below is the **original** implementation's run, retained as history. Its "140 BPM"
+is the synthetic target; the detected tempo was 143.55 BPM, as H1 re-measured above.
 
 Real Stages 1–6 through real FFmpeg on a 140 BPM / 72 s synthetic track with Stage-3 sections
 `intro`/`drop`/`verse`/`finale` and three sources, in an isolated scratch build. Freestyle OFF gave
