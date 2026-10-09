@@ -240,9 +240,23 @@ def parse_arguments() -> argparse.Namespace:
 def get_video_files(directory : str) -> VideoList:
     video_extensions = ['.mp4', '.MP4', '.mkv', '.MKV']
     video_files = []
+    # [FORK] Windows `Path.glob` matches case-insensitively, so '*.mp4' and '*.MP4' return the
+    # SAME file and the four passes below yielded every source twice — measured on this machine as
+    # 4 real files producing 8 CLI entries, which doubled Stage-5 analysis work in the headless
+    # path. Keep the passes (they are what supports both extensions in either case on a
+    # case-sensitive platform) and keep the first occurrence of each real file, identified by a
+    # platform-normalised absolute path rather than by filename: two different directories may
+    # legitimately hold the same basename. On a case-sensitive platform `normcase` is a no-op, so
+    # genuinely distinct differently-cased filenames stay distinct.
+    seen = set()
 
     for ext in video_extensions:
-        video_files.extend(Path(directory).glob(f'*{ext}'))
+        for path in Path(directory).glob(f'*{ext}'):
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if key in seen:
+                continue
+            seen.add(key)
+            video_files.append(path)
 
     if not video_files:
         raise ValueError(f'No MP4/MKV files found in {directory}')
