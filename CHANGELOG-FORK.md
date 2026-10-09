@@ -20,6 +20,13 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+_Nothing yet._
+
+## 0.1.0 — 2026-10-09
+
+First tagged release of the Digital Union fork. Everything below was previously recorded under
+`Unreleased` and is carried over unchanged; no entry has been rewritten, reordered or summarised.
+
 ### Fixed — 2026-10-09 (v0.1.0 RC0 release blockers)
 
 Two independent corrections found by the v0.1.0 release candidate review.
