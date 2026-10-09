@@ -20,6 +20,79 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-09 (v0.1.0 RC0 release blockers)
+
+Two independent corrections found by the v0.1.0 release candidate review.
+
+**1. AI Director V2: intent evidence basis, and a truthful read-out.**
+
+Every present semantic axis now carries a required `basis` of `requested` or `associated`, and
+deterministic product policy decides which may reach an execution control. The system prompt and
+model schema become the exact RC0-P3 evidence bytes
+(prompt `4e43d0cb…40e928e8`, schema `d841b142…95cb37d4`); the model, installer, llama.cpp build and
+media adapter are unchanged, and it is still one model call.
+
+RC0-P0…P2 measured five materially different prompt wordings trying to stop the 4B model inferring
+`source_variety` from mood alone, and none worked: a style-only instruction such as *"Let it come
+apart at the seams."* kept producing an unrequested source-breadth preference that changed the
+render. Asking the model to suppress the thought failed; asking it the separate question *"was this
+requested?"* did not.
+
+`basis` is not a confidence value and not a seventh dimension. It answers whether the user expressed
+the preference, while `strength` still answers how much they want it, and the two are independent —
+a faintly-put real request is `requested` with a small strength. A strength threshold was measured
+and **rejected**: explicit breadth requests span 20…100 and overlap style-inferred emissions, so the
+only threshold that rejects every style-only emission also discards 12 of 32 genuine requests.
+
+```
+cut_pacing · scene_reading · motion_preference            both bases actionable
+impact_accents · section_reactivity · source_variety      requested only; an associated
+    reading resolves exactly as an omitted axis — the control stays at 50, at any strength
+```
+
+`resolve_semantic_intent()` owns the policy so the GUI, the media adapter, Apply and any future
+non-GUI caller share it. The raw intent is never filtered in place — it is provenance. Because
+`basis` resolves *before* the media step, a suppressed association arrives as BASE 50, the
+adapter's `BASE > 50` gate cannot fire, and FINAL stays 50 with no adjustment.
+
+`basis` also created a divergence the read-out could not previously have: the model's `explanation`
+describes its **raw** reading while the recipe shows what was **applied**, and on a requested-only
+axis those can legitimately disagree. The explanation is left completely alone — never parsed,
+rewritten, truncated differently or withheld — and one deterministic line derived from the
+structured intent states the difference:
+
+```
+Director: ...suggests using more of the available clips rather than reusing a small set...
+Not applied (associated, not requested): Source variety - left neutral.
+```
+
+The wording is attributed on purpose: it reports a model classification, not a claim about what the
+user objectively asked for.
+
+**Accepted limitation.** RC0-P3 measured **2 of 24** very faintly phrased explicit source-breadth
+requests as `associated` — direction correct, basis conservative — so those leave Source Diversity
+neutral instead of nudging it, and the new line makes that visible rather than silent. A false
+negative is a no-op, whereas a style-only false positive changes execution without a request. The
+RC0-P4 wording that fixed those two cases was rejected because it also made style-only text read as
+`requested`, produced the programme's only wrong direction, and dropped targeted basis accuracy to
+98.8 %. There is no claim of 100 % natural-language breadth recall.
+
+`src/gui.py` needed no change. Contract: `.claude/rules/director.md`.
+
+**2. Headless CLI: duplicate Windows source enumeration.**
+
+`video_processor.get_video_files()` ran four separate `Path.glob` passes (`*.mp4`, `*.MP4`, `*.mkv`,
+`*.MKV`). Windows `Path.glob` matches case-insensitively, so each real file was returned by two
+patterns — measured on this machine as **4 real files producing 8 entries**, which doubled Stage-5
+analysis work in the headless path. The GUI folder mode was unaffected.
+
+The passes are kept (they are what supports both extensions in either case on a case-sensitive
+platform) and the first occurrence of each real file is retained, identified by
+`os.path.normcase(os.path.abspath(...))` rather than by filename — so two directories holding the
+same basename stay distinct, and on a case-sensitive platform genuinely distinct differently-cased
+filenames also stay distinct. MP4/MKV support, mixed-case files, first-seen ordering and the
+existing `ValueError` on an empty directory are all preserved. 4 → 8 before, 4 → 4 after.
+
 ### Maintenance — 2026-10-07 (post-C3 contract/documentation consistency)
 
 **Prose only. No runtime behaviour, constant, signature, wiring, assertion, UI copy or cache version

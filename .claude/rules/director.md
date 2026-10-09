@@ -66,11 +66,33 @@ DETERMINISM                     PASS      (byte-identical repeats)
 MEDIAN_LATENCY                  ~3.5 s
 ```
 
-**The prompt and the schema are hash-pinned to those exact bytes.**
-`SEMANTIC_IR_SYSTEM_PROMPT_SHA256 = 2ef076e1693f08e0ac7a9d4f055fad88cf0ed3f5913b107882c52fd821e58ddd`
-and `SEMANTIC_IR_SCHEMA_SHA256 = 411615315546af8707127d506375033c48369188b2b985b8df0fbab13889df35`,
-asserted by `tests/test_director.py`. Drifting off them invalidates the evidence above, so a change
-there is a re-measurement, not an edit.
+Those numbers are the **pre-RC0** record, produced before `basis` existed. RC0-P0…P4 re-measured the
+whole surface on the evidence-basis contract below and moved the pins; the pre-RC0 hashes
+(`2ef076e1…21e58ddd` prompt, `41161531…3889df35` schema) are now historical only.
+
+**The prompt and the schema are hash-pinned to the RC0-P3 bytes.**
+`SEMANTIC_IR_SYSTEM_PROMPT_SHA256 = 4e43d0cbb747ca704281f04ed4dc5852034371492525d7968cb0c40440e928e8`
+and `SEMANTIC_IR_SCHEMA_SHA256 = d841b142e94f7904ed44afb62a055bb0cbba56784821185104304c3e95cb37d4`,
+asserted by `tests/test_director.py`. There is exactly **one** current pair and no tolerated
+alternatives. Drifting off them invalidates the evidence, so a change there is a re-measurement,
+not an edit.
+
+RC0-P3's own record on those bytes:
+
+```
+SCHEMA_VALID_RATE                      100 %   (131 / 131)
+STYLE_ONLY_ACTIONABLE_SOURCE_VARIETY   0 / 12
+TRUE_POSITIVE_BREADTH_DIRECTION        8 / 8
+TRUE_POSITIVE_BASIS_REQUESTED          8 / 8
+INTENSITY_DIRECTION                    24 / 24  (very slight -> strong)
+INTENSITY_BASIS_REQUESTED              22 / 24  <- the known limitation below
+TARGETED_BASIS_REQUESTED_ACCURACY      100 %    (39 / 39, non-source-variety axes)
+ENERGY_CLUSTER / CONCEPT / MEDIA / UNSEEN   6/6 · 14/14 · 10/10 · 12/12
+WRONG_DIRECTION_TOTAL                  0
+ACTIONABLE_NON_TARGET_AXIS_EMISSION    1.25 %   (raw 2.50 %)
+DETERMINISM                            PASS     (byte-identical repeats)
+MEDIAN_LATENCY                         ~3.3 s   (still one call)
+```
 
 ## The model-facing surface carries no execution vocabulary
 
@@ -119,6 +141,121 @@ reported axis     -> 50 ± magnitude_for_strength(strength)
 Banker's rounding sends `0.5` to `0`, which would make the smallest possible request a silent no-op,
 and sends `24.5` to `24`, breaking monotonicity at every half point. `director_media.half_up` is the
 same discipline for the float product in the adapter.
+
+## Evidence basis: RAW intent, ACTIONABLE intent, and the four words that matter
+
+Every **present** axis carries a third required field, `basis`, of `requested` or `associated`:
+
+```
+RAW INTENT        = what the model reported            (SemanticIntent.requests)
+ACTIONABLE INTENT = what may affect execution          (SemanticIntent.actionable_requests())
+MODEL EXPLANATION = provenance for the RAW reading     (never an authority, never parsed)
+NOT APPLIED LINE  = deterministic disclosure of the associated requested-only
+                    dimensions that were held at neutral
+```
+
+`basis` answers a **different question** from `strength`, and conflating them is the mistake worth
+naming:
+
+```
+strength -> HOW MUCH does the user want this direction?
+basis    -> DID THE USER EXPRESS this preference at all?
+```
+
+So it is **not** a confidence number and **not** a seventh axis — it is metadata about one existing
+request, and all four combinations are legal. A faintly-put real request is `requested` with a small
+strength; a dimension the model is certain would suit the described style is `associated` however
+strong that certainty feels.
+
+```
+STYLE_INFERABLE_ASSOCIATED_AXES = cut_pacing · scene_reading · motion_preference
+REQUESTED_ONLY_AXES             = impact_accents · section_reactivity · source_variety
+```
+
+On the style-inferable three, **both** bases move the control: ordinary filmmaking language is
+*intended* to imply them, and that is exactly why a broad instruction still produces a real
+proposal. On the requested-only three, `associated` resolves **exactly as an omitted axis** — the
+control stays at 50, at any strength, and `associated` at strength 100 is as inert as at strength 1.
+
+**`source_variety` is requested-only because mood does not establish a preference about source
+breadth.** A calm edit may use every source; a frantic one may reuse a few. RC0-P0…P2 measured
+*five* prompt wordings trying to stop the model inferring it from style alone and none worked
+(4/12 clean on a frozen style-only set under three different restraint policies). Asking the model
+to suppress the thought failed; asking it the separate question *"was this requested?"* did not.
+`impact_accents` and `section_reactivity` are requested-only to **preserve** a measured property,
+not to add a restriction: RC0-P1 and RC0-P3 both recorded zero unsupported associated emissions
+there.
+
+**A strength threshold is rejected and must not be revived.** RC0-P3 measured explicit breadth
+requests spanning 20..80 (very slight), 40..90 (mild), 75..100 (moderate) and 95..100 (strong),
+overlapping style-inferred emissions throughout. No threshold separates them: the only value that
+rejects every style-only emission also discards 12 of 32 genuine requests.
+`STRENGTH_IS_PREFERENCE_MAGNITUDE = YES`, `STRENGTH_IS_CONFIDENCE = NO`.
+
+### The resolver owns the policy, and the raw intent is never filtered in place
+
+`resolve_semantic_intent()` applies it, so the GUI, the media adapter, Apply and every future
+non-GUI caller receive the same product semantics — the policy is deliberately **not** in `gui.py`.
+The invariant is not "associated entries disappear" but **"associated entries on requested-only axes
+cannot become execution controls"**: `requests` keeps what the model said, because that is
+provenance, and `actionable_requests()` / `non_actionable_associations()` are views over it.
+`SemanticAxisRequest.is_actionable` is the single shared truth both the resolver and the read-out
+consume; there is no second axis list inside display formatting.
+
+Ordering matters for media too: `basis` resolves **before** `director_media`, so a suppressed
+association arrives at the adapter as BASE 50, the `BASE > 50` gate cannot fire, and FINAL is 50
+with no `MediaAdjustment`. A media step is never able to invent a direction the user did not ask
+for. Tested.
+
+### The read-out states the distinction instead of editing the prose
+
+`basis` created a divergence the read-out previously could not have: the model's `explanation`
+describes its **raw** reading, the recipe shows what was **applied**, and on a requested-only axis
+those can legitimately disagree. Before `basis`, every reported axis was actionable, so they could
+not.
+
+The answer is one deterministic line, **not** an explanation sanitizer:
+
+```
+Director: <the model's own sentence, verbatim and untouched>
+Not applied (associated, not requested): Source variety - left neutral.
+```
+
+It is derived **only** from `SemanticIntent` plus the actionability policy — never from the
+explanation text, which is never parsed, rewritten, truncated differently, filtered by sentence or
+withheld. A deliberately misleading explanation cannot change which axes are listed, and a
+suppressed axis the prose never mentions is still disclosed; both directions are tested.
+
+Wording is **attributed on purpose**. It says the Director marked these `associated` rather than
+`requested`; it does not say the instruction objectively contained no such request, because all we
+have is a classification, not ground truth about the user. Labels come from `AXIS_DISPLAY_LABELS`
+(user-semantic names like *Source variety*), never from `AXIS_TO_CONTROL` — a label derived from an
+execution control name is how `source_diversity` would eventually reach the screen.
+
+Display order, with and without a media adjustment:
+
+```
+Instruction · recipe · Director explanation · NOT APPLIED · media note · proposal-only footer
+Instruction · Base · Director explanation · NOT APPLIED · Media adjustment · Final · footer
+```
+
+The qualification sits immediately after the explanation it qualifies, and stays visible even when
+a *different*, actionable Source Diversity request is being attenuated by the media step.
+
+### Known limitation, accepted for v0.1.0 — do not paper over it
+
+RC0-P3 measured **2 of 24** very faintly phrased explicit source-breadth requests as `associated`:
+direction correct, basis conservative. Those two therefore leave Source Diversity at neutral
+instead of nudging it, and the Not applied line makes that visible rather than silent.
+
+It is accepted because a false negative is a **no-op**, whereas a style-only false positive changes
+execution without a request. RC0-P4 built a wording (candidate J) that fixed those two and was
+**rejected**: it also made style-only text read as `requested` (1/12 style-only, 1 short-style, 1
+broad), produced the programme's only wrong direction, and dropped targeted basis accuracy to
+98.8 %. Do not implement candidate J, do not write a candidate K, do not add examples or a lexicon,
+and do not change the P3 prompt or schema to chase these two cases.
+
+**Do not claim 100 % natural-language breadth recall** anywhere in docs or UI copy.
 
 ## BASE and FINAL are two different truths
 
@@ -235,8 +372,12 @@ prose — a broad `\{.*\}` search is how a truncated object, a code fence or a c
 half-accepted, and Stage 5's own truncation defect lived exactly there. The parse is: strip, remove
 the one fixed `[end of text]` marker, `json.loads` the entire remainder, require a mapping, require
 the exact top-level key set, require `intent` to be a mapping of known axes only, and require every
-**present** axis to carry exactly `{direction, strength}` with an axis-specific enum value and a
-plain in-range `int`.
+**present** axis to carry exactly `{direction, strength, basis}` with an axis-specific enum value,
+a plain in-range `int` and one of the two legal basis strings.
+
+**A missing `basis` is never read as `requested`.** There is no default and no salvage: an absent
+or unknown basis rejects the whole payload, because defaulting it would silently promote
+unclassified model output into execution — the exact failure the field exists to prevent.
 
 **A malformed present axis rejects the whole intent.** It is not dropped and not salvaged: a producer
 emitting `{"motion_preference": {"direction": "sideways"}}` disagrees with this contract about what
@@ -374,6 +515,21 @@ Proposal only - press Apply Proposal to move the controls. Nothing has been rend
 Both halves are mandatory: the **benefit** (more pressure cannot buy more variety) and the
 **trade-off** (relaxing it may allow more adjacent source reuse). With a fully prepared library and
 nothing to change, the proposal says so concisely; with no eligible scan it names the reason.
+
+A third author can appear, and it is deterministic local code rather than the model: when the
+Director reported a requested-only dimension as an association, the read-out says so immediately
+after the explanation it qualifies.
+
+```
+Instruction: Maybe lean just a touch wider across the clips I gave you.
+Clip seed … · Cut 50 · Micro 50 · Semantic 50 · Energy 50 · Motion 50 · Diversity 50
+Director: ...suggests using more of the available clips rather than reusing a small set...
+Not applied (associated, not requested): Source variety - left neutral.
+Proposal only - press Apply Proposal to move the controls. Nothing has been rendered.
+```
+
+The model's sentence stays exactly as written — see the evidence-basis section for why the line is
+a structured disclosure and not an explanation sanitizer.
 
 ## UI copy must not over-claim
 

@@ -58,6 +58,40 @@ and a model asked for absolute values collapsed every downward request onto 50. 
 only way to say "leave this alone", and it means *no expressed preference*.
 
 ===============================================================================
+Evidence basis: did the user ask, or does it merely suit the style?
+===============================================================================
+
+Each reported dimension also carries a ``basis`` of ``requested`` or ``associated``. It answers a
+different question from ``strength``:
+
+* ``strength`` — *how much* does the user want this direction?
+* ``basis`` — did the user **express** this preference at all?
+
+``basis`` is therefore **not** a confidence number, and it is **not** a seventh dimension: it is
+metadata about one existing request. All four combinations are legal and meaningful, which is the
+point — a faintly-put real request is ``requested`` with a small strength, and a dimension the model
+is sure would suit the described style is ``associated`` however strong that feeling is.
+
+The field exists because five successive prompt-only attempts could not stop the model inferring
+``source_variety`` from mood alone. Mood does not establish a preference about source breadth: a
+calm edit may use every source and a frantic one may reuse a few. Asking the model to suppress the
+thought failed; asking it the separate question *"was this requested?"* did not.
+
+So the product policy is per axis, and it lives in :func:`resolve_semantic_intent` alone:
+:data:`STYLE_INFERABLE_ASSOCIATED_AXES` may be moved by an ``associated`` reading because ordinary
+filmmaking language is *intended* to imply them, while on :data:`REQUESTED_ONLY_AXES` an
+``associated`` reading resolves exactly as an omitted axis — the control stays at 50, at any
+strength. The raw intent is never filtered in place: it is provenance, and
+:meth:`SemanticIntent.actionable_requests` is how a caller asks what survived.
+
+**Known limitation, measured and accepted for v0.1.0.** RC0-P3 measured two of twenty-four very
+faintly phrased explicit source-breadth requests as ``associated`` — direction correct, basis
+conservative — so they leave Source Diversity neutral instead of nudging it. That is a false
+negative, i.e. a no-op, and it was preferred to the alternative measured in RC0-P4, where a wording
+that fixed those two also made style-only text read as a request and changed execution without one.
+See ``.claude/rules/director.md``; do not claim 100 % natural-language breadth recall.
+
+===============================================================================
 What V2 still deliberately does not do
 ===============================================================================
 
@@ -122,6 +156,21 @@ INSTRUCTION_MAX_CHARS = 2000
 #: The inclusive strength range. ``0`` is excluded on purpose: see the module docstring.
 STRENGTH_MIN = 1
 STRENGTH_MAX = 100
+
+#: The per-dimension evidence field. ``basis`` is **metadata about one reported dimension**, never a
+#: seventh dimension and never a confidence number — see the "Evidence basis" section of the module
+#: docstring for why those two readings are both wrong.
+BASIS_KEY = "basis"
+
+#: The user's own instruction expressed this editing preference, literally or by clear implication.
+BASIS_REQUESTED = "requested"
+
+#: The model supplied the dimension because it seems stylistically compatible with what the user
+#: asked for — the user did not actually request it.
+BASIS_ASSOCIATED = "associated"
+
+#: The only two legal values, in schema order. Immutable: a third value would be a contract change.
+BASIS_VALUES: tuple[str, str] = (BASIS_REQUESTED, BASIS_ASSOCIATED)
 
 # ---------------------------------------------------------------------------
 # Generation settings
@@ -198,6 +247,64 @@ CONTROL_TO_AXIS = {control: axis for axis, control in AXIS_TO_CONTROL.items()}
 #: The six internal names that must never reach the model.
 _INTERNAL_CONTROL_NAMES = tuple(DIRECTOR_CONTROL_FIELDS)
 
+# ---------------------------------------------------------------------------
+# The actionability policy: which `basis` values may move an execution control
+# ---------------------------------------------------------------------------
+#
+# This policy lives HERE, in the pure boundary, and nowhere else. `gui.py`, the invocation code, the
+# media adapter and the Apply handler must all receive the same product semantics, which is only
+# true if `resolve_semantic_intent` owns the decision — see RC0-P3/P4 and `.claude/rules/director.md`.
+
+#: Dimensions ordinary filmmaking language is *intentionally allowed* to imply. A style description
+#: may move these, so both bases are actionable. This is the behaviour the short-style measurement
+#: set depends on: "Use a cinematic, patient, emotional style." resolves to a real three-axis
+#: proposal precisely because these three accept `associated`.
+STYLE_INFERABLE_ASSOCIATED_AXES = frozenset({
+    "cut_pacing", "scene_reading", "motion_preference"})
+
+#: Dimensions that require the user to have actually asked. An `associated` value on one of these
+#: resolves **exactly as an omitted axis** — the control stays at 50 — regardless of strength.
+#:
+#: `source_variety` is here because mood does not establish a preference about source breadth: a
+#: calm edit may use every source and a frantic one may reuse a few, so inferring it from style
+#: changes execution without a request. `impact_accents` and `section_reactivity` are here to
+#: preserve a measured property rather than to add a new restriction: RC0-P1 and RC0-P3 both
+#: recorded zero unsupported associated emissions for them, and generic style does not by itself
+#: ask for extra impact accenting or stronger section-following.
+REQUESTED_ONLY_AXES = frozenset({
+    "impact_accents", "section_reactivity", "source_variety"})
+
+# The policy must partition the six axes exactly: an axis added without a decision would otherwise
+# default to whichever branch the resolver happened to be written with.
+assert STYLE_INFERABLE_ASSOCIATED_AXES.isdisjoint(REQUESTED_ONLY_AXES)
+assert STYLE_INFERABLE_ASSOCIATED_AXES | REQUESTED_ONLY_AXES == set(SEMANTIC_AXES)
+
+
+def actionable_bases(axis: str) -> frozenset[str]:
+    """The ``basis`` values that may move ``axis``'s execution control. Total over the six axes."""
+    if axis not in SEMANTIC_AXES:
+        raise KeyError(axis)
+    return frozenset(BASIS_VALUES) if axis in STYLE_INFERABLE_ASSOCIATED_AXES \
+        else frozenset({BASIS_REQUESTED})
+
+
+#: User-facing label per semantic axis, for the read-out. Written from the **model-facing** axis
+#: vocabulary and never derived from ``AXIS_TO_CONTROL`` — a label built from an execution control
+#: name is how ``source_diversity`` would eventually reach the screen.
+AXIS_DISPLAY_LABELS: dict[str, str] = {
+    "cut_pacing": "Cut pacing",
+    "impact_accents": "Impact accents",
+    "scene_reading": "Scene reading",
+    "section_reactivity": "Section reactivity",
+    "motion_preference": "Motion preference",
+    "source_variety": "Source variety",
+}
+
+# Total over the six axes, and free of execution vocabulary — both checked rather than trusted.
+assert set(AXIS_DISPLAY_LABELS) == set(SEMANTIC_AXES)
+for _label in AXIS_DISPLAY_LABELS.values():
+    assert not any(c in _label.lower() for c in _INTERNAL_CONTROL_NAMES), _label
+
 # Structural guards rather than comments: the axes and the control registry are the same six, and
 # every axis has a distinct direction pair. A control added to `presets.CREATIVE_CONTROL_FIELDS`
 # without a semantic axis fails at import time instead of being silently left for the model to guess.
@@ -241,10 +348,11 @@ def model_schema() -> dict:
         axis_properties[axis] = {
             "type": "object",
             "additionalProperties": False,
-            "required": ["direction", "strength"],
+            "required": ["direction", "strength", BASIS_KEY],
             "properties": {
                 "direction": {"type": "string", "enum": [negative, positive]},
                 "strength": {"type": "integer", "minimum": STRENGTH_MIN, "maximum": STRENGTH_MAX},
+                BASIS_KEY: {"type": "string", "enum": list(BASIS_VALUES)},
             },
         }
     return {
@@ -288,9 +396,11 @@ def system_prompt() -> str:
         "user is asking for, using a small fixed set of editing dimensions, for a "
         "beat-synchronised music video.",
         "",
-        "There are six dimensions. For each one you report, give a direction and a strength:",
+        "There are six dimensions. For each one you report, give a direction, a strength and a "
+        "basis:",
         f"  strength is a whole number from {STRENGTH_MIN} to {STRENGTH_MAX}, where "
         f"{STRENGTH_MIN} is a very slight preference and {STRENGTH_MAX} is as strong as possible.",
+        f"  basis is either \"{BASIS_REQUESTED}\" or \"{BASIS_ASSOCIATED}\".",
         "",
     ]
     for axis, spec in SEMANTIC_AXES.items():
@@ -298,10 +408,31 @@ def system_prompt() -> str:
         lines.append(f"{axis} ({negative} / {positive}): {meaning}")
     lines.extend([
         "",
-        "Report a dimension ONLY when the user's words directly support it. Omit every dimension "
-        "the instruction does not speak to, and omit any dimension you are unsure about. There is "
-        "no neutral option and no way to say \"leave this alone\" other than leaving it out: "
-        "omitting a dimension simply means the user expressed no preference about it.",
+        "Report a dimension when the user's words directly express it, or when ordinary editing "
+        "and style language clearly and conventionally implies it. The user does not have to name "
+        "editing mechanics literally.",
+        "",
+        "cut_pacing, scene_reading and motion_preference answer to everyday descriptions of "
+        "style. Where a described style carries a clear and conventional implication for one of "
+        "those three, report it even though the user never named it.",
+        "",
+        "impact_accents, section_reactivity and source_variety are narrower, and need words aimed "
+        "at what that dimension is itself about: brief accenting on the biggest musical impacts; "
+        "how much the choice of imagery follows the song's structure and each section's intensity; "
+        "how widely the edit draws on the available source videos. Apply a stricter standard to "
+        "these three. A described style that only conveys how intense or how pleasing the result "
+        "should be does not reach that standard, however strongly it is put.",
+        "",
+        "For a short, broad description of style, report the smallest defensible set of "
+        "dimensions. Do not report several dimensions merely because together they would amount "
+        "to a plausible house style. If one dimension captures what was asked, one is enough; "
+        "report more than one only where separate elements of the instruction independently "
+        "support each of them.",
+        "",
+        "Omit every dimension the instruction does not speak to, and omit any dimension you are "
+        "unsure about. There is no neutral option and no way to say \"leave this alone\" other "
+        "than leaving it out: omitting a dimension simply means the user expressed no preference "
+        "about it.",
         "",
         "Do not turn a specific request into a generally more intense or more extreme edit. Do "
         "not add a second dimension to reinforce, balance or compensate for the one actually "
@@ -312,6 +443,22 @@ def system_prompt() -> str:
         "",
         "If the instruction expresses no actionable editing preference at all, report an empty "
         "set of dimensions.",
+        "",
+        "For every dimension you report, say which of the two it is. Report it as "
+        f"\"{BASIS_REQUESTED}\" when the user's own instruction expresses that editing preference, "
+        "either plainly or by a clear implication of what they said. Report it as "
+        f"\"{BASIS_ASSOCIATED}\" when the dimension merely seems to fit the style they described, "
+        "but they did not ask for it.",
+        "",
+        "This is not a measure of how certain you are, and it is not strength under another name. "
+        f"A slight preference the user genuinely expressed is still \"{BASIS_REQUESTED}\", however "
+        "gently they put it. A dimension you are confident would complement their style is still "
+        f"\"{BASIS_ASSOCIATED}\" if they never asked for it.",
+        "",
+        "Label the basis honestly. Do not omit a dimension you would have to call "
+        f"\"{BASIS_ASSOCIATED}\" in order to present a stricter answer, and do not report a "
+        "dimension you would not report in any case just so you can label it "
+        f"\"{BASIS_ASSOCIATED}\". Label each dimension you do report truthfully.",
         "",
         f"You may add one short sentence of reasoning in an optional \"{EXPLANATION_KEY}\" field, "
         f"at most {EXPLANATION_MAX_CHARS} characters. It is shown to the user for review and "
@@ -377,11 +524,18 @@ def normalize_explanation(value: Any) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SemanticAxisRequest:
-    """One reported dimension: a direction from that axis's own pair, and a strength ``1..100``."""
+    """One reported dimension: a direction from that axis's own pair, a strength and a basis.
+
+    ``basis`` records *whether the user asked*; ``strength`` records *how much they want it*. The
+    two are independent, and conflating them is the mistake worth naming: a faintly-put request is
+    ``requested`` with a small strength, while a confident stylistic hunch is ``associated`` no
+    matter how strong it feels. :attr:`is_actionable` answers only the first question.
+    """
 
     axis: str
     direction: str
     strength: int
+    basis: str
 
     def __post_init__(self) -> None:
         if self.axis not in SEMANTIC_AXES:
@@ -392,13 +546,25 @@ class SemanticAxisRequest:
             raise ValueError(f"strength must be a plain int, got {self.strength!r}")
         if not STRENGTH_MIN <= self.strength <= STRENGTH_MAX:
             raise ValueError(f"strength {self.strength} outside {STRENGTH_MIN}..{STRENGTH_MAX}")
+        if not isinstance(self.basis, str) or self.basis not in BASIS_VALUES:
+            raise ValueError(f"basis must be one of {BASIS_VALUES}, got {self.basis!r}")
 
     @property
     def is_positive(self) -> bool:
         return self.direction == directions(self.axis)[1]
 
+    @property
+    def is_actionable(self) -> bool:
+        """May this request move its execution control?
+
+        Deliberately independent of :attr:`strength`: strength scales a preference that is already
+        actionable, it never decides actionability. ``source_variety`` at strength 100 on an
+        ``associated`` basis is exactly as non-actionable as the same axis at strength 1.
+        """
+        return self.basis in actionable_bases(self.axis)
+
     def describe(self) -> str:
-        return f"{self.axis} {self.direction} ({self.strength})"
+        return f"{self.axis} {self.direction} ({self.strength}, {self.basis})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +585,28 @@ class SemanticIntent:
 
     def by_axis(self) -> dict[str, SemanticAxisRequest]:
         return {r.axis: r for r in self.requests}
+
+    def actionable_requests(self) -> tuple[SemanticAxisRequest, ...]:
+        """Only the requests that may move an execution control.
+
+        The raw :attr:`requests` tuple is **never** filtered in place — it is the provenance of what
+        the model actually said, and the read-out and tests both depend on it surviving. The
+        invariant this method exists to express is not "associated entries disappear" but
+        "associated entries on requested-only axes cannot become execution controls".
+        """
+        return tuple(r for r in self.requests if r.is_actionable)
+
+    def non_actionable_associations(self) -> tuple[SemanticAxisRequest, ...]:
+        """Reported ``associated`` dimensions that product policy leaves at neutral.
+
+        The input to the read-out's disclosure line. Note what decides membership: the request's
+        own :attr:`~SemanticAxisRequest.is_actionable`, which reads the one frozen policy the
+        resolver reads. It is deliberately **not** decided by noticing that some control came out
+        at 50 — a genuine request can resolve near neutral, and an actionable axis is not silently
+        reclassified because its arithmetic happened to land there.
+        """
+        return tuple(r for r in self.requests
+                     if r.basis == BASIS_ASSOCIATED and not r.is_actionable)
 
     def describe(self) -> str:
         if not self.requests:
@@ -502,15 +690,22 @@ def parse_semantic_intent(stdout: Any) -> tuple[SemanticIntent, str] | None:
         spec = raw_intent[axis]
         if not isinstance(spec, Mapping):
             return None
-        if set(spec) != {"direction", "strength"}:
+        if set(spec) != {"direction", "strength", BASIS_KEY}:
             return None
         direction = spec["direction"]
         strength = spec["strength"]
+        basis = spec[BASIS_KEY]
         if not isinstance(direction, str) or direction not in directions(axis):
             return None
         if not _is_plain_int(strength) or not STRENGTH_MIN <= strength <= STRENGTH_MAX:
             return None
-        requests.append(SemanticAxisRequest(axis=axis, direction=direction, strength=strength))
+        # No default and no salvage: a present axis without a legal basis is a producer disagreeing
+        # with this contract about what a reported dimension is. In particular an absent `basis` is
+        # NOT read as "requested" — that would silently promote unclassified output to execution.
+        if not isinstance(basis, str) or basis not in BASIS_VALUES:
+            return None
+        requests.append(SemanticAxisRequest(axis=axis, direction=direction, strength=strength,
+                                            basis=basis))
 
     try:
         intent = SemanticIntent(requests=tuple(requests))
@@ -545,8 +740,15 @@ def resolve_semantic_intent(intent: Any) -> dict[str, int] | None:
 
     * an **omitted** axis leaves its control at exactly ``50`` — never a previous slider value,
       never a preset value, never a model default, never a guess;
-    * a reported axis lands at ``50 ± magnitude_for_strength(strength)``, below neutral for the
-      axis's negative direction and above it for the positive one.
+    * a reported **actionable** axis lands at ``50 ± magnitude_for_strength(strength)``, below
+      neutral for the axis's negative direction and above it for the positive one;
+    * a reported axis whose ``basis`` is not actionable for it resolves **exactly as an omitted
+      axis** — ``50``, at any strength.
+
+    That third rule is the whole product meaning of ``basis``, and it lives here rather than in
+    ``gui.py`` so that every caller gets it: the GUI, the media adapter, Apply and the tests all
+    read the same resolved truth. The raw intent is left untouched — it is provenance, and
+    :meth:`SemanticIntent.actionable_requests` is how a caller asks what survived.
 
     Every result is six plain ``int``s in ``0..100``, which the final assertion checks rather than
     assumes.
@@ -554,7 +756,7 @@ def resolve_semantic_intent(intent: Any) -> dict[str, int] | None:
     if not isinstance(intent, SemanticIntent):
         return None
     resolved = {control: fork_creative.DEFAULT_CONTROL for control in DIRECTOR_CONTROL_FIELDS}
-    for request in intent.requests:
+    for request in intent.actionable_requests():
         magnitude = magnitude_for_strength(request.strength)
         control = AXIS_TO_CONTROL[request.axis]
         value = (fork_creative.DEFAULT_CONTROL + magnitude if request.is_positive
@@ -632,6 +834,28 @@ class DirectorProposal:
 
     # -- reporting ----------------------------------------------------------
 
+    def not_applied_line(self) -> str:
+        """One truthful line naming the reported associations that were left neutral, or ``""``.
+
+        This exists because ``basis`` created a distinction the read-out previously could not have:
+        the model's ``explanation`` describes its **raw** reading, while the recipe shows what was
+        **applied**, and on a requested-only axis those two can now legitimately disagree. The
+        answer is to state the difference, not to edit the prose — the explanation is model
+        provenance and is never parsed, rewritten, truncated or withheld here.
+
+        Wording is attributed on purpose. It says the Director *marked* these as associated rather
+        than requested; it does not assert that the user's instruction objectively contained no
+        such request, because that is a claim about the world and all we have is a classification.
+        """
+        suppressed = self.intent.non_actionable_associations() \
+            if isinstance(self.intent, SemanticIntent) else ()
+        if not suppressed:
+            return ""
+        # Registry order, so two proposals with the same suppressed set read identically.
+        names = [AXIS_DISPLAY_LABELS[axis] for axis in SEMANTIC_AXES
+                 if any(r.axis == axis for r in suppressed)]
+        return (f"Not applied (associated, not requested): {', '.join(names)} - left neutral.")
+
     def display_text(self) -> str:
         """The whole Director proposal read-out. ``gui.py`` formats none of it.
 
@@ -641,12 +865,15 @@ class DirectorProposal:
         step, and the media step is never described as an improvement — P3 measured it as a
         trade-off, and :meth:`MediaAdjustment.describe` states both halves.
         """
+        not_applied = self.not_applied_line()
         lines = [f"Instruction: {self.instruction}"]
         if self.media_adjusted:
             lines.append("")
             lines.append(f"Base:  {self.base_recipe.describe()}")
             if self.explanation:
                 lines.append(f"Director: {self.explanation}")
+            if not_applied:
+                lines.append(not_applied)
             lines.append("")
             lines.append(f"Media adjustment: {self.adjustment.describe()}")
             lines.append("")
@@ -655,6 +882,8 @@ class DirectorProposal:
             lines.append(self.final_recipe.describe())
             if self.explanation:
                 lines.append(f"Director: {self.explanation}")
+            if not_applied:
+                lines.append(not_applied)
             if self.media_note:
                 lines.append(self.media_note)
         lines.append("Proposal only - press Apply Proposal to move the controls. "
@@ -806,7 +1035,12 @@ for _name in _INTERNAL_CONTROL_NAMES:
 
 
 __all__ = [
+    "AXIS_DISPLAY_LABELS",
     "AXIS_TO_CONTROL",
+    "BASIS_ASSOCIATED",
+    "BASIS_KEY",
+    "BASIS_REQUESTED",
+    "BASIS_VALUES",
     "CONTEXT_TOKENS",
     "CONTROL_TO_AXIS",
     "DIRECTOR_CONTROL_FIELDS",
@@ -821,6 +1055,7 @@ __all__ = [
     "MEDIA_NOTE_NO_SCAN",
     "MEDIA_NOTE_NO_SUMMARY",
     "MEDIA_NOTE_STALE_SCAN",
+    "REQUESTED_ONLY_AXES",
     "SEMANTIC_AXES",
     "STATUS_INVALID_PAYLOAD",
     "STATUS_NOTHING_TO_APPLY",
@@ -828,11 +1063,13 @@ __all__ = [
     "STATUS_TIMEOUT",
     "STRENGTH_MAX",
     "STRENGTH_MIN",
+    "STYLE_INFERABLE_ASSOCIATED_AXES",
     "SemanticAxisRequest",
     "SemanticIntent",
     "TEMPERATURE",
     "TIMEOUT_SECONDS",
     "TOP_K",
+    "actionable_bases",
     "applied_status",
     "apply_media_adaptation",
     "axis_for_control",

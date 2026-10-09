@@ -1464,7 +1464,15 @@ def _answer(intent: dict, explanation: str | None = None) -> str:
     return _json.dumps(payload) + " [end of text]"
 
 
-_DIVERSE_ANSWER = _answer({"source_variety": {"direction": "diverse", "strength": 100}})
+_DIVERSE_ANSWER = _answer({"source_variety": {"direction": "diverse", "strength": 100,
+                                              "basis": "requested"}})
+
+#: The same reading the model would give a style-only instruction: it reports the dimension, but
+#: marks it as a stylistic association rather than something the user asked for. Product policy
+#: must leave Source Diversity neutral, and Apply must receive that neutral value.
+_ASSOCIATED_DIVERSE_ANSWER = _answer(
+    {"source_variety": {"direction": "diverse", "strength": 100, "basis": "associated"}},
+    explanation="A broad, varied sweep across the footage would suit this.")
 
 
 def _scan(prepared=2, needs=0, unavailable=0, counts=None, folder="F", recursive=True,
@@ -1663,7 +1671,8 @@ def test_v2_a_neutral_or_reuse_request_is_never_adjusted(tmp_path, direction, st
 
     # reuse direction: BASE lands below neutral and must be returned untouched
     shim.result = _FakeCompleted(
-        0, _answer({"source_variety": {"direction": "reuse", "strength": 100}}))
+        0, _answer({"source_variety": {"direction": "reuse", "strength": 100,
+                                       "basis": "requested"}}))
     state, _read_out, _status = ns["_on_generate_director_proposal"](
         "a few heroes", "F", True, state_obj)
     assert state.recipe.source_diversity == 0
@@ -1761,7 +1770,13 @@ def test_v2_a_missing_director_model_fails_truthfully_without_a_fallback(tmp_pat
 @pytest.mark.parametrize("stdout", [
     "", "not json", '{"intent": {"nonsense": {"direction": "up", "strength": 50}}}',
     '{"intent": {}, "seed": 7}',
-    '{"intent": {"source_variety": {"direction": "diverse", "strength": 0}}}',
+    '{"intent": {"source_variety": {"direction": "diverse", "strength": 0,'
+    ' "basis": "requested"}}}',
+    # a present axis with no basis at all: rejected outright, never read as "requested"
+    '{"intent": {"source_variety": {"direction": "diverse", "strength": 80}}}',
+    # an unknown basis value is equally fatal
+    '{"intent": {"source_variety": {"direction": "diverse", "strength": 80,'
+    ' "basis": "guessed"}}}',
     '```json\n{"intent": {}}\n```',
 ])
 def test_v2_an_invalid_answer_clears_the_state_and_reports_it(tmp_path, stdout):
@@ -1829,6 +1844,36 @@ def test_v2_apply_writes_the_final_recipe_not_the_base(tmp_path):
     # the preset label is derived from the FINAL numbers
     assert preset == fork_presets.matching_preset(tuple(controls))
     assert str(seed) in status
+
+
+def test_v2_an_associated_source_variety_reaches_apply_as_neutral(tmp_path):
+    """The RC0 product decision, end to end through the real handlers.
+
+    The model reports ``source_variety: diverse`` at full strength but marks it ``associated``.
+    Source Diversity is a requested-only axis, so BASE and FINAL are both neutral, the media
+    adapter never fires (it needs ``BASE > 50``), and Apply writes 50 into the real widget — on a
+    deliberately *concentrated* library, which is the case where an actionable request would have
+    been attenuated to something visibly non-neutral instead.
+    """
+    shim = _SubprocessShim()
+    shim.result = _FakeCompleted(0, _ASSOCIATED_DIVERSE_ANSWER)
+    ns = _director_namespace(tmp_path, shim)
+    proposal, read_out, _status = ns["_on_generate_director_proposal"](
+        "Make it feel broad and sweeping", "F", True,
+        _state_with(_scan(counts=_CONCENTRATED_COUNTS)))
+
+    assert proposal.base_recipe.source_diversity == 50
+    assert proposal.final_recipe.source_diversity == 50
+    assert proposal.media_adjusted is False
+    # the model's own prose is preserved verbatim, and the suppression is disclosed separately
+    assert "A broad, varied sweep across the footage would suit this." in read_out
+    assert "Not applied (associated, not requested): Source variety - left neutral." in read_out
+
+    written = ns["_on_apply_director_proposal"](proposal)
+    seed, *controls, _preset, _status = written
+    values = dict(zip(list(fork_presets.CREATIVE_CONTROL_FIELDS), controls))
+    assert values["source_diversity"] == 50, "an association must never reach the slider"
+    assert seed == proposal.final_recipe.seed
 
 
 def test_v2_apply_runs_no_media_logic(tmp_path):
