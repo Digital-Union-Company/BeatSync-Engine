@@ -35,12 +35,23 @@ from beatsync_fork.creative_recipe import CreativeRecipe
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DIRECTOR = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "director.py")
 
-#: The frozen P2-R3 evidence hashes. The selected model's whole measurement record — 6/6 energy
-#: cluster, 14/14 concepts, 10/10 media-control concepts, 0 wrong-direction, 12/12 unseen holdout —
-#: was produced against *these exact bytes*, so production drifting off them silently would
-#: invalidate the evidence this feature was authorized on.
-FROZEN_PROMPT_SHA256 = "2ef076e1693f08e0ac7a9d4f055fad88cf0ed3f5913b107882c52fd821e58ddd"
-FROZEN_SCHEMA_SHA256 = "411615315546af8707127d506375033c48369188b2b985b8df0fbab13889df35"
+#: The frozen RC0-P3 evidence hashes — the **one** current production prompt/schema pair. The
+#: selected model's whole measurement record was produced against *these exact bytes*: on the
+#: evidence-basis contract, 0/12 style-only source_variety emissions actionable, 8/8 true-positive
+#: breadth direction and basis, 24/24 intensity direction, 100 % targeted basis accuracy, 6/6
+#: energy cluster, 14/14 concepts, 10/10 media-control concepts, 12/12 unseen holdout, 0
+#: wrong-direction answers and byte-identical repeats. Production drifting off them silently would
+#: invalidate the evidence this feature is authorized on, so there is exactly one accepted value
+#: each and no tolerated alternatives.
+FROZEN_PROMPT_SHA256 = "4e43d0cbb747ca704281f04ed4dc5852034371492525d7968cb0c40440e928e8"
+FROZEN_SCHEMA_SHA256 = "d841b142e94f7904ed44afb62a055bb0cbba56784821185104304c3e95cb37d4"
+
+#: Historical only, retained as documentation of what the pins used to be and never asserted: the
+#: pre-RC0 pair, measured before ``basis`` existed. RC0-P0 through RC0-P4 moved production off them.
+_HISTORICAL_PRE_RC0_PROMPT_SHA256 = \
+    "2ef076e1693f08e0ac7a9d4f055fad88cf0ed3f5913b107882c52fd821e58ddd"
+_HISTORICAL_PRE_RC0_SCHEMA_SHA256 = \
+    "411615315546af8707127d506375033c48369188b2b985b8df0fbab13889df35"
 
 AXES = ("cut_pacing", "impact_accents", "scene_reading", "section_reactivity",
         "motion_preference", "source_variety")
@@ -72,8 +83,13 @@ def _stdout(intent: dict, explanation: str | None = None, marker: bool = True) -
     return f"{text} [end of text]" if marker else text
 
 
-def _axis(axis: str, direction: str, strength: int) -> dict:
-    return {axis: {"direction": direction, "strength": strength}}
+def _axis(axis: str, direction: str, strength: int, basis: str) -> dict:
+    """One present-axis payload. ``basis`` is deliberately REQUIRED and has no default:
+
+    a fixture default would let a test say nothing about evidence while the strict parser
+    demands it, which is exactly the drift the parser exists to catch.
+    """
+    return {axis: {"direction": direction, "strength": strength, "basis": basis}}
 
 
 # ===========================================================================
@@ -83,13 +99,13 @@ def _axis(axis: str, direction: str, strength: int) -> dict:
 def test_the_system_prompt_matches_the_frozen_evidence_bytes():
     actual = hashlib.sha256(fork_director.system_prompt().encode("utf-8")).hexdigest()
     assert actual == FROZEN_PROMPT_SHA256, (
-        "the system prompt drifted off the bytes P2-R3 measured; re-run the evidence or revert")
+        "the system prompt drifted off the bytes RC0-P3 measured; re-run the evidence or revert")
 
 
 def test_the_model_schema_matches_the_frozen_evidence_bytes():
     actual = hashlib.sha256(fork_director.model_schema_json().encode("utf-8")).hexdigest()
     assert actual == FROZEN_SCHEMA_SHA256, (
-        "the model schema drifted off the bytes P2-R3 measured; re-run the evidence or revert")
+        "the model schema drifted off the bytes RC0-P3 measured; re-run the evidence or revert")
 
 
 @pytest.mark.parametrize("control", fork_presets.CREATIVE_CONTROL_FIELDS)
@@ -178,13 +194,15 @@ def test_additional_properties_are_forbidden_at_both_levels():
         assert schema["properties"]["intent"]["properties"][axis]["additionalProperties"] is False
 
 
-def test_each_present_axis_requires_both_direction_and_strength():
+def test_each_present_axis_requires_direction_strength_and_basis():
     schema = fork_director.model_schema()
     for axis in AXES:
         node = schema["properties"]["intent"]["properties"][axis]
-        assert sorted(node["required"]) == ["direction", "strength"]
+        assert sorted(node["required"]) == ["basis", "direction", "strength"]
         strength = node["properties"]["strength"]
         assert strength == {"type": "integer", "minimum": 1, "maximum": 100}
+        assert node["properties"]["basis"] == {
+            "type": "string", "enum": ["requested", "associated"]}
 
 
 def test_strength_excludes_zero_because_zero_is_indistinguishable_from_omission():
@@ -233,7 +251,7 @@ def test_the_wire_form_round_trips_to_the_same_schema():
 
 def test_a_valid_single_axis_answer_parses():
     parsed = fork_director.parse_semantic_intent(
-        _stdout(_axis("section_reactivity", "steadier", 80)))
+        _stdout(_axis("section_reactivity", "steadier", 80, "requested")))
     assert parsed is not None
     intent, explanation = parsed
     assert explanation == ""
@@ -242,15 +260,32 @@ def test_a_valid_single_axis_answer_parses():
 
 
 def test_the_real_measured_model_output_parses():
-    """Verbatim stdout from the selected 4B model on the A1 sentence P2-R3 measured."""
-    raw = ('{"intent": {"section_reactivity": {"direction": "steadier", "strength": 80}}, '
-           '"explanation": "The intention to keep scene choice relatively even across sections '
-           'implies a consistent scene selection regardless of musical intensity."} [end of text]')
+    """Verbatim stdout from the selected 4B model on the A1 sentence, as RC0-P3 recorded it.
+
+    Pretty-printed with newlines and no ``explanation`` key, exactly as the real run came back —
+    both of which the strict parser has to accept, and neither of which a hand-written fixture
+    would have thought to include.
+    """
+    raw = (
+        '{\n'
+        '  "intent": {\n'
+        '    "section_reactivity": {\n'
+        '      "direction": "steadier",\n'
+        '      "strength": 85,\n'
+        '      "basis": "requested"\n'
+        '    }\n'
+        '  }\n'
+        '} [end of text]'
+    )
     parsed = fork_director.parse_semantic_intent(raw)
     assert parsed is not None
     intent, explanation = parsed
-    assert intent.by_axis()["section_reactivity"].direction == "steadier"
-    assert explanation.startswith("The intention to keep scene choice")
+    request = intent.by_axis()["section_reactivity"]
+    assert request.direction == "steadier"
+    assert request.strength == 85
+    assert request.basis == fork_director.BASIS_REQUESTED
+    assert request.is_actionable
+    assert explanation == ""
 
 
 def test_an_empty_intent_is_valid_and_means_no_expressed_preference():
@@ -265,14 +300,14 @@ def test_an_empty_intent_is_valid_and_means_no_expressed_preference():
 def test_all_six_axes_may_be_reported_at_once():
     intent_payload: dict[str, Any] = {}
     for axis in AXES:
-        intent_payload.update(_axis(axis, EXPECTED_DIRECTIONS[axis][1], 100))
+        intent_payload.update(_axis(axis, EXPECTED_DIRECTIONS[axis][1], 100, "requested"))
     parsed = fork_director.parse_semantic_intent(_stdout(intent_payload))
     assert parsed is not None
     assert len(parsed[0].requests) == 6
 
 
 def test_the_end_of_generation_marker_is_stripped_but_nothing_else_is():
-    body = _stdout(_axis("cut_pacing", "denser", 50), marker=False)
+    body = _stdout(_axis("cut_pacing", "denser", 50, "requested"), marker=False)
     assert fork_director.parse_semantic_intent(body) is not None
     assert fork_director.parse_semantic_intent(body + " [end of text]") is not None
     assert fork_director.parse_semantic_intent(body + "\n [end of text] \n") is not None
@@ -312,13 +347,17 @@ def test_a_direction_from_the_wrong_axis_or_the_wrong_case_rejects_everything(ax
 
 @pytest.mark.parametrize("strength", [0, -1, 101, 1000, True, False, 50.0, 50.5, "50", None, [50]])
 def test_a_malformed_strength_rejects_the_whole_payload(strength: Any):
-    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser", "strength": strength}}})
+    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser",
+                                                "strength": strength,
+                                                "basis": "requested"}}})
     assert fork_director.parse_semantic_intent(raw) is None
 
 
 @pytest.mark.parametrize("strength", [1, 2, 49, 50, 51, 99, 100])
 def test_every_in_range_strength_endpoint_is_accepted(strength: int):
-    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser", "strength": strength}}})
+    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser",
+                                                "strength": strength,
+                                                "basis": "requested"}}})
     parsed = fork_director.parse_semantic_intent(raw)
     assert parsed is not None
     assert parsed[0].requests[0].strength == strength
@@ -367,8 +406,8 @@ def test_one_axis_cannot_be_reported_twice():
     """JSON collapses duplicate keys, so the guard lives on the record itself."""
     with pytest.raises(ValueError):
         fork_director.SemanticIntent(requests=(
-            fork_director.SemanticAxisRequest("cut_pacing", "denser", 50),
-            fork_director.SemanticAxisRequest("cut_pacing", "sparser", 50),
+            fork_director.SemanticAxisRequest("cut_pacing", "denser", 50, "requested"),
+            fork_director.SemanticAxisRequest("cut_pacing", "sparser", 50, "requested"),
         ))
 
 
@@ -431,7 +470,7 @@ def test_the_magnitude_refuses_an_invalid_strength(bad: Any):
 
 def test_an_omitted_axis_leaves_its_control_at_exactly_fifty():
     intent = fork_director.SemanticIntent(
-        requests=(fork_director.SemanticAxisRequest("cut_pacing", "denser", 100),))
+        requests=(fork_director.SemanticAxisRequest("cut_pacing", "denser", 100, "requested"),))
     resolved = fork_director.resolve_semantic_intent(intent)
     assert resolved["cut_density"] == 100
     for control in fork_presets.CREATIVE_CONTROL_FIELDS:
@@ -447,9 +486,9 @@ def test_both_directions_of_every_axis_land_on_the_right_side_of_neutral(axis: s
     magnitude = fork_director.magnitude_for_strength(strength)
 
     low = fork_director.resolve_semantic_intent(fork_director.SemanticIntent(
-        requests=(fork_director.SemanticAxisRequest(axis, negative, strength),)))
+        requests=(fork_director.SemanticAxisRequest(axis, negative, strength, "requested"),)))
     high = fork_director.resolve_semantic_intent(fork_director.SemanticIntent(
-        requests=(fork_director.SemanticAxisRequest(axis, positive, strength),)))
+        requests=(fork_director.SemanticAxisRequest(axis, positive, strength, "requested"),)))
 
     assert low[control] == 50 - magnitude
     assert high[control] == 50 + magnitude
@@ -461,7 +500,7 @@ def test_every_resolved_control_is_a_plain_int_in_range():
         for direction in fork_director.directions(axis):
             for strength in range(1, 101):
                 resolved = fork_director.resolve_semantic_intent(fork_director.SemanticIntent(
-                    requests=(fork_director.SemanticAxisRequest(axis, direction, strength),)))
+                    requests=(fork_director.SemanticAxisRequest(axis, direction, strength, "requested"),)))
                 for value in resolved.values():
                     assert isinstance(value, int) and not isinstance(value, bool)
                     assert fork_creative.CONTROL_MIN <= value <= fork_creative.CONTROL_MAX
@@ -469,8 +508,8 @@ def test_every_resolved_control_is_a_plain_int_in_range():
 
 def test_the_mapping_is_deterministic():
     intent = fork_director.SemanticIntent(requests=(
-        fork_director.SemanticAxisRequest("motion_preference", "dynamic", 100),
-        fork_director.SemanticAxisRequest("source_variety", "diverse", 75),
+        fork_director.SemanticAxisRequest("motion_preference", "dynamic", 100, "requested"),
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 75, "requested"),
     ))
     first = fork_director.resolve_semantic_intent(intent)
     for _ in range(50):
@@ -498,7 +537,7 @@ def test_a_non_intent_resolves_to_nothing(bad: Any):
 ])
 def test_the_axis_request_record_refuses_an_invalid_combination(axis, direction, strength):
     with pytest.raises(ValueError):
-        fork_director.SemanticAxisRequest(axis, direction, strength)
+        fork_director.SemanticAxisRequest(axis, direction, strength, "requested")
 
 
 # ===========================================================================
@@ -516,7 +555,7 @@ DIVERSE_LIBRARY = fork_prep.PreparedMediaSummary(
 
 def _diverse_intent(strength: int = 100) -> fork_director.SemanticIntent:
     return fork_director.SemanticIntent(
-        requests=(fork_director.SemanticAxisRequest("source_variety", "diverse", strength),))
+        requests=(fork_director.SemanticAxisRequest("source_variety", "diverse", strength, "requested"),))
 
 
 def test_a_proposal_without_media_has_identical_base_and_final():
@@ -560,7 +599,7 @@ def test_a_fully_supported_library_leaves_the_recipe_alone():
 
 def test_a_reuse_request_is_never_media_adjusted():
     intent = fork_director.SemanticIntent(
-        requests=(fork_director.SemanticAxisRequest("source_variety", "reuse", 100),))
+        requests=(fork_director.SemanticAxisRequest("source_variety", "reuse", 100, "requested"),))
     proposal = fork_director.build_proposal("a few heroes", intent, "", 4242,
                                             summary=CONCENTRATED)
     assert proposal.final_recipe.source_diversity == 0
@@ -569,7 +608,7 @@ def test_a_reuse_request_is_never_media_adjusted():
 
 def test_no_other_control_is_ever_media_adjusted():
     intent = fork_director.SemanticIntent(requests=tuple(
-        fork_director.SemanticAxisRequest(axis, EXPECTED_DIRECTIONS[axis][1], 100)
+        fork_director.SemanticAxisRequest(axis, EXPECTED_DIRECTIONS[axis][1], 100, "requested")
         for axis in AXES))
     proposal = fork_director.build_proposal("everything up", intent, "", 4242,
                                             summary=CONCENTRATED)
@@ -904,3 +943,359 @@ def test_the_director_does_not_read_the_current_sliders_or_any_screen_state():
     source = _executable_source(_DIRECTOR).lower()
     for forbidden in ("current_", "live_", "on_screen", "existing_recipe", "transform"):
         assert forbidden not in source, f"director.py mentions {forbidden!r}"
+
+
+# ===========================================================================
+# 11. THE EVIDENCE BASIS: WAS IT REQUESTED, OR DOES IT MERELY SUIT THE STYLE?
+# ===========================================================================
+#
+# RC0-P0..P4 measured seven prompt wordings trying to stop the model inferring `source_variety`
+# from mood alone, and none of them worked. `basis` solves it by asking a different question, and
+# the product policy that consumes it is what these tests pin.
+
+def test_the_two_basis_values_are_exactly_requested_and_associated():
+    assert fork_director.BASIS_REQUESTED == "requested"
+    assert fork_director.BASIS_ASSOCIATED == "associated"
+    assert fork_director.BASIS_VALUES == ("requested", "associated")
+    assert isinstance(fork_director.BASIS_VALUES, tuple)
+
+
+def test_basis_is_not_a_seventh_axis():
+    """It is metadata about one existing request, so the registry stays at six."""
+    assert len(fork_director.SEMANTIC_AXES) == 6
+    assert fork_director.BASIS_KEY not in fork_director.SEMANTIC_AXES
+    schema = fork_director.model_schema()
+    assert sorted(schema["properties"]["intent"]["properties"]) == sorted(AXES)
+
+
+def test_the_model_facing_surface_never_calls_basis_a_confidence():
+    surface = (fork_director.system_prompt() + fork_director.model_schema_json()).lower()
+    assert "confidence" not in surface
+
+
+@pytest.mark.parametrize("basis", ["requested", "associated"])
+def test_both_basis_values_are_accepted_on_every_axis(basis: str):
+    for axis in AXES:
+        request = fork_director.SemanticAxisRequest(
+            axis, EXPECTED_DIRECTIONS[axis][1], 50, basis)
+        assert request.basis == basis
+
+
+@pytest.mark.parametrize("basis", [
+    "guessed", "inferred", "REQUESTED", "", " requested", "requested ", "neutral",
+    None, 1, 0, True, 1.0, ["requested"], {"basis": "requested"},
+])
+def test_an_unknown_or_non_string_basis_is_rejected_by_the_record(basis: Any):
+    with pytest.raises(ValueError):
+        fork_director.SemanticAxisRequest("cut_pacing", "denser", 50, basis)
+
+
+def test_a_present_axis_without_a_basis_rejects_the_whole_payload():
+    """And is specifically NOT read as "requested" - no default promotes unclassified output."""
+    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser", "strength": 50}}})
+    assert fork_director.parse_semantic_intent(raw) is None
+
+
+@pytest.mark.parametrize("basis", ["guessed", "", "REQUESTED", None, 1, True, 1.0, ["requested"]])
+def test_a_malformed_basis_rejects_the_whole_payload(basis: Any):
+    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser", "strength": 50,
+                                                "basis": basis}}})
+    assert fork_director.parse_semantic_intent(raw) is None
+
+
+def test_an_extra_per_axis_property_still_rejects_the_whole_payload():
+    raw = json.dumps({"intent": {"cut_pacing": {"direction": "denser", "strength": 50,
+                                                "basis": "requested", "why": "because"}}})
+    assert fork_director.parse_semantic_intent(raw) is None
+
+
+def test_the_basis_reaches_describe_so_provenance_is_visible():
+    request = fork_director.SemanticAxisRequest("source_variety", "diverse", 20, "associated")
+    assert request.describe() == "source_variety diverse (20, associated)"
+
+
+def test_a_request_carrying_a_basis_is_still_deepcopy_safe():
+    intent = fork_director.SemanticIntent(requests=(
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 20, "associated"),
+        fork_director.SemanticAxisRequest("cut_pacing", "sparser", 80, "requested"),
+    ))
+    clone = copy.deepcopy(intent)
+    assert clone == intent
+    assert clone.requests[0].basis == "associated"
+
+
+# ===========================================================================
+# 12. THE ACTIONABILITY POLICY - ONE PRODUCT TRUTH, OWNED BY THE RESOLVER
+# ===========================================================================
+
+#: The frozen RC0-P3 product decision, restated here so a change to the module has to change the
+#: test too. `associated` is actionable only where ordinary style language is *meant* to imply the
+#: dimension.
+EXPECTED_ACTIONABLE = {
+    "cut_pacing": {"requested": True, "associated": True},
+    "scene_reading": {"requested": True, "associated": True},
+    "motion_preference": {"requested": True, "associated": True},
+    "impact_accents": {"requested": True, "associated": False},
+    "section_reactivity": {"requested": True, "associated": False},
+    "source_variety": {"requested": True, "associated": False},
+}
+
+
+def test_the_policy_partitions_the_six_axes():
+    assert fork_director.STYLE_INFERABLE_ASSOCIATED_AXES == frozenset(
+        {"cut_pacing", "scene_reading", "motion_preference"})
+    assert fork_director.REQUESTED_ONLY_AXES == frozenset(
+        {"impact_accents", "section_reactivity", "source_variety"})
+    assert fork_director.STYLE_INFERABLE_ASSOCIATED_AXES.isdisjoint(
+        fork_director.REQUESTED_ONLY_AXES)
+    assert (fork_director.STYLE_INFERABLE_ASSOCIATED_AXES
+            | fork_director.REQUESTED_ONLY_AXES) == set(AXES)
+
+
+@pytest.mark.parametrize("axis", AXES)
+@pytest.mark.parametrize("basis", ["requested", "associated"])
+def test_is_actionable_matches_the_frozen_product_policy(axis: str, basis: str):
+    request = fork_director.SemanticAxisRequest(axis, EXPECTED_DIRECTIONS[axis][1], 50, basis)
+    assert request.is_actionable is EXPECTED_ACTIONABLE[axis][basis]
+
+
+@pytest.mark.parametrize("axis", AXES)
+@pytest.mark.parametrize("basis", ["requested", "associated"])
+@pytest.mark.parametrize("strength", [1, 100])
+def test_the_resolver_applies_the_policy_for_every_axis_basis_and_endpoint(
+        axis: str, basis: str, strength: int):
+    """Strength must never decide actionability - only how far an actionable request moves."""
+    control = EXPECTED_CONTROLS[axis]
+    intent = fork_director.SemanticIntent(requests=(
+        fork_director.SemanticAxisRequest(axis, EXPECTED_DIRECTIONS[axis][1], strength, basis),))
+    resolved = fork_director.resolve_semantic_intent(intent)
+    assert resolved is not None
+    if EXPECTED_ACTIONABLE[axis][basis]:
+        expected = fork_creative.DEFAULT_CONTROL + fork_director.magnitude_for_strength(strength)
+        assert resolved[control] == expected
+    else:
+        assert resolved[control] == fork_creative.DEFAULT_CONTROL
+    for other in fork_presets.CREATIVE_CONTROL_FIELDS:
+        if other != control:
+            assert resolved[other] == fork_creative.DEFAULT_CONTROL
+
+
+@pytest.mark.parametrize("axis", ["impact_accents", "section_reactivity", "source_variety"])
+@pytest.mark.parametrize("strength", [1, 25, 50, 75, 100])
+def test_a_requested_only_axis_resolves_exactly_as_omitted_on_an_associated_basis(
+        axis: str, strength: int):
+    """The whole product meaning of `basis`: identical to never having reported the axis."""
+    control = EXPECTED_CONTROLS[axis]
+    for direction in EXPECTED_DIRECTIONS[axis]:
+        suppressed = fork_director.resolve_semantic_intent(fork_director.SemanticIntent(
+            requests=(fork_director.SemanticAxisRequest(axis, direction, strength,
+                                                        "associated"),)))
+        omitted = fork_director.resolve_semantic_intent(fork_director.SemanticIntent())
+        assert suppressed == omitted
+        assert suppressed[control] == 50
+
+
+def test_the_raw_intent_is_never_filtered_in_place():
+    """Provenance survives: `requests` keeps what the model said, actionability is a view."""
+    intent = fork_director.SemanticIntent(requests=(
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 80, "associated"),
+        fork_director.SemanticAxisRequest("cut_pacing", "sparser", 60, "requested"),
+    ))
+    fork_director.resolve_semantic_intent(intent)
+    assert len(intent.requests) == 2
+    assert [r.axis for r in intent.actionable_requests()] == ["cut_pacing"]
+    assert [r.axis for r in intent.non_actionable_associations()] == ["source_variety"]
+
+
+def test_actionable_bases_is_total_and_rejects_an_unknown_axis():
+    for axis in AXES:
+        assert fork_director.actionable_bases(axis) <= frozenset(fork_director.BASIS_VALUES)
+        assert fork_director.BASIS_REQUESTED in fork_director.actionable_bases(axis)
+    with pytest.raises(KeyError):
+        fork_director.actionable_bases("not_an_axis")
+
+
+# ===========================================================================
+# 13. MEDIA COMPOSITION: A SUPPRESSED ASSOCIATION CANNOT BE RESURRECTED
+# ===========================================================================
+
+def test_an_associated_source_variety_request_cannot_be_revived_by_media_adaptation():
+    """BASE 50 -> the adapter's `BASE > 50` gate cannot fire -> FINAL 50, no adjustment.
+
+    The ordering is the point: `basis` resolves *before* the media layer, so the adapter never sees
+    a direction it could attenuate. A media step that invented one from neutral would be inventing
+    a preference the user never expressed.
+    """
+    concentrated = fork_prep.PreparedMediaSummary(
+        candidate_moments=309, effective_sources=4.0,
+        top_source_share=0.4126, median_moments_per_source=77.0)
+    assert concentrated.is_usable()
+    intent = fork_director.SemanticIntent(requests=(
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 100, "associated"),))
+    base = fork_director.resolve_semantic_intent(intent)
+    assert base["source_diversity"] == 50
+    final, adjustment = fork_director.apply_media_adaptation(base, concentrated)
+    assert final["source_diversity"] == 50
+    assert adjustment is None
+
+
+def test_the_same_request_on_a_requested_basis_is_adapted_exactly_as_before():
+    """The suppression must not have broken the authorized media path for real requests."""
+    concentrated = fork_prep.PreparedMediaSummary(
+        candidate_moments=309, effective_sources=4.0,
+        top_source_share=0.4126, median_moments_per_source=77.0)
+    intent = fork_director.SemanticIntent(requests=(
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 100, "requested"),))
+    base = fork_director.resolve_semantic_intent(intent)
+    assert base["source_diversity"] == 100
+    final, adjustment = fork_director.apply_media_adaptation(base, concentrated)
+    assert adjustment is not None
+    assert 50 <= final["source_diversity"] < base["source_diversity"]
+
+
+# ===========================================================================
+# 14. TRUTHFUL DISCLOSURE: THE "NOT APPLIED" LINE
+# ===========================================================================
+#
+# `basis` created a distinction the read-out could not previously have: `explanation` describes the
+# model's RAW reading, the recipe shows what was APPLIED, and on a requested-only axis those can
+# legitimately disagree. The decision (RC0 transparency gate, option 1) is to state the difference
+# structurally and leave the model's prose completely alone.
+
+_MISLEADING = ("Everything about this instruction points at a much wider spread across every "
+               "single source video, and the edit now leans hard on source variety throughout.")
+
+
+def _proposal(requests, explanation="", summary=None, media_note=""):
+    return fork_director.build_proposal(
+        "an instruction", fork_director.SemanticIntent(requests=tuple(requests)),
+        explanation, seed=4242, summary=summary, media_note=media_note)
+
+
+def test_an_associated_source_variety_keeps_the_prose_and_discloses_the_suppression():
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("source_variety", "diverse", 20, "associated")],
+        explanation="...suggests using more of the available clips...")
+    text = proposal.display_text()
+    assert proposal.recipe.source_diversity == 50
+    assert "Director: ...suggests using more of the available clips..." in text
+    assert proposal.not_applied_line() == (
+        "Not applied (associated, not requested): Source variety - left neutral.")
+    assert proposal.not_applied_line() in text
+
+
+def test_the_disclosure_comes_from_structured_intent_not_from_the_explanation():
+    """A deliberately misleading explanation must not change which axes are listed."""
+    requests = [fork_director.SemanticAxisRequest("impact_accents", "more", 70, "associated")]
+    for explanation in ("", "x", _MISLEADING, "source variety source variety source variety"):
+        proposal = _proposal(requests, explanation=explanation)
+        assert proposal.not_applied_line() == (
+            "Not applied (associated, not requested): Impact accents - left neutral.")
+    silent = _proposal(
+        [fork_director.SemanticAxisRequest("source_variety", "reuse", 50, "associated")],
+        explanation="A calm, unhurried reading.")
+    assert "Source variety" in silent.not_applied_line()
+
+
+def test_an_associated_style_inferable_axis_is_actionable_and_not_disclosed():
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("motion_preference", "dynamic", 60, "associated")],
+        explanation="a kinetic reading")
+    assert proposal.recipe.motion_bias == 80
+    assert proposal.not_applied_line() == ""
+    assert "Not applied" not in proposal.display_text()
+
+
+def test_several_suppressed_associations_are_listed_in_registry_order():
+    proposal = _proposal([
+        fork_director.SemanticAxisRequest("impact_accents", "more", 70, "associated"),
+        fork_director.SemanticAxisRequest("source_variety", "reuse", 50, "associated"),
+        fork_director.SemanticAxisRequest("motion_preference", "calmer", 60, "associated"),
+    ])
+    assert proposal.not_applied_line() == (
+        "Not applied (associated, not requested): Impact accents, Source variety - left neutral.")
+    assert proposal.recipe.micro_cuts == 50
+    assert proposal.recipe.source_diversity == 50
+    assert proposal.recipe.motion_bias == 20
+
+
+def test_a_requested_source_variety_is_applied_and_never_disclosed_as_suppressed():
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("source_variety", "diverse", 80, "requested")])
+    assert proposal.recipe.source_diversity == 90
+    assert proposal.not_applied_line() == ""
+    assert "Not applied" not in proposal.display_text()
+
+
+def test_no_suppressed_association_leaves_the_compact_read_out_unchanged():
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("cut_pacing", "sparser", 80, "requested")],
+        explanation="Fewer cuts.")
+    lines = proposal.display_text().splitlines()
+    assert lines[0] == "Instruction: an instruction"
+    assert lines[1] == proposal.final_recipe.describe()
+    assert lines[2] == "Director: Fewer cuts."
+    assert lines[3].startswith("Proposal only")
+    assert len(lines) == 4
+
+
+def test_the_disclosure_survives_a_media_adjustment_and_keeps_the_documented_order():
+    """A different axis is suppressed while an actionable Source Diversity is attenuated."""
+    concentrated = fork_prep.PreparedMediaSummary(
+        candidate_moments=309, effective_sources=4.0,
+        top_source_share=0.4126, median_moments_per_source=77.0)
+    proposal = _proposal([
+        fork_director.SemanticAxisRequest("source_variety", "diverse", 80, "requested"),
+        fork_director.SemanticAxisRequest("impact_accents", "more", 70, "associated"),
+    ], explanation="Broader source use, with punchier accents to match.", summary=concentrated)
+    assert proposal.media_adjusted
+    lines = [line for line in proposal.display_text().splitlines() if line]
+    order = [
+        next(i for i, line in enumerate(lines) if line.startswith("Base:")),
+        next(i for i, line in enumerate(lines) if line.startswith("Director:")),
+        next(i for i, line in enumerate(lines) if line.startswith("Not applied")),
+        next(i for i, line in enumerate(lines) if line.startswith("Media adjustment:")),
+        next(i for i, line in enumerate(lines) if line.startswith("Final:")),
+    ]
+    assert order == sorted(order), lines
+    assert proposal.recipe.micro_cuts == 50
+
+
+def test_the_disclosure_never_exposes_an_execution_control_name():
+    proposal = _proposal([
+        fork_director.SemanticAxisRequest(axis, EXPECTED_DIRECTIONS[axis][1], 70, "associated")
+        for axis in sorted(fork_director.REQUESTED_ONLY_AXES)
+    ])
+    line = proposal.not_applied_line().lower()
+    assert line
+    for control in fork_presets.CREATIVE_CONTROL_FIELDS:
+        for spelling in (control, control.replace("_", " "), control.replace("_", "-")):
+            assert spelling not in line, spelling
+
+
+def test_the_display_labels_cover_the_six_axes_and_carry_no_execution_vocabulary():
+    assert set(fork_director.AXIS_DISPLAY_LABELS) == set(AXES)
+    joined = " ".join(fork_director.AXIS_DISPLAY_LABELS.values()).lower()
+    for control in fork_presets.CREATIVE_CONTROL_FIELDS:
+        assert control not in joined
+        assert control.replace("_", " ") not in joined
+
+
+def test_the_disclosure_does_not_claim_the_instruction_objectively_lacked_the_request():
+    """Attribution matters: we have a model classification, not ground truth about the user."""
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("source_variety", "diverse", 20, "associated")])
+    line = proposal.not_applied_line().lower()
+    assert "associated, not requested" in line
+    for overclaim in ("the instruction did not", "you did not", "the user did not",
+                      "no request", "nothing was requested"):
+        assert overclaim not in line
+
+
+def test_the_read_out_never_calls_the_disclosure_a_correction_or_the_model_wrong():
+    proposal = _proposal(
+        [fork_director.SemanticAxisRequest("source_variety", "diverse", 20, "associated")],
+        explanation="a reading")
+    text = proposal.display_text().lower()
+    for word in ("incorrect", "wrong", "mistake", "error", "ignored", "discarded", "sanitiz"):
+        assert word not in text, word

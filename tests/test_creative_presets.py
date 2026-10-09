@@ -979,6 +979,12 @@ def _intent_for(controls: dict):
 
     Every preset value is reachable: a control at exactly 50 means the axis is simply omitted, and
     otherwise `strength = 2 * |value - 50|` inverts `magnitude_for_strength` exactly.
+
+    Every request is built on a ``requested`` basis, and that is the honest label rather than a
+    convenience: this helper reconstructs a preset's *intended* control values, so each axis has to
+    be actionable for the projection to land on those numbers at all. An ``associated`` basis would
+    resolve the three requested-only axes back to 50 and the projection would no longer describe
+    the preset — see the evidence-basis section of `.claude/rules/director.md`.
     """
     from beatsync_fork import director as fork_director
 
@@ -993,6 +999,7 @@ def _intent_for(controls: dict):
             axis=axis,
             direction=positive if delta > 0 else negative,
             strength=2 * abs(delta),
+            basis=fork_director.BASIS_REQUESTED,
         ))
     return fork_director.SemanticIntent(requests=tuple(requests))
 
