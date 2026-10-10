@@ -40,12 +40,28 @@ runs each, in the balanced order `1,16,16,1,1,16` frozen before any timing was o
 
 The warm figure reconfirms L1B's 8.77x on a larger library; the cold figure inverts it. The groups do
 not overlap — every worker-16 cold run (115.185–116.135 s) was slower than every worker-1 cold run
-(97.933–103.280 s), with worker-16 spread of only 0.950 s — so this is not noise. Cold, the phase is
-bound by platter seeks rather than by latency threads can hide: 16 readers walking 1815 scattered
-files interleave their seeks and destroy sequential readahead. Warm there is no seek, so the `stat`
-plus bounded-fingerprint work parallelises cleanly. The 16-worker default therefore stands as a
-**warm-path** optimisation and is **not** a first-touch improvement. The sign is HDD-specific and is
-not generalised to NVMe/SSD.
+(97.933–103.280 s), with worker-16 spread of only 0.950 s — so this is not noise.
+
+**Classification: `H2_RESULT_CATEGORY = D — COLD_PARALLEL_REGRESSION`, recording a new maintenance
+finding `COLD_PARALLEL_IDENTITY_REGRESSION`.** The 16-worker path is a proven warm-cache optimisation,
+**but** H2 establishes a cold first-touch regression on this measured mechanical-HDD workload — and
+production currently applies that same default in both cache states. This entry **records** the
+regression; it does not correct it, and the correction strategy is a separate future decision.
+
+The finding is scoped deliberately: it is measured on this 1815-source mechanical-HDD library, applies
+to controlled first-touch/cold cache identity, is **not** proven universal across storage devices, and
+**does not affect identity correctness**. It is **not** a general regression of the parallel
+implementation — warm behaviour remains strongly beneficial.
+
+Separating what was measured from what explains it: the *measured fact* is that worker 16 is 17.9 %
+slower cold on this workload. The *supported interpretation* is that the result is consistent with
+seek/readahead contention on a mechanical HDD — 16 concurrent readers over scattered source files can
+increase physical seeking and disrupt sequential readahead, whereas a warm pass does no physical I/O
+and the `stat` plus bounded-fingerprint work parallelises cleanly. **H2 measured the timing effect,
+not the storage mechanism**: it did not instrument seek counts, storage queue depth, readahead
+decisions or head movement, so the mechanism is not asserted as fact. The *open question* is cold
+behaviour on SSD/NVMe, which remains **unmeasured**; the sign is therefore not generalised beyond this
+HDD.
 
 **Identity parity is exact**, which is the contract the worker knob is bound by: a single ordered
 `sha256` over all 1815 positions across every worker-1 and worker-16 run, 0 `None` results,
@@ -66,8 +82,17 @@ valid and are the 8.58x reconfirmation above.
 
 This measurement ran entirely against a frozen out-of-repository source export: 0 Qwen jobs,
 0 `analyze_video_sources` calls, 0 cache payload writes, 0 renders, and no writes to production
-`input/` or `output/`. The historical **~69 s** in-Stage-5 discrepancy remains unreproduced and
-unresolved; nothing here retcons it.
+`input/` or `output/`. It is an identity-phase benchmark only — no full Stage-5 speed-up or slow-down
+may be inferred from it.
+
+**The historical ~69 s full-call result remains unreproduced, but H2 now strongly explains its
+cold/warm shape** through controlled identity-I/O measurement
+(`HISTORICAL_69S_STATUS = STRONGLY_EXPLAINED_BUT_NOT_REPRODUCED`). It is not reproduced because that
+figure came from ~845 sources through a full `analyze_video_sources()` call, which H2 never made. It
+is strongly explained because controlled first-touch identity repeatedly measures ~98–100 s serial
+against ~6.6 s warm on the larger real library — the same order of magnitude and the same direction as
+~69 s versus ~3.2–3.4 s, which supports identity I/O and OS file-cache state as the explanation for
+that shape. Neither `RESOLVED` nor `REPRODUCED`; nothing here retcons the original number.
 
 ### Fixed — 2026-10-10 (installer tool idempotence)
 

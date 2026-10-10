@@ -121,30 +121,50 @@ bounded fingerprint windows), against the exact production identity operation:
 Exact identity parity over the same library: **20,064 comparisons, 0 mismatches, 0 `None` results,
 0 missing results, 0 duplicate results.**
 
-**Measured cold (H2), and it inverts: concurrency makes the cold identity phase SLOWER.** On the
-real 1815-source Windows library under a controlled standby-list purge before every timed run,
+### Measured cold (H2): `COLD_PARALLEL_IDENTITY_REGRESSION`
+
+```
+H2_RESULT_CATEGORY          = D — COLD_PARALLEL_REGRESSION
+NEW_MAINTENANCE_FINDING     = COLD_PARALLEL_IDENTITY_REGRESSION
+```
+
+On the real 1815-source Windows library under a controlled standby-list purge before every timed run,
 median of 3 valid runs each:
 
 | workers | cold identity phase | warm control | cold vs 1 worker |
 |---|---|---|---|
 | 1 | **98.190 s** | 6.585 s | — |
-| **16** | **115.806 s** | 0.767 s | **0.85x — a 17.9 % slow-down** |
+| **16** | **115.806 s** | 0.767 s | **0.8479x — a 17.9 % slow-down** |
 
 The warm column reconfirms the 8.77x above (8.58x at 1815 sources). The cold column is the opposite
 sign, and the groups do not overlap: every worker-16 cold run (115.185–116.135 s) was slower than
-every worker-1 cold run (97.933–103.280 s). `J:` is a **mechanical HDD**, and cold the phase is bound
-by platter seeks rather than by latency threads can hide — 16 readers walking 1815 scattered files
-interleave their seeks and destroy sequential readahead. Warm there is no seek, so the `stat` +
-BLAKE2b work parallelises cleanly.
+every worker-1 cold run (97.933–103.280 s).
 
-So **do not describe the 16-worker default as a cold-start or first-touch improvement** — it is a
-warm-path optimisation, and on an HDD it costs ~18 % on the cold path. The *measurement* is evidence
-about this library on this disk; the *mechanism* is HDD-specific, so the sign must not be assumed to
-carry to NVMe/SSD. That is a new measurement, not an inference. Identity parity held exactly across
-the whole H2 run — one ordered digest over all 1815 positions in every worker-1 and worker-16 run,
-0 `None`, 0 exceptions, 0 drift, 0 duplicate positions — which is the contract that matters here:
-the worker count reaches no key. See `.claude/rules/stage5-reporting.md` for the full boundary of
-what the cold figures do and do not support.
+**Both of these are true of the *same* current default, and must be stated together.** The 16-worker
+path is a proven warm-cache optimisation, **but** H2 establishes a cold first-touch regression on this
+measured mechanical-HDD workload — and production uses that one default in both states. So never
+describe the 16-worker default as a cold-start or first-touch improvement, and do not read this
+finding as implying the cold regression has been corrected. **It has not.** Choosing a correction
+strategy is a separate, future authorization.
+
+**Scope of the finding.** It is measured on this 1815-source mechanical-HDD library
+(`J:` — `WDC WD30EFRX`), applies to controlled first-touch/cold cache identity, is **not** proven
+universal across storage devices, and **does not affect identity correctness**. It is not a general
+regression of the parallel implementation — warm behaviour remains strongly beneficial.
+
+**Mechanism is interpretation, not measurement.** The result is consistent with seek/readahead
+contention on a mechanical HDD: 16 concurrent readers over scattered source files can increase
+physical seeking and disrupt sequential readahead, whereas a warm pass does no physical I/O at all
+and the `stat` + BLAKE2b work parallelises cleanly. **H2 measured the timing effect, not the storage
+mechanism** — it did not instrument seek counts, storage queue depth, readahead decisions or head
+movement. Accordingly the *sign* must not be assumed to carry to NVMe/SSD, where cold behaviour is
+**unmeasured**; establishing it is new measurement work, not an inference from this result.
+
+Identity parity held exactly across the whole H2 run — one ordered digest over all 1815 positions in
+every worker-1 and worker-16 run, 0 `None`, 0 exceptions, 0 drift, 0 duplicate positions — which is
+the contract that matters here: the worker count reaches no key. See
+`.claude/rules/stage5-reporting.md` for the full boundary of what the cold figures do and do not
+support.
 
 **If the invocation-level backend identity fails, AI caching is off for that entire run.** The
 orchestrator holds an explicit `ai_cache_disabled` state and then does not call `_cache_path` at all —

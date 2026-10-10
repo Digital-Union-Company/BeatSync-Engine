@@ -106,7 +106,7 @@ fingerprint bytes:
 | first-touch / current-state **serial** identity | **~103.8–110.5 s** |
 | immediate **warm serial** identity | ~6.5–10.5 s |
 | warm **16-thread** identity benchmark | **~0.746 s** median (8.77x vs the warm serial benchmark baseline of 6.545 s) |
-| controlled **cold parallel** speed-up | **MEASURED by H2 — it is a SLOW-DOWN: 0.85x** (see below) |
+| controlled **cold parallel** speed-up | **MEASURED by H2 — it is a SLOW-DOWN: 0.8479x** (Category D, see below) |
 
 Three things follow, and the boundaries between them matter:
 
@@ -128,7 +128,14 @@ results, 0 missing results, 0 duplicate results.** The contract is
 (`cache_identity_seconds` is now wall-clock phase latency, not a serial sum) is
 `.claude/rules/scale-diagnostics.md`.
 
-### H2 measured the cold parallel case — the answer is a slow-down
+### H2 measured the cold parallel case — Category D, a cold regression
+
+```
+H2_RESULT_CATEGORY          = D — COLD_PARALLEL_REGRESSION
+NEW_MAINTENANCE_FINDING     = COLD_PARALLEL_IDENTITY_REGRESSION
+H2_MEASUREMENT_DEBT_CLOSED  = YES
+HISTORICAL_69S_STATUS       = STRONGLY_EXPLAINED_BUT_NOT_REPRODUCED
+```
 
 The row above used to read `NOT MEASURED`, with the instruction not to claim a cold parallel
 improvement "until one is measured on Windows against the exact candidate". H2 measured exactly that,
@@ -144,23 +151,50 @@ immediate no-reset warm control inside every slot. Median of 3 valid runs each, 
 
 So the warm 8.77x reconfirms (8.58x at 1815 sources) and **the cold case goes the other way.** The
 groups do not overlap: every worker-16 cold run (115.185–116.135 s) was slower than every worker-1
-cold run (97.933–103.280 s), with worker-16 spread of only 0.950 s across three runs. `J:` is a
-**mechanical HDD** (`WDC WD30EFRX`), and cold the phase is bound by platter seeks, not by latency
-threads can hide.
+cold run (97.933–103.280 s), with worker-16 spread of only 0.950 s across three runs.
+
+**State both truths about the same default.** The 16-worker path is a proven warm-cache optimisation,
+**but** H2 establishes a cold first-touch regression on this measured mechanical-HDD workload. That
+matters operationally because production currently applies the same default in both cache states.
+Nothing here corrects the cold regression — it is recorded, not fixed.
 
 What this does and does not license:
 
-- **Do not claim a first-touch or cold-start improvement from the 16-worker default.** It is a
-  warm-path optimisation; on this disk it costs ~18 % cold. The earlier "evidence of *potential* user
-  value" reading of the ~103.8–110.5 s serial figure is **not** supported for the parallel path.
-- **Do not generalise the sign.** The measurement is solid for this library on this HDD; the
-  mechanism is HDD-specific and may not hold on NVMe/SSD. Measuring that is new work.
-- **The ~69 s in-Stage-5 discrepancy is still unresolved and still unreproduced.** H2 timed the
-  identity phase only, never called `analyze_video_sources`, ran 0 Qwen jobs and wrote 0 cache
-  payloads. Nothing here retcons it.
+- **Do not claim a first-touch or cold-start improvement from the 16-worker default.** On this disk it
+  costs ~18 % cold. The earlier "evidence of *potential* user value" reading of the ~103.8–110.5 s
+  serial figure is **not** supported for the parallel path.
+- **Separate the measured fact from its explanation.** *Measured fact:* worker 16 is 17.9 % slower
+  cold on this HDD workload. *Supported interpretation:* mechanical-disk seek/readahead contention is
+  a plausible explanation — 16 concurrent readers over scattered source files can increase physical
+  seeking and disrupt sequential readahead. **H2 measured the timing effect, not the storage
+  mechanism**; it did not instrument seek counts, queue depth, readahead decisions or head movement,
+  so the mechanism must not be stated as proven. *Open question:* cold behaviour on SSD/NVMe, which is
+  **unmeasured** — and measuring it is a measurement, not an implementation fix.
+- **Do not generalise the sign** beyond this library on this HDD.
+- **Scope the finding accurately.** It applies to controlled first-touch/cold cache identity on this
+  1815-source mechanical-HDD library, is not proven universal across storage devices, and **does not
+  affect identity correctness**. It is **not** a general regression of the parallel implementation.
+- **This is an identity-phase benchmark only** — do not infer a full Stage-5 speed-up or slow-down
+  from it.
 - **Identity parity under the cold regime is exact**, which is the contract that actually matters:
   one ordered digest across all 1815 positions in every worker-1 and worker-16 run, with 0 `None`,
   0 exceptions, 0 manifest drift and 0 duplicate positions. The worker count reaches no key.
+
+### The historical ~69 s: strongly explained in shape, still not reproduced
+
+`HISTORICAL_69S_STATUS = STRONGLY_EXPLAINED_BUT_NOT_REPRODUCED`. The historical ~69 s full-call result
+remains **unreproduced**, but H2 now **strongly explains its cold/warm shape** through controlled
+identity-I/O measurement. Keep the distinction explicit — it is neither `RESOLVED`/`REPRODUCED` nor
+simply `STILL_UNEXPLAINED`:
+
+- **Why not reproduced.** The historical figure was ~69 s over **845 sources** through a full
+  `analyze_video_sources()` call. H2 never called `analyze_video_sources`, ran **0** Qwen jobs and
+  wrote **0** cache payloads; it timed the identity phase alone. So "reproduced" is false, and nothing
+  here retcons the original number.
+- **Why strongly explained.** Controlled first-touch identity repeatedly measures ~98–100 s serial
+  against ~6.6 s warm on the larger real library. That is the same order of magnitude and the same
+  direction as ~69 s versus ~3.2–3.4 s, which strongly supports identity I/O and OS file-cache state
+  as the explanation for that cold-versus-warm shape.
 
 ## Counts and optional telemetry have different trust contracts (T1)
 
