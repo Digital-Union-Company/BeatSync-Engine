@@ -46,11 +46,19 @@ own immediate no-reset warm control:
 | 8 | 114.0817 s | 1.6973 s | 3.90x | PARETO |
 | 16 | 115.7938 s | **0.8070 s** | **8.20x** | PARETO (best warm) |
 
-Cold turned out to be a **step at 1→2 workers and then flat** — the whole penalty is paid by the
-second worker (+10.792 s) and the rest plateaus within ~1.5 s. So worker 1 is the only setting that
-avoids the regression, at 8.20x warm cost, and there is **no universally superior static
-replacement**: workers 1, 2, 8 and 16 all sit on the cold/warm frontier and **only worker 4 is
-dominated**, by worker 8, which is faster on both axes. Nobody should choose 4.
+The cold regression turned out to be **front-loaded at the 1→2 transition, which is the largest single
+increase (+10.7922 s) — but additional cold cost remains at higher worker counts.** w2→w16 adds a
+further +5.4799 s, giving +16.2721 s in total from w1 to w16; the individual steps are
+`1→2 +10.7922`, `2→4 +4.0214`, `4→8 −0.2536`, `8→16 +1.7121` s, so w2 through w16 span 5.4799 s while
+w4/w8/w16 form a tighter cluster spanning 1.7121 s.
+
+Worker 1 is therefore the only setting that avoids the regression, at 8.20x warm cost, and there is
+**no universally superior static replacement**: workers 1, 2, 8 and 16 all sit on the cold/warm
+frontier and **only worker 4 is dominated**, by worker 8, which is faster on both axes. Nobody should
+choose 4. That conclusion follows from the frontier and the measured cold-versus-warm trade-off — not
+from the cold curve being flat above worker 2, which it is not. Partial concurrency is the poor
+bargain: w2 already surrenders +10.7922 s of the +16.2721 s cold cost for only 1.77x of the available
+8.20x warm speed-up.
 
 Repeating the same full scan under the illustrative cold-first / fully-warm-subsequent model, worker 1
 leads by 16.2721 s / 10.4641 s / 4.6561 s at 1 / 2 / 3 scans and worker 16 first leads at the fourth

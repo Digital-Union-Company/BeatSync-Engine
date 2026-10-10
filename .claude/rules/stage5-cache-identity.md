@@ -194,11 +194,20 @@ there is no such point.** Same frozen 1815-source library and manifest, same rea
 | 8 | 114.0817 s | 1.6973 s | 3.90x | **PARETO** |
 | **16** | 115.7938 s | **0.8070 s** | **8.20x** | **PARETO** (best warm) |
 
-**Cold is a step at 1→2 workers, then flat.** The whole penalty is paid by the second worker
-(+10.792 s) and the rest plateaus within ~1.5 s. So worker 1 is the *only* setting that avoids the
-regression, and it costs 8.20x warm throughput. **Worker 4 is the one dominated point — worker 8 is
-faster on both axes, so never choose 4.** No static setting is universally superior across both cache
-states, which is why `STATIC_POLICY_CANDIDATE = NONE` and a lower static default is not justified.
+**The cold regression is front-loaded, but it does not stop at the second worker.** The 1→2
+transition is the largest single increase (**+10.7922 s**), and additional cold cost remains above it:
+w2→w16 adds a further **+5.4799 s**, for **+16.2721 s** in total from w1 to w16. The step sizes are
+`1→2 +10.7922`, `2→4 +4.0214`, `4→8 −0.2536`, `8→16 +1.7121` s — so the higher-worker measurements
+w4/w8/w16 form a tighter cluster spanning **1.7121 s**, while w2 through w16 span **5.4799 s**.
+
+So worker 1 is the only setting that avoids the regression, and it costs 8.20x warm throughput.
+**Worker 4 is the one dominated point — worker 8 is faster on both axes, so never choose 4.** No
+static setting is universally superior across both cache states, which is why
+`STATIC_POLICY_CANDIDATE = NONE` and a lower static default is not justified. **That conclusion rests
+on the frontier shape and the measured cold-versus-warm trade-off, not on the cold curve being flat
+above worker 2 — it is not.** Partial concurrency is the poor bargain here: w2 already gives up
++10.7922 s of the +16.2721 s cold cost while delivering only 1.77x of the available 8.20x warm
+speed-up.
 
 Repeating the same full scan, under the illustrative **cold-first / fully-warm-subsequent** model:
 

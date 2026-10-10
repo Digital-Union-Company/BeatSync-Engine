@@ -197,9 +197,13 @@ than an oversight:
   speed-up on the repeated case.
 - **A known HDD cold penalty**, unchanged and not fixed: +16.2721 s on a single controlled-cold scan
   versus worker 1.
-- **No universally superior static alternative.** Cold is a step at 1→2 workers then flat, so worker 1
-  is the only setting that avoids the penalty and it forfeits the warm benefit. Workers 1, 2, 8 and 16
-  are all on the cold/warm frontier; **only worker 4 is dominated** (by worker 8, faster on both axes).
+- **No universally superior static alternative.** The cold regression is front-loaded — the 1→2
+  transition is the largest single increase (+10.7922 s) — but it does **not** stop there: w2→w16 adds
+  a further +5.4799 s, and w2 through w16 span 5.4799 s while w4/w8/w16 cluster within 1.7121 s. So
+  worker 1 is the only setting that avoids the penalty, and it forfeits the warm benefit. Workers 1, 2,
+  8 and 16 are all on the cold/warm frontier; **only worker 4 is dominated** (by worker 8, faster on
+  both axes). The conclusion follows from that frontier and the cold-versus-warm trade-off, **not**
+  from any claim that cold is flat above worker 2.
 - **The real crossover is not known.** Under the illustrative cold-first / fully-warm-subsequent model
   the cumulative crossover is at the fourth full scan (continuous 3.8017). But a long Qwen batch runs
   between scans and `INTER_BATCH_CACHE_SURVIVAL = UNMEASURED`, so the number of later scans that are
