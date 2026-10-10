@@ -56,12 +56,14 @@ implementation — warm behaviour remains strongly beneficial.
 Separating what was measured from what explains it: the *measured fact* is that worker 16 is 17.9 %
 slower cold on this workload. The *supported interpretation* is that the result is consistent with
 seek/readahead contention on a mechanical HDD — 16 concurrent readers over scattered source files can
-increase physical seeking and disrupt sequential readahead, whereas a warm pass does no physical I/O
-and the `stat` plus bounded-fingerprint work parallelises cleanly. **H2 measured the timing effect,
-not the storage mechanism**: it did not instrument seek counts, storage queue depth, readahead
-decisions or head movement, so the mechanism is not asserted as fact. The *open question* is cold
-behaviour on SSD/NVMe, which remains **unmeasured**; the sign is therefore not generalised beyond this
-HDD.
+increase physical seeking and disrupt sequential readahead, whereas the warm result is consistent with
+those bounded fingerprint reads being served predominantly from the OS file cache rather than
+requiring the same cold disk access, so the `stat` plus bounded-fingerprint work parallelises cleanly.
+**H2 measured the timing effect, not the storage mechanism**: it did not instrument seek counts,
+storage queue depth, readahead decisions or head movement, and it did not establish that any
+particular warm read avoided the disk, so the mechanism is not asserted as fact. The *open question*
+is cold behaviour on SSD/NVMe, which remains **unmeasured**; the sign is therefore not generalised
+beyond this HDD.
 
 **Identity parity is exact**, which is the contract the worker knob is bound by: a single ordered
 `sha256` over all 1815 positions across every worker-1 and worker-16 run, 0 `None` results,

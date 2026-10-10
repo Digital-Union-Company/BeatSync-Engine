@@ -154,10 +154,12 @@ regression of the parallel implementation — warm behaviour remains strongly be
 
 **Mechanism is interpretation, not measurement.** The result is consistent with seek/readahead
 contention on a mechanical HDD: 16 concurrent readers over scattered source files can increase
-physical seeking and disrupt sequential readahead, whereas a warm pass does no physical I/O at all
-and the `stat` + BLAKE2b work parallelises cleanly. **H2 measured the timing effect, not the storage
-mechanism** — it did not instrument seek counts, storage queue depth, readahead decisions or head
-movement. Accordingly the *sign* must not be assumed to carry to NVMe/SSD, where cold behaviour is
+physical seeking and disrupt sequential readahead, whereas the warm result is consistent with those
+bounded fingerprint reads being served predominantly from the OS file cache rather than requiring the
+same cold disk access, so the `stat` + BLAKE2b work parallelises cleanly. **H2 measured the timing
+effect, not the storage mechanism** — it did not instrument seek counts, storage queue depth,
+readahead decisions or head movement, and it did not establish that any particular warm read avoided
+the disk. Accordingly the *sign* must not be assumed to carry to NVMe/SSD, where cold behaviour is
 **unmeasured**; establishing it is new measurement work, not an inference from this result.
 
 Identity parity held exactly across the whole H2 run — one ordered digest over all 1815 positions in
