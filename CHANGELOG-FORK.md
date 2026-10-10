@@ -20,6 +20,53 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-10 (installer tool idempotence)
+
+Two defects made `scripts/install.ps1` re-download bootstrap tooling it already had. No application
+runtime code is involved, and no model, Python or FFmpeg pin moved.
+
+**A valid llama.cpp `b9842` is no longer replaced because its version arrives on stderr.**
+`llama-cli.exe --version` writes to stderr and leaves stdout empty (measured: exit 0, stdout empty,
+`version: 9842 (6f4f53f2b)` on stderr). The old probe was `& $CliExe --version 2>$null`, which
+discarded exactly the text it needed — and under the Windows PowerShell 5.1 that `install.bat`
+launches, with `$ErrorActionPreference = "Stop"`, redirecting a native command's stderr *throws* a
+`RemoteException`. So the probe did not merely come back empty, it landed in the `catch` branch, and
+a perfectly good pinned build was re-downloaded and replaced on **every** run. Version probing now
+goes through an explicit `Invoke-NativeProbe` helper that redirects both streams to temp files
+outside the repository, preserves the native exit code, and reports a failed launch as exit `-1` so
+callers treat it exactly like a wrong version. The naive `2>&1` fix was measured too and throws as
+well, with the version line itself as the exception message. The matched build number is now derived
+from `$LlamaBuild` rather than restated in the probe; the one remaining `version:\s+9842` literal is
+a tripwire that is compared against the derived pattern and throws if they disagree, so moving the
+pin fails loudly instead of silently matching nothing.
+
+Both pinned-version comparisons were also tightened from a trailing `\b`, which matches between `0`
+and `-` and so accepted `uv 0.13.0-rc1` as satisfying a `0.13.0` pin. That was found by measuring
+the predicate against near-miss strings, not by reading it.
+
+**UV is pinned to `0.13.0`, archive-verified, and retained after a successful install.** It came
+from a floating `/releases/latest/download/` URL, so each run could install a different, unaudited
+build of the tool that resolves and installs every other dependency — and then cleanup deleted the
+whole `bin\uv` directory on success, forcing another download next time. UV now comes from the
+pinned release, its archive is checked for exact size (15,722,003 bytes) and SHA256 before it is
+extracted, and `bin\uv\uv.exe` is kept. A retained executable is reused only if it reports exit 0
+*and* the exact pinned version; anything missing, wrong or unprovable is replaced. The installer
+re-proves UV **after** cleanup, so retention itself is what gets verified before it reports success.
+Download caches stay transient — `bin\downloads\` is still removed wholesale, so idempotence never
+comes to rest on a cached archive.
+
+Measured on Windows against an isolated copy of the verified portable runtime: run 1 reused
+llama.cpp with **zero** llama archive downloads and fetched UV exactly once; run 2 reused both, with
+zero llama and zero UV archive downloads, and the llama executables and `uv.exe` were byte-identical
+before and after. This is **tool-asset reuse, not offline installation** — the installer still
+resolves and installs packages from the network on every run.
+
+Adds `tests/test_installer_contract.py`, the repository's first dedicated installer test: 37 checks
+read the real `install.ps1` as source and assert the pins, the stderr-safe probe, the UV integrity
+constants, the reuse/replace decisions and the retention rule. It runs on a bare CPython with no
+PowerShell, Windows, network, portable runtime or model assets. Against the unmodified installer 19
+of them fail.
+
 ### Maintenance — 2026-10-10 (Freestyle V1 Windows runtime acceptance)
 
 No code change. Closes the `FREESTYLE_WINDOWS_ACCEPTANCE` debt that v0.1.0 shipped with — the one
