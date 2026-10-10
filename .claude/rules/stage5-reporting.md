@@ -106,7 +106,7 @@ fingerprint bytes:
 | first-touch / current-state **serial** identity | **~103.8–110.5 s** |
 | immediate **warm serial** identity | ~6.5–10.5 s |
 | warm **16-thread** identity benchmark | **~0.746 s** median (8.77x vs the warm serial benchmark baseline of 6.545 s) |
-| controlled **cold parallel** speed-up | **NOT MEASURED** |
+| controlled **cold parallel** speed-up | **MEASURED by H2 — it is a SLOW-DOWN: 0.85x** (see below) |
 
 Three things follow, and the boundaries between them matter:
 
@@ -119,17 +119,48 @@ Three things follow, and the boundaries between them matter:
   launched real Qwen work and changed the library under measurement. The exact historical full-call
   number therefore remains unreproduced, and nothing here retcons it.
 - **The 8.77x is a WARM benchmark speed-up of the identity phase only.** It is not a cold-start
-  speed-up, not a Stage-5 speed-up, and not a measurement of the ~103.8–110.5 s first-touch case
-  under parallelism. The first-touch serial figure is evidence of **potential** user value, nothing
-  more. **Do not claim a cold parallel improvement**, a production Stage-5 improvement, or a
-  first-touch improvement, until one is measured on Windows against the exact candidate; the
-  pre-implementation benchmark is design authority, not post-implementation acceptance.
+  speed-up and not a Stage-5 speed-up. It remains true that the pre-implementation benchmark is
+  design authority, not post-implementation acceptance.
 
 Identity parity under parallelism *is* fully measured: **20,064 comparisons, 0 mismatches, 0 `None`
 results, 0 missing results, 0 duplicate results.** The contract is
 `.claude/rules/stage5-cache-identity.md`; the telemetry definition change
 (`cache_identity_seconds` is now wall-clock phase latency, not a serial sum) is
 `.claude/rules/scale-diagnostics.md`.
+
+### H2 measured the cold parallel case — the answer is a slow-down
+
+The row above used to read `NOT MEASURED`, with the instruction not to claim a cold parallel
+improvement "until one is measured on Windows against the exact candidate". H2 measured exactly that,
+on the real library (now **1815 sources**), through the real `_compute_cache_paths_parallel`, with a
+controlled standby-list purge (`RAMMap -Et`, two-cycle validated) before every timed run and an
+immediate no-reset warm control inside every slot. Median of 3 valid runs each, frozen balanced order
+`1,16,16,1,1,16`:
+
+| | worker 1 | worker 16 | ratio |
+|---|---|---|---|
+| **controlled cold** | **98.190 s** | **115.806 s** | **0.8479x (17.9 % slower)** |
+| immediate **warm** control | 6.585 s | 0.767 s | 8.5838x |
+
+So the warm 8.77x reconfirms (8.58x at 1815 sources) and **the cold case goes the other way.** The
+groups do not overlap: every worker-16 cold run (115.185–116.135 s) was slower than every worker-1
+cold run (97.933–103.280 s), with worker-16 spread of only 0.950 s across three runs. `J:` is a
+**mechanical HDD** (`WDC WD30EFRX`), and cold the phase is bound by platter seeks, not by latency
+threads can hide.
+
+What this does and does not license:
+
+- **Do not claim a first-touch or cold-start improvement from the 16-worker default.** It is a
+  warm-path optimisation; on this disk it costs ~18 % cold. The earlier "evidence of *potential* user
+  value" reading of the ~103.8–110.5 s serial figure is **not** supported for the parallel path.
+- **Do not generalise the sign.** The measurement is solid for this library on this HDD; the
+  mechanism is HDD-specific and may not hold on NVMe/SSD. Measuring that is new work.
+- **The ~69 s in-Stage-5 discrepancy is still unresolved and still unreproduced.** H2 timed the
+  identity phase only, never called `analyze_video_sources`, ran 0 Qwen jobs and wrote 0 cache
+  payloads. Nothing here retcons it.
+- **Identity parity under the cold regime is exact**, which is the contract that actually matters:
+  one ordered digest across all 1815 positions in every worker-1 and worker-16 run, with 0 `None`,
+  0 exceptions, 0 manifest drift and 0 duplicate positions. The worker count reaches no key.
 
 ## Counts and optional telemetry have different trust contracts (T1)
 
