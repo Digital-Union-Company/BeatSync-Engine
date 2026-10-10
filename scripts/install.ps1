@@ -16,9 +16,43 @@ $FfmpegDir = Join-Path $BinDir "ffmpeg"
 $ModelsDir = Join-Path $BinDir "models"
 
 $PythonZipUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
-$UvZipUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+# UV IS PINNED, HASH-VERIFIED AND RETAINED.
+# This used to be `/releases/latest/download/...`, which has two costs. The obvious one is that a
+# floating URL silently installs a different UV whenever upstream publishes -- an unaudited build of
+# the tool that resolves and installs every other dependency. The less obvious one is that
+# successful cleanup then deleted `bin\uv` outright, so the next run had to fetch UV again: a
+# repeated download of a tool that was already present and working. Pinning the version makes the
+# archive's exact bytes checkable, which in turn is what makes retaining and reusing it safe.
+$UvVersion = "0.13.0"
+$UvZipUrl = "https://github.com/astral-sh/uv/releases/download/$UvVersion/uv-x86_64-pc-windows-msvc.zip"
+$UvArchiveExpectedBytes = 15722003
+$UvArchiveSha256 = "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c"
+
+# Appended to every pinned-version regex below. A plain `\b` is NOT enough: it matches between `0`
+# and `-`, so `uv 0.13.0-rc1` would satisfy a pin of `0.13.0`, and `version: 9842-dirty` would
+# satisfy `b9842`. Requiring the next character to be neither a word character, a dot nor a hyphen
+# means the pinned token has to end exactly where the pin ends. Measured against `uv 0.13.00`,
+# `uv 0.13.01`, `uv 0.13.0-rc1` and `uv 1.0.13.0`, none of which may pass.
+$VersionTokenEnd = '(?![\w.\-])'
 $FfmpegZipUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$FfmpegVersion/ffmpeg-$FfmpegVersion-essentials_build.zip"
 $LlamaZipUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/llama-$LlamaBuild-bin-win-vulkan-x64.zip"
+
+# The version probe matches a build number DERIVED from the pin. The old check restated it as a bare
+# `9842`, a literal that could drift away from $LlamaBuild with nothing to notice.
+#
+# `$LlamaVersionRecorded` is NOT that duplicate coming back: it is a tripwire. The derived pattern
+# and this recorded contract text (also pinned by `tests/test_gui_guard_seam.py`) must agree, so
+# moving $LlamaBuild fails loudly here on the very next run rather than quietly matching nothing and
+# replacing a perfectly good install -- which is the failure mode H3 exists to remove.
+$LlamaBuildMatch = [regex]::Match($LlamaBuild, '^b(\d+)$')
+if (-not $LlamaBuildMatch.Success) {
+    throw "Unexpected llama.cpp build pin '$LlamaBuild'; expected the form b<number>."
+}
+$LlamaVersionPattern = "version:\s+$($LlamaBuildMatch.Groups[1].Value)"
+$LlamaVersionRecorded = "version:\s+9842"
+if ($LlamaVersionPattern -ne $LlamaVersionRecorded) {
+    throw "llama.cpp pin '$LlamaBuild' no longer agrees with the recorded version pattern '$LlamaVersionRecorded'. Update the pin and the recorded pattern together, deliberately."
+}
 # Stage 5 semantic analysis: the VISION model plus its multimodal projector. Unchanged.
 $QwenModelUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf?download=true"
 $QwenMmprojUrl = "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf?download=true"
@@ -58,6 +92,63 @@ function Assert-InDirectory($Path, $Parent, $Label) {
     if (-not $IsInside) {
         throw "Refusing to operate on $Label outside expected folder: $ResolvedPath"
     }
+}
+
+function Invoke-NativeProbe($Exe, [string[]]$ProbeArgs) {
+    <#
+        Run a native executable and return its exit code with BOTH output streams captured.
+
+        This exists because asking a tool for its version is deceptively hostile in Windows
+        PowerShell. `llama-cli.exe --version` writes the version to STDERR and leaves stdout empty,
+        and this script runs under `$ErrorActionPreference = "Stop"` in the Windows PowerShell 5.1
+        that `install.bat` launches. Measured on 5.1.26100:
+
+          & $exe --version 2>$null    -> THROWS (RemoteException). The old probe did this, so a
+                                         perfectly good pinned build landed in the catch branch and
+                                         was re-downloaded and replaced on every run.
+          & $exe --version 2>&1       -> ALSO THROWS. Merging stderr into the success stream turns
+                                         each stderr line into an ErrorRecord, and `Stop` makes the
+                                         first one terminating -- the exception message is literally
+                                         the version text we were trying to read.
+
+        Redirecting to files sidesteps PowerShell's stream semantics entirely: the OS writes both
+        streams, nothing passes through the error pipeline, and there is no reader deadlock. A
+        launch failure (missing or unrunnable image) is reported as exit code -1 rather than
+        propagating, so every caller can treat "could not prove it" exactly like "wrong version".
+
+        Scratch goes to the system temp directory, never into the repository, and is removed in
+        `finally`.
+    #>
+    $OutFile = [IO.Path]::GetTempFileName()
+    $ErrFile = [IO.Path]::GetTempFileName()
+    try {
+        try {
+            $Proc = Start-Process -FilePath $Exe -ArgumentList $ProbeArgs -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
+        } catch {
+            return [pscustomobject]@{
+                ExitCode = -1
+                StdOut = ""
+                StdErr = $_.Exception.Message
+                Combined = $_.Exception.Message
+            }
+        }
+        $StdOut = [string](Get-Content -LiteralPath $OutFile -Raw -ErrorAction SilentlyContinue)
+        $StdErr = [string](Get-Content -LiteralPath $ErrFile -Raw -ErrorAction SilentlyContinue)
+        return [pscustomobject]@{
+            ExitCode = $Proc.ExitCode
+            StdOut = $StdOut
+            StdErr = $StdErr
+            Combined = ($StdOut + "`n" + $StdErr)
+        }
+    } finally {
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $ErrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ProbeFirstLine($Probe) {
+    return ($Probe.Combined -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
 }
 
 function Get-CurlExe {
@@ -174,7 +265,12 @@ function Test-FileSha256($Path, $ExpectedSha256) {
 
 function Install-VerifiedModel($Url, $Path, [long]$ExpectedBytes, $ExpectedSha256, $Label) {
     <#
-        A Director-specific ensure/verify wrapper around the shared `Download-File`.
+        An exact-size-AND-SHA256 ensure/verify wrapper around the shared `Download-File`.
+
+        The name is historical: the Director model was the only caller, and is still the strictest
+        consumer. The pinned UV archive now uses this same path, because the requirement is
+        identical and one verified code path beats two. The seam is pinned by name in
+        `tests/test_gui_guard_seam.py`, so it keeps that name.
 
         The generic downloader treats any existing file of at least `MinimumBytes` as reusable,
         which is the right policy for an archive that is about to be expanded and validated by its
@@ -245,16 +341,38 @@ function Remove-SafeFolder($Path, $Parent, $Label) {
 }
 
 function Install-Uv {
-    Step "Preparing UV"
+    <#
+        Reuse a retained UV only when it can PROVE it is the pinned version.
+
+        "The file exists" was the old test, which was both too weak and -- because cleanup deleted
+        the folder anyway -- never actually exercised. Existence says nothing about which UV it is,
+        and a `latest`-era executable left behind by an older install is exactly the thing that must
+        not be trusted. So: exit code 0 AND an exact pinned version string, or it gets replaced from
+        the hash-verified archive.
+    #>
+    Step "Preparing UV $UvVersion"
     $UvExe = Join-Path $UvDir "uv.exe"
+
     if (Test-Path $UvExe) {
-        Write-Host "UV ready: $UvExe"
-        return $UvExe
+        $Probe = Invoke-NativeProbe $UvExe @("--version")
+        if (($Probe.ExitCode -eq 0) -and ($Probe.Combined -match "uv\s+$([regex]::Escape($UvVersion))$VersionTokenEnd")) {
+            Write-Host "UV $UvVersion ready (reusing retained executable): $UvExe"
+            return $UvExe
+        }
+        if ($Probe.ExitCode -ne 0) {
+            Write-Host "Retained uv.exe could not report its version (exit $($Probe.ExitCode)); replacing it." -ForegroundColor Yellow
+        } else {
+            Write-Host "Retained uv.exe is not $UvVersion (got: $(Get-ProbeFirstLine $Probe)); replacing it." -ForegroundColor Yellow
+        }
+        Assert-InDirectory $UvDir $BinDir "UV folder"
+        Remove-Item -LiteralPath $UvDir -Recurse -Force
     }
 
     Ensure-Dir $UvDir
-    $Archive = Join-Path $DownloadsDir "uv-x86_64-pc-windows-msvc.zip"
-    Download-File $UvZipUrl $Archive 1048576
+    $Archive = Join-Path $DownloadsDir "uv-$UvVersion-x86_64-pc-windows-msvc.zip"
+    # Exact size AND SHA256 BEFORE extraction -- this archive carries the tool that installs
+    # everything else, so "big enough" is not a sufficient check for it either.
+    Install-VerifiedModel $UvZipUrl $Archive $UvArchiveExpectedBytes $UvArchiveSha256 "UV $UvVersion archive"
     Expand-Zip $Archive $UvDir
 
     $Found = Get-ChildItem -Path $UvDir -Recurse -Filter "uv.exe" | Select-Object -First 1
@@ -337,15 +455,18 @@ function Install-LlamaCppVulkan {
     # satisfy this check and still have no Director runtime.
     $CompletionExe = Join-Path $LlamaDir "llama-completion.exe"
     if ((Test-Path $ServerExe) -and (Test-Path $MtmdExe) -and (Test-Path $CliExe) -and (Test-Path $CompletionExe)) {
-        try {
-            $CurrentVersion = (& $CliExe --version 2>$null | Select-Object -First 1)
-            if ($CurrentVersion -match "version:\s+9842\b") {
-                Write-Host "llama.cpp Vulkan ready: $LlamaDir"
-                return
-            }
-            Write-Host "Existing llama.cpp build is not $LlamaBuild; replacing Vulkan binaries."
-        } catch {
-            Write-Host "Existing llama.cpp version check failed; replacing Vulkan binaries."
+        # `llama-cli --version` prints to STDERR with an empty stdout and exit code 0. See
+        # `Invoke-NativeProbe` for why reading that through the PowerShell pipeline throws instead
+        # of returning text, and why a valid pinned build was consequently replaced on every run.
+        $Probe = Invoke-NativeProbe $CliExe @("--version")
+        if (($Probe.ExitCode -eq 0) -and ($Probe.Combined -match "$LlamaVersionPattern$VersionTokenEnd")) {
+            Write-Host "llama.cpp Vulkan $LlamaBuild ready (reusing existing binaries): $LlamaDir"
+            return
+        }
+        if ($Probe.ExitCode -ne 0) {
+            Write-Host "Existing llama-cli.exe could not report its version (exit $($Probe.ExitCode)); replacing Vulkan binaries." -ForegroundColor Yellow
+        } else {
+            Write-Host "Existing llama.cpp build is not $LlamaBuild (got: $(Get-ProbeFirstLine $Probe)); replacing Vulkan binaries." -ForegroundColor Yellow
         }
     }
 
@@ -453,9 +574,18 @@ function Remove-InstallerFolder($Path, $Label) {
 }
 
 function Cleanup-InstallerFiles {
-    Step "Cleaning installer cache"
-    Remove-InstallerFolder $DownloadsDir "downloads"
-    Remove-InstallerFolder $UvDir "UV"
+    <#
+        Remove the transient download cache and NOTHING ELSE.
+
+        `bin\uv\uv.exe` used to be deleted here, which is what made the next run download UV again.
+        It is now deliberately retained: it is a pinned, hash-verified executable, `Install-Uv`
+        re-proves its version on every run, and the verification block below confirms it survived
+        this cleanup. Archives are still not kept -- the durable artifact is the verified
+        executable, not the ZIP it came out of, and `$DownloadsDir` holds every archive the
+        installer fetches.
+    #>
+    Step "Cleaning transient installer downloads"
+    Remove-InstallerFolder $DownloadsDir "download cache"
 }
 
 function Test-RequiredFile($Path, $Label) {
@@ -508,5 +638,19 @@ if ($LASTEXITCODE -ne 0) {
 
 Cleanup-InstallerFiles
 
+# Deliberately AFTER cleanup: what needs proving is that the retained tooling survived it, so the
+# next run can validate and reuse it instead of downloading the archive again.
+Step "Verifying retained installer tooling"
+Test-RequiredFile $UvExe "retained uv.exe"
+$UvVerification = Invoke-NativeProbe $UvExe @("--version")
+if ($UvVerification.ExitCode -ne 0) {
+    throw "Retained uv.exe --version failed with exit code $($UvVerification.ExitCode)."
+}
+if ($UvVerification.Combined -notmatch "uv\s+$([regex]::Escape($UvVersion))$VersionTokenEnd") {
+    throw "Retained uv.exe did not report $UvVersion`: $(Get-ProbeFirstLine $UvVerification)"
+}
+Write-Host "UV $UvVersion retained and verified: $UvExe"
+
 Write-Host ""
 Write-Host "Portable install is ready: llama.cpp Vulkan + CuPy CTK, no PyTorch." -ForegroundColor Green
+Write-Host "Pinned tooling is reused on later runs: llama.cpp $LlamaBuild and UV $UvVersion are not re-downloaded while they verify." -ForegroundColor Green
