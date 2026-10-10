@@ -121,6 +121,17 @@ bounded fingerprint windows), against the exact production identity operation:
 Exact identity parity over the same library: **20,064 comparisons, 0 mismatches, 0 `None` results,
 0 missing results, 0 duplicate results.**
 
+**This L1B table is historical, and D0 supersedes it for the intermediate worker counts (D0-E1).** It
+was measured on a **1672**-source library; D0 re-measured warm on the later **1815**-source library
+and got materially different figures in the middle of the range — most visibly **worker 8: 1.088 s /
+6.02x here versus 1.6973 s / 3.90x in D0**, with worker 16 close (0.746 s / 8.77x versus 0.8070 s /
+8.20x). Different library, different campaign; **neither table is a correction of the other**, and
+both stand as measured. **For current worker-count comparisons quote the D0 table**, which is the one
+with a matching cold column and committed raw runs. The same caveat applies to the warm figures in
+`_cache_identity_workers`' docstring in `src/video_analysis.py`, which still records the 1672-source
+numbers — that is upstream-adjacent source text and was deliberately **not** edited here; realigning
+it is a separate proposed task, not part of this documentation change.
+
 ### Measured cold (H2): `COLD_PARALLEL_IDENTITY_REGRESSION`
 
 ```
@@ -194,20 +205,70 @@ there is no such point.** Same frozen 1815-source library and manifest, same rea
 | 8 | 114.0817 s | 1.6973 s | 3.90x | **PARETO** |
 | **16** | 115.7938 s | **0.8070 s** | **8.20x** | **PARETO** (best warm) |
 
+**Those are medians of three runs each, and the dispersion is part of the evidence (D0-E1).** The
+accepted observations, and the two slots the pre-registration excluded, are:
+
+| workers | cold runs (s) | warm runs (s) |
+|---|---|---|
+| 1 | 99.1686 · **99.5217** · 99.6989 | 6.4925 · **6.6150** · 11.7589 |
+| 2 | 110.0748 · **110.3139** · 110.6744 | 3.7189 · **3.7322** · 6.3808 |
+| 4 | 114.1619 · **114.3353** · 114.4101 | 2.0241 · **2.0465** · 3.2459 |
+| 8 | 113.6586 · **114.0817** · 114.3318 | 1.1127 · **1.6973** · 1.7438 |
+| 16 | 115.4680 · **115.7938** · 115.8657 | 0.7839 · **0.8070** · 1.1890 |
+
+Cold is tight (≤1.1 s within every setting). **Warm is noisy** — worker 1 spans 5.2664 s — so
+**8.20x is a median ratio, not a guaranteed production speed-up**: the same three runs admit ~5.5x to
+~15.0x depending on which are paired. The median is used because it agrees closely with H2's
+independent 6.585 s at worker 1; the mean (8.2888 s) is skewed by the single 11.76 s run and was
+reported but not relied on. 17 slots ran and **15 were accepted**: `d0_a1_w1` (standby 429.2 MB) and
+`d0_a2_w2` (514.8 MB) failed the pre-registered `standby_after ≤ 200 MB` ceiling and were replaced by
+`d0_r1_w1` / `d0_r2_w2`, ordered in advance. Re-including them moves w1's cold median *up* to
+99.6103 s, so the exclusion flatters the **rejected** alternative, not this decision, and the
+crossover still lands on scan 4.
+
+**The full evidence is committed**: `docs/claude/d0-cold-identity/` carries every slot, the frozen
+manifest, the key dumps' hashes, the pre-registration and the harness, plus `verify_d0.py`, which
+recomputes all ten medians and both digests from stdlib alone.
+
+**H2 and D0 are two independent campaigns, and they corroborate each other (D0-E1).** Their 1-vs-16
+cold figures differ slightly — H2 reported 98.190 / 115.806 s (0.8479x, 17.9 % slower), D0 reports
+99.5217 / 115.7938 s (0.8595x, 16.4 % slower) — because they are separate sets of timed runs, not
+because either was revised. **Neither number is corrected by the other, and both stand as measured.**
+They agree where it matters: each D0 median falls inside H2's reported run range for the same setting
+(H2 worker 1 spanned 97.933–103.280 s, worker 16 spanned 115.185–116.135 s), the sign and rough
+magnitude of the regression reproduce, and identity parity is exact in both. When quoting a 1-vs-16
+cold figure, say which campaign it came from.
+
 **The cold regression is front-loaded, but it does not stop at the second worker.** The 1→2
 transition is the largest single increase (**+10.7922 s**), and additional cold cost remains above it:
 w2→w16 adds a further **+5.4799 s**, for **+16.2721 s** in total from w1 to w16. The step sizes are
 `1→2 +10.7922`, `2→4 +4.0214`, `4→8 −0.2536`, `8→16 +1.7121` s — so the higher-worker measurements
 w4/w8/w16 form a tighter cluster spanning **1.7121 s**, while w2 through w16 span **5.4799 s**.
 
-So worker 1 is the only setting that avoids the regression, and it costs 8.20x warm throughput.
-**Worker 4 is the one dominated point — worker 8 is faster on both axes, so never choose 4.** No
+So worker 1 is the only setting that avoids the regression, and it costs 8.20x warm throughput. No
 static setting is universally superior across both cache states, which is why
 `STATIC_POLICY_CANDIDATE = NONE` and a lower static default is not justified. **That conclusion rests
 on the frontier shape and the measured cold-versus-warm trade-off, not on the cold curve being flat
 above worker 2 — it is not.** Partial concurrency is the poor bargain here: w2 already gives up
 +10.7922 s of the +16.2721 s cold cost while delivering only 1.77x of the available 8.20x warm
 speed-up.
+
+**Worker 4 is the one dominated point, and the strength of that claim differs per axis (D0-E1).**
+On the medians w8 is better on both, so w4 is Pareto-dominated and there is no reason to choose it.
+But say what each axis actually supports, because n = 3:
+
+- **Warm: established.** w8's three runs (1.1127 / 1.6973 / 1.7438 s) lie entirely below w4's
+  (2.0241 / 2.0465 / 3.2459 s) — complete separation, a ~17 % better median.
+- **Cold: not established.** The margin is **0.2536 s** on ~114 s (0.22 %), and the samples
+  *overlap* — w8 `113.6586 … 114.3318` against w4 `114.1619 … 114.4101`. This is the only adjacent
+  cold pair in the sweep that is not cleanly separated. Do **not** state w8 is faster cold as a
+  measured fact; at n = 3 the honest reading is "indistinguishable".
+
+**The practical advice survives either way, which is why this was not worth re-measuring:** if cold
+is a tie and warm is better, w8 still (weakly) dominates w4, so w4 remains the one setting with no
+argument for it. What is withdrawn is the categorical "faster on both axes", not the conclusion. The
+same qualification applies to **w8 vs w16 on the warm axis**, which also overlaps — see the
+cumulative comparison below.
 
 Repeating the same full scan, under the illustrative **cold-first / fully-warm-subsequent** model:
 
@@ -226,6 +287,22 @@ between scans and whether it evicts the bounded fingerprint windows was never me
 number of later scans behaving fully warm, partially warm or cold is unknown, and the real cumulative
 crossover with it. State the identity-policy difference in **absolute seconds** — no percentage of
 Stage-5 or of total preparation wall time is claimed from current data.
+
+**Worker 8 is 16's nearest rival, and it loses under the same model (D0-E1).** It is the only setting
+that is better cold than 16 *and* within one order of magnitude warm, so it is the one worth stating
+explicitly rather than leaving as an unexamined `PARETO` label:
+
+| | w8 | w16 | |
+|---|---:|---:|---|
+| cold median | 114.0817 s | 115.7938 s | w8 better by **1.7121 s** — samples cleanly separated |
+| warm median | 1.6973 s | 0.8070 s | w16 better by **0.8903 s** (2.10x) — samples **overlap** at n = 3 |
+
+Under the *same* cold-first / fully-warm-subsequent model, w16 overtakes w8 at a continuous
+**2.9231 scans**, i.e. from the **third** full scan — one scan earlier than it overtakes worker 1.
+**This is the same conditional model and carries the same caveat: it is not an observed production
+threshold**, and the warm leg of the comparison is the half that n = 3 does not establish. It is
+recorded because it shows the retained default is not resting on an unexamined neighbour, not as
+independent proof.
 
 **Why not storage detection.** Media type does not observe the variable that decides the trade-off:
 OS file-cache state. A mechanical HDD can have a perfectly warm identity scan, so a rule like

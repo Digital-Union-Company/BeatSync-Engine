@@ -20,6 +20,61 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Maintenance — 2026-10-10 (D0 evidence archival and documentation precision)
+
+**No code change.** Closes the five accepted MINOR findings from the independent review of the cold
+cache-identity decision below. The decision itself is **unchanged** — 16 workers stay, the cold
+penalty remains an accepted trade-off, `INTER_BATCH_CACHE_SURVIVAL` and `NVME_SSD_STATUS` remain
+`UNMEASURED` — and no runtime, test, script, cache-contract or analysis-version file was touched.
+
+**M3 — the evidence is now durable.** `docs/claude/d0-cold-identity/` carries a curated, committed
+package: all 17 measurement slots with raw cold/warm durations and reset telemetry, the frozen
+1815-entry source manifest, one canonical ordered cache-key dump plus the SHA-256 of all 18 (the
+identity-invariance proof), the pre-registration and its amendment, the run transcripts, the
+measurement harness, and the D0 write-up. `verify_d0.py` recomputes all ten medians, every cold step
+and warm ratio, both cumulative crossover models and **both headline digests**
+(`96bc14cd…` manifest, `bed9efdd…` ordered keys) from the stdlib alone, and exits non-zero on any
+mismatch. Previously this evidence existed only under `C:\tmp`, which `PCBUS-HK-v1` forbids as a sole
+location. Deliberately excluded and documented: 34 zero-byte RAMMap I/O files, 17 byte-identical key
+dumps (hashes retained), and per-slot telemetry folded losslessly into `measurements.json`; the
+immutable full archive is named in the package README.
+
+**M1 — `w4` versus `w8` is qualified per axis.** The earlier "worker 8 is faster on both axes" is
+withdrawn as categorical. On medians w8 dominates, and its **warm** advantage is established
+(completely separated samples), but its **cold** advantage is **not**: a 0.2536 s margin on ~114 s
+with overlapping three-run samples — the only adjacent cold pair in the sweep that is not separated.
+The practical conclusion is unchanged, because a cold tie plus a better warm still leaves w4 with no
+argument for it.
+
+**M2 — dispersion and exclusions are now disclosed.** Every accepted observation is recorded with
+units. **8.20x is a median warm ratio, not a guaranteed speed-up**: worker 1's warm runs spanned
+6.4925–11.7589 s, and the same three runs admit ~5.5x–15.0x. The two slots excluded by the
+pre-registered `standby_after ≤ 200 MB` ceiling (`d0_a1_w1` 429.2 MB, `d0_a2_w2` 514.8 MB) are named
+with their criterion; re-including them moves worker 1's cold median *up* to 99.6103 s, so the
+exclusion flattered the **rejected** alternative and the crossover still lands on scan 4.
+
+**M4 — `w8` versus `w16` is recorded as a conditional comparison.** w8 is 16's nearest rival: better
+cold by a cleanly separated 1.7121 s, 2.10x worse warm (that warm leg overlaps at n=3). Under the
+same cold-first / fully-warm-subsequent model w16 overtakes it at **2.9231 scans**, i.e. from the
+third full scan — one earlier than it overtakes worker 1. Stated as a model, never as an observed
+production threshold.
+
+**M5 — a modelled value is no longer labelled measured.** "The absolute identity-policy difference is
+measured in seconds to minutes" is corrected: **measured** is +16.2721 s on one controlled-cold scan
+and −5.8080 s per warm repeat; the ~88.3 s "minutes" figure is a **19-scan model output**. No
+replacement percentage is introduced.
+
+Also recorded, without changing any historical measurement: **H2 and D0 are independent campaigns**
+whose 1-vs-16 cold figures differ (98.190/115.806 s versus 99.5217/115.7938 s) because they are
+separate runs — each D0 median falls inside H2's reported range for its setting, so they corroborate;
+neither corrects the other, and a quoted figure must name its campaign. The **L1B 1672-source warm
+table** is marked historical and superseded for the intermediate worker counts (worker 8: 1.088 s /
+6.02x there versus 1.6973 s / 3.90x in D0); the matching figures in `_cache_identity_workers`'
+docstring in `src/video_analysis.py` were deliberately **not** edited, since this change touches no
+runtime file — realigning them is a separate proposed task. The archived `D0_RESULT.md` carries one
+inline-marked correction: 100.6211 s and 110.7998 s are the **excluded** slots' cold timings, not the
+replacement slots', which measured 99.1686 s and 110.0748 s.
+
 ### Maintenance — 2026-10-10 (Cold cache-identity regression decision)
 
 **No code change.** Decides the open `COLD_PARALLEL_IDENTITY_REGRESSION` finding recorded by H2

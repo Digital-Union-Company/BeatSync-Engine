@@ -1,0 +1,29 @@
+{
+  "amendment": 1,
+  "written_before_the_replacement_runs": true,
+  "parent_plan_sha256": "B885429FDA11969FA788950B897659D32173271B68229B2864FFAE496353C016",
+  "why": [
+    "The frozen sweep produced 3 runs per worker count, but two slots failed the pre-registered reset condition 'standby_after <= 200 MB': d0_a1_w1 (49131.1 -> 429.2 MB) and d0_a2_w2 (33457.1 -> 514.8 MB).",
+    "Section 7 requires a MINIMUM of 3 VALID controlled-cold runs per worker count. Worker 1 and worker 2 currently have 2 each, so the gate is not met for those two settings.",
+    "This amendment adds exactly two replacement slots, one at worker 1 and one at worker 2, to reach 3 valid runs for every worker count."
+  ],
+  "what_is_NOT_being_done": [
+    "The pre-registered reset criterion is NOT being rewritten after seeing results. The 200 MB absolute threshold stands as written, and both affected slots remain INVALID under it and are retained with their reason.",
+    "No measured number is being discarded. The two invalid slots' timings are reported in full, and every statistic is reported BOTH as-pre-registered and with all 15 slots included.",
+    "No worker count is being re-run selectively on the basis of its timing. Only the two settings whose VALID-run count fell below the required 3 are re-run, and that shortfall was caused by reset telemetry, not by timing."
+  ],
+  "honest_note_on_the_threshold": [
+    "Both failing purges were in fact highly effective: they evicted 48 701.9 MB (99.13 %) and 32 942.3 MB (98.46 %) of the standby list respectively.",
+    "The 200 MB absolute ceiling was calibrated in H2 where standby-before was ~7.5 GB. These two slots ran while standby held 49.1 GB and 33.5 GB with only 164.7 MB free, so a larger absolute residual re-accumulated during the 2 s settle window.",
+    "The criterion should arguably have been relative (percent evicted) rather than absolute. That is a flaw in MY pre-registration, not evidence that these runs were warm - their cold timings (100.621 s at w1, 110.800 s at w2) sit squarely with the valid runs at the same settings (99.522/99.699 at w1; 110.674/110.314 at w2).",
+    "The flaw is recorded rather than silently corrected. Any future sweep should pre-register a relative eviction criterion."
+  ],
+  "replacement_slots": [
+    {"slot": "d0_r1_w1", "workers": 1},
+    {"slot": "d0_r2_w2", "workers": 2}
+  ],
+  "replacement_order_fixed_in_advance": [1, 2],
+  "procedure": "identical to the frozen per-slot procedure: -Et reset, telemetry either side, one timed production run, one immediate no-reset warm control, parity recorded",
+  "criteria": "unchanged from benchmark_plan.json",
+  "prewarm": "not repeated; the library is warm from the immediately preceding sweep and each slot's own reset telemetry proves the purge"
+}

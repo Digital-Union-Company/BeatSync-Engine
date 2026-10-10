@@ -194,32 +194,60 @@ superior static alternative**, so the current default stands as an explicit prod
 than an oversight:
 
 - **Strongest measured warm performance.** 0.8070 s at 16 workers against 6.6150 s at 1 — an 8.20x
-  speed-up on the repeated case.
+  speed-up on the repeated case. Those are **medians of 3 runs**, and worker 1's warm runs spanned
+  6.4925–11.7589 s, so **8.20x is a median ratio, not a guaranteed speed-up** (the same runs admit
+  ~5.5x–15.0x). The w1-vs-w16 warm samples are nonetheless completely separated, so the *direction*
+  and rough size are established; the exact multiple is not. Raw runs:
+  `docs/claude/d0-cold-identity/`.
 - **A known HDD cold penalty**, unchanged and not fixed: +16.2721 s on a single controlled-cold scan
   versus worker 1.
 - **No universally superior static alternative.** The cold regression is front-loaded — the 1→2
   transition is the largest single increase (+10.7922 s) — but it does **not** stop there: w2→w16 adds
   a further +5.4799 s, and w2 through w16 span 5.4799 s while w4/w8/w16 cluster within 1.7121 s. So
   worker 1 is the only setting that avoids the penalty, and it forfeits the warm benefit. Workers 1, 2,
-  8 and 16 are all on the cold/warm frontier; **only worker 4 is dominated** (by worker 8, faster on
-  both axes). The conclusion follows from that frontier and the cold-versus-warm trade-off, **not**
-  from any claim that cold is flat above worker 2.
+  8 and 16 are all on the cold/warm frontier; **only worker 4 is dominated** by worker 8 — on the
+  medians. Per axis (D0-E1): w8's warm advantage is **established** (samples completely separated),
+  its cold advantage is **not** (0.2536 s median margin, overlapping samples). Either way w4 is the
+  one setting with no argument for it, but do not restate this as "faster on both axes". The
+  conclusion follows from the frontier and the cold-versus-warm trade-off, **not** from any claim
+  that cold is flat above worker 2.
 - **The real crossover is not known.** Under the illustrative cold-first / fully-warm-subsequent model
   the cumulative crossover is at the fourth full scan (continuous 3.8017). But a long Qwen batch runs
   between scans and `INTER_BATCH_CACHE_SURVIVAL = UNMEASURED`, so the number of later scans that are
   actually fully warm, partially warm or cold is unknown — and the exact real crossover with it.
+  The same model puts 16 ahead of its nearest rival, **worker 8**, from the **third** full scan
+  (continuous 2.9231) — w8 is better cold by a cleanly separated 1.7121 s but 2.10x worse warm. That
+  is the same conditional model with the same caveat, recorded so the retained default is not resting
+  on an unexamined neighbour; it is **not** an observed threshold.
 - **No percentage is claimed.** Keep identity evidence in absolute seconds. No share of Stage 5 and no
   share of total preparation wall time may be derived from current data; the historical
   41-source / 490.8 s Qwen figure is explicitly an order of magnitude only, because candidate counts
   and clip lengths vary by more than 10x.
 
-The absolute identity-policy difference is measured in **seconds to minutes**, while Qwen preparation
-is independently known to operate on a much larger timescale for substantial cold libraries. That is a
-statement about relative magnitude, deliberately **not** a guaranteed percentage.
+**Separate the measured difference from the modelled one (D0-E1).** The earlier wording here said the
+identity-policy difference "is measured in **seconds to minutes**", which labelled a modelled value as
+measured. Corrected:
+
+- **Measured**, on one controlled-cold scan of the 1815-source library: **+16.2721 s** (w16 vs w1),
+  and **−5.8080 s** on each immediately-warm repeat. Both are seconds.
+- **Modelled**, not measured: anything cumulative. Repeating the same full scan 19 times under the
+  cold-first / fully-warm-subsequent model reaches ~88.3 s — that is where "minutes" came from, and it
+  is a model output, conditional on `INTER_BATCH_CACHE_SURVIVAL = UNMEASURED`.
+
+Qwen preparation is independently known to operate on a much larger timescale for substantial cold
+libraries, so the identity-policy difference is the smaller term. That remains a statement about
+relative magnitude and is deliberately **not** a guaranteed percentage.
 
 No HDD/SSD detection semantics are introduced, and none should be: media type does not observe OS
 file-cache state, which is the variable that actually decides the trade-off. Identity correctness is
 untouched — D0 reconfirmed one ordered digest across every setting from 1 to 16 workers.
+
+**Quoting H2 versus D0 (D0-E1).** The two campaigns' 1-vs-16 cold figures differ — H2 98.190 /
+115.806 s (17.9 % slower), D0 99.5217 / 115.7938 s (16.4 % slower) — because they are independent
+sets of runs, not because either was revised. **Both stand as measured; neither corrects the other.**
+Each D0 median falls inside H2's reported run range for its setting, so they corroborate rather than
+conflict. Always name the campaign a cold figure came from. The committed raw evidence for D0 is
+`docs/claude/d0-cold-identity/` (run `verify_d0.py` to recompute every figure and digest).
 
 ### The historical ~69 s: strongly explained in shape, still not reproduced
 

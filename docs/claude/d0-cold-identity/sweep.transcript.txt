@@ -1,0 +1,71 @@
+D0 controlled cold worker SWEEP
+  reset method   : RAMMap64.exe -accepteula -Et (Empty Standby List, H2-proven)
+  plan sha256    : B885429FDA11969FA788950B897659D32173271B68229B2864FFAE496353C016  (frozen before any timing)
+  frozen order   : 1, 2, 4, 8, 16, 4, 8, 16, 1, 2, 16, 1, 2, 4, 8
+  frozen manifest: 96bc14cd9014a5b9fd3fa8445494ab0fd88c26ef6909927f21c1ca2f0ab47c6c
+  reset condition: standby_before >= 5000 MB AND standby_after <= 200 MB AND exit 0
+  ratio < 2 is FLAGGED, never silently dropped
+
+=== prewarm_d0 (workers=1, NO reset: guarantee the fingerprint windows have been touched) ===
+    prewarm 123,857180s  standby now 49146,7 MB  digest bed9efdd1776  (enters NO statistics)
+
+=== d0_a1_w1  (block A pos 1, workers=1) ===
+    reset exit=0 7260ms : standby 49131,1 -> 429,2 MB (dropped 48701,9), free 164,7 -> 49262,2 MB | met=False
+    cold=100,621125s  warm=11,517598s  ratio=   8,7363x  VALID=False  [reset condition not met (exit=0, standby 49131.1 -> 429.2 MB)]
+
+=== d0_a2_w2  (block A pos 2, workers=2) ===
+    reset exit=0 3596ms : standby 33457,1 -> 514,8 MB (dropped 32942,3), free 15727,9 -> 48664,8 MB | met=False
+    cold=110,799825s  warm= 6,330583s  ratio=  17,5023x  VALID=False  [reset condition not met (exit=0, standby 33457.1 -> 514.8 MB)]
+
+=== d0_a3_w4  (block A pos 3, workers=4) ===
+    reset exit=0 1157,3ms : standby 11275,1 -> 2,8 MB (dropped 11272,3), free 37833,2 -> 49584,4 MB | met=True
+    cold=114,335306s  warm= 3,245856s  ratio=   35,225x  VALID=True
+
+=== d0_a4_w8  (block A pos 4, workers=8) ===
+    reset exit=0 783,8ms : standby 7533,6 -> 26 MB (dropped 7507,6), free 42477,1 -> 49936,8 MB | met=True
+    cold=113,658609s  warm= 1,697266s  ratio=  66,9657x  VALID=True
+
+=== d0_a5_w16  (block A pos 5, workers=16) ===
+    reset exit=0 843,8ms : standby 7585,2 -> 31,8 MB (dropped 7553,4), free 41861,1 -> 49409,4 MB | met=True
+    cold=115,467953s  warm= 1,189003s  ratio=  97,1132x  VALID=True
+
+=== d0_b1_w4  (block B pos 1, workers=4) ===
+    reset exit=0 742,3ms : standby 7088 -> 16,9 MB (dropped 7071,1), free 42645,4 -> 49890,4 MB | met=True
+    cold=114,410118s  warm= 2,046457s  ratio=  55,9064x  VALID=True
+
+=== d0_b2_w8  (block B pos 2, workers=8) ===
+    reset exit=0 766ms : standby 7397,3 -> 19,4 MB (dropped 7377,9), free 42048,6 -> 49410,6 MB | met=True
+    cold=114,081672s  warm= 1,112669s  ratio= 102,5297x  VALID=True
+
+=== d0_b3_w16  (block B pos 3, workers=16) ===
+    reset exit=0 760,5ms : standby 7379,4 -> 15 MB (dropped 7364,4), free 42559,5 -> 49944,7 MB | met=True
+    cold=115,865720s  warm= 0,806988s  ratio= 143,5779x  VALID=True
+
+=== d0_b4_w1  (block B pos 4, workers=1) ===
+    reset exit=0 805,9ms : standby 7643,8 -> 62,5 MB (dropped 7581,3), free 41733,6 -> 49515,6 MB | met=True
+    cold= 99,521651s  warm= 6,614960s  ratio=  15,0449x  VALID=True
+
+=== d0_b5_w2  (block B pos 5, workers=2) ===
+    reset exit=0 793,5ms : standby 7600,6 -> 36,7 MB (dropped 7563,9), free 42218,1 -> 49832,8 MB | met=True
+    cold=110,674358s  warm= 3,732165s  ratio=  29,6542x  VALID=True
+
+=== d0_c1_w16  (block C pos 1, workers=16) ===
+    reset exit=0 922,7ms : standby 8777,9 -> 39,5 MB (dropped 8738,4), free 41081,5 -> 49854,6 MB | met=True
+    cold=115,793836s  warm= 0,783940s  ratio= 147,7075x  VALID=True
+
+=== d0_c2_w1  (block C pos 2, workers=1) ===
+    reset exit=0 780,8ms : standby 7394,5 -> 24,1 MB (dropped 7370,4), free 42465,9 -> 49843,3 MB | met=True
+    cold= 99,698918s  warm=11,758907s  ratio=   8,4786x  VALID=True
+
+=== d0_c3_w2  (block C pos 3, workers=2) ===
+    reset exit=0 1009,2ms : standby 8739,4 -> 51,8 MB (dropped 8687,6), free 41037,1 -> 49665,5 MB | met=True
+    cold=110,313907s  warm= 3,718911s  ratio=   29,663x  VALID=True
+
+=== d0_c4_w4  (block C pos 4, workers=4) ===
+    reset exit=0 863,9ms : standby 8363,1 -> 38,9 MB (dropped 8324,2), free 41580,4 -> 49913,2 MB | met=True
+    cold=114,161886s  warm= 2,024137s  ratio=  56,4003x  VALID=True
+
+=== d0_c5_w8  (block C pos 5, workers=8) ===
+    reset exit=0 878,5ms : standby 8232,3 -> 35,9 MB (dropped 8196,4), free 41546 -> 49784 MB | met=True
+    cold=114,331751s  warm= 1,743848s  ratio=  65,5629x  VALID=True
+
