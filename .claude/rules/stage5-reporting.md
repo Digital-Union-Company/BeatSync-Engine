@@ -180,6 +180,47 @@ What this does and does not license:
   one ordered digest across all 1815 positions in every worker-1 and worker-16 run, with 0 `None`,
   0 exceptions, 0 manifest drift and 0 duplicate positions. The worker count reaches no key.
 
+### D0: the 16-worker default is retained deliberately — `ACCEPTED_TRADE_OFF`
+
+```
+COLD_PARALLEL_IDENTITY_REGRESSION_STATUS = ACCEPTED_TRADE_OFF
+PRODUCTION_CHANGE_REQUIRED               = NO
+STATIC_POLICY_CANDIDATE                  = NONE
+INTER_BATCH_CACHE_SURVIVAL               = UNMEASURED
+```
+
+D0 swept the already-supported worker settings on the same frozen library and found **no universally
+superior static alternative**, so the current default stands as an explicit product decision rather
+than an oversight:
+
+- **Strongest measured warm performance.** 0.8070 s at 16 workers against 6.6150 s at 1 — an 8.20x
+  speed-up on the repeated case.
+- **A known HDD cold penalty**, unchanged and not fixed: +16.2721 s on a single controlled-cold scan
+  versus worker 1.
+- **No universally superior static alternative.** The cold regression is front-loaded — the 1→2
+  transition is the largest single increase (+10.7922 s) — but it does **not** stop there: w2→w16 adds
+  a further +5.4799 s, and w2 through w16 span 5.4799 s while w4/w8/w16 cluster within 1.7121 s. So
+  worker 1 is the only setting that avoids the penalty, and it forfeits the warm benefit. Workers 1, 2,
+  8 and 16 are all on the cold/warm frontier; **only worker 4 is dominated** (by worker 8, faster on
+  both axes). The conclusion follows from that frontier and the cold-versus-warm trade-off, **not**
+  from any claim that cold is flat above worker 2.
+- **The real crossover is not known.** Under the illustrative cold-first / fully-warm-subsequent model
+  the cumulative crossover is at the fourth full scan (continuous 3.8017). But a long Qwen batch runs
+  between scans and `INTER_BATCH_CACHE_SURVIVAL = UNMEASURED`, so the number of later scans that are
+  actually fully warm, partially warm or cold is unknown — and the exact real crossover with it.
+- **No percentage is claimed.** Keep identity evidence in absolute seconds. No share of Stage 5 and no
+  share of total preparation wall time may be derived from current data; the historical
+  41-source / 490.8 s Qwen figure is explicitly an order of magnitude only, because candidate counts
+  and clip lengths vary by more than 10x.
+
+The absolute identity-policy difference is measured in **seconds to minutes**, while Qwen preparation
+is independently known to operate on a much larger timescale for substantial cold libraries. That is a
+statement about relative magnitude, deliberately **not** a guaranteed percentage.
+
+No HDD/SSD detection semantics are introduced, and none should be: media type does not observe OS
+file-cache state, which is the variable that actually decides the trade-off. Identity correctness is
+untouched — D0 reconfirmed one ordered digest across every setting from 1 to 16 workers.
+
 ### The historical ~69 s: strongly explained in shape, still not reproduced
 
 `HISTORICAL_69S_STATUS = STRONGLY_EXPLAINED_BUT_NOT_REPRODUCED`. The historical ~69 s full-call result

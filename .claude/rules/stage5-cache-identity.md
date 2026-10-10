@@ -168,6 +168,90 @@ the contract that matters here: the worker count reaches no key. See
 `.claude/rules/stage5-reporting.md` for the full boundary of what the cold figures do and do not
 support.
 
+### D0: the decision — `ACCEPTED_TRADE_OFF`, and 16 stays
+
+```
+COLD_PARALLEL_IDENTITY_REGRESSION_STATUS = ACCEPTED_TRADE_OFF
+PRODUCTION_CHANGE_REQUIRED               = NO
+STATIC_POLICY_CANDIDATE                  = NONE
+STORAGE_DETECTION_REQUIRED               = NO
+ADAPTIVE_RUNTIME_SIGNAL                  = NOT PROVEN
+INTER_BATCH_CACHE_SURVIVAL               = UNMEASURED
+NVME_SSD_STATUS                          = UNMEASURED
+```
+
+H2 measured cold only at 1 and 16 workers, which left open the hope of an intermediate setting with
+near-worker-1 cold cost and most of the warm benefit. **D0 swept the already-supported settings and
+there is no such point.** Same frozen 1815-source library and manifest, same real
+`_compute_cache_paths_parallel`, same `-Et` cold method, balanced order frozen before any timing,
+3 valid controlled-cold runs per setting each with its own immediate no-reset warm control:
+
+| workers | cold median | warm median | warm speed-up | frontier |
+|---|---|---|---|---|
+| **1** | **99.5217 s** | 6.6150 s | 1.00x | **PARETO** (best cold) |
+| 2 | 110.3139 s | 3.7322 s | 1.77x | **PARETO** |
+| 4 | 114.3353 s | 2.0465 s | 3.23x | **DOMINATED by 8** |
+| 8 | 114.0817 s | 1.6973 s | 3.90x | **PARETO** |
+| **16** | 115.7938 s | **0.8070 s** | **8.20x** | **PARETO** (best warm) |
+
+**The cold regression is front-loaded, but it does not stop at the second worker.** The 1→2
+transition is the largest single increase (**+10.7922 s**), and additional cold cost remains above it:
+w2→w16 adds a further **+5.4799 s**, for **+16.2721 s** in total from w1 to w16. The step sizes are
+`1→2 +10.7922`, `2→4 +4.0214`, `4→8 −0.2536`, `8→16 +1.7121` s — so the higher-worker measurements
+w4/w8/w16 form a tighter cluster spanning **1.7121 s**, while w2 through w16 span **5.4799 s**.
+
+So worker 1 is the only setting that avoids the regression, and it costs 8.20x warm throughput.
+**Worker 4 is the one dominated point — worker 8 is faster on both axes, so never choose 4.** No
+static setting is universally superior across both cache states, which is why
+`STATIC_POLICY_CANDIDATE = NONE` and a lower static default is not justified. **That conclusion rests
+on the frontier shape and the measured cold-versus-warm trade-off, not on the cold curve being flat
+above worker 2 — it is not.** Partial concurrency is the poor bargain here: w2 already gives up
++10.7922 s of the +16.2721 s cold cost while delivering only 1.77x of the available 8.20x warm
+speed-up.
+
+Repeating the same full scan, under the illustrative **cold-first / fully-warm-subsequent** model:
+
+| full scans | w=1 | w=16 | advantage |
+|---|---|---|---|
+| 1 | 99.5217 s | 115.7938 s | **w1 by 16.2721 s** |
+| 2 | 106.1367 s | 116.6008 s | w1 by 10.4641 s |
+| 3 | 112.7517 s | 117.4078 s | w1 by 4.6561 s |
+| 4 | 119.3667 s | 118.2148 s | **w16 by 1.1519 s** |
+| 5 | 125.9817 s | 119.0218 s | w16 by 6.9599 s |
+
+Continuous crossover **3.8017 scans**, i.e. the fourth full scan — corresponding to more than 300
+outstanding sources at the default batch size of 100. **That is a conditional model statement, not an
+observed production threshold.** `INTER_BATCH_CACHE_SURVIVAL = UNMEASURED`: a long Qwen batch runs
+between scans and whether it evicts the bounded fingerprint windows was never measured, so the real
+number of later scans behaving fully warm, partially warm or cold is unknown, and the real cumulative
+crossover with it. State the identity-policy difference in **absolute seconds** — no percentage of
+Stage-5 or of total preparation wall time is claimed from current data.
+
+**Why not storage detection.** Media type does not observe the variable that decides the trade-off:
+OS file-cache state. A mechanical HDD can have a perfectly warm identity scan, so a rule like
+"HDD → worker 1" would throw away the measured warm benefit on that same HDD. There is also no seam
+for it — no storage-type detection, no Win32 storage IOCTL path, no `ctypes` storage code, no
+PowerShell storage query and no path→volume→physical-device mapping contract exist in this
+repository, and `src/**/*.py` returns zero hits for any of them. Adding one is a substantial platform
+dependency that D0 does not support. **Why not an adaptive policy.** D0 measured no robust
+production-safe cold/warm signal, and process-local invocation history is not OS file-cache authority
+— the OS may evict pages independently.
+
+**So the 16-worker default is retained deliberately**, as an explicit product/performance trade-off:
+strongest measured warm performance, a known and documented HDD cold penalty, no universally superior
+static alternative, and **no correctness consequence** — D0 reconfirmed exact identity invariance with
+a single ordered digest across all 35 identity computations at 1, 2, 4, 8 and 16 workers, with
+`none`/`exceptions`/`drift`/`duplicate positions` all 0 and no cache payload written.
+`CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched.
+
+**This is acceptance, not a fix.** The cold regression remains historically true and is not
+`FIXED` or resolved by code. Revisit the decision only on bounded evidence: real user evidence that
+first-touch identity latency is materially harming the workflow; an inter-batch cache-survival
+measurement showing repeated full scans are mostly cold *and* the identity cost is
+product-significant; a material change to the source-library workflow; a robust storage-agnostic
+cold/warm signal becoming available; SSD/NVMe measurements revealing a materially different policy
+opportunity; or source counts growing until the absolute regression becomes material.
+
 **If the invocation-level backend identity fails, AI caching is off for that entire run.** The
 orchestrator holds an explicit `ai_cache_disabled` state and then does not call `_cache_path` at all —
 and, since L1B, does not start a thread pool either: it constructs the ordered `None` results

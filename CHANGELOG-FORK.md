@@ -20,6 +20,81 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Maintenance — 2026-10-10 (Cold cache-identity regression decision)
+
+**No code change.** Decides the open `COLD_PARALLEL_IDENTITY_REGRESSION` finding recorded by H2
+below. The current 16-worker default is **retained**, and the measured cold penalty on a mechanical
+HDD is accepted as an explicit product trade-off.
+
+```
+COLD_PARALLEL_IDENTITY_REGRESSION_STATUS = ACCEPTED_TRADE_OFF
+PRODUCTION_CHANGE_REQUIRED               = NO
+```
+
+H2 had measured cold at only 1 and 16 workers, leaving open the hope of an intermediate setting with
+near-worker-1 cold cost and most of the warm benefit. D0 swept every already-supported setting on the
+same frozen 1815-source library (manifest `96bc14cd…`), through the same real
+`_compute_cache_paths_parallel`, with the same `-Et` standby-list purge before each timed run, a
+balanced order frozen before any timing, and 3 valid controlled-cold runs per setting each with its
+own immediate no-reset warm control:
+
+| workers | cold median | warm median | warm speed-up | frontier |
+|---|---|---|---|---|
+| 1 | **99.5217 s** | 6.6150 s | 1.00x | PARETO (best cold) |
+| 2 | 110.3139 s | 3.7322 s | 1.77x | PARETO |
+| 4 | 114.3353 s | 2.0465 s | 3.23x | **DOMINATED by 8** |
+| 8 | 114.0817 s | 1.6973 s | 3.90x | PARETO |
+| 16 | 115.7938 s | **0.8070 s** | **8.20x** | PARETO (best warm) |
+
+The cold regression turned out to be **front-loaded at the 1→2 transition, which is the largest single
+increase (+10.7922 s) — but additional cold cost remains at higher worker counts.** w2→w16 adds a
+further +5.4799 s, giving +16.2721 s in total from w1 to w16; the individual steps are
+`1→2 +10.7922`, `2→4 +4.0214`, `4→8 −0.2536`, `8→16 +1.7121` s, so w2 through w16 span 5.4799 s while
+w4/w8/w16 form a tighter cluster spanning 1.7121 s.
+
+Worker 1 is therefore the only setting that avoids the regression, at 8.20x warm cost, and there is
+**no universally superior static replacement**: workers 1, 2, 8 and 16 all sit on the cold/warm
+frontier and **only worker 4 is dominated**, by worker 8, which is faster on both axes. Nobody should
+choose 4. That conclusion follows from the frontier and the measured cold-versus-warm trade-off — not
+from the cold curve being flat above worker 2, which it is not. Partial concurrency is the poor
+bargain: w2 already surrenders +10.7922 s of the +16.2721 s cold cost for only 1.77x of the available
+8.20x warm speed-up.
+
+Repeating the same full scan under the illustrative cold-first / fully-warm-subsequent model, worker 1
+leads by 16.2721 s / 10.4641 s / 4.6561 s at 1 / 2 / 3 scans and worker 16 first leads at the fourth
+by 1.1519 s (continuous crossover 3.8017 scans, i.e. more than 300 outstanding sources at the default
+batch size of 100). **That is a conditional model statement, not an observed production threshold.**
+`INTER_BATCH_CACHE_SURVIVAL = UNMEASURED` — a long Qwen batch runs between scans and whether it evicts
+the bounded fingerprint windows was never measured, so the real mix of fully warm, partially warm and
+cold later scans is unknown, and the real cumulative crossover with it. Identity evidence is stated in
+absolute seconds; **no share of Stage 5 or of total preparation wall time is claimed**, because the
+historical 41-source / 490.8 s Qwen figure is an order of magnitude only.
+
+Two corrective strategies were examined and rejected on the measurements.
+`STORAGE_DETECTION_REQUIRED = NO`: media type does not observe OS file-cache state, which is the
+variable that decides the trade-off — a mechanical HDD can have a perfectly warm identity scan, so
+"HDD → worker 1" would discard the measured warm benefit on that same HDD. There is also no seam for
+it (no storage-type detection, no Win32 storage IOCTL, no `ctypes` storage code, no PowerShell storage
+query, no path→volume→device mapping), so adding one is a platform dependency D0 does not support.
+`ADAPTIVE_RUNTIME_SIGNAL = NOT PROVEN`: no robust production-safe cold/warm signal was measured, and
+process-local invocation history is not OS file-cache authority. `NVME_SSD_STATUS = UNMEASURED`, and
+the decision does not depend on SSD behaviour.
+
+**The identity contract is unchanged.** D0 reconfirmed exact invariance: one ordered digest across all
+35 identity computations at 1, 2, 4, 8 and 16 workers, with 0 `None` results, 0 exceptions, 0 manifest
+drift, 0 duplicate positions and 0 cache payload writes. `CACHE_CONTRACT_VERSION` and
+`ANALYSIS_VERSION` are untouched, no cache was invalidated, and
+`BEATSYNC_CACHE_IDENTITY_WORKERS` remains available for benchmarking. Worker count is still execution
+policy only.
+
+This is **acceptance, not a fix** — the cold regression remains historically true and is not resolved
+by code. It should be revisited only on bounded evidence: real user evidence that first-touch identity
+latency is materially harming the workflow; an inter-batch cache-survival measurement showing repeated
+full scans are mostly cold *and* the identity cost is product-significant; a material change to the
+source-library workflow; a robust storage-agnostic cold/warm signal becoming available; SSD/NVMe
+measurements revealing a different policy opportunity; or source counts growing until the absolute
+regression becomes material.
+
 ### Maintenance — 2026-10-10 (H2 — controlled cold cache-identity benchmark, 1 vs 16 workers)
 
 No code change. Closes the `NOT MEASURED` gap that *Performance — 2026-10-04 (Stage-5 Bounded Cache
