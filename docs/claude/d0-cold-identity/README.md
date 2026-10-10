@@ -42,6 +42,31 @@ only if every check passes, and re-derives from the files here:
 Both digest formulas are reproduced verbatim in `verify_d0.py` from `harness/d0_common.py`, so the
 script stands alone.
 
+### `verify_d0.py` is the only thing here you should run
+
+**`verify_d0.py` is safe**: offline and read-only. It opens three files in this directory, computes
+hashes and medians, prints them and exits. It writes nothing, launches no process, needs no
+elevation and touches no cache.
+
+**`harness/run_cold_sweep.ps1` and `harness/run_replacement_slots.ps1` are not.** They are the
+**historical measurement runners**, archived as provenance for how the numbers above were produced —
+not as a tool to re-run. Before every timed slot they invoke
+`RAMMap64.exe -accepteula -Et` (Empty Standby List), which **purges the operating system's standby
+file cache machine-wide**, and they therefore **require an elevated (Administrator) PowerShell** —
+both scripts hard-exit if they are not elevated.
+
+> **Do not run them casually on a production or actively used machine.** Discarding the standby list
+> is not destructive — no file is deleted or modified, no process is terminated, and the media
+> library is read-only throughout (see the header of each script) — but it evicts the cached pages of
+> *every* running application at once, so unrelated software will visibly stall while it re-reads
+> from disk. That is acceptable on a machine dedicated to a benchmark and inappropriate anywhere
+> else.
+
+Reproducing the original timings is in any case not possible from this package alone: the runners
+also need the frozen `source/src` export, `RAMMap64.exe`, the 1815-source `J:` HDD library and the
+recorded `C:\tmp` paths. **Nothing in this directory needs to be re-measured** — the decision is
+closed, and `verify_d0.py` re-establishes every published figure from the committed bytes.
+
 ## What was measured
 
 `video_analysis._compute_cache_paths_parallel` — the real production helper, not a reimplementation —
@@ -147,7 +172,7 @@ needed to reproduce the digest is recorded in `measurements.json`
 
 | file | what it is |
 |---|---|
-| `verify_d0.py` | recomputes every number and digest here; exit 0 = all pass |
+| `verify_d0.py` | recomputes every number and digest here; exit 0 = all pass. **Safe to run** — offline, read-only, no elevation |
 | `measurements.json` | all 17 slots: timings, counts, digests, reset telemetry, medians |
 | `measurements.csv` | the same table, flat, for spreadsheet or `git diff` audit |
 | `source_manifest.json` | the frozen 1815-entry manifest (path, size, mtime_ns) |
@@ -157,7 +182,7 @@ needed to reproduce the digest is recorded in `measurements.json`
 | `plan_amendment_1.json` | the replacement-slot amendment, verbatim |
 | `sweep.transcript.txt`, `replacement.transcript.txt` | run transcripts, verbatim |
 | `D0_RESULT.md` | the original write-up, with one corrected attribution marked inline |
-| `harness/` | the exact measurement harness, including both digest formulas |
+| `harness/` | the exact measurement harness, including both digest formulas. **Archival only — do not run**: the two `.ps1` runners need Administrator rights and purge the machine-wide standby cache (see "`verify_d0.py` is the only thing here you should run") |
 | `INVENTORY.sha256` | sha256 of every file in this directory |
 | `.gitattributes` | pins these files as binary so `core.autocrlf` cannot rewrite a line ending and silently invalidate every hash above |
 

@@ -980,6 +980,17 @@ def _cache_identity_workers(source_count: int) -> int:
     warm on the real 1672-source library (~4.75 GiB of fingerprint windows): 6.545 s at 1 worker,
     3.552 s at 2 (1.84x), 1.796 s at 4 (3.65x), 1.088 s at 8 (6.02x) and 0.746 s at 16 (8.77x).
 
+    **That table is the L1B campaign on the 1672-source library, and it is historical.** The later
+    D0 campaign re-measured warm on an **1815**-source library and got materially different figures
+    in the middle of the range - most visibly **worker 8: 1.088 s / 6.02x here versus 1.6973 s /
+    3.90x in D0** - while the endpoints stayed close (worker 1: 6.545 s versus 6.6150 s; worker 16:
+    0.746 s / 8.77x versus 0.8070 s / 8.20x). Different library, different campaign: **both stand as
+    measured within their own context and neither corrects the other.** For current worker-count
+    comparisons quote D0, which is the one with a matching cold column and committed raw runs; the
+    committed evidence and a stdlib-only verifier are under `docs/claude/d0-cold-identity/`, and the
+    full contract is `.claude/rules/stage5-cache-identity.md`. **Neither campaign changes the policy
+    below: the default and the cap are both still 16.**
+
     **The cap is hard at 16 on purpose: nothing above 16 has been measured.** Raising it is a new
     measurement, not a tuning decision. `BEATSYNC_CACHE_IDENTITY_WORKERS` exists for benchmarking and
     is execution policy only - it reaches no signature, no key and no record, so changing it must
