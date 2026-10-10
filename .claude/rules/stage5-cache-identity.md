@@ -119,8 +119,53 @@ bounded fingerprint windows), against the exact production identity operation:
 | **16** | **0.746 s** | **8.77x** |
 
 Exact identity parity over the same library: **20,064 comparisons, 0 mismatches, 0 `None` results,
-0 missing results, 0 duplicate results.** A **controlled cold parallel speed-up is NOT MEASURED** —
-do not claim one. See `.claude/rules/stage5-reporting.md` for what the cold figures do and do not
+0 missing results, 0 duplicate results.**
+
+### Measured cold (H2): `COLD_PARALLEL_IDENTITY_REGRESSION`
+
+```
+H2_RESULT_CATEGORY          = D — COLD_PARALLEL_REGRESSION
+NEW_MAINTENANCE_FINDING     = COLD_PARALLEL_IDENTITY_REGRESSION
+```
+
+On the real 1815-source Windows library under a controlled standby-list purge before every timed run,
+median of 3 valid runs each:
+
+| workers | cold identity phase | warm control | cold vs 1 worker |
+|---|---|---|---|
+| 1 | **98.190 s** | 6.585 s | — |
+| **16** | **115.806 s** | 0.767 s | **0.8479x — a 17.9 % slow-down** |
+
+The warm column reconfirms the 8.77x above (8.58x at 1815 sources). The cold column is the opposite
+sign, and the groups do not overlap: every worker-16 cold run (115.185–116.135 s) was slower than
+every worker-1 cold run (97.933–103.280 s).
+
+**Both of these are true of the *same* current default, and must be stated together.** The 16-worker
+path is a proven warm-cache optimisation, **but** H2 establishes a cold first-touch regression on this
+measured mechanical-HDD workload — and production uses that one default in both states. So never
+describe the 16-worker default as a cold-start or first-touch improvement, and do not read this
+finding as implying the cold regression has been corrected. **It has not.** Choosing a correction
+strategy is a separate, future authorization.
+
+**Scope of the finding.** It is measured on this 1815-source mechanical-HDD library
+(`J:` — `WDC WD30EFRX`), applies to controlled first-touch/cold cache identity, is **not** proven
+universal across storage devices, and **does not affect identity correctness**. It is not a general
+regression of the parallel implementation — warm behaviour remains strongly beneficial.
+
+**Mechanism is interpretation, not measurement.** The result is consistent with seek/readahead
+contention on a mechanical HDD: 16 concurrent readers over scattered source files can increase
+physical seeking and disrupt sequential readahead, whereas the warm result is consistent with those
+bounded fingerprint reads being served predominantly from the OS file cache rather than requiring the
+same cold disk access, so the `stat` + BLAKE2b work parallelises cleanly. **H2 measured the timing
+effect, not the storage mechanism** — it did not instrument seek counts, storage queue depth,
+readahead decisions or head movement, and it did not establish that any particular warm read avoided
+the disk. Accordingly the *sign* must not be assumed to carry to NVMe/SSD, where cold behaviour is
+**unmeasured**; establishing it is new measurement work, not an inference from this result.
+
+Identity parity held exactly across the whole H2 run — one ordered digest over all 1815 positions in
+every worker-1 and worker-16 run, 0 `None`, 0 exceptions, 0 drift, 0 duplicate positions — which is
+the contract that matters here: the worker count reaches no key. See
+`.claude/rules/stage5-reporting.md` for the full boundary of what the cold figures do and do not
 support.
 
 **If the invocation-level backend identity fails, AI caching is off for that entire run.** The
