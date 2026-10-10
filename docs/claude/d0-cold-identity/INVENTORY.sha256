@@ -2,11 +2,15 @@
 # Verify on Windows:  Get-FileHash -Algorithm SHA256 <file>
 # Verify elsewhere:   sha256sum -c INVENTORY.sha256  (after stripping the size column)
 #
-# 18 files, 391801 bytes (this inventory excluded).
+# 18 files, 393727 bytes (this inventory excluded).
+#
+# Only README.md has changed since the package was archived (D0-FINAL-DOCS: added the harness
+# safety warning). Every measurement, manifest, key-dump, transcript, plan and harness hash below
+# is unchanged from the original archive.
 #
 dd798332fa382d6602ab79a90d0115e97149261053fce8c519f1ddf81d6ca97e  .gitattributes                                   730
 b89e7d73a4b549602d72df823429b3c2d9200de130dd9e69c6fc51b31accca24  D0_RESULT.md                                   21762
-a40ecf7f308bae3aaf738ee0e1701144521854c291ce2690fc9383709e384017  README.md                                      11787
+508ebbc275540b33824686149a8facef10049703e58825b1becc212d00bfac70  README.md                                      13713
 b885429fda11969fa788950b897659d32173271b68229b2864ffae496353c016  benchmark_plan.json                             6424
 c7637e0bd32218684dfb27b8f4cbf942fdb53975b291f7e101de733c77d6122e  cache_key_dump_hashes.txt                       1882
 53b4c9b6905640f661b0783c2ba20dca4322667d9092d75f402c3316c8fab78e  cache_keys.ordered.txt                         80565

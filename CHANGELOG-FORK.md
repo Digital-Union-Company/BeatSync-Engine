@@ -20,6 +20,30 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Maintenance — 2026-10-10 (D0 residual documentation closure)
+
+**Documentation only — no executable change.** Closes the two non-blocking follow-ups left open by
+the D0-E2 merge. The accepted decision is untouched: 16 identity workers stay, the cold HDD penalty
+remains an accepted trade-off, and `CACHE_CONTRACT_VERSION`, `ANALYSIS_VERSION` and
+`_CACHE_IDENTITY_WORKER_CAP` are unchanged. No new measurement is claimed.
+
+**F1 — archival harness safety warning.** `docs/claude/d0-cold-identity/README.md` now separates the
+safe offline verifier from the historical runners: `verify_d0.py` is read-only, stdlib-only and needs
+no elevation, while `harness/run_cold_sweep.ps1` and `harness/run_replacement_slots.ps1` require an
+elevated PowerShell and purge the operating system's standby file cache **machine-wide** via
+`RAMMap64.exe -Et`, so they must not be run casually on a production or actively used machine. The
+archived harness itself is **not** modified. Because that README lives inside the hash-verified
+evidence package, its `INVENTORY.sha256` entry is restated to the new digest/size
+(`508ebbc2…`, 13713 B) and the header byte total updated; **all 17 other hashes — every measurement,
+manifest, key dump, transcript, plan and harness file — are unchanged.**
+
+**F2 — historical worker-performance docstring.** `_cache_identity_workers`' docstring in
+`src/video_analysis.py` now states that its warm table is the earlier **1672**-source L1B campaign
+and that D0 later measured an **1815**-source library, differing in the middle of the range
+(**worker 8: 1.088 s / 6.02x versus 1.6973 s / 3.90x**) while the endpoints stayed close. Both stand
+as measured within their own context; neither corrects the other. Docstring text only — the AST
+excluding docstrings is identical, so no signature, constant, import or statement changed.
+
 ### Maintenance — 2026-10-10 (D0 evidence archival and documentation precision)
 
 **No code change.** Closes the five accepted MINOR findings from the independent review of the cold
