@@ -1,0 +1,107 @@
+{
+  "task": "D0 - COLD_PARALLEL_IDENTITY_REGRESSION corrective design, cold worker sweep",
+  "frozen_before_any_timing": true,
+  "authority": {
+    "main_sha": "eabf342e22bbf6fe876d2006a0fd86bf8cbbd75f",
+    "main_tree": "548d302ca0f6e60034e62f4486380b901d4a9ac3",
+    "open_pr_count": 0,
+    "video_analysis_git_blob": "67f54b9d84ca93422538139011bec5495f871925",
+    "video_analysis_sha256": "c88e19d619df84343820fb9d70d8819d09925b93a92e88f6dfd6c6183d23c863",
+    "src_identical_to_h2_basis_dd26c4fe": true
+  },
+  "library": {
+    "path": "J:\\New folder\\Cuts",
+    "source_count": 1815,
+    "manifest_sha256": "96bc14cd9014a5b9fd3fa8445494ab0fd88c26ef6909927f21c1ca2f0ab47c6c",
+    "h2_library_exact_match": true,
+    "total_file_bytes": 49117687787,
+    "bounded_fingerprint_bytes_approx": 5543213605,
+    "storage": "J: = WDC WD30EFRX-68EUZN0, SATA, MediaType=HDD"
+  },
+  "measured_operation": {
+    "timed_call": "video_analysis._compute_cache_paths_parallel(sources, enable_ai, qwen_model_path, backend_token=, config_token=)",
+    "timed_region": "one perf_counter() immediately before, one subtraction immediately after; nothing else inside",
+    "worker_policy": "production video_analysis._cache_identity_workers(source_count) via BEATSYNC_CACHE_IDENTITY_WORKERS",
+    "untimed_outside": ["source enumeration", "backend token", "config token", "manifest drift verification"],
+    "never_called": ["analyze_video_sources", "any Qwen worker", "any cache payload read or write"],
+    "cache_dir": "redirected into D0 scratch; stays empty"
+  },
+  "cold_method": {
+    "command": "RAMMap64.exe -accepteula -Et",
+    "operation": "Empty Standby List",
+    "rammap_sha256": "e970913798481432cd590991577089e68510b861dc669dcab24feb06aae0df52",
+    "rammap_version": "1.63",
+    "forbidden": ["-Es (Empty System Working Set - the H2 attempt-1 defect)", "bulk-read eviction"],
+    "proven_by": "H2 two-cycle validation 2026-10-10: cycle A 25646.1->107.1 MB then 98.504s vs 6.648s; cycle B 7559.7->0.5 MB then 99.789s vs 6.675s"
+  },
+  "worker_counts": [1, 2, 4, 8, 16],
+  "runs_per_worker_count": 3,
+  "max_workers_benchmarked": 16,
+  "frozen_run_order": [
+    {"block": "A", "slots": [1, 2, 4, 8, 16]},
+    {"block": "B", "slots": [4, 8, 16, 1, 2]},
+    {"block": "C", "slots": [16, 1, 2, 4, 8]}
+  ],
+  "frozen_run_order_flat": [1, 2, 4, 8, 16, 4, 8, 16, 1, 2, 16, 1, 2, 4, 8],
+  "run_order_rationale": "Balanced rotation taken verbatim from the authorization's example. Each worker count appears exactly once per block and in three different within-block positions (w1: 1,4,2 | w2: 2,5,3 | w4: 3,1,4 | w8: 4,2,5 | w16: 5,3,1), so position-correlated drift cannot favour any single setting. Chosen before any timing was observed and not revisited.",
+  "prewarm": {
+    "slot": "prewarm_d0",
+    "workers": 1,
+    "reset": "none",
+    "purpose": "One untimed full identity pass so the fingerprint windows are known to have been touched, guaranteeing slot 1's reset demonstrates warm -> purge -> cold rather than benefiting from an already naturally-cold start. The machine's standby list has been observed to drain spontaneously (H2 R1: 41 GB -> 5 GB in ~6 h), so warmth is established by measurement, never assumed.",
+    "enters_statistics": false
+  },
+  "per_slot_procedure": [
+    "sample memory telemetry before purge",
+    "RAMMap -accepteula -Et via Start-Process -Wait -PassThru with stdout/stderr redirected; capture exit code and duration",
+    "settle 2000 ms, sample memory telemetry again",
+    "run the production helper once at the slot's worker count (timed cold run)",
+    "immediately re-run the identical call with NO reset (warm control, same worker count)",
+    "sample memory telemetry after the run",
+    "record parity fields and the ordered-key digest"
+  ],
+  "validity_criteria": {
+    "note": "Reset telemetry is the PRIMARY cold-state authority. Cold/warm timing separation is corroborating evidence only. A slot with a proven reset is NOT invalidated merely because an absolute worker-1-derived timing threshold was not reached - cold absolute time at 2, 4 and 8 workers is unknown and is a discovery of this sweep.",
+    "reset_condition_primary": {
+      "rammap_exit_code": 0,
+      "standby_before_mb_min": 5000,
+      "standby_after_mb_max": 200,
+      "rationale": "H2 proved -Et drives standby to 0.3-107 MB from a populated list; the library's own cache footprint is ~7.1-8.1 GB, so a completed preceding run always leaves >5 GB to evict. A 'before' below that means the purge had nothing to do, which is not the validated condition."
+    },
+    "hard_invalid_if": [
+      "reset condition not met",
+      "python exit code != 0",
+      "effective_workers != requested workers",
+      "source_count != 1815",
+      "manifest_sha256 != frozen",
+      "none_count != 0",
+      "exception_count != 0",
+      "duplicate_position_count != 0",
+      "manifest_drift_count != 0",
+      "cache_files_present_after != 0"
+    ],
+    "corroborating_only": {
+      "min_cold_warm_ratio_flag": 2.0,
+      "handling": "A slot meeting every hard criterion but with cold/warm ratio < 2.0 is retained, counted, and EXPLICITLY FLAGGED in the report as low-separation. It is never silently dropped and never silently kept without mention."
+    }
+  },
+  "parity_hard_gate": {
+    "requirement": "every valid run at every worker count returns the identical ordered-key digest",
+    "expected_digest_from_h2": "f93300d41778c36b4a0b2445748cb4fc51369090aaa478d199e9893457678d41",
+    "on_mismatch": "STOP with COLD_POLICY_IDENTITY_PARITY_FAILURE; no corrective design may proceed from unequal identities"
+  },
+  "analysis_pre_registered": [
+    "per worker count: cold min/max/median/mean and warm min/max/median/mean, reported separately",
+    "cold ratio vs worker 1 and warm speed-up vs worker 1",
+    "Pareto frontier: a worker count is DOMINATED if another is no slower cold AND no slower warm with at least one strict improvement; no weighting is applied",
+    "multi-scan cumulative cost at 1, 2, 5 and 10 full scans using first=cold median, later=warm median"
+  ],
+  "forbidden_in_d0": [
+    "any repository file change, branch, commit, push or PR",
+    "any production source modification",
+    "putting worker count / storage type / cache state / seek penalty into any signature, key, record or contract constant",
+    "benchmarking above 16 workers",
+    "bulk-read eviction",
+    "RAMMap -Es"
+  ]
+}

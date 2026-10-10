@@ -1,0 +1,19 @@
+D0 controlled cold worker SWEEP
+  reset method   : RAMMap64.exe -accepteula -Et (Empty Standby List, H2-proven)
+  plan sha256    : B885429FDA11969FA788950B897659D32173271B68229B2864FFAE496353C016  (frozen before any timing)
+  frozen order   : 1, 2, 4, 8, 16, 4, 8, 16, 1, 2, 16, 1, 2, 4, 8
+  frozen manifest: 96bc14cd9014a5b9fd3fa8445494ab0fd88c26ef6909927f21c1ca2f0ab47c6c
+  reset condition: standby_before >= 5000 MB AND standby_after <= 200 MB AND exit 0
+  ratio < 2 is FLAGGED, never silently dropped
+
+=== AMENDMENT 1: replacement slots, order fixed in advance: w1 then w2 ===
+
+=== d0_r1_w1  (block R pos 1, workers=1) ===
+    reset exit=0 1022,6ms : standby 9606,4 -> 50,4 MB (dropped 9556), free 38952,7 -> 49195,8 MB | met=True
+    cold= 99,168605s  warm= 6,492493s  ratio=  15,2743x  VALID=True
+
+=== d0_r2_w2  (block R pos 1, workers=2) ===
+    reset exit=0 912,9ms : standby 8565,6 -> 43,1 MB (dropped 8522,5), free 40893,3 -> 49418,5 MB | met=True
+    cold=110,074788s  warm= 6,380809s  ratio=  17,2509x  VALID=True
+
+Replacement slots finished. Statistics are derived from evidenceuns\*.json.

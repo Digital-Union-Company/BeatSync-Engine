@@ -1,0 +1,11 @@
+# This directory is hash-verified evidence: INVENTORY.sha256 lists a SHA-256 per file, and
+# verify_d0.py recomputes digests over exact file bytes (notably cache_keys.ordered.txt, whose
+# content hash 53b4c9b6... is the identity-invariance proof).
+#
+# The repository is used on Windows with core.autocrlf=true, which would hand a fresh checkout
+# CRLF line endings and silently invalidate every one of those hashes. Pin the bytes instead:
+# treat everything here as binary so Git never rewrites a line ending in either direction.
+#
+# Do not relax this to `text eol=lf` -- that still normalises on commit and would let a future
+# config change reintroduce the drift. Scoped to this directory only; it affects nothing else.
+* -text

@@ -1,0 +1,24 @@
+# SHA-256 inventory of the curated D0 evidence package.
+# Verify on Windows:  Get-FileHash -Algorithm SHA256 <file>
+# Verify elsewhere:   sha256sum -c INVENTORY.sha256  (after stripping the size column)
+#
+# 18 files, 391801 bytes (this inventory excluded).
+#
+dd798332fa382d6602ab79a90d0115e97149261053fce8c519f1ddf81d6ca97e  .gitattributes                                   730
+b89e7d73a4b549602d72df823429b3c2d9200de130dd9e69c6fc51b31accca24  D0_RESULT.md                                   21762
+a40ecf7f308bae3aaf738ee0e1701144521854c291ce2690fc9383709e384017  README.md                                      11787
+b885429fda11969fa788950b897659d32173271b68229b2864ffae496353c016  benchmark_plan.json                             6424
+c7637e0bd32218684dfb27b8f4cbf942fdb53975b291f7e101de733c77d6122e  cache_key_dump_hashes.txt                       1882
+53b4c9b6905640f661b0783c2ba20dca4322667d9092d75f402c3316c8fab78e  cache_keys.ordered.txt                         80565
+6d0ae170403a973ef05dddd54f8d8b2f36d84c74d1562e4e20e60f93b86810b7  harness/bench_identity.py                       7814
+10bf4e524130b88ede59b5742a6a9edc132ad797e8fa7505fa9c5c1e2b1eb8d6  harness/d0_common.py                            4890
+218d5c5496093acf6ebc5c67ddd6c299073fcb8c3e1e42ff56a42b867d4e83dc  harness/enumerate_library.py                    3395
+f788f380e13812ff695d93c98cd1420dd4973403305b8f9c99bd65b96f55f298  harness/run_cold_sweep.ps1                     20126
+269aac43ad78c606af6ba4ae6b8aaa7dec69f962f438f44903dd3c8fc3b17dbb  harness/run_replacement_slots.ps1              13541
+150da83abd1e4b1215d4e26f725fdabab7508d1ee535626da1bc2779c5e9ce3f  measurements.csv                                3629
+594ce6f8462778b88246af82614522be260c573d9b6d7a7eed42f0a94bcefb25  measurements.json                              28242
+fea838394ad946d90e9bee85247eefe9edd87d9be6bd152cf603a1896feed2e7  plan_amendment_1.json                           2792
+b810d165edfd8c06b077ae1d6bb61aef373c4f0230b7e06f9125ef9a59140651  replacement.transcript.txt                      1122
+c1c53c6ec6d67c222beb94aa2a9e47dbb16383d0a9e108f4aacd2d8197cb54a5  source_manifest.json                          168118
+f4dc9cac0a9da1f53400ad3da070cb07751b29a88e7d2b94d4a55cc5f41ba944  sweep.transcript.txt                            4243
+85152843bb5d6dfdd281698c28e193144e00c88681ee6c17457409ac8181cf8a  verify_d0.py                                   10739

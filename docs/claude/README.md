@@ -53,6 +53,7 @@ implementation **and its GUI seam test**, so editing `tests/test_gui_guard_seam.
 |---|---|
 | `instruction-architecture.md` | why this layout exists, the classification of every original section, and the old → new mapping |
 | `stage5-cache-history.md` | the D1-era cache state the D2 identity transition superseded |
+| `d0-cold-identity/` | committed raw evidence for the D0 cold cache-identity decision (`ACCEPTED_TRADE_OFF`, 16 workers retained): all 17 measurement slots, the frozen 1815-source manifest, identity-invariance proof, the pre-registration and the harness. `python docs/claude/d0-cold-identity/verify_d0.py` recomputes every median and both digests on bare CPython. |
 | `removed-and-superseded.md` | what was dropped rather than relocated, and why it is no longer authoritative |
 
 `CHANGELOG-FORK.md` remains the AGPL-3.0 §5(a) modification record and the per-feature engineering
