@@ -21,6 +21,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | Rule | Scoped to (abridged) |
 |---|---|
 | `pipeline-core.md` | `src/video_processor.py`, `src/ffmpeg_processing.py`, `src/auto_mode/stage{1,2,3,4,6}*.py`, `src/auto_mode/__init__.py`, `src/logger.py`, `src/paths.py`, `src/gpu_cpu_utils.py`, `src/beatsync_fork/ffmpeg_diagnostics.py` + their tests |
+| `l2-stage-cache.md` | `src/beatsync_fork/stage_cache.py`, `src/auto_mode/__init__.py`, `tests/test_stage_cache.py`, `tests/test_l2_stage3_cache_identity.py` |
 | `stage5-worker.md` | `src/video_analysis.py`, `src/auto_mode/stage5_qwen_scene_worker.py`, `src/beatsync_fork/qwen_progress.py`, `tests/test_qwen_*.py`, `tests/test_media_neutral_semantics.py` |
 | `stage5-cache-identity.md` | `src/video_analysis.py`, `tests/test_stage5_cache_identity.py`, `tests/test_fingerprint.py` |
 | `stage5-cache-durability.md` | `src/video_analysis.py`, `tests/test_stage5_cache_{durability,completion}.py` |
@@ -30,6 +31,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `freestyle.md` | `src/beatsync_fork/freestyle.py`, `tests/test_freestyle.py` |
 | `director.md` | `src/beatsync_fork/director.py`, `tests/test_director.py` |
 | `variant-lab.md` | `src/beatsync_fork/{variant_lab,creative_recipe}.py` + their tests |
+| `render-worker.md` | `src/beatsync_fork/render_worker.py`, `tests/test_render_{worker,cancellation}.py` |
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `progress-events.md` | `src/beatsync_fork/{progress,progress_view,qwen_progress}.py`, `tests/test_progress_*.py`, `tests/test_gui_progress_seam.py` |
 | `input-gate.md` | `src/beatsync_fork/{input_manager,input_report,input_confirmation,input_session}.py`, `tests/test_input_*.py`, `tests/test_gui_guard_seam.py` |
