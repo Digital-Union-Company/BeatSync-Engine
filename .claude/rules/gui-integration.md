@@ -196,6 +196,29 @@ automatically.
   a Director proposal is an absolute set of seven values, as valid now as when it was generated. So
   the proposal state survives an apply and may be re-applied. Do not conflate the two, and do not
   weaken Variant Lab's gate.
+- **Every successful render yields two artifacts, and only one of them is durable (Deliverable
+  Export V1-A).** The master is promoted exactly once, as above. The **delivery preview** is a
+  session-scoped `<stem>_preview.mp4` built by `ffmpeg_processing.build_delivery_preview_command`
+  and handed to `gr.Video`; it is generated for **all four** processing modes, strictly after the
+  SUCCESS commit point, and it is **never** promoted into `output/`. A durable shareable MP4 is
+  V1-B and requires its own authorization — nothing in the preview path may write to
+  `get_output_dir()`, rename, replace, move or delete anything.
+
+  Why it exists: every master muxes `pcm_s24le`, which lands in MP4 as `ipcm` (ISO/IEC 23003-5) and
+  is not decodable by an ordinary browser, so the pre-V1-A non-ProRes path previewed a finished
+  render silently; ProRes and HEVC masters are not AVC at all. Measured on 18 real renders,
+  stream-copying the `-crf 0` master and swapping only PCM→AAC saves 4.7 % — so the preview
+  **re-encodes** (one CPU `libx264 -crf 21` + `aac 192k` profile for every mode, so it never depends
+  on NVENC). Resolution and frame rate are preserved by omitting `-vf`/`-s`/`-r`, and no H.264 level
+  is pinned.
+
+  **The preview is selected only when FFmpeg exited 0 AND the file exists AND it is non-empty.**
+  Assigning `preview_path` before the subprocess is exactly how the old block returned a path to a
+  file that was never created. Any failure, timeout or cancellation is contained: the master stays
+  SUCCESS, `LAST_OUTPUT_PATH_KEY` still names it, the display path falls back to it, and the panel
+  says no shareable MP4 was produced — it must **never** claim the master is browser-playable. See
+  `.claude/rules/render-worker.md` for the swallow exemption and why a `TimeoutExpired` is now
+  caught.
 - **One new subprocess, bounded and windowless.** `_run_director_model` is one
   `subprocess.run(..., timeout=60, creationflags=CREATE_NO_WINDOW)` with stdout and stderr captured
   separately — `run` rather than `Popen` precisely so a timeout kills and reaps the child. `gui.py`

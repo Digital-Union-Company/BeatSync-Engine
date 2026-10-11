@@ -520,14 +520,20 @@ def test_a_cancellation_handler_always_precedes_the_broad_one_it_protects(path):
 def _post_commit_preview_handlers() -> set[int]:
     """Line numbers of the `except RenderCancelled` handlers inside the post-promotion preview block.
 
-    Located **structurally**, by walking the `if is_prores:` block that follows the durable
-    promotion inside `_process_video_impl` — not by matching a token a future author could sprinkle
-    anywhere to opt out of the no-swallow rule below.
+    Located **structurally**, by walking the `try` block that builds the delivery preview after the
+    durable promotion inside `_process_video_impl` — not by matching a token a future author could
+    sprinkle anywhere to opt out of the no-swallow rule below.
+
+    [FORK] Digital-Union (Deliverable Export V1-A): the anchor used to be `if is_prores:`, because
+    the preview was ProRes-only. It now covers every mode, so the stable structural anchor is the
+    `try` whose body constructs the delivery argv.
     """
     impl = _func(_GUI, "_process_video_impl")
-    preview = next(n for n in ast.walk(impl) if isinstance(n, ast.If)
-                   and ast.unparse(n.test) == "is_prores"
-                   and "preview_cmd" in ast.unparse(n))
+    preview = next(n for n in ast.walk(impl) if isinstance(n, ast.Try)
+                   and "build_delivery_preview_command(" in ast.unparse(n)
+                   and any(h.type is not None
+                           and ast.unparse(h.type) == "subprocess.TimeoutExpired"
+                           for h in n.handlers))
     # it must genuinely sit after the SUCCESS commit point, or this exception would be a loophole
     commit = next(n for n in ast.walk(impl) if isinstance(n, ast.Assign)
                   and ast.unparse(n) ==
@@ -578,10 +584,18 @@ def test_a_cancellation_handler_never_swallows_and_never_substitutes():
                     f"{os.path.basename(path)} line {handler.lineno} re-types a cancellation"
 
             if post_commit:
-                # and the exempt one must do exactly one thing: fall back to the durable output
-                assert rendered.strip().endswith("preview_path = output_path"), rendered
-                assert "RENDER_OUTCOME_KEY" not in rendered, \
-                    "the post-commit handler must not touch the committed outcome"
+                # and the exempt one must do exactly one thing: record a contained failure.
+                #
+                # [FORK] Digital-Union (Deliverable Export V1-A): it used to end with
+                # `preview_path = output_path`, restoring the display path. There is nothing to
+                # restore now — `preview_path` starts at the durable output and is moved onto the
+                # preview only after FFmpeg succeeded AND the file was validated — so the check is
+                # the stronger one: the handler may record, and may touch neither the display
+                # path, the committed outcome, the durable key, nor control flow.
+                assert "preview_failure = " in rendered, rendered
+                for forbidden in ("preview_path =", "RENDER_OUTCOME_KEY",
+                                  "LAST_OUTPUT_PATH_KEY", "return "):
+                    assert forbidden not in rendered, f"{forbidden} in:\n{rendered}"
 
 
 def test_a_cancellation_is_never_narrated_as_a_failure_event():
@@ -1364,35 +1378,54 @@ def test_nothing_after_the_commit_point_can_downgrade_success():
     would be false.
     """
     node = _func(_GUI, "_process_video_impl")
-    preview = next(n for n in ast.walk(node) if isinstance(n, ast.If)
-                   and ast.unparse(n.test) == "is_prores"
-                   and "preview_cmd" in ast.unparse(n))
+    # [FORK] Digital-Union (Deliverable Export V1-A): the preview is no longer ProRes-only, so the
+    # structural anchor is the `try` that builds the delivery argv rather than `if is_prores:`.
+    preview = next(n for n in ast.walk(node) if isinstance(n, ast.Try)
+                   and "build_delivery_preview_command(" in ast.unparse(n)
+                   and any(h.type is not None
+                           and ast.unparse(h.type) == "subprocess.TimeoutExpired"
+                           for h in n.handlers))
     rendered = ast.unparse(preview)
     assert "RENDER_OUTCOME_KEY" not in rendered, \
         "the preview block touches the outcome key"
     assert "raise_if_cancelled" not in rendered, \
         "raising here would discard a render that already succeeded"
 
-    # [R2] three explicit branches, and all three must exist. R1A had only the first two, which is
-    # why an already-running preview could not be stopped at all.
+    # [R2] both run paths must exist. R1A had only the blocking one, which is why an already-running
+    # preview could not be stopped at all.
     assert "if lifecycle is None:" in rendered, \
-        "the no-lifecycle path must stay the original blocking call"
-    assert "subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)" in rendered, \
-        "the lifecycle-free preview call must be byte-identical to today's"
-    assert "elif lifecycle.cancel_requested():" in rendered, \
-        "an already-cancelled render must not START a preview child"
-    assert "run_cancellable_media_command(preview_cmd, 180, lifecycle=lifecycle)" in rendered, \
+        "the no-lifecycle path must stay the blocking call"
+    assert "subprocess.run(preview_cmd, capture_output=True, text=True, " \
+           "timeout=DELIVERY_PREVIEW_TIMEOUT_SECONDS)" in rendered, \
+        "the lifecycle-free preview call must stay the plain bounded blocking call"
+    assert "run_cancellable_media_command(preview_cmd, DELIVERY_PREVIEW_TIMEOUT_SECONDS, " \
+           "lifecycle=lifecycle)" in rendered, \
         "an in-flight preview must go through the cancellable runner"
     # the cancellation lands here and goes no further
     assert "except RenderCancelled:" in rendered
-    assert rendered.rstrip().endswith("preview_path = output_path")
-    # and a genuine timeout stays a timeout on both paths -- never caught, never relabelled
-    assert "except subprocess.TimeoutExpired" not in rendered, \
-        "a stuck encode is a different fact from a user pressing Stop"
+    # [FORK] Digital-Union (Deliverable Export V1-A): the handler records a contained failure
+    # instead of restoring `preview_path`. There is nothing to restore -- the display path starts
+    # at the durable output and only moves onto a VALIDATED preview -- so the stronger check is
+    # that the handler touches neither the display path nor the committed outcome.
+    assert "preview_failure = 'cancelled during preview encoding'" in rendered
+    assert "preview_path =" not in rendered.split("except RenderCancelled:")[1]
+    # [FORK] Digital-Union (Deliverable Export V1-A): a timeout IS caught now, and the reversal is
+    # deliberate. The pre-V1-A comment reserved it as "a stuck encode is a different fact from a
+    # user pressing Stop", which was defensible while the preview was a ProRes-only convenience.
+    # After the commit point it is not: an uncaught TimeoutExpired would escape into the generic
+    # render-failure handler and report a finished, promoted render as "❌ Error", which is exactly
+    # the downgrade this test exists to forbid. It is contained and reported truthfully instead.
+    assert "except subprocess.TimeoutExpired:" in rendered, \
+        "a stuck preview encode must be contained after the commit point, not propagated"
+    assert "preview encoding exceeded" in rendered
 
     impl = _body(_GUI, "_process_video_impl")
+    # an already-cancelled render must not START a preview child; that check sits just OUTSIDE the
+    # try, so it is asserted against the whole body rather than the try block
+    assert "elif lifecycle is not None and lifecycle.cancel_requested():" in impl, \
+        "an already-cancelled render must not START a preview child"
     assert impl.index("session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS") < \
-        impl.index("if is_prores:")
+        impl.index("preview_target = os.path.join(")
 
 
 def test_a_cancellation_during_the_prores_preview_still_reports_success(tmp_path):

@@ -927,24 +927,30 @@ def test_the_promotion_is_not_preceded_by_an_exists_check():
     assert body.count("os.path.exists(output_path)") == 1
 
 
-def test_prores_preview_is_generated_only_after_a_successful_promotion():
-    """A ProRes render's durable artifact is the `.mov`; the `_preview.mp4` is a session temp.
+def test_the_delivery_preview_is_generated_only_after_a_successful_promotion():
+    """The durable artifact is the master; the `_preview.mp4` is a session temp.
 
     Order is the contract: promote, record the durable path, *then* build the preview. A refused
     or failed promotion must produce no preview at all — there is no durable file to preview, and
     the one already on disk belongs to a render the user owns.
+
+    [FORK] Digital-Union (Deliverable Export V1-A): the preview is no longer ProRes-only, so the
+    `if is_prores:` anchor is gone. Every mode's master carries `pcm_s24le` (muxed as `ipcm`),
+    which an ordinary browser cannot decode, so every mode now gets one H.264/AAC preview. The
+    ordering contract this test exists for is unchanged — only what the block covers.
     """
     impl = _gui_body("_process_video_impl")
     promotion = impl.index(f"{PROMOTION_HELPER}(result_path, output_path)")
     refusal = impl.index("return (None, promotion_error, session_state)")
     durable = impl.index("session_state[LAST_OUTPUT_PATH_KEY] = output_path")
-    preview_branch = impl.index("if is_prores:")
-    preview_run = impl.index("subprocess.run(preview_cmd")
-    assert promotion < refusal < durable < preview_branch < preview_run
+    preview_target = impl.index("preview_target = os.path.join(")
+    preview_build = impl.index("build_delivery_preview_command(")
+    assert promotion < refusal < durable < preview_target < preview_build
 
-    # and the preview filename semantics are untouched
-    assert "preview_filename = f'{name}_{timestamp}_preview.mp4'" in impl
-    assert "preview_path = os.path.join(session_dir, preview_filename)" in impl
+    # the preview is a session temp, named off the master's own stem, and is never durable
+    assert "_preview.mp4'" in impl
+    assert "preview_target = os.path.join(session_dir," in impl
+    assert "preview_path = preview_target" in impl
 
 
 def test_the_ordinary_filename_contract_is_unchanged():
@@ -1180,7 +1186,7 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
                 handle.write(b"OLD")
         return output_file
 
-    return {
+    namespace = {
         "os": _OsShim(rename), "errno": errno,
         "datetime": __import__("datetime"), "time": __import__("time"),
         "tempfile": __import__("tempfile"), "subprocess": __import__("subprocess"),
@@ -1210,6 +1216,16 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
         "USING_PORTABLE_PYTHON": False, "USING_PORTABLE_CUDA": False, "USING_CUPY_CTK": False,
         "FFMPEG_PATH": "ffmpeg",
     }
+    # [FORK] Digital-Union (Deliverable Export V1-A): the REAL delivery-preview argv builder and
+    # its REAL constants, AST-extracted from `ffmpeg_processing.py` — that module needs the
+    # portable runtime and cannot be imported here, but the builder is deliberately
+    # dependency-free. A stub would let the preview's argv ordering drift unnoticed, which is the
+    # exact defect V1-A fixed. Exec'd INTO this namespace, as production has it, so a test that
+    # swaps `FFMPEG_PATH` sees the swap in the generated argv.
+    from test_delivery_preview import load_delivery_builder
+
+    load_delivery_builder(namespace)
+    return namespace
 
 
 def _run_real_impl(tmp_path, *, existing_dest=None, rename=None,

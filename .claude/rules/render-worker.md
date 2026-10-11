@@ -188,13 +188,25 @@ The durable `os.rename` promotion into `output/` is the **one** success commit p
 `session_state[RENDER_OUTCOME_KEY] = SUCCESS` is written exactly once, immediately after the durable
 path is recorded, and **nothing afterwards may downgrade it**.
 
-The ProRes preview is post-commit convenience work. A cancellation arriving while the preview child is
-already running terminates and reaps that child, discards the partial preview (it is simply never
-selected — `preview_path` falls back to the durable output), and leaves the outcome `SUCCESS`. This is
-the **one** place a `RenderCancelled` may be swallowed, and swallowing is correct there: the render is
-finished and the user owns the `.mov`, so propagating would turn a completed render into a cancelled
-one. The exemption is located structurally (the `is_prores` block after the commit point), never by a
-token a future author could sprinkle elsewhere to opt out.
+The **delivery preview** is post-commit convenience work. A cancellation arriving while the preview
+child is already running terminates and reaps that child, discards the partial preview (it is simply
+never selected), and leaves the outcome `SUCCESS`. This is the **one** place a `RenderCancelled` may
+be swallowed, and swallowing is correct there: the render is finished and the user owns the master,
+so propagating would turn a completed render into a cancelled one. The exemption is located
+structurally — the `try` that calls `build_delivery_preview_command`, after the commit point — never
+by a token a future author could sprinkle elsewhere to opt out.
+
+**Deliverable Export V1-A changed three things about that block and none of this contract.** The
+preview is no longer ProRes-only (every mode's master carries `pcm_s24le`, muxed as `ipcm`, which an
+ordinary browser cannot decode), so the structural anchor moved off `if is_prores:`; the handler now
+**records** a contained failure instead of restoring `preview_path`, because there is nothing to
+restore — the display path starts at the durable output and moves onto the preview only after FFmpeg
+exited 0 and the file was validated as present and non-empty; and a `TimeoutExpired` **is** caught
+now. That last one reverses an earlier deliberate choice, and the reason it reverses is this very
+contract: after the commit point an uncaught timeout escapes into the generic handler and reports a
+finished, promoted render as an error, which is exactly the downgrade forbidden above. The exempt
+handler may touch neither `preview_path`, `RENDER_OUTCOME_KEY`, `LAST_OUTPUT_PATH_KEY` nor control
+flow, and a test pins all four.
 
 ## Abandonment is not cancellation
 
