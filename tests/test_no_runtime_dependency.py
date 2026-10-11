@@ -118,6 +118,13 @@ def test_fork_modules_import_only_stdlib():
         # dependency — and deliberately not numpy, which remains forbidden for the fork package.
         "statistics",
         "subprocess",
+        # `tempfile` arrived with Stage-5 A1: `qwen_partials.write_partial` publishes a per-job
+        # partial through a UNIQUE same-directory `mkstemp` temp plus `fsync` and `os.replace`,
+        # exactly as `video_analysis._save_cache` does. A shared `path + ".tmp"` is the measured D1
+        # collision - one writer's `os.replace` published the other's payload while reporting
+        # success - so using the stdlib primitive is a contract here rather than a convenience.
+        # Still stdlib, still no runtime dependency.
+        "tempfile",
         "threading",
         "time",
         "collections",
