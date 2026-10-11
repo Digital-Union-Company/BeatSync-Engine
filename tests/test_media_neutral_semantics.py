@@ -721,8 +721,14 @@ def test_e_no_director_or_freestyle_machinery_was_added():
     # may exist, but **Stage 5 must never hear of it**. `shortlist`, `second_pass` and
     # `interpretation_mode` are untouched and still forbidden everywhere including the GUI — a
     # second interpretation pass over the persisted library is still not built.
+    # **Stage-5 A1 widens `stage5_side` by one file**, it does not relax anything: the new
+    # `beatsync_fork/qwen_partials.py` owns the per-job partial artifact the worker publishes, so it
+    # sits squarely on the Stage-5 side of this boundary and must know nothing about a master seed, a
+    # Director, a proposal or Freestyle either. Partials carry intrinsic media evidence only.
     speculative_everywhere = ("shortlist", "second_pass", "interpretation_mode")
-    stage5_side = (_VA, _WORKER, os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"))
+    stage5_side = (_VA, _WORKER,
+                   os.path.join(_REPO, "src", "beatsync_fork", "library_prep.py"),
+                   os.path.join(_REPO, "src", "beatsync_fork", "qwen_partials.py"))
 
     for path in stage5_side + (_GUI,):
         source = open(path, "r", encoding="utf-8").read()

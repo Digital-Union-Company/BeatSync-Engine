@@ -2112,12 +2112,51 @@ def test_k_no_incremental_worker_response_was_implemented():
     """This task bounds the submission; it does NOT make an in-flight worker resumable.
 
     Pinned so a future reader does not infer a durability guarantee that does not exist.
+
+    **Narrowed by Stage-5 A1.** A1 makes the worker publish one atomic *per-job partial artifact*
+    after each job's loop returns, so ``write_partial`` now legitimately appears in the worker and is
+    the one name dropped from the forbidden list below. Everything this test actually protected is
+    unchanged and still asserted:
+
+    * there is still **no incremental response** — the response JSON is written exactly once, after
+      the whole job loop, and remains the primary semantic authority;
+    * **library preparation is still not resumable** — nothing in the parent reads a partial, so a
+      batch whose worker dies may still need repeating. Recovery is A2, and A2 is where
+      ``library_prep``'s own sentence below legitimately changes.
+
+    A1 is therefore inert with respect to preparation: it adds diagnostic/recovery-ready evidence and
+    no durability guarantee. The A1 artifact contract itself is pinned by
+    ``tests/test_stage5_job_partials.py``.
     """
     worker = os.path.join(_REPO, "src", "auto_mode", "stage5_qwen_scene_worker.py")
     source = open(worker, "r", encoding="utf-8").read()
-    for invented in ("incremental_response", "partial_response", "write_partial",
+    for invented in ("incremental_response", "partial_response",
                      "checkpoint_response", "flush_response"):
         assert invented not in source
+
+    # The response is still ONE write, after the loop - that is what "no incremental response" means.
+    tree = ast.parse(source)
+    main = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "main")
+    loop = next(node for node in ast.walk(main) if isinstance(node, ast.For))
+    in_loop = {id(node) for node in ast.walk(loop)}
+    writes = [
+        node for node in ast.walk(main)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"
+        and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == "w"
+    ]
+    assert len(writes) == 1 and id(writes[0]) not in in_loop
+
+    # A1 really did add the per-job publication, so this test cannot quietly become vacuous.
+    assert "_publish_job_partial" in source
+
+    # ...and the parent still consumes nothing: preparation is not resumable yet.
+    parent_source = open(_VA, "r", encoding="utf-8").read()
+    for consumer in ("qwen_partials", "partial_path", "write_partial", "partial_glob",
+                     "stage5_job_partial", ".partial.json"):
+        assert consumer not in parent_source, (
+            f"video_analysis.py must not consume partials until A2 ({consumer})")
 
     prep_source = open(_PREP, "r", encoding="utf-8").read()
     assert "does not make an in-flight worker resumable" in prep_source

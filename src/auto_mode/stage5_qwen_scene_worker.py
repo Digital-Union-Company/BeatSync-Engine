@@ -49,6 +49,15 @@ try:
 except Exception:  # pragma: no cover - exercised only on a broken/partial checkout
     _encode_qwen_progress = None
 
+# [FORK] Digital-Union (A1): per-job partial artifacts, imported under the same guard and for the same
+# reason. A missing or broken fork package must mean "no partials", never a broken Qwen run - partials
+# are diagnostic/recovery evidence, never semantic authority, so losing them costs nothing this process
+# is here to do.
+try:
+    from beatsync_fork import qwen_partials as _qwen_partials
+except Exception:  # pragma: no cover - exercised only on a broken/partial checkout
+    _qwen_partials = None
+
 
 def _emit_progress(kind: str, **fields) -> None:
     """Write one namespaced protocol line. Observability only — never affects inference.
@@ -1286,6 +1295,75 @@ def _run_semantics_for_video(
     return semantics, timings
 
 
+def _publish_job_partial(
+    *,
+    response_path: str,
+    job_index: int,
+    job_total: int,
+    job_id: str,
+    video_file: str,
+    semantics: Dict[str, Dict],
+    timings: Dict,
+    client: "QwenLlamaClient",
+) -> None:
+    """[FORK] Digital-Union (A1): make one finished job's evidence durable before the next one starts.
+
+    The response JSON is written **once**, after the whole job loop (see ``main``), so until A1 a
+    worker that died on its last job discarded every earlier job's completed inference. This publishes
+    each job's own ``semantics``/``timings`` the moment they exist.
+
+    Three properties are load-bearing:
+
+    * **No verdict.** Only evidence crosses this boundary. ``_qwen_job_completed`` is the parent's rule
+      and is never evaluated here - a second completion rule is exactly what
+      ``.claude/rules/stage5-cache-durability.md`` forbids.
+    * **Written for every job that returns**, including one that decoded nothing or produced zero valid
+      tags. Filtering by "looks complete" would require that forbidden second rule, and an incomplete
+      job's evidence is still what makes a failed invocation diagnosable.
+    * **It can never cost a job.** Everything is swallowed, exactly like ``_emit_progress``: this runs
+      next to llama.cpp calls that have already spent GPU minutes. ``Exception`` only, so
+      ``KeyboardInterrupt``/``SystemExit`` still propagate. A failure is reported on stdout as an
+      ordinary human line - no new progress protocol kind, because the progress stream carries no
+      semantic authority and must not start looking as if it did.
+
+    ``backend`` is diagnostic only and must never influence completion. It is captured per job because
+    it genuinely varies within a batch: ``load_seconds`` accumulates and ``batch_size`` is reassigned
+    whenever ``restart_server_with_slots`` succeeds, so a reader wanting the values a successful
+    response would have carried must take them from the **last** valid partial, not the first.
+    """
+    if _qwen_partials is None:
+        return
+    try:
+        target = _qwen_partials.partial_path(response_path, job_index, job_id)
+        payload = _qwen_partials.build_payload(
+            response_path=response_path,
+            job_index=job_index,
+            job_total=job_total,
+            job_id=job_id,
+            video_file=video_file,
+            semantics=semantics,
+            timings=timings,
+            backend={
+                "model_id": client.model_id,
+                "batch_size": client.batch_size,
+                "model_load_seconds": client.load_seconds,
+            },
+        )
+        written = _qwen_partials.write_partial(
+            target, payload,
+            on_error=lambda reason: print(
+                f"Qwen per-job partial not written for job {job_id}: {reason}", flush=True),
+        )
+        if written:
+            print(
+                f"Qwen per-job partial published for job {job_id}: "
+                f"{os.path.basename(written)}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"Qwen per-job partial not written for job {job_id}: {exc}", flush=True)
+
+
 def main() -> None:
     args = _parse_args()
     whole_started = time.perf_counter()
@@ -1351,6 +1429,20 @@ def main() -> None:
                 candidates=candidates,
                 prompt=prompt,
                 job_context=job_context,
+            )
+            # [FORK] Digital-Union (A1): publish this job's evidence here, not after the loop. The
+            # response below is still the single, final, unchanged write - this only stops a later
+            # job's death from discarding a job that has already finished. Nothing in the parent reads
+            # these artifacts yet, and the fail-fast behaviour of this loop is deliberately unchanged.
+            _publish_job_partial(
+                response_path=args.response,
+                job_index=job_index,
+                job_total=len(jobs),
+                job_id=job_id,
+                video_file=video_file,
+                semantics=semantics,
+                timings=timings,
+                client=client,
             )
             semantics_by_job[job_id] = semantics
             timings_by_job[job_id] = timings

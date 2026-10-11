@@ -20,6 +20,84 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-11 (Stage-5 A1: worker-side atomic per-job partial artifacts)
+
+**The Qwen worker now publishes one small JSON artifact per finished job, next to the response file it
+would eventually write.** `stage5_qwen_scene_worker.main()` accumulates every job's semantics in
+memory and writes its response **once**, after the whole job loop, so until now a worker that died on
+job 100 of 100 discarded 99 jobs of finished GPU inference — the parent's per-job checkpointing (D1)
+cannot help, because it only runs after a usable response arrives. Bounding the submission
+(`library_prep.DEFAULT_ANALYZE_BATCH_SIZE = 100`) bounds that exposure; it does not close it.
+
+**A1 is deliberately inert, and no durability or recovery improvement may be claimed for it.** Nothing
+in the parent reads a partial: `src/video_analysis.py` is **byte-identical** to the base commit, and a
+test asserts it mentions none of the new names. Library preparation is still not resumable — a batch
+whose worker dies may still need repeating, exactly as `library_prep.py` already says. What A1
+delivers is diagnostics (a failed invocation becomes forensically readable for the first time) and the
+substrate for A2, which is where recovery and that documentation sentence legitimately change.
+
+**The worker emits evidence; the parent will judge it.** A partial carries the job's `semantics` and
+`timings` **verbatim** — the same objects `_run_semantics_for_video` returned and the same ones the
+final response would have carried — plus `partial_contract`, `invocation`, `job_index`, `job_total`,
+`job_id`, `video_file` and an optional diagnostic `backend`. It carries **no verdict**: no
+`ai_enabled`, no completion flag, no requested-candidate set. `_qwen_job_completed` and
+`_cache_entry_is_complete` remain the only completion rules, and evaluating either in the worker would
+be the second rule `.claude/rules/stage5-cache-durability.md` forbids. A partial is therefore written
+for **every** job that returns, including one that decoded nothing or produced zero valid tags —
+filtering by "looks complete" would require exactly that forbidden second rule.
+
+**Identity is the parent's, echoed.** The filename is
+`{response_stem}_job_{job_index:05d}_{safe_job_id}.partial.json`, reusing the worker's existing
+`_response_prefix` sibling convention (`*_llama_server_ctx*_stdout.log`, `*_llama_frames`). So partials
+need no new directory, no new identity formula and no knowledge of `VIDEO_ANALYSIS_CACHE_DIR`: the
+parent mints the response path once per launch and the worker only echoes its stem as `invocation`. The
+job index disambiguates filenames and names the loop position; it is explicitly **not** a fix for
+duplicate job IDs, which would collapse the parent's own `job_to_video`/`selected_by_job` mappings
+*before* the worker is launched (they cannot today — `analyze_video_sources` numbers jobs with
+`enumerate(existing, 1)`). Sanitisation is lossy, so the filename is a hint and the payload's exact
+`job_id` is the authority; `safe_job_id` is pinned against the real worker `_safe_file_token` by
+executing it.
+
+**Atomicity and failure containment.** `write_partial` mirrors `_save_cache`: a **unique**
+same-directory `tempfile.mkstemp` temp, `flush`, `os.fsync`, `os.replace`, best-effort own-temp
+cleanup. Never a shared `path + ".tmp"` — that was the measured D1 collision where one writer's
+`os.replace` published the other's payload while reporting success. `PROCESS_CRASH_ATOMICITY` is
+tested for this writer rather than inherited: the target is never opened for writing at all, a failure
+at serialisation or at `os.replace` publishes nothing and leaves no temp, and an already-published
+partial survives a failed rewrite intact. **`POWER_LOSS_DURABILITY` is not claimed** — the temp is
+fsynced, the containing directory is not. A write failure can never cost a Qwen job that has already
+spent GPU minutes: everything is contained and reported as an ordinary human stdout line, catching
+`Exception` only so `KeyboardInterrupt`/`SystemExit` still propagate. A missing or broken fork package
+degrades to "no partials" through the same guarded import the progress protocol already uses.
+
+**No cleanup code, by design.** Published partials live in `input/video_analysis_cache/`, which project
+policy preserves deliberately — including the retained `qwen_batch_request_*` /
+`qwen_batch_response_*` files. A retention policy is a separate product-owner decision; a test asserts
+the only removal anywhere in the module is `write_partial`'s own temp. Expected growth is roughly a
+doubling of an already-unbounded term: a partial holds the same semantics the response holds, split per
+job (~8–14 KB typical, ~95–160 KB at the 120-candidate bound).
+
+**Explicitly not in this change**, and each excluded on its own merits rather than by omission:
+parent-side recovery (A2); per-job exception isolation in the job loop, whose motivating example turned
+out to be false — an unopenable source does **not** raise, it returns a 0-tag job; any change to the
+invocation token, which is a pre-existing hardening question and not required for A1 correctness; and
+any change to batch size, cache cleanup or cross-invocation recovery. The job loop keeps its fail-fast
+behaviour, the response is still one write after the loop, the legacy single-job response shape is
+unchanged, no progress protocol kind was added, and `CACHE_CONTRACT_VERSION = stage5_cache_v3` /
+`ANALYSIS_VERSION = auto_av_analysis_v8_llama_vulkan_batched` are untouched. No cache was invalidated
+and no record gained a field.
+
+Two existing guards were **narrowed or widened, never weakened**.
+`test_k_no_incremental_worker_response_was_implemented` drops exactly one forbidden name
+(`write_partial`, which the worker now legitimately calls) and gains positive assertions that the
+response is still written once after the loop, that A1's publication really exists, and that
+`video_analysis.py` consumes no partial — so "library preparation is not resumable" is now proven
+rather than inferred from an absent string. `test_media_neutral_semantics.py`'s `stage5_side` tuple
+gains the new module, extending the Stage-5-side ban on `master_seed`/`director`/`proposal`/`freestyle`
+to cover it. `test_no_runtime_dependency.py`'s curated stdlib allowlist gains `tempfile` with the same
+justification `copy` (L2 V1) and `statistics` (Director V2) carry; the fork package remains provably
+free of the upstream runtime.
+
 ### Maintenance — 2026-10-11 (instruction-map completeness and its mechanical guard)
 
 **Documentation and tests only — no application executable change.** No `src/` file, no
