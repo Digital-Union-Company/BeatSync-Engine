@@ -144,10 +144,18 @@ Bounding the submission bounds that exposure.
 
 Two claims this explicitly does **not** make:
 
-- **It does not make an in-flight worker resumable.** If a batch's worker dies before producing its
-  response, that batch may still need repeating; the bound only limits what that costs. The worker
-  was **not** modified — incremental worker responses remain possible future work, and a test asserts
-  no such machinery was invented here.
+- **It does not make preparation resumable across runs.** The bound only limits what a dead batch
+  costs. **A1 and A2-S1 narrowed that exposure without removing it**: the worker publishes one atomic
+  partial artifact per finished job, and when a batch's final response comes back unusable the parent
+  recovers the jobs that did finish — *within the same invocation* — and checkpoints the ones the
+  unchanged completion rule accepts. So a dead worker no longer discards every job it had already
+  completed, and the bound now limits a genuinely smaller loss.
+
+  What is still **not** claimed: a *later* run does not resume anything, because a source that was
+  never checkpointed is simply re-analysed; recovery is never attempted while the response is usable;
+  a job with no partial is retried exactly as before; and there is still no incremental worker
+  response — the response JSON is written once, after the whole job loop. A test pins each of those,
+  positively rather than by banning a name. See `.claude/rules/stage5-cache-durability.md`.
 - **It is not a library cap.** A 5000-source scan still reports 5000 needing analysis; the batch size
   only decides how many of them one click submits. `normalize_batch_size` therefore has **no upper
   bound** and the `gr.Number` carries no `maximum`. Tests pin both.

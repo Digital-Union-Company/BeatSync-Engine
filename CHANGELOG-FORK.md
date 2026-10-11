@@ -20,6 +20,82 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-11 (Stage-5 A2-S1: same-invocation parent recovery from per-job partials)
+
+**A dead Qwen batch no longer discards the jobs it had already finished.** A1 made the worker publish
+one atomic JSON artifact per finished job; this is the half that reads them. When
+`_complete_deferred_qwen_batch`'s shared worker returns an **unusable** response — killed, crashed,
+timed out, non-zero exit, unparseable JSON — the parent now rebuilds the response envelope of the jobs
+that did complete, from that **same invocation's** partials, and checkpoints the ones the existing
+completion rule accepts. Previously that branch marked all of them incomplete and returned, so a
+worker dying on job 100 of 100 threw away 99 jobs of finished GPU inference.
+
+**The final response always wins, and that is enforced structurally rather than by precedence.**
+Recovery lives inside the `if not semantics_by_job:` guard and nowhere else, so a usable response
+never enumerates a directory, opens a partial or runs a validation — a contradictory partial is
+*unreachable*, not merely out-voted. A test counts reader calls at runtime and asserts zero.
+
+**No second completion rule, because there is no completion decision.**
+`_recover_jobs_from_partials` returns one job's `semantics`/`timings` verbatim plus diagnostic
+telemetry, and contains no call to `_qwen_job_completed`, `_cache_entry_is_complete`,
+`_checkpoint_cache` or `_save_cache`. The recovered maps flow into the **unchanged** per-job merge
+loop, which applies `_qwen_job_completed` to the **live** `selected_by_job` candidate ids. So a
+recovered-but-incomplete job stays incomplete, is not cached and retries next run; a previously
+complete record is never overwritten by an incomplete recovery (asserted byte-for-byte).
+
+**Validation, never inference.** A partial is admitted only if it is a JSON object of a known
+`PARTIAL_CONTRACT_VERSION`, carries *this* invocation's id, names a `job_id` in the live request,
+matches the job's source through the existing `_same_source`, and has mapping-typed
+`semantics`/`timings`. Every file is handled independently, so one bad partial costs its siblings
+nothing — eleven rejection shapes are tested that way. A filename is never identity: `safe_job_id` is
+lossy, so the payload's own `job_id` plus the source check are the authority. **Duplicate job ids are
+rejected and reported, never merged or silently overwritten**: the lowest `job_index` wins, proven
+stable under both write orders. Backend telemetry comes from the **highest validated `job_index`**
+(`model_load_seconds` accumulates and `batch_size` is reassigned by a mid-batch slot restart), never
+from enumeration order, and `peak_vram_gb` — which a partial does not carry — stays honestly unknown
+rather than a fabricated `0.0`.
+
+**It cannot fail Stage 5 and it changes no accounting.** The whole helper is contained: any failure
+degrades to "nothing recovered", which is exactly the pre-A2 behaviour. R2's submission-first
+`run_stats` block is untouched, the per-job loop still only *promotes*, and no counter, key or
+increment was added — `qwen_jobs` is still counted once at submission and `batch_seconds` still added
+once. Nothing is deleted: a recovered partial is read and left on disk.
+
+**Scope.** `_run_qwen_worker_batch` gained one keyword-only out-parameter, `artifact_sink`, filled
+with the request/response paths **before the launch** — the only way the caller can know the path,
+since the invocation token embeds `time.time()` and re-minting one would point at nothing, while
+globbing `qwen_batch_response_*` would cross invocations. Its return type, `event_callback` and the
+retained-artifact `finally` blocks are unchanged. The legacy single-job path, the worker, the prompt,
+semantic normalisation, the GUI, batch size, `CACHE_CONTRACT_VERSION = stage5_cache_v3`,
+`ANALYSIS_VERSION`, `PARTIAL_CONTRACT_VERSION = stage5_job_partial_v1` and every cache key are all
+untouched; cache identity is asserted byte-identical with partials littering the very directory
+recovery reads. **No cross-invocation recovery and no cross-run resumability**: a source that was
+never checkpointed is still simply re-analysed.
+
+Discovery deliberately lives in `beatsync_fork.qwen_partials.find_partials`, implemented on
+`os.listdir`, so `video_analysis.py` keeps containing **no** directory enumeration — that is what
+holds "Stage 5 has no cache sweeper and no migration" to a mechanically tested fact, and the existing
+guard asserting it passes unmodified. No `glob`/`fnmatch` import was added to the fork package
+either; neither is on its curated stdlib allowlist, and a published artifact contract is not worth
+widening it for.
+
+One observable delta is pinned rather than left to be discovered: a job with **no** partial now takes
+the path a job *absent from a usable response* has always taken, instead of the early return. Its
+current-run counters are unaffected (`_bounded_count(None, n)` is 0), it gains in-memory `timings`
+whose pre-existing `qwen_frame_count` fallback reaches no cache because the record is never
+checkpointed, and it prints one extra "semantic pass incomplete" line.
+
+Two existing negative tests were **narrowed, and strengthened in the process**:
+`test_k_no_incremental_worker_response_was_implemented` and
+`test_g_no_cache_identity_or_completion_function_learns_about_partials` dropped parent-side
+forbidden-name lists that would now ban the feature, and gained positive structural assertions — that
+recovery sits inside the unusable-response guard, that it evaluates no completion rule, that no
+identity/completion/reuse function mentions a partial, and that the parent never publishes one.
+`test_total_batch_failure_behaviour_is_preserved` and every D1 durability assertion pass **unchanged**.
+
+Tests: 5416 passed, 8 skipped (5424 collected) — baseline 5359/8/5367 plus the 57 new A2-S1 tests,
+zero failures.
+
 ### Added — 2026-10-11 (Stage-5 A1: worker-side atomic per-job partial artifacts)
 
 **The Qwen worker now publishes one small JSON artifact per finished job, next to the response file it

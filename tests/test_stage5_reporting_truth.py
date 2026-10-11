@@ -500,6 +500,8 @@ import json as _json
 import math as _math
 import tempfile as _tempfile
 
+from beatsync_fork import qwen_partials as _qwen_partials
+
 _PIPE_DEPS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_count",
               "_reported_count", "_stored_ai_cache_is_consistent", "_qwen_job_completed",
               "_deterministic_analysis_completed", "_cache_entry_is_complete",
@@ -509,7 +511,14 @@ _PIPE_DEPS = ("_safe_name", "_hash_text", "_same_source", "_coerce_count", "_is_
               # have to be extracted alongside - the same coupling CLAUDE.md records for this pattern.
               "_as_mapping", "_is_real_number", "_optional_telemetry_number", "_telemetry_seconds",
               "_telemetry_total", "_is_nonnegative_count", "_bounded_count", "_telemetry_text",
-              "_record_telemetry", "_record_candidate_count")
+              "_record_telemetry", "_record_candidate_count",
+              # A2-S1: `_complete_deferred_qwen_batch` now calls the recovery helper, so it has to be
+              # extracted alongside for the same reason the T1 helpers are - and
+              # `fork_partials` lands in the namespace below for it. This changes nothing these tests
+              # assert: the stubbed worker never fills the artifact sink, so the response path is
+              # `None`, recovery returns nothing, and the R2 submission-accounting expectations below
+              # measure exactly today's empty-response behaviour.
+              "_recover_jobs_from_partials")
 _PIPE_CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
                 "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
 
@@ -529,6 +538,7 @@ def _pipeline_ns(extra_funcs, **stubs):
     merged: list = []
     ns: dict = {
         "os": os, "json": _json, "tempfile": _tempfile, "math": _math, "time": time,
+        "fork_partials": _qwen_partials,
         "Any": typing.Any, "Dict": typing.Dict, "List": list, "Sequence": list,
         "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],
         # faithful to the real `_merge_semantic`, which also sets ai_analyzed

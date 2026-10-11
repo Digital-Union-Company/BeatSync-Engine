@@ -930,12 +930,39 @@ def test_g_the_module_is_stdlib_only():
 
 
 def test_g_no_cache_identity_or_completion_function_learns_about_partials():
-    """A1 does not touch video_analysis.py at all - pinned by name rather than by a diff."""
-    source = _read(_PARENT).lower()
+    """A2-S1 lets the parent READ partials. No identity or completion function may learn of them.
 
-    for name in ("qwen_partials", "partial_contract", "stage5_job_partial",
-                 "partial_path", "write_partial", "build_payload", ".partial.json"):
-        assert name not in source, f"video_analysis.py must not mention {name}"
+    A1's version of this test banned every partial name from ``video_analysis.py`` outright, which
+    was right while A1 was inert and is wrong now: the ban would forbid the feature. What actually
+    needed protecting was narrower and is asserted directly here instead — **the parent may consume
+    a partial, but no function that decides identity, completion or reusability may mention one.**
+    That is the boundary A1's blanket ban was approximating, and naming it makes the test stronger:
+    it now fails if a partial name ever reaches `_qwen_job_completed`, `_cache_entry_is_complete`,
+    `_video_signature`, `_cache_path` or `_qwen_config_token`, which a string search over the whole
+    file could never detect once any mention became legal.
+    """
+    tree = ast.parse(_read(_PARENT))
+
+    # The parent never publishes, and never re-implements the artifact contract.
+    whole = ast.unparse(tree)
+    for never in ("write_partial", "build_payload", "partial_path", "PARTIAL_SUFFIX",
+                  "PARTIAL_CONTRACT_VERSION"):
+        assert never not in whole, f"video_analysis.py must not use {never}"
+
+    # No identity, completion or reuse rule may know a partial exists.
+    sealed = ("_qwen_job_completed", "_cache_entry_is_complete", "_stored_ai_cache_is_consistent",
+              "_deterministic_analysis_completed", "_video_signature", "_cache_path",
+              "_qwen_config_token", "_checkpoint_cache", "_save_cache", "_load_cache")
+    for name in sealed:
+        body = _body_code(_function(tree, name)).lower()
+        for banned in ("partial", "qwen_partials", "invocation", "recover"):
+            assert banned not in body, f"{name} must not mention {banned!r}"
+
+    # And the one consumer is the recovery helper, which writes nothing.
+    helper = _body_code(_function(tree, "_recover_jobs_from_partials"))
+    for banned in ("_save_cache", "_checkpoint_cache", "_qwen_job_completed",
+                   "_cache_entry_is_complete", "os.remove", "os.unlink", "shutil"):
+        assert banned not in helper, f"recovery must not reference {banned}"
 
 
 def test_g_the_contract_constants_are_untouched():

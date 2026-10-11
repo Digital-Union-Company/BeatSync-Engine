@@ -47,6 +47,9 @@ from typing import Any, Dict
 
 import pytest
 
+# A2-S1: the real per-job artifact contract, needed by the extracted `_recover_jobs_from_partials`.
+from beatsync_fork import qwen_partials
+
 _VA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "src", "video_analysis.py")
 
@@ -60,7 +63,10 @@ _CACHE_FUNCS = ("_safe_name", "_hash_text", "_same_source", "_stored_ai_cache_is
                 "_qwen_job_completed", "_deterministic_analysis_completed",
                 "_cache_entry_is_complete", "_load_cache", "_save_cache", "_checkpoint_cache",
                 "_fmt_seconds", "_select_ai_candidates", "_qwen_max_windows")
-_PIPELINE_FUNCS = ("_annotate_candidates_with_qwen", "_complete_deferred_qwen_batch")
+# `_recover_jobs_from_partials` joined this with A2-S1 - the batch body now calls it, and an
+# extracted body resolves every name from the namespace, so leaving it out is a `NameError`.
+_PIPELINE_FUNCS = ("_annotate_candidates_with_qwen", "_recover_jobs_from_partials",
+                   "_complete_deferred_qwen_batch")
 _ALL_FUNCS = _TELEMETRY_FUNCS + _COUNT_FUNCS + _CACHE_FUNCS + _PIPELINE_FUNCS
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_QWEN_COMPLETED_KEY",
            "_QWEN_SINGLE_JOB_ID", "_DETERMINISTIC_SCORING_KEY")
@@ -101,6 +107,7 @@ def _namespace(**stubs) -> Dict[str, Any]:
     merged: list = []
     namespace: Dict[str, Any] = {
         "os": os, "json": json, "tempfile": tempfile, "math": math, "time": time,
+        "fork_partials": qwen_partials,
         "Any": Any, "Dict": Dict, "List": list, "Sequence": list, "Iterable": list,
         # faithful to the real `_merge_semantic`, which also sets `ai_analyzed`
         "_merge_semantic": lambda candidate, semantic: (

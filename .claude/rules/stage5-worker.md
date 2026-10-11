@@ -55,10 +55,29 @@ because both kill only the direct child and neither runs the worker's `finally: 
 is pre-existing; do not "fix" it with `taskkill /T` or a process-group redesign as a side effect of
 unrelated work.
 
-**The response JSON remains the only semantic authority.** Nothing is reconstructed from stdout and no
-tag is ever parsed out of a progress line, so the same request returns the same semantics whether a
-progress callback exists or not. A test compares the streaming result against the old capture path for
-identical response JSON.
+**The response JSON is the PRIMARY semantic authority, and the progress stream is never any kind of
+authority.** Nothing is reconstructed from stdout and no tag is ever parsed out of a progress line, so
+the same request returns the same semantics whether a progress callback exists or not. A test compares
+the streaming result against the old capture path for identical response JSON. That half is absolute
+and must stay so.
+
+**It is no longer the *only* source, and the exception is narrow (A2-S1).** When the response is
+**unusable** — a worker that died, was killed, timed out, exited non-zero or wrote unparseable JSON —
+`_complete_deferred_qwen_batch` may fall back to the per-job partial artifacts A1's worker published
+for **that same invocation**:
+
+```
+RESPONSE_USABLE      -> authority. No partial is enumerated, opened or validated at all.
+RESPONSE_UNUSABLE    -> validated same-invocation partials become fallback EVIDENCE.
+PROGRESS STREAM      -> never authority, in either case.
+CROSS-INVOCATION     -> never. A foreign `invocation` id is refused by the reader.
+```
+
+The fallback supplies one job's `semantics`/`timings` verbatim and nothing else — no verdict.
+`_qwen_job_completed` and `_cache_entry_is_complete` remain the only completion rules and are applied
+by the unchanged per-job merge loop against the live requested-candidate set, so a recovered job is
+checkpointed only if it would have been checkpointed from a healthy response. Full contract and the
+four boundaries: `.claude/rules/stage5-cache-durability.md`.
 
 Qwen is advisory, not authoritative: `_merge_semantic()` keeps deterministic motion/quality metrics
 dominant (e.g. action = 0.72·deterministic + 0.28·semantic·motion_gate) so a pretty static frame can't be

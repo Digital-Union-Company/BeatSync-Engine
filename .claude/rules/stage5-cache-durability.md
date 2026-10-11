@@ -25,12 +25,43 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   | AI-deferred parallel result | `ai_deferred=True` | **no** — only after its Qwen result completes |
   | candidate-less with scoring evidence | no Qwen work exists | **yes** (the explicit exception) |
   | shared Qwen batch, per job | after the worker's final response returns | **yes, per job** |
+  | shared Qwen batch whose response is unusable | after same-invocation partial recovery (A2-S1) | **yes, per recovered job** |
 
   So a failing or missing sibling job, and a parent interruption during the post-response merge loop,
-  cannot discard jobs already written. **While the shared worker is still in flight its per-job
-  results are not durable at all** — they exist only inside that process until its final response is
-  written, and the streamed progress channel carries no semantic result authority. Closing that gap
-  would need a two-phase deterministic-only record, which D1 deliberately does not introduce.
+  cannot discard jobs already written. While the shared worker is still in flight its per-job results
+  are not durable — they exist only inside that process — and the streamed progress channel carries no
+  semantic result authority, ever.
+
+  **A2-S1 narrowed that gap, and the shape of the fix matters.** The claim that in-flight per-job
+  results "are not durable *at all*" and that closing the gap "would need a two-phase
+  deterministic-only record" were both true of D1 and are now **obsolete**. Since A1 the worker
+  publishes one atomic JSON artifact per finished job (`beatsync_fork.qwen_partials`), so those
+  results *do* exist outside the process — as **evidence**, not as records. A2-S1 added the reader:
+
+  ```
+  RESPONSE_USABLE   -> the response is the authority; no partial is opened, globbed or validated
+  RESPONSE_UNUSABLE -> validated SAME-INVOCATION partials rebuild the envelope of the jobs that
+                       finished, and the UNCHANGED per-job merge loop decides each one
+  ```
+
+  Four boundaries make this not a second completion rule:
+
+  * **`_recover_jobs_from_partials` decides nothing.** It contains no call to `_qwen_job_completed`,
+    `_cache_entry_is_complete`, `_checkpoint_cache` or `_save_cache`; it returns one job's
+    `semantics`/`timings` verbatim and diagnostic telemetry. Completion is still decided by
+    `_qwen_job_completed` against the **live** `selected_by_job` candidate ids, so a recovered job
+    that is incomplete stays incomplete and is not checkpointed.
+  * **Same invocation only.** Discovery is anchored on the response path of the worker that very call
+    launched, and the reader refuses a foreign `invocation`. A *later* run still re-analyses any
+    source that was never checkpointed — **there is no cross-run resumability**.
+  * **The response always wins.** Recovery is unreachable while `semantics_by_job` is usable, so a
+    contradictory partial cannot compete with a live response.
+  * **No durability upgrade.** `POWER_LOSS_DURABILITY` is still not claimed, a partial is still not a
+    cache record, and nothing deletes one — `input/video_analysis_cache/` is preserved by policy.
+
+  A job with no partial is simply retried, exactly as before. The two-phase deterministic-only record
+  D1 declined to introduce is still not introduced; this closed the gap from the worker's side
+  instead.
 - **`_cache_entry_is_complete()` is the single completion rule.** Never re-answer "is this reusable?"
   anywhere else — the scattered version is exactly how a failed Qwen run became a permanent
   AI-complete hit. It rejects a non-dict payload, a wrong `analysis_version`, a missing/non-string

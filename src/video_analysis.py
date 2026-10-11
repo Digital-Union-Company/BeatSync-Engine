@@ -35,6 +35,12 @@ from logger import ROOT_DIR, setup_environment
 from beatsync_fork import progress as fork_progress
 # [FORK] Digital-Union (Phase 2B): streaming Qwen worker runner + stdout progress protocol.
 from beatsync_fork import qwen_progress as fork_qwen
+# [FORK] Digital-Union (A2-S1): the per-job partial artifact contract (filename, glob, reader). Used
+# ONLY to recover a batch whose final response is unusable; a usable response never reaches it. The
+# import is unguarded, like the two above - this module already hard-depends on the fork package, and
+# the worker's own guarded import exists for a different reason (a broken checkout must not kill an
+# in-flight GPU run, which does not apply to the parent).
+from beatsync_fork import qwen_partials as fork_partials
 # [FORK] Digital-Union (P V1): media library preparation vocabulary. Imported for the classification
 # status/reason VALUES only, so the runtime classifier and the stdlib-only state module cannot drift
 # apart on a string. The dependency runs one way: the fork module never imports this one.
@@ -1971,6 +1977,120 @@ def _qwen_max_windows() -> int:
     return max(0, value)
 
 
+def _recover_jobs_from_partials(
+    response_path: Any,
+    selected_by_job: Dict[str, List[Dict]],
+    job_to_video: Dict[str, Dict],
+) -> tuple[Dict[str, Dict], Dict[str, Dict], Dict[str, Any]]:
+    """[FORK] Digital-Union (A2-S1): rebuild the response envelope of the jobs that DID finish.
+
+    Reached only from `_complete_deferred_qwen_batch`, and only when the shared worker's final
+    response is unusable. It reads the per-job partial artifacts the worker published for **this one
+    invocation** (A1, `beatsync_fork.qwen_partials`) and returns what the response would have carried
+    for each job it can prove belongs here.
+
+    **It decides nothing.** There is no call to `_qwen_job_completed`, `_cache_entry_is_complete`,
+    `_checkpoint_cache` or `_save_cache` anywhere below, and that is the whole architectural point:
+    the recovered maps go back into the *existing* per-job merge loop, which applies the *existing*
+    completion rule to the *live* `selected_by_job` candidate ids. A2 therefore adds **no second
+    completion rule** - not by convention, but because it contains no completion arithmetic at all.
+    A partial is evidence; the parent still judges it.
+
+    What each partial must prove before it is admitted - validation, never inference:
+
+    * the file is a well-formed partial of a known contract version, carrying **this** invocation's
+      id (`qwen_partials.load_partial`). Discovery is `qwen_partials.find_partials`, anchored on this
+      invocation's own stem *and* on the terminal ``.partial.json``, so another run's artifacts and a
+      killed write's ``.tmp`` leftover are never even enumerated. The listing deliberately lives in
+      the fork module: this file must stay free of directory enumeration, which is what keeps "Stage 5
+      has no cache sweeper and no migration" a mechanically tested fact;
+    * ``job_id`` is a key of the live `selected_by_job` - a job this parent actually submitted;
+    * ``video_file`` is the source this parent asked about, via the existing `_same_source`. The
+      filename is **never** identity: `qwen_partials.safe_job_id` is lossy by construction, so the
+      payload's own `job_id` plus this source check are the authority;
+    * ``semantics`` and ``timings`` are genuine mappings. A truthy non-dict would reach `.get` in the
+      merge loop and raise, which is the T1 failure shape.
+
+    **Duplicate job ids are rejected, never merged and never silently overwritten.** Paths are walked
+    in sorted order - the filename's zero-padded ``job_index`` makes that loop-position order - so the
+    lowest-indexed valid partial for a job id wins and every later one is refused with a printed
+    reason. Nothing here depends on filesystem enumeration order.
+
+    **Backend telemetry is diagnostic only** and is taken from the highest validated ``job_index``
+    among accepted partials, because it genuinely varies within a batch: `load_seconds` accumulates
+    and `batch_size` is reassigned whenever the worker's `restart_server_with_slots` succeeds. Only
+    the three fields a partial actually carries are returned; ``peak_vram_gb`` is **absent**, so
+    `_optional_telemetry_number` reports it as unknown rather than as a fabricated `0.0`.
+
+    **It can never fail Stage 5.** Every file is handled independently, so one unreadable partial
+    costs its siblings nothing, and the whole body is contained: any failure degrades to "nothing
+    recovered", which is exactly today's behaviour. `Exception` only, so
+    `KeyboardInterrupt`/`SystemExit` still propagate. Nothing is written, renamed or deleted - a
+    recovered partial stays on disk, because `input/video_analysis_cache/` is preserved by policy and
+    retention is a separate product-owner decision.
+    """
+    recovered_semantics: Dict[str, Dict] = {}
+    recovered_timings: Dict[str, Dict] = {}
+    telemetry: Dict[str, Any] = {}
+    try:
+        if not isinstance(response_path, str) or not response_path:
+            return {}, {}, {}
+        expected_invocation = fork_partials.invocation_id(response_path)
+        accepted: List[tuple[int, str, Any]] = []
+        for path in fork_partials.find_partials(response_path):
+            try:
+                payload = fork_partials.load_partial(
+                    path, expected_invocation=expected_invocation)
+                if payload is None:
+                    print(f"      Qwen partial ignored (unreadable or not this invocation): "
+                          f"{os.path.basename(path)}")
+                    continue
+                job_id = payload.get("job_id")
+                if not isinstance(job_id, str) or job_id not in selected_by_job:
+                    print(f"      Qwen partial ignored (job id not in this request): "
+                          f"{os.path.basename(path)}")
+                    continue
+                if job_id in recovered_semantics:
+                    print(f"      Qwen partial ignored (duplicate job id {job_id}; the first valid "
+                          f"partial already won): {os.path.basename(path)}")
+                    continue
+                expected_video = _as_mapping(job_to_video.get(job_id)).get("video_file")
+                if not isinstance(expected_video, str) or not _same_source(
+                        payload.get("video_file"), expected_video):
+                    print(f"      Qwen partial ignored (source does not match job {job_id}): "
+                          f"{os.path.basename(path)}")
+                    continue
+                semantics = payload.get("semantics")
+                timings = payload.get("timings")
+                if not isinstance(semantics, dict) or not isinstance(timings, dict):
+                    print(f"      Qwen partial ignored (malformed semantics/timings envelope): "
+                          f"{os.path.basename(path)}")
+                    continue
+                recovered_semantics[job_id] = semantics
+                recovered_timings[job_id] = timings
+                job_index = payload.get("job_index")
+                if _is_count(job_index):
+                    accepted.append((int(job_index), path, payload.get("backend")))
+            except Exception as exc:
+                print(f"      Qwen partial ignored ({type(exc).__name__}: {exc}): "
+                      f"{os.path.basename(str(path))}")
+                continue
+        if accepted:
+            accepted.sort(key=lambda item: (item[0], item[1]))
+            backend = _as_mapping(accepted[-1][2])
+            # Only the three fields a partial carries. `peak_vram_gb` is deliberately absent.
+            telemetry = {
+                "model_id": backend.get("model_id"),
+                "batch_size": backend.get("batch_size"),
+                "model_load_seconds": backend.get("model_load_seconds"),
+            }
+    except Exception as exc:
+        print(f"      Qwen per-job partial recovery unavailable ({type(exc).__name__}: {exc}); "
+              f"AI analysis will retry on the next run.")
+        return {}, {}, {}
+    return recovered_semantics, recovered_timings, telemetry
+
+
 def _complete_deferred_qwen_batch(
     video_items: Sequence[tuple[Dict, Dict]],
     use_gpu: bool,
@@ -2035,11 +2155,16 @@ def _complete_deferred_qwen_batch(
 
     print(f"   Running one shared Qwen worker for {len(request_jobs)} video(s) (model loads once)")
     batch_started = time.perf_counter()
+    # [FORK] Digital-Union (A2-S1): the sink is filled with this invocation's request/response paths
+    # before the worker is launched, so the partials it published stay findable even when the call
+    # below returns `{}`. Nothing reads it unless the final response turns out to be unusable.
+    worker_artifacts: Dict[str, str] = {}
     response = _run_qwen_worker_batch(
         jobs=request_jobs,
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
         event_callback=event_callback,
+        artifact_sink=worker_artifacts,
     )
     batch_seconds = time.perf_counter() - batch_started
     # [FORK] Digital-Union (R2): SUBMISSION truth, recorded the moment the shared worker returns and
@@ -2070,6 +2195,32 @@ def _complete_deferred_qwen_batch(
     # object by `beatsync_fork.qwen_progress`, so that check is not repeated here.
     semantics_by_job = _as_mapping(response.get("semantics_by_job"))
     timings_by_job = _as_mapping(response.get("timings_by_job"))
+    # [FORK] Digital-Union (A2-S1): THE FINAL RESPONSE ALWAYS WINS. Recovery lives inside this guard
+    # and nowhere else, so a usable response never globs a directory, never opens a partial and never
+    # runs a validation - a contradictory partial is unreachable rather than merely out-voted.
+    #
+    # Only once the response has already failed does the worker's own per-job evidence become worth
+    # consulting: before A2 this branch discarded every job the worker had genuinely finished, which
+    # for a dead batch of 100 meant up to 99 jobs of completed GPU inference. Recovery supplies those
+    # jobs' envelopes and NOTHING else - the per-job loop below is entirely unchanged and still
+    # applies `_qwen_job_completed` to the live `selected_by_job` ids, so a job without a partial
+    # stays incomplete, is not checkpointed, and retries on the next run exactly as it does today.
+    # Same invocation only: there is no cross-run resumability here.
+    if not semantics_by_job:
+        recovered_semantics, recovered_timings, recovered_telemetry = _recover_jobs_from_partials(
+            worker_artifacts.get("response_path"), selected_by_job, job_to_video)
+        if recovered_semantics:
+            semantics_by_job = recovered_semantics
+            timings_by_job = recovered_timings
+            # The unusable response is replaced outright: it is proven untrustworthy, and its
+            # telemetry would be read below. The recovered mapping carries only the three fields a
+            # partial really holds, so `peak_vram_gb` stays honestly unknown rather than 0.0.
+            response = recovered_telemetry
+            print(
+                f"      Recovered {len(recovered_semantics)} of {len(request_jobs)} Qwen job(s) "
+                f"from this invocation's per-job partial artifacts; the unusable final response is "
+                f"discarded and the existing completion rule still decides each job."
+            )
     if not semantics_by_job:
         for video_data in job_to_video.values():
             video_data["ai_deferred"] = False
@@ -2215,11 +2366,39 @@ def _run_qwen_worker_batch(
     qwen_model_path: str,
     use_gpu: bool,
     event_callback=None,
+    *,
+    artifact_sink: Dict[str, str] | None = None,
 ) -> Dict:
+    """[FORK] Digital-Union: run the shared Qwen worker. ``{}`` on any failure, as before.
+
+    ``artifact_sink`` (A2-S1) is an **out-parameter**, and the only reason it exists is that the
+    invocation token below embeds ``time.time()``: the caller cannot re-derive ``response_path``, and
+    re-minting one would produce a *different* path pointing at nothing. Globbing the cache directory
+    for ``qwen_batch_response_*`` instead would cross invocations, which same-invocation recovery
+    forbids outright. So the one process that knows the path hands it back.
+
+    It is filled **before the worker is launched**, which is the load-bearing half: the paths must be
+    recoverable precisely in the cases where this function returns ``{}`` — a non-zero exit, a
+    timeout, a launch failure, unparseable response JSON, or a response carrying no usable semantics.
+    Filling it after a successful launch would make it useless exactly when it is needed.
+
+    The return type is deliberately unchanged (still the response mapping, still ``{}`` on failure):
+    **three** suites AST-extract and execute this function's caller against a stubbed
+    ``_run_qwen_worker_batch`` — ``test_stage5_cache_completion.py``,
+    ``test_qwen_scalar_boundary.py`` and ``test_stage5_reporting_truth.py`` — and a tuple return
+    would silently rewrite that seam in all three. Their stubs take ``**kwargs``, so this keyword is
+    absorbed and simply yields no recovery there, which is why adding it broke none of them.
+    """
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
     token = _hash_text(f"batch|{time.time()}|{len(jobs)}", 12)
     request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_request_{token}.json")
     response_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_batch_response_{token}.json")
+    # [FORK] Digital-Union (A2-S1): published here, before the request file is even written, so every
+    # failure path below still leaves the caller able to find this invocation's partials. No second
+    # token is minted and nothing is reconstructed - these are the exact strings the worker is given.
+    if artifact_sink is not None:
+        artifact_sink["request_path"] = request_path
+        artifact_sink["response_path"] = response_path
     worker_path = os.path.join(ROOT_DIR, "src", "auto_mode", "stage5_qwen_scene_worker.py")
     # [FORK] Digital-Union (P2): no `audio_profile` key. The worker's only consumer of it was
     # `_build_prompt`, which is media-neutral now, so music/edit context does not cross this boundary.

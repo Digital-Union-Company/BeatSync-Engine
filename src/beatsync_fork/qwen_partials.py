@@ -13,9 +13,23 @@ submission (``library_prep.DEFAULT_ANALYZE_BATCH_SIZE``) bounds that exposure; i
 This module lets the worker publish one small artifact per job, the moment that job's loop returns,
 next to the response file it would eventually have written.
 
-**A1 is deliberately inert.** Nothing in the parent reads these artifacts yet, so A1 provides
-*diagnostics* and the substrate for A2 — it provides **no recovery and no durability guarantee**, and
-none may be claimed for it. Library preparation is not yet resumable.
+**A1 wrote these artifacts; A2-S1 reads them, and only on one narrow path.** The worker's final
+response JSON is still the **primary** semantic authority: when it is usable, nothing here is opened,
+globbed or validated at all. Only when that response is unusable — a dead, killed, timed-out or
+unparseable worker — may ``video_analysis._recover_jobs_from_partials`` admit **same-invocation**
+partials as fallback evidence for the jobs that did finish.
+
+Three limits are permanent, not transitional:
+
+* **Same invocation only.** :func:`load_partial` refuses a partial whose ``invocation`` is not the
+  one the caller names, and :func:`partial_glob` is anchored on that invocation's own stem. There is
+  no cross-invocation recovery and no cross-run resumability — a *later* run still re-analyses a
+  source whose record was never checkpointed.
+* **Evidence, never a verdict.** A recovered partial supplies one job's ``semantics``/``timings`` and
+  nothing else. ``_qwen_job_completed`` and ``_cache_entry_is_complete`` in ``video_analysis.py``
+  remain the only completion rules and still decide, unchanged, whether the job may be checkpointed.
+* **No durability upgrade.** ``POWER_LOSS_DURABILITY`` is still not claimed, and a partial is still
+  not a cache record: it is read, used once to rebuild one response envelope, and left on disk.
 
 **The worker emits evidence; the parent judges it.** A partial carries the job's ``semantics`` and
 ``timings`` verbatim and **no verdict** — no ``ai_enabled``, no completion flag, no requested-candidate
@@ -254,11 +268,113 @@ def write_partial(
                 pass
 
 
+def find_partials(response_path: str) -> list[str]:
+    """Every published partial of **one** invocation, in loop-position order. Never raises.
+
+    [FORK] Digital-Union (A2-S1): the production discovery call, and the reason it lives here rather
+    than in the parent is twofold.
+
+    **Ownership.** :func:`partial_glob` already declares the pattern, and the comment there says why
+    it is owned in one place — a reader that re-derived it wrongly would start reading half-written
+    temps. Enumerating here keeps the pattern and its application together instead of splitting them
+    across the boundary.
+
+    **The parent must not enumerate its own cache directory.** ``video_analysis.py`` is guarded
+    against exactly that (``glob.glob``, ``os.scandir``, ``os.unlink``, ``shutil.rmtree`` are all
+    banned there, by test) so that "Stage 5 has no cache sweeper and no migration" stays a mechanical
+    fact rather than a promise. Recovery needs to *read* two or three files out of that directory, not
+    to acquire a licence to walk it, so the listing happens behind this contract.
+
+    Implemented with ``os.listdir`` and the two anchors :func:`partial_glob` expresses as a pattern —
+    deliberately **no** ``glob``/``fnmatch`` import, because neither is on this package's curated
+    stdlib allowlist and a published artifact contract is not worth widening it for. ``os.listdir``
+    rather than ``os.scandir`` for the same reason the parent is banned from both: a plain name list
+    cannot grow into a directory walk. :func:`partial_glob` stays the published pattern and a test
+    pins the two to agree.
+
+    Both anchors are load-bearing:
+
+    * the **prefix** is this invocation's own stem basename plus ``_job_``, so another run's artifacts
+      in the same directory are never enumerated — which is what makes recovery same-invocation by
+      construction rather than by a later check;
+    * the **suffix** is the terminal :data:`PARTIAL_SUFFIX`, so a killed write's
+      ``<name>.partial.json.<random>.tmp`` can never be returned.
+
+    Sorted, so the caller's iteration order is the zero-padded ``job_index`` order and never the
+    filesystem's. An unreadable or missing directory yields ``[]`` — absence of evidence, never an
+    exception into the caller.
+    """
+    try:
+        stem = response_stem(str(response_path))
+        directory = os.path.dirname(stem) or "."
+        prefix = os.path.basename(stem) + _JOB_TOKEN
+        if not os.path.basename(stem):
+            return []
+        return sorted(
+            os.path.join(directory, name)
+            for name in os.listdir(directory)
+            if name.startswith(prefix) and name.endswith(PARTIAL_SUFFIX)
+        )
+    except Exception:
+        return []
+
+
+def load_partial(path: str, *, expected_invocation: str) -> Dict[str, Any] | None:
+    """Read one published partial, or ``None``. Never raises an ordinary exception.
+
+    [FORK] Digital-Union (A2-S1): the read side of the artifact contract, owned here next to the
+    writer so a reader cannot re-derive it wrongly. It answers exactly one question — *is this file a
+    well-formed partial belonging to the invocation the caller names?* — and deliberately stops there.
+
+    Three checks, and no fourth:
+
+    * the bytes parse as a **JSON object** (a list, a number or a truncated file is not a partial);
+    * ``partial_contract`` is a value this code knows. An unrecognised version is **refused, never
+      guessed** — a future shape may mean something different, and the whole point of versioning the
+      artifact is that a reader can tell;
+    * ``invocation`` equals ``expected_invocation``, which the parent derives from the response path
+      it *itself* chose for the worker it *itself* launched. This is what keeps recovery
+      same-invocation: a partial from any other run is refused here even if it is otherwise perfect.
+
+    Deliberately **not** done here, and not to be added:
+
+    * **no completion verdict.** ``_qwen_job_completed`` and ``_cache_entry_is_complete`` live in
+      ``video_analysis.py`` and stay the only rules — evaluating one here is the second completion
+      rule ``.claude/rules/stage5-cache-durability.md`` forbids;
+    * **no job/source authority.** Whether ``job_id`` belongs to the live request and whether
+      ``video_file`` is the source the parent asked about are the *parent's* questions, answered with
+      the parent's own ``selected_by_job`` and ``_same_source``. A filename is never identity;
+    * **no write, no rename, no delete.** This function only ever opens a file for reading;
+    * **no cache knowledge** — no signature, no key, no record, no ``VIDEO_ANALYSIS_CACHE_DIR``.
+
+    ``Exception`` only, like :func:`write_partial`: ``KeyboardInterrupt``/``SystemExit`` still
+    propagate. A missing file, a permission error, a directory handed in place of a file, a
+    non-``str`` path and malformed JSON all return ``None`` — one unreadable partial must cost its
+    siblings nothing.
+    """
+    if not isinstance(expected_invocation, str) or not expected_invocation:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("partial_contract") != PARTIAL_CONTRACT_VERSION:
+        return None
+    if payload.get("invocation") != expected_invocation:
+        return None
+    return payload
+
+
 __all__ = [
     "PARTIAL_CONTRACT_VERSION",
     "PARTIAL_SUFFIX",
     "build_payload",
+    "find_partials",
     "invocation_id",
+    "load_partial",
     "partial_glob",
     "partial_path",
     "response_stem",
