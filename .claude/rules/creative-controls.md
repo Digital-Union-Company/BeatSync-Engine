@@ -342,10 +342,16 @@ already gives (measured: stripping `scene_index` from all 509 candidates yields
 seeded before the empty-plan early return so they are present on **every** summary — unlike
 `source_count`, whose absence there is a pre-existing asymmetry this does not copy.
 
-**The console does not print them yet.** The planner's `Sources used:` line lives in
-`video_processor.py`, outside P1's authorised path, so only the plan-summary dict and
-`render_info["plan_summary"]` carry the metrics. Folding them into that existing line is a separate
-one-line change and must not raise the five-line CMD budget.
+**The console prints them on the line that already existed (P2).**
+`video_processor._planner_sources_line` renders
+`   Sources used: 33 | Shots: 49 | Top shot: 9.2% | Shot HHI: 0.0327` — the share as a percentage
+with one decimal, the HHI to four, aggregates only, never a path or a scene index. The planner block
+still prints exactly four lines, so the **five-line CMD budget is untouched**. The values are read
+straight off `plan_summary`: the console is never a second authority on a plan, and nothing is
+recomputed in `video_processor.py`. A segment appears only when its value is a usable finite number,
+so a pre-P1 summary renders the original line byte-for-byte and a `None`/`NaN`/unparseable value is
+dropped rather than printed as a fabricated `0.0 %`. The GUI's `Planner:` line still does **not**
+carry them — that remains a separate, unauthorised change.
 
 ### Semantic Emphasis reinterprets persisted media truth (PR2)
 

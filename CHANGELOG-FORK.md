@@ -20,6 +20,44 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-11 (Stage-6 P2: the shot diagnostics reach the console)
+
+**The planner's existing `Sources used:` line now also reports P1's three shot diagnostics.**
+Reporting only: no selection, score, RNG draw, clip timing, render behaviour or cache identity
+changed, the Stage-6 planner is unchanged from merged main, and no console line was added.
+
+```
+   Sources used: 33 | Shots: 49 | Top shot: 9.2% | Shot HHI: 0.0327
+```
+
+P1 computed `shot_count` / `top_shot_share` / `shot_hhi` but nothing rendered them, so the metrics
+existed only in the plan-summary dict. The four values are read straight off `plan_summary` — the
+console is never a second authority on a plan, and nothing is recomputed in `video_processor.py`.
+The metrics ride on the line that already existed, exactly as the seed, the L0 scale facts and the
+Creative Profile do, so the planner block still prints four lines and the five-line CMD budget is
+untouched. `top_shot_share` is rendered as a percentage with one decimal and `shot_hhi` to four,
+because 0.0327 and 0.0252 are the real neutral and diversity-100 figures and two decimals collapses
+both. Aggregates only: no file path and no scene index is printed.
+
+`_planner_sources_line` and `_finite_diagnostic` are dependency-free by design — builtins only, no
+`math`, no `numpy`, no module global — so `tests/test_stage6_console_reporting.py` AST-extracts and
+executes the **real** functions rather than restating their formatting test-side. A segment appears
+only when its value is a usable finite number, which covers both degraded shapes with one rule: a
+pre-P1 or hand-built summary renders the original line byte-for-byte, and a key that is present but
+`None`/`NaN`/infinite/unparseable is dropped rather than printed as a fabricated `0.0 %` — the one
+direction a concentration diagnostic may never fail in. `source_count` keeps its own pre-existing
+`.get(..., 0)` fallback, so the original field survives the newer ones being unavailable, and the
+helper is total on a non-mapping summary because a finished render must never fail inside its own
+report.
+
+Tests: 5611 passed, 8 skipped (was 5553 / 8; +58 new, reconciled exactly).
+
+The GUI's `Planner:` line still does **not** carry the metrics — `gui.py` is outside this slice's
+authorised path, so a GUI render reports them nowhere. That remains deliberately deferred.
+
+Changed: `src/video_processor.py`, `tests/test_stage6_console_reporting.py` (new),
+`.claude/rules/creative-controls.md`.
+
 ### Added — 2026-10-11 (Stage-6 P1: shot-level diversity diagnostics)
 
 **`summarize_clip_plan` now reports how many distinct continuous *shots* a plan selected from.
