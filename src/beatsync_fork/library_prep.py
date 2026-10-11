@@ -38,8 +38,14 @@ all-or-nothing worker invocation. Bounding the submission bounds that exposure.
 
 Two things this deliberately does **not** claim:
 
-* It does not make an in-flight worker resumable. If a batch's worker dies before producing its
-  response, that batch may still need repeating — the bound only limits how much work that costs.
+* It does not make an in-flight worker resumable. The bound only limits how much work a dead batch
+  costs. **Stage-5 A2-S1 narrowed — but did not remove — that exposure**: since A1 the worker
+  publishes one atomic partial artifact per finished job, and when a batch's final response comes
+  back unusable the parent now recovers the jobs that did finish, *within the same invocation*, and
+  checkpoints the ones the unchanged completion rule accepts. So a dead worker no longer discards
+  every job it had already completed. It does not make preparation resumable across runs: a *later*
+  run still re-analyses any source that was never checkpointed, recovery is never attempted when the
+  response is usable, and a job with no partial is still simply retried.
 * It is not a library cap. A 5000-source scan still reports 5000 needing analysis; the batch size
   only decides how many of them one click submits.
 

@@ -24,6 +24,10 @@ from typing import Any, Dict
 
 import pytest
 
+# A2-S1: the real artifact contract, so an extracted `_recover_jobs_from_partials` reads real
+# partials rather than a stand-in. Stdlib-only by rule, so importing it here costs nothing.
+from beatsync_fork import qwen_partials
+
 _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
 
@@ -947,7 +951,12 @@ def test_bool_counts_are_rejected_by_the_single_path():
 # R4: batch per-job completion truth (T6, T7, T8)
 # ---------------------------------------------------------------------------
 
-_BATCH_FUNCS = ("_qwen_max_windows", "_complete_deferred_qwen_batch")
+# `_recover_jobs_from_partials` joined this tuple with A2-S1: `_complete_deferred_qwen_batch` now
+# calls it, and an extracted body resolves every name from the namespace below - omitting it is a
+# `NameError`, not a silent skip. It is extracted rather than stubbed so these tests keep exercising
+# the real recovery code; `fork_partials` is the one name it needs in turn.
+_BATCH_FUNCS = ("_qwen_max_windows", "_recover_jobs_from_partials",
+                "_complete_deferred_qwen_batch")
 
 
 def _load_batch(worker_response):
@@ -956,6 +965,7 @@ def _load_batch(worker_response):
     calls: Dict[str, Any] = {"merged": []}
     namespace: Dict[str, Any] = {
         "os": os, "json": json, "tempfile": tempfile, "math": math, "time": time,
+        "fork_partials": qwen_partials,
         "Any": Any, "Dict": Dict, "List": list, "Sequence": list,
         "__builtins__": __builtins__,
         "_select_ai_candidates": lambda candidates, limit: list(candidates)[:limit],

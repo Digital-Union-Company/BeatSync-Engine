@@ -2113,20 +2113,27 @@ def test_k_no_incremental_worker_response_was_implemented():
 
     Pinned so a future reader does not infer a durability guarantee that does not exist.
 
-    **Narrowed by Stage-5 A1.** A1 makes the worker publish one atomic *per-job partial artifact*
-    after each job's loop returns, so ``write_partial`` now legitimately appears in the worker and is
-    the one name dropped from the forbidden list below. Everything this test actually protected is
-    unchanged and still asserted:
+    **Narrowed by Stage-5 A1, then again by A2-S1.** A1 made the worker publish one atomic *per-job
+    partial artifact* after each job's loop returns; A2-S1 lets the parent read those artifacts, but
+    only for the one invocation that produced them and only when the final response is unusable. So
+    the parent-side forbidden-name list this test used to carry is gone — it would now ban the
+    feature. It is replaced by **positive structural assertions**, which is strictly stronger: an
+    absent string proved nothing about behaviour, whereas the checks below fail if recovery ever
+    escapes its guard, acquires a completion rule, or becomes cross-invocation.
 
-    * there is still **no incremental response** — the response JSON is written exactly once, after
-      the whole job loop, and remains the primary semantic authority;
-    * **library preparation is still not resumable** — nothing in the parent reads a partial, so a
-      batch whose worker dies may still need repeating. Recovery is A2, and A2 is where
-      ``library_prep``'s own sentence below legitimately changes.
+    What this test still protects, and now proves rather than infers:
 
-    A1 is therefore inert with respect to preparation: it adds diagnostic/recovery-ready evidence and
-    no durability guarantee. The A1 artifact contract itself is pinned by
-    ``tests/test_stage5_job_partials.py``.
+    * **no incremental worker response.** The response JSON is still written exactly once, after the
+      whole job loop, and is still the **primary** semantic authority;
+    * **recovery is same-invocation only.** `library_prep`'s sentence changes here (a dead worker's
+      finished jobs are now recoverable *within* the run), but a *later* run still re-analyses any
+      source that was never checkpointed. There is no cross-run resumability, and nothing in this
+      change makes preparation restartable;
+    * **the response always wins.** Recovery is reachable only from inside the unusable-response
+      branch, so a usable response never reads a partial;
+    * **no second completion rule.** The recovery helper evaluates none.
+
+    The A1 artifact contract itself is pinned by ``tests/test_stage5_job_partials.py``.
     """
     worker = os.path.join(_REPO, "src", "auto_mode", "stage5_qwen_scene_worker.py")
     source = open(worker, "r", encoding="utf-8").read()
@@ -2150,16 +2157,48 @@ def test_k_no_incremental_worker_response_was_implemented():
 
     # A1 really did add the per-job publication, so this test cannot quietly become vacuous.
     assert "_publish_job_partial" in source
+    # The parent never WRITES a partial - publication stays the worker's job alone.
+    parent_tree = ast.parse(open(_VA, "r", encoding="utf-8").read())
+    parent_body = ast.unparse(parent_tree)
+    assert "write_partial" not in parent_body, "the parent must never publish a partial"
+    assert "build_payload" not in parent_body
 
-    # ...and the parent still consumes nothing: preparation is not resumable yet.
-    parent_source = open(_VA, "r", encoding="utf-8").read()
-    for consumer in ("qwen_partials", "partial_path", "write_partial", "partial_glob",
-                     "stage5_job_partial", ".partial.json"):
-        assert consumer not in parent_source, (
-            f"video_analysis.py must not consume partials until A2 ({consumer})")
+    # A2-S1 positive structure: recovery exists, and it is fenced.
+    batch = next(node for node in ast.walk(parent_tree)
+                 if isinstance(node, ast.FunctionDef)
+                 and node.name == "_complete_deferred_qwen_batch")
+    guards = [node for node in ast.walk(batch) if isinstance(node, ast.If)
+              and "not semantics_by_job" in ast.unparse(node.test)]
+    recovery_calls = [node for node in ast.walk(batch) if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name)
+                      and node.func.id == "_recover_jobs_from_partials"]
+    assert len(recovery_calls) == 1, "exactly one recovery attempt"
+    assert guards, "the unusable-response guard must still exist"
+    # ...and that single call lives INSIDE an `if not semantics_by_job:` guard, so a usable
+    # response can never reach it. This is the assertion the old name ban was standing in for.
+    assert any(any(node is recovery_calls[0] for node in ast.walk(guard)) for guard in guards), (
+        "recovery must be unreachable while the final response is usable")
+
+    # The recovery helper decides nothing: the completion rules stay the only rules.
+    helper = next(node for node in ast.walk(parent_tree)
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_recover_jobs_from_partials")
+    helper_body = "\n".join(
+        ast.unparse(stmt) for stmt in helper.body
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)))
+    for banned in ("_qwen_job_completed", "_cache_entry_is_complete", "_checkpoint_cache",
+                   "_save_cache", "ai_enabled", "ai_deferred"):
+        assert banned not in helper_body, f"recovery must not evaluate {banned}"
+
+    # Same-invocation only: the helper validates this invocation's id and nothing wider.
+    assert "expected_invocation" in helper_body
+    assert "find_partials" in helper_body
 
     prep_source = open(_PREP, "r", encoding="utf-8").read()
-    assert "does not make an in-flight worker resumable" in prep_source
+    # The sentence legitimately changed with A2-S1 - but only to a conditional, same-invocation
+    # claim. Cross-run resumability must still be denied in the same breath.
+    assert "does not make preparation resumable across runs" in prep_source
 
 
 # ---------------------------------------------------------------------------
