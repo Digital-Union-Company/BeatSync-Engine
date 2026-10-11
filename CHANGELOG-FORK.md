@@ -20,6 +20,60 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-11 (Stage-6 P1: shot-level diversity diagnostics)
+
+**`summarize_clip_plan` now reports how many distinct continuous *shots* a plan selected from.
+Diagnostics only — no candidate selection, score, RNG draw, clip timing, render behaviour or cache
+identity changed, and no shot reuse penalty was added.**
+
+A *shot* is `(video_file, scene_index)`: Stage 5's own within-file scene boundary, already persisted
+on every candidate and until now read by nothing. Three keys join `source_count` —
+`shot_count`, `top_shot_share` (a share of selected cuts, in `[0.0, 1.0]`) and
+`shot_hhi` (`sum((shot_cuts / total_cuts) ** 2)`, the existing source-concentration convention).
+
+**Why.** On the real 41-source / 509-candidate TEST1 pool, **499 of 509 candidates (98 %)** are
+`scene_chunk` slices of shots longer than the 5.2 s window cap, so 509 distinct candidate ids
+describe only **82 distinct shots** — and chunk siblings are near-duplicates by measurement (mean L1
+**0.0299** over the six CV primitives, against **0.1749** across a scene boundary and **0.1615** for
+unrelated pairs). A neutral 142-cut plan draws from **49 of 82** shots, with the most-reused shot
+supplying **13 cuts (9.2 %)** and the top five supplying **26.8 %**, while the summary reported
+`source_count = 33` and nothing about any of it. Adjacent same-shot cuts are **not** the problem —
+measured 0 at neutral and at diversity 100, because the existing `recent_videos` deque already
+blocks them; the concentration is dispersed in time, which is why no existing metric could see it.
+
+**A source-level control is not a shot-level control, and the sign is pool-dependent.** Source
+Diversity scales only the two source-level penalties. On the real pool diversity 0 → 100 moves shots
+43 → 55 and `top_shot_share` 14.1 % → 6.3 %; on the synthetic test pool the same change moves shots
+15 → **13** with `shot_hhi` rising at a constant `source_count`. Neither direction is a general
+property, and the test asserts none — only that the metric is not a restatement of `source_count`.
+
+- **`scene_index` is media-local, never provenance.** The path is half the key, so candidates from
+  different files are always different shots however their indices compare. No filename, prefix,
+  numeric ordering, parent folder or cross-file similarity is read. This is **not** Source Groups.
+- **Malformed input falls back conservatively.** A real `int` only; `bool` rejected first (it
+  subclasses `int`), and float/string/`None`/malformed fall back to `(video_file, None)`. That
+  merges a source's unknown-shot cuts into one bucket, so `shot_count` can only be under-reported
+  and concentration over-reported — the one direction that cannot flatter the edit. With no usable
+  `scene_index` the metrics degrade exactly to the source-level view (measured: stripping it from
+  all 509 candidates gives `shot_count == source_count == 33`).
+- **Equivalence is verified against committed history, not a test-side scorer.** The planner as
+  committed at `72255d86` is loaded out of git as a second module and compared on every
+  pre-existing planned-clip field across seeds 0/101/4242/381944 and ten control configurations
+  (neutral, Source Diversity 0/100, Semantic Emphasis 0/100, Energy Response 15/90, Motion Bias
+  10/95, and a combined setting) — exact equality, no tolerance. The scorers, the
+  `_stable_rng` stream, `_materialize_clip`'s timing and the `_static_base_score` evaluation count
+  are compared the same way. A structural test proves no scoring or choosing function can reach the
+  diagnostic, and that `build_planned_clip_sequence` still holds exactly two reuse deques.
+- **The console is unchanged.** The planner's `Sources used:` line lives in `video_processor.py`,
+  outside this slice's authorised path, so only the plan-summary dict and
+  `render_info["plan_summary"]` carry the metrics. The five-line CMD budget is untouched.
+- **No Stage-5 contact.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+  `auto_av_analysis_v8_llama_vulkan_batched`, `video_analysis.py` and the Qwen worker are
+  unmodified, no cache payload gained a field and the planner's import set is unchanged.
+
+Changed: `src/auto_mode/stage6_av_planner.py`, `tests/test_stage6_shot_diagnostics.py` (new),
+`.claude/rules/creative-controls.md`.
+
 ### Fixed — 2026-10-11 (Stage-5 A2-H1: partial identity, telemetry provenance and writer cleanup)
 
 **The five accepted non-blocking findings from the A1 and A2-S1 reviews, corrected. No behaviour
