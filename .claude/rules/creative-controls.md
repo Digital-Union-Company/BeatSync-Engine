@@ -285,6 +285,68 @@ segments: unique sources 31 → 39, top-source usage 20 → 10, HHI 0.054 → 0.
 legacy-score cost, with zero adjacent source repeats even at the reuse end. Base 2 was visibly weaker
 (31 → 37); base 4 reached all 41 sources but started producing adjacent source repeats at 0.
 
+### Shot-level diversity is reported, never scored (P1)
+
+`summarize_clip_plan` carries three **diagnostics** beside `source_count`, because a source count
+cannot see the repetition that actually occurs. A *shot* is `(video_file, scene_index)` — Stage 5's
+own within-file scene boundary, already persisted on every candidate:
+
+| key | meaning |
+|---|---|
+| `shot_count` | distinct continuous shots the plan selected from |
+| `top_shot_share` | the largest single shot's share of selected cuts, in `[0.0, 1.0]` |
+| `shot_hhi` | `sum((shot_cuts / total_cuts) ** 2)` — the same HHI convention used for sources |
+
+**Why it was needed.** On the real TEST1 pool **499 of 509 candidates (98 %) are `scene_chunk`
+slices** of shots longer than the 5.2 s window cap, so 509 candidate ids describe only **82 distinct
+shots**. Chunk siblings are near-duplicates by measurement — mean L1 **0.0299** over the six CV
+primitives, against **0.1749** across a scene boundary and **0.1615** for unrelated pairs. A
+neutral 142-cut plan draws from **49 of 82** shots with the most-reused shot supplying **13 cuts
+(9.2 %)** and the top five supplying **26.8 %**, while the summary reported `source_count = 33` and
+nothing else. The production metric reproduces those figures exactly.
+
+**A source-level control is not a shot-level control, and the sign is pool-dependent.** Source
+Diversity scales only the two source-level penalties, so spreading an edit across more *files* does
+not imply more *shots*. Measured both ways: on the real TEST1 pool diversity 0 → 100 moves shots
+43 → 55 and `top_shot_share` 14.1 % → 6.3 %, but on the synthetic pool in
+`tests/test_stage6_shot_diagnostics.py` it moves shots 15 → **13** with `shot_hhi` rising
+0.0764 → 0.0868 at a constant `source_count` of 9. **Neither direction may be stated as a general
+property**; what is established is that the metric is not a restatement of `source_count`. A test
+pins exactly that, and deliberately asserts no direction.
+
+Three boundaries keep this a report rather than a mechanism:
+
+- **It changes no selection.** `_shot_key`/`_shot_metrics` are called only from
+  `summarize_clip_plan`, which runs after a plan exists; `_materialize_clip` carries `scene_index`
+  as metadata after `_choose_candidate` has already returned a winner. Equivalence is verified
+  against the **planner as committed at `72255d86`**, loaded out of git rather than reimplemented
+  test-side, across seeds 0/101/4242/381944 and ten control configurations. A structural test
+  additionally proves no scoring or choosing function can reach any of it.
+- **There is no shot reuse penalty, and no dormant abstraction for one.** `build_planned_clip_sequence`
+  still holds exactly two reuse deques and one `usage` counter; a test pins the deque count and the
+  nine `score -=` sites in `_adjusted_score`. Whether a third tier is justified is a separate,
+  unauthorised decision that this measurement exists to inform.
+- **`scene_index` is media-local, not provenance.** The path is half the key, so two candidates from
+  different files are always different shots however their indices compare — no filename, prefix,
+  numeric ordering, parent folder or cross-file similarity is read. This is **not** Source Groups.
+
+`scene_index` must be a real `int`; `bool` is rejected first (it subclasses `int`, so `True` would
+read as scene 1), and a float, a numeric string, `None` or anything malformed falls back to
+**source level**, `(video_file, None)`. That fallback is conservative in the one direction that
+cannot flatter the edit: it merges a source's unknown-shot cuts into one bucket, so `shot_count` can
+only be under-reported and concentration over-reported — a diagnostic for revealing concentration
+must never understate it by inventing a boundary it cannot see. Its limitation is the mirror image:
+with no usable `scene_index` the metrics degrade exactly to the source-level view `source_count`
+already gives (measured: stripping `scene_index` from all 509 candidates yields
+`shot_count == source_count == 33`). An empty plan reports finite zeros, and the three keys are
+seeded before the empty-plan early return so they are present on **every** summary — unlike
+`source_count`, whose absence there is a pre-existing asymmetry this does not copy.
+
+**The console does not print them yet.** The planner's `Sources used:` line lives in
+`video_processor.py`, outside P1's authorised path, so only the plan-summary dict and
+`render_info["plan_summary"]` carry the metrics. Folding them into that existing line is a separate
+one-line change and must not raise the five-line CMD budget.
+
 ### Semantic Emphasis reinterprets persisted media truth (PR2)
 
 `factor = 1 + ((semantic_emphasis - 50) / 50)` -> 0.0 / 1.0 / 2.0. The effective static score is

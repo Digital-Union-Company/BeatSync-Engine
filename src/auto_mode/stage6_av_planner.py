@@ -323,6 +323,70 @@ def build_planned_clip_sequence(
     return planned
 
 
+def _shot_key(item: Dict) -> tuple:
+    """[FORK] Digital-Union (P1): the diagnostic identity of one planned clip's *continuous shot*.
+
+    A shot is ``(video_file, scene_index)`` — Stage 5's own within-file scene boundary, which
+    `_build_candidate` already persists on every candidate. 98 % of a measured real library's
+    candidates are `scene_chunk` slices of a shot longer than the 5.2 s window cap, so many
+    distinct candidate ids describe one continuous shot; this is the only identity that can see
+    that, and `summarize_clip_plan` is its only consumer.
+
+    **This is media-local, not provenance.** It compares two moments *inside one file* and can
+    never relate two different files: the path is one half of the key, so two candidates from
+    different sources are always different shots however their scene indices compare. No filename,
+    prefix, numeric ordering, parent folder or cross-file similarity is read, inferred or implied.
+
+    `scene_index` must be a real ``int``. ``bool`` is rejected first because it subclasses ``int``,
+    so ``True`` would otherwise read as scene 1 — the same boundary `variation.normalize_seed` and
+    `creative.normalize_control` draw. A float, a numeric string, ``None`` and anything malformed
+    all fall back to **source level**, ``(video_file, None)``.
+
+    That fallback is deliberately conservative *in the direction that cannot flatter the edit*: it
+    merges every unknown-shot cut of one source into a single bucket, so `shot_count` can only be
+    under-reported and `top_shot_share` / `shot_hhi` can only be over-reported. A diagnostic whose
+    job is to reveal concentration must never understate it by inventing a boundary it cannot see.
+    Its limitation is the mirror image: on a record with no usable `scene_index` the metrics
+    degrade to the source-level view `source_count` already gives, and say nothing new.
+
+    Total: reads two keys, coerces nothing, mutates nothing and cannot raise.
+    """
+    scene = item.get("scene_index")
+    if isinstance(scene, bool) or not isinstance(scene, int):
+        scene = None
+    return (item.get("video_file"), scene)
+
+
+def _shot_metrics(plan: Sequence[Dict]) -> Dict:
+    """[FORK] Digital-Union (P1): the three shot-concentration diagnostics. Pure, order-independent.
+
+    ``shot_count``      distinct continuous shots the plan selected from.
+    ``top_shot_share``  the largest single shot's share of selected cuts, in ``[0.0, 1.0]``.
+    ``shot_hhi``        ``sum((shot_cuts / total_cuts) ** 2)`` — the existing HHI convention used
+                        for source concentration, so the two numbers are directly comparable.
+
+    All three are functions of a multiset of shot keys — a set size, a maximum and a sum of squares
+    — so they are **invariant under plan ordering** by construction rather than by sorting.
+
+    An empty plan returns finite zeros: there is no division, because the total is only ever used
+    as a denominator inside the non-empty branch. `shot_count` of 0 with a `top_shot_share` of 0.0
+    says "no cuts, therefore no concentration", which is the honest reading of an empty plan and
+    is why these keys are seeded into the summary unconditionally.
+
+    Selection cannot reach this function: it runs after a plan exists and returns a report.
+    """
+    total = len(plan)
+    if not total:
+        return {"shot_count": 0, "top_shot_share": 0.0, "shot_hhi": 0.0}
+    shots = Counter(_shot_key(item) for item in plan)
+    counts = shots.values()
+    return {
+        "shot_count": len(shots),
+        "top_shot_share": max(counts) / total,
+        "shot_hhi": sum((count / total) ** 2 for count in counts),
+    }
+
+
 def summarize_clip_plan(plan: Sequence[Dict], seed: int = 0, creative=None) -> Dict:
     # [FORK] Digital-Union: `seed` is optional and defaults to legacy, so existing callers are
     # unchanged. It is reported, never re-derived — the plan itself carries no seed.
@@ -347,6 +411,12 @@ def summarize_clip_plan(plan: Sequence[Dict], seed: int = 0, creative=None) -> D
         "creative": profile.as_dict(),
         "creative_text": profile.describe(),
     }
+    # [FORK] Digital-Union (P1): the shot diagnostics are seeded here, in the pre-`plan` block, so
+    # the three keys are present on EVERY summary including the empty-plan early return. Adding them
+    # only to the `update` below would make a consumer's `summary["shot_count"]` raise on exactly
+    # the path that already reports `clip_count: 0` — and `source_count`'s absence there is a
+    # pre-existing asymmetry this must not copy. Reporting only; nothing is re-derived from them.
+    summary.update(_shot_metrics(plan))
     if not plan:
         return summary
     targets = Counter(str(item.get("target", "flow")) for item in plan)
@@ -759,6 +829,13 @@ def _materialize_clip(candidate: Dict, profile: Dict, index: int,
         # are untouched by any creative control.
         "score": _score_candidate(candidate, profile, controls, deterministic),
         "candidate_id": candidate.get("id"),
+        # [FORK] Digital-Union (P1): carried VERBATIM for the shot diagnostics — Stage 5's own
+        # within-file scene boundary, read straight off the already-selected candidate. It is pure
+        # metadata: this runs after `_choose_candidate` has returned a winner, so it cannot reach
+        # scoring, the RNG, clip timing or the candidate itself. Not coerced here — `_shot_key` owns
+        # the int/bool/malformed boundary, so there is exactly one place that decides what a usable
+        # scene index is.
+        "scene_index": candidate.get("scene_index"),
         "tags": list(candidate.get("tags", [])),
         "ai_analyzed": bool(candidate.get("ai_analyzed")),
         "audio_start": profile.get("start"),
