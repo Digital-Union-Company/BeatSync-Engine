@@ -944,10 +944,20 @@ def test_g_no_cache_identity_or_completion_function_learns_about_partials():
     tree = ast.parse(_read(_PARENT))
 
     # The parent never publishes, and never re-implements the artifact contract.
-    whole = ast.unparse(tree)
+    #
+    # **Executable code only** (A2-H1). This used `ast.unparse(tree)`, which keeps docstrings, so
+    # prose explaining *why* the parent does not call `partial_path` failed the ban on calling it —
+    # the same trap `_strip_docstrings` exists for everywhere else in this suite. A ban on USING a
+    # name must not be satisfiable, or breakable, by writing about it.
+    whole = ast.unparse(_strip_docstrings(tree))
     for never in ("write_partial", "build_payload", "partial_path", "PARTIAL_SUFFIX",
                   "PARTIAL_CONTRACT_VERSION"):
         assert never not in whole, f"video_analysis.py must not use {never}"
+    # ...and the prose really does discuss them, so the strip above is load-bearing rather than
+    # cosmetic: without it this test fails on a comment.
+    assert "partial_path" in ast.unparse(tree), (
+        "expected the docstrings to name partial_path - if they no longer do, the strip above is "
+        "untested and this ban could silently become a prose check again")
 
     # No identity, completion or reuse rule may know a partial exists.
     sealed = ("_qwen_job_completed", "_cache_entry_is_complete", "_stored_ai_cache_is_consistent",
@@ -1054,3 +1064,182 @@ def test_g_the_module_declares_the_atomicity_boundary_it_claims():
     assert "PROCESS_CRASH_ATOMICITY = YES" in source
     assert "POWER_LOSS_DURABILITY   = NOT CLAIMED" in source
     assert "the containing directory is not" in source
+
+
+# ---------------------------------------------------------------------------
+# H. A1-H1/H2 — THE OWN-TEMP CLEANUP GUARD, AND ITS FAILURE MODES
+#
+# The A1 review flagged the `finally` block's `os.path.exists(tmp_path)` probe as the one statement
+# outside the never-raise contract: an exception raised by the probe itself would replace the
+# function's `return None`. `os.remove` on a missing file already raises `FileNotFoundError`, an
+# `OSError`, which the handler swallowed anyway — so the probe was never a guard, only an extra
+# syscall and a TOCTOU window. These tests pin the simplified shape and every way cleanup can fail.
+# ---------------------------------------------------------------------------
+
+
+def test_h_the_cleanup_guard_has_no_exists_probe():
+    """Structural: the removal is attempted directly, inside the try, with no stat in front of it."""
+    writer = _function(_tree(_MODULE), "write_partial")
+    tries = [node for node in writer.body if isinstance(node, ast.Try)]
+    assert len(tries) == 1, "write_partial keeps exactly one top-level try"
+    final = tries[0].finalbody
+    assert final, "write_partial must keep a finally block"
+    code = "\n".join(ast.unparse(node) for node in final)
+
+    assert "os.path.exists" not in code, "the exists probe must be gone"
+    assert "os.remove(tmp_path)" in code
+    # the guard is now truthiness alone - which is what makes a PUBLISHED partial unreachable,
+    # because `tmp_path` is cleared to "" by the successful os.replace
+    guards = [node for node in final if isinstance(node, ast.If)]
+    assert len(guards) == 1 and ast.unparse(guards[0].test) == "tmp_path"
+    # and the removal is still wrapped, so it cannot raise out of the finally
+    assert any(isinstance(node, ast.Try) for node in ast.walk(guards[0]))
+
+
+def test_h_os_remove_raising_permission_error_is_swallowed(tmp_path, monkeypatch):
+    """The Windows shape: the temp is still open or locked, so cleanup cannot complete."""
+    target = qp.partial_path(str(tmp_path / "resp.json"), 1, "1")
+    monkeypatch.setattr(qp.os, "replace", lambda *_a, **_k: (_ for _ in ()).throw(OSError("nope")))
+    monkeypatch.setattr(qp.os, "remove", lambda *_a, **_k: (_ for _ in ()).throw(
+        PermissionError(13, "file in use by another process")))
+    reasons = []
+
+    assert qp.write_partial(target, _payload(), on_error=reasons.append) is None
+
+    assert reasons and "nope" in reasons[0], "the real failure is still the one reported"
+    assert not os.path.exists(target), "and nothing was published"
+
+
+def test_h_a_temp_that_is_already_gone_is_not_an_error(tmp_path, monkeypatch):
+    """`FileNotFoundError` is an `OSError`, which is exactly why the probe was redundant."""
+    target = qp.partial_path(str(tmp_path / "resp.json"), 1, "1")
+    monkeypatch.setattr(qp.os, "replace", lambda *_a, **_k: (_ for _ in ()).throw(OSError("nope")))
+    real_remove = qp.os.remove
+    seen = []
+
+    def remove_twice(path):
+        seen.append(path)
+        real_remove(path)
+        real_remove(path)          # second call raises FileNotFoundError
+
+    monkeypatch.setattr(qp.os, "remove", remove_twice)
+
+    assert qp.write_partial(target, _payload()) is None, "must not raise"
+    assert seen, "cleanup really was attempted"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("error", [
+    PermissionError(13, "denied"), OSError(28, "No space left on device"),
+    FileNotFoundError(2, "gone"), IsADirectoryError(21, "is a directory"),
+])
+def test_h_no_ordinary_cleanup_failure_escapes(tmp_path, monkeypatch, error):
+    target = qp.partial_path(str(tmp_path / "resp.json"), 1, "1")
+    monkeypatch.setattr(qp.os, "replace", lambda *_a, **_k: (_ for _ in ()).throw(OSError("nope")))
+    monkeypatch.setattr(qp.os, "remove", lambda *_a, **_k: (_ for _ in ()).throw(error))
+
+    assert qp.write_partial(target, _payload()) is None
+
+
+def test_h_cleanup_failure_after_a_failed_replace_still_reports_the_real_cause(tmp_path,
+                                                                              monkeypatch):
+    """Two failures at once: the publish failed AND the temp could not be removed."""
+    target = qp.partial_path(str(tmp_path / "resp.json"), 1, "1")
+    monkeypatch.setattr(qp.os, "replace", lambda *_a, **_k: (_ for _ in ()).throw(
+        OSError(13, "Permission denied")))
+    monkeypatch.setattr(qp.os, "remove", lambda *_a, **_k: (_ for _ in ()).throw(
+        PermissionError(13, "locked")))
+    reasons = []
+
+    assert qp.write_partial(target, _payload(), on_error=reasons.append) is None
+
+    assert len(reasons) == 1, "cleanup must not add a second on_error report"
+    assert "Permission denied" in reasons[0]
+    leftovers = [p.name for p in tmp_path.iterdir()]
+    assert leftovers and all(name.endswith(".tmp") for name in leftovers), (
+        "an unremovable temp may survive - untidy, but never published and never fatal")
+
+
+def test_h_a_published_partial_is_never_a_cleanup_candidate(tmp_path, monkeypatch):
+    """`tmp_path` is cleared by the successful `os.replace`, so the guard cannot reach the target."""
+    target = qp.partial_path(str(tmp_path / "resp.json"), 1, "1")
+    removed = []
+    real_remove = qp.os.remove
+    monkeypatch.setattr(qp.os, "remove", lambda p: (removed.append(p), real_remove(p))[0])
+
+    assert qp.write_partial(target, _payload()) == target
+
+    assert removed == [], "a successful write performs no removal at all"
+    assert os.path.exists(target)
+    assert json.loads(Path(target).read_text(encoding="utf-8")) == _payload()
+
+
+def test_h_a_publication_failure_can_never_cost_the_calling_job(tmp_path, monkeypatch, capsys):
+    """End to end through the REAL worker publisher: every failure is contained and reported."""
+    monkeypatch.setattr(qp.os, "replace", lambda *_a, **_k: (_ for _ in ()).throw(OSError("nope")))
+    monkeypatch.setattr(qp.os, "remove", lambda *_a, **_k: (_ for _ in ()).throw(
+        PermissionError(13, "locked")))
+
+    _publish(tmp_path)   # must not raise
+
+    out = capsys.readouterr().out
+    assert "Qwen per-job partial not written for job 2" in out
+    assert not globmod.glob(str(tmp_path / "*.partial.json"))
+
+
+# ---------------------------------------------------------------------------
+# I. A2-H1 — `path_matches`, the filename/payload consistency predicate
+# ---------------------------------------------------------------------------
+
+
+def test_i_path_matches_accepts_exactly_the_writers_own_filename(tmp_path):
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    target = qp.partial_path(response, 7, "7")
+
+    assert qp.path_matches(target, response, job_index=7, job_id="7")
+    # the two spellings find_partials and partial_path can produce are both accepted
+    assert qp.path_matches(os.path.join(".", os.path.basename(target)),
+                           os.path.basename(response), job_index=7, job_id="7")
+
+
+@pytest.mark.parametrize("index, job_id", [(8, "7"), (6, "7"), (7, "8"), (1, "7")])
+def test_i_path_matches_rejects_any_other_index_or_job(tmp_path, index, job_id):
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    target = qp.partial_path(response, 7, "7")
+
+    assert not qp.path_matches(target, response, job_index=index, job_id=job_id)
+
+
+def test_i_path_matches_rejects_a_foreign_invocation(tmp_path):
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    target = qp.partial_path(str(tmp_path / "qwen_batch_response_OTHER.json"), 1, "1")
+
+    assert not qp.path_matches(target, response, job_index=1, job_id="1")
+
+
+@pytest.mark.parametrize("bad", [None, "x", 2.5, True, -1, [1]])
+def test_i_path_matches_never_raises_on_a_hostile_index(tmp_path, bad):
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    target = qp.partial_path(response, 1, "1")
+
+    assert qp.path_matches(target, response, job_index=bad, job_id="1") in (True, False)
+
+
+def test_i_path_matches_touches_no_filesystem(tmp_path):
+    """Pure string comparison - it answers the same for a path that does not exist."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    missing = qp.partial_path(response, 3, "3")
+
+    assert not os.path.exists(missing)
+    assert qp.path_matches(missing, response, job_index=3, job_id="3")
+
+
+def test_i_path_matches_applies_the_same_lossy_sanitisation(tmp_path):
+    """`safe_job_id` is lossy, so two ids sharing a token share a legal filename. That is fine:
+    the payload's exact `job_id` remains the authority, and the parent checks it separately."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    target = qp.partial_path(response, 1, "a/b")
+
+    assert qp.path_matches(target, response, job_index=1, job_id="a/b")
+    assert qp.path_matches(target, response, job_index=1, job_id="a:b")
+    assert qp.safe_job_id("a/b") == qp.safe_job_id("a:b")

@@ -20,6 +20,86 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-11 (Stage-5 A2-H1: partial identity, telemetry provenance and writer cleanup)
+
+**The five accepted non-blocking findings from the A1 and A2-S1 reviews, corrected. No behaviour
+A1/A2 delivered is withdrawn: the response still always wins, recovery is still same-invocation only,
+and `_qwen_job_completed` / `_cache_entry_is_complete` are still the only completion rules.**
+
+**A declared loop position must now agree with live parent state and with its own filename.** A2-S1
+gated `job_index` with `_is_count`, which admits `0` and negatives by design — that is exactly why
+`_bounded_count` exists under T1 — so a partial declaring `job_index: 0` or `-999` passed, sorted
+*ahead* of every honest partial, and captured the batch's backend telemetry. Measured consequence:
+`model_load_seconds` reported 8.0 instead of 15.5 and `qwen_concurrency` 8 instead of 4, which then
+reached a **checkpointed** record's `timings["qwen_seconds"]`. Three checks replace the one:
+
+* `job_index` is a strictly positive non-bool integer — a worker position comes from
+  `enumerate(jobs, 1)`, so `0`, negatives, floats, strings and `True` are all impossible for a
+  genuine artifact;
+* it equals this job's **live** position in the submitted batch, from a `job_id → position` map that
+  `_complete_deferred_qwen_batch` builds by enumerating `request_jobs` — the very list handed to the
+  worker. This binds the declared index to parent state instead of trusting the file, and bounds it
+  by the request's job count as a consequence rather than as a separate rule. It is deliberately
+  **not** `int(job_id)`: `job_id` is the source's index among *all* sources while the position is its
+  place in the *submitted batch*, so the two legitimately differ whenever only some sources deferred
+  — a test proves that premise before relying on it;
+* the discovered path is the one legal filename for that (invocation, index, job id) triple, via the
+  new `qwen_partials.path_matches`, which **recomputes** `partial_path` rather than parsing the name.
+  Parsing would be a second drift-prone decoder of A1's formula, and `safe_job_id` is lossy so a
+  parsed token cannot be inverted anyway.
+
+A partial failing any of them is **refused outright**, not merely excluded from telemetry. That is a
+deliberate behaviour change from A2-S1, which accepted such a file's semantics and only ignored its
+index: a file whose filename and payload disagree is self-contradictory about which job it describes,
+and no quantity of otherwise-valid semantics makes contradictory identity metadata trustworthy. No
+genuine artifact can fail, because A1 writes the filename and the payload from one `job_index`
+variable — so **no contract version bump, no migration, and every already-written A1 partial stays
+readable.**
+
+**The duplicate-handling contract is now true as written.** The A2-S1 review established that
+selection followed filename lexical order while the changelog claimed "lowest `job_index` wins". With
+consistency enforced, filename order, declared-index order and live batch position are the **same
+ordering by construction**, so the ambiguity is resolved in the implementation rather than papered
+over in prose. A stronger consequence falls out: one job id admits exactly one legal filename, so two
+files can never both pass and a duplicate is now structurally impossible for valid artifacts. The
+first-accepted-wins guard is retained as defence — a duplicate is refused with a printed reason and
+may **never** overwrite an accepted result.
+
+**`write_partial`'s own-temp cleanup lost its `os.path.exists` probe.** The probe was never a guard:
+`os.remove` on an absent file raises `FileNotFoundError`, an `OSError`, already swallowed. It only
+added a syscall, a TOCTOU window, and one statement *outside* the inner `try` that could in principle
+raise and defeat the never-raise contract the block exists to honour. `mkstemp` → write → `flush` →
+`fsync` → `os.replace` ordering is untouched, and because `tmp_path` is cleared by a successful
+`os.replace`, a **published** partial is still never a removal candidate — the only file this can ever
+delete remains the temp the current call created.
+
+**Tests gained the fixtures the old ones could not express.** A2-S1's duplicate and telemetry cases
+all used partials whose filename and payload indices *agreed*, so they would have passed under either
+mechanism — they could not fail for the reason they named. The new `_write_partial(payload_index=…)`
+override sets the two independently, and 20 new cases cover filename-1/payload-2, filename-2/
+payload-1, zero, negative, bool, float, string, missing and out-of-range indices, duplicates under
+both orderings, telemetry provenance under a malformed index, and outcome invariance when the
+directory listing is reversed. 17 further cases cover the writer: `os.remove` raising
+`PermissionError`, a temp already gone, cleanup failing *after* a failed `os.replace` (the real cause
+still reported exactly once), a published partial never being a cleanup candidate, publication failure
+remaining non-fatal through the real worker publisher, and `path_matches` itself.
+
+One existing guard was corrected rather than relaxed:
+`test_g_no_cache_identity_or_completion_function_learns_about_partials` compared against
+`ast.unparse(tree)`, which keeps docstrings, so prose explaining why the parent does *not* call
+`partial_path` failed the ban on calling it. It now strips docstrings — the convention used everywhere
+else in that suite — and asserts the prose really does name it, so the strip stays load-bearing.
+
+Unchanged: `_qwen_job_completed`, `_cache_entry_is_complete`, `_stored_ai_cache_is_consistent`,
+`_checkpoint_cache`, `_save_cache`, `_select_ai_candidates`, `_merge_semantic`, the frozen count
+helpers, `CACHE_CONTRACT_VERSION = stage5_cache_v3`, `ANALYSIS_VERSION`,
+`PARTIAL_CONTRACT_VERSION = stage5_job_partial_v1`, the identity worker cap (16), the analyze batch
+size (100), cache identity, the worker, the request schema, the GUI and every rules file. No new
+environment variable, no deletion policy, no cross-run resume.
+
+Tests: 5460 passed, 8 skipped (5468 collected) — baseline 5416/8/5424 plus 44 new cases (20 in
+`test_stage5_a2_recovery.py`, 57 → 77; 24 in `test_stage5_job_partials.py`, 63 → 87), zero failures.
+
 ### Added — 2026-10-11 (Stage-5 A2-S1: same-invocation parent recovery from per-job partials)
 
 **A dead Qwen batch no longer discards the jobs it had already finished.** A1 made the worker publish

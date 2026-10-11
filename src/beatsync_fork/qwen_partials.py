@@ -139,6 +139,37 @@ def partial_path(response_path: str, job_index: int, job_id: str) -> str:
     return f"{stem}{_JOB_TOKEN}{int(job_index):05d}_{safe_job_id(job_id)}{PARTIAL_SUFFIX}"
 
 
+def path_matches(path: str, response_path: str, *, job_index: Any, job_id: Any) -> bool:
+    """Is ``path`` the **one** legal filename for this invocation + index + job id? Never raises.
+
+    [FORK] Digital-Union (A2-H1): the filename/payload consistency predicate.
+
+    A1's writer derives the filename from the same two values it records in the payload, so for any
+    genuine artifact ``path == partial_path(response_path, payload["job_index"], payload["job_id"])``.
+    A file where those disagree is therefore **self-contradictory about its own identity** — it was
+    not produced by this worker — and a reader that silently accepted it would be trusting a filename
+    and a payload that do not describe the same job.
+
+    Implemented by **recomputing** :func:`partial_path` from the payload rather than by parsing the
+    filename, which is deliberate: parsing would be a second, drift-prone decoder of A1's naming
+    formula, and `safe_job_id` is lossy so a parsed token cannot be inverted anyway. Recomputation
+    applies the identical (lossy) sanitisation to the payload's exact ``job_id``, so a valid artifact
+    always matches and no new naming rule is introduced.
+
+    ``normpath``/``normcase`` only — the two spellings can legitimately differ (``find_partials``
+    joins a directory, so a bare relative response path yields ``.\\name`` where
+    :func:`partial_path` yields ``name``), and they name the same file. Nothing here touches the
+    filesystem: it is pure string comparison, so it cannot be raced and cannot raise on a missing
+    file.
+    """
+    try:
+        expected = partial_path(str(response_path), int(job_index), job_id)
+        return (os.path.normcase(os.path.normpath(str(path)))
+                == os.path.normcase(os.path.normpath(expected)))
+    except Exception:
+        return False
+
+
 def partial_glob(response_path: str) -> str:
     """Discovery pattern for every partial belonging to **one** invocation.
 
@@ -261,7 +292,15 @@ def write_partial(
     finally:
         # Best effort, and never allowed to raise: a leftover temp is untidy, a raised exception here
         # would cost the job this whole function exists not to cost.
-        if tmp_path and os.path.exists(tmp_path):
+        #
+        # [FORK] Digital-Union (A2-H1): the removal is attempted directly, with no `os.path.exists`
+        # probe in front of it. The probe was never a guard - `os.remove` on an absent file raises
+        # `FileNotFoundError`, which *is* an `OSError` and was already swallowed below - so it only
+        # added a syscall, a TOCTOU window, and one statement outside the `try` that could in
+        # principle raise and defeat the never-raise contract this block exists to honour.
+        # `tmp_path` is `""` after a successful `os.replace`, so a PUBLISHED partial is never a
+        # removal candidate: the only file this can ever delete is the temp this call created.
+        if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
@@ -377,6 +416,7 @@ __all__ = [
     "load_partial",
     "partial_glob",
     "partial_path",
+    "path_matches",
     "response_stem",
     "safe_job_id",
     "write_partial",
