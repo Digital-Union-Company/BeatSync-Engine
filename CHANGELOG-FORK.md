@@ -20,6 +20,42 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Maintenance — 2026-10-11 (instruction-map completeness and its mechanical guard)
+
+**Documentation and tests only — no application executable change.** No `src/` file, no
+`.claude/rules/` file and no D0 evidence file was touched. Cache identity, rendering, Stage-5 worker
+policy and AI processing are all unaffected: `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are
+unchanged, and nothing here can alter a render or a cache key.
+
+**The defect.** The root `CLAUDE.md` nominates `docs/claude/README.md` as the map of the instruction
+architecture, which makes its *Subsystem rules* table a contract rather than a convenience. Two
+scoped rules had been missing from it since they were introduced: `.claude/rules/l2-stage-cache.md`
+(L2 stage caching, **PR #36**) and `.claude/rules/render-worker.md` (the C3-R1A render lifecycle and
+cancellation contract, **PR #37**). Both carry valid `paths:` frontmatter and both load correctly —
+the rules worked, but anyone navigating by the documented route could not see that they exist. At the
+base commit the table listed 19 of the repository's 21 scoped rules; it now lists all 21, of 22 rule
+files total (`operating-policies.md` is the one deliberately unscoped rule and belongs in the layer
+table, not among the conditional subsystem rules). The README stays a routing map: each new row
+records the rule's scope, not its contract.
+
+**The guard.** `tests/test_instruction_map.py` makes this class of drift mechanically detectable
+instead of relying on review. It reads the repository files directly, imports no application module
+and is stdlib-plus-pytest only, so it runs on bare CPython with the rest of the suite. It parses the
+*table* under `## Subsystem rules` and inspects only its first column — deliberately not a whole-file
+substring search, which would be satisfied by a rule name appearing in prose or in the
+reference-document table. It asserts that every scoped rule is mapped, that every mapped basename
+resolves to a real file (the reverse direction), that `operating-policies.md` appears in the layer
+table and never as a subsystem rule, that every scoped rule has correctly bounded frontmatter with a
+non-empty `paths:` list, and that duplicate rows fail. Malformed frontmatter — unterminated, missing
+`paths:`, or an empty list — is rejected with a diagnostic that names the file and the consequence.
+The frontmatter parser accepts both the quoted entries used by most rules and the bare entries used
+by `l2-stage-cache.md`.
+
+Verified against the pre-fix base commit in an isolated scratch copy: the completeness check fails
+there with `scoped rule(s) missing from the Subsystem rules table: l2-stage-cache.md,
+render-worker.md`. Dropping either recovered row, fabricating a reference to a nonexistent rule, and
+duplicating a row each fail by name on the corrected map.
+
 ### Maintenance — 2026-10-10 (D0 residual documentation closure)
 
 **Documentation only — no executable change.** Closes the two non-blocking follow-ups left open by
