@@ -92,6 +92,77 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{value:.1f}s"
 
 
+def _finite_diagnostic(value: object) -> float | None:
+    """[FORK] Digital-Union (P2): one usable finite number, or ``None`` for "not a measurement".
+
+    Same totality contract as `beatsync_fork.input_report.format_seconds` and `_fmt_seconds` above —
+    a diagnostic must never raise inside a render — but it returns ``None`` instead of a zero,
+    because the caller's job is different. `format_seconds` renders a field that is always present,
+    so a fallback *is* the honest answer there. A shot metric that is absent, ``None``, ``NaN``,
+    infinite or unparseable is **not** a measurement of zero concentration, and printing ``0.0 %``
+    for it would invent one. The caller omits the segment instead.
+
+    `value != value` is the NaN test and the infinity comparison is literal, so this needs no
+    ``math`` import — which is what keeps the reporting helpers below exec-testable on a bare
+    interpreter, as `tests/test_stage6_console_reporting.py` relies on.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _planner_sources_line(plan_summary: object) -> str:
+    """[FORK] Digital-Union (P2): the planner's existing ``Sources used:`` line, now also carrying
+    the three shot diagnostics merged by P1.
+
+    Reporting only, and reporting *exclusively* — every value is read straight off `plan_summary`,
+    which `summarize_clip_plan` already computed. Nothing is recomputed, re-derived or re-measured
+    here, so the console can never become a second authority on what a plan contains: if this
+    function and the summary ever disagreed, this function would be the thing that is wrong.
+
+    **It stays one line.** The three metrics ride on the line that already existed rather than
+    spending another console slot, exactly as the seed, the L0 scale facts and the Creative Profile
+    do on the GUI's `Planner:` line. The prefix is preserved verbatim, including its indentation.
+
+    A segment appears only when its value is a usable finite number (`_finite_diagnostic`). That one
+    rule covers both degraded shapes without a special case for either: a pre-P1 or hand-built
+    summary carrying none of the keys renders the original line byte-for-byte, and a key that is
+    present but malformed is dropped rather than rendered as a fabricated zero. The merged planner
+    seeds all three keys on *every* summary — including the empty-plan early return — so in
+    production all four segments are always present; the omission path exists for foreign input, not
+    for a shape this pipeline produces.
+
+    `source_count` keeps its own pre-existing ``.get(..., 0)`` fallback untouched: it is the
+    original field, and it must survive the newer ones being unavailable.
+
+    Shares are clamped to their documented ranges. Both are bounded by construction in
+    `_shot_metrics` (``top_shot_share`` and ``shot_hhi`` are in ``[0.0, 1.0]``), so a clamp can only
+    ever fire on input this pipeline did not produce, and it keeps the printed units honest instead
+    of emitting ``-40.0 %``.
+    """
+    summary = plan_summary if isinstance(plan_summary, dict) else {}
+    # The pre-existing expression, unchanged.
+    segments = [f"Sources used: {summary.get('source_count', 0)}"]
+
+    shot_count = _finite_diagnostic(summary.get("shot_count"))
+    if shot_count is not None:
+        segments.append(f"Shots: {max(0, int(shot_count))}")
+
+    top_shot_share = _finite_diagnostic(summary.get("top_shot_share"))
+    if top_shot_share is not None:
+        segments.append(f"Top shot: {min(1.0, max(0.0, top_shot_share)) * 100:.1f}%")
+
+    shot_hhi = _finite_diagnostic(summary.get("shot_hhi"))
+    if shot_hhi is not None:
+        segments.append(f"Shot HHI: {min(1.0, max(0.0, shot_hhi)):.4f}")
+
+    return "   " + " | ".join(segments)
+
+
 def _env_int(name: str, default: int, lo: int = 1, hi: int | None = None) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -599,7 +670,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             beat_info['clip_plan_summary'] = plan_summary
             render_info["plan_summary"] = plan_summary
         print(f"🧠 Auto visual planner: {plan_summary['clip_count']} planned clips")
-        print(f"   Sources used: {plan_summary.get('source_count', 0)}")
+        # [FORK] Digital-Union (P2): the same line, now also carrying P1's shot diagnostics. The
+        # print count and the line order are unchanged — the metrics ride on the line that already
+        # existed, so the planner's console budget is untouched.
+        print(_planner_sources_line(plan_summary))
         print(f"   Targets: {plan_summary.get('targets', {})}")
         print(f"   AI-tagged source moments used: {plan_summary.get('ai_tagged', 0)}")
     else:
