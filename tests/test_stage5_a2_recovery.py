@@ -209,9 +209,20 @@ def _timings(frames, tags):
             "inference_seconds": 5.0, "prefetch_seconds": 0.1}
 
 
+_UNSET = object()
+
+
 def _write_partial(response_path, job_index, job_id, *, video_file, name, frames=3, tags=3,
-                   records=3, backend=None, invocation=None, contract=None, raw=None):
-    """Publish one partial through the REAL writer, optionally corrupting one declared field."""
+                   records=3, backend=None, invocation=None, contract=None, raw=None,
+                   payload_index=_UNSET):
+    """Publish one partial through the REAL writer, optionally corrupting one declared field.
+
+    ``job_index`` always names the **filename** position. ``payload_index`` (A2-H1) overrides the
+    ``job_index`` recorded *inside* the payload, which is what lets these tests tell filename order
+    apart from declared-index order — the two agree in every genuine artifact, so a fixture where
+    they agree cannot distinguish the two mechanisms. Pass ``payload_index=None`` to drop the field
+    entirely.
+    """
     target = qp.partial_path(str(response_path), job_index, job_id)
     if raw is not None:
         with open(target, "w", encoding="utf-8") as handle:
@@ -228,6 +239,11 @@ def _write_partial(response_path, job_index, job_id, *, video_file, name, frames
         payload["invocation"] = invocation
     if contract is not None:
         payload["partial_contract"] = contract
+    if payload_index is not _UNSET:
+        if payload_index is None:
+            payload.pop("job_index", None)
+        else:
+            payload["job_index"] = payload_index
     assert qp.write_partial(target, payload) == target
     return target
 
@@ -1071,3 +1087,264 @@ def test_k_only_the_batch_runner_grew_a_sink():
     for name in ("_run_qwen_worker", "_run_qwen_worker_batch"):
         body = ast.unparse(_func(tree, name))
         assert "Keep Qwen worker request/response files" in body or "pass" in body
+
+
+# ---------------------------------------------------------------------------
+# L. A2-H1 — DECLARED INDEX vs FILENAME INDEX vs LIVE BATCH POSITION
+#
+# A2-S1's duplicate and telemetry fixtures all used partials whose filename index and payload
+# `job_index` agreed, so they could not tell the two orderings apart and would have passed under
+# either mechanism. Every fixture below makes them DISAGREE on purpose.
+#
+# Three values are now required to coincide, and that distinction is the point of this section:
+#
+#   filename index   - the zero-padded token in `{stem}_job_{index:05d}_{job}.partial.json`
+#   payload index    - the `job_index` field recorded inside the JSON
+#   live position    - this job id's 1-based place in the parent's own `request_jobs`
+#
+# `job_id` is deliberately NOT a fourth name for the same number: it is the source's index among
+# ALL sources, while the position is its place in the SUBMITTED batch.
+# ---------------------------------------------------------------------------
+
+
+def test_l_job_id_is_not_the_batch_position_when_only_some_sources_defer():
+    """The premise of the live-position check, proven against the real batch body first.
+
+    If `job_id` always equalled the batch position, binding to `job_positions` would be the same as
+    `int(job_id)` and the mapping would be pointless. It is not: `job_id` comes from the source's
+    index among every source, so deferring sources 5, 9 and 12 yields positions 1, 2, 3.
+    """
+    body = _body_code(_func(_tree(), "_complete_deferred_qwen_batch"))
+
+    assert "job_id = str(idx or len(request_jobs) + 1)" in body, (
+        "job_id is the source index, not the batch position")
+    assert "enumerate(request_jobs, 1)" in body, "the live position map must enumerate request_jobs"
+    assert "int(job_id)" not in body, "the position must never be re-derived from the job id"
+
+
+def _diverging(tmp_path, file_index, payload_index, job_id="1", frames=3, tags=3, records=3):
+    """One partial for job `job_id` whose filename and payload indices are set independently."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    _write_partial(response, file_index, job_id,
+                   video_file=recs[int(job_id) - 1]["video_file"], name=f"s{job_id}.mp4",
+                   frames=frames, tags=tags, records=records, payload_index=payload_index)
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+    return ns, paths, recs
+
+
+def test_l_filename_1_payload_2_is_refused(tmp_path, capsys):
+    """Filename says position 1, payload declares 2. Self-contradictory identity, so refused."""
+    ns, paths, recs = _diverging(tmp_path, file_index=1, payload_index=2)
+
+    out = capsys.readouterr().out
+    assert "position" in out or "filename disagrees" in out
+    assert recs[0]["ai_enabled"] is False
+    assert not os.path.exists(paths[0]), "contradictory metadata must not reach the cache"
+
+
+def test_l_filename_2_payload_1_is_refused(tmp_path, capsys):
+    """The mirror. Under A2-S1 this partial was ACCEPTED - the index was merely unused."""
+    ns, paths, recs = _diverging(tmp_path, file_index=2, payload_index=1)
+
+    assert "filename disagrees with its own payload identity" in capsys.readouterr().out
+    assert recs[0]["ai_enabled"] is False
+    assert not os.path.exists(paths[0])
+
+
+def test_l_an_honest_partial_still_recovers(tmp_path):
+    """The control: all three values coincide, exactly as A1 writes them."""
+    ns, paths, recs = _diverging(tmp_path, file_index=1, payload_index=1)
+
+    assert recs[0]["ai_enabled"] is True
+    assert os.path.exists(paths[0])
+
+
+@pytest.mark.parametrize("payload_index, why", [
+    (0, "zero is not a loop position - enumerate starts at 1"),
+    (-999, "a negative sorted ahead of every honest partial under A2-S1"),
+    (True, "bool subclasses int and would compare equal to position 1"),
+    (2.0, "a float is not an integer position"),
+    ("1", "a numeric string is not an integer position"),
+    (None, "a missing field proves nothing"),
+    (5, "out of range: only 4 jobs were submitted"),
+    (99999, "far out of range"),
+])
+def test_l_a_malformed_or_out_of_range_index_is_refused(tmp_path, payload_index, why):
+    ns, paths, recs = _diverging(tmp_path, file_index=1, payload_index=payload_index)
+
+    assert recs[0]["ai_enabled"] is False, why
+    assert not os.path.exists(paths[0]), why
+
+
+def test_l_out_of_range_is_caught_by_the_live_position_not_a_separate_bound(tmp_path, capsys):
+    """Index 5 of a 4-job batch is refused because job 1 sits at position 1 - no second rule."""
+    _diverging(tmp_path, file_index=5, payload_index=5)
+
+    assert "position 1 in this batch" in capsys.readouterr().out
+
+
+def test_l_a_malformed_index_cannot_capture_the_backend_telemetry(tmp_path):
+    """The A2-S1 defect, directly.
+
+    Job 1 reports the early accumulating figures, job 2 the later ones. Under A2-S1 a malformed
+    index on job 2 silently handed the telemetry back to job 1, understating `model_load_seconds`
+    in a record that then got checkpointed. Now job 2's partial is refused outright, so it can
+    neither contribute telemetry nor displace job 1's.
+    """
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    _write_partial(response, 1, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   backend={"model_id": "EARLY", "batch_size": 8, "model_load_seconds": 8.0})
+    _write_partial(response, 2, "2", video_file=recs[1]["video_file"], name="s2.mp4",
+                   payload_index=-1,
+                   backend={"model_id": "LATE", "batch_size": 4, "model_load_seconds": 15.5})
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+
+    assert recs[0]["ai_enabled"] is True, "job 1's honest partial still recovers"
+    assert recs[1]["ai_enabled"] is False, "job 2's contradictory partial is refused"
+    assert recs[0]["timings"]["qwen_model_id"] == "EARLY", (
+        "telemetry comes from the only surviving validated partial")
+    assert recs[0]["timings"]["qwen_concurrency"] == 8
+
+
+def test_l_the_highest_valid_index_still_wins_the_telemetry(tmp_path):
+    """And when both are honest, the LATER partial's accumulating figures win."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    # written in reverse, so write order cannot explain the outcome
+    _write_partial(response, 2, "2", video_file=recs[1]["video_file"], name="s2.mp4",
+                   backend={"model_id": "LATE", "batch_size": 4, "model_load_seconds": 15.5})
+    _write_partial(response, 1, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   backend={"model_id": "EARLY", "batch_size": 8, "model_load_seconds": 8.0})
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+
+    assert recs[0]["timings"]["qwen_model_id"] == "LATE"
+    assert recs[0]["timings"]["qwen_concurrency"] == 4
+    assert recs[0]["timings"]["qwen_model_load_seconds_amortized"] == pytest.approx(15.5 / 4)
+
+
+def test_l_a_duplicate_job_id_cannot_exist_for_valid_partials(tmp_path, capsys):
+    """One job id admits exactly ONE legal filename, so two files can never both pass.
+
+    This is the structural consequence of the consistency check, and it is what makes the duplicate
+    policy unambiguous rather than merely deterministic: the filename-order winner, the
+    lowest-declared-index winner and the live-position match are now the same single file.
+    """
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    # Two files both claiming job "1". Only filename index 1 can match job 1's live position.
+    _write_partial(response, 1, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   frames=3, tags=3, records=3)
+    _write_partial(response, 2, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   frames=3, tags=1, records=1, payload_index=1)
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+
+    out = capsys.readouterr().out
+    assert "duplicate job id 1" in out, "the second file is refused as a duplicate"
+    assert recs[0]["ai_enabled"] is True, "and the legal one - the complete one - won"
+    assert len(ns["_merged"]) == 3
+    assert os.path.exists(paths[0])
+
+
+def test_l_duplicate_resolution_is_identical_under_the_opposite_ordering(tmp_path):
+    """The same two files written the other way round must produce the same winner.
+
+    Under A2-S1 this pair was indistinguishable from the one above; now the mis-named file is
+    refused on identity grounds regardless of which was written first.
+    """
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    _write_partial(response, 2, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   frames=3, tags=1, records=1, payload_index=1)
+    _write_partial(response, 1, "1", video_file=recs[0]["video_file"], name="s1.mp4",
+                   frames=3, tags=3, records=3)
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+
+    assert recs[0]["ai_enabled"] is True
+    assert len(ns["_merged"]) == 3, "the complete, legally-named partial won either way"
+    assert os.path.exists(paths[0])
+
+
+def test_l_an_incomplete_but_legally_named_partial_still_cannot_become_complete(tmp_path):
+    """Identity validation is not completion validation. The existing rule still decides."""
+    ns, paths, recs = _diverging(tmp_path, file_index=1, payload_index=1,
+                                 frames=3, tags=2, records=2)
+
+    assert recs[0]["ai_enabled"] is False, "2 of 3 requested candidates tagged"
+    assert not os.path.exists(paths[0])
+    assert len(ns["_merged"]) == 2, "the tags that arrived are still merged"
+
+
+def test_l_recovery_is_independent_of_filesystem_enumeration_order(tmp_path, monkeypatch):
+    """Reverse what the directory listing reports; no outcome may move."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    results = []
+    for reverse in (False, True):
+        ns = _namespace(_dead_worker(), response_path=response)
+        items, paths, recs = _four_jobs(ns, tmp_path)
+        for index in (1, 2, 3):
+            _write_partial(response, index, str(index),
+                           video_file=recs[index - 1]["video_file"], name=f"s{index}.mp4",
+                           backend={"model_id": f"m{index}", "batch_size": index,
+                                    "model_load_seconds": float(index)})
+        real_listdir = os.listdir
+        monkeypatch.setattr(
+            os, "listdir",
+            lambda p: sorted(real_listdir(p), reverse=True) if reverse else real_listdir(p))
+        ns["_complete_deferred_qwen_batch"](
+            video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+            run_stats=_run_stats())
+        monkeypatch.undo()
+        results.append((
+            [r["ai_enabled"] for r in recs],
+            recs[0]["timings"]["qwen_model_id"],
+            recs[0]["timings"]["qwen_concurrency"],
+            sorted(ns["_merged"]),
+        ))
+        for path in paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+    assert results[0] == results[1], "enumeration order must not change any outcome"
+    assert results[0][1] == "m3", "and the highest validated index still supplies telemetry"
+
+
+def test_l_the_live_position_map_comes_from_the_submitted_list(tmp_path):
+    """A candidate-less source never reaches `request_jobs`, so it shifts every later position."""
+    response = str(tmp_path / "qwen_batch_response_tok.json")
+    ns = _namespace(_dead_worker(), response_path=response)
+    items, paths, recs = _four_jobs(ns, tmp_path)
+    # job 2 has NO candidates, so jobs 1 and 3 become positions 1 and 2
+    recs[1]["candidates"] = []
+    items = items[:3]
+    _write_partial(response, 1, "1", video_file=recs[0]["video_file"], name="s1.mp4")
+    _write_partial(response, 2, "3", video_file=recs[2]["video_file"], name="s3.mp4")
+
+    ns["_complete_deferred_qwen_batch"](
+        video_items=items, use_gpu=False, qwen_model_path="m", total_video_count=4,
+        run_stats=_run_stats())
+
+    assert recs[0]["ai_enabled"] is True, "position 1"
+    assert recs[2]["ai_enabled"] is True, (
+        "job id 3 sits at POSITION 2 once the candidate-less source is skipped")
+    assert os.path.exists(paths[0]) and os.path.exists(paths[2])

@@ -1981,6 +1981,7 @@ def _recover_jobs_from_partials(
     response_path: Any,
     selected_by_job: Dict[str, List[Dict]],
     job_to_video: Dict[str, Dict],
+    job_positions: Dict[str, int],
 ) -> tuple[Dict[str, Dict], Dict[str, Dict], Dict[str, Any]]:
     """[FORK] Digital-Union (A2-S1): rebuild the response envelope of the jobs that DID finish.
 
@@ -2011,16 +2012,44 @@ def _recover_jobs_from_partials(
     * ``semantics`` and ``timings`` are genuine mappings. A truthy non-dict would reach `.get` in the
       merge loop and raise, which is the T1 failure shape.
 
-    **Duplicate job ids are rejected, never merged and never silently overwritten.** Paths are walked
-    in sorted order - the filename's zero-padded ``job_index`` makes that loop-position order - so the
-    lowest-indexed valid partial for a job id wins and every later one is refused with a printed
-    reason. Nothing here depends on filesystem enumeration order.
+    **The declared loop position must agree with live state, and with its own filename (A2-H1).**
+    Three checks replace A2-S1's single `_is_count`, and together they close the gap where malformed
+    identity metadata was *tolerated* (its semantics accepted, its index merely unused):
+
+    * ``job_index`` is a strictly positive non-bool integer. A worker position comes from
+      ``enumerate(jobs, 1)``, so `0`, a negative, a float, a string and `True` are all impossible for
+      a genuine artifact. A2-S1 used `_is_count` here, which admits `0` and negatives by design;
+    * ``job_index`` equals this job's **live** position in `job_positions`, which
+      `_complete_deferred_qwen_batch` builds by enumerating `request_jobs` - the very list handed to
+      the worker. This binds the declared index to parent state instead of trusting the file, and it
+      bounds the index by the request's job count as a consequence rather than as a separate rule.
+      **Note it is NOT ``int(job_id)``**: `job_id` is the source's index among *all* sources while
+      `job_index` is its position within the *submitted batch*, so the two legitimately differ
+      whenever only some sources were deferred;
+    * the discovered path is the one legal filename for that (invocation, index, job id) triple
+      (`qwen_partials.path_matches`, which recomputes `partial_path` rather than parsing the name).
+
+    A partial failing any of them is **refused outright**, not merely excluded from telemetry. That is
+    a deliberate A2-H1 behaviour change: such a file is self-contradictory about which job it
+    describes, and no amount of otherwise-valid semantics makes contradictory identity metadata
+    trustworthy evidence. No genuine artifact can fail, because A1 writes the filename and the payload
+    from the same ``job_index`` variable.
+
+    **Duplicate job ids therefore cannot arise for valid artifacts at all**, and the guard below is
+    kept as defence rather than as policy: one job id admits exactly one legal filename, so two files
+    cannot both pass. If one somehow did, paths are walked in sorted order and the first accepted
+    result stands - a duplicate is refused with a printed reason and may **never** overwrite it. With
+    the consistency check in force, filename order, declared ``job_index`` order and live batch
+    position are the same ordering by construction, which is what makes that statement unambiguous;
+    A2-S1's prose conflated the three. Nothing depends on filesystem enumeration order.
 
     **Backend telemetry is diagnostic only** and is taken from the highest validated ``job_index``
     among accepted partials, because it genuinely varies within a batch: `load_seconds` accumulates
-    and `batch_size` is reassigned whenever the worker's `restart_server_with_slots` succeeds. Only
-    the three fields a partial actually carries are returned; ``peak_vram_gb`` is **absent**, so
-    `_optional_telemetry_number` reports it as unknown rather than as a fabricated `0.0`.
+    and `batch_size` is reassigned whenever the worker's `restart_server_with_slots` succeeds. Since
+    every accepted partial now carries a position validated against live state, a malformed index can
+    no longer steer that choice to an earlier or unrelated artifact. Only the three fields a partial
+    actually carries are returned; ``peak_vram_gb`` is **absent**, so `_optional_telemetry_number`
+    reports it as unknown rather than as a fabricated `0.0`.
 
     **It can never fail Stage 5.** Every file is handled independently, so one unreadable partial
     costs its siblings nothing, and the whole body is contained: any failure degrades to "nothing
@@ -2054,6 +2083,36 @@ def _recover_jobs_from_partials(
                     print(f"      Qwen partial ignored (duplicate job id {job_id}; the first valid "
                           f"partial already won): {os.path.basename(path)}")
                     continue
+                # [FORK] Digital-Union (A2-H1): the declared loop position must be a real position,
+                # must match this job's LIVE position in the submitted batch, and must match the
+                # filename the writer would have produced for it. Identity metadata that contradicts
+                # itself is refused rather than half-trusted.
+                # A strictly positive non-bool int, checked INLINE rather than through a new
+                # module-level predicate. That is deliberate: four suites AST-extract and execute
+                # this body, and every module-level name it calls has to join each of their
+                # extraction tuples or the exec dies with `NameError` - a coupling this work stream
+                # has already tripped over twice. `_is_count` (A2-S1's choice) is the wrong predicate
+                # anyway and is frozen for the completion contract: it admits `0` and negatives by
+                # design, which is exactly how a malformed index used to sort ahead of every honest
+                # partial and capture the telemetry. A worker position comes from
+                # `enumerate(jobs, 1)`, so `>= 1` is the only legal shape; `bool` is excluded
+                # because it subclasses `int` and `True` would compare equal to position 1.
+                job_index = payload.get("job_index")
+                if not (isinstance(job_index, int) and not isinstance(job_index, bool)
+                        and job_index >= 1):
+                    print(f"      Qwen partial ignored (job_index is not a positive loop position): "
+                          f"{os.path.basename(path)}")
+                    continue
+                if job_index != job_positions.get(job_id):
+                    print(f"      Qwen partial ignored (job_index {job_index} is not job {job_id}'s "
+                          f"position {job_positions.get(job_id)} in this batch): "
+                          f"{os.path.basename(path)}")
+                    continue
+                if not fork_partials.path_matches(
+                        path, response_path, job_index=job_index, job_id=job_id):
+                    print(f"      Qwen partial ignored (filename disagrees with its own payload "
+                          f"identity): {os.path.basename(path)}")
+                    continue
                 expected_video = _as_mapping(job_to_video.get(job_id)).get("video_file")
                 if not isinstance(expected_video, str) or not _same_source(
                         payload.get("video_file"), expected_video):
@@ -2068,9 +2127,9 @@ def _recover_jobs_from_partials(
                     continue
                 recovered_semantics[job_id] = semantics
                 recovered_timings[job_id] = timings
-                job_index = payload.get("job_index")
-                if _is_count(job_index):
-                    accepted.append((int(job_index), path, payload.get("backend")))
+                # The position is already validated above, so every accepted partial contributes a
+                # trustworthy ordering key - there is no "accepted but unordered" tier any more.
+                accepted.append((int(job_index), path, payload.get("backend")))
             except Exception as exc:
                 print(f"      Qwen partial ignored ({type(exc).__name__}: {exc}): "
                       f"{os.path.basename(str(path))}")
@@ -2207,8 +2266,15 @@ def _complete_deferred_qwen_batch(
     # stays incomplete, is not checkpointed, and retries on the next run exactly as it does today.
     # Same invocation only: there is no cross-run resumability here.
     if not semantics_by_job:
+        # [FORK] Digital-Union (A2-H1): the live job_id -> batch-position map, built from the very
+        # list handed to the worker. The worker numbers its loop with `enumerate(jobs, 1)`, so this is
+        # the exact `job_index` an honest partial must declare. It is NOT `int(job_id)`: `job_id` is
+        # the source's index among ALL sources, while the position is its place in the SUBMITTED
+        # batch, and the two differ whenever only some sources were deferred.
+        job_positions = {str(job.get("job_id")): position
+                         for position, job in enumerate(request_jobs, 1)}
         recovered_semantics, recovered_timings, recovered_telemetry = _recover_jobs_from_partials(
-            worker_artifacts.get("response_path"), selected_by_job, job_to_video)
+            worker_artifacts.get("response_path"), selected_by_job, job_to_video, job_positions)
         if recovered_semantics:
             semantics_by_job = recovered_semantics
             timings_by_job = recovered_timings
