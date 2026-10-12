@@ -90,7 +90,14 @@ import uuid
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
 
 # Import FFmpeg processing module
-from ffmpeg_processing import get_video_fps, FFMPEG_PATH, run_cancellable_media_command
+from ffmpeg_processing import (
+    get_video_fps, run_cancellable_media_command,
+    # [FORK] Digital-Union (Deliverable Export V1-A): the delivery-preview argv lives in
+    # `ffmpeg_processing` with every other FFmpeg command, so it is unit-testable without Gradio
+    # and the GUI gains no second command-construction site. `FFMPEG_PATH` is no longer imported
+    # here: the preview was the last consumer, and the builder resolves it from its own module.
+    build_delivery_preview_command, DELIVERY_PREVIEW_TIMEOUT_SECONDS,
+)
 
 # Shared runtime settings
 from gpu_cpu_utils import (
@@ -1172,54 +1179,80 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # point -- nothing after this line (preview generation included) may ever downgrade it.
         session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS
 
-        # Create preview for ProRes if needed
+        # [FORK] Digital-Union (Deliverable Export V1-A): ONE browser-playable preview, for EVERY
+        # processing mode rather than only ProRes.
+        #
+        # Why every mode: the master always muxes `pcm_s24le`, which lands in MP4 as `ipcm`
+        # (ISO/IEC 23003-5). An ordinary browser cannot decode that, so handing the durable master
+        # straight to `gr.Video` — which is what the non-ProRes path did — produced a preview whose
+        # audio nothing in the page can play. ProRes and HEVC masters are not AVC at all.
+        #
+        # Two defects in the block this replaces are fixed here, and both were measured:
+        #   * the argv placed `-c:v` BEFORE `-i`, so FFmpeg read the encoder as an input decoder
+        #     and died on `Unknown decoder 'h264_nvenc'` / `Unknown decoder 'libx264'`. The argv
+        #     now comes from `build_delivery_preview_command`, which emits every encoder option
+        #     after the input and is pinned positionally by test.
+        #   * `preview_path` was assigned BEFORE the subprocess and there was no returncode or
+        #     existence check, so a failed preview (i.e. always) returned a path to a file that was
+        #     never created. The validation below is the fix: the preview is selected only after
+        #     FFmpeg succeeded AND the file exists AND it is non-empty.
+        #
+        # Everything here runs AFTER the SUCCESS commit point, so it is post-commit convenience
+        # work and is contained accordingly: no failure, timeout or cancellation may change the
+        # render's terminal result, downgrade SUCCESS, touch `LAST_OUTPUT_PATH_KEY`, or reach the
+        # generic render-failure handler below. `except RenderCancelled` therefore comes FIRST --
+        # it is an ordinary `Exception`, so the generic clause would otherwise swallow it.
+        #
+        # One deliberate behaviour change from the pre-V1-A block: a `TimeoutExpired` IS caught
+        # now. The old comment reserved it as "a stuck encode is a different fact from a user
+        # pressing Stop", but after the commit point a stuck *preview* must not be able to turn a
+        # finished render into a traceback.
         preview_path = output_path
-        if is_prores:
-            preview_filename = f"{name}_{timestamp}_preview.mp4"
-            preview_path = os.path.join(session_dir, preview_filename)
-            preview_cmd = [FFMPEG_PATH]
-            if NVENC_AVAILABLE:
-                preview_cmd.extend(['-hwaccel', 'cuda', '-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23'])
-            else:
-                preview_cmd.extend(['-hwaccel', 'auto', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
-            preview_cmd.extend(['-i', output_path, '-pix_fmt', 'yuv420p', '-y', preview_path])
-            # [FORK] Digital-Union (C3-R1A / R2): the durable .mov above is already SUCCESS and
-            # STAYS so regardless of anything below. Cancellation stops this post-commit
-            # convenience work; it never changes the render's terminal result, and nothing here
-            # touches RENDER_OUTCOME_KEY. Three explicit branches, because they are three genuinely
-            # different situations:
-            #
-            #   lifecycle is None          today's exact blocking call, byte-for-byte, including
-            #                              its existing TimeoutExpired behaviour. Every pre-R1A
-            #                              caller and the headless path take this.
-            #   already cancelled          never START a child at all. Cheaper than starting one
-            #                              and terminating it on the first poll, and it is the
-            #                              common case when Cancel landed during the render.
-            #   cancelled WHILE running    R2 fixed this: R1A only handled the branch above, so an
-            #                              already-running preview kept FFmpeg alive for up to 180s
-            #                              while the UI claimed cancellation. The cancellable runner
-            #                              terminates, graces, kills if needed and REAPS the child,
-            #                              then raises RenderCancelled -- which is caught HERE and
-            #                              goes no further, because a cancelled preview is not a
-            #                              cancelled render.
-            #
-            # A partial preview is simply never selected: `preview_path` falls back to the durable
-            # `output_path`. It is deliberately not deleted -- `session_dir` already legitimately
-            # retains non-promoted artifacts (a cross-volume promotion failure keeps the whole
-            # render there and names it in the message), and adding a destructive operation to this
-            # function to tidy session scratch is not worth the surface.
-            #
-            # A genuine `TimeoutExpired` is deliberately NOT caught on either path: a stuck encode
-            # is a different fact from a user pressing Stop, and its existing behaviour is unchanged.
-            if lifecycle is None:
-                subprocess.run(preview_cmd, capture_output=True, text=True, timeout=180)
-            elif lifecycle.cancel_requested():
-                preview_path = output_path
-            else:
-                try:
-                    run_cancellable_media_command(preview_cmd, 180, lifecycle=lifecycle)
-                except RenderCancelled:
-                    preview_path = output_path
+        preview_bytes = 0
+        preview_failure = None
+        preview_target = os.path.join(
+            session_dir, f"{name}_{timestamp}{creative.filename_suffix()}_preview.mp4")
+        if os.path.exists(preview_target):
+            # Never overwrite an existing artifact, and never silently reuse one: the master stem
+            # already carries a timestamp and the seed suffix, and `session_dir` is a per-session
+            # mkdtemp, so this is close to impossible -- and refusing costs only the preview.
+            preview_failure = 'a file already occupies the preview path'
+        elif lifecycle is not None and lifecycle.cancel_requested():
+            # Never START a child when cancellation is already pending. Cheaper than starting one
+            # and terminating it on the first poll, and it is the common case when Stop landed
+            # during the render.
+            preview_failure = 'cancelled before the preview started'
+        else:
+            try:
+                preview_cmd = build_delivery_preview_command(output_path, preview_target)
+                if lifecycle is None:
+                    completed = subprocess.run(
+                        preview_cmd, capture_output=True, text=True,
+                        timeout=DELIVERY_PREVIEW_TIMEOUT_SECONDS)
+                else:
+                    completed = run_cancellable_media_command(
+                        preview_cmd, DELIVERY_PREVIEW_TIMEOUT_SECONDS, lifecycle=lifecycle)
+                if getattr(completed, 'returncode', 1) != 0:
+                    preview_failure = 'FFmpeg exited non-zero'
+                elif not os.path.exists(preview_target):
+                    preview_failure = 'FFmpeg produced no output file'
+                elif os.path.getsize(preview_target) == 0:
+                    preview_failure = 'FFmpeg produced an empty output file'
+                else:
+                    preview_bytes = os.path.getsize(preview_target)
+                    preview_path = preview_target
+            except RenderCancelled:
+                preview_failure = 'cancelled during preview encoding'
+            except subprocess.TimeoutExpired:
+                preview_failure = (
+                    f'preview encoding exceeded {DELIVERY_PREVIEW_TIMEOUT_SECONDS}s')
+            except Exception as preview_error:
+                preview_failure = f'preview encoding failed: {preview_error}'
+        # The cancellable runner (C3-R1A / R2) terminates, graces, kills and REAPS its child before
+        # raising, so a Stop during preview encoding leaves no FFmpeg behind. A failed or abandoned
+        # preview is simply never selected and is deliberately NOT deleted: `session_dir` already
+        # legitimately retains non-promoted artifacts, and adding a destructive operation here to
+        # tidy session scratch is not worth the surface.
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -1287,6 +1320,39 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # explanatory report but adds no summary, because no SFX was used.
         if smart_mix_plan is not None and smart_mix_plan.total:
             status_msg = f"{status_msg}\n\n{smart_mix_plan.summary_line()}"
+        # [FORK] Digital-Union (Deliverable Export V1-A): name the two artifacts explicitly,
+        # because they are genuinely different things and conflating them is what made the old
+        # panel misleading. The master is durable; the preview is session-scoped and must never be
+        # described as a permanent download. On failure this says so plainly and does NOT claim the
+        # master is browser-playable -- it usually is not, which is the whole reason for the
+        # preview. Sizes come from the files just written, so nothing is estimated.
+        # No second `os.path.exists(output_path)`: the promotion above already proved the master is
+        # there, and a second check would be exactly the TOCTOU pair the no-replace rename exists
+        # to avoid (a test pins that exactly one such check survives, the early one). A stat that
+        # somehow fails must not turn a finished render into an error message either, so it
+        # degrades to 0 rather than propagating.
+        try:
+            master_bytes = os.path.getsize(output_path)
+        except OSError:
+            master_bytes = 0
+        delivery_lines = [
+            "HIGH-QUALITY MASTER:",
+            f"   {output_path}",
+            f"   {codec_info}, {audio_info} - {master_bytes / 1048576:.1f} MB",
+        ]
+        if preview_failure is None:
+            delivery_lines.extend([
+                "PLAYABLE PREVIEW (this session only - not a permanent download):",
+                f"   {preview_path}",
+                f"   H.264/AAC MP4 - {preview_bytes / 1048576:.1f} MB",
+            ])
+        else:
+            delivery_lines.extend([
+                f"⚠️  Browser-compatible preview was not created ({preview_failure}).",
+                "   The master above is unchanged and complete, but it may not play in this",
+                "   browser; no shareable MP4 was produced.",
+            ])
+        status_msg = f"{status_msg}\n\n" + "\n".join(delivery_lines)
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 

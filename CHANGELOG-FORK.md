@@ -20,6 +20,79 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed / Added — 2026-10-12 (Deliverable Export V1-A: a preview that actually plays)
+
+**Every successful GUI render now produces one browser-playable H.264/AAC MP4 preview, for all four
+processing modes.** The high-quality master, its single no-replace durable promotion and the SUCCESS
+commit point are untouched; the preview is session-scoped and **no second durable artifact is
+created** (that is V1-B, which needs its own authorization).
+
+Three measured defects are fixed:
+
+```
+before:  preview_cmd = [FFMPEG_PATH, '-hwaccel', …, '-c:v', 'h264_nvenc', …, '-i', master, …]
+         -> "Unknown decoder 'h264_nvenc'" / "Unknown decoder 'libx264'", exit != 0, no file
+after:   every encoder option is emitted AFTER -i, by build_delivery_preview_command()
+```
+
+1. **The preview argv put `-c:v` before `-i`**, so FFmpeg read the encoder as an input *decoder*.
+   Reproduced on the pinned FFmpeg 8.1.2: both the NVENC and CPU branches died with
+   `Unknown decoder`, non-zero exit, no output. A repo-wide ordering audit found this was the
+   **only** such defect in any of the 18 FFmpeg/ffprobe argv constructions in `src/`.
+2. **The preview result was never checked.** `preview_path` was assigned *before* the subprocess,
+   and the only fallbacks were the two cancellation branches — so a failed preview (i.e. always,
+   for ProRes) returned a path to a file that was never created. The in-code comment claimed
+   otherwise. The preview is now selected only when FFmpeg exited 0 **and** the file exists **and**
+   it is non-empty.
+3. **The non-ProRes modes had no preview at all** — they handed the durable master straight to
+   `gr.Video`. Every master muxes `pcm_s24le`, which lands in MP4 as `ipcm` (ISO/IEC 23003-5) and
+   is not decodable by an ordinary browser, so a finished render previewed silently. ProRes and
+   HEVC masters are not AVC at all.
+
+`ffmpeg_processing.build_delivery_preview_command(source, destination)` is the one delivery profile:
+`libx264 -preset veryfast -crf 21 -pix_fmt yuv420p -profile:v high` + `aac -b:a 192k -ar 48000 -ac 2`
++ `-movflags +faststart`, with explicit `-map 0:v:0 -map 0:a:0` so a master missing either stream
+fails loudly instead of yielding a silent "preview". Resolution and frame rate are preserved by
+**omitting** `-vf`/`-s`/`-r` (the master is already CFR at the render's own fps), and **no level is
+pinned** — a fixed `4.1` would be wrong for a 4K or high-fps master. One CPU profile serves all four
+modes, so the preview never depends on NVENC; a hardware-encoded preview is a separate later
+optimisation. It raises rather than ever letting the destination equal the master.
+
+The video is **re-encoded, not stream-copied**, and that is measured: over the 18 real renders of the
+P3-E2 package, copying the `-crf 0` master and swapping only PCM→AAC moved 47.1 Mbps to 44.9 Mbps — a
+4.7 % reduction. Copying fixes playability and not size.
+
+**Real-media validation** (one existing E2 master, the verified isolated portable FFmpeg, read-only):
+`avc1` + `mp4a`, profile High, `yuv420p`, 1280x720 @ 25/1 and 321/321 frames preserved, audio
+−16.9 dBFS, **46,947,228 → 2,770,066 bytes (5.9 % of the master)** in **0.43 s for 12.84 s of video
+(29.6x realtime)**. Source byte-identical afterwards. That is one CPU-H.264 fixture — it does **not**
+establish all four modes end-to-end, and real browser playback and full-length cost remain explicit
+later acceptance gates.
+
+Failure, timeout and cancellation are all contained *after* the commit point: the master stays
+SUCCESS, `LAST_OUTPUT_PATH_KEY` still names the master, the display path falls back to it, and the
+panel says plainly that no shareable MP4 was produced — it never claims the master is
+browser-playable. **One deliberate reversal:** a `TimeoutExpired` is now caught. The pre-V1-A comment
+reserved it ("a stuck encode is a different fact from a user pressing Stop"), which was defensible
+while the preview was a ProRes-only convenience; after the commit point an uncaught timeout would
+escape into the generic handler and report a finished, promoted render as `❌ Error`.
+
+The status panel now names the two artifacts separately — `HIGH-QUALITY MASTER` (path, format, size)
+and `PLAYABLE PREVIEW (this session only - not a permanent download)` — with sizes read off the files
+just written. No new panel, widget, slider, output key, state machine or `subprocess.run` site
+(`gui.py` still has exactly two, and the preview's is one of them).
+
+Tests: 5652 passed, 8 skipped (was 5611 / 8; +41, all in the new
+`tests/test_delivery_preview.py`, reconciled exactly). The new suite executes the **real** builder
+and the **real** `_process_video_impl`, including a regression guard that the pre-V1-A argv ordering
+is rejected by the very check the new argv passes. Four existing guards were retargeted from the
+retired `if is_prores:` anchor to the delivery `try` and, where their mechanism changed, *tightened*
+rather than relaxed.
+
+Changed: `src/gui.py`, `src/ffmpeg_processing.py`, `tests/test_delivery_preview.py` (new),
+`tests/test_gui_guard_seam.py`, `tests/test_render_cancellation.py`,
+`.claude/rules/gui-integration.md`, `.claude/rules/render-worker.md`.
+
 ### Added — 2026-10-11 (Stage-6 P2: the shot diagnostics reach the console)
 
 **The planner's existing `Sources used:` line now also reports P1's three shot diagnostics.**
