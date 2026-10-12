@@ -480,9 +480,24 @@ def test_a_staging_path_that_only_shares_a_string_prefix_is_refused(tmp_path):
     assert not os.path.exists(L["share"])
 
 
-def test_a_reparse_point_in_the_publication_path_is_refused(tmp_path):
-    """Junctions are refused rather than followed. Simulated via st_file_attributes so the test
-    does not need elevation; the real-junction case is covered by the OS itself."""
+def test_an_unresolvable_reparse_attribute_refuses_the_publication(tmp_path):
+    """The RESIDUAL reparse guard, which is the only thing it actually is.
+
+    [FORK] Digital-Union (V1-B-S2, accepted review finding MINOR-2): this test was named
+    `..._a_reparse_point_in_the_publication_path_is_refused` and its docstring claimed junctions
+    are "refused rather than followed" with "the real-junction case covered by the OS itself".
+    Both were wrong. `realpath` runs BEFORE `_is_reparse`, so a real junction is **followed** and
+    the attribute check only ever sees an already-resolved path — which by construction is not a
+    reparse point. Verified against real Windows junctions: the branch below never fires for one.
+
+    So what this pins is the residual case the branch genuinely covers: `realpath` returned a path
+    whose attributes still say reparse point (it could not resolve), and the publication refuses
+    rather than proceeding blind. The shim is what makes that state reachable at all.
+
+    Real junctions are contained by measurement instead, and that is asserted separately in
+    `test_a_staging_path_that_only_shares_a_string_prefix_is_refused` (commonpath) and
+    `test_a_staging_directory_on_another_volume_is_refused_before_any_copy` (splitdrive).
+    """
     L = layout(tmp_path)
 
     class _Stat:
@@ -503,14 +518,112 @@ def test_a_reparse_point_in_the_publication_path_is_refused(tmp_path):
 
 def test_a_corrupted_staged_copy_is_detected_by_rereading_it(tmp_path):
     """A flipped byte keeps the SIZE correct, so only a real digest check catches it.
-    This is why verification re-reads the staged file instead of trusting the write digest."""
+    This is why verification re-reads the staged file instead of trusting the write digest.
+
+    [FORK] Digital-Union (V1-B-S2, accepted review finding MINOR-3): the fragment asserted below
+    was "does not match the preview", which overstated the comparison. What is compared is the
+    staged bytes against the bytes **read during the copy** — which is exactly what catches this
+    corrupt write, and is also why a source mutated mid-copy would not be caught (see
+    `test_the_digest_check_does_not_claim_the_source_was_stable`). Wording only; the control flow
+    and every published byte are unchanged.
+    """
     L = layout(tmp_path)
     ns = load_share_publisher({"open": _corrupting_open(flip=True)})
 
     reason, published = ns["_publish_share_no_replace"](L["preview"], L["share"], L["stage"])
 
     assert published == 0
-    assert "does not match the preview" in reason, reason
+    assert "does not match the bytes copied" in reason, reason
+    assert not os.path.exists(L["share"])
+
+
+def test_the_digest_check_does_not_claim_the_source_was_stable(tmp_path):
+    """The exact scope of the verification, pinned so the docs cannot drift back.
+
+    [FORK] Digital-Union (V1-B-S2, accepted review finding MINOR-3): a same-size in-place mutation
+    of the preview DURING the copy publishes successfully, because the staged bytes still match
+    what was read. That is not a defect — the runtime supplies source stability (`_RENDER_LOCK`
+    serialises renders, `session_dir` is a per-session mkdtemp, and the preview's FFmpeg child is
+    reaped before publication starts), so the condition is unreachable in the app. It is pinned
+    because the *claim* must stay honest: this proves "staged == bytes copied", nothing more.
+
+    A SIZE-changing mutation is a different matter and IS caught, by the pre-copy size comparison.
+    """
+    L = layout(tmp_path, preview_bytes=b"A" * (CHUNK * 2))
+    pristine = sha(L["preview"])
+    real_open = open
+    reads = {"n": 0}
+
+    def mutating_open(path, mode="r", *a, **k):
+        handle = real_open(path, mode, *a, **k)
+        if str(path) != L["preview"] or "r" not in str(mode):
+            return handle
+
+        class _MutatingReader:
+            def read(self, size=-1):
+                reads["n"] += 1
+                if reads["n"] == 2:
+                    # same length, so the size check cannot see it
+                    with real_open(L["preview"], "r+b") as writable:
+                        writable.seek(0)
+                        writable.write(b"Z" * 16)
+                return handle.read(size)
+
+            def __getattr__(self, item):
+                return getattr(handle, item)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return handle.__exit__(*exc)
+
+        return _MutatingReader()
+
+    ns = load_share_publisher({"open": mutating_open})
+    reason, published = ns["_publish_share_no_replace"](L["preview"], L["share"], L["stage"])
+
+    assert reason == "", "a same-size mid-copy source mutation was reported as a failure"
+    assert published > 0
+    assert sha(L["preview"]) != pristine, "the probe did not actually mutate the source"
+    # published == what was READ, which here is the pre-mutation content: NOT the source as it
+    # now stands. Claim A holds; claim B does not, and the docs must not say otherwise.
+    assert sha(L["share"]) != sha(L["preview"])
+
+
+def test_a_source_that_changes_size_during_the_copy_is_refused(tmp_path):
+    """The other half of MINOR-3: size drift IS detected, by the pre-copy `source_bytes`."""
+    L = layout(tmp_path, preview_bytes=b"B" * (CHUNK * 2))
+    real_open = open
+    reads = {"n": 0}
+
+    def shrinking_open(path, mode="r", *a, **k):
+        handle = real_open(path, mode, *a, **k)
+        if str(path) != L["preview"] or "r" not in str(mode):
+            return handle
+
+        class _ShrinkingReader:
+            def read(self, size=-1):
+                reads["n"] += 1
+                data = handle.read(size)
+                return data[: len(data) // 2] if reads["n"] == 1 else data
+
+            def __getattr__(self, item):
+                return getattr(handle, item)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return handle.__exit__(*exc)
+
+        return _ShrinkingReader()
+
+    ns = load_share_publisher({"open": shrinking_open})
+    reason, published = ns["_publish_share_no_replace"](L["preview"], L["share"], L["stage"])
+
+    assert published == 0
+    assert "wrong size" in reason, reason
     assert not os.path.exists(L["share"])
 
 
@@ -738,9 +851,26 @@ def test_a_failed_share_publication_leaves_the_render_successful(tmp_path):
     assert out["share"] == ""
 
 
-def test_an_exploding_publisher_cannot_reach_the_generic_render_handler(tmp_path):
-    """Defence in depth: even if the helper's own guarantee were broken, the post-commit
-    containment must stop a finished render being reported as an error."""
+def test_an_exploding_publisher_cannot_downgrade_the_committed_outcome(tmp_path):
+    """An IMPOSSIBLE breach of the helper's contract: what survives it, and what does not.
+
+    [FORK] Digital-Union (V1-B-S2, accepted review finding MINOR-5): this test was named
+    `..._cannot_reach_the_generic_render_handler`, which is false — a raising publisher **does**
+    reach `_process_video_impl`'s generic `except Exception`. Two different things were being
+    conflated, and only one of them holds:
+
+        the committed OUTCOME survives   -> RENDER_OUTCOME_KEY is already SUCCESS and the
+                                            handler's `is None` guard leaves it standing, so the
+                                            batch's continuation decision stays correct
+        the user-visible RESULT does not -> the function still returns (None, '❌ Error: ...'),
+                                            clearing gr.Video and showing an error panel for a
+                                            finished, promoted render
+
+    Both are asserted below, so the distinction cannot be lost again. None of this is reachable in
+    the shipped code: the helper's structural wrapper catches `Exception`, and *that* — not this
+    generic handler — is what delivers "never raises". This case only describes the blast radius
+    if the wrapper were ever removed.
+    """
     from test_delivery_preview import _run_impl
     import test_gui_guard_seam as seam
 
@@ -761,9 +891,17 @@ def test_an_exploding_publisher_cannot_reach_the_generic_render_handler(tmp_path
     finally:
         seam._impl_namespace = real_namespace
 
+    # what SURVIVES: the committed outcome and the durable master
     assert str(out["state"]["render_outcome_kind"]).endswith("SUCCESS"), \
         "a broken publisher downgraded a committed render"
     assert out["state"]["last_output_path"] == out["durable"]
+    assert os.path.isfile(out["durable"]), "the promoted master was lost"
+
+    # what DOES NOT: the panel and the video widget. Measured, not assumed -- this is precisely
+    # the cost the wrapper exists to prevent, and calling it "contained" would be wrong.
+    assert out["status"].startswith("❌"), \
+        "the generic handler is being credited with containing the user-visible result"
+    assert out["preview_path"] is None, "gr.Video would have kept the preview"
 
 
 def test_no_share_file_is_published_when_the_preview_failed(tmp_path):
@@ -786,9 +924,16 @@ def test_a_cancelled_render_publishes_no_share_file(tmp_path):
     assert str(out["state"]["render_outcome_kind"]).endswith("SUCCESS")
 
 
-def test_the_batch_cannot_see_a_share_failure(tmp_path):
-    """C3 derives continuation from LAST_OUTPUT_PATH_KEY + RENDER_OUTCOME_KEY only. A share
-    failure writes neither, so candidate 2 failing to publish cannot stop candidates 3-4."""
+def test_a_share_failure_writes_nothing_the_batch_reads(tmp_path):
+    """The SEAM half: three independent real renders with a failing publisher all keep SUCCESS.
+
+    [FORK] Digital-Union (V1-B-S2, accepted review finding MINOR-4): this was named
+    `test_the_batch_cannot_see_a_share_failure`, which claimed more than it executed — it calls
+    `_run_impl` three times and never constructs `render_selected_variants_guarded` at all. What
+    it genuinely establishes is the seam: what `_process_video_impl` writes into `session_state`
+    after a share failure, which is the only thing the batch reads. The batch WRAPPER is now
+    driven for real in `test_the_real_batch_continues_past_a_candidate_share_failure` below.
+    """
     from test_delivery_preview import _run_impl
     import test_gui_guard_seam as seam
 
@@ -822,6 +967,156 @@ def test_the_batch_cannot_see_a_share_failure(tmp_path):
         assert "SHARED_FATAL" not in str(kind)
 
 
+def test_the_real_batch_continues_past_a_candidate_share_failure(tmp_path):
+    """The WRAPPER half, executed rather than inferred (accepted review finding MINOR-4).
+
+    [FORK] Digital-Union (V1-B-S2): this drives the REAL `render_selected_variants_guarded` over
+    four selected candidates, and each candidate runs the REAL `_process_video_impl` — real master
+    promotion, real preview, real publisher — with the subordinate publication failing on
+    **candidate 2 only**. Nothing about the continuation policy is stubbed: the real
+    `RenderCandidateOutcome` is constructed with the real arguments the loop passes, so its
+    `__post_init__` invariant still runs and a contradiction would still raise out of here.
+
+    The production batch policy is untouched; this only measures it.
+    """
+    import test_render_failure_classification as rfc
+    import test_delivery_preview as dp
+    import test_gui_guard_seam as seam
+    import threading
+    import types
+    import uuid as _uuid
+
+    FAILING_CANDIDATE = 1                       # 0-based -> candidate 2
+    COUNT = 4
+    real_namespace = seam._impl_namespace
+    current = {"index": -1}
+    published = {}
+    run = rfc._BatchRun()
+    lifecycle_box = {}
+    per_candidate = {}
+
+    def namespace_for_current_candidate(*a, **k):
+        ns = real_namespace(*a, **k)
+        genuine = ns["_publish_share_no_replace"]
+
+        def routed(*pa, **pk):
+            if current["index"] == FAILING_CANDIDATE:
+                return ("simulated candidate-2 share failure", 0)
+            return genuine(*pa, **pk)
+
+        ns["_publish_share_no_replace"] = routed
+        return ns
+
+    class _Skip:
+        def __repr__(self):
+            return "<skip>"
+
+    def capturing_outcome(*args, **kwargs):
+        outcome = rfc.fork_render_batch.RenderCandidateOutcome(*args, **kwargs)
+        run.captured.append(outcome)
+        return outcome
+
+    def capturing_batch_outcome(*args, **kwargs):
+        run.batch_outcome = rfc.fork_render_batch.RenderBatchOutcome(*args, **kwargs)
+        return run.batch_outcome
+
+    def guarded_unlocked(*args, **kwargs):
+        index = len(run.order)
+        run.order.append(index)
+        session_state = args[24]
+
+        def stream():
+            current["index"] = index
+            seam._impl_namespace = namespace_for_current_candidate
+            try:
+                out = dp._run_impl(tmp_path / f"candidate{index}")
+            finally:
+                seam._impl_namespace = real_namespace
+            per_candidate[index] = out
+            published[index] = out["share"]
+            inner = out["state"]
+            # exactly the hand-off production performs: the batch reads these two keys and
+            # nothing else -- not the status prose, not the share path, not the preview.
+            session_state["render_outcome_kind"] = inner.get("render_outcome_kind")
+            session_state["last_output_path"] = inner.get("last_output_path", "")
+            session_state["audio_layers_report"] = ""
+            session_state["smart_mix_report"] = ""
+            yield (out["preview_path"], out["status"], session_state, "", "", "inv")
+
+        return stream()
+
+    def tracking_lifecycle(invocation_id):
+        assert "lifecycle" not in lifecycle_box, "a second RenderLifecycle for one batch"
+        lifecycle_box["lifecycle"] = rfc.fork_render_worker.RenderLifecycle(
+            invocation_id=invocation_id)
+        run.lifecycle = lifecycle_box["lifecycle"]
+        return lifecycle_box["lifecycle"]
+
+    namespace = {
+        "gr": types.SimpleNamespace(skip=_Skip),
+        "uuid": _uuid,
+        "threading": threading,
+        "fork_render_batch": types.SimpleNamespace(
+            RenderCandidateOutcome=capturing_outcome,
+            RenderBatchOutcome=capturing_batch_outcome,
+            build_request=rfc.fork_render_batch.build_request,
+        ),
+        "RenderLifecycle": tracking_lifecycle,
+        "RenderLifecycleState": rfc.fork_render_worker.RenderLifecycleState,
+        "RenderOutcomeKind": rfc.KIND,
+        "RenderCancelled": rfc.RenderCancelled,
+        "RENDER_OUTCOME_KEY": "render_outcome_kind",
+        "LAST_OUTPUT_PATH_KEY": "last_output_path",
+        "AUDIO_LAYERS_REPORT_KEY": "audio_layers_report",
+        "SMART_MIX_REPORT_KEY": "smart_mix_report",
+        "RENDER_BUSY_MESSAGE": "busy",
+        "_RENDER_LOCK": threading.Lock(),
+        "_install_active_render": lambda lifecycle: None,
+        "_clear_active_render": lambda invocation_id: None,
+        "_render_batch_request_tag": lambda: "T",
+        "_process_video_guarded_unlocked": guarded_unlocked,
+        "Iterator": None, "Tuple": None, "VideoFilesInput": None,
+    }
+    exec(compile(ast.Module(body=[rfc._gui_func("render_selected_variants_guarded")],
+                            type_ignores=[]), "<gui>", "exec"), namespace)  # noqa: S102
+
+    stream = namespace["render_selected_variants_guarded"](
+        rfc._root_92_batch(count=COUNT), list(range(COUNT)), "track.mp3", None, 2.0, 1.0, True, "",
+        rfc.fork_smart_mix.ROLE_ORDER,
+        "folder", "C:/src", False, None, "music_video", "h264", 30.0, {}, None)
+    for _ in stream:
+        pass
+
+    # every candidate was STARTED -- a measured call order, not inferred from a count
+    assert run.order == [0, 1, 2, 3], f"candidates attempted: {run.order}"
+    assert len(run.captured) == COUNT
+
+    for index, outcome in enumerate(run.captured):
+        kind = str(outcome.outcome_kind)
+        assert kind.endswith("SUCCESS"), f"candidate {index + 1} outcome was {kind}"
+        assert outcome.success is True, index
+        # a subordinate failure must never become one of the authoritative classes
+        for forbidden in ("CANDIDATE_LOCAL", "SHARED_FATAL", "UNKNOWN_FATAL", "CANCELLED"):
+            assert forbidden not in kind, f"candidate {index + 1} -> {kind}"
+        # the batch summary stays truthful: every master path is the real promoted file
+        assert outcome.durable_output_path == per_candidate[index]["durable"]
+        assert os.path.isfile(outcome.durable_output_path)
+
+    # candidate 2 published nothing; every other candidate did
+    assert published[FAILING_CANDIDATE] == "", "candidate 2 published a share file anyway"
+    for index in (0, 2, 3):
+        assert published[index].endswith("_share.mp4"), f"candidate {index + 1}: {published[index]}"
+    # and candidate 2's own panel says so, without reporting the render as an error
+    failing_status = per_candidate[FAILING_CANDIDATE]["status"]
+    assert "No permanent shareable MP4 was saved" in failing_status
+    assert not failing_status.startswith("❌")
+    assert "PLAYABLE PREVIEW" in failing_status
+
+    # the top-level event exhausted its selection under the authorized policy
+    assert run.lifecycle_state is rfc.fork_render_worker.RenderLifecycleState.FINISHED
+    assert run.batch_outcome.outcome_kind is None
+
+
 # ===========================================================================
 # PROTECTED CONSTANTS
 # ===========================================================================
@@ -841,13 +1136,20 @@ def test_the_protected_contract_constants_are_unchanged():
 
 
 def test_no_new_gui_output_wiring_was_added():
-    """S1 adds no download button, no new output component and no new state."""
+    """No download button, no new output component and no new state.
+
+    [FORK] Digital-Union (V1-B-S2): the `gr.DownloadButton` assertion used to read "S2's download
+    button leaked into S1". The product owner has since **rejected** a download control outright in
+    favour of Open Output Folder, so this is no longer a sequencing guard that S2 will one day
+    relax — it is permanent. See `tests/test_open_output_folder.py` for what S2 did add.
+    """
     source = _gui_source()
     tree = ast.parse(source)
     components = [ast.unparse(n.func) for n in ast.walk(tree)
                   if isinstance(n, ast.Call) and ast.unparse(n.func).startswith("gr.")]
 
-    assert components.count("gr.DownloadButton") == 0, "S2's download button leaked into S1"
+    assert components.count("gr.DownloadButton") == 0, \
+        "a download control was rejected by the product owner; it must not return"
     assert components.count("gr.Video") == 1
     assert "share_download" not in source
     assert "SHARE_OUTCOME_KEY" not in source, "a second outcome class was introduced"

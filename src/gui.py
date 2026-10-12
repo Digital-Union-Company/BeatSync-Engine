@@ -838,10 +838,20 @@ def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: st
     truncates an existing file, removes another invocation's staging artifact, or deletes an
     existing final share file.
 
-    **Verification re-reads the staged bytes** rather than trusting the digest accumulated while
-    writing. Trusting the in-flight digest would confirm only "what I hashed is what I hashed"; it
-    cannot detect a short or partial write. Size is checked first because it is the cheap, decisive
-    case.
+    **Verification re-reads the staged bytes and compares them to the bytes read during the copy.**
+    That is the exact scope of the claim, and stating it loosely as "matches the preview" was
+    imprecise. Re-reading is what detects a short or partial write -- trusting the digest
+    accumulated while writing would confirm only "what I hashed is what I hashed". What it does
+    **not** prove is equality with the source as it stands at publication time: a same-size
+    in-place mutation of the preview mid-copy would stage a torn read that still matches, and was
+    measured doing exactly that. A size-changing mutation IS caught, because the size check
+    compares against `source_bytes` sampled before the copy, and size is checked first because it
+    is the cheap, decisive case.
+
+    Source stability is supplied by the runtime rather than by this helper, which is why that
+    narrower claim is sufficient: the render lock serialises renders, `session_dir` is a
+    per-session `mkdtemp`, and the preview's FFmpeg child has exited and been reaped before
+    publication starts, so nothing in the app writes that file while it is being copied.
 
     **Atomicity is final-path visibility, not power-loss durability.** `os.rename` makes the
     complete file appear under its final name in one step, and on Windows refuses when the
@@ -854,9 +864,20 @@ def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: st
 
     **Containment is measured, not assumed.** The staging directory must be a real child of the
     final file's own directory by `realpath` + `commonpath` -- a string prefix test would accept
-    `output-evil/` for `output/`. Same volume is checked explicitly, reparse points (junctions,
-    symlinks) are refused rather than followed, and `errno.EXDEV` is still handled fail-closed even
-    though the layout should make it unreachable.
+    `output-evil/` for `output/`. Same volume is checked explicitly, and `errno.EXDEV` is still
+    handled fail-closed even though the layout should make it unreachable.
+
+    **Reparse points are resolved, and containment is then measured on the resolved location** --
+    they are NOT refused on sight, and the earlier wording that said so was wrong. `realpath` runs
+    first, so a junction or symlink is followed and `_is_reparse` below sees an already-resolved
+    path, which by construction is no longer a reparse point; it therefore fires only in the
+    residual case where `realpath` could not resolve and returned its input unchanged. Measured
+    against real Windows junctions: one escaping `output/` is refused by `commonpath`, one pointing
+    to another volume by the `splitdrive` check, and one resolving back inside `output/` is allowed
+    -- so containment holds in every case, which is the stronger property and the one that matters.
+    **Do not "harden" this by inspecting the unresolved paths instead.** An `output/` folder that is
+    itself a junction to a larger drive is a legitimate, measured-working configuration, and
+    refusing reparse points on sight would break it.
     """
     def _cancelled():
         return lifecycle is not None and lifecycle.cancel_requested()
@@ -964,7 +985,9 @@ def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: st
                             break
                         staged_digest.update(block)
                 if staged_digest.hexdigest() != written.hexdigest():
-                    failure = 'verification failed: the staged copy does not match the preview'
+                    # Names what was actually compared. The re-read detects a corrupt or short
+                    # write; it does not speak to a source mutated during the copy.
+                    failure = 'verification failed: the staged copy does not match the bytes copied'
         except OSError as exc:
             failure = f'verification failed ({exc})'
         except Exception as exc:
@@ -1501,8 +1524,15 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         #     `output/` path answers 403. So "move the preview into output/ and show that" is not a
         #     simpler alternative, it is broken -- and widening `allowed_paths` to fix it would
         #     expose the whole folder to every user of the app.
-        # The helper never raises, so this needs no try/except of its own; the post-commit
-        # containment below still covers it as defence in depth.
+        # The helper never raises, so this needs no try/except of its own. Be precise about what
+        # the generic handler below would and would not do if that guarantee were ever breached,
+        # because the two are not the same thing: `RENDER_OUTCOME_KEY` is already SUCCESS and its
+        # `is None` guard leaves it standing, so the committed outcome and the batch's
+        # continuation decision are safe -- but the function would still return
+        # `(None, '❌ Error: ...')`, clearing `gr.Video` and showing an error panel for a finished,
+        # promoted render. So the generic handler protects the OUTCOME, not the user-visible
+        # result. What makes the breach unreachable is the helper's own structural wrapper, and
+        # that is where the guarantee lives.
         share_path = ''
         share_bytes = 0
         share_failure = None
@@ -2953,6 +2983,65 @@ def _on_cancel_render_click(invocation_id: str) -> str:
     if _request_cancel_if_matching(invocation_id):
         return STATUS_CANCEL_REQUESTED
     return STATUS_CANCEL_NOTHING_ACTIVE
+
+
+def _on_open_output_folder_click() -> None:
+    """[FORK] Digital-Union (Deliverable Export V1-B-S2): the Open Output Folder button's ENTIRE
+    handler. Takes no input, writes no component, and returns nothing.
+
+    The product owner rejected a `gr.DownloadButton` in favour of this, and the rejection is
+    load-bearing rather than a style preference. A download control would have had to solve a
+    problem V1-B-S1 already measured: a raw `output/` path is served **403** by
+    `route_utils.file_fetch`, so making one work means either widening the served-path allowlist --
+    which exposes the whole folder to every user of the app -- or copying each video into
+    `GRADIO_TEMP_DIR`, i.e. a third copy of an artifact that is already durable on this very disk.
+    This button needs neither: the files are already where the user wants them.
+
+    **Zero inputs and zero outputs, both deliberate.** Nothing about which folder to open comes
+    from the screen, so there is nothing to pass in: the path is the one process-global directory
+    this installation renders into, resolved by the same helper the render path uses. It is
+    explicitly NOT derived from the durable-output key, the outcome key, the status textbox or the
+    video widget -- so the button works before the first render of a session, and a render in
+    flight cannot change where it points. No user-controlled text reaches the OS call, which is why
+    no quoting, escaping or shell involvement exists to get wrong.
+
+    Feedback is a Gradio toast (`gr.Info` / `gr.Warning`) precisely so the handler writes no
+    component: adding the status textbox to `outputs` would give it a second writer, and
+    `.claude/rules/gui-integration.md` pins its single writer as the render click. Opening a folder
+    must not be able to overwrite a render's result panel.
+
+    **`os.startfile`, not a child process.** It is the stdlib Windows shell verb, so this adds no
+    `run`/`Popen` site to a module whose count of two is pinned by test, and there is no
+    `explorer.exe` command line to assemble. `getattr` rather than a bare attribute access because
+    `os.startfile` exists only on Windows and the test suite runs on bare CPython anywhere.
+
+    **It never claims Explorer appeared.** `startfile` hands the path to the shell and returns as
+    soon as the request is accepted; a window could still fail to surface. The success toast
+    therefore says the request was made. Visual confirmation is a human step, recorded as such.
+    """
+    output_dir = get_output_dir()
+    # Windows-only by construction, same as the rest of the app -- but a *missing* attribute is a
+    # fact to report, not an exception to raise, because this runs inside a live Gradio event.
+    open_in_shell = getattr(os, 'startfile', None)
+    if open_in_shell is None:
+        gr.Warning(STATUS_OPEN_FOLDER_UNSUPPORTED.format(path=output_dir))
+        return
+    # Checked, never created. The directory is made by `paths.ensure_project_dirs()` at import and
+    # by the render itself; creating it here would make a read-only user action write to disk.
+    if not os.path.isdir(output_dir):
+        gr.Warning(STATUS_OPEN_FOLDER_MISSING.format(path=output_dir))
+        return
+    try:
+        open_in_shell(output_dir)
+    except OSError as exc:
+        gr.Warning(STATUS_OPEN_FOLDER_FAILED.format(path=output_dir, reason=exc))
+        return
+    except Exception as exc:
+        # Broad on purpose: an unhandled exception inside a Gradio event surfaces as a raw server
+        # error, and no shell-association failure justifies that for a button that changes nothing.
+        gr.Warning(STATUS_OPEN_FOLDER_FAILED.format(path=output_dir, reason=exc))
+        return
+    gr.Info(STATUS_OPEN_FOLDER_REQUESTED.format(path=output_dir))
 
 
 def process_video_guarded(audio_file: str,
@@ -4441,7 +4530,22 @@ def create_ui() -> gr.Blocks:
                 gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
                 video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
-                
+                # [FORK] Digital-Union (Deliverable Export V1-B-S2): directly below the preview,
+                # because the two answer the same question in sequence -- "did it work" then
+                # "where is it". `secondary`, because it is not an action on the render.
+                #
+                # Like `cancel_render_btn` and unlike `process_btn`, this is deliberately ALWAYS
+                # interactive: it is never gated by the source confirmation and never disabled
+                # while a render runs. The folder is a fixed property of the installation, so
+                # there is no state in which pointing at it would be wrong, and it is absent from
+                # `source_outputs` and `prep_outputs` so no source or preparation event can
+                # disable it.
+                open_output_folder_btn = gr.Button(
+                    LABEL_OPEN_OUTPUT_FOLDER, variant='secondary', size='sm',
+                    elem_id='open-output-folder-button',
+                )
+                gr.Markdown(INFO_OPEN_OUTPUT_FOLDER)
+
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.
         #
         # Every one of these events routes through beatsync_fork.input_session, so any source change
@@ -4788,6 +4892,23 @@ def create_ui() -> gr.Blocks:
             outputs=[status_output],
             show_progress='hidden',
             concurrency_id=CANCEL_CONCURRENCY_ID,
+        )
+
+        # [FORK] Digital-Union (Deliverable Export V1-B-S2): the Open Output Folder button.
+        #
+        # `inputs=[]` and `outputs=[]` are both EXACT and both the contract. Nothing from the
+        # screen decides which folder to open, and nothing on the screen is written: feedback is a
+        # toast raised inside the handler. Naming the status textbox here would make this a second
+        # writer of the render's result panel, which the GUI rules pin to exactly one.
+        #
+        # No `concurrency_id`: this is not a render and must never share the render lane, or it
+        # would queue uselessly behind the render it is most useful during. No `cancels=` either --
+        # a module-wide test forbids it.
+        open_output_folder_btn.click(
+            fn=_on_open_output_folder_click,
+            inputs=[],
+            outputs=[],
+            show_progress='hidden',
         )
 
         # [FORK] Digital-Union (P V1): media library preparation wiring.
