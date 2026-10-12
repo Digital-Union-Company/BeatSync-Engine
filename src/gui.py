@@ -79,6 +79,9 @@ import shutil
 import datetime
 # [FORK] Digital-Union (H1): `errno.EXDEV` tells a cross-volume promotion apart from a collision.
 import errno
+# [FORK] Digital-Union (Deliverable Export V1-B-S1): the subordinate share publication verifies its
+# staged copy by re-reading it, so it needs a digest. Stdlib only, like everything else here.
+import hashlib
 import multiprocessing
 import queue
 import re
@@ -770,6 +773,233 @@ def _promote_output_no_replace(temp_output: str, output_path: str):
     return '', None
 
 
+#: [FORK] Digital-Union (Deliverable Export V1-B-S1 / H1-b): the subordinate publication's staging
+#: directory name and copy chunk.
+#:
+#: Staging lives **inside** `output/` on purpose. The final step is therefore always a
+#: same-directory `os.rename`, which makes `errno.EXDEV` structurally impossible rather than merely
+#: unlikely -- the master promotion cannot have that property, because it must cross from
+#: `session_dir`, which is exactly why H1 needs an EXDEV branch and H1-b does not. The leading dot
+#: keeps it out of the way in a folder the user browses.
+SHARE_STAGING_DIR_NAME = '.beatsync-staging'
+SHARE_COPY_CHUNK_BYTES = 1 << 20
+
+
+def _publish_share_no_replace(preview_source: str, share_path: str, staging_dir: str,
+                              lifecycle=None):
+    """[FORK] Digital-Union (V1-B-S1 / H1-b): publish the SUBORDINATE durable shareable MP4.
+
+    Returns ``(failure_reason, published_bytes)`` -- ``('', n)`` on success. **It never raises**,
+    and this wrapper is what makes that true rather than merely intended.
+
+    The attempt below handles every failure it can *name*. This outer guard exists because
+    "never raises" cannot be delivered by naming causes one at a time: a first draft put
+    ``hashlib.sha256()`` one line above its ``try`` and a test that broke the digest backend
+    escaped the helper entirely. Since every caller sits after the master SUCCESS commit point, an
+    escape would report a finished, promoted render as ``❌ Error`` -- precisely the downgrade H1-b
+    forbids. So the contract is enforced structurally, and a staging file the attempt had already
+    created is still discarded on the way out.
+    """
+    created: List[str] = []
+    try:
+        return _publish_share_attempt(
+            preview_source, share_path, staging_dir, lifecycle, created)
+    except Exception as exc:
+        for path in created:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return f'the shareable MP4 could not be published ({exc})', 0
+
+
+def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: str,
+                           lifecycle, created: list):
+    """The publication itself. May raise; `_publish_share_no_replace` is the only caller and
+    contains everything. ``created`` collects the staging path this attempt exclusively made, so
+    the wrapper can clean it up if an unnamed failure unwinds past here.
+
+    This is deliberately **not** `_promote_output_no_replace` and must never become it. That helper
+    carries *authoritative* semantics -- its `CANDIDATE_LOCAL` / `SHARED_FATAL` / `UNKNOWN_FATAL`
+    classes feed `RenderCandidateOutcome` and batch continuation. A share failure must produce none
+    of those, so it returns a plain reason string and no outcome class at all. Routing both through
+    one helper with a policy flag is exactly the per-caller boolean that `refuse_existing_output`
+    was deleted for.
+
+    **No second transcode.** The bytes already exist: this copies the validated V1-A preview. Over
+    18 real renders a re-encode would buy nothing, and the preview is 5.5-9.2 % of the master
+    (measured), so the extra durable artifact is cheap.
+
+    **The staging file is attempt-unique and exclusively created** (`O_CREAT | O_EXCL`), not a
+    predictable `<name>.part`. A predictable name is a latent collision between two attempts at the
+    same share name -- the second would silently truncate the first's in-flight copy and could
+    publish interleaved bytes that still passed a digest check computed from its own writes. With
+    `O_EXCL` the loser of that race cannot even open the file. Nothing here ever uses `os.replace`,
+    truncates an existing file, removes another invocation's staging artifact, or deletes an
+    existing final share file.
+
+    **Verification re-reads the staged bytes** rather than trusting the digest accumulated while
+    writing. Trusting the in-flight digest would confirm only "what I hashed is what I hashed"; it
+    cannot detect a short or partial write. Size is checked first because it is the cheap, decisive
+    case.
+
+    **Atomicity is final-path visibility, not power-loss durability.** `os.rename` makes the
+    complete file appear under its final name in one step, and on Windows refuses when the
+    destination exists (`FileExistsError`, WinError 183) with both files intact -- that refusal *is*
+    the no-replace guarantee, and an early `exists()` check would only be an optimisation, never the
+    authority. `os.fsync` is called on the staged copy before the rename, but **that is not a claim
+    of crash consistency**: proving the published bytes survive power loss would need
+    filesystem-level durability testing that has not been done. What is guaranteed is weaker and
+    sufficient: a partial file never appears under the final name.
+
+    **Containment is measured, not assumed.** The staging directory must be a real child of the
+    final file's own directory by `realpath` + `commonpath` -- a string prefix test would accept
+    `output-evil/` for `output/`. Same volume is checked explicitly, reparse points (junctions,
+    symlinks) are refused rather than followed, and `errno.EXDEV` is still handled fail-closed even
+    though the layout should make it unreachable.
+    """
+    def _cancelled():
+        return lifecycle is not None and lifecycle.cancel_requested()
+
+    def _is_reparse(path):
+        try:
+            attrs = getattr(os.lstat(path), 'st_file_attributes', 0)
+        except OSError:
+            return False
+        # 0x400 == FILE_ATTRIBUTE_REPARSE_POINT. `st_file_attributes` is Windows-only, and the
+        # portable test suite runs on bare CPython elsewhere, so this degrades to the islink check.
+        return bool(attrs & 0x400) or os.path.islink(path)
+
+    def _discard_own_staging(path):
+        # Only ever the file THIS invocation exclusively created. Never another attempt's.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    if _cancelled():
+        return 'cancelled before publication started', 0
+
+    # H1-b: only ever derived from a validated preview. No preview, no share file.
+    try:
+        if not preview_source or not os.path.isfile(preview_source):
+            return 'the playable preview is missing', 0
+        source_bytes = os.path.getsize(preview_source)
+        if source_bytes == 0:
+            return 'the playable preview is empty', 0
+    except OSError as exc:
+        return f'the playable preview could not be read ({exc})', 0
+
+    final_dir = os.path.dirname(os.path.abspath(share_path))
+    try:
+        os.makedirs(staging_dir, exist_ok=True)
+        real_staging = os.path.realpath(staging_dir)
+        real_final = os.path.realpath(final_dir)
+    except OSError as exc:
+        return f'the staging directory is unavailable ({exc})', 0
+
+    if os.path.splitdrive(real_staging)[0].lower() != os.path.splitdrive(real_final)[0].lower():
+        return 'refused: staging and the output folder are on different volumes', 0
+    try:
+        if os.path.commonpath([real_staging, real_final]) != real_final:
+            return 'refused: the staging folder is not inside the output folder', 0
+    except ValueError:
+        return 'refused: the staging folder is not inside the output folder', 0
+    if _is_reparse(real_staging) or _is_reparse(real_final):
+        return 'refused: a junction or symlink is in the publication path', 0
+
+    staging_path = os.path.join(
+        staging_dir,
+        f'{os.path.basename(share_path)}.{os.getpid()}.{uuid.uuid4().hex[:12]}.part')
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+        handle = os.open(staging_path, flags, 0o600)
+    except FileExistsError:
+        return 'refused: the staging filename was already taken', 0
+    except OSError as exc:
+        if getattr(exc, 'errno', None) == errno.ENOSPC:
+            return 'not enough free disk space for the shareable MP4', 0
+        return f'the staging file could not be created ({exc})', 0
+    # From here on a staging file exists and is owned by THIS attempt, so the wrapper must be
+    # able to discard it if anything unnamed unwinds past the handlers below.
+    created.append(staging_path)
+
+    failure = ''
+    try:
+        written = hashlib.sha256()
+        with open(handle, 'wb', closefd=True) as staged:
+            with open(preview_source, 'rb') as src:
+                while True:
+                    # Bounded chunks so Stop is observable during the copy. This cannot interrupt a
+                    # read/write already blocked inside the OS -- it bounds the work between checks.
+                    if _cancelled():
+                        failure = 'cancelled during publication'
+                        break
+                    chunk = src.read(SHARE_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    staged.write(chunk)
+                    written.update(chunk)
+            if not failure:
+                staged.flush()
+                os.fsync(staged.fileno())
+    except OSError as exc:
+        if getattr(exc, 'errno', None) == errno.ENOSPC:
+            failure = 'not enough free disk space for the shareable MP4'
+        else:
+            failure = f'the shareable MP4 could not be written ({exc})'
+    except Exception as exc:
+        failure = f'the shareable MP4 could not be written ({exc})'
+
+    if not failure:
+        try:
+            if os.path.getsize(staging_path) != source_bytes:
+                failure = 'verification failed: the staged copy is the wrong size'
+            else:
+                staged_digest = hashlib.sha256()
+                with open(staging_path, 'rb') as fh:
+                    while True:
+                        block = fh.read(SHARE_COPY_CHUNK_BYTES)
+                        if not block:
+                            break
+                        staged_digest.update(block)
+                if staged_digest.hexdigest() != written.hexdigest():
+                    failure = 'verification failed: the staged copy does not match the preview'
+        except OSError as exc:
+            failure = f'verification failed ({exc})'
+        except Exception as exc:
+            failure = f'verification failed ({exc})'
+
+    # Last cancellation check, immediately before the one irreversible step.
+    if not failure and _cancelled():
+        failure = 'cancelled before publication'
+
+    if failure:
+        _discard_own_staging(staging_path)
+        return failure, 0
+
+    try:
+        os.rename(staging_path, share_path)
+    except FileExistsError:
+        _discard_own_staging(staging_path)
+        return (f'a file already exists at {share_path} and was preserved'), 0
+    except OSError as exc:
+        _discard_own_staging(staging_path)
+        if getattr(exc, 'errno', None) == errno.EXDEV:
+            return 'refused: staging and the output folder are on different volumes', 0
+        if getattr(exc, 'errno', None) == errno.ENOSPC:
+            return 'not enough free disk space for the shareable MP4', 0
+        return f'the shareable MP4 could not be published ({exc})', 0
+    except Exception as exc:
+        _discard_own_staging(staging_path)
+        return f'the shareable MP4 could not be published ({exc})', 0
+
+    try:
+        return '', os.path.getsize(share_path)
+    except OSError:
+        return '', source_bytes
+
+
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
                        custom_fps: float, creative: fork_creative.CreativeProfile | None,
@@ -1253,6 +1483,40 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # preview is simply never selected and is deliberately NOT deleted: `session_dir` already
         # legitimately retains non-promoted artifacts, and adding a destructive operation here to
         # tidy session scratch is not worth the surface.
+        #
+        # [FORK] Digital-Union (Deliverable Export V1-B-S1 / H1-b): the SUBORDINATE durable
+        # publication -- one permanent, browser-playable `<stem>_share.mp4` beside the master.
+        #
+        # H1 is unchanged and still owns the one AUTHORITATIVE promotion above. This is subordinate
+        # by construction, and every clause of that is load-bearing:
+        #   * it runs strictly after the SUCCESS commit point, and only when a VALIDATED preview
+        #     exists -- no preview, no share file, because the share file is a copy of the preview;
+        #   * it writes neither `RENDER_OUTCOME_KEY` nor `LAST_OUTPUT_PATH_KEY`, so the master stays
+        #     the sole success authority and the C3 batch's continuation policy cannot see this at
+        #     all -- a share failure on candidate 2 produces no outcome class and cannot stop
+        #     candidates 3-4;
+        #   * `preview_path` is NOT reassigned: `gr.Video` keeps the session preview, which is the
+        #     only location Gradio will serve. Measured against the live app: a path under
+        #     `GRADIO_TEMP_DIR` answers 206 with `video/mp4` and range support, while a raw
+        #     `output/` path answers 403. So "move the preview into output/ and show that" is not a
+        #     simpler alternative, it is broken -- and widening `allowed_paths` to fix it would
+        #     expose the whole folder to every user of the app.
+        # The helper never raises, so this needs no try/except of its own; the post-commit
+        # containment below still covers it as defence in depth.
+        share_path = ''
+        share_bytes = 0
+        share_failure = None
+        if preview_failure is None:
+            share_target = os.path.join(
+                output_folder, f"{name}_{timestamp}{creative.filename_suffix()}_share.mp4")
+            share_failure, share_bytes = _publish_share_no_replace(
+                preview_path, share_target,
+                os.path.join(output_folder, SHARE_STAGING_DIR_NAME),
+                lifecycle=lifecycle)
+            if not share_failure:
+                share_path = share_target
+            else:
+                share_bytes = 0
         _stage6_summary(console_logger, beat_info)
 
         # Generate status message based on mode
@@ -1340,6 +1604,28 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             f"   {output_path}",
             f"   {codec_info}, {audio_info} - {master_bytes / 1048576:.1f} MB",
         ]
+        # [FORK] Digital-Union (Deliverable Export V1-B-S1): three artifacts now, and exactly two of
+        # them are permanent. Naming them separately is the whole point -- the one thing the panel
+        # must never do is let the session-scoped preview read as a permanent download, or let a
+        # failed share publication read as a delivered one.
+        # Three states, deliberately distinguished rather than collapsed:
+        #   share_failure is None  -> never attempted, because the preview failed. The preview
+        #                             branch below already reports that; adding a second line
+        #                             would say the same thing twice.
+        #   share_failure == ''    -> published.
+        #   share_failure is text  -> attempted and refused/failed, with the reason.
+        if share_failure == '':
+            delivery_lines.extend([
+                "SHAREABLE MP4 (saved permanently):",
+                f"   {share_path}",
+                f"   H.264/AAC MP4 - {share_bytes / 1048576:.1f} MB",
+            ])
+        elif share_failure:
+            delivery_lines.extend([
+                f"⚠️  No permanent shareable MP4 was saved ({share_failure}).",
+                "   The high-quality master above is complete and unchanged, and the playable",
+                "   preview below still works for this session.",
+            ])
         if preview_failure is None:
             delivery_lines.extend([
                 "PLAYABLE PREVIEW (this session only - not a permanent download):",

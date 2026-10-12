@@ -46,7 +46,8 @@ Grep `except RenderCancelled` to enumerate the covered sites;
 `tests/test_render_cancellation.py` pins their **count per module** and their **handler order**, so a
 new broad catch cannot arrive without someone revisiting that number. Handlers may re-raise bare,
 store the exception to re-raise once quiescent, or translate it into a truthful typed status — and
-exactly one may **swallow** it, the post-commit ProRes preview (see below).
+exactly one may **swallow** it, the post-commit delivery preview (see below) — which covers all four
+processing modes, not only ProRes.
 
 ## BOUNDARY_ONLY_CANCEL
 
@@ -207,6 +208,17 @@ contract: after the commit point an uncaught timeout escapes into the generic ha
 finished, promoted render as an error, which is exactly the downgrade forbidden above. The exempt
 handler may touch neither `preview_path`, `RENDER_OUTCOME_KEY`, `LAST_OUTPUT_PATH_KEY` nor control
 flow, and a test pins all four.
+
+**V1-B-S1 added a second post-commit step and deliberately no second exemption.** The subordinate
+share publication (`_publish_share_no_replace`, contract in `.claude/rules/gui-integration.md`)
+runs after the preview and reports failure **by return value**, never by raising — so it needs no
+handler of its own and **must not grow one**. Exactly one `except RenderCancelled` may live after
+the commit point and it is still the preview's; a test asserts the share region contains no
+`except` at all and that the function's `RenderCancelled` handler count is unchanged. The publisher
+is wrapped in its own broad guard so that promise holds structurally rather than by inspection: an
+earlier draft constructed its digest one line above its `try`, and a test that broke the digest
+backend escaped the helper entirely — which, after the commit point, would have reported a
+finished, promoted render as `❌ Error`.
 
 ## Abandonment is not cancellation
 
