@@ -239,7 +239,7 @@ def test_the_builder_touches_no_clock_rng_or_environment():
 
 
 def _run_impl(tmp_path, *, preview_result="ok", lifecycle=None, mode="cpu",
-              runner=None, cancel_during_render=False):
+              runner=None, cancel_during_render=False, fixed_now=None, precreate=None):
     """Execute the REAL render body with a controllable preview subprocess.
 
     `preview_result` decides what the stubbed FFmpeg does: "ok" writes a non-empty file, "empty"
@@ -276,6 +276,16 @@ def _run_impl(tmp_path, *, preview_result="ok", lifecycle=None, mode="cpu",
     namespace["subprocess"] = _Subprocess
     namespace.update(load_delivery_builder())
     namespace["STATUS_RENDER_CANCELLED"] = "⏹️ cancelled"
+    if fixed_now is not None:
+        # Pin the render timestamp so the preview/share filenames are predictable, which is what
+        # makes a real collision test possible at all.
+        class _FixedDatetime:
+            class datetime:
+                @staticmethod
+                def now():
+                    return fixed_now
+
+        namespace["datetime"] = _FixedDatetime
     if runner is not None:
         namespace["run_cancellable_media_command"] = runner
     if cancel_during_render:
@@ -302,16 +312,30 @@ def _run_impl(tmp_path, *, preview_result="ok", lifecycle=None, mode="cpu",
     audio = write_file(str(tmp_path / "src" / "track.wav"), b"audio")
     clip = write_file(str(tmp_path / "src" / "a.mp4"), b"clip")
     state = {"session_dir": session_dir}
+    if precreate is not None:
+        # Pre-occupy a path the render is about to compute. Only meaningful together with
+        # `fixed_now`, which makes that path predictable.
+        with open(os.path.join(session_dir, precreate[0]), "wb") as handle:
+            handle.write(precreate[1])
 
     preview_path, status, state = namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
         processing_mode=mode, custom_fps=30.0, creative=None,
         session_state=state, lifecycle=lifecycle)
     out_dir = str(tmp_path / "output")
-    produced = sorted(os.listdir(out_dir))
+    # [FORK] Digital-Union (Deliverable Export V1-B-S1): `output/` now holds up to three entries --
+    # the master, the subordinate `_share.mp4`, and the `.beatsync-staging` directory. So each
+    # artifact is identified by what it IS rather than by sort position: the old `produced[0]`
+    # silently became `.beatsync-staging`, because a dot sorts first.
+    produced = sorted(f for f in os.listdir(out_dir)
+                      if os.path.isfile(os.path.join(out_dir, f)))
+    masters = [f for f in produced if not f.endswith("_share.mp4")]
+    shares = [f for f in produced if f.endswith("_share.mp4")]
     return {"preview_path": preview_path, "status": status, "state": state,
-            "attempts": attempts, "durable": os.path.join(out_dir, produced[0]),
-            "produced": produced, "session_dir": session_dir}
+            "attempts": attempts,
+            "durable": os.path.join(out_dir, masters[0]) if masters else "",
+            "share": os.path.join(out_dir, shares[0]) if shares else "",
+            "produced": produced, "out_dir": out_dir, "session_dir": session_dir}
 
 
 @pytest.mark.parametrize("mode,ext", [("cpu", ".mp4"), ("h264_nvenc", ".mp4"),
@@ -462,18 +486,41 @@ def test_the_lifecycle_path_uses_the_cancellable_runner_not_a_bare_subprocess(tm
 
 def test_an_existing_preview_artifact_is_never_overwritten(tmp_path):
     """The name carries the master's timestamp and seed suffix inside a per-session mkdtemp, so a
-    collision is near-impossible — and if it happens, refusing costs only the preview."""
-    first = _run_impl(tmp_path)
-    assert os.path.isfile(first["preview_path"])
-    before = open(first["preview_path"], "rb").read()
+    collision is near-impossible — and if it happens, refusing costs only the preview.
 
-    source = ast.parse(open(os.path.join(_SRC, "gui.py"), encoding="utf-8").read())
-    impl = next(n for n in ast.walk(source) if isinstance(n, ast.FunctionDef)
-                and n.name == "_process_video_impl")
-    body = ast.unparse(impl)
+    [FORK] Digital-Union (Deliverable Export V1-B-S1, deferred finding M1): this test used to be
+    **vacuous**. It rendered once with no collision, read the resulting preview's bytes, asserted
+    that a *source string* was present, then re-read the same bytes — nothing had happened in
+    between, so the byte comparison proved nothing and the collision branch was never entered.
+    Deleting the branch and keeping the message would have passed. It now pins the render clock,
+    pre-creates the exact path the render is about to compute, and measures what really happens.
+    """
+    import datetime as _dt
 
-    assert "a file already occupies the preview path" in body
-    assert open(first["preview_path"], "rb").read() == before
+    stamp = _dt.datetime(2026, 1, 2, 3, 4, 5)
+    guard = b"PRE-EXISTING-PREVIEW-BYTES"
+    occupied = "music_video_20260102_030405_preview.mp4"
+
+    out = _run_impl(tmp_path, fixed_now=stamp, precreate=(occupied, guard))
+    victim = os.path.join(out["session_dir"], occupied)
+
+    # the branch really fired: no FFmpeg child was started at all
+    assert out["attempts"] == [], "a preview child ran despite the path being occupied"
+    # the pre-existing bytes survived untouched
+    with open(victim, "rb") as handle:
+        assert handle.read() == guard, "the pre-existing preview was overwritten"
+    # the display path fell back to the durable master, and the master is intact
+    assert out["preview_path"] == out["durable"]
+    assert os.path.isfile(out["durable"])
+    # the render still succeeded and still names the master
+    assert str(out["state"]["render_outcome_kind"]).endswith("SUCCESS")
+    assert out["state"]["last_output_path"] == out["durable"]
+    # the panel says why, and never claims a preview or a share file exists
+    assert "a file already occupies the preview path" in out["status"]
+    assert "PLAYABLE PREVIEW" not in out["status"]
+    assert "SHAREABLE MP4" not in out["status"]
+    # and no share file was published, because there was no validated preview to copy
+    assert out["share"] == "", out["produced"]
 
 
 # ===========================================================================

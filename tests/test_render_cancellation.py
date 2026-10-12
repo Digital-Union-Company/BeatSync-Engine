@@ -1428,6 +1428,38 @@ def test_nothing_after_the_commit_point_can_downgrade_success():
         impl.index("preview_target = os.path.join(")
 
 
+def test_the_subordinate_share_publication_adds_no_swallow_site():
+    """[FORK] Digital-Union (V1-B-S1 / H1-b): the post-commit region grew a second step, and the
+    containment rule must cover it without adding a second place a cancellation may be swallowed.
+
+    The share publisher reports failure by RETURN VALUE and never raises, so the share region
+    needs no handler of its own -- and must not grow one. Exactly one `except RenderCancelled`
+    may live after the commit point, and it is still the preview's.
+    """
+    node = _func(_GUI, "_process_video_impl")
+    body = ast.unparse(node)
+    commit = body.index("session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS")
+
+    # the share region sits strictly after the commit point and after the preview
+    share_call = body.index("_publish_share_no_replace(")
+    assert commit < body.index("build_delivery_preview_command(") < share_call
+
+    # it touches none of the authoritative state, and does not redirect the display path
+    region = body[body.index("share_path = ''"):body.index("_stage6_summary(")]
+    for forbidden in ("RENDER_OUTCOME_KEY", "LAST_OUTPUT_PATH_KEY", "preview_path =",
+                      "RenderOutcomeKind", "return "):
+        assert forbidden not in region, f"{forbidden} in the share region:\n{region}"
+
+    # and it introduces no handler at all -- so the one swallow site is unchanged
+    assert "except" not in region, f"the share region grew an exception handler:\n{region}"
+    cancelled_handlers = [h for n in ast.walk(node) if isinstance(n, ast.Try)
+                          for h in n.handlers
+                          if h.type is not None and "RenderCancelled" in ast.unparse(h.type)]
+    assert len(cancelled_handlers) == 2, (
+        f"{len(cancelled_handlers)} RenderCancelled handlers; expected exactly two -- the "
+        f"function-level one and the single post-commit preview exemption")
+
+
 def test_a_cancellation_during_the_prores_preview_still_reports_success(tmp_path):
     """The frozen invariant, measured against the REAL `_process_video_impl`.
 

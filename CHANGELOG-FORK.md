@@ -20,6 +20,104 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-12 (Deliverable Export V1-B-S1: a permanent shareable MP4)
+
+**Every successful GUI render now also saves one permanent, browser-playable
+`output/<stem>_share.mp4` beside the high-quality master.** The master, its single no-replace
+promotion and the SUCCESS commit point are untouched; the session preview still feeds `gr.Video`
+and is still where it was. There is **no second transcode** — the share file is a verified copy of
+the V1-A preview.
+
+```
+HIGH-QUALITY MASTER   output/<stem>.<ext>               durable, authoritative, GUARANTEED
+SHAREABLE MP4         output/<stem>_share.mp4           durable, subordinate, best-effort   <- NEW
+PLAYABLE PREVIEW      <session_dir>/<stem>_preview.mp4  session-scoped, best-effort
+```
+
+**H1-b, the subordinate publication contract.** H1 still owns the one *authoritative* promotion.
+`_publish_share_no_replace()` is a **separate helper** and must never be merged into
+`_promote_output_no_replace()`: that one's `CANDIDATE_LOCAL`/`SHARED_FATAL`/`UNKNOWN_FATAL` classes
+feed `RenderCandidateOutcome` and batch continuation, and a share failure must produce none of
+them. It runs strictly after the commit point and only from a validated preview; it writes neither
+`RENDER_OUTCOME_KEY` nor `LAST_OUTPUT_PATH_KEY`; it never reassigns `preview_path`; and it never
+raises. A share failure is a delivery warning, never a render failure — so a batch's candidate 2
+failing to publish cannot stop candidates 3–4.
+
+**Why the preview is not simply moved into `output/`.** Measured against the running app:
+
+```
+GET /gradio_api/file=<GRADIO_TEMP_DIR>/…_preview.mp4  -> 206  video/mp4, Content-Range, ranges OK
+GET /gradio_api/file=<output>/…master.mp4             -> 403  Forbidden
+GET /gradio_api/file=<output>/…master.mov             -> 403  Forbidden
+```
+
+`route_utils.file_fetch` → `is_allowed_file` admits only `allowed_paths` plus Gradio's **created**
+paths (`[upload_dir, cache_folder]`), and `gui.py` sets `GRADIO_TEMP_DIR=input/gradio_uploads`. So
+"move the preview to `output/` and show that path" is not a simpler design, it is broken, and
+widening `allowed_paths` would expose the whole output folder to every user of the app. The preview
+stays put; the share file is an additional copy.
+
+**Publication mechanics, and why each choice.** Staging lives **inside** `output/.beatsync-staging/`,
+so the final step is always a same-directory `os.rename` and `errno.EXDEV` is structurally
+impossible (still handled fail-closed regardless). The staging file is **attempt-unique and
+exclusively created** (`O_CREAT | O_EXCL`) rather than a predictable `<name>.part`, which would be
+a latent collision in which a second attempt truncates the first's in-flight copy and could publish
+interleaved bytes that still matched its own write-time digest. Verification therefore
+**re-reads the staged bytes**: trusting the write-time digest confirms only what it hashed and
+cannot detect a short write. Containment is measured — `realpath` + `commonpath`, an explicit
+same-volume check, and reparse points refused — not a string-prefix test, which would accept
+`output-evil/` for `output/`. Cancellation is checked before the copy, between 1 MiB chunks, after
+verification and immediately before the rename; it cannot interrupt a read already blocked in the
+OS, only bound the work between checks.
+
+`os.fsync` runs before the rename, but **atomicity here means final-path visibility, not power-loss
+durability** — a partial file never appears under the final name. Crash consistency is not claimed;
+proving it would need filesystem-level durability testing that has not been done. An interrupted
+process may leave its own unique `*.part` behind; that is acceptable, must not block later
+attempts, and nothing may sweep that folder, because another invocation's `.part` may be in flight.
+
+**Real-media validation** (read-only copy of an existing A1 preview, isolated scratch):
+2,250,600 B published in **0.013 s**, `sha256 778fb8cd…` identical to the source, staging left
+empty, a second publication of the same name **refused** with the existing bytes intact, and the A1
+source byte-identical afterwards. Share size is **5.5 %** of a CPU master and **9.2 %** of a ProRes
+master (measured on the four A1 renders), so the extra durable artifact is cheap.
+
+**Deferred findings.** M1 — the preview-collision test was **vacuous** (it rendered with no
+collision, asserted a *source string*, then re-read bytes nothing had touched) and is now real: it
+pins the render clock, pre-creates the exact path, and measures that no FFmpeg child starts, the
+bytes survive, the display path falls back, SUCCESS is retained and the panel says why. It was
+mutation-checked — stubbing the production branch to `if False` makes it fail. M2 — the
+documentation no longer claims a fixed artifact count; one artifact is guaranteed and two are
+best-effort. M3 — the three stale "ProRes preview" references are corrected.
+**M4 (delivery progress) is `DEFERRED_BY_PRODUCT_OWNER`, not resolved.** It is not merely skipped:
+`video_processor` emits Stage 6's END before the preview begins and `EventKind.STATE` does not clear
+`finished` (only `START` does), so a "Delivery" STATE event on Stage 6 renders *nothing*. Faking it
+would have meant restarting Stage 6 — whose closing `end()` would overwrite the planner summary
+carrying the P1/P2 shot diagnostics — or inventing Stage 7. A test asserts the share region emits
+no progress event at all.
+
+**One defect found and fixed during implementation, by a test.** The helper's `hashlib.sha256()`
+construction originally sat one line above its `try`, so a broken digest backend escaped the helper
+— which, after the commit point, reports a finished, promoted render as `❌ Error`. "Never raises"
+is now enforced structurally by a wrapper around the whole attempt, and that wrapper still discards
+the staging file the attempt had created.
+
+No new download button, widget, slider, output key, state machine, progress stage or
+`subprocess.run` site (`gui.py` still has exactly two). The durable download control is V1-B-S2 and
+needs its own authorization.
+
+Tests: 5652 passed / 8 skipped / 5660 collected → **5704 passed / 8 skipped / 5712 collected**
+(+52, reconciled exactly: 51 new in `tests/test_delivery_share.py`, which exercises the **real**
+AST-extracted publisher under injected faults, plus one new post-commit containment guard in
+`tests/test_render_cancellation.py`; the M1 rewrite and the tightened promotion guard changed
+existing tests rather than adding any). The
+promotion guard was **tightened** from "exactly one `os.rename`" to an exact two-element list
+naming both renames by argument, so a third durable write fails the suite.
+
+Changed: `src/gui.py`, `tests/test_delivery_share.py` (new), `tests/test_delivery_preview.py`,
+`tests/test_gui_guard_seam.py`, `tests/test_render_cancellation.py`,
+`.claude/rules/gui-integration.md`, `.claude/rules/render-worker.md`.
+
 ### Fixed / Added — 2026-10-12 (Deliverable Export V1-A: a preview that actually plays)
 
 **Every successful GUI render now produces one browser-playable H.264/AAC MP4 preview, for all four

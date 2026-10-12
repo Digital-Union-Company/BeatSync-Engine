@@ -888,10 +888,24 @@ def test_the_final_promotion_is_one_owned_no_replace_helper():
     assert "shutil.move(" not in source, "shutil.move silently replaces; it must not return"
     assert "os.replace(" not in source, "os.replace silently replaces"
 
-    # nothing else renames into the output folder
+    # Exactly two renames exist in the module, and each is named explicitly.
+    #
+    # [FORK] Digital-Union (Deliverable Export V1-B-S1 / H1-b): this used to assert a single
+    # rename. It is now an exact two-element list rather than a relaxed membership test, because
+    # H1-b authorises one SUBORDINATE publication alongside H1's authoritative promotion -- and a
+    # third rename into `output/` would be a new durable artifact nobody reviewed. Both entries are
+    # pinned by their exact argument names, so a renamed variable fails this rather than sneaking a
+    # different source or destination past it.
     renames = [ast.unparse(n) for n in ast.walk(_gui_tree())
                if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.rename"]
-    assert renames == ["os.rename(temp_output, output_path)"], renames
+    assert renames == [
+        "os.rename(temp_output, output_path)",       # H1  : the authoritative master promotion
+        "os.rename(staging_path, share_path)",       # H1-b: the subordinate share publication
+    ], renames
+    # and the subordinate one publishes from staging, never from the session preview directly,
+    # so the preview `gr.Video` is serving can never be moved out from under it
+    assert "os.rename(preview_target, " not in _gui_source()
+    assert "os.rename(preview_path, " not in _gui_source()
 
     # a promotion failure returns a failure; it never falls through into the success path
     failure = next(n for n in ast.walk(_gui_func("_process_video_impl"))
@@ -1225,6 +1239,13 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
     from test_delivery_preview import load_delivery_builder
 
     load_delivery_builder(namespace)
+    # [FORK] Digital-Union (Deliverable Export V1-B-S1): likewise the REAL subordinate share
+    # publisher and its REAL constants, AST-extracted from `gui.py`. It is stdlib-only by design,
+    # so the genuine publication logic runs here -- a stub would let the no-replace, exclusive-
+    # create and checksum guarantees drift, and those are the whole contract.
+    from test_delivery_share import load_share_publisher
+
+    load_share_publisher(namespace)
     return namespace
 
 

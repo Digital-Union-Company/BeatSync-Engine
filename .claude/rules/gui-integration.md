@@ -71,7 +71,7 @@ automatically.
   `.claude/rules/variant-lab.md` (C3-R1A section).
 - **Diagnostics the batch reads rather than writes.** C3-R0 records each candidate's durable
   output in `session_state[LAST_OUTPUT_PATH_KEY]` — cleared before every attempt, set only after
-  the promotion into `output/` succeeds, and never the ProRes preview — and reads the two report
+  the promotion into `output/` succeeds, and never the delivery preview or the share file — and reads the two report
   keys after each candidate. It becomes a writer of **neither** report panel; the batch summary
   owns multi-render diagnostics so no panel can describe a candidate the user is not looking at.
 
@@ -196,13 +196,31 @@ automatically.
   a Director proposal is an absolute set of seven values, as valid now as when it was generated. So
   the proposal state survives an apply and may be re-applied. Do not conflate the two, and do not
   weaken Variant Lab's gate.
-- **Every successful render yields two artifacts, and only one of them is durable (Deliverable
-  Export V1-A).** The master is promoted exactly once, as above. The **delivery preview** is a
-  session-scoped `<stem>_preview.mp4` built by `ffmpeg_processing.build_delivery_preview_command`
-  and handed to `gr.Video`; it is generated for **all four** processing modes, strictly after the
-  SUCCESS commit point, and it is **never** promoted into `output/`. A durable shareable MP4 is
-  V1-B and requires its own authorization — nothing in the preview path may write to
-  `get_output_dir()`, rename, replace, move or delete anything.
+- **A successful render yields one guaranteed artifact and up to two best-effort ones (Deliverable
+  Export V1-A + V1-B-S1).** Only the **master** is guaranteed: it is promoted exactly once, as
+  above, and once that promotion returns success the render is SUCCESS no matter what follows. The
+  other two are attempted after the commit point and either may be absent:
+
+  ```
+  HIGH-QUALITY MASTER   output/<stem>.<ext>              durable, authoritative, GUARANTEED
+  SHAREABLE MP4         output/<stem>_share.mp4          durable, subordinate, best-effort
+  PLAYABLE PREVIEW      <session_dir>/<stem>_preview.mp4  session-scoped, best-effort
+  ```
+
+  Do not restate this as "every render produces three artifacts". A preview failure skips the
+  share file entirely (it is a copy of the preview), and a share failure leaves the preview
+  working — the panel must say which of the three actually exist.
+
+  The **delivery preview** is built by `ffmpeg_processing.build_delivery_preview_command` and
+  handed to `gr.Video`; it is generated for **all four** processing modes, strictly after the
+  SUCCESS commit point, and is **never** promoted into `output/`. It stays in `session_dir` under
+  `GRADIO_TEMP_DIR` and that location is load-bearing: **measured against the running app, a path
+  under `GRADIO_TEMP_DIR` is served `206` with `video/mp4` and range support, while a raw
+  `output/` path is served `403`** (`route_utils.file_fetch` → `is_allowed_file`, whose
+  `created_paths` is `[upload_dir, cache_folder]`). So moving the preview into `output/` and
+  handing `gr.Video` that path is not a simplification, it is broken — and widening
+  `allowed_paths` to make it work would expose the whole folder to every user of the app. Never do
+  either.
 
   Why it exists: every master muxes `pcm_s24le`, which lands in MP4 as `ipcm` (ISO/IEC 23003-5) and
   is not decodable by an ordinary browser, so the pre-V1-A non-ProRes path previewed a finished
@@ -219,10 +237,55 @@ automatically.
   says no shareable MP4 was produced — it must **never** claim the master is browser-playable. See
   `.claude/rules/render-worker.md` for the swallow exemption and why a `TimeoutExpired` is now
   caught.
+
+- **H1-b: the subordinate durable publication (Deliverable Export V1-B-S1).** H1 still owns the
+  **one authoritative** promotion. `_publish_share_no_replace()` adds **at most one subordinate**
+  durable artifact per render, and subordinate is a contract, not a description:
+
+  ```
+  runs strictly after the SUCCESS commit point, and only from a VALIDATED preview
+  writes neither RENDER_OUTCOME_KEY nor LAST_OUTPUT_PATH_KEY  -> invisible to batch continuation
+  never reassigns preview_path                                -> gr.Video keeps the servable file
+  never raises                                                -> an escape would downgrade SUCCESS
+  failure is a delivery warning, never a render outcome class
+  ```
+
+  It is **a separate helper and must never be merged into `_promote_output_no_replace`**. That one
+  carries authoritative semantics — its `CANDIDATE_LOCAL`/`SHARED_FATAL`/`UNKNOWN_FATAL` classes
+  feed `RenderCandidateOutcome` and continuation — and a share failure must produce none of them.
+  Routing both through one helper behind a policy flag is exactly the per-caller boolean that
+  `refuse_existing_output` was deleted for.
+
+  **No second transcode:** it copies the already-encoded preview (5.5–9.2 % of the master,
+  measured). Staging lives **inside** `output/.beatsync-staging/`, so the final step is always a
+  same-directory `os.rename` and `errno.EXDEV` is structurally impossible rather than merely
+  unlikely — `EXDEV` is still handled fail-closed anyway. The staging file is **attempt-unique and
+  exclusively created** (`O_CREAT | O_EXCL`), never a predictable `<name>.part`: a predictable
+  name is a latent collision in which the second attempt truncates the first's in-flight copy.
+  Containment is measured (`realpath` + `commonpath`, explicit same-volume check, reparse points
+  refused) rather than tested by string prefix, which would accept `output-evil/` for `output/`.
+  Verification **re-reads the staged bytes**; trusting the write-time digest would confirm only
+  what it hashed and could not detect a short write.
+
+  **Retention:** an interrupted process may leave its own unique `*.part` in the staging folder.
+  That is acceptable and must not block later attempts. Nothing may sweep that folder — not
+  `cleanup_on_startup`, not housekeeping — because another invocation's `.part` may be in flight;
+  each attempt discards only the file it exclusively created.
+
+  `os.fsync` is called before the rename, but **atomicity here means final-path visibility, not
+  power-loss durability**: a partial file never appears under the final name. Claiming crash
+  consistency would need filesystem-level durability testing that has not been done.
+
+  **Delivery progress is DEFERRED BY PRODUCT OWNER** for S1, and the deferral is deliberate rather
+  than an oversight. `video_processor` emits Stage 6's END before the preview begins, and
+  `EventKind.STATE` does not clear `finished` — only `START` does — so a "Delivery" STATE event on
+  Stage 6 renders **nothing at all**. Do not emit one to look busy, do not restart Stage 6 (its
+  closing `end()` would overwrite the planner summary carrying the P1/P2 shot diagnostics), and do
+  not invent Stage 7 without separate authorization.
 - **One new subprocess, bounded and windowless.** `_run_director_model` is one
   `subprocess.run(..., timeout=60, creationflags=CREATE_NO_WINDOW)` with stdout and stderr captured
   separately — `run` rather than `Popen` precisely so a timeout kills and reaps the child. `gui.py`
-  now has exactly two `subprocess.run` call sites (the pre-existing ProRes preview and this one),
+  now has exactly two `subprocess.run` call sites (the delivery preview encode and this one),
   pinned by test. It uses `llama-completion.exe` rather than `llama-cli.exe` on measured grounds;
   see `.claude/rules/director.md` before touching the argv.
 - **The Director owns its own read-outs.** `director_proposal` and `director_status` are written
