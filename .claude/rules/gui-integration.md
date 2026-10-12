@@ -324,12 +324,21 @@ automatically.
 
   `inputs=[]` and `outputs=[]` are both exact and both load-bearing. Nothing on the screen decides
   which folder to open, so there is nothing to pass in, and no user-controlled text reaches the OS
-  call — which is why there is no quoting or shell involvement to get wrong. Writing
-  `status_output` here would give that panel a second writer, which the invariant above forbids;
-  the toast exists precisely to avoid that. The button takes no `concurrency_id` (it is not a
-  render and must not queue behind one), is always interactive, and is absent from `source_outputs`
-  and `prep_outputs` — the folder is a fixed property of the installation, so no state makes
-  pointing at it wrong, and it works before the first render of a session.
+  call — which is why there is no quoting or shell involvement to get wrong. **The folder button
+  adds no new writer to `status_output`; feedback uses Gradio notifications.** That is the
+  invariant — not "the panel has one writer", which it does not: `process_btn.click`,
+  `render_selected_variants_btn.click` and `cancel_render_btn.click` all write it, and
+  `tests/test_open_output_folder.py` pins exactly that set. Writing `status_output` from the folder
+  button would make a **fourth** writer and let opening a folder overwrite a render's result panel;
+  the toast exists precisely to avoid that. (An earlier version of this bullet said "a second
+  writer, which the invariant above forbids" — wrong on both counts: the count, and the invariant,
+  which at *Diagnostic read-out panels* above governs the diagnostic panels rather than
+  `status_output`.)
+
+  The button takes no `concurrency_id` (it is not a render and must not queue behind one), is
+  always interactive, and is absent from `source_outputs` and `prep_outputs` — the folder is a
+  fixed property of the installation, so no state makes pointing at it wrong, and it works before
+  the first render of a session.
 
   Platform support is read with `getattr(os, 'startfile', None)` because that attribute is
   Windows-only and the suite runs on bare CPython anywhere; a missing directory is **reported, never
@@ -346,7 +355,10 @@ automatically.
 - **The Director owns its own read-outs.** `director_proposal` and `director_status` are written
   only by Director handlers, and no Director handler writes `variant_report`,
   `variant_batch_status`, `variant_batch_table`, `audio_layers_report`, `smart_mix_report`,
-  `render_batch_summary` or `status_output`. Their existing single writers are unchanged.
+  `render_batch_summary` or `status_output`. Their existing writer sets are unchanged — and "set"
+  is the accurate word: `status_output` has **three** writers (`process_btn.click`,
+  `render_selected_variants_btn.click`, `cancel_render_btn.click`), not one. Corrected 2026-10-13
+  under V1-B-S2-R2 (accepted review finding MINOR-B); no writer was added or removed.
 - **Freestyle's eleven widgets are render-request inputs with exactly one read-out between them
   (Freestyle V1).** The checkbox and the ten section dropdowns each register one `.change()`, and
   all eleven write **only** the read-only `freestyle_summary` textbox — never a slider, the Variation

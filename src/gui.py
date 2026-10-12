@@ -3006,9 +3006,13 @@ def _on_open_output_folder_click() -> None:
     no quoting, escaping or shell involvement exists to get wrong.
 
     Feedback is a Gradio toast (`gr.Info` / `gr.Warning`) precisely so the handler writes no
-    component: adding the status textbox to `outputs` would give it a second writer, and
-    `.claude/rules/gui-integration.md` pins its single writer as the render click. Opening a folder
-    must not be able to overwrite a render's result panel.
+    component. **The invariant is that this button adds NO new writer to `status_output`** -- not
+    that the panel has only one. It already has three, and naming the status textbox in `outputs`
+    here would make a fourth: `process_btn.click`, `render_selected_variants_btn.click` and
+    `cancel_render_btn.click` all write it, and `tests/test_open_output_folder.py` asserts exactly
+    that set. (An earlier version of this docstring claimed a single existing writer; that was
+    wrong, and the distinction matters because the real requirement is additive.) What the toast
+    buys is that opening a folder can never overwrite a render's result panel.
 
     **`os.startfile`, not a child process.** It is the stdlib Windows shell verb, so this adds no
     `run`/`Popen` site to a module whose count of two is pinned by test, and there is no
@@ -4898,8 +4902,9 @@ def create_ui() -> gr.Blocks:
         #
         # `inputs=[]` and `outputs=[]` are both EXACT and both the contract. Nothing from the
         # screen decides which folder to open, and nothing on the screen is written: feedback is a
-        # toast raised inside the handler. Naming the status textbox here would make this a second
-        # writer of the render's result panel, which the GUI rules pin to exactly one.
+        # toast raised inside the handler. `status_output` already has three writers -- the two
+        # render clicks and Cancel -- so naming it here would add a FOURTH, and the rule for this
+        # button is that it adds NONE. Opening a folder must not reach a render's result panel.
         #
         # No `concurrency_id`: this is not a render and must never share the render lane, or it
         # would queue uselessly behind the render it is most useful during. No `cancels=` either --

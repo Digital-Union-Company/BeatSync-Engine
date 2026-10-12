@@ -23,8 +23,18 @@ behaviour is preserved as the default.
 ### Added — 2026-10-12 (Deliverable Export V1-B-S2: Open Output Folder)
 
 **One secondary button below the video preview opens this installation's `output` folder in Windows
-File Explorer.** Both artifacts a finished render saves are already there — the high-quality master
-and the permanent `*_share.mp4` — so nothing is copied, transferred or re-encoded to reach them.
+File Explorer.** The folder holds the completed high-quality masters and any `*_share.mp4` files that
+were successfully saved — a finished render's master is guaranteed, the shareable copy beside it is
+best-effort — so nothing is copied, transferred or re-encoded to reach either of them.
+
+> Corrected 2026-10-13 under V1-B-S2-R2 (accepted review finding MINOR-A): this paragraph originally
+> read "Both artifacts a finished render saves are already there", which promises two permanent
+> artifacts unconditionally — and contradicted the conditional V1-B-S1 paragraph three paragraphs
+> below it, corrected in this same change. Two reachable SUCCESS paths save the master only: a
+> refused share publication, and a preview failure that skips publication entirely. The status panel
+> was already truthful in both; `src/ui_content.py`'s `INFO_OPEN_OUTPUT_FOLDER` carried the same
+> overclaim and is corrected with it. Wording only — no behaviour, notification, label or
+> publication change.
 
 **A download control was rejected by the product owner**, and the rejection is better than the
 feature it replaces. A `gr.DownloadButton` would have had to solve a problem V1-B-S1 already
@@ -47,12 +57,22 @@ gr.Info / gr.Warning             feedback is a toast, so `outputs` stays exactly
 `inputs=[]` and `outputs=[]` are both exact and both the contract. Nothing on the screen decides
 which folder to open, so there is nothing to pass in — and because no user-controlled text reaches
 the OS call, there is no quoting, escaping or shell involvement to get wrong. Feedback is a toast
-rather than a textbox write specifically so `status_output` keeps its single writer,
-`process_btn.click`: opening a folder must not be able to overwrite a render's result panel. The
-button takes no `concurrency_id` (it is not a render and must not queue behind one), is always
+rather than a textbox write specifically so **this button adds no new writer to `status_output`** —
+a panel that already has three, `process_btn.click`, `render_selected_variants_btn.click` and
+`cancel_render_btn.click`. Opening a folder must not be able to overwrite a render's result panel.
+The button takes no `concurrency_id` (it is not a render and must not queue behind one), is always
 interactive like Cancel rather than gated like Create Music Video, and is absent from
 `source_outputs` and `prep_outputs` — so it works before the first render of a session and no source
 or preparation event can disable it.
+
+> Corrected 2026-10-13 under V1-B-S2-R2 (accepted review finding MINOR-B): this paragraph originally
+> read "so `status_output` keeps its single writer, `process_btn.click`". That panel had **three**
+> writers before this change, not one — `tests/test_open_output_folder.py` asserts exactly that set,
+> and the live Gradio config shows the same three. The correct statement, and the only load-bearing
+> one, is that the folder button adds **no new** writer; "keeps its single writer" was both wrong and
+> the weaker claim. The same inaccuracy is corrected in `src/gui.py`'s handler docstring and
+> button-registration comment and in `.claude/rules/gui-integration.md`. The writer matrix itself,
+> and the `inputs=[]` / `outputs=[]` registration, are unchanged.
 
 **Three things it deliberately does not do.** It does not create the directory when missing — a
 read-only user action must not write to disk, so that case is *reported*. It does not guess a

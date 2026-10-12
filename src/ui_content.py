@@ -825,9 +825,11 @@ STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
 LABEL_OPEN_OUTPUT_FOLDER = "📂 Open Output Folder"
 INFO_OPEN_OUTPUT_FOLDER = (
     "Opens this BeatSync installation's `output` folder in Windows File Explorer, on the computer "
-    "running BeatSync. Both artifacts a finished render saves are there: the high-quality master "
-    "and the permanent shareable MP4. The folder opens whether or not you have rendered anything "
-    "yet, and this never starts, stops or changes a render."
+    "running BeatSync. It holds the completed high-quality masters and any shareable MP4 files "
+    "that were successfully saved: the master of a finished render is guaranteed, the shareable "
+    "copy beside it is best-effort, and that render's own status panel names whichever of the two "
+    "it actually wrote. The folder opens whether or not you have rendered anything yet, and this "
+    "never starts, stops or changes a render."
 )
 #: Deliberately **not** "Explorer opened". `os.startfile` hands the path to the Windows shell and
 #: returns immediately; it reports that the request was accepted, not that a window appeared. Only
