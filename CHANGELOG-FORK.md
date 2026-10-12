@@ -20,13 +20,94 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-12 (Deliverable Export V1-B-S2: Open Output Folder)
+
+**One secondary button below the video preview opens this installation's `output` folder in Windows
+File Explorer.** The folder holds the completed high-quality masters and any `*_share.mp4` files that
+were successfully saved — a finished render's master is guaranteed, the shareable copy beside it is
+best-effort — so nothing is copied, transferred or re-encoded to reach either of them.
+
+> Corrected 2026-10-13 under V1-B-S2-R2 (accepted review finding MINOR-A): this paragraph originally
+> read "Both artifacts a finished render saves are already there", which promises two permanent
+> artifacts unconditionally — and contradicted the conditional V1-B-S1 paragraph three paragraphs
+> below it, corrected in this same change. Two reachable SUCCESS paths save the master only: a
+> refused share publication, and a preview failure that skips publication entirely. The status panel
+> was already truthful in both; `src/ui_content.py`'s `INFO_OPEN_OUTPUT_FOLDER` carried the same
+> overclaim and is corrected with it. Wording only — no behaviour, notification, label or
+> publication change.
+
+**A download control was rejected by the product owner**, and the rejection is better than the
+feature it replaces. A `gr.DownloadButton` would have had to solve a problem V1-B-S1 already
+measured: a raw `output/` path is served **403** by `route_utils.file_fetch`, so making one work
+means either widening `allowed_paths` — exposing the whole output folder to every user of the app —
+or copying each video into `GRADIO_TEMP_DIR`, a third copy of a file that is already durable on the
+same disk. Opening the folder needs neither. There is no download button, no download endpoint, no
+browser file transfer, no `allowed_paths` change, no download cache, no duplicate video and no
+share-file state machine.
+
+```
+_on_open_output_folder_click()   zero parameters, returns None, writes no component
+path = get_output_dir()          the fixed process-global folder -- never LAST_OUTPUT_PATH_KEY,
+                                 never RENDER_OUTCOME_KEY, never the status text or the widget,
+                                 and never the "latest output filename"
+os.startfile                     the stdlib Windows shell verb, so NOT a new subprocess site
+gr.Info / gr.Warning             feedback is a toast, so `outputs` stays exactly []
+```
+
+`inputs=[]` and `outputs=[]` are both exact and both the contract. Nothing on the screen decides
+which folder to open, so there is nothing to pass in — and because no user-controlled text reaches
+the OS call, there is no quoting, escaping or shell involvement to get wrong. Feedback is a toast
+rather than a textbox write specifically so **this button adds no new writer to `status_output`** —
+a panel that already has three, `process_btn.click`, `render_selected_variants_btn.click` and
+`cancel_render_btn.click`. Opening a folder must not be able to overwrite a render's result panel.
+The button takes no `concurrency_id` (it is not a render and must not queue behind one), is always
+interactive like Cancel rather than gated like Create Music Video, and is absent from
+`source_outputs` and `prep_outputs` — so it works before the first render of a session and no source
+or preparation event can disable it.
+
+> Corrected 2026-10-13 under V1-B-S2-R2 (accepted review finding MINOR-B): this paragraph originally
+> read "so `status_output` keeps its single writer, `process_btn.click`". That panel had **three**
+> writers before this change, not one — `tests/test_open_output_folder.py` asserts exactly that set,
+> and the live Gradio config shows the same three. The correct statement, and the only load-bearing
+> one, is that the folder button adds **no new** writer; "keeps its single writer" was both wrong and
+> the weaker claim. The same inaccuracy is corrected in `src/gui.py`'s handler docstring and
+> button-registration comment and in `.claude/rules/gui-integration.md`. The writer matrix itself,
+> and the `inputs=[]` / `outputs=[]` registration, are unchanged.
+
+**Three things it deliberately does not do.** It does not create the directory when missing — a
+read-only user action must not write to disk, so that case is *reported*. It does not guess a
+filename or open a video; it opens the folder. And **it never claims Explorer appeared**:
+`os.startfile` returns as soon as the Windows shell accepts the path, so the success toast says the
+request was made. Visual confirmation is a human step and is recorded as pending, not asserted.
+
+This opens Explorer on the computer **running the BeatSync backend**, which for a loopback-only
+local app is the same computer the browser is on. That is intentional. No browser-side `file://`
+navigation, custom JavaScript or shell execution from a user-provided path was added, and the app
+stays loopback-only with `share=False`.
+
+Also in this change: the five accepted MINOR findings from the V1-B-S1 independent review, all
+wording or test accuracy with **no publication behaviour change** — see the corrections noted
+inline below and in `.claude/rules/gui-integration.md`. `M4 delivery progress` remains
+`DEFERRED_BY_PRODUCT_OWNER`; no Stage 7 was invented and Stage 6 and `ProgressView` are untouched.
+
+Changed: `src/gui.py`, `src/ui_content.py`, `tests/test_open_output_folder.py` (new),
+`tests/test_delivery_share.py`, `.claude/rules/gui-integration.md`, `CHANGELOG-FORK.md`.
+
 ### Added — 2026-10-12 (Deliverable Export V1-B-S1: a permanent shareable MP4)
 
-**Every successful GUI render now also saves one permanent, browser-playable
-`output/<stem>_share.mp4` beside the high-quality master.** The master, its single no-replace
-promotion and the SUCCESS commit point are untouched; the session preview still feeds `gr.Video`
-and is still where it was. There is **no second transcode** — the share file is a verified copy of
-the V1-A preview.
+**A successful GUI render now also attempts one permanent, browser-playable
+`output/<stem>_share.mp4` beside the high-quality master — best-effort, and not guaranteed.** It is
+published whenever the session preview was produced, because the share file is a copy of that
+preview: a preview failure skips it entirely, and a publication failure leaves the preview working.
+The panel names whichever artifacts actually exist and never implies a fixed count of three. The
+master, its single no-replace promotion and the SUCCESS commit point are untouched; the session
+preview still feeds `gr.Video` and is still where it was. There is **no second transcode** — the
+share file is a verified copy of the V1-A preview.
+
+> Corrected 2026-10-12 under V1-B-S2 (accepted review finding MINOR-1): this paragraph originally
+> opened "Every successful GUI render now also saves one permanent …", which stated unconditionally
+> what the implementation does best-effort, and contradicted both the table below it and
+> `.claude/rules/gui-integration.md`. Publication behaviour is unchanged.
 
 ```
 HIGH-QUALITY MASTER   output/<stem>.<ext>               durable, authoritative, GUARANTEED
@@ -63,12 +144,30 @@ impossible (still handled fail-closed regardless). The staging file is **attempt
 exclusively created** (`O_CREAT | O_EXCL`) rather than a predictable `<name>.part`, which would be
 a latent collision in which a second attempt truncates the first's in-flight copy and could publish
 interleaved bytes that still matched its own write-time digest. Verification therefore
-**re-reads the staged bytes**: trusting the write-time digest confirms only what it hashed and
-cannot detect a short write. Containment is measured — `realpath` + `commonpath`, an explicit
-same-volume check, and reparse points refused — not a string-prefix test, which would accept
-`output-evil/` for `output/`. Cancellation is checked before the copy, between 1 MiB chunks, after
-verification and immediately before the rename; it cannot interrupt a read already blocked in the
-OS, only bound the work between checks.
+**re-reads the staged bytes and compares them to the bytes read during the copy**: trusting the
+write-time digest confirms only what it hashed and cannot detect a short write. Containment is
+measured — `realpath` + `commonpath` plus an explicit same-volume check — not a string-prefix test,
+which would accept `output-evil/` for `output/`. Cancellation is checked before the copy, between
+1 MiB chunks, after verification and immediately before the rename; it cannot interrupt a read
+already blocked in the OS, only bound the work between checks.
+
+> Corrected 2026-10-12 under V1-B-S2, no behaviour change (accepted review findings MINOR-2 and
+> MINOR-3):
+>
+> * **Reparse points are resolved, not refused.** The original wording claimed junctions and
+>   symlinks were "refused"; `realpath` runs first, so they are *followed* and containment is then
+>   measured on the resolved location. Verified against real Windows junctions: one escaping
+>   `output/` is refused by `commonpath`, one on another volume by `splitdrive`, and one resolving
+>   back inside `output/` is allowed. Containment holds in every case — the stronger property. The
+>   attribute check survives only as a residual guard for paths `realpath` cannot resolve, and
+>   must **not** be moved onto the unresolved paths: an `output/` folder that is itself a junction
+>   to a larger drive is a legitimate configuration that was measured working and would break.
+> * **The digest check's scope is the bytes copied.** It detects a corrupt or short write. It does
+>   not prove equality with the source at publication time: a same-size in-place mutation mid-copy
+>   stages a torn read that still matches (measured), while a size-changing one is caught by the
+>   pre-copy size comparison. Source stability comes from the runtime — `_RENDER_LOCK` serialises
+>   renders, `session_dir` is a per-session `mkdtemp`, and the preview's FFmpeg child is reaped
+>   before publication begins. The failure message now reads "does not match the bytes copied".
 
 `os.fsync` runs before the rename, but **atomicity here means final-path visibility, not power-loss
 durability** — a partial file never appears under the final name. Crash consistency is not claimed;

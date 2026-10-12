@@ -262,10 +262,25 @@ automatically.
   unlikely — `EXDEV` is still handled fail-closed anyway. The staging file is **attempt-unique and
   exclusively created** (`O_CREAT | O_EXCL`), never a predictable `<name>.part`: a predictable
   name is a latent collision in which the second attempt truncates the first's in-flight copy.
-  Containment is measured (`realpath` + `commonpath`, explicit same-volume check, reparse points
-  refused) rather than tested by string prefix, which would accept `output-evil/` for `output/`.
-  Verification **re-reads the staged bytes**; trusting the write-time digest would confirm only
-  what it hashed and could not detect a short write.
+  Containment is measured (`realpath` + `commonpath` plus an explicit same-volume check) rather
+  than tested by string prefix, which would accept `output-evil/` for `output/`.
+
+  **Reparse points are resolved and containment is measured on the resolved location — they are
+  not refused on sight.** `realpath` runs before `_is_reparse`, so a junction or symlink is
+  followed and the attribute check sees an already-resolved path; it fires only in the residual
+  case where `realpath` could not resolve. Measured against real Windows junctions: one escaping
+  `output/` is refused by `commonpath`, one on another volume by `splitdrive`, and one resolving
+  back inside `output/` is allowed — containment holds in every case. **Never change this to
+  inspect the unresolved paths:** an `output/` that is itself a junction to a larger drive is a
+  legitimate, measured-working setup, and refusing reparse points on sight would break it.
+
+  Verification **re-reads the staged bytes and compares them to the bytes read during the copy** —
+  that is the exact scope. It detects a corrupt or short write, which trusting the write-time
+  digest could not. It does **not** prove equality with the source at publication time: a
+  same-size in-place mutation mid-copy stages a torn read that still matches (measured), while a
+  size-changing one is caught by the pre-copy size comparison. Source stability comes from the
+  runtime instead — `_RENDER_LOCK` serialises renders, `session_dir` is a per-session `mkdtemp`,
+  and the preview's FFmpeg child is reaped before publication starts.
 
   **Retention:** an interrupted process may leave its own unique `*.part` in the staging folder.
   That is acceptable and must not block later attempts. Nothing may sweep that folder — not
@@ -276,12 +291,61 @@ automatically.
   power-loss durability**: a partial file never appears under the final name. Claiming crash
   consistency would need filesystem-level durability testing that has not been done.
 
+  **A breach of "never raises" would cost the panel, not the outcome.** If the helper ever did
+  raise, `_process_video_impl`'s generic `except Exception` leaves the already-written SUCCESS
+  standing (its `is None` guard does not overwrite), so the committed outcome and batch
+  continuation stay correct — but the function returns `(None, '❌ Error: …')`, clearing `gr.Video`
+  and showing an error for a finished, promoted render. The generic handler protects the
+  **outcome**, not the user-visible result; the helper's structural wrapper is what makes the
+  breach unreachable. Do not describe the two as interchangeable.
+
   **Delivery progress is DEFERRED BY PRODUCT OWNER** for S1, and the deferral is deliberate rather
   than an oversight. `video_processor` emits Stage 6's END before the preview begins, and
   `EventKind.STATE` does not clear `finished` — only `START` does — so a "Delivery" STATE event on
   Stage 6 renders **nothing at all**. Do not emit one to look busy, do not restart Stage 6 (its
   closing `end()` would overwrite the planner summary carrying the P1/P2 shot diagnostics), and do
   not invent Stage 7 without separate authorization.
+- **S2 is Open Output Folder, and a download control was REJECTED (Deliverable Export V1-B-S2).**
+  The product owner replaced the planned `gr.DownloadButton` with one button that opens the local
+  output folder. Do **not** reintroduce a download button, a download endpoint, a browser file
+  transfer, a widened `allowed_paths`, a download cache, a duplicate video or a share-file state
+  machine. The rejection rests on the same measurement as the preview's location: a raw `output/`
+  path is served **403**, so a download control would need either a wider `allowed_paths` — which
+  exposes the whole folder to every user — or a third copy of an artifact that is already durable
+  on that disk.
+
+  ```
+  _on_open_output_folder_click()   zero parameters, returns None, writes no component
+  path = get_output_dir()          the fixed process-global folder, never LAST_OUTPUT_PATH_KEY,
+                                   never RENDER_OUTCOME_KEY, never the status text or the widget
+  os.startfile                     stdlib Windows shell verb -- NOT a subprocess site
+  gr.Info / gr.Warning             feedback is a toast, so `outputs` stays exactly []
+  ```
+
+  `inputs=[]` and `outputs=[]` are both exact and both load-bearing. Nothing on the screen decides
+  which folder to open, so there is nothing to pass in, and no user-controlled text reaches the OS
+  call — which is why there is no quoting or shell involvement to get wrong. **The folder button
+  adds no new writer to `status_output`; feedback uses Gradio notifications.** That is the
+  invariant — not "the panel has one writer", which it does not: `process_btn.click`,
+  `render_selected_variants_btn.click` and `cancel_render_btn.click` all write it, and
+  `tests/test_open_output_folder.py` pins exactly that set. Writing `status_output` from the folder
+  button would make a **fourth** writer and let opening a folder overwrite a render's result panel;
+  the toast exists precisely to avoid that. (An earlier version of this bullet said "a second
+  writer, which the invariant above forbids" — wrong on both counts: the count, and the invariant,
+  which at *Diagnostic read-out panels* above governs the diagnostic panels rather than
+  `status_output`.)
+
+  The button takes no `concurrency_id` (it is not a render and must not queue behind one), is
+  always interactive, and is absent from `source_outputs` and `prep_outputs` — the folder is a
+  fixed property of the installation, so no state makes pointing at it wrong, and it works before
+  the first render of a session.
+
+  Platform support is read with `getattr(os, 'startfile', None)` because that attribute is
+  Windows-only and the suite runs on bare CPython anywhere; a missing directory is **reported, never
+  created**, since a read-only user action must not write to disk. **The success message says the
+  request was made, not that Explorer appeared** — `startfile` returns as soon as the shell accepts
+  the path, so visual confirmation is a human step and must be recorded as one, never asserted.
+
 - **One new subprocess, bounded and windowless.** `_run_director_model` is one
   `subprocess.run(..., timeout=60, creationflags=CREATE_NO_WINDOW)` with stdout and stderr captured
   separately — `run` rather than `Popen` precisely so a timeout kills and reaps the child. `gui.py`
@@ -291,7 +355,10 @@ automatically.
 - **The Director owns its own read-outs.** `director_proposal` and `director_status` are written
   only by Director handlers, and no Director handler writes `variant_report`,
   `variant_batch_status`, `variant_batch_table`, `audio_layers_report`, `smart_mix_report`,
-  `render_batch_summary` or `status_output`. Their existing single writers are unchanged.
+  `render_batch_summary` or `status_output`. Their existing writer sets are unchanged — and "set"
+  is the accurate word: `status_output` has **three** writers (`process_btn.click`,
+  `render_selected_variants_btn.click`, `cancel_render_btn.click`), not one. Corrected 2026-10-13
+  under V1-B-S2-R2 (accepted review finding MINOR-B); no writer was added or removed.
 - **Freestyle's eleven widgets are render-request inputs with exactly one read-out between them
   (Freestyle V1).** The checkbox and the ten section dropdowns each register one `.change()`, and
   all eleven write **only** the read-only `freestyle_summary` textbox — never a slider, the Variation

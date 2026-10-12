@@ -816,6 +816,39 @@ STATUS_CANCEL_REQUESTED = (
 )
 STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
 
+# [FORK] Digital-Union (Deliverable Export V1-B-S2): open the output folder.
+#
+# The product owner rejected a browser download in favour of this. The distinction the copy has to
+# carry is that this opens Explorer on the machine **running** BeatSync, which for a local
+# loopback-only app is the same machine the browser is on — but saying "your" folder without
+# qualification would be a lie if the page were ever opened from another device.
+LABEL_OPEN_OUTPUT_FOLDER = "📂 Open Output Folder"
+INFO_OPEN_OUTPUT_FOLDER = (
+    "Opens this BeatSync installation's `output` folder in Windows File Explorer, on the computer "
+    "running BeatSync. It holds the completed high-quality masters and any shareable MP4 files "
+    "that were successfully saved: the master of a finished render is guaranteed, the shareable "
+    "copy beside it is best-effort, and that render's own status panel names whichever of the two "
+    "it actually wrote. The folder opens whether or not you have rendered anything yet, and this "
+    "never starts, stops or changes a render."
+)
+#: Deliberately **not** "Explorer opened". `os.startfile` hands the path to the Windows shell and
+#: returns immediately; it reports that the request was accepted, not that a window appeared. Only
+#: a human looking at the desktop can confirm the latter, so the copy promises exactly what was
+#: measured and no more.
+STATUS_OPEN_FOLDER_REQUESTED = "📂 Asked Windows to open the output folder: {path}"
+STATUS_OPEN_FOLDER_MISSING = (
+    "The output folder does not exist yet: {path}. It is created when BeatSync starts and when a "
+    "render saves its first file — nothing was created or changed just now."
+)
+STATUS_OPEN_FOLDER_UNSUPPORTED = (
+    "Opening a folder is a Windows-only action and this system does not support it. The output "
+    "folder is still {path}."
+)
+STATUS_OPEN_FOLDER_FAILED = (
+    "Windows could not open the output folder {path} ({reason}). Nothing was created, moved or "
+    "deleted, and any finished render is still saved there."
+)
+
 #: The status one cancelled render attempt reports. Deliberately **neutral about candidates**: the
 #: pipeline function that emits it (`gui._process_video_impl`) is shared by an ordinary Create Music
 #: Video click, which has no candidates at all, and by one candidate of a C3 batch. Naming a
