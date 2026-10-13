@@ -931,6 +931,46 @@ LABEL_PREP_SCAN = "🔍 Scan Library"
 LABEL_PREP_ANALYZE = "⚙️ Analyze New / Changed"
 LABEL_PREP_REPORT = "📋 Preparation Status"
 
+# ----------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+# ----------------------------------------------------------------------------
+# Deliberately worded so that a metadata read can never be mistaken for a decode guarantee. The
+# button says "Verify Sources", not "Check for corruption": it reads container headers, and a file
+# with an intact header and a shredded middle passes. The report repeats that limit in full.
+LABEL_PREP_VERIFY = "🩺 Verify Sources"
+LABEL_PREP_VERIFY_REPORT = "🩺 Source Verification (read-only)"
+INFO_PREP_VERIFY = (
+    "Read-only check of the library folder above. It answers two separate questions quickly: which "
+    "sources still have a reusable analysis cache, and which have basic media problems. It reads "
+    "metadata only — it does not decode every frame, so it cannot prove a video is fully intact. "
+    "Nothing is analyzed, cached, repaired, re-rendered or modified."
+)
+PREP_VERIFY_INITIAL_TEXT = (
+    "Press Verify Sources to check the library folder above.\n"
+    "Read-only: no analysis, no cache changes, no rendering, no file modification."
+)
+#: Shown when the folder or the subfolder setting changes. The previous report described a
+#: different library snapshot, so it is cleared rather than left on screen looking current.
+PREP_VERIFY_STALE_TEXT = (
+    "The library folder or subfolder setting changed; the previous verification no longer applies.\n"
+    "Press Verify Sources again to check the current folder."
+)
+PREP_VERIFY_NO_FOLDER_TEXT = (
+    "No library folder selected. Enter a folder path above, then press Verify Sources."
+)
+#: Verification and rendering both hammer the same source drive, so they are mutually exclusive.
+#: This is the refusal the operator sees; it never cancels or disturbs the running render.
+PREP_VERIFY_RENDER_BUSY_TEXT = (
+    "⏳ A render is running. Source verification reads the same drive the render is reading from, "
+    "so it will not start while a render is active — that competition is what made clip extraction "
+    "time out in the first place. Wait for the render to finish, then press Verify Sources again."
+)
+#: The mirror image: shown by the render path when verification holds the shared mutex.
+VERIFY_BUSY_MESSAGE = (
+    "⏳ Source verification is running. It reads the same drive a render reads from, so renders "
+    "wait for it — it is bounded and read-only. Try again once it finishes."
+)
+
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
     """GPU status info."""
     if gpu_available and nvenc_available:

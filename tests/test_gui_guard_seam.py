@@ -452,11 +452,23 @@ def test_a_busy_renderer_refuses_without_touching_anything():
         # yields `gr.skip()` for the video so the previous preview survives
         wrapper = _gui_body("process_video_guarded")
         assert "if not _RENDER_LOCK.acquire(blocking=False):" in wrapper
-        assert "RENDER_BUSY_MESSAGE" in wrapper
+        # MEDIA-VERIFY-S2-A: the refusal now yields `_busy_message()` rather than the constant
+        # directly, because read-only source verification can also hold this mutex and the message
+        # must name the real holder. The chain to the original constant is asserted below rather
+        # than assumed, so this is a stronger check than the previous substring match, not a
+        # weaker one: the wrapper must call the helper, AND the helper must still fall back to
+        # RENDER_BUSY_MESSAGE when nothing else holds the lock.
+        assert "_busy_message()" in wrapper
         assert "gr.skip()" in wrapper
         batch = _gui_body("render_selected_variants_guarded")
         assert "if not _RENDER_LOCK.acquire(blocking=False):" in batch
-        assert "RENDER_BUSY_MESSAGE" in batch
+        assert "_busy_message()" in batch
+
+        helper = _gui_body("_busy_message")
+        assert "RENDER_BUSY_MESSAGE" in helper, \
+            "the default refusal must still be the render-busy message"
+        assert "VERIFY_BUSY_MESSAGE" in helper
+        assert "_verification_running" in helper
     finally:
         gui_lock.release()
 

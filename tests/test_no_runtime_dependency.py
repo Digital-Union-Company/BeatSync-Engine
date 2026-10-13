@@ -128,6 +128,11 @@ def test_fork_modules_import_only_stdlib():
         "threading",
         "time",
         "collections",
+        # `concurrent` arrived with MEDIA-VERIFY-S2-A: `media_verify` runs its bounded FFprobe
+        # probes through `concurrent.futures.ThreadPoolExecutor`, with the probe itself injected so
+        # the module needs no runtime import to be tested. Still stdlib, still no runtime
+        # dependency -- the same standard every other name on this list meets.
+        "concurrent",
         "dataclasses",
         "enum",
         "math",

@@ -2966,3 +2966,63 @@ def test_m_the_stage5_side_learned_no_consumer_vocabulary():
                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         for speculative in ("director", "proposal", "master_seed", "freestyle"):
             assert not any(speculative in name for name in defined), (path, speculative)
+
+
+# -- MEDIA-VERIFY-S2-A: the verification action must not disturb preparation ------------
+#
+# Every check below goes through `_body_code`, not `ast.unparse`: these ban tokens, and the
+# production docstrings legitimately explain which of those tokens the code deliberately does NOT
+# use. Stripping docstrings is what makes the assertion about code rather than about prose.
+
+def test_m_verification_does_not_join_the_preparation_state_machine():
+    """A Verify click must not be able to move the Scan/Analyze state machine."""
+    gui_tree = _tree(_GUI)
+    for fn_name in ("_verify_sources_impl", "_on_verify_sources_click", "_on_verify_invalidate"):
+        body = _body_code(_func(gui_tree, fn_name))
+        for forbidden in ("prep_state", "record_scan", "record_failure", "set_folder",
+                          "set_recursive", "set_batch_size", "record_analysis_complete",
+                          "_prep_ui_updates", "_prep_busy_updates", "_run_prep_in_worker"):
+            assert forbidden not in body, f"{fn_name} touches preparation state via {forbidden}"
+
+
+def test_m_verification_reads_no_cache_record_itself():
+    """The classifier's single `_load_cache` stays the one authorized record-read point."""
+    body = _body_code(_func(_tree(_GUI), "_verify_sources_impl"))
+    for forbidden in ("_load_cache", "_cache_path", "_video_signature", "json.load",
+                      "_cache_entry_is_complete", "_bounded_fingerprint"):
+        assert forbidden not in body, f"_verify_sources_impl reaches {forbidden} directly"
+    assert "classify_library_sources" in body, \
+        "the cache question must go through the existing classifier"
+
+
+def test_m_verification_reuses_the_preparation_qwen_runtime_resolution():
+    """One resolution rule, not a second one that could drift from Stage 5's."""
+    body = _body_code(_func(_tree(_GUI), "_verify_sources_impl"))
+    assert "_resolve_prep_qwen_runtime()" in body
+    for forbidden in ("DEFAULT_QWEN_MODEL_DIR", "enable_qwen_semantics", "BEATSYNC_DISABLE_QWEN"):
+        assert forbidden not in body, f"_verify_sources_impl re-derives {forbidden}"
+
+
+def test_m_verification_does_not_change_the_analyze_batch_selection():
+    """Analyze's bound and its submitted subset are untouched by verification."""
+    gui_tree = _tree(_GUI)
+    verify = _body_code(_func(gui_tree, "_verify_sources_impl"))
+    for forbidden in ("batch_size", "normalize_batch_size", "DEFAULT_ANALYZE_BATCH_SIZE",
+                      "needs_analysis_paths"):
+        assert forbidden not in verify, f"verification touches the Analyze batch via {forbidden}"
+    analyze = _body_code(_func(gui_tree, "_prep_analyze_impl"))
+    for forbidden in ("verify_media_health", "probe_media_metadata", "fork_media_verify"):
+        assert forbidden not in analyze, f"_prep_analyze_impl now runs verification ({forbidden})"
+
+
+def test_m_verification_does_not_touch_the_director_media_summary():
+    """`_eligible_media_summary` remains the AI Director's only media authority."""
+    gui_tree = _tree(_GUI)
+    verify = _body_code(_func(gui_tree, "_verify_sources_impl"))
+    for forbidden in ("_eligible_media_summary", "media_summary_from_source_counts",
+                      "PreparedMediaSummary", "director_proposal_state", "fork_director"):
+        assert forbidden not in verify, f"verification reaches the Director via {forbidden}"
+    summary = _body_code(_func(gui_tree, "_eligible_media_summary"))
+    for forbidden in ("verify_media_health", "MediaStatus", "fork_media_verify",
+                      "probe_media_metadata"):
+        assert forbidden not in summary, f"the Director summary now consults {forbidden}"

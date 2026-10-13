@@ -20,6 +20,101 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-14 (MEDIA-VERIFY-S2-A: Verify Sources — read-only cache and media health)
+
+**A new "Verify Sources" button in the Media Library Preparation accordion answers two questions
+about the library folder without touching anything.** The owner sometimes overwrites previously
+analysed video files; until now the only way to find out what that cost was to start a preparation
+run and watch Qwen re-analyse, or to start a render and watch it fail. Verification answers it from
+cache records and container headers instead.
+
+The two questions are reported **separately**, because they are independent properties — an
+overwritten file is perfectly readable *and* has no reusable cache:
+
+* **CACHE VERIFICATION** — sources classified, reusable (`PREPARED`), new-or-changed,
+  incomplete/invalid record, identity unavailable, plus the exact problem paths. This goes through
+  the existing `video_analysis.classify_library_sources()`; there is no new cache key, no second
+  completion rule, no record written and no Qwen worker launched.
+* **MEDIA HEALTH** — one bounded FFprobe metadata read per source, reporting
+  `MEDIA_METADATA_OK` / `MEDIA_UNREADABLE` / `MEDIA_NO_VIDEO_STREAM` / `MEDIA_INVALID_METADATA` /
+  `MEDIA_PROBE_TIMEOUT` / `MEDIA_CHANGED_DURING_CHECK` / `MEDIA_NOT_CHECKED`, plus the exact problem
+  paths. These are report labels only; none is a cache-generation token.
+
+Four honesty boundaries are the substance of this change, not decoration:
+
+* **A metadata read is never sold as a decode guarantee.** Every report carries "Metadata readable —
+  full video decoding not verified." FFprobe parses headers; it does not decode frames. The D0
+  failure that motivated this milestone (a truncated MP4 with no `moov` atom) *is* caught, but a
+  file with an intact header and a shredded middle is not. A test forbids the words "intact", "no
+  corruption" and "fully verified" from appearing in any report.
+* **A probe timeout is not a corruption verdict.** A mechanical drive under concurrent load times
+  out for reasons unrelated to the file's bytes, so a timeout reports *unverified* and says so.
+* **A skipped source is never a successful one.** The overall work budget stops *scheduling*;
+  everything unreached becomes `MEDIA_NOT_CHECKED` with its own reason and the run is labelled
+  `PARTIAL / INCOMPLETE`.
+* **An unprovable Qwen backend identity is `UNVERIFIABLE`, not a damaged cache.** No per-source
+  cache verdict can exist in that state, so none is invented — printing "0 reusable" would be a
+  fabricated verdict.
+
+**Bounded by construction.** At most four concurrent FFprobe children (D0 measured 1.50 s → 0.59 s
+at four workers on a 41-file sample of the owner's mechanical source drive; beyond four a 5400-RPM
+spindle seeks rather than reads), submitted through a sliding window so a 2,000-source library never
+queues 2,000 work items, a 20 s per-file timeout, a 600 s overall budget, and every started child
+reaped before anything is reported. D0's ~30 s full-library extrapolation was never measured on the
+whole library and is **not** restated as a guarantee; the committed benchmark measures harness
+overhead (~0.05 ms/source) on synthetic fixtures with a stub probe.
+
+**Render exclusion reuses the existing mutex rather than adding a second one.** Verification and
+rendering read the same drive, and D0 traced clip-extraction timeouts to exactly that contention, so
+`_on_verify_sources_click` takes the process-global `_RENDER_LOCK` non-blockingly: Verify refuses
+while a render runs, and a render refuses while Verify runs — the latter needed no change to the
+render path, because it already refuses when the lock is held and does not care who holds it. One
+`acquire(blocking=False)` is the test and the acquisition in one indivisible step, where
+`if not lock.locked(): start()` would have been a check-then-act race, and a second lock would have
+had to be ordered against the first. The release is in a `finally`, so an exception or an abandoned
+request cannot leave the app permanently refusing renders. A running render is never signalled,
+throttled or terminated. Nothing — no lock, thread, process handle or cancellation object — is
+stored in `gr.State`.
+
+Verification is deliberately **not** serialized against the preparation Scan/Analyze buttons: those
+are the operator's own long-running clicks in the same accordion, and overlapping a bounded
+read-only probe sweep with one costs disk throughput only, unlike a render with a hard per-clip
+timeout.
+
+A source that changes while it is being probed is `MEDIA_CHANGED_DURING_CHECK` **whatever the probe
+said, including a clean read** — the bytes FFprobe described are not the bytes now on disk. Nothing
+is deleted, rebuilt or re-analysed in response. The `(size, mtime_ns)` bracket detects an overwrite
+and is not presented as proof of whole-file byte identity, exactly as Stage-5's bounded fingerprint
+is not.
+
+The report writes to one dedicated textbox and nothing else — not `status_output`, `video_output`,
+`process_btn`, `source_state`, `render_invocation_state`, `director_proposal_state`,
+`variant_batch_state`, the render-outcome state, `prep_outputs` or any element of `source_outputs`.
+Changing the folder or the subfolder setting clears the report through its own `change` listeners,
+leaving the preparation state machine untouched; the report header always names the folder, the
+recursive setting and the verification time so it cannot be mistaken for a different snapshot. No
+persistent report file is produced.
+
+Unchanged: Stage-5 prompt and semantics, cache filenames and payloads, backend identity, completion
+rules, audio analysis, Stage-4 cut selection, Stage-6 source selection and scoring, creative controls
+and presets, AI Director, Variant Lab, the S1 render failure diagnostics, render cancellation, master
+no-replace promotion, share/preview publication, the 120 s extraction timeout, the zero retry count
+and the FFmpeg argv. `src/video_analysis.py` and `src/video_processor.py` were not modified at all.
+All five protected contract constants are verified unchanged by test:
+`stage5_cache_v3`, `auto_av_analysis_v8_llama_vulkan_batched`, `stage5_job_partial_v1`,
+`_CACHE_IDENTITY_WORKER_CAP = 16`, `DEFAULT_ANALYZE_BATCH_SIZE = 100`.
+
+Out of scope here, by design: full-file decoding, targeted multi-window decode, automatic cache
+repair or invalidation, automatic render retry, and any Stage-6 change.
+
+Tests: 5905 passed, 8 skipped (5913 collected), from the 5806/8/5814 merged-main baseline — exactly
++99: 94 new cases in `tests/test_media_verify.py` (381 → 386 in `tests/test_library_preparation.py`
+accounts for the other 5), skips unchanged.
+`tests/test_no_runtime_dependency.py`'s stdlib allowlist gained `concurrent` (still stdlib, still no
+runtime dependency) and `tests/test_gui_guard_seam.py`'s busy-refusal check now also pins
+`_busy_message()`'s fallback to `RENDER_BUSY_MESSAGE` — a stronger assertion than the substring it
+replaced, not a weaker one.
+
 ### Changed — 2026-10-13 (MEDIA-VERIFY-S1: a failed clip names the source it was reading)
 
 **A failed FFmpeg extraction now reports which source video failed, and where in it.** Before this

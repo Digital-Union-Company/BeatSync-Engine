@@ -317,6 +317,8 @@ DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'qwen3-4b-instruct-2507
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
 # only wires it to widgets and supplies the runtime calls it must not make itself.
 from beatsync_fork import library_prep as fork_prep
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification (stdlib-only fork module).
+from beatsync_fork import media_verify as fork_media_verify
 from beatsync_fork.library_prep import initial_state as initial_prep_state
 from beatsync_fork.input_manager import InputScanError, scan_folder as scan_library_folder
 
@@ -2912,6 +2914,63 @@ RENDER_BUSY_MESSAGE = (
 )
 
 # ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): render <-> verification exclusion.
+# ---------------------------------------------------------------------------
+#
+# Source verification issues up to four concurrent FFprobe reads against the same mechanical drive
+# a render extracts clips from. D0 established that exactly this kind of contention is what made
+# clip extraction exceed its 120 s bound (four NVENC workers against a 5400-RPM source disk), so
+# the two must never run together.
+#
+# **The mutex is reused, not duplicated.** `_RENDER_LOCK` is already a plain non-reentrant
+# `threading.Lock`, acquired non-blockingly at exactly two sites and released in `finally`. Taking
+# that same lock for verification yields bidirectional exclusion from one atomic test-and-set in
+# each direction, with no second lock to order against it and therefore no deadlock to reason
+# about:
+#
+#   * Verify while a render runs  -> `acquire(blocking=False)` fails -> verification refuses.
+#   * Render while Verify runs    -> the EXISTING `acquire(blocking=False)` fails -> render refuses.
+#
+# The second direction needed no change to the render path at all; it already refuses when the lock
+# is held, and it does not care who holds it. That is the whole reason this is a reused mutex rather
+# than a new flag: `if not lock.locked(): start_work()` is a check-then-act race, and a second lock
+# would have to be ordered against the first. One `acquire(blocking=False)` is the test and the
+# acquisition in a single indivisible step.
+#
+# Nothing is stored in `gr.State`: no lock, no thread, no process handle, no cancellation object.
+# The only cross-request state is the small boolean below, and it exists purely so the refusal
+# message can name the real reason.
+#
+# Deliberately NOT extended to the preparation Scan/Analyze buttons. Those are the operator's own
+# long-running maintenance workflow in the same accordion; serializing them against verification
+# would be new behaviour for existing controls, and any new serialization must stay narrow.
+# Verification is bounded and read-only, so overlapping it with a Scan costs disk
+# throughput and nothing else -- unlike a render, which has a hard per-clip timeout that contention
+# can actually break.
+_VERIFY_FLAG_LOCK = threading.Lock()
+_verification_running = False
+
+
+def _mark_verification(active: bool) -> None:
+    """Publish whether the shared mutex is currently held by verification.
+
+    Called immediately after acquiring `_RENDER_LOCK` and immediately before releasing it, so a
+    reader that has just FAILED to acquire sees the correct holder. The one-statement window
+    between the two acquisitions can only mislabel a refusal message, never admit a second worker:
+    the mutex, not this flag, is the exclusion.
+    """
+    global _verification_running
+    with _VERIFY_FLAG_LOCK:
+        _verification_running = bool(active)
+
+
+def _busy_message() -> str:
+    """The accurate refusal for a caller that just failed to take `_RENDER_LOCK`."""
+    with _VERIFY_FLAG_LOCK:
+        running = _verification_running
+    return VERIFY_BUSY_MESSAGE if running else RENDER_BUSY_MESSAGE
+
+# ---------------------------------------------------------------------------
 # [FORK] Digital-Union (C3-R1A): the capacity-one active-render slot.
 # ---------------------------------------------------------------------------
 #
@@ -3096,7 +3155,10 @@ def process_video_guarded(audio_file: str,
     is never execution authority.
     """
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip(), ''
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the refusal is unchanged -- only its wording is
+        # now accurate about WHO holds the mutex, since read-only source verification can also hold
+        # it. The gate itself is the same single non-blocking acquire.
+        yield gr.skip(), _busy_message(), session_state, gr.skip(), gr.skip(), ''
         return
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for this whole render event, constructed and
     # installed here, before any expensive work -- the mutex-owning wrapper owns
@@ -3220,7 +3282,10 @@ def render_selected_variants_guarded(
         return
 
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE, ''
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): same accurate wording as the single-render
+        # wrapper; the gate is the unchanged single non-blocking acquire.
+        _busy = _busy_message()
+        yield gr.skip(), _busy, session_state, _busy, ''
         return
 
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- every selected candidate
@@ -3745,6 +3810,131 @@ def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tu
             event_callback=event_callback, console_logger=console_logger),
         state,
     )
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+# ---------------------------------------------------------------------------
+
+def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
+    """Answer the two verification questions for the folder the widgets declare RIGHT NOW.
+
+    Returns the report text and nothing else. It takes no `gr.State` and returns no state, by
+    design: verification is a pure read of the disk, it owns no session state, and giving it one
+    would be a second persistence layer for media-health results that nothing needs.
+
+    Why the LIVE widget values rather than `prep_state`
+    ---------------------------------------------------
+    Gradio delivers widget changes as separate queued events, so a user can retype the folder and
+    click Verify before the `change` handler has run. Reusing the recorded scan would then verify
+    the *previous* library while the screen declared a different one -- the same hazard the render
+    gate and `_prep_analyze_impl` already take live widget values to avoid. This enumerates the
+    folder itself, with the existing scanner and the live recursive flag, rather than trusting any
+    prior scan.
+
+    What it deliberately does NOT do
+    --------------------------------
+    No Qwen worker is launched (the classifier answers the cache question from records alone), no
+    analysis runs, no cache record is written, checkpointed or deleted, no media is modified, and
+    nothing is rendered. It writes no file at all -- the report lives in one textbox, because a
+    persistent report artifact is a later, separately reviewed milestone.
+    """
+    from ffmpeg_processing import probe_media_metadata
+    from video_analysis import classify_library_sources
+
+    folder = (folder_path or "").strip()
+    recursive = bool(recursive)
+    verified_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not folder:
+        return PREP_VERIFY_NO_FOLDER_TEXT
+
+    # 1. Enumerate the live folder with the existing scanner. `detect_duplicates=False` matches
+    #    `_prep_scan_impl`: duplicate grouping is a source-screen reporting feature and would be
+    #    pure extra reads here.
+    scan_started = time.perf_counter()
+    try:
+        input_set = scan_library_folder(folder, recursive=recursive, detect_duplicates=False)
+    except (InputScanError, OSError) as exc:
+        return (f"SOURCE VERIFICATION FAILED\n  Folder: {folder}\n"
+                f"  Include subfolders: {'yes' if recursive else 'no'}\n"
+                f"  Verified at: {verified_at}\n\n{exc}")
+    folder_scan_seconds = time.perf_counter() - scan_started
+    sources = [media.path for media in input_set.files]
+
+    # 2. The cache question, through the EXISTING Stage-5 classifier. No new key formula, no new
+    #    completion rule, and the same Qwen enablement/model resolution the preparation workflow
+    #    uses -- `_resolve_prep_qwen_runtime` is shared, not reimplemented.
+    cache_started = time.perf_counter()
+    qwen_enabled, model_path = _resolve_prep_qwen_runtime()
+    classification = classify_library_sources(
+        sources, enable_ai=qwen_enabled, qwen_model_path=model_path)
+    cache_seconds = time.perf_counter() - cache_started
+
+    # An unprovable backend identity means no per-source cache verdict can EXIST. It is reported as
+    # UNVERIFIABLE, never as evidence that the cache is damaged -- the classifier returns empty
+    # counts in that state, and presenting them as "0 reusable" would be a fabricated verdict.
+    unverifiable = ""
+    if classification.get("ai_cache_disabled"):
+        unverifiable = ("The Qwen backend identity could not be verified, so Stage-5 cache records "
+                        "cannot be looked up for this library.")
+
+    # 3. The media question. Independent of the cache answer, and bounded: at most four probe
+    #    workers, a per-file timeout, and an overall budget after which unreached sources are
+    #    reported as not checked rather than quietly omitted.
+    run = fork_media_verify.verify_media_health(sources, probe_media_metadata)
+
+    return fork_media_verify.format_verification_report(
+        folder=folder, recursive=recursive, verified_at=verified_at,
+        source_count=len(sources),
+        cache=classification,
+        cache_classifications=classification.get("classifications") or (),
+        run=run,
+        folder_scan_seconds=folder_scan_seconds,
+        cache_seconds=cache_seconds,
+        cache_unverifiable_reason=unverifiable,
+    )
+
+
+def _on_verify_sources_click(folder_path: str, recursive: bool) -> str:
+    """The Verify Sources click: take the shared render mutex, or refuse immediately.
+
+    One non-blocking `acquire` is both the test and the acquisition, so there is no window in which
+    a render could start alongside an accepted verification -- and none in which this could start
+    alongside a render. A render that arrives while this holds the lock hits the EXISTING
+    non-blocking acquire in `process_video_guarded` / the batch wrapper and refuses; nothing in the
+    render path needed a new check.
+
+    The release is in `finally`, so an exception, an early return or an abandoned request cannot
+    leave the application permanently refusing renders. A running render is never signalled,
+    throttled or terminated to make room for this.
+    """
+    if not _RENDER_LOCK.acquire(blocking=False):
+        return PREP_VERIFY_RENDER_BUSY_TEXT
+    _mark_verification(True)
+    try:
+        return _verify_sources_impl(folder_path, recursive)
+    except Exception as exc:
+        # Total: a verification that raised must report, not vanish behind Gradio's generic error
+        # and not leave the operator unable to tell whether anything ran.
+        import traceback
+        traceback.print_exc()
+        return (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
+                f"No analysis, cache change, media change or render was performed.")
+    finally:
+        # Cleared BEFORE the release, so a caller that fails the acquire a moment later attributes
+        # the mutex to whoever actually holds it next.
+        _mark_verification(False)
+        _RENDER_LOCK.release()
+
+
+def _on_verify_invalidate() -> str:
+    """Clear the verification report when the folder or recursive setting changes.
+
+    A separate listener rather than an addition to `prep_outputs`: the preparation state machine is
+    untouched by verification and must stay that way, so this writes ONLY the verification textbox
+    and shares no outputs with the preparation events.
+    """
+    return PREP_VERIFY_STALE_TEXT
 
 
 def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
@@ -4530,6 +4720,31 @@ def create_ui() -> gr.Blocks:
                         initial_prep_state().notice, elem_id='prep-status'
                     )
 
+                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+                    # Inside this accordion because it asks about the same library folder, and
+                    # below Analyze because it is the "did my files change / are they still OK"
+                    # question you ask around a preparation run rather than part of one.
+                    #
+                    # Like the rest of this section it is absent from `source_outputs` and from
+                    # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
+                    # move the preparation state machine. It is also ALWAYS interactive -- the
+                    # render mutex, not a disabled button, is what prevents it running during a
+                    # render, because a button's interactivity is per-session UX while the mutex is
+                    # process-global truth.
+                    gr.Markdown(INFO_PREP_VERIFY)
+                    prep_verify_btn = gr.Button(
+                        LABEL_PREP_VERIFY, variant='secondary',
+                        elem_id='prep-verify-button',
+                    )
+                    prep_verify_report = gr.Textbox(
+                        label=LABEL_PREP_VERIFY_REPORT,
+                        value=PREP_VERIFY_INITIAL_TEXT,
+                        interactive=False,
+                        lines=12,
+                        max_lines=24,
+                        elem_id='prep-verify-report-box',
+                    )
+
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
@@ -4963,6 +5178,47 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_folder, prep_recursive, prep_batch_size, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
+        )
+
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+        #
+        # Note what is absent from `inputs`: `prep_state`. Verification owns no session state and
+        # reads no recorded scan -- its inputs are exactly the two LIVE widgets that define "which
+        # library did you mean", so a queued `change` event can never make it verify the previous
+        # folder.
+        #
+        # Note what is absent from `outputs`: everything except its own report box. Not
+        # `status_output`, `video_output`, `process_btn`, `source_state`,
+        # `render_invocation_state`, `director_proposal_state`, `variant_batch_state`, the render
+        # outcome state, `prep_outputs` or any element of `source_outputs`. A verification click
+        # therefore cannot enable a render, disable one, move the preparation state machine or
+        # overwrite a render's status line.
+        #
+        # It joins RENDER_CONCURRENCY_ID with `concurrency_limit=1`: the shared `_RENDER_LOCK` is
+        # the authority (and the only thing the regression tests rely on), but queuing verification
+        # in the same cooperative lane as the renders means a user who clicks both usually gets
+        # them in sequence rather than one refusal.
+        prep_verify_btn.click(
+            fn=_on_verify_sources_click,
+            inputs=[prep_folder, prep_recursive],
+            outputs=[prep_verify_report],
+            show_progress='hidden',
+            concurrency_id=RENDER_CONCURRENCY_ID,
+            concurrency_limit=1,
+        )
+        # Separate `change` listeners rather than entries in `prep_outputs`: a changed folder makes
+        # the old verification describe a different library snapshot, so it is visibly cleared --
+        # but the preparation state machine's own folder/recursive handling is left exactly as it
+        # was, sharing no outputs with these.
+        prep_folder.change(
+            fn=_on_verify_invalidate,
+            inputs=None,
+            outputs=[prep_verify_report],
+        )
+        prep_recursive.change(
+            fn=_on_verify_invalidate,
+            inputs=None,
+            outputs=[prep_verify_report],
         )
 
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the

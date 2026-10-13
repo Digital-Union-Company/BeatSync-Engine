@@ -42,6 +42,17 @@ automatically.
   events also share one `concurrency_id` with `concurrency_limit=1`, but that is cooperative: the
   lock is the authority, because it is provable without Gradio.
 
+  **`_RENDER_LOCK` has a THIRD non-blocking acquirer since S2-A: `_on_verify_sources_click`.**
+  Read-only source verification issues up to four concurrent FFprobe reads against the same drive a
+  render extracts from, and D0 traced clip-extraction timeouts to exactly that contention, so the
+  two are mutually exclusive. The mutex is *reused* rather than duplicated precisely because the
+  render side then needs no new check — it already refuses when the lock is held and does not care
+  who holds it — and because one `acquire(blocking=False)` is a test-and-set, whereas
+  `if not lock.locked(): start()` is a check-then-act race. The refusal message now comes from
+  `_busy_message()` so it names the real holder; `RENDER_BUSY_MESSAGE` remains the default.
+  Verification holds no `RenderLifecycle`, is not cancellable, and is not a render. See
+  `.claude/rules/source-verification.md`.
+
   **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
   `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
   event, an exception while draining — the frame unwinds immediately. Without a finalizer the
@@ -394,5 +405,6 @@ automatically.
 | Variant Lab **comparison / Apply Selected** seam, candidate count, batch state (C3) | `.claude/rules/variant-lab.md` **+** `.claude/rules/creative-presets.md` **+** `.claude/rules/audio-mixdown.md` — Apply writes both creative and audio widgets, so all three writer matrices apply |
 | voice clips, Smart Mix folder/roles/Amount/Level, the report panels | `.claude/rules/audio-mixdown.md` |
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
+| the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |
