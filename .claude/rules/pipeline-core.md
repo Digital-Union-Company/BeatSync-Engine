@@ -353,12 +353,38 @@ Load-bearing details:
   diagnosis. `_short_error`'s own default is unchanged for every other caller, and this is **not** a
   change to the stderr budget: `ffmpeg_diagnostics.MAX_REASON_CHARS` still bounds the summarised
   stderr at 240 before it ever arrives.
-- **The terminal `RuntimeError` carries the first failure.** The progress ERROR event's
+- **FIELD ORDER is load-bearing, and a larger budget alone does not fix this (R3).** The first
+  implementation ordered the fields path-first, reason-last, and an independent review reproduced the
+  consequence: the fixed scaffolding costs 247 characters, leaving ~769 of path headroom before
+  `_short_error` — which keeps the beginning and cuts the **end** — starts eating the trailing
+  fields. Measured at PR #59's first commit: the reason was gone at a 900-character path and the path
+  itself at 1024. The order is now **label → reason → bare filename → timings → FPS → encoder →
+  full absolute path LAST**. The reason can no longer be pushed out by any path length; the bare
+  filename survives any truncation of the line (which is what middle elision was asked to buy,
+  without needing a second composition or a wider result tuple); and only the one genuinely
+  unbounded field sits where truncation lands. Truncation stays visible — `_short_error` appends an
+  ellipsis.
+- **The reason prose is bounded inside the describer; the path deliberately is not.** An arbitrary
+  exception's `str` can be megabytes and must not turn the terminal message into a log sink, but a
+  path is small and is the one fact the forensic question needs. `describe_failure`'s
+  `reason_budget=240` is a literal default rather than a module constant, for the same harness reason
+  the describer is nested.
+- **The terminal `RuntimeError` carries the first failure WHOLE (R3).** The progress ERROR event's
   `first_failures` is replaced by the terminal message when the render ends, so the identifying
-  context would otherwise be visible only mid-render. Exactly one failure is promoted, so the
-  bounded-reporting policy (`<= 3` concrete warnings, then every 25th, `first_failures[:3]`) is
-  untouched. The refusal sentence stays **inside** the `raise` expression, because a seam test counts
-  the raise nodes whose text carries it.
+  context would otherwise be visible only mid-render. It uses a dedicated invocation-scoped
+  `first_failure_detail` — the untruncated worker detail, captured once under a guard at each of the
+  two recording sites — and **not** `clip_failures[0]`, which is the bounded entry. That separation
+  is the whole correction: the progress panel needs a short line, the terminal needs the complete
+  absolute path, and one string cannot serve both. `gui.py::_process_video_impl` builds
+  `❌ Error: {str(e)}` with no `_short_error`, so the full path does reach the operator. Exactly one
+  failure is promoted, so the bounded-reporting policy (`<= 3` concrete warnings, then every 25th,
+  `first_failures[:3]`) is untouched. The refusal sentence stays **inside** the `raise` expression,
+  because a seam test counts the raise nodes whose text carries it.
+- **No duplicate clip identification on the bounded surfaces.** The detail already opens with
+  `Clip N (internal index M) failed after …`, so the old `clip {i+1}: ` and `Clip {i+1} failed: `
+  wrappers were dropped. The console print keeps its own wording; it is a separate, unbounded
+  surface — and in a GUI run it is discarded entirely, because `gui.py` redirects stdout and stderr
+  into `QuietConsole`. That is why the bounded and terminal surfaces carry the whole burden.
 - **Total by construction.** The describer is fully guarded and falls back to the bare reason: a
   diagnostic that raised would replace a real cause with its own traceback.
 

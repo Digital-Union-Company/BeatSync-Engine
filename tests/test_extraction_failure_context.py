@@ -248,21 +248,168 @@ def test_awkward_paths_are_reported_verbatim(source):
     assert "FFmpeg timed out after 120s" in detail, "a long path must not evict the reason"
 
 
-def test_a_very_long_path_still_leaves_the_reason_inside_the_widened_budget(processor_tree):
-    """The composed line must fit the budget the consumption site applies."""
-    budget = None
-    for node in processor_tree.body:
+def _budget(tree):
+    for node in tree.body:
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "CLIP_FAILURE_DETAIL_MAX_CHARS":
-                    budget = node.value.value
-    assert isinstance(budget, int) and budget > 240
+                    return node.value.value
+    raise AssertionError("CLIP_FAILURE_DETAIL_MAX_CHARS not found")
+
+
+def _load_short_error():
+    """The REAL ``_short_error``, which is what bounds the progress surfaces."""
+    ns = {}
+    exec(compile(ast.Module(body=[_func(_tree(_PROCESSOR), "_short_error")], type_ignores=[]),
+                 _PROCESSOR, "exec"), ns)
+    return ns["_short_error"]
+
+
+def _surfaces(source, reason=_TIMEOUT[1], tree=None):
+    """Reproduce the three operator surfaces for one failing clip.
+
+    Mirrors ``create_music_video``'s own construction: the worker's raw detail, the bounded
+    progress entry, and the terminal refusal built from the UNTRUNCATED first-failure detail.
+    """
+    budget = _budget(tree or _tree(_PROCESSOR))
+    short_error = _load_short_error()
+    worker, _ = _load_worker(lambda **_k: (False, reason))
+    planned = {"video_file": source, "source_duration": 1.96, "start_time": 12.48}
+    raw = worker(_args(source="J:/lib/fallback.mp4") + (planned,))[4]
+    bounded = short_error(raw, budget)
+    terminal = ("1 clip(s) failed; refusing to concatenate an incomplete timeline."
+                f" First failure: {raw}")
+    return raw, bounded, terminal, budget
+
+
+#: The boundary the original S1 commit did NOT exercise. An independent review measured the
+#: composed line's fixed cost at 247 characters, leaving ~769 of path headroom before
+#: ``_short_error`` -- which keeps the beginning and cuts the END -- began evicting the trailing
+#: fields. With the reason last, a 900-character path silently removed the diagnosis and a
+#: 1024-character path removed the path too. These lengths straddle that boundary deliberately.
+_PATH_LENGTHS = (45, 260, 500, 750, 770, 900, 1024, 1500, 4000)
+
+
+@pytest.mark.parametrize("length", _PATH_LENGTHS)
+def test_the_reason_is_never_evicted_by_path_length(length):
+    """R3 MAJOR-1: the diagnosis must survive at EVERY path length."""
+    source = ("J:/" + "p" * max(1, length - 24) + "/0_279-realname.mp4")[:length]
+    raw, bounded, terminal, budget = _surfaces(source)
+
+    assert _TIMEOUT[1] in raw, "the raw worker detail must carry the reason"
+    assert _TIMEOUT[1] in bounded, f"the bounded warning lost the reason at {length} chars"
+    assert _TIMEOUT[1] in terminal, f"the terminal error lost the reason at {length} chars"
+
+
+@pytest.mark.parametrize("length", _PATH_LENGTHS)
+def test_the_complete_source_path_survives_into_the_terminal_error(length):
+    """The terminal surface is unbounded by the GUI, so it must keep the WHOLE path."""
+    source = ("J:/" + "p" * max(1, length - 24) + "/0_279-realname.mp4")[:length]
+    raw, bounded, terminal, budget = _surfaces(source)
+
+    assert source in raw, f"the raw detail must carry the complete path at {length} chars"
+    assert source in terminal, f"the terminal error lost the complete path at {length} chars"
+
+
+@pytest.mark.parametrize("length", _PATH_LENGTHS)
+def test_the_bounded_warning_stays_bounded_and_keeps_the_filename(length):
+    """The progress surface must stay short, mark any truncation, and never lose the filename."""
+    source = ("J:/" + "p" * max(1, length - 24) + "/0_279-realname.mp4")[:length]
+    raw, bounded, terminal, budget = _surfaces(source)
+
+    assert len(bounded) <= budget, f"bounded warning exceeded its limit at {length} chars"
+    assert os.path.basename(source) in bounded, \
+        f"the filename was silently lost from the warning at {length} chars"
+    if len(raw) > budget:
+        assert "\u2026" in bounded, "truncation must be explicitly marked, never silent"
+
+
+def test_a_long_path_does_not_change_whether_the_render_fails():
+    """Path length is a reporting concern only; the outcome must be identical."""
+    short_src = "J:/lib/a.mp4"
+    long_src = "J:/" + "p" * 3000 + "/a.mp4"
+    for source in (short_src, long_src):
+        worker, _ = _load_worker(lambda **_k: _TIMEOUT)
+        planned = {"video_file": source, "source_duration": 1.96, "start_time": 12.48}
+        index, path, _size, display, detail, _elapsed = worker(_args() + (planned,))
+        assert (index, path, display) == (3, None, None), source
+        assert isinstance(detail, str) and detail
+
+
+def test_the_reason_prose_is_bounded_independently_of_the_path():
+    """A megabyte of stderr must not reach the terminal; a long PATH must still survive."""
+    worker, _ = _load_worker(lambda **_k: (False, "X" * 500_000))
+    planned = {"video_file": "J:/" + "p" * 2000 + "/a.mp4",
+               "source_duration": 1.96, "start_time": 12.48}
+    raw = worker(_args() + (planned,))[4]
+
+    assert "X" * 300 not in raw, "the reason prose must be bounded"
+    assert "\u2026" in raw, "a bounded reason must say so"
+    assert planned["video_file"] in raw, "bounding the prose must not sacrifice the path"
+    assert len(raw) < 2600, "the line is path-length plus a bounded remainder, not a log sink"
+
+
+@pytest.mark.parametrize("length", (260, 1024, 2000))
+def test_long_unicode_windows_paths_survive(length):
+    source = "J:/" + ("\u00fc\u00e4\u00df\u30af\u30ea" * (length // 5)) + "/\u30d5\u30a1.mp4"
+    raw, bounded, terminal, budget = _surfaces(source)
+
+    assert source in raw and source in terminal
+    assert _TIMEOUT[1] in bounded
+    assert os.path.basename(source) in bounded
+    assert len(bounded) <= budget
+
+
+def test_only_the_first_failure_reaches_the_terminal_error(processor_tree):
+    """Multiple failures: the terminal names ONE, the bounded policy still names up to three.
+
+    Counted per WRITE SITE rather than by substring presence. A mutation that removed the guard on
+    just one of the two recording sites previously escaped, because the surviving site still put the
+    literal "if not first_failure_detail:" somewhere in the source. Every write must be guarded, so
+    the assertion pairs each assignment with its own enclosing guard.
+    """
+    fn = _func(processor_tree, "create_music_video")
+
+    writes = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "first_failure_detail"
+                      for t in n.targets)
+              and "str(" in ast.unparse(n.value)]
+    assert len(writes) == 2, \
+        "exactly the two failure paths (clip error and worker exception) record the detail"
+
+    guarded = [n for n in ast.walk(fn) if isinstance(n, ast.If)
+               and ast.unparse(n.test).replace(" ", "") == "notfirst_failure_detail"
+               and any(isinstance(b, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "first_failure_detail"
+                               for t in b.targets)
+                       for b in n.body)]
+    assert len(guarded) == len(writes), (
+        f"every write must sit under its own `if not first_failure_detail:` guard; "
+        f"found {len(guarded)} guard(s) for {len(writes)} write(s)")
+
+    source = ast.unparse(fn)
+    assert "first_failures=clip_failures[:3]" in source
+    assert "len(clip_failures) <= 3" in source
+    assert "len(clip_failures) % 25 == 0" in source
+
+
+def test_the_clip_identification_is_not_repeated_on_the_bounded_surfaces(processor_tree):
+    """R2 MINOR: the detail already opens with "Clip N (internal index M)".
+
+    The old wrappers produced "clip 4: Clip 4 (internal index 3) failed ..." and
+    "Clip 4 failed: Clip 4 (internal index 3) failed ...". Cosmetic, but removed now that the
+    composition was being touched anyway.
+    """
+    source = ast.unparse(_func(processor_tree, "create_music_video"))
+    assert "f'clip {i + 1}: " not in source.replace('"', "'")
+    assert "f'Clip {i + 1} failed: " not in source.replace('"', "'")
+    # The console print keeps its own wording -- it is a different surface and is not bounded.
+    assert "Clip {i + 1} failed after" in source or "Clip {i+1} failed after" in source
 
     worker, _ = _load_worker(lambda **_k: _TIMEOUT)
-    source = "J:/" + "x" * 240 + "/clip.mp4"
-    detail = worker(_args(source=source))[4]
-    assert len(detail) <= budget, "a realistic worst-case path must fit without truncation"
-    assert source in detail and "FFmpeg timed out after 120s" in detail
+    raw = worker(_args(index=3))[4]
+    assert raw.count("internal index 3") == 1
+    assert raw.startswith("Clip 4 (internal index 3)")
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +543,12 @@ def test_the_terminal_refusal_carries_the_first_failure(processor_tree):
 
     Without this the identifying context lives only in the progress ERROR event's
     ``first_failures``, which is gone the moment the render ends.
+
+    **R3 strengthened this.** It previously asserted the terminal used ``clip_failures[0]`` --
+    the BOUNDED list entry -- which is exactly the defect an independent review reproduced: a
+    long source path was truncated out of the only surface that could carry it. The terminal
+    message must now use the untruncated ``first_failure_detail`` instead, and must NOT reach
+    for the bounded list.
     """
     fn = _func(processor_tree, "create_music_video")
     raises = [n for n in ast.walk(fn)
@@ -406,9 +559,21 @@ def test_the_terminal_refusal_carries_the_first_failure(processor_tree):
     assert "first_failure" in text, "the first failure's context must reach the terminal error"
 
     source = ast.unparse(fn)
-    assert "clip_failures[0]" in source
+    assert "first_failure_detail" in source, "the whole detail must be retained for the terminal"
+    # The terminal message must be built from the UNTRUNCATED detail, never the bounded entry.
+    assigns = [ast.unparse(n) for n in ast.walk(fn)
+               if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "first_failure" for t in n.targets)]
+    assert assigns, "the terminal suffix must be built explicitly"
+    assert "first_failure_detail" in assigns[0], assigns[0]
+    assert "clip_failures[0]" not in assigns[0], \
+        "the terminal must not use the bounded list entry (R3 MAJOR-1)"
     # Exactly one failure is promoted, so the bounded-reporting policy is intact.
     assert "clip_failures[:3]" in source
+    # And the retained detail is written exactly once, on the first failure only.
+    guards = [ast.unparse(n) for n in ast.walk(fn)
+              if isinstance(n, ast.If) and "not first_failure_detail" in ast.unparse(n.test)]
+    assert guards, "the retained detail must be guarded so only the FIRST failure writes it"
 
 
 def test_the_bounded_first_failures_policy_is_unchanged(processor_tree):

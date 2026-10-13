@@ -426,13 +426,35 @@ def create_clip_parallel(args):
     clip_start = None
     source_duration = None
 
-    def describe_failure(reason):
+    def describe_failure(reason, reason_budget=240):
         """[FORK] Digital-Union (MEDIA-VERIFY-S1): one line naming WHICH source failed and WHERE.
 
         Nested, and dependency-free by requirement rather than by taste. This body is compiled and
         executed on its own by `tests/test_render_cancellation.py` against a namespace holding only
         the names it uses, so a module-level helper called from here would have to be added to that
         harness. Keeping the describer inside the worker preserves that deliberate test pattern.
+        ``reason_budget`` is a literal default for the same reason: a module-level constant would
+        not resolve inside that namespace.
+
+        **FIELD ORDER IS THE R3 CORRECTION, not a style choice.** The first implementation put the
+        source path early and the reason last, which an independent review reproduced as a defect:
+        the consumption sites bound the composed line with `_short_error`, which keeps the beginning
+        and cuts the END, so a source path over ~769 characters evicted the very diagnosis the line
+        exists to carry -- measured: reason gone at 900 characters, path gone too at 1024. Three
+        ordering rules now make that structurally impossible:
+
+        * the **reason comes second**, right after the label, so no path length can push it out;
+        * the **bare filename comes third**, so the single most identifying fact survives any
+          truncation of the line -- this is what the review asked middle elision to buy, achieved
+          without a second composition or a wider result tuple;
+        * the **full absolute path comes LAST**, because it is the only unbounded field. A bounded
+          surface truncates it (visibly -- `_short_error` appends an ellipsis) while the terminal
+          surface, which the GUI does not bound, keeps it whole.
+
+        **The reason prose is bounded here; the path deliberately is not.** An arbitrary exception's
+        ``str`` can be megabytes and must not turn the terminal message into a log sink, but a
+        Windows path is small and is the one fact the forensic question needs, so the two are
+        budgeted separately rather than competing for one allowance.
 
         It closes over the locals rather than taking them as arguments, so it always reports the
         values as they stood when the failure happened -- including ``video_file`` after it was
@@ -467,15 +489,26 @@ def create_clip_parallel(args):
                 label = f"Clip {int(i) + 1} (internal index {int(i)})"
             except (TypeError, ValueError):
                 label = f"Clip at index {i!r}"
+
+            prose = " ".join(str(reason).split())
+            if len(prose) > reason_budget:
+                prose = prose[: reason_budget - 1] + "…"
+            try:
+                filename = os.path.basename(str(video_file)) or str(video_file)
+            except Exception:
+                filename = str(video_file)
+
             return " | ".join([
                 f"{label} failed after {seconds(time.perf_counter() - clip_started)}",
-                f"Source: {video_file}",
+                f"Reason: {prose}",
+                f"Source file: {filename}",
                 f"Source start: {seconds(clip_start)}",
                 f"Source duration: {seconds(source_duration)}",
                 f"Target segment duration: {seconds(final_duration)}",
                 f"Output FPS: {number(fps)}",
                 f"Encoder: {gpu_encoder if use_nvenc else 'cpu-h264'}",
-                f"Reason: {reason}",
+                # LAST, and deliberately unbounded -- see the field-order note above.
+                f"Source: {video_file}",
             ])
         except Exception:
             return str(reason)
@@ -969,6 +1002,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             6, len(clip_args), min_interval=0.5, started=clip_stage_started
         )
         clip_failures: List[str] = []
+        # [FORK] Digital-Union (MEDIA-VERIFY-S1 / R3): the FIRST failure's COMPLETE detail, kept
+        # whole for the terminal RuntimeError. One invocation-scoped plain string, written once and
+        # never truncated -- not a second failure list, not a diagnostic state machine, and nothing
+        # persisted. `clip_failures` stays bounded for the progress panel, so the two surfaces no
+        # longer share one string with two incompatible requirements.
+        first_failure_detail = ''
         
         # Process all clips in parallel
         # [FORK] Digital-Union (C3-R1A): cancelled_exc is set (and only set) inside the loop below
@@ -999,19 +1038,24 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                     
                     if error:
                         print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
-                        # [FORK] Digital-Union (MEDIA-VERIFY-S1): the wider budget applies at the two
-                        # clip-failure sites only, so the source path the worker now supplies cannot
-                        # push the FFmpeg reason off the end of the line. The bound still exists --
-                        # the status box must never receive megabytes of stderr.
-                        clip_failures.append(
-                            f"clip {i + 1}: {_short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS)}")
+                        # [FORK] Digital-Union (R3): retain the FIRST failure whole, for the
+                        # terminal RuntimeError below. The bounded entry beside it serves the
+                        # progress panel.
+                        if not first_failure_detail:
+                            first_failure_detail = str(error)
+                        # The wider budget applies at the two clip-failure sites only. With the
+                        # reason and the bare filename now ahead of the full path in the composed
+                        # line, truncation here can only ever shorten the trailing absolute path --
+                        # visibly, since `_short_error` appends an ellipsis.
+                        clip_failures.append(_short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS))
                         # Surface the first few concretely, then only the running count, so a
                         # systematic failure (every NVENC clip, say) is visible without flooding.
                         if len(clip_failures) <= 3:
+                            # No "Clip N failed:" prefix: the detail already opens with
+                            # "Clip N (internal index M) failed after ...", and R2 recorded the
+                            # repetition as needless verbosity.
                             fork_progress.emit(event_callback, fork_progress.warning(
-                                6,
-                                f"Clip {i + 1} failed: "
-                                f"{_short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS)}",
+                                6, _short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS),
                                 failed_clips=len(clip_failures),
                             ))
                         elif len(clip_failures) % 25 == 0:
@@ -1053,6 +1097,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                     break
                 except Exception as e:
                     print(f"⚠️  Warning: Error processing clip: {str(e)}")
+                    if not first_failure_detail:
+                        first_failure_detail = str(e)
                     clip_failures.append(_short_error(e))
                     fork_progress.emit(event_callback, fork_progress.warning(
                         6, f"Clip worker error: {_short_error(e)}",
@@ -1095,7 +1141,13 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             # The refusal literal stays INSIDE the `raise` expression: a seam test counts the raise
             # nodes whose text carries it, and moving it into a local would have hidden the guard
             # from exactly the check that protects it.
-            first_failure = f" First failure: {clip_failures[0]}" if clip_failures else ""
+            # R3: the UNTRUNCATED detail, not `clip_failures[0]`. The list entry is bounded for the
+            # progress panel; this message is NOT bounded by the GUI (`gui.py::_process_video_impl`
+            # builds "❌ Error: {str(e)}" with no `_short_error`), so it is the one operator-visible
+            # surface that can carry a complete absolute source path -- exactly what the forensic
+            # question "which file failed?" needs. The reason prose inside it is already bounded by
+            # `describe_failure`, so this cannot become a stderr sink.
+            first_failure = f" First failure: {first_failure_detail}" if first_failure_detail else ""
             raise RuntimeError(
                 f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
                 f"{first_failure}"
