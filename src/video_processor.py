@@ -82,6 +82,23 @@ def _short_error(exc: object, max_chars: int = 240) -> str:
     return text if len(text) <= max_chars else text[: max_chars - 1] + "\u2026"
 
 
+#: [FORK] Digital-Union (MEDIA-VERIFY-S1): the budget for ONE clip-failure line, used only at the
+#: two clip-failure sites below. It is deliberately larger than `_short_error`'s 240-char default.
+#:
+#: A D0 forensic investigation could not say *which* source video timed out, because the failure
+#: string carried only the segment index and the elapsed time. Adding the source path fixes that —
+#: but a Windows path can be 260 characters on its own, and `_short_error` truncates the *whole*
+#: line, so at 240 the new path would have pushed the real reason ("FFmpeg timed out after 120s")
+#: off the end. That is the one outcome this feature must not produce: a diagnostic that evicts the
+#: diagnosis. One generous budget for the composed line keeps both, and `_short_error`'s own default
+#: is untouched for every other caller.
+#:
+#: This is NOT a change to the FFmpeg stderr budget. `ffmpeg_diagnostics.MAX_REASON_CHARS` still
+#: bounds the summarised stderr at 240 before it ever reaches here; this bounds the envelope the
+#: context and that reason travel in together.
+CLIP_FAILURE_DETAIL_MAX_CHARS = 1024
+
+
 def _fmt_seconds(seconds: float) -> str:
     try:
         value = float(seconds)
@@ -402,6 +419,67 @@ def create_clip_parallel(args):
     clip_started = time.perf_counter()
     planned_clip = None
     lifecycle = None
+    # [FORK] Digital-Union (MEDIA-VERIFY-S1): bound BEFORE the try so the failure describer can
+    # report them honestly even when the failure happened before they were resolved. The
+    # source-duration probe below can raise, and a `None` here is what makes the difference between
+    # reporting "Source start: unavailable" and inventing a start of 0.000s that nothing attempted.
+    clip_start = None
+    source_duration = None
+
+    def describe_failure(reason):
+        """[FORK] Digital-Union (MEDIA-VERIFY-S1): one line naming WHICH source failed and WHERE.
+
+        Nested, and dependency-free by requirement rather than by taste. This body is compiled and
+        executed on its own by `tests/test_render_cancellation.py` against a namespace holding only
+        the names it uses, so a module-level helper called from here would have to be added to that
+        harness. Keeping the describer inside the worker preserves that deliberate test pattern.
+
+        It closes over the locals rather than taking them as arguments, so it always reports the
+        values as they stood when the failure happened -- including ``video_file`` after it was
+        replaced by the planned source, and ``clip_start``/``source_duration`` still ``None`` when
+        the duration probe raised before resolving them.
+
+        Nothing is re-derived: no planner re-run, no source re-chosen, no seed drawn, no probe
+        issued. It only formats what the worker already had and was throwing away.
+
+        **Total by construction.** A describer that raised would replace a real cause with its own
+        traceback, so the whole body is guarded and falls back to the bare reason.
+        """
+        try:
+            def number(value, suffix=""):
+                """A finite measurement, or an honest ``unavailable`` -- never a fabricated 0."""
+                try:
+                    measured = float(value)
+                except (TypeError, ValueError):
+                    return "unavailable"
+                if measured != measured or measured in (float("inf"), float("-inf")):
+                    return "unavailable"
+                return f"{measured:.3f}{suffix}"
+
+            def seconds(value):
+                return number(value, "s")
+
+            try:
+                # 1-based for the operator, matching the existing console and warning wording, with
+                # the 0-based index stated outright. D0 burned real time reconciling "Clip 4"
+                # against temp clip index 3. This is the OUTPUT SEGMENT number, never a position in
+                # the source library.
+                label = f"Clip {int(i) + 1} (internal index {int(i)})"
+            except (TypeError, ValueError):
+                label = f"Clip at index {i!r}"
+            return " | ".join([
+                f"{label} failed after {seconds(time.perf_counter() - clip_started)}",
+                f"Source: {video_file}",
+                f"Source start: {seconds(clip_start)}",
+                f"Source duration: {seconds(source_duration)}",
+                f"Target segment duration: {seconds(final_duration)}",
+                f"Output FPS: {number(fps)}",
+                f"Encoder: {gpu_encoder if use_nvenc else 'cpu-h264'}",
+                f"Reason: {reason}",
+            ])
+        except Exception:
+            return str(reason)
+
     if len(args) >= 10:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, lifecycle) = args
@@ -463,9 +541,13 @@ def create_clip_parallel(args):
         if not success:
             # The original wording is kept as a prefix so existing log/string expectations still
             # match; the useful part is appended rather than replacing it.
-            detail = f"FFmpeg extraction failed: {reason}" if reason else "FFmpeg extraction failed"
+            # [FORK] Digital-Union (MEDIA-VERIFY-S1): that prefix+reason is now wrapped in the
+            # execution context around it -- which source, which seek position, which encoder --
+            # because the reason alone could not identify the file that failed.
+            detail = describe_failure(
+                f"FFmpeg extraction failed: {reason}" if reason else "FFmpeg extraction failed")
             return (i, None, target_size, None, detail, elapsed)
-        
+
         return (i, temp_clip_path, target_size, temp_clip_path, None, elapsed)
 
     except RenderCancelled:
@@ -475,7 +557,13 @@ def create_clip_parallel(args):
         raise
     except Exception as e:
         elapsed = time.perf_counter() - clip_started
-        return (i, None, target_size, None, str(e), elapsed)
+        # [FORK] Digital-Union (MEDIA-VERIFY-S1): the same context, for the paths that never reached
+        # the extractor at all -- most importantly a source-duration probe that raised, where
+        # `clip_start` and `source_duration` are still None and are reported as unavailable rather
+        # than as zero. `video_file` is whatever was resolved at the point of the raise, which is the
+        # planned source once `planned_clip` has been read and the caller's argument before that.
+        detail = describe_failure(str(e))
+        return (i, None, target_size, None, detail, elapsed)
 
 
 def create_music_video(audio_file: str, video_files: VideoList, beat_times: BeatTimes,
@@ -911,12 +999,19 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                     
                     if error:
                         print(f"⚠️  Warning: Clip {i+1} failed after {_fmt_seconds(clip_elapsed)}: {error}")
-                        clip_failures.append(f"clip {i + 1}: {_short_error(error)}")
+                        # [FORK] Digital-Union (MEDIA-VERIFY-S1): the wider budget applies at the two
+                        # clip-failure sites only, so the source path the worker now supplies cannot
+                        # push the FFmpeg reason off the end of the line. The bound still exists --
+                        # the status box must never receive megabytes of stderr.
+                        clip_failures.append(
+                            f"clip {i + 1}: {_short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS)}")
                         # Surface the first few concretely, then only the running count, so a
                         # systematic failure (every NVENC clip, say) is visible without flooding.
                         if len(clip_failures) <= 3:
                             fork_progress.emit(event_callback, fork_progress.warning(
-                                6, f"Clip {i + 1} failed: {_short_error(error)}",
+                                6,
+                                f"Clip {i + 1} failed: "
+                                f"{_short_error(error, CLIP_FAILURE_DETAIL_MAX_CHARS)}",
                                 failed_clips=len(clip_failures),
                             ))
                         elif len(clip_failures) % 25 == 0:
@@ -990,8 +1085,20 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 failed_clips=int(failed_count), total_clips=int(total_clips),
                 first_failures=clip_failures[:3],
             ))
+            # [FORK] Digital-Union (MEDIA-VERIFY-S1): the refusal sentence is unchanged and still
+            # leads the message -- it is the contract, and callers and tests match on it. What is
+            # appended is the FIRST failure's context, because this RuntimeError is what becomes the
+            # operator's terminal error panel: the progress ERROR event above carries
+            # `first_failures`, but a terminal exception message replaces the progress line, so
+            # without this the identifying detail is visible only until the render ends. One
+            # failure, not all of them, keeps the existing bounded-reporting policy intact.
+            # The refusal literal stays INSIDE the `raise` expression: a seam test counts the raise
+            # nodes whose text carries it, and moving it into a local would have hidden the guard
+            # from exactly the check that protects it.
+            first_failure = f" First failure: {clip_failures[0]}" if clip_failures else ""
             raise RuntimeError(
                 f"{failed_count} clip(s) failed; refusing to concatenate an incomplete timeline."
+                f"{first_failure}"
             )
 
         if not clip_files:

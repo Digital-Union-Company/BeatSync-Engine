@@ -322,6 +322,56 @@ without FFmpeg or a GPU. Load-bearing details:
 - Missing/empty output and exceptions get their own honest wording rather than a fabricated stderr
   quote; a `TimeoutExpired` is described by its timeout, not by its 4000-character argv.
 
+## A failed clip also names WHICH source it was reading (MEDIA-VERIFY-S1)
+
+Phase 3B made the *reason* real. It left the **subject** missing: `"FFmpeg extraction failed: FFmpeg
+timed out after 120s"` does not say which of 2,038 sources stalled. A forensic investigation (D0) of
+a real failed render could prove output segment 3 was killed — its retained temp MP4 had no `moov`
+atom, and its size sat exactly on a 3 MiB buffer boundary — and still could not name the file,
+because the clip plan is not persisted and `temp_clip_{i}_{uuid4}.mp4` carries no source identity.
+
+`create_clip_parallel` now wraps the Phase 3B reason in the execution context it already had in
+scope and was discarding: 1-based clip number **and** the 0-based index, resolved source path, source
+start, source duration, target segment duration, output FPS, encoder, elapsed.
+
+Load-bearing details:
+
+- **The describer is nested inside the worker and calls no module-level helper.**
+  `tests/test_render_cancellation.py` compiles that one function body and executes it against a
+  hand-built namespace containing only the names the body uses, so a module-level helper would have
+  to be added to that harness. Nesting keeps the deliberate test pattern intact. It closes over the
+  locals rather than taking parameters, so it reports `video_file` *after* the planned source
+  replaced it.
+- **`clip_start` and `source_duration` are bound to `None` before the `try`.** When the
+  source-duration probe raises, the worker never resolved a seek position, and the diagnostic says
+  `unavailable` rather than `0.000s`. A fabricated zero would read as "we sought to the beginning and
+  that failed" — a different and untrue story. The target duration *is* known pre-probe and is still
+  reported.
+- **`CLIP_FAILURE_DETAIL_MAX_CHARS = 1024` applies at the two clip-failure sites only.** A Windows
+  path can be 260 characters alone and `_short_error` truncates the *whole* line, so at the 240-char
+  default the new path would have pushed the real reason off the end — a diagnostic evicting the
+  diagnosis. `_short_error`'s own default is unchanged for every other caller, and this is **not** a
+  change to the stderr budget: `ffmpeg_diagnostics.MAX_REASON_CHARS` still bounds the summarised
+  stderr at 240 before it ever arrives.
+- **The terminal `RuntimeError` carries the first failure.** The progress ERROR event's
+  `first_failures` is replaced by the terminal message when the render ends, so the identifying
+  context would otherwise be visible only mid-render. Exactly one failure is promoted, so the
+  bounded-reporting policy (`<= 3` concrete warnings, then every 25th, `first_failures[:3]`) is
+  untouched. The refusal sentence stays **inside** the `raise` expression, because a seam test counts
+  the raise nodes whose text carries it.
+- **Total by construction.** The describer is fully guarded and falls back to the bare reason: a
+  diagnostic that raised would replace a real cause with its own traceback.
+
+Diagnostics only. The timeout stays 120 s, the retry count stays zero, the argv, frame arithmetic,
+worker count, source selection, tuple contract, temp-clip naming and the complete-timeline refusal
+are all unchanged — `tests/test_extraction_failure_context.py` pins each of those alongside the new
+behaviour, executing the real worker body rather than inspecting strings.
+
+**The UUID naming was deliberately kept.** Replacing it with a source-path digest was proposed and
+rejected: a digest is not reversible into a path, deterministic naming alone loses attempt
+uniqueness, and neither identifies a source without a trusted side mapping. Reporting the real path
+at the failure boundary is the smaller and more direct fix.
+
 ## Environment variables
 
 Tuning knobs, all optional. Most useful when debugging performance or an unstable GPU path:
