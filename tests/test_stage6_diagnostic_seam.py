@@ -47,6 +47,20 @@ def _calls(node, name):
     return found
 
 
+def _module_constant(tree, name):
+    """The literal value of a module-level ``NAME = <constant>`` assignment.
+
+    Added by MEDIA-VERIFY-S1 so a widened truncation budget can be asserted to be a plain integer
+    constant rather than something computed at import time.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return node.value.value
+    raise AssertionError(f"module-level constant {name} not found")
+
+
 @pytest.fixture(scope="module")
 def ffmpeg_tree():
     return _tree(_FFMPEG)
@@ -262,7 +276,21 @@ def test_the_complete_timeline_refusal_is_intact(processor_tree):
     assert len(failed_count) == 1
     assert "clip_files" in ast.unparse(failed_count[0]) and "is None" in ast.unparse(failed_count[0])
     # And the per-clip reason is still bounded before it reaches the UI.
-    assert "_short_error(error)" in source
+    #
+    # MEDIA-VERIFY-S1 widened the budget rather than removing it: the worker now prepends the
+    # source path and seek context, and a 260-character Windows path at the old 240-char cap would
+    # have truncated away the FFmpeg reason itself. The invariant being protected is "bounded", not
+    # "bounded at exactly the default", so this asserts the bound is still applied AND that it is an
+    # explicit finite budget rather than an unbounded splat.
+    bounded = [ast.unparse(n) for n in ast.walk(fn)
+               if isinstance(n, ast.Call) and ast.unparse(n.func) == "_short_error"
+               and any("error" == ast.unparse(a) for a in n.args)]
+    assert bounded, "the per-clip reason must still pass through _short_error"
+    for call in bounded:
+        assert "CLIP_FAILURE_DETAIL_MAX_CHARS" in call, call
+    assert isinstance(
+        _module_constant(processor_tree, "CLIP_FAILURE_DETAIL_MAX_CHARS"), int), \
+        "the widened budget must be a module-level integer constant, not a computed value"
 
 
 def test_the_frame_arithmetic_filters_and_encoder_selection_are_untouched(ffmpeg_tree):

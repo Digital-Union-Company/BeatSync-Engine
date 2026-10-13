@@ -20,6 +20,90 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-13 (MEDIA-VERIFY-S1: a failed clip names the source it was reading)
+
+**A failed FFmpeg extraction now reports which source video failed, and where in it.** Before this
+change the operator saw only:
+
+```
+Clip 4 failed: FFmpeg extraction failed: FFmpeg timed out after 120s
+1 clip(s) failed; refusing to concatenate an incomplete timeline.
+```
+
+A forensic investigation of exactly that failure, on a real 2,038-source render, could establish
+*that* output segment 3 was killed — its retained temporary MP4 had no `moov` atom, and its size sat
+exactly on a 3 MiB write-buffer boundary — and could **not** establish which of the 2,038 sources it
+had been reading. The clip plan is not persisted and the temporary filename's suffix is a `uuid4`,
+so the source identity was simply gone. The same failure now reports:
+
+```
+Clip 4 (internal index 3) failed after 120.4s | Source: J:\...\0_312.mp4 |
+Source start: 12.480s | Source duration: 1.960s | Target segment duration: 1.960s |
+Output FPS: 25.000 | Encoder: h264_nvenc | Reason: FFmpeg extraction failed: FFmpeg timed out after 120s
+```
+
+Every value was already in the clip worker's scope at the moment of failure and was being discarded.
+Nothing is re-derived: no planner re-run, no source re-chosen, no seed drawn, no probe issued.
+
+Three decisions worth recording:
+
+- **Both clip numbers are stated.** The existing user-facing numbering is 1-based while the retained
+  temporary files are 0-based, and reconciling "Clip 4" against `temp_clip_3_*` consumed real
+  investigation time. The number is the *output segment* index — never a position in the source
+  library.
+- **A pre-extraction failure reports `unavailable`, not `0.000s`.** When the source-duration probe
+  raises, no seek position was ever resolved; a fabricated zero would read as "we sought to the
+  beginning and that failed", which is untrue. The target segment duration *is* known at that point
+  and is still reported.
+- **The truncation budget was widened at the two clip-failure sites only** (1024 chars). A Windows
+  path can be 260 characters by itself and the bound applies to the whole line, so at the previous
+  240 the newly added path would have pushed the real timeout reason off the end — a diagnostic
+  evicting the diagnosis. The FFmpeg stderr budget itself is unchanged.
+
+> **Corrected 2026-10-13 under MEDIA-VERIFY-S1-R3 (accepted independent review finding MAJOR-1):
+> the widened budget alone did not deliver that promise.** The first implementation ordered the
+> fields path-first and reason-last, and `_short_error` keeps the beginning of a line while cutting
+> the end. With 247 characters of fixed scaffolding the path had ~769 characters of headroom, after
+> which the trailing fields were evicted: measured, the timeout reason disappeared at a 900-character
+> source path and the path itself at 1024. The shipped regression test used a 252-character path
+> composing to 499 of 1024 — a margin of 525 — so it never reached the boundary its name claimed to
+> guard.
+>
+> Two separate corrections, because the two surfaces have different requirements:
+>
+> * **Field order.** Now label → reason → bare filename → timings → FPS → encoder → full absolute
+>   path LAST. The reason can no longer be pushed out by any path length, the bare filename survives
+>   any truncation of the line, and only the one genuinely unbounded field sits where truncation
+>   lands. The reason prose is bounded separately inside the describer so a megabyte of stderr still
+>   cannot reach the panel, while a long path no longer competes with it for the same allowance.
+> * **The terminal error keeps the first failure WHOLE.** It now uses a dedicated invocation-scoped
+>   `first_failure_detail` — the untruncated worker detail, captured once under a guard — instead of
+>   the bounded `clip_failures[0]`. `gui.py::_process_video_impl` applies no truncation to that
+>   message, so the complete absolute path does reach the operator. `clip_failures` stays bounded for
+>   the progress panel.
+>
+> Verified at source-path lengths 45 / 260 / 500 / 750 / 770 / 900 / 1024 / 1500 / 4000, plus long
+> Unicode paths: the reason, the filename and the complete path all survive at every length, the
+> bounded warning stays inside its limit, and any truncation is explicitly marked. Eight mutations of
+> the failure surfaces were each caught by the tests.
+>
+> Also removed the duplicate clip identification R2 recorded (`clip 4: Clip 4 (internal index 3) …`),
+> since the composition was being touched anyway. Behaviour, timeout, retry count, argv, cache
+> identity and the incomplete-timeline refusal are all still unchanged.
+
+**This does not attempt to fix the timeout.** The 120-second bound, the zero retry count, the FFmpeg
+command, NVENC parameters, worker count, frame-locked timeline arithmetic, source selection, the
+worker's return tuple, the temporary-clip naming scheme and the refusal to concatenate an incomplete
+timeline are all unchanged. A proposal to replace the `uuid4` suffix with a source-path digest was
+**rejected**: a digest is not reversible into a path, deterministic naming alone loses attempt
+uniqueness, and neither identifies a source without a trusted side mapping.
+
+Nothing about Stage-5 analysis, Qwen, or cache identity participates: `CACHE_CONTRACT_VERSION` and
+`ANALYSIS_VERSION` are untouched and `src/video_analysis.py` was not modified.
+
+Changed: `src/video_processor.py`, `.claude/rules/pipeline-core.md`,
+`tests/test_stage6_diagnostic_seam.py`, `tests/test_extraction_failure_context.py` (new).
+
 ### Added — 2026-10-12 (Deliverable Export V1-B-S2: Open Output Folder)
 
 **One secondary button below the video preview opens this installation's `output` folder in Windows

@@ -322,6 +322,82 @@ without FFmpeg or a GPU. Load-bearing details:
 - Missing/empty output and exceptions get their own honest wording rather than a fabricated stderr
   quote; a `TimeoutExpired` is described by its timeout, not by its 4000-character argv.
 
+## A failed clip also names WHICH source it was reading (MEDIA-VERIFY-S1)
+
+Phase 3B made the *reason* real. It left the **subject** missing: `"FFmpeg extraction failed: FFmpeg
+timed out after 120s"` does not say which of 2,038 sources stalled. A forensic investigation (D0) of
+a real failed render could prove output segment 3 was killed — its retained temp MP4 had no `moov`
+atom, and its size sat exactly on a 3 MiB buffer boundary — and still could not name the file,
+because the clip plan is not persisted and `temp_clip_{i}_{uuid4}.mp4` carries no source identity.
+
+`create_clip_parallel` now wraps the Phase 3B reason in the execution context it already had in
+scope and was discarding: 1-based clip number **and** the 0-based index, resolved source path, source
+start, source duration, target segment duration, output FPS, encoder, elapsed.
+
+Load-bearing details:
+
+- **The describer is nested inside the worker and calls no module-level helper.**
+  `tests/test_render_cancellation.py` compiles that one function body and executes it against a
+  hand-built namespace containing only the names the body uses, so a module-level helper would have
+  to be added to that harness. Nesting keeps the deliberate test pattern intact. It closes over the
+  locals rather than taking parameters, so it reports `video_file` *after* the planned source
+  replaced it.
+- **`clip_start` and `source_duration` are bound to `None` before the `try`.** When the
+  source-duration probe raises, the worker never resolved a seek position, and the diagnostic says
+  `unavailable` rather than `0.000s`. A fabricated zero would read as "we sought to the beginning and
+  that failed" — a different and untrue story. The target duration *is* known pre-probe and is still
+  reported.
+- **`CLIP_FAILURE_DETAIL_MAX_CHARS = 1024` applies at the two clip-failure sites only.** A Windows
+  path can be 260 characters alone and `_short_error` truncates the *whole* line, so at the 240-char
+  default the new path would have pushed the real reason off the end — a diagnostic evicting the
+  diagnosis. `_short_error`'s own default is unchanged for every other caller, and this is **not** a
+  change to the stderr budget: `ffmpeg_diagnostics.MAX_REASON_CHARS` still bounds the summarised
+  stderr at 240 before it ever arrives.
+- **FIELD ORDER is load-bearing, and a larger budget alone does not fix this (R3).** The first
+  implementation ordered the fields path-first, reason-last, and an independent review reproduced the
+  consequence: the fixed scaffolding costs 247 characters, leaving ~769 of path headroom before
+  `_short_error` — which keeps the beginning and cuts the **end** — starts eating the trailing
+  fields. Measured at PR #59's first commit: the reason was gone at a 900-character path and the path
+  itself at 1024. The order is now **label → reason → bare filename → timings → FPS → encoder →
+  full absolute path LAST**. The reason can no longer be pushed out by any path length; the bare
+  filename survives any truncation of the line (which is what middle elision was asked to buy,
+  without needing a second composition or a wider result tuple); and only the one genuinely
+  unbounded field sits where truncation lands. Truncation stays visible — `_short_error` appends an
+  ellipsis.
+- **The reason prose is bounded inside the describer; the path deliberately is not.** An arbitrary
+  exception's `str` can be megabytes and must not turn the terminal message into a log sink, but a
+  path is small and is the one fact the forensic question needs. `describe_failure`'s
+  `reason_budget=240` is a literal default rather than a module constant, for the same harness reason
+  the describer is nested.
+- **The terminal `RuntimeError` carries the first failure WHOLE (R3).** The progress ERROR event's
+  `first_failures` is replaced by the terminal message when the render ends, so the identifying
+  context would otherwise be visible only mid-render. It uses a dedicated invocation-scoped
+  `first_failure_detail` — the untruncated worker detail, captured once under a guard at each of the
+  two recording sites — and **not** `clip_failures[0]`, which is the bounded entry. That separation
+  is the whole correction: the progress panel needs a short line, the terminal needs the complete
+  absolute path, and one string cannot serve both. `gui.py::_process_video_impl` builds
+  `❌ Error: {str(e)}` with no `_short_error`, so the full path does reach the operator. Exactly one
+  failure is promoted, so the bounded-reporting policy (`<= 3` concrete warnings, then every 25th,
+  `first_failures[:3]`) is untouched. The refusal sentence stays **inside** the `raise` expression,
+  because a seam test counts the raise nodes whose text carries it.
+- **No duplicate clip identification on the bounded surfaces.** The detail already opens with
+  `Clip N (internal index M) failed after …`, so the old `clip {i+1}: ` and `Clip {i+1} failed: `
+  wrappers were dropped. The console print keeps its own wording; it is a separate, unbounded
+  surface — and in a GUI run it is discarded entirely, because `gui.py` redirects stdout and stderr
+  into `QuietConsole`. That is why the bounded and terminal surfaces carry the whole burden.
+- **Total by construction.** The describer is fully guarded and falls back to the bare reason: a
+  diagnostic that raised would replace a real cause with its own traceback.
+
+Diagnostics only. The timeout stays 120 s, the retry count stays zero, the argv, frame arithmetic,
+worker count, source selection, tuple contract, temp-clip naming and the complete-timeline refusal
+are all unchanged — `tests/test_extraction_failure_context.py` pins each of those alongside the new
+behaviour, executing the real worker body rather than inspecting strings.
+
+**The UUID naming was deliberately kept.** Replacing it with a source-path digest was proposed and
+rejected: a digest is not reversible into a path, deterministic naming alone loses attempt
+uniqueness, and neither identifies a source without a trusted side mapping. Reporting the real path
+at the failure boundary is the smaller and more direct fix.
+
 ## Environment variables
 
 Tuning knobs, all optional. Most useful when debugging performance or an unstable GPU path:
