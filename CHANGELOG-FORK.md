@@ -20,6 +20,249 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R5: an active verification's revision could be evicted)
+
+A second independent review of this branch passed with no blocker and no major finding, and
+confirmed both R3 corrections, but reproduced one remaining correctness defect in the
+stale-report suppression that R3 added. It is corrected here. Nothing else changes: Stage-5 cache
+identity and payloads, the classifier, source fingerprinting and cross-phase stability, the
+FFprobe argv, the 20 s per-file timeout, the 600 s budget, the four-worker cap, the bounded
+submission window, the report's cache/media separation, the immediate-refusal behaviour,
+`RENDER_CONCURRENCY_ID`, the Cancel lane, Scan/Analyze, Stage-4/6 and rendering are all untouched.
+
+**The bounded revision map could drop the entry of a verification that was still running, and
+absence reads back as revision zero.** `_verify_revision` returns `0` for a key that is not
+present, which made "this session was invalidated" and "nothing has changed" the same observation:
+
+1. Session A clicks Verify with no map entry yet, so it captures revision `0`.
+2. A's folder changes. `_bump_verify_revision` stores `A = 1`.
+3. `_VERIFY_REVISION_CAP` other sessions invalidate their own folders. A — whose verification is
+   still running — is evicted as least-recently-touched.
+4. The terminal check reads A again, finds it absent, and gets `0` back. `0 == 0`, so the report
+   describing the folder the operator has already left is published as current.
+
+Measured against the pre-correction branch: 511 competing sessions were safe, 512 published the
+stale report, and the same hole had an ABA form — an entry evicted at revision N and recreated at
+N by a later invalidation. R3's code comment and the scoped rule both asserted the opposite
+("eviction ... can never let a stale report be published as current"); that claim was simply
+wrong, and the owner chose to fix the behaviour rather than weaken the documented guarantee.
+
+The correction uses an invariant that already exists instead of adding a mechanism. `_RENDER_LOCK`
+permits at most **one** verification at a time, so at most one session's revision is load-bearing
+at any instant. `_verify_active_session` — a plain string, capacity one — names that session for
+exactly the span of its own run, and the eviction loop in `_bump_verify_revision` skips it. The cap
+still bounds the map *including* the pinned entry: when the cap is exceeded there are always at
+least `_VERIFY_REVISION_CAP` droppable keys, because only one key can ever be pinned. Other
+sessions evict exactly as before, reads still never insert, a session that never edits its folder
+still never appears, and once the run ends the entry is ordinary and evictable again.
+
+Two orderings are load-bearing and both are now fixed by tests as well as by comments.
+`_begin_verify_session` pins and captures the baseline in **one** locked step, and only on the
+accepted path — pinning and reading separately would let an invalidation land between them and be
+folded into the baseline, and capturing before the mutex would make a *refused* click leave state
+behind. `_end_verify_session` compares and then unpins in one locked step, called from the
+`finally` that also releases the mutex, so success, a reported exception, a `BaseException`
+propagating out of an abandoned request and a withheld stale answer all drop the pin exactly once.
+Because both statements sit inside the same critical section the two orders behave identically
+today — a reviewer's mutation of exactly that swap survived the suite — so the source order is
+pinned by a structural test, against the day the lock block is ever split.
+
+Also corrected, from the same review: the test seam `_load_concurrency_seam` injected
+`_VERIFY_REVISION_CAP = 512` as a literal of its own instead of reading `src/gui.py`. That made
+the eviction tests blind to the production constant — the reviewer mutated the shipped cap to `2`,
+which makes this defect trivially reachable, and all 151 tests stayed green. The seam now reads the
+real module-level assignments, and a test pins the shipped value. One existing test's comment
+claimed "an active session keeps reading its own" revision; a running verification reads its
+revision exactly twice, at the start and at the end, and that false model of the lifecycle is why
+eviction of a running entry looked impossible. The comment is corrected and the test now says what
+it actually covers.
+
+No new module, no new Gradio component, no schema change, no persistence, and nothing live in
+`_verify_revisions`, the pin or `gr.State`. Tests: 5992 passed, 8 skipped (6000 collected), from
+the 5962/8/5970 pre-correction baseline — exactly +31, all in `tests/test_media_verify.py`
+(151 -> 182). Skips unchanged. Eight targeted mutations applied, all eight caught, including the
+exact pre-correction eviction body, the unpin/compare swap, capturing before the mutex, a leaked
+pin, and the cap mutation that previously survived.
+
+### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R3: two independently reproduced defects in Verify Sources)
+
+An independent review reproduced two MAJOR defects against the S2-A commit. Both are corrected
+here, on the same branch, with no change to Stage-5 cache identity, the classifier, the FFprobe
+command, the probe timeout, the work budget, the four-worker cap, rendering, or the Scan/Analyze
+workflows.
+
+**1. Cache classification and FFprobe could describe different versions of a file, reported as one
+complete verification.** A click answers the cache question and then the media question, and S2-A
+bracketed source stability only around the FFprobe call. A file overwritten *after* it was
+classified and *before* it was probed therefore reported `PREPARED` (the old bytes) beside
+`MEDIA_METADATA_OK` (the new bytes), under one "Verified at" header, `STATUS: COMPLETE`, "Every
+source has a reusable Stage-5 cache record." and "No metadata problems found in any source." — two
+confident verdicts about two different files, with nothing marked uncertain. This is precisely the
+case the feature exists to catch, and the window is the whole remainder of the cache phase, not a
+few milliseconds.
+
+`_verify_sources_impl` now takes one cheap `(size, mtime_ns)` observation per source
+(`media_verify.fingerprint_sources`) **before** calling `classify_library_sources`, and passes them
+positionally into `verify_media_health(..., baselines=...)`. `_verify_one` compares three
+observations instead of two — baseline, pre-probe, post-probe — and any disagreement is
+`MEDIA_CHANGED_DURING_CHECK` whatever the probe said, with the new `MediaVerdict.change_window`
+recording which window (`CROSS_PHASE` / `DURING_PROBE` / `BOTH`, never collapsed). A test asserts
+no code path can pair a change window with `METADATA_OK`.
+
+The report tells the truth about what that means without inventing anything: the classifier's
+counts are printed **verbatim and never silently adjusted** (subtracting changed sources would
+publish a classification nobody computed), a dedicated
+`Changed after classification - cache verdict INCONCLUSIVE` block names each affected path with the
+verdict it was given, the clean-cache and no-problems sentences are withdrawn, and an
+`INCONCLUSIVE:` line sits beside the `COMPLETE` banner with both window counts.
+`VerificationRun.complete` is deliberately unchanged — it is about probe coverage, which really was
+complete. `CHANGE_DETECTION_LIMIT_TEXT` is now carried in every report: this compares size and
+modification time only, it catches an accidental overwrite, and it is not whole-file
+byte-integrity proof. One extra `os.stat` per source; no file opened, no hash, no second identity
+formula, nothing persisted.
+
+**2. Gradio queued Verify Sources behind a render instead of refusing it, and a queued run could
+overwrite a newer invalidation.** S2-A gave the Verify event
+`concurrency_id=RENDER_CONCURRENCY_ID, concurrency_limit=1`. Measured on the pinned
+`gradio==6.19.0`, `Queue.get_events()` skips a concurrency group already at its limit and leaves
+the event **in the queue** — so the handler never reached `_RENDER_LOCK.acquire(blocking=False)` at
+all. It was entered only once the render finished, ran automatically against the folder captured at
+*click* time, and overwrote the "the library folder changed" notice the operator's own edit had just
+produced. Both busy messages were unreachable, and the scoped rule promised an immediate refusal
+nobody could observe. Mutual exclusion itself was never broken.
+
+`prep_verify_btn.click` now carries no `concurrency_id` and `concurrency_limit=None`, so its handler
+always executes and the mutex really is the gate. `None` rather than the default of 1 because a lane
+of 1 re-creates the same defect one step in, queuing a *second* Verify click instead of letting the
+mutex refuse it; a refusal is microseconds, so an unlimited lane costs nothing. Re-measured in an
+isolated fixture driving the shipped handlers: Verify refused in 0.19 s against a 5 s render and
+never auto-ran afterwards; a render clicked during verification was refused in 0.31 s. Both render
+events keep their lane, and `CANCEL_CONCURRENCY_ID` is untouched.
+
+The residual race — the folder changing *while* a verification is genuinely running, since the
+`change` listeners have their own lane — is closed by a **per-session** revision.
+`_on_verify_invalidate` bumps the revision for `gr.Request.session_hash`; the click captures it
+before starting and returns `PREP_VERIFY_STALE_TEXT` instead of its report (or its failure text, which
+names a folder too) if it moved. Session-scoped deliberately: one process-global counter would let a
+folder edit in one browser session invalidate a legitimate, still-running verification in another,
+and a fixture proves both directions. `_verify_revisions` is a bounded `str -> int` map (cap 512,
+least-recently-touched eviction, entries created only by a real invalidation, reads never insert) —
+`demo.unload` was measured not to fire for a closed client on this version, so the bound is the
+cleanup rather than a hook that does not run. No `gr.State`, no persistence, no live object in the
+map, and `prep_state` / `source_state` are untouched.
+
+**Refusals now name the real holder.** `_verify_busy_message()` returns the new
+`PREP_VERIFY_ALREADY_RUNNING_TEXT` when another verification owns the mutex and
+`PREP_VERIFY_RENDER_BUSY_TEXT` when a render does — telling the operator a render is running when
+none is was a wrong answer. `VERIFY_BUSY_MESSAGE` no longer says renders "wait for it": the render
+path refuses on a non-blocking acquire and never queued. A test bans "wait for it", "queued",
+"will start automatically" and similar from all three strings, because promising that a declined
+request will take its turn is the same class of inaccuracy this correction removes.
+
+Tests: 5962 passed, 8 skipped (5970 collected), from the 5905/8/5913 S2-A baseline — exactly +57,
+all in `tests/test_media_verify.py` (94 → 151). Skips unchanged. Nineteen targeted mutations were
+applied and all nineteen are caught, including two gaps this work closed: R2's MINOR that deleting
+the bounded submission window left the suite green (counting probes that have *entered* cannot see
+the window, because the thread pool caps that number either way — the new test records `submit`
+calls on the real executor while every worker is blocked), and the previously unpinned busy-message
+wording. Eight existing tests were adjusted for the new `request` parameter and the two distinct
+refusals; none was weakened.
+
+### Added — 2026-10-14 (MEDIA-VERIFY-S2-A: Verify Sources — read-only cache and media health)
+
+**A new "Verify Sources" button in the Media Library Preparation accordion answers two questions
+about the library folder without touching anything.** The owner sometimes overwrites previously
+analysed video files; until now the only way to find out what that cost was to start a preparation
+run and watch Qwen re-analyse, or to start a render and watch it fail. Verification answers it from
+cache records and container headers instead.
+
+The two questions are reported **separately**, because they are independent properties — an
+overwritten file is perfectly readable *and* has no reusable cache:
+
+* **CACHE VERIFICATION** — sources classified, reusable (`PREPARED`), new-or-changed,
+  incomplete/invalid record, identity unavailable, plus the exact problem paths. This goes through
+  the existing `video_analysis.classify_library_sources()`; there is no new cache key, no second
+  completion rule, no record written and no Qwen worker launched.
+* **MEDIA HEALTH** — one bounded FFprobe metadata read per source, reporting
+  `MEDIA_METADATA_OK` / `MEDIA_UNREADABLE` / `MEDIA_NO_VIDEO_STREAM` / `MEDIA_INVALID_METADATA` /
+  `MEDIA_PROBE_TIMEOUT` / `MEDIA_CHANGED_DURING_CHECK` / `MEDIA_NOT_CHECKED`, plus the exact problem
+  paths. These are report labels only; none is a cache-generation token.
+
+Four honesty boundaries are the substance of this change, not decoration:
+
+* **A metadata read is never sold as a decode guarantee.** Every report carries "Metadata readable —
+  full video decoding not verified." FFprobe parses headers; it does not decode frames. The D0
+  failure that motivated this milestone (a truncated MP4 with no `moov` atom) *is* caught, but a
+  file with an intact header and a shredded middle is not. A test forbids the words "intact", "no
+  corruption" and "fully verified" from appearing in any report.
+* **A probe timeout is not a corruption verdict.** A mechanical drive under concurrent load times
+  out for reasons unrelated to the file's bytes, so a timeout reports *unverified* and says so.
+* **A skipped source is never a successful one.** The overall work budget stops *scheduling*;
+  everything unreached becomes `MEDIA_NOT_CHECKED` with its own reason and the run is labelled
+  `PARTIAL / INCOMPLETE`.
+* **An unprovable Qwen backend identity is `UNVERIFIABLE`, not a damaged cache.** No per-source
+  cache verdict can exist in that state, so none is invented — printing "0 reusable" would be a
+  fabricated verdict.
+
+**Bounded by construction.** At most four concurrent FFprobe children (D0 measured 1.50 s → 0.59 s
+at four workers on a 41-file sample of the owner's mechanical source drive; beyond four a 5400-RPM
+spindle seeks rather than reads), submitted through a sliding window so a 2,000-source library never
+queues 2,000 work items, a 20 s per-file timeout, a 600 s overall budget, and every started child
+reaped before anything is reported. D0's ~30 s full-library extrapolation was never measured on the
+whole library and is **not** restated as a guarantee; the committed benchmark measures harness
+overhead (~0.05 ms/source) on synthetic fixtures with a stub probe.
+
+**Render exclusion reuses the existing mutex rather than adding a second one.** Verification and
+rendering read the same drive, and D0 traced clip-extraction timeouts to exactly that contention, so
+`_on_verify_sources_click` takes the process-global `_RENDER_LOCK` non-blockingly: Verify refuses
+while a render runs, and a render refuses while Verify runs — the latter needed no change to the
+render path, because it already refuses when the lock is held and does not care who holds it. One
+`acquire(blocking=False)` is the test and the acquisition in one indivisible step, where
+`if not lock.locked(): start()` would have been a check-then-act race, and a second lock would have
+had to be ordered against the first. The release is in a `finally`, so an exception or an abandoned
+request cannot leave the app permanently refusing renders. A running render is never signalled,
+throttled or terminated. Nothing — no lock, thread, process handle or cancellation object — is
+stored in `gr.State`.
+
+Verification is deliberately **not** serialized against the preparation Scan/Analyze buttons: those
+are the operator's own long-running clicks in the same accordion, and overlapping a bounded
+read-only probe sweep with one costs disk throughput only, unlike a render with a hard per-clip
+timeout.
+
+A source that changes while it is being probed is `MEDIA_CHANGED_DURING_CHECK` **whatever the probe
+said, including a clean read** — the bytes FFprobe described are not the bytes now on disk. Nothing
+is deleted, rebuilt or re-analysed in response. The `(size, mtime_ns)` bracket detects an overwrite
+and is not presented as proof of whole-file byte identity, exactly as Stage-5's bounded fingerprint
+is not.
+
+The report writes to one dedicated textbox and nothing else — not `status_output`, `video_output`,
+`process_btn`, `source_state`, `render_invocation_state`, `director_proposal_state`,
+`variant_batch_state`, the render-outcome state, `prep_outputs` or any element of `source_outputs`.
+Changing the folder or the subfolder setting clears the report through its own `change` listeners,
+leaving the preparation state machine untouched; the report header always names the folder, the
+recursive setting and the verification time so it cannot be mistaken for a different snapshot. No
+persistent report file is produced.
+
+Unchanged: Stage-5 prompt and semantics, cache filenames and payloads, backend identity, completion
+rules, audio analysis, Stage-4 cut selection, Stage-6 source selection and scoring, creative controls
+and presets, AI Director, Variant Lab, the S1 render failure diagnostics, render cancellation, master
+no-replace promotion, share/preview publication, the 120 s extraction timeout, the zero retry count
+and the FFmpeg argv. `src/video_analysis.py` and `src/video_processor.py` were not modified at all.
+All five protected contract constants are verified unchanged by test:
+`stage5_cache_v3`, `auto_av_analysis_v8_llama_vulkan_batched`, `stage5_job_partial_v1`,
+`_CACHE_IDENTITY_WORKER_CAP = 16`, `DEFAULT_ANALYZE_BATCH_SIZE = 100`.
+
+Out of scope here, by design: full-file decoding, targeted multi-window decode, automatic cache
+repair or invalidation, automatic render retry, and any Stage-6 change.
+
+Tests: 5905 passed, 8 skipped (5913 collected), from the 5806/8/5814 merged-main baseline — exactly
++99: 94 new cases in `tests/test_media_verify.py` (381 → 386 in `tests/test_library_preparation.py`
+accounts for the other 5), skips unchanged.
+`tests/test_no_runtime_dependency.py`'s stdlib allowlist gained `concurrent` (still stdlib, still no
+runtime dependency) and `tests/test_gui_guard_seam.py`'s busy-refusal check now also pins
+`_busy_message()`'s fallback to `RENDER_BUSY_MESSAGE` — a stronger assertion than the substring it
+replaced, not a weaker one.
+
 ### Changed — 2026-10-13 (MEDIA-VERIFY-S1: a failed clip names the source it was reading)
 
 **A failed FFmpeg extraction now reports which source video failed, and where in it.** Before this

@@ -42,6 +42,52 @@ automatically.
   events also share one `concurrency_id` with `concurrency_limit=1`, but that is cooperative: the
   lock is the authority, because it is provable without Gradio.
 
+  **`_RENDER_LOCK` has a THIRD non-blocking acquirer since S2-A: `_on_verify_sources_click`.**
+  Read-only source verification issues up to four concurrent FFprobe reads against the same drive a
+  render extracts from, and D0 traced clip-extraction timeouts to exactly that contention, so the
+  two are mutually exclusive. The mutex is *reused* rather than duplicated precisely because the
+  render side then needs no new check — it already refuses when the lock is held and does not care
+  who holds it — and because one `acquire(blocking=False)` is a test-and-set, whereas
+  `if not lock.locked(): start()` is a check-then-act race. The refusal message now comes from
+  `_busy_message()` so it names the real holder; `RENDER_BUSY_MESSAGE` remains the default.
+  Verification holds no `RenderLifecycle`, is not cancellable, and is not a render. See
+  `.claude/rules/source-verification.md`.
+
+  **A mutex cannot refuse an event the queue never delivers (S2-A R3).** `concurrency_id` grouping
+  is described above as "cooperative", and that is exactly why the Verify event must **not** join
+  `RENDER_CONCURRENCY_ID`. S2-A did, with `concurrency_limit=1`; measured on the pinned
+  `gradio==6.19.0`, `Queue.get_events()` skips a group already at its limit and leaves the event
+  queued, so the handler was not entered until the render finished — then it ran automatically
+  against the folder captured at *click* time and overwrote the newer invalidation notice. The
+  mutex was never reached and both busy messages were unreachable. `prep_verify_btn.click`
+  therefore carries no `concurrency_id` and `concurrency_limit=None` (unlimited — a lane of 1 would
+  queue a *second* Verify click instead of letting the mutex refuse it). Both render events keep
+  `concurrency_id=RENDER_CONCURRENCY_ID, concurrency_limit=1`, and `CANCEL_CONCURRENCY_ID` is
+  untouched. **Before claiming any Gradio queuing behaviour in this repository, measure it against
+  the pinned version** — this is the second time a plausible reading of a `concurrency_*` parameter
+  turned out to describe something the operator could not observe.
+
+  **`gr.Request` is an injected per-request value, not a widget and not session state.**
+  `_on_verify_sources_click(folder_path, recursive, request: gr.Request = None)` and
+  `_on_verify_invalidate(request: gr.Request = None)` both take it; neither lists it in `inputs`,
+  both default it to `None` so they stay callable without Gradio, and both read only
+  `session_hash`. It keys a bounded `str -> int` map (`_verify_revisions`, cap 512, LRU eviction)
+  that exists solely so a verification finishing after a folder change can withhold its now-stale
+  report. Session-scoped deliberately: a process-global counter would let one browser session
+  invalidate another's legitimate run. Nothing live — no lock, thread, handle or lifecycle — may
+  enter that map, and it is not a persistence layer.
+
+  **The running verification's own entry is exempt from that eviction (R5).** An absent key reads
+  back as revision `0`, so evicting the entry of a verification that is still running made "I was
+  invalidated" indistinguishable from "nothing changed" and published a stale report as current —
+  reproduced by independent review at exactly 512 competing sessions. `_RENDER_LOCK` already
+  permits only one verification, so `_verify_active_session` pins that one session for the span of
+  its run and `_bump_verify_revision` skips it; the cap still holds including the pinned entry.
+  `_begin_verify_session` pins and captures in one locked step **after** the mutex is taken, and
+  `_end_verify_session` compares and unpins in one locked step from the `finally`, so a refused
+  click pins nothing and no terminal path can leak a pin. The pin is a plain string and never
+  reaches `gr.State`. Full contract: `.claude/rules/source-verification.md`.
+
   **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
   `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
   event, an exception while draining — the frame unwinds immediately. Without a finalizer the
@@ -394,5 +440,6 @@ automatically.
 | Variant Lab **comparison / Apply Selected** seam, candidate count, batch state (C3) | `.claude/rules/variant-lab.md` **+** `.claude/rules/creative-presets.md` **+** `.claude/rules/audio-mixdown.md` — Apply writes both creative and audio widgets, so all three writer matrices apply |
 | voice clips, Smart Mix folder/roles/Amount/Level, the report panels | `.claude/rules/audio-mixdown.md` |
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
+| the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |

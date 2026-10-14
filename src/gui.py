@@ -317,6 +317,8 @@ DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'qwen3-4b-instruct-2507
 # report rendering live in src/beatsync_fork/library_prep.py (stdlib-only, Gradio-free); this module
 # only wires it to widgets and supplies the runtime calls it must not make itself.
 from beatsync_fork import library_prep as fork_prep
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification (stdlib-only fork module).
+from beatsync_fork import media_verify as fork_media_verify
 from beatsync_fork.library_prep import initial_state as initial_prep_state
 from beatsync_fork.input_manager import InputScanError, scan_folder as scan_library_folder
 
@@ -2912,6 +2914,240 @@ RENDER_BUSY_MESSAGE = (
 )
 
 # ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): render <-> verification exclusion.
+# ---------------------------------------------------------------------------
+#
+# Source verification issues up to four concurrent FFprobe reads against the same mechanical drive
+# a render extracts clips from. D0 established that exactly this kind of contention is what made
+# clip extraction exceed its 120 s bound (four NVENC workers against a 5400-RPM source disk), so
+# the two must never run together.
+#
+# **The mutex is reused, not duplicated.** `_RENDER_LOCK` is already a plain non-reentrant
+# `threading.Lock`, acquired non-blockingly at exactly two sites and released in `finally`. Taking
+# that same lock for verification yields bidirectional exclusion from one atomic test-and-set in
+# each direction, with no second lock to order against it and therefore no deadlock to reason
+# about:
+#
+#   * Verify while a render runs  -> `acquire(blocking=False)` fails -> verification refuses.
+#   * Render while Verify runs    -> the EXISTING `acquire(blocking=False)` fails -> render refuses.
+#
+# The second direction needed no change to the render path at all; it already refuses when the lock
+# is held, and it does not care who holds it. That is the whole reason this is a reused mutex rather
+# than a new flag: `if not lock.locked(): start_work()` is a check-then-act race, and a second lock
+# would have to be ordered against the first. One `acquire(blocking=False)` is the test and the
+# acquisition in a single indivisible step.
+#
+# **R3: the LOCK is only half the story, and the Gradio queue was quietly the other half.** S2-A
+# put the Verify event in `RENDER_CONCURRENCY_ID` with `concurrency_limit=1`, so a Verify clicked
+# during a render never reached the `acquire` above at all -- Gradio's `Queue.get_events()` skips a
+# concurrency group that is at its limit and leaves the event sitting in the queue. Measured on the
+# pinned gradio==6.19.0: the handler was entered only after the render finished, then ran
+# automatically against the folder value captured at CLICK time and overwrote the newer
+# "folder changed" invalidation. Both refusal messages were therefore unreachable, and the rule
+# text promising an immediate refusal described something the operator could never see. The Verify
+# event now has NO shared `concurrency_id` and `concurrency_limit=None`, so its handler always
+# executes and the mutex really is the gate -- re-measured on the same version.
+#
+# Nothing is stored in `gr.State`: no lock, no thread, no process handle, no cancellation object.
+# The cross-request state is a boolean (so a refusal can name the real holder) and a bounded
+# session->revision map (so a report cannot be published for a folder the operator has since
+# changed). Both are plain immutable values behind one small lock.
+#
+# Deliberately NOT extended to the preparation Scan/Analyze buttons. Those are the operator's own
+# long-running maintenance workflow in the same accordion; serializing them against verification
+# would be new behaviour for existing controls, and any new serialization must stay narrow.
+# Verification is bounded and read-only, so overlapping it with a Scan costs disk
+# throughput and nothing else -- unlike a render, which has a hard per-clip timeout that contention
+# can actually break.
+_VERIFY_FLAG_LOCK = threading.Lock()
+_verification_running = False
+
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): per-session verification revisions.
+#
+# One small integer per Gradio session, bumped when that session's folder or recursive setting
+# changes, so a verification that finishes AFTER an invalidation can tell that its answer is no
+# longer about the selected library.
+#
+# **Session-scoped, deliberately not process-global.** A single global counter would let a folder
+# edit in one browser session invalidate a legitimate, still-running verification in another. The
+# key is `gr.Request.session_hash`, which was measured on gradio==6.19.0 to be injected into both
+# the `.click` and the `inputs=None` `.change` handler, stable within a session and distinct
+# between two independent clients.
+#
+# **Bounded, and the bound IS the cleanup.** `demo.unload` was measured NOT to fire for a closed
+# API client on this version, so no end-of-session hook is relied on. Instead the map holds at most
+# `_VERIFY_REVISION_CAP` entries with least-recently-touched eviction, and an entry is only ever
+# created by an actual invalidation -- a session that never edits the folder never appears here.
+#
+# **R5: eviction used to be able to publish a stale report, and now cannot.** The R3 text claimed
+# eviction "can only ever make a comparison fail". That was wrong, and an independent review
+# reproduced it against these functions. `_verify_revision` returns 0 for an ABSENT key, so absence
+# and "revision zero" were indistinguishable:
+#
+#   1. Session A starts a verification with no entry yet -- it captures revision 0.
+#   2. A's folder changes; `_bump_verify_revision` stores A = 1.
+#   3. `_VERIFY_REVISION_CAP` OTHER sessions invalidate, and A -- whose verification is still
+#      running -- is evicted as least-recently-touched.
+#   4. The terminal check reads A again, finds it absent, and gets 0 back. `0 == 0`, so the report
+#      for the folder the operator has already left is published as current.
+#
+# Measured exactly: 511 other sessions were safe, 512 published the stale report. The same hole had
+# an ABA form -- an entry evicted at revision N and recreated at N by a later invalidation.
+#
+# The fix uses the invariant that already exists. `_RENDER_LOCK` permits at most ONE verification at
+# a time, so at most one session's revision is load-bearing at any instant. That session is pinned
+# in `_verify_active_session` for exactly the span of its own verification, and the eviction loop
+# skips it. Everything else is unchanged: other sessions evict normally, the cap still bounds the
+# map INCLUDING the pinned entry (there are always >= cap evictable keys when the cap is exceeded,
+# because only one key can be pinned), reads still never insert, and an unedited session still
+# never appears. Once the verification ends the pin is dropped and that entry is ordinary again.
+#
+# The pin is a plain string and nothing else -- no lock, thread, event, handle or lifecycle object
+# enters `_verify_revisions` or `gr.State`, and nothing is persisted.
+_VERIFY_REVISION_CAP = 512
+_verify_revisions: Dict[str, int] = {}
+
+#: The session whose verification is running right now, or `''`. Capacity exactly one, because
+#: `_RENDER_LOCK` already guarantees exactly one verification -- this is not a second authority on
+#: whether a verification may start, only a note of whose revision must survive eviction while it
+#: does. Set by `_begin_verify_session` after the mutex is held and cleared by
+#: `_end_verify_session` in a `finally`, so a refused click never pins anything and no terminal
+#: path can leave it set.
+_verify_active_session: str = ''
+
+
+def _mark_verification(active: bool) -> None:
+    """Publish whether the shared mutex is currently held by verification.
+
+    Called immediately after acquiring `_RENDER_LOCK` and immediately before releasing it, so a
+    reader that has just FAILED to acquire sees the correct holder. The one-statement window
+    between the two acquisitions can only mislabel a refusal message, never admit a second worker:
+    the mutex, not this flag, is the exclusion.
+    """
+    global _verification_running
+    with _VERIFY_FLAG_LOCK:
+        _verification_running = bool(active)
+
+
+def _busy_message() -> str:
+    """The accurate refusal for a RENDER caller that just failed to take `_RENDER_LOCK`."""
+    with _VERIFY_FLAG_LOCK:
+        running = _verification_running
+    return VERIFY_BUSY_MESSAGE if running else RENDER_BUSY_MESSAGE
+
+
+def _verify_busy_message() -> str:
+    """The accurate refusal for a VERIFY caller that just failed to take `_RENDER_LOCK`.
+
+    The mirror of `_busy_message`, and it exists for the same reason: telling the operator "a
+    render is running" when another verification actually owns the mutex is a wrong answer, and the
+    two cases need different advice (wait for the render, versus this one is already underway).
+    """
+    with _VERIFY_FLAG_LOCK:
+        running = _verification_running
+    return PREP_VERIFY_ALREADY_RUNNING_TEXT if running else PREP_VERIFY_RENDER_BUSY_TEXT
+
+
+def _verify_session_key(request) -> str:
+    """The session this verification request belongs to, or a shared fallback bucket.
+
+    A request without a usable `session_hash` (a scripted API call, a transport that did not carry
+    one) falls into one named bucket rather than into the per-session map: the fallback must not be
+    a *unique* key, or an invalidation could never match the verification it belongs to.
+    """
+    session = getattr(request, "session_hash", None) if request is not None else None
+    return str(session) if session else "__no_session__"
+
+
+def _touch_verify_revision_locked(session: str) -> int:
+    """This session's revision, moved to the most-recently-touched end. Caller holds the lock.
+
+    A read, never an insert: an absent session reports 0 and STAYS absent, so a session that never
+    edits its folder never occupies a slot. Absence reporting 0 is exactly what made eviction
+    dangerous before R5, which is why the active session is pinned rather than inserted here --
+    inserting on read would let any idle session hold a slot, and the R3 contract rules that out.
+    """
+    value = _verify_revisions.get(session)
+    if value is None:
+        return 0
+    del _verify_revisions[session]
+    _verify_revisions[session] = value
+    return value
+
+
+def _verify_revision(session: str) -> int:
+    """This session's current revision. A read, never an insert -- an unedited session stays absent.
+
+    The standalone accessor. The verification click does NOT use it: capturing a revision and
+    pinning the session have to happen in one locked step (see `_begin_verify_session`), because a
+    read-then-pin sequence would let an invalidation land in between and be captured as the
+    baseline instead of being detected.
+    """
+    with _VERIFY_FLAG_LOCK:
+        return _touch_verify_revision_locked(session)
+
+
+def _bump_verify_revision(session: str) -> int:
+    """Invalidate this session's pending verification result. Bounded, with LRU eviction.
+
+    Eviction skips `_verify_active_session`. That one exemption is the R5 correction: the running
+    verification's revision is the only one whose disappearance could be misread as "revision 0,
+    nothing has changed", and publishing an answer about a folder the operator has already left is
+    the exact failure this map exists to prevent.
+
+    The cap still bounds the map including the pinned entry. When the cap is exceeded there are at
+    least `_VERIFY_REVISION_CAP` keys available to drop, since at most one key is ever pinned, so
+    the loop always makes progress; the `break` is a belt-and-braces guard, not a reachable path.
+    """
+    with _VERIFY_FLAG_LOCK:
+        value = _verify_revisions.pop(session, 0) + 1
+        _verify_revisions[session] = value
+        while len(_verify_revisions) > _VERIFY_REVISION_CAP:
+            # Insertion order is touch order, so the first key is the least recently touched --
+            # except the active verification's, which must outlive every other session's churn.
+            victim = next((key for key in _verify_revisions
+                           if key != _verify_active_session), None)
+            if victim is None:
+                break
+            del _verify_revisions[victim]
+        return value
+
+
+def _begin_verify_session(session: str) -> int:
+    """Pin `session` as the active verification AND capture its revision, in one locked step.
+
+    Called only after `_RENDER_LOCK` has been acquired and before any verification work, so a
+    refused click never pins and never leaves active state behind.
+
+    Atomic on purpose. Pinning and reading as two separate locked operations would reopen the race
+    in a new place: an invalidation arriving between them would already be folded into the captured
+    baseline, and the terminal comparison would then see no change and publish the stale report.
+    """
+    global _verify_active_session
+    with _VERIFY_FLAG_LOCK:
+        _verify_active_session = session
+        return _touch_verify_revision_locked(session)
+
+
+def _end_verify_session(session: str, revision: int) -> bool:
+    """Decide staleness and release the pin, in one locked step. True means withhold the answer.
+
+    The order inside the lock is load-bearing and is the whole point of this function existing:
+    the comparison happens while the entry is still protected, and only then is the pin dropped.
+    Unpinning first and comparing afterwards would restore the original defect, because the entry
+    could be evicted in that gap and read back as 0.
+
+    Safe to call on every terminal path, including one where `_begin_verify_session` never ran:
+    clearing the pin is conditional on this session actually holding it.
+    """
+    global _verify_active_session
+    with _VERIFY_FLAG_LOCK:
+        current = _touch_verify_revision_locked(session)
+        if _verify_active_session == session:
+            _verify_active_session = ''
+        return current != revision
+
+# ---------------------------------------------------------------------------
 # [FORK] Digital-Union (C3-R1A): the capacity-one active-render slot.
 # ---------------------------------------------------------------------------
 #
@@ -3096,7 +3332,10 @@ def process_video_guarded(audio_file: str,
     is never execution authority.
     """
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, gr.skip(), gr.skip(), ''
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the refusal is unchanged -- only its wording is
+        # now accurate about WHO holds the mutex, since read-only source verification can also hold
+        # it. The gate itself is the same single non-blocking acquire.
+        yield gr.skip(), _busy_message(), session_state, gr.skip(), gr.skip(), ''
         return
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for this whole render event, constructed and
     # installed here, before any expensive work -- the mutex-owning wrapper owns
@@ -3220,7 +3459,10 @@ def render_selected_variants_guarded(
         return
 
     if not _RENDER_LOCK.acquire(blocking=False):
-        yield gr.skip(), RENDER_BUSY_MESSAGE, session_state, RENDER_BUSY_MESSAGE, ''
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): same accurate wording as the single-render
+        # wrapper; the gate is the unchanged single non-blocking acquire.
+        _busy = _busy_message()
+        yield gr.skip(), _busy, session_state, _busy, ''
         return
 
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- every selected candidate
@@ -3745,6 +3987,192 @@ def _on_prep_scan_click(folder_path: str, recursive: bool, state) -> Iterator[Tu
             event_callback=event_callback, console_logger=console_logger),
         state,
     )
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+# ---------------------------------------------------------------------------
+
+def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
+    """Answer the two verification questions for the folder the widgets declare RIGHT NOW.
+
+    Returns the report text and nothing else. It takes no `gr.State` and returns no state, by
+    design: verification is a pure read of the disk, it owns no session state, and giving it one
+    would be a second persistence layer for media-health results that nothing needs.
+
+    Why the LIVE widget values rather than `prep_state`
+    ---------------------------------------------------
+    Gradio delivers widget changes as separate queued events, so a user can retype the folder and
+    click Verify before the `change` handler has run. Reusing the recorded scan would then verify
+    the *previous* library while the screen declared a different one -- the same hazard the render
+    gate and `_prep_analyze_impl` already take live widget values to avoid. This enumerates the
+    folder itself, with the existing scanner and the live recursive flag, rather than trusting any
+    prior scan.
+
+    What it deliberately does NOT do
+    --------------------------------
+    No Qwen worker is launched (the classifier answers the cache question from records alone), no
+    analysis runs, no cache record is written, checkpointed or deleted, no media is modified, and
+    nothing is rendered. It writes no file at all -- the report lives in one textbox, because a
+    persistent report artifact is a later, separately reviewed milestone.
+    """
+    from ffmpeg_processing import probe_media_metadata
+    from video_analysis import classify_library_sources
+
+    folder = (folder_path or "").strip()
+    recursive = bool(recursive)
+    verified_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not folder:
+        return PREP_VERIFY_NO_FOLDER_TEXT
+
+    # 1. Enumerate the live folder with the existing scanner. `detect_duplicates=False` matches
+    #    `_prep_scan_impl`: duplicate grouping is a source-screen reporting feature and would be
+    #    pure extra reads here.
+    scan_started = time.perf_counter()
+    try:
+        input_set = scan_library_folder(folder, recursive=recursive, detect_duplicates=False)
+    except (InputScanError, OSError) as exc:
+        return (f"SOURCE VERIFICATION FAILED\n  Folder: {folder}\n"
+                f"  Include subfolders: {'yes' if recursive else 'no'}\n"
+                f"  Verified at: {verified_at}\n\n{exc}")
+    folder_scan_seconds = time.perf_counter() - scan_started
+    sources = [media.path for media in input_set.files]
+
+    # 2. [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): one cheap `(size, mtime_ns)` observation per
+    #    source, taken HERE -- before the cache phase looks at anything. This is the whole of the
+    #    cross-phase fix: without it, a file overwritten between being classified and being probed
+    #    produced PREPARED (old bytes) beside METADATA_OK (new bytes) under one COMPLETE banner.
+    #    One `os.stat` per source, aligned BY POSITION so a duplicate path keeps its own
+    #    observation. No hash, no second identity formula, nothing persisted.
+    baselines = fork_media_verify.fingerprint_sources(sources)
+
+    # 3. The cache question, through the EXISTING Stage-5 classifier. No new key formula, no new
+    #    completion rule, and the same Qwen enablement/model resolution the preparation workflow
+    #    uses -- `_resolve_prep_qwen_runtime` is shared, not reimplemented.
+    cache_started = time.perf_counter()
+    qwen_enabled, model_path = _resolve_prep_qwen_runtime()
+    classification = classify_library_sources(
+        sources, enable_ai=qwen_enabled, qwen_model_path=model_path)
+    cache_seconds = time.perf_counter() - cache_started
+
+    # An unprovable backend identity means no per-source cache verdict can EXIST. It is reported as
+    # UNVERIFIABLE, never as evidence that the cache is damaged -- the classifier returns empty
+    # counts in that state, and presenting them as "0 reusable" would be a fabricated verdict.
+    unverifiable = ""
+    if classification.get("ai_cache_disabled"):
+        unverifiable = ("The Qwen backend identity could not be verified, so Stage-5 cache records "
+                        "cannot be looked up for this library.")
+
+    # 4. The media question. Independent of the cache answer, and bounded: at most four probe
+    #    workers, a per-file timeout, and an overall budget after which unreached sources are
+    #    reported as not checked rather than quietly omitted. The baselines from step 2 ride along,
+    #    so each verdict can see whether its own file moved since its own classification.
+    run = fork_media_verify.verify_media_health(
+        sources, probe_media_metadata, baselines=baselines)
+
+    return fork_media_verify.format_verification_report(
+        folder=folder, recursive=recursive, verified_at=verified_at,
+        source_count=len(sources),
+        cache=classification,
+        cache_classifications=classification.get("classifications") or (),
+        run=run,
+        folder_scan_seconds=folder_scan_seconds,
+        cache_seconds=cache_seconds,
+        cache_unverifiable_reason=unverifiable,
+    )
+
+
+def _on_verify_sources_click(folder_path: str, recursive: bool,
+                             request: gr.Request = None) -> str:
+    """The Verify Sources click: take the shared render mutex, or refuse immediately.
+
+    One non-blocking `acquire` is both the test and the acquisition, so there is no window in which
+    a render could start alongside an accepted verification -- and none in which this could start
+    alongside a render. A render that arrives while this holds the lock hits the EXISTING
+    non-blocking acquire in `process_video_guarded` / the batch wrapper and refuses; nothing in the
+    render path needed a new check.
+
+    This is only an *immediate* refusal because the event is no longer queued behind the render
+    lane -- see the exclusion block above. Measured on gradio==6.19.0, not inferred.
+
+    The release is in `finally`, so an exception, an early return or an abandoned request cannot
+    leave the application permanently refusing renders. A running render is never signalled,
+    throttled or terminated to make room for this.
+
+    `request` is Gradio's injected `gr.Request`, not a widget: it carries the session identity used
+    to decide, at the very end, whether this answer is still about the library the operator has
+    selected. It is read for `session_hash` and nothing else, defaults to `None` so the function
+    stays callable without Gradio, and never reaches `gr.State`.
+
+    Four states, and the revision bookkeeping exists to keep them distinguishable
+    ---------------------------------------------------------------------------
+    *Starting* (mutex taken, pin and baseline established together), *running* (an invalidation may
+    arrive at any moment and must survive other sessions' churn), *finished but not published* (the
+    comparison is made while the entry is still pinned), *published or withheld*. R5's correction is
+    entirely about the third state: before it, the entry could be evicted between the second and
+    third, and its absence read back as "revision 0, nothing changed".
+    """
+    session = _verify_session_key(request)
+
+    if not _RENDER_LOCK.acquire(blocking=False):
+        # Names the real holder: a render, or another verification already underway. Nothing is
+        # pinned and no revision is captured on this path -- a refused click leaves no state at all.
+        return _verify_busy_message()
+    _mark_verification(True)
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5): pinned and captured together, AFTER the mutex is
+    # held and BEFORE any work, so this session's revision cannot be evicted by other sessions'
+    # churn while the verification it belongs to is still running. `stale` is decided inside the
+    # same `finally` that drops the pin, so there is no window between the two.
+    #
+    # `revision` is pre-set because the `finally` below reads it: if `_begin_verify_session` itself
+    # ever failed, the cleanup still has to run with a defined baseline. `stale` needs no such
+    # default -- the `finally` always assigns it, and the only way past it without one is an
+    # exception propagating, which never reaches the comparison.
+    revision = 0
+    try:
+        revision = _begin_verify_session(session)
+        try:
+            report = _verify_sources_impl(folder_path, recursive)
+        except Exception as exc:
+            # Total: a verification that raised must report, not vanish behind Gradio's generic
+            # error and not leave the operator unable to tell whether anything ran.
+            import traceback
+            traceback.print_exc()
+            report = (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
+                      f"No analysis, cache change, media change or render was performed.")
+    finally:
+        # The staleness decision happens HERE, while the entry is still pinned, and the pin is
+        # released by the same locked call. Reached on every terminal path including a
+        # `BaseException` propagating out, so the pin can never outlive its verification.
+        stale = _end_verify_session(session, revision)
+        # Cleared BEFORE the release, so a caller that fails the acquire a moment later attributes
+        # the mutex to whoever actually holds it next.
+        _mark_verification(False)
+        _RENDER_LOCK.release()
+
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): the folder-change listener runs in its own
+    # Gradio lane, so it can complete WHILE this is working. Publishing now would overwrite the
+    # newer "the folder changed" notice with an older answer about a folder that is no longer
+    # selected. The failure text is withheld for the same reason: it names a folder too.
+    if stale:
+        return PREP_VERIFY_STALE_TEXT
+    return report
+
+
+def _on_verify_invalidate(request: gr.Request = None) -> str:
+    """Clear the verification report when the folder or recursive setting changes.
+
+    A separate listener rather than an addition to `prep_outputs`: the preparation state machine is
+    untouched by verification and must stay that way, so this writes ONLY the verification textbox
+    and shares no outputs with the preparation events.
+
+    It also bumps this SESSION's verification revision, which is what stops a verification already
+    in flight from publishing its older answer over this notice. Session-scoped on purpose: a
+    folder edit here must not invalidate a legitimate verification running in a different browser
+    session.
+    """
+    _bump_verify_revision(_verify_session_key(request))
+    return PREP_VERIFY_STALE_TEXT
 
 
 def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
@@ -4530,6 +4958,31 @@ def create_ui() -> gr.Blocks:
                         initial_prep_state().notice, elem_id='prep-status'
                     )
 
+                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+                    # Inside this accordion because it asks about the same library folder, and
+                    # below Analyze because it is the "did my files change / are they still OK"
+                    # question you ask around a preparation run rather than part of one.
+                    #
+                    # Like the rest of this section it is absent from `source_outputs` and from
+                    # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
+                    # move the preparation state machine. It is also ALWAYS interactive -- the
+                    # render mutex, not a disabled button, is what prevents it running during a
+                    # render, because a button's interactivity is per-session UX while the mutex is
+                    # process-global truth.
+                    gr.Markdown(INFO_PREP_VERIFY)
+                    prep_verify_btn = gr.Button(
+                        LABEL_PREP_VERIFY, variant='secondary',
+                        elem_id='prep-verify-button',
+                    )
+                    prep_verify_report = gr.Textbox(
+                        label=LABEL_PREP_VERIFY_REPORT,
+                        value=PREP_VERIFY_INITIAL_TEXT,
+                        interactive=False,
+                        lines=12,
+                        max_lines=24,
+                        elem_id='prep-verify-report-box',
+                    )
+
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
@@ -4963,6 +5416,61 @@ def create_ui() -> gr.Blocks:
             inputs=[prep_folder, prep_recursive, prep_batch_size, prep_state],
             outputs=prep_outputs,
             show_progress='hidden',
+        )
+
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+        #
+        # Note what is absent from `inputs`: `prep_state`. Verification owns no session state and
+        # reads no recorded scan -- its inputs are exactly the two LIVE widgets that define "which
+        # library did you mean", so a queued `change` event can never make it verify the previous
+        # folder.
+        #
+        # Note what is absent from `outputs`: everything except its own report box. Not
+        # `status_output`, `video_output`, `process_btn`, `source_state`,
+        # `render_invocation_state`, `director_proposal_state`, `variant_batch_state`, the render
+        # outcome state, `prep_outputs` or any element of `source_outputs`. A verification click
+        # therefore cannot enable a render, disable one, move the preparation state machine or
+        # overwrite a render's status line.
+        #
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): NO `concurrency_id`, and
+        # `concurrency_limit=None`.
+        #
+        # S2-A put this event in `RENDER_CONCURRENCY_ID` with `concurrency_limit=1` as "cooperative
+        # UX". Measured on the pinned gradio==6.19.0, that is what broke the contract: a Verify
+        # clicked during a render was QUEUED rather than refused -- `Queue.get_events()` skips a
+        # group at its limit and leaves the event queued -- then ran automatically once the render
+        # finished, against the folder captured at click time, and overwrote the newer
+        # "folder changed" notice. Both busy messages were unreachable.
+        #
+        # Its own lane makes the handler always execute, so `_RENDER_LOCK` is reached and the
+        # refusal is real and immediate. `concurrency_limit=None` (unlimited) rather than the
+        # default of 1, because a lane of 1 would re-create the same defect one step in: a second
+        # Verify click would queue behind the first instead of being refused by the mutex. A
+        # refusal is microseconds of work, so unlimited here costs nothing -- the mutex, not the
+        # lane, is what bounds the actual disk reads to one at a time.
+        #
+        # Deliberately NOT `CANCEL_CONCURRENCY_ID`: that lane belongs to Cancel and is untouched.
+        prep_verify_btn.click(
+            fn=_on_verify_sources_click,
+            inputs=[prep_folder, prep_recursive],
+            outputs=[prep_verify_report],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        # Separate `change` listeners rather than entries in `prep_outputs`: a changed folder makes
+        # the old verification describe a different library snapshot, so it is visibly cleared --
+        # but the preparation state machine's own folder/recursive handling is left exactly as it
+        # was, sharing no outputs with these. They also bump this session's verification revision,
+        # which is what keeps an in-flight verification from publishing over this notice.
+        prep_folder.change(
+            fn=_on_verify_invalidate,
+            inputs=None,
+            outputs=[prep_verify_report],
+        )
+        prep_recursive.change(
+            fn=_on_verify_invalidate,
+            inputs=None,
+            outputs=[prep_verify_report],
         )
 
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the

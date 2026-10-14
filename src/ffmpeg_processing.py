@@ -33,6 +33,13 @@ from gpu_cpu_utils import MAX_THREADS
 from beatsync_fork import ffmpeg_diagnostics as fork_diagnostics
 # [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module).
 from beatsync_fork.render_worker import RenderCancelled
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the read-only verification contract (stdlib-only fork
+# module). Imported for the probe's result record and its bound only; the hard rule is one-way --
+# a runtime module may import the fork package, never the reverse.
+from beatsync_fork.media_verify import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS as _MEDIA_VERIFY_PROBE_TIMEOUT,
+    ProbeOutcome,
+)
 
 # Initialize environment
 setup_environment()
@@ -298,6 +305,72 @@ def get_video_resolution(video_file: str) -> Tuple[int, int]:
     except Exception as e:
         print(f"   ⚠️  Could not get video resolution with ffprobe: {e}")
         return (1920, 1080)  # Default fallback
+
+
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the read-only metadata probe.
+#
+# A pure argv builder plus the smallest bounded execution seam, placed beside the existing FFprobe
+# helpers above and sharing their `FFPROBE_PATH` and `_run_media_command` conventions. It exists
+# here rather than in `gui.py` so that no new `subprocess.run`/`Popen` site is added to the UI
+# layer, and so the command itself can be asserted without running anything.
+#
+# Unlike `get_video_duration`/`get_video_fps`/`get_video_resolution` above, this returns the raw
+# outcome instead of a fallback value. Those three are render-path helpers whose callers need *a*
+# number to proceed; this is a diagnostic whose entire purpose is to report failure accurately, and
+# a silent `10.0` default would be the exact dishonesty the milestone exists to remove.
+#
+# Nothing here is a cache input. It reads no cache record, writes nothing, launches no Qwen worker
+# and touches no media: `-show_format -show_streams` reads headers only and never decodes a frame.
+def build_ffprobe_metadata_command(video_file: str) -> List[str]:
+    """The argv for one read-only metadata probe. An ARRAY, never a shell string.
+
+    `-show_format` and `-show_streams` together give container duration plus per-stream codec,
+    geometry and frame rate in one child process — one spin-up per source rather than the three the
+    existing single-value helpers would cost.
+    """
+    return [
+        FFPROBE_PATH,
+        '-v', 'error',
+        '-print_format', 'json',
+        '-show_format',
+        '-show_streams',
+        video_file,
+    ]
+
+
+def probe_media_metadata(video_file: str,
+                         timeout: float = _MEDIA_VERIFY_PROBE_TIMEOUT) -> ProbeOutcome:
+    """Run one bounded metadata probe and report the outcome verbatim.
+
+    Total by construction, because this runs inside a verification worker pool: every failure mode
+    becomes a reported outcome rather than an exception that would abort a 2,000-source run.
+
+    The three outcomes are kept DISTINCT rather than collapsed into one error string, because the
+    verdict they imply differs:
+
+    * `timed_out=True` — the probe exceeded its bound. Says nothing about the file's bytes; a
+      mechanical drive under concurrent load is the likely cause, so the classifier reports
+      UNVERIFIED rather than corrupt.
+    * `error` — the seam itself failed (FFprobe missing, OS refused the spawn). We hold no opinion
+      on the file at all.
+    * a real `returncode`/`stdout`/`stderr` — FFprobe ran and judged the file.
+
+    No `lifecycle` is passed to `_run_media_command`: that parameter is the render cancellation
+    path, and verification is not a render. The plain `timeout` branch it takes is the original
+    unchanged `subprocess.run(..., timeout=timeout)`.
+    """
+    cmd = build_ffprobe_metadata_command(video_file)
+    try:
+        result = _run_media_command(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ProbeOutcome(timed_out=True)
+    except (OSError, ValueError) as exc:
+        return ProbeOutcome(error=f"{type(exc).__name__}: {exc}")
+    return ProbeOutcome(
+        returncode=int(result.returncode),
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+    )
 
 
 def seconds_to_frame_count(seconds: float, fps: float) -> int:
