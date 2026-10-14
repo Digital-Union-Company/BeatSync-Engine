@@ -2937,9 +2937,21 @@ RENDER_BUSY_MESSAGE = (
 # would have to be ordered against the first. One `acquire(blocking=False)` is the test and the
 # acquisition in a single indivisible step.
 #
+# **R3: the LOCK is only half the story, and the Gradio queue was quietly the other half.** S2-A
+# put the Verify event in `RENDER_CONCURRENCY_ID` with `concurrency_limit=1`, so a Verify clicked
+# during a render never reached the `acquire` above at all -- Gradio's `Queue.get_events()` skips a
+# concurrency group that is at its limit and leaves the event sitting in the queue. Measured on the
+# pinned gradio==6.19.0: the handler was entered only after the render finished, then ran
+# automatically against the folder value captured at CLICK time and overwrote the newer
+# "folder changed" invalidation. Both refusal messages were therefore unreachable, and the rule
+# text promising an immediate refusal described something the operator could never see. The Verify
+# event now has NO shared `concurrency_id` and `concurrency_limit=None`, so its handler always
+# executes and the mutex really is the gate -- re-measured on the same version.
+#
 # Nothing is stored in `gr.State`: no lock, no thread, no process handle, no cancellation object.
-# The only cross-request state is the small boolean below, and it exists purely so the refusal
-# message can name the real reason.
+# The cross-request state is a boolean (so a refusal can name the real holder) and a bounded
+# session->revision map (so a report cannot be published for a folder the operator has since
+# changed). Both are plain immutable values behind one small lock.
 #
 # Deliberately NOT extended to the preparation Scan/Analyze buttons. Those are the operator's own
 # long-running maintenance workflow in the same accordion; serializing them against verification
@@ -2949,6 +2961,27 @@ RENDER_BUSY_MESSAGE = (
 # can actually break.
 _VERIFY_FLAG_LOCK = threading.Lock()
 _verification_running = False
+
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): per-session verification revisions.
+#
+# One small integer per Gradio session, bumped when that session's folder or recursive setting
+# changes, so a verification that finishes AFTER an invalidation can tell that its answer is no
+# longer about the selected library.
+#
+# **Session-scoped, deliberately not process-global.** A single global counter would let a folder
+# edit in one browser session invalidate a legitimate, still-running verification in another. The
+# key is `gr.Request.session_hash`, which was measured on gradio==6.19.0 to be injected into both
+# the `.click` and the `inputs=None` `.change` handler, stable within a session and distinct
+# between two independent clients.
+#
+# **Bounded, and the bound IS the cleanup.** `demo.unload` was measured NOT to fire for a closed
+# API client on this version, so no end-of-session hook is relied on. Instead the map holds at most
+# `_VERIFY_REVISION_CAP` entries with least-recently-touched eviction, and an entry is only ever
+# created by an actual invalidation -- a session that never edits the folder never appears here.
+# Eviction can only ever make a comparison fail, i.e. show the "folder changed" notice instead of a
+# report; it can never let a stale report be published as current.
+_VERIFY_REVISION_CAP = 512
+_verify_revisions: Dict[str, int] = {}
 
 
 def _mark_verification(active: bool) -> None:
@@ -2965,10 +2998,56 @@ def _mark_verification(active: bool) -> None:
 
 
 def _busy_message() -> str:
-    """The accurate refusal for a caller that just failed to take `_RENDER_LOCK`."""
+    """The accurate refusal for a RENDER caller that just failed to take `_RENDER_LOCK`."""
     with _VERIFY_FLAG_LOCK:
         running = _verification_running
     return VERIFY_BUSY_MESSAGE if running else RENDER_BUSY_MESSAGE
+
+
+def _verify_busy_message() -> str:
+    """The accurate refusal for a VERIFY caller that just failed to take `_RENDER_LOCK`.
+
+    The mirror of `_busy_message`, and it exists for the same reason: telling the operator "a
+    render is running" when another verification actually owns the mutex is a wrong answer, and the
+    two cases need different advice (wait for the render, versus this one is already underway).
+    """
+    with _VERIFY_FLAG_LOCK:
+        running = _verification_running
+    return PREP_VERIFY_ALREADY_RUNNING_TEXT if running else PREP_VERIFY_RENDER_BUSY_TEXT
+
+
+def _verify_session_key(request) -> str:
+    """The session this verification request belongs to, or a shared fallback bucket.
+
+    A request without a usable `session_hash` (a scripted API call, a transport that did not carry
+    one) falls into one named bucket rather than into the per-session map: the fallback must not be
+    a *unique* key, or an invalidation could never match the verification it belongs to.
+    """
+    session = getattr(request, "session_hash", None) if request is not None else None
+    return str(session) if session else "__no_session__"
+
+
+def _verify_revision(session: str) -> int:
+    """This session's current revision. A read, never an insert -- an unedited session stays absent."""
+    with _VERIFY_FLAG_LOCK:
+        value = _verify_revisions.get(session)
+        if value is None:
+            return 0
+        # Touch: least-recently-used eviction must not drop a session that is still in use.
+        del _verify_revisions[session]
+        _verify_revisions[session] = value
+        return value
+
+
+def _bump_verify_revision(session: str) -> int:
+    """Invalidate this session's pending verification result. Bounded, with LRU eviction."""
+    with _VERIFY_FLAG_LOCK:
+        value = _verify_revisions.pop(session, 0) + 1
+        _verify_revisions[session] = value
+        while len(_verify_revisions) > _VERIFY_REVISION_CAP:
+            # Insertion order is touch order, so the first key is the least recently touched.
+            del _verify_revisions[next(iter(_verify_revisions))]
+        return value
 
 # ---------------------------------------------------------------------------
 # [FORK] Digital-Union (C3-R1A): the capacity-one active-render slot.
@@ -3861,7 +3940,15 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
     folder_scan_seconds = time.perf_counter() - scan_started
     sources = [media.path for media in input_set.files]
 
-    # 2. The cache question, through the EXISTING Stage-5 classifier. No new key formula, no new
+    # 2. [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): one cheap `(size, mtime_ns)` observation per
+    #    source, taken HERE -- before the cache phase looks at anything. This is the whole of the
+    #    cross-phase fix: without it, a file overwritten between being classified and being probed
+    #    produced PREPARED (old bytes) beside METADATA_OK (new bytes) under one COMPLETE banner.
+    #    One `os.stat` per source, aligned BY POSITION so a duplicate path keeps its own
+    #    observation. No hash, no second identity formula, nothing persisted.
+    baselines = fork_media_verify.fingerprint_sources(sources)
+
+    # 3. The cache question, through the EXISTING Stage-5 classifier. No new key formula, no new
     #    completion rule, and the same Qwen enablement/model resolution the preparation workflow
     #    uses -- `_resolve_prep_qwen_runtime` is shared, not reimplemented.
     cache_started = time.perf_counter()
@@ -3878,10 +3965,12 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
         unverifiable = ("The Qwen backend identity could not be verified, so Stage-5 cache records "
                         "cannot be looked up for this library.")
 
-    # 3. The media question. Independent of the cache answer, and bounded: at most four probe
+    # 4. The media question. Independent of the cache answer, and bounded: at most four probe
     #    workers, a per-file timeout, and an overall budget after which unreached sources are
-    #    reported as not checked rather than quietly omitted.
-    run = fork_media_verify.verify_media_health(sources, probe_media_metadata)
+    #    reported as not checked rather than quietly omitted. The baselines from step 2 ride along,
+    #    so each verdict can see whether its own file moved since its own classification.
+    run = fork_media_verify.verify_media_health(
+        sources, probe_media_metadata, baselines=baselines)
 
     return fork_media_verify.format_verification_report(
         folder=folder, recursive=recursive, verified_at=verified_at,
@@ -3895,7 +3984,8 @@ def _verify_sources_impl(folder_path: str, recursive: bool) -> str:
     )
 
 
-def _on_verify_sources_click(folder_path: str, recursive: bool) -> str:
+def _on_verify_sources_click(folder_path: str, recursive: bool,
+                             request: gr.Request = None) -> str:
     """The Verify Sources click: take the shared render mutex, or refuse immediately.
 
     One non-blocking `acquire` is both the test and the acquisition, so there is no window in which
@@ -3904,36 +3994,64 @@ def _on_verify_sources_click(folder_path: str, recursive: bool) -> str:
     non-blocking acquire in `process_video_guarded` / the batch wrapper and refuses; nothing in the
     render path needed a new check.
 
+    This is only an *immediate* refusal because the event is no longer queued behind the render
+    lane -- see the exclusion block above. Measured on gradio==6.19.0, not inferred.
+
     The release is in `finally`, so an exception, an early return or an abandoned request cannot
     leave the application permanently refusing renders. A running render is never signalled,
     throttled or terminated to make room for this.
+
+    `request` is Gradio's injected `gr.Request`, not a widget: it carries the session identity used
+    to decide, at the very end, whether this answer is still about the library the operator has
+    selected. It is read for `session_hash` and nothing else, defaults to `None` so the function
+    stays callable without Gradio, and never reaches `gr.State`.
     """
+    # Captured BEFORE the work starts, so an invalidation that arrives at any point during it is
+    # visible as a difference afterwards.
+    session = _verify_session_key(request)
+    revision = _verify_revision(session)
+
     if not _RENDER_LOCK.acquire(blocking=False):
-        return PREP_VERIFY_RENDER_BUSY_TEXT
+        # Names the real holder: a render, or another verification already underway.
+        return _verify_busy_message()
     _mark_verification(True)
     try:
-        return _verify_sources_impl(folder_path, recursive)
+        report = _verify_sources_impl(folder_path, recursive)
     except Exception as exc:
         # Total: a verification that raised must report, not vanish behind Gradio's generic error
         # and not leave the operator unable to tell whether anything ran.
         import traceback
         traceback.print_exc()
-        return (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
-                f"No analysis, cache change, media change or render was performed.")
+        report = (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
+                  f"No analysis, cache change, media change or render was performed.")
     finally:
         # Cleared BEFORE the release, so a caller that fails the acquire a moment later attributes
         # the mutex to whoever actually holds it next.
         _mark_verification(False)
         _RENDER_LOCK.release()
 
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): the folder-change listener runs in its own
+    # Gradio lane, so it can complete WHILE this is working. Publishing now would overwrite the
+    # newer "the folder changed" notice with an older answer about a folder that is no longer
+    # selected. The failure text is withheld for the same reason: it names a folder too.
+    if _verify_revision(session) != revision:
+        return PREP_VERIFY_STALE_TEXT
+    return report
 
-def _on_verify_invalidate() -> str:
+
+def _on_verify_invalidate(request: gr.Request = None) -> str:
     """Clear the verification report when the folder or recursive setting changes.
 
     A separate listener rather than an addition to `prep_outputs`: the preparation state machine is
     untouched by verification and must stay that way, so this writes ONLY the verification textbox
     and shares no outputs with the preparation events.
+
+    It also bumps this SESSION's verification revision, which is what stops a verification already
+    in flight from publishing its older answer over this notice. Session-scoped on purpose: a
+    folder edit here must not invalidate a legitimate verification running in a different browser
+    session.
     """
+    _bump_verify_revision(_verify_session_key(request))
     return PREP_VERIFY_STALE_TEXT
 
 
@@ -5194,22 +5312,36 @@ def create_ui() -> gr.Blocks:
         # therefore cannot enable a render, disable one, move the preparation state machine or
         # overwrite a render's status line.
         #
-        # It joins RENDER_CONCURRENCY_ID with `concurrency_limit=1`: the shared `_RENDER_LOCK` is
-        # the authority (and the only thing the regression tests rely on), but queuing verification
-        # in the same cooperative lane as the renders means a user who clicks both usually gets
-        # them in sequence rather than one refusal.
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): NO `concurrency_id`, and
+        # `concurrency_limit=None`.
+        #
+        # S2-A put this event in `RENDER_CONCURRENCY_ID` with `concurrency_limit=1` as "cooperative
+        # UX". Measured on the pinned gradio==6.19.0, that is what broke the contract: a Verify
+        # clicked during a render was QUEUED rather than refused -- `Queue.get_events()` skips a
+        # group at its limit and leaves the event queued -- then ran automatically once the render
+        # finished, against the folder captured at click time, and overwrote the newer
+        # "folder changed" notice. Both busy messages were unreachable.
+        #
+        # Its own lane makes the handler always execute, so `_RENDER_LOCK` is reached and the
+        # refusal is real and immediate. `concurrency_limit=None` (unlimited) rather than the
+        # default of 1, because a lane of 1 would re-create the same defect one step in: a second
+        # Verify click would queue behind the first instead of being refused by the mutex. A
+        # refusal is microseconds of work, so unlimited here costs nothing -- the mutex, not the
+        # lane, is what bounds the actual disk reads to one at a time.
+        #
+        # Deliberately NOT `CANCEL_CONCURRENCY_ID`: that lane belongs to Cancel and is untouched.
         prep_verify_btn.click(
             fn=_on_verify_sources_click,
             inputs=[prep_folder, prep_recursive],
             outputs=[prep_verify_report],
             show_progress='hidden',
-            concurrency_id=RENDER_CONCURRENCY_ID,
-            concurrency_limit=1,
+            concurrency_limit=None,
         )
         # Separate `change` listeners rather than entries in `prep_outputs`: a changed folder makes
         # the old verification describe a different library snapshot, so it is visibly cleared --
         # but the preparation state machine's own folder/recursive handling is left exactly as it
-        # was, sharing no outputs with these.
+        # was, sharing no outputs with these. They also bump this session's verification revision,
+        # which is what keeps an in-flight verification from publishing over this notice.
         prep_folder.change(
             fn=_on_verify_invalidate,
             inputs=None,

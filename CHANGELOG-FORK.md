@@ -20,6 +20,90 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R3: two independently reproduced defects in Verify Sources)
+
+An independent review reproduced two MAJOR defects against the S2-A commit. Both are corrected
+here, on the same branch, with no change to Stage-5 cache identity, the classifier, the FFprobe
+command, the probe timeout, the work budget, the four-worker cap, rendering, or the Scan/Analyze
+workflows.
+
+**1. Cache classification and FFprobe could describe different versions of a file, reported as one
+complete verification.** A click answers the cache question and then the media question, and S2-A
+bracketed source stability only around the FFprobe call. A file overwritten *after* it was
+classified and *before* it was probed therefore reported `PREPARED` (the old bytes) beside
+`MEDIA_METADATA_OK` (the new bytes), under one "Verified at" header, `STATUS: COMPLETE`, "Every
+source has a reusable Stage-5 cache record." and "No metadata problems found in any source." — two
+confident verdicts about two different files, with nothing marked uncertain. This is precisely the
+case the feature exists to catch, and the window is the whole remainder of the cache phase, not a
+few milliseconds.
+
+`_verify_sources_impl` now takes one cheap `(size, mtime_ns)` observation per source
+(`media_verify.fingerprint_sources`) **before** calling `classify_library_sources`, and passes them
+positionally into `verify_media_health(..., baselines=...)`. `_verify_one` compares three
+observations instead of two — baseline, pre-probe, post-probe — and any disagreement is
+`MEDIA_CHANGED_DURING_CHECK` whatever the probe said, with the new `MediaVerdict.change_window`
+recording which window (`CROSS_PHASE` / `DURING_PROBE` / `BOTH`, never collapsed). A test asserts
+no code path can pair a change window with `METADATA_OK`.
+
+The report tells the truth about what that means without inventing anything: the classifier's
+counts are printed **verbatim and never silently adjusted** (subtracting changed sources would
+publish a classification nobody computed), a dedicated
+`Changed after classification - cache verdict INCONCLUSIVE` block names each affected path with the
+verdict it was given, the clean-cache and no-problems sentences are withdrawn, and an
+`INCONCLUSIVE:` line sits beside the `COMPLETE` banner with both window counts.
+`VerificationRun.complete` is deliberately unchanged — it is about probe coverage, which really was
+complete. `CHANGE_DETECTION_LIMIT_TEXT` is now carried in every report: this compares size and
+modification time only, it catches an accidental overwrite, and it is not whole-file
+byte-integrity proof. One extra `os.stat` per source; no file opened, no hash, no second identity
+formula, nothing persisted.
+
+**2. Gradio queued Verify Sources behind a render instead of refusing it, and a queued run could
+overwrite a newer invalidation.** S2-A gave the Verify event
+`concurrency_id=RENDER_CONCURRENCY_ID, concurrency_limit=1`. Measured on the pinned
+`gradio==6.19.0`, `Queue.get_events()` skips a concurrency group already at its limit and leaves
+the event **in the queue** — so the handler never reached `_RENDER_LOCK.acquire(blocking=False)` at
+all. It was entered only once the render finished, ran automatically against the folder captured at
+*click* time, and overwrote the "the library folder changed" notice the operator's own edit had just
+produced. Both busy messages were unreachable, and the scoped rule promised an immediate refusal
+nobody could observe. Mutual exclusion itself was never broken.
+
+`prep_verify_btn.click` now carries no `concurrency_id` and `concurrency_limit=None`, so its handler
+always executes and the mutex really is the gate. `None` rather than the default of 1 because a lane
+of 1 re-creates the same defect one step in, queuing a *second* Verify click instead of letting the
+mutex refuse it; a refusal is microseconds, so an unlimited lane costs nothing. Re-measured in an
+isolated fixture driving the shipped handlers: Verify refused in 0.19 s against a 5 s render and
+never auto-ran afterwards; a render clicked during verification was refused in 0.31 s. Both render
+events keep their lane, and `CANCEL_CONCURRENCY_ID` is untouched.
+
+The residual race — the folder changing *while* a verification is genuinely running, since the
+`change` listeners have their own lane — is closed by a **per-session** revision.
+`_on_verify_invalidate` bumps the revision for `gr.Request.session_hash`; the click captures it
+before starting and returns `PREP_VERIFY_STALE_TEXT` instead of its report (or its failure text, which
+names a folder too) if it moved. Session-scoped deliberately: one process-global counter would let a
+folder edit in one browser session invalidate a legitimate, still-running verification in another,
+and a fixture proves both directions. `_verify_revisions` is a bounded `str -> int` map (cap 512,
+least-recently-touched eviction, entries created only by a real invalidation, reads never insert) —
+`demo.unload` was measured not to fire for a closed client on this version, so the bound is the
+cleanup rather than a hook that does not run. No `gr.State`, no persistence, no live object in the
+map, and `prep_state` / `source_state` are untouched.
+
+**Refusals now name the real holder.** `_verify_busy_message()` returns the new
+`PREP_VERIFY_ALREADY_RUNNING_TEXT` when another verification owns the mutex and
+`PREP_VERIFY_RENDER_BUSY_TEXT` when a render does — telling the operator a render is running when
+none is was a wrong answer. `VERIFY_BUSY_MESSAGE` no longer says renders "wait for it": the render
+path refuses on a non-blocking acquire and never queued. A test bans "wait for it", "queued",
+"will start automatically" and similar from all three strings, because promising that a declined
+request will take its turn is the same class of inaccuracy this correction removes.
+
+Tests: 5962 passed, 8 skipped (5970 collected), from the 5905/8/5913 S2-A baseline — exactly +57,
+all in `tests/test_media_verify.py` (94 → 151). Skips unchanged. Nineteen targeted mutations were
+applied and all nineteen are caught, including two gaps this work closed: R2's MINOR that deleting
+the bounded submission window left the suite green (counting probes that have *entered* cannot see
+the window, because the thread pool caps that number either way — the new test records `submit`
+calls on the real executor while every worker is blocked), and the previously unpinned busy-message
+wording. Eight existing tests were adjusted for the new `request` parameter and the two distinct
+refusals; none was weakened.
+
 ### Added — 2026-10-14 (MEDIA-VERIFY-S2-A: Verify Sources — read-only cache and media health)
 
 **A new "Verify Sources" button in the Media Library Preparation accordion answers two questions

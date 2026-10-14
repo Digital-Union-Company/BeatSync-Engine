@@ -867,20 +867,51 @@ def test_the_existing_extraction_and_render_commands_are_untouched(ffmpeg_tree):
 # the GUI integration: concurrency, live inputs, output isolation
 # ---------------------------------------------------------------------------
 
+class _FakeRequest:
+    """What Gradio injects: an object carrying a `session_hash` and nothing this code needs.
+
+    Deliberately not a Gradio import — these tests run on a bare interpreter. The real injection
+    (and the fact that `session_hash` is per-session and distinct between two clients) is measured
+    against the pinned gradio==6.19.0 outside the suite; what is asserted here is the BEHAVIOUR the
+    handler builds on top of it.
+    """
+
+    def __init__(self, session_hash):
+        self.session_hash = session_hash
+
+
+class _FakeGradio:
+    """Stands in for the `gr` module so the real signatures' annotations can be evaluated."""
+
+    Request = _FakeRequest
+
+
 def _load_concurrency_seam():
-    """Execute the REAL `_on_verify_sources_click` over a real Lock and a stubbed impl."""
+    """Execute the REAL verification concurrency seam over a real Lock and a stubbed impl.
+
+    Every function in the chain is the shipped source, extracted by AST: the mutex gate, the two
+    busy-message helpers and the whole session-revision mechanism. Only `_verify_sources_impl` (the
+    disk work) is stubbed, because that is the part that would need a library.
+    """
     tree = _tree(_GUI)
     nodes = [_func(tree, name) for name in
-             ("_mark_verification", "_busy_message", "_on_verify_sources_click")]
+             ("_mark_verification", "_busy_message", "_verify_busy_message",
+              "_verify_session_key", "_verify_revision", "_bump_verify_revision",
+              "_on_verify_sources_click", "_on_verify_invalidate")]
     state = {"impl_calls": [], "impl": lambda folder, recursive: "REPORT"}
     namespace = {
+        "gr": _FakeGradio,
         "threading": threading,
         "_RENDER_LOCK": threading.Lock(),
         "_VERIFY_FLAG_LOCK": threading.Lock(),
         "_verification_running": False,
+        "_verify_revisions": {},
+        "_VERIFY_REVISION_CAP": 512,
         "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
         "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "VERIFY_REFUSED_RENDER_ACTIVE",
+        "PREP_VERIFY_ALREADY_RUNNING_TEXT": "VERIFY_REFUSED_ALREADY_RUNNING",
+        "PREP_VERIFY_STALE_TEXT": "STALE_FOLDER_CHANGED",
     }
 
     def impl(folder, recursive):
@@ -979,7 +1010,9 @@ def test_two_concurrent_verifications_do_not_overlap():
     second = ns["_on_verify_sources_click"]("J:/lib", True)
     hold.set()
     first.join(5)
-    assert second == "VERIFY_REFUSED_RENDER_ACTIVE"
+    # R3: the refusal now names the REAL holder. A second verification is not a render, and
+    # saying "a render is running" when none is would be a wrong answer.
+    assert second == "VERIFY_REFUSED_ALREADY_RUNNING"
     assert results == ["REPORT"]
 
 
@@ -987,13 +1020,20 @@ def test_the_click_handler_takes_only_the_live_folder_and_recursive_widgets(gui_
     """No `prep_state`: a queued change event must not let it verify the previous folder."""
     handler = _func(gui_tree, "_on_verify_sources_click")
     arg_names = [a.arg for a in handler.args.args]
-    assert arg_names == ["folder_path", "recursive"], arg_names
+    # R3 added `request`, which is Gradio's INJECTED `gr.Request` and not a widget: it never
+    # appears in `inputs`, and it carries only the session identity.
+    assert arg_names == ["folder_path", "recursive", "request"], arg_names
+    annotation = ast.unparse(handler.args.args[2].annotation)
+    assert annotation == "gr.Request", annotation
+    assert ast.unparse(handler.args.defaults[-1]) == "None", \
+        "the request must default to None so the handler stays callable without Gradio"
 
     source = ast.unparse(gui_tree)
     call = next(seg for seg in source.split("prep_verify_btn.click(")[1:])
     wiring = call.split(")")[0]
     assert "inputs=[prep_folder, prep_recursive]" in wiring, wiring
     assert "prep_state" not in wiring, "verification must not read the recorded scan"
+    assert "request" not in wiring, "the injected request is not a widget input"
 
 
 def test_the_verification_handler_writes_only_its_own_report(gui_tree):
@@ -1073,10 +1113,29 @@ def test_no_lock_thread_or_process_object_is_stored_in_gradio_state(gui_tree):
                       "_active_render_slot"):
         assert forbidden not in handler, forbidden
         assert forbidden not in impl, forbidden
-    # Neither function takes or returns any Gradio state object.
-    for name in ("_on_verify_sources_click", "_verify_sources_impl"):
-        node = _func(gui_tree, name)
-        assert [a.arg for a in node.args.args] == ["folder_path", "recursive"]
+    # Neither function takes or returns any Gradio state object. R3's `request` is Gradio's
+    # injected `gr.Request`, which is a per-request value object, not session state -- and the
+    # handler reads exactly one attribute off it.
+    assert [a.arg for a in _func(gui_tree, "_verify_sources_impl").args.args] == \
+        ["folder_path", "recursive"]
+    click = _func(gui_tree, "_on_verify_sources_click")
+    assert [a.arg for a in click.args.args] == ["folder_path", "recursive", "request"]
+    key_node = _func(gui_tree, "_verify_session_key")
+    attributes_read = {n.value for n in ast.walk(key_node)
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert "session_hash" in attributes_read, \
+        "the session key must come from the request's session_hash"
+    session_key = _referenced(key_node)
+    for forbidden in ("gr.State", "Thread", "Popen", "Lock", "RenderLifecycle",
+                      "prep_state", "source_state"):
+        assert forbidden not in session_key, forbidden
+    # The revision map holds integers only: there is no code path that could put a live
+    # synchronisation object, thread or handle into it.
+    for name in ("_verify_revision", "_bump_verify_revision"):
+        referenced = _referenced(_func(gui_tree, name))
+        for forbidden in ("Thread", "Popen", "Event", "RenderLifecycle", "gr.State",
+                          "session_state", "_RENDER_LOCK"):
+            assert forbidden not in referenced, (name, forbidden)
 
 
 def test_verification_never_launches_qwen_analysis_or_writes_anything(gui_tree):
@@ -1194,3 +1253,881 @@ def test_media_verify_starts_no_subprocess_itself():
         assert forbidden not in referenced, forbidden
     # The only OS call it makes is the stat behind the stability fingerprint.
     assert "os.stat" in referenced
+
+
+# ===========================================================================
+# MEDIA-VERIFY-S2-A R3 regressions
+# ===========================================================================
+#
+# Two independently reproduced MAJOR defects, each with the behaviour that was wrong asserted
+# directly rather than its wiring:
+#
+# MAJOR-1  A source overwritten between its cache classification and its probe produced PREPARED
+#          beside METADATA_OK -- two confident verdicts about two different versions of one file,
+#          under one "Verified at" header and a COMPLETE banner.
+# MAJOR-2  The Verify event shared the render concurrency lane, so Gradio QUEUED it behind a render
+#          instead of refusing it, then ran it automatically against the click-time folder and
+#          overwrote the newer "folder changed" notice.
+#
+# The Gradio-side event mechanisms (`concurrency_limit=None` reaching the handler during a render,
+# `gr.Request` injection into both the click and the `inputs=None` change listener, per-session
+# `session_hash`) were measured against the pinned gradio==6.19.0 in an isolated fixture outside
+# this suite -- this suite stays importable on a bare interpreter, as CLAUDE.md requires. What is
+# asserted below is the behaviour the shipped handlers build on top of those mechanisms, executed
+# as real extracted source.
+
+from beatsync_fork.media_verify import (  # noqa: E402
+    CHANGE_DETECTION_LIMIT_TEXT,
+    NO_BASELINE,
+    ChangeWindow,
+    MediaVerdict,
+    VerificationRun,
+    fingerprint_sources,
+)
+
+
+def _verify_one_body():
+    """The real `_verify_one`, reached through the module (it is private but shipped)."""
+    from beatsync_fork.media_verify import _verify_one
+    return _verify_one
+
+
+def _rewrite(path, content=b"\xff" * 4096):
+    """Replace a source's bytes AND guarantee a different (size, mtime_ns)."""
+    with open(path, "wb") as handle:
+        handle.write(content)
+    stat = os.stat(path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000))
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-1: the cross-phase window
+# ---------------------------------------------------------------------------
+
+def test_a_source_changed_after_classification_is_not_a_clean_current_verdict(tmp_path):
+    """THE regression. PREPARED + METADATA_OK for two different files must be impossible."""
+    source = _video(tmp_path)
+    baseline = fingerprint_source(source)          # what the cache phase saw
+    _rewrite(source)                               # the operator overwrites it
+    run = verify_media_health([source], _ok_probe(), baselines=[baseline])
+
+    verdict = run.verdicts[0]
+    assert verdict.status is MediaStatus.CHANGED_DURING_CHECK, verdict.status
+    assert verdict.status is not MediaStatus.METADATA_OK
+    assert verdict.change_window is ChangeWindow.CROSS_PHASE
+    assert verdict.changed and verdict.changed_before_probe
+    assert verdict.is_problem
+
+
+def test_the_two_change_windows_are_distinguished_not_merged(tmp_path):
+    """A report that cannot tell the two apart cannot say which verdict it outdated."""
+    before_only = _video(tmp_path, "a.mp4")
+    baseline_a = fingerprint_source(before_only)
+    _rewrite(before_only)
+
+    during_only = _video(tmp_path, "b.mp4")
+    baseline_b = fingerprint_source(during_only)
+
+    def probe(path, timeout=None):
+        if path == during_only:
+            _rewrite(path)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    run = verify_media_health([before_only, during_only], probe,
+                              baselines=[baseline_a, baseline_b], workers=1)
+    assert run.verdicts[0].change_window is ChangeWindow.CROSS_PHASE
+    assert run.verdicts[1].change_window is ChangeWindow.DURING_PROBE
+    assert run.verdicts[1].changed and not run.verdicts[1].changed_before_probe
+
+
+def test_a_change_in_both_windows_is_reported_as_both(tmp_path):
+    source = _video(tmp_path)
+    baseline = fingerprint_source(source)
+    _rewrite(source)
+
+    def probe(path, timeout=None):
+        _rewrite(path, b"\x01" * 8192)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    run = verify_media_health([source], probe, baselines=[baseline])
+    verdict = run.verdicts[0]
+    assert verdict.change_window is ChangeWindow.BOTH
+    assert verdict.changed_before_probe, "BOTH must still outdate the cache verdict"
+    assert "after its Stage-5 cache classification" in verdict.detail
+    assert "while it was being probed" in verdict.detail
+
+
+def test_an_unchanged_source_with_a_baseline_is_still_metadata_ok(tmp_path):
+    """No false positives: the correction must not flag a stable library."""
+    sources = [_video(tmp_path, f"s{i}.mp4") for i in range(5)]
+    baselines = fingerprint_sources(sources)
+    run = verify_media_health(sources, _ok_probe(), baselines=baselines)
+    assert all(v.status is MediaStatus.METADATA_OK for v in run.verdicts)
+    assert all(v.change_window is ChangeWindow.NONE for v in run.verdicts)
+    assert run.complete
+    assert run.changed_before_probe == [] and run.changed_during_probe == []
+
+
+def test_a_source_that_disappeared_after_classification_cannot_be_metadata_ok(tmp_path):
+    source = _video(tmp_path)
+    baseline = fingerprint_source(source)
+    os.remove(source)
+    probed = []
+
+    def probe(path, timeout=None):
+        probed.append(path)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    run = verify_media_health([source], probe, baselines=[baseline])
+    verdict = run.verdicts[0]
+    assert verdict.status is MediaStatus.UNREADABLE
+    assert verdict.status is not MediaStatus.METADATA_OK
+    assert verdict.change_window is ChangeWindow.CROSS_PHASE, \
+        "it was readable when classified, so that verdict is inconclusive too"
+    assert verdict.changed_before_probe
+    assert probed == [], "a vanished source is never probed"
+
+
+def test_a_source_replaced_by_a_different_file_is_inconclusive(tmp_path):
+    """Replaced, not edited: a new file at the same path with different size."""
+    source = _video(tmp_path, "clip.mp4", content=b"\x00" * 64)
+    baseline = fingerprint_source(source)
+    os.remove(source)
+    with open(source, "wb") as handle:
+        handle.write(b"\x02" * 999)
+    run = verify_media_health([source], _ok_probe(), baselines=[baseline])
+    assert run.verdicts[0].status is MediaStatus.CHANGED_DURING_CHECK
+    assert run.verdicts[0].change_window is ChangeWindow.CROSS_PHASE
+
+
+def test_an_unavailable_initial_fingerprint_does_not_fabricate_a_change(tmp_path):
+    """`None` baseline means "we looked and it was not there" -- not "we never looked"."""
+    missing = str(tmp_path / "never-existed.mp4")
+    run = verify_media_health([missing], _ok_probe(), baselines=[None])
+    assert run.verdicts[0].status is MediaStatus.UNREADABLE
+    assert run.verdicts[0].change_window is ChangeWindow.NONE, \
+        "absent then, absent now: nothing changed"
+
+
+def test_a_source_that_appeared_after_classification_is_inconclusive(tmp_path):
+    """The mirror: unreadable when classified, readable now. The classification cannot stand."""
+    source = str(tmp_path / "late.mp4")
+    baselines = fingerprint_sources([source])
+    assert baselines == [None]
+    with open(source, "wb") as handle:
+        handle.write(b"\x00" * 64)
+    run = verify_media_health([source], _ok_probe(), baselines=baselines)
+    assert run.verdicts[0].status is MediaStatus.CHANGED_DURING_CHECK
+    assert run.verdicts[0].change_window is ChangeWindow.CROSS_PHASE
+
+
+def test_duplicate_paths_keep_independent_positional_baselines(tmp_path):
+    """Position is the authority, exactly as the Stage-5 classifier treats it."""
+    source = _video(tmp_path)
+    good = fingerprint_source(source)
+    stale = SourceFingerprint(size=good.size + 1, mtime_ns=good.mtime_ns)
+    run = verify_media_health([source, source], _ok_probe(),
+                              baselines=[good, stale], workers=1)
+    assert len(run.verdicts) == 2
+    assert run.verdicts[0].status is MediaStatus.METADATA_OK
+    assert run.verdicts[0].change_window is ChangeWindow.NONE
+    assert run.verdicts[1].status is MediaStatus.CHANGED_DURING_CHECK
+    assert run.verdicts[1].change_window is ChangeWindow.CROSS_PHASE
+
+
+def test_fingerprint_sources_is_positional_and_stats_once_per_source(tmp_path):
+    sources = [_video(tmp_path, "a.mp4"), _video(tmp_path, "a.mp4"),
+               str(tmp_path / "gone.mp4")]
+    calls = []
+
+    def counting_stat(path):
+        calls.append(path)
+        return os.stat(path)
+
+    observed = fingerprint_sources(sources, stat=counting_stat)
+    assert len(observed) == len(sources), "one entry per POSITION, never deduplicated"
+    assert len(calls) == 3, "exactly one stat per source and nothing else"
+    assert observed[0] == observed[1] and observed[2] is None
+
+
+def test_a_mismatched_baseline_length_degrades_instead_of_raising(tmp_path):
+    """A bad caller must not be able to fail a read-only verification click."""
+    sources = [_video(tmp_path, f"s{i}.mp4") for i in range(3)]
+    short = verify_media_health(sources, _ok_probe(),
+                                baselines=[fingerprint_source(sources[0])])
+    assert [v.status for v in short.verdicts] == [MediaStatus.METADATA_OK] * 3
+    overlong = verify_media_health(sources, _ok_probe(),
+                                   baselines=fingerprint_sources(sources) + [None, None])
+    assert [v.status for v in overlong.verdicts] == [MediaStatus.METADATA_OK] * 3
+
+
+def test_an_empty_library_accepts_baselines_without_starting_a_pool():
+    run = verify_media_health([], _ok_probe(), baselines=[])
+    assert run.verdicts == [] and run.scheduled == 0
+    assert run.changed_before_probe == []
+
+
+def test_omitting_baselines_reproduces_the_original_probe_bracket_exactly(tmp_path):
+    """S2-A behaviour is the default: no baseline, no cross-phase comparison."""
+    source = _video(tmp_path)
+    _rewrite(source)
+    run = verify_media_health([source], _ok_probe())
+    assert run.verdicts[0].status is MediaStatus.METADATA_OK
+    assert run.verdicts[0].change_window is ChangeWindow.NONE
+    # And the private worker's default is the sentinel, not None.
+    import inspect
+    assert inspect.signature(_verify_one_body()).parameters["baseline"].default is NO_BASELINE
+
+
+@pytest.mark.parametrize("window", [ChangeWindow.CROSS_PHASE, ChangeWindow.DURING_PROBE,
+                                    ChangeWindow.BOTH])
+def test_an_observed_change_can_never_carry_a_clean_status(window, tmp_path):
+    """The invariant behind every claim above: changed implies not-OK, for every window."""
+    verdict = MediaVerdict(path="J:/x.mp4", status=MediaStatus.CHANGED_DURING_CHECK,
+                           change_window=window)
+    assert verdict.changed and verdict.is_problem
+    # And no code path in the real worker produces METADATA_OK with a window set.
+    source = _video(tmp_path)
+    baseline = fingerprint_source(source)
+    if window in (ChangeWindow.CROSS_PHASE, ChangeWindow.BOTH):
+        _rewrite(source)
+
+    def probe(path, timeout=None):
+        if window in (ChangeWindow.DURING_PROBE, ChangeWindow.BOTH):
+            _rewrite(path, b"\x03" * 2048)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    produced = verify_media_health([source], probe, baselines=[baseline]).verdicts[0]
+    assert produced.change_window is window
+    assert produced.status is not MediaStatus.METADATA_OK
+
+
+def test_a_worker_exception_still_carries_the_cross_phase_fact(tmp_path):
+    """A change is a fact about the file; our tooling failing does not erase it."""
+    source = _video(tmp_path)
+    baseline = fingerprint_source(source)
+    _rewrite(source)
+
+    def boom(path, timeout=None):
+        raise RuntimeError("probe seam exploded")
+
+    verdict = verify_media_health([source], boom, baselines=[baseline]).verdicts[0]
+    assert verdict.status is MediaStatus.NOT_CHECKED
+    assert verdict.change_window is ChangeWindow.CROSS_PHASE
+
+
+def test_the_cross_phase_check_adds_no_file_open(tmp_path):
+    """One extra `os.stat` per source. Nothing opened, nothing written."""
+    import builtins
+    source = _video(tmp_path)
+    baselines = fingerprint_sources([source])
+    opened = []
+    real_open = builtins.open
+
+    def watching_open(*args, **kwargs):
+        opened.append(args[0] if args else None)
+        return real_open(*args, **kwargs)
+
+    builtins.open = watching_open
+    try:
+        verify_media_health([source], _ok_probe(), baselines=baselines)
+    finally:
+        builtins.open = real_open
+    assert opened == [], "the cross-phase comparison must not open any file"
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-1: the report must not present an outdated cache verdict as current
+# ---------------------------------------------------------------------------
+
+def _changed_run(window=ChangeWindow.CROSS_PHASE, path="J:/ok0.mp4"):
+    return VerificationRun(verdicts=[
+        MediaVerdict(path=path, status=MediaStatus.CHANGED_DURING_CHECK,
+                     change_window=window, detail="changed"),
+    ], scheduled=1)
+
+
+def test_the_report_withdraws_the_clean_cache_claim_when_a_source_changed():
+    cache, items = _cache(prepared=1)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=items, run=_changed_run())
+    assert "Every source has a reusable Stage-5 cache record." not in report, \
+        "that sentence is a claim about the CURRENT files"
+    assert "when it was classified" in report
+    assert "INCONCLUSIVE" in report
+    assert "J:/ok0.mp4" in report
+
+
+def test_the_report_preserves_the_classifier_counts_verbatim():
+    """Qualify the counts, never silently recompute them: that would publish a classification
+    nobody ran."""
+    cache, items = _cache(prepared=1)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=items, run=_changed_run())
+    assert "Reusable cache (PREPARED):     1" in report, "the real count stays"
+    assert "Reusable cache (PREPARED):     0" not in report
+    assert "classifier's own output" in report
+    assert "Nothing was reclassified" in report
+
+
+def test_the_report_names_the_outdated_classification_for_each_changed_source():
+    cache, items = _cache(prepared=1)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=items, run=_changed_run())
+    assert "Changed after classification - cache verdict INCONCLUSIVE (1)" in report
+    assert "Classified as PREPARED, then the file changed" in report
+
+
+def test_a_during_probe_only_change_does_not_claim_the_classification_was_outdated():
+    cache, items = _cache(prepared=1)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=items,
+        run=_changed_run(window=ChangeWindow.DURING_PROBE))
+    assert "Changed after classification" not in report
+    # ...but it is still reported as inconclusive on the media side.
+    assert "INCONCLUSIVE:" in report
+    assert "1 changed while being probed" in report
+
+
+def test_the_report_never_says_no_metadata_problems_when_a_source_changed():
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=None, run=_changed_run())
+    assert "No metadata problems found" not in report
+    assert "MEDIA_CHANGED_DURING_CHECK" in report
+
+
+def test_a_complete_sweep_with_a_changed_source_still_says_inconclusive():
+    """COMPLETE is about probe coverage. It must not read as "everything is fine"."""
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=None, run=_changed_run())
+    assert "STATUS: COMPLETE" in report, "coverage really was complete"
+    assert "INCONCLUSIVE: 1 source(s) changed between the cache phase and their probe" in report
+    assert "NO current media verdict" in report
+
+
+def test_the_report_states_the_bound_of_size_and_mtime_comparison():
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=None, run=_changed_run())
+    assert CHANGE_DETECTION_LIMIT_TEXT in report
+    assert "not whole-file byte-integrity proof" in report
+    for overclaim in ("no corruption", "files are intact", "fully verified", "all frames"):
+        assert overclaim not in report.lower()
+
+
+def test_a_misaligned_classification_list_is_not_attributed_to_the_wrong_source():
+    """Position is the authority, and the recorded path is the guard on that assumption."""
+    cache, _items = _cache(prepared=1)
+    wrong = [{"path": "J:/a-completely-different-file.mp4", "status": "PREPARED", "reason": ""}]
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=wrong, run=_changed_run())
+    assert "could not be matched by position" in report
+    assert "Classified as PREPARED" not in report
+
+
+def test_an_unverifiable_backend_still_reports_the_change_and_invents_no_cache_verdict():
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache={"source_count": 1, "prepared_count": 0, "needs_analysis_count": 0,
+               "unavailable_count": 0, "classifications": []},
+        run=_changed_run(),
+        cache_unverifiable_reason="The Qwen backend identity could not be verified.")
+    assert "UNVERIFIABLE" in report
+    assert "Reusable cache (PREPARED)" not in report, "no verdict exists to qualify"
+    assert "INCONCLUSIVE:" in report, "the media-side change is still reported"
+
+
+def test_a_clean_run_report_is_unchanged_apart_from_the_new_limit_sentence():
+    """No regression in the common case: a stable library still reads as it did."""
+    cache, items = _cache(prepared=2)
+    run = _run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))])
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=2,
+        cache=cache, cache_classifications=items, run=run)
+    assert "Every source has a reusable Stage-5 cache record." in report
+    assert "No metadata problems found" in report
+    assert "INCONCLUSIVE" not in report
+    assert "Changed after classification" not in report
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-1: the baseline is captured BEFORE the cache phase, in the shipped impl
+# ---------------------------------------------------------------------------
+
+def test_the_impl_captures_baselines_before_it_calls_the_classifier(gui_tree):
+    """Ordering IS the fix. A baseline taken after classification measures nothing."""
+    impl = _func(gui_tree, "_verify_sources_impl")
+    order = []
+    for node in ast.walk(impl):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ast.unparse(node.func)
+        if name.endswith("fingerprint_sources"):
+            order.append(("baseline", node.lineno))
+        elif name.endswith("classify_library_sources"):
+            order.append(("classify", node.lineno))
+        elif name.endswith("verify_media_health"):
+            order.append(("media", node.lineno))
+    stages = [n for n, _ in sorted(order, key=lambda pair: pair[1])]
+    assert stages == ["baseline", "classify", "media"], stages
+
+
+def test_the_impl_passes_the_baselines_into_the_media_phase(gui_tree):
+    impl = _func(gui_tree, "_verify_sources_impl")
+    call = next(n for n in ast.walk(impl)
+                if isinstance(n, ast.Call) and ast.unparse(n.func).endswith(
+                    "verify_media_health"))
+    keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert keywords.get("baselines") == "baselines", keywords
+
+
+def test_the_cross_phase_fix_adds_no_cache_write_and_no_qwen(gui_tree):
+    impl = ast.unparse(_func(gui_tree, "_verify_sources_impl"))
+    assert "fingerprint_sources" in impl
+    for forbidden in ("_save_cache", "_checkpoint_cache", "_load_cache", "_cache_path",
+                      "_video_signature", "analyze_video_sources", "_analyze_single_video",
+                      "stage5_qwen_scene_worker", "subprocess", "Popen", "open("):
+        assert forbidden not in impl, forbidden
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-2: the Verify event is out of the render lane
+# ---------------------------------------------------------------------------
+
+def test_the_verify_event_has_its_own_unlimited_lane(gui_tree):
+    """Sharing the render lane is what made Gradio queue instead of refuse."""
+    source = ast.unparse(gui_tree)
+    wiring = source.split("prep_verify_btn.click(")[1].split(")")[0]
+    assert "concurrency_id" not in wiring, \
+        "a shared lane queues the event and the mutex is never reached"
+    assert "RENDER_CONCURRENCY_ID" not in wiring
+    assert "concurrency_limit=None" in wiring, \
+        "a lane of 1 would queue a SECOND verify click instead of refusing it"
+
+
+def _click_keywords(tree, widget):
+    """The keyword arguments of `<widget>.click(...)`, read from the AST rather than from text.
+
+    The render registrations carry dozens of inputs, so a text window around the call name is not
+    a reliable way to reach their keywords.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "click" or not isinstance(node.func.value, ast.Name):
+            continue
+        if node.func.value.id != widget:
+            continue
+        return {k.arg: ast.unparse(k.value) for k in node.keywords}
+    raise AssertionError(f"{widget}.click(...) not found")
+
+
+def test_both_render_events_keep_the_shared_render_lane(gui_tree):
+    for widget in ("process_btn", "render_selected_variants_btn"):
+        keywords = _click_keywords(gui_tree, widget)
+        assert keywords.get("concurrency_id") == "RENDER_CONCURRENCY_ID", (widget, keywords)
+        assert keywords.get("concurrency_limit") == "1", (widget, keywords)
+
+
+def test_the_verify_event_shares_no_lane_with_the_renders(gui_tree):
+    """The same assertion from the other side, through the AST rather than a text window."""
+    keywords = _click_keywords(gui_tree, "prep_verify_btn")
+    assert "concurrency_id" not in keywords, keywords
+    assert keywords.get("concurrency_limit") == "None", keywords
+    assert keywords.get("inputs") == "[prep_folder, prep_recursive]", keywords
+    assert keywords.get("outputs") == "[prep_verify_report]", keywords
+
+
+def test_the_cancel_lane_is_untouched(gui_tree):
+    source = ast.unparse(gui_tree)
+    assert "CANCEL_CONCURRENCY_ID = 'beatsync-cancel'" in source
+    assert "concurrency_id=CANCEL_CONCURRENCY_ID" in source
+    assert "concurrency_id=CANCEL_CONCURRENCY_ID" not in \
+        source.split("prep_verify_btn.click(")[1][:2000]
+
+
+def test_a_refused_verification_does_no_work_and_does_not_run_later():
+    """The queued-then-auto-run behaviour, asserted as absent: a refusal is terminal."""
+    ns, state = _load_concurrency_seam()
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: a render holds the mutex"
+    out = ns["_on_verify_sources_click"]("J:/lib", True)
+    assert out == "VERIFY_REFUSED_RENDER_ACTIVE"
+    assert state["impl_calls"] == []
+    # The render ends. Nothing re-runs by itself; the refused click is simply gone.
+    ns["_RENDER_LOCK"].release()
+    assert state["impl_calls"] == [], "a refused verification must not resume on its own"
+    # And a fresh click now works, proving the refusal left nothing broken behind it.
+    assert ns["_on_verify_sources_click"]("J:/lib", True) == "REPORT"
+    assert state["impl_calls"] == [("J:/lib", True)]
+
+
+def test_the_verify_refusal_names_a_render_or_another_verification():
+    ns, state = _load_concurrency_seam()
+    ns["_RENDER_LOCK"].acquire(blocking=False)
+    try:
+        assert ns["_on_verify_sources_click"]("J:/l", True) == "VERIFY_REFUSED_RENDER_ACTIVE"
+    finally:
+        ns["_RENDER_LOCK"].release()
+
+    seen = {}
+
+    def impl(folder, recursive):
+        seen["second"] = ns["_on_verify_sources_click"]("J:/l", True)
+        return "REPORT"
+
+    state["impl"] = impl
+    assert ns["_on_verify_sources_click"]("J:/l", True) == "REPORT"
+    assert seen["second"] == "VERIFY_REFUSED_ALREADY_RUNNING", \
+        "a verification is not a render and must not be described as one"
+
+
+def test_neither_side_terminates_the_other():
+    """A refusal is a refusal: nothing is signalled, cancelled or killed."""
+    click = _referenced(_func(_tree(_GUI), "_on_verify_sources_click"))
+    for forbidden in ("terminate", "kill", "request_cancel", "mark_terminal",
+                      "RenderCancelled", "RenderLifecycle"):
+        assert forbidden not in click, forbidden
+
+
+def _ui_strings():
+    tree = _tree(_UI_CONTENT)
+    strings = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    strings[target.id] = node.value.value
+    return strings
+
+
+def test_the_busy_messages_never_promise_queuing():
+    """Both refusals are REFUSALS. Promising that the request will wait its turn describes the
+    defect R3 removed, and it is the same class of inaccuracy as over-claiming a decode check."""
+    strings = _ui_strings()
+    for name in ("VERIFY_BUSY_MESSAGE", "PREP_VERIFY_RENDER_BUSY_TEXT",
+                 "PREP_VERIFY_ALREADY_RUNNING_TEXT"):
+        assert name in strings, name
+        text = strings[name].lower()
+        for forbidden in ("wait for it", "renders wait", "queued", "in the queue",
+                          "will start automatically", "starts automatically", "your turn",
+                          "will run when", "once it is your"):
+            assert forbidden not in text, (name, forbidden)
+    # And each one says what actually happened to the request.
+    assert "was not started" in strings["VERIFY_BUSY_MESSAGE"].lower()
+    assert "will not start" in strings["PREP_VERIFY_RENDER_BUSY_TEXT"].lower()
+    already = strings["PREP_VERIFY_ALREADY_RUNNING_TEXT"].lower()
+    assert "already running" in already
+    assert "nothing was started or cancelled" in already
+
+
+def test_the_two_verify_refusals_are_distinct_messages():
+    strings = _ui_strings()
+    assert strings["PREP_VERIFY_RENDER_BUSY_TEXT"] != \
+        strings["PREP_VERIFY_ALREADY_RUNNING_TEXT"]
+    assert "render is running" in strings["PREP_VERIFY_RENDER_BUSY_TEXT"].lower()
+    assert "render" not in strings["PREP_VERIFY_ALREADY_RUNNING_TEXT"].lower(), \
+        "the already-running refusal must not blame a render that is not running"
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-2: the stale-report race, session-scoped
+# ---------------------------------------------------------------------------
+
+def test_an_invalidation_during_verification_withholds_the_stale_report():
+    """THE regression: the operator changed folder, so the older answer must not be published."""
+    ns, state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+
+    def impl(folder, recursive):
+        # The operator retypes the folder while this is running. Its listener runs in another
+        # Gradio lane and completes first.
+        assert ns["_on_verify_invalidate"](request) == "STALE_FOLDER_CHANGED"
+        return "REPORT for folder=A"
+
+    state["impl"] = impl
+    out = ns["_on_verify_sources_click"]("J:/A", True, request)
+    assert out == "STALE_FOLDER_CHANGED", \
+        "a report for the previous folder must not overwrite the newer notice"
+    assert state["impl_calls"] == [("J:/A", True)], "the work itself still ran and was bounded"
+
+
+def test_a_recursive_flag_change_during_verification_also_withholds_the_report():
+    ns, state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+
+    def impl(folder, recursive):
+        ns["_on_verify_invalidate"](request)
+        return "REPORT"
+
+    state["impl"] = impl
+    assert ns["_on_verify_sources_click"]("J:/A", False, request) == "STALE_FOLDER_CHANGED"
+
+
+def test_both_change_listeners_share_the_one_invalidating_handler(gui_tree):
+    source = ast.unparse(gui_tree)
+    for widget in ("prep_folder", "prep_recursive"):
+        blocks = [seg for seg in source.split(f"{widget}.change(")[1:]]
+        wiring = next(b.split(")")[0] for b in blocks
+                      if "_on_verify_invalidate" in b.split(")")[0])
+        assert "outputs=[prep_verify_report]" in wiring
+        assert "inputs=None" in wiring, "the request is injected, not taken from a widget"
+
+
+def test_repeated_folder_changes_during_verification_still_withhold_the_report():
+    ns, state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+
+    def impl(folder, recursive):
+        for _ in range(4):
+            ns["_on_verify_invalidate"](request)
+        return "REPORT"
+
+    state["impl"] = impl
+    assert ns["_on_verify_sources_click"]("J:/A", True, request) == "STALE_FOLDER_CHANGED"
+
+
+def test_a_failed_verification_is_also_withheld_after_an_invalidation():
+    """The failure text names a folder too, so it is stale for exactly the same reason."""
+    ns, state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+
+    def impl(folder, recursive):
+        ns["_on_verify_invalidate"](request)
+        raise RuntimeError("scanner exploded")
+
+    state["impl"] = impl
+    out = ns["_on_verify_sources_click"]("J:/A", True, request)
+    assert out == "STALE_FOLDER_CHANGED"
+    assert "scanner exploded" not in out
+    # The mutex is still released, and before the staleness decision.
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "the lock leaked on the stale path"
+    ns["_RENDER_LOCK"].release()
+
+
+def test_an_invalidation_after_the_report_was_published_does_not_rewrite_it():
+    """The check is a point-in-time comparison, not a subscription."""
+    ns, _state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+    assert ns["_on_verify_sources_click"]("J:/A", True, request) == "REPORT"
+    assert ns["_on_verify_invalidate"](request) == "STALE_FOLDER_CHANGED"
+    # A later verification is unaffected by the earlier bump.
+    assert ns["_on_verify_sources_click"]("J:/A", True, request) == "REPORT"
+
+
+def test_two_sessions_do_not_invalidate_each_others_reports():
+    """A single process-global counter would fail this: it is why one was not used."""
+    ns, state = _load_concurrency_seam()
+    session_a = _FakeRequest("session-A")
+    session_b = _FakeRequest("session-B")
+
+    def impl(folder, recursive):
+        # Another operator, in another browser, edits THEIR folder.
+        ns["_on_verify_invalidate"](session_b)
+        return f"REPORT for {folder}"
+
+    state["impl"] = impl
+    out = ns["_on_verify_sources_click"]("J:/A", True, session_a)
+    assert out == "REPORT for J:/A", \
+        "session B's folder edit must not invalidate session A's legitimate verification"
+
+
+def test_a_sessions_own_edit_still_invalidates_when_another_session_also_edits():
+    ns, state = _load_concurrency_seam()
+    session_a = _FakeRequest("session-A")
+    session_b = _FakeRequest("session-B")
+
+    def impl(folder, recursive):
+        ns["_on_verify_invalidate"](session_b)
+        ns["_on_verify_invalidate"](session_a)
+        return "REPORT"
+
+    state["impl"] = impl
+    assert ns["_on_verify_sources_click"]("J:/A", True, session_a) == "STALE_FOLDER_CHANGED"
+
+
+def test_a_request_without_a_session_hash_falls_into_one_shared_bucket():
+    """The fallback must be ONE bucket: a unique key per request could never match."""
+    ns, state = _load_concurrency_seam()
+    assert ns["_verify_session_key"](None) == ns["_verify_session_key"](_FakeRequest(None))
+
+    def impl(folder, recursive):
+        ns["_on_verify_invalidate"](None)
+        return "REPORT"
+
+    state["impl"] = impl
+    assert ns["_on_verify_sources_click"]("J:/A", True, None) == "STALE_FOLDER_CHANGED"
+
+
+def test_rapid_verify_clicks_do_not_overlap_and_the_winner_publishes():
+    ns, state = _load_concurrency_seam()
+    request = _FakeRequest("session-A")
+    inside = threading.Event()
+    hold = threading.Event()
+    overlapping = []
+    results = []
+
+    def impl(folder, recursive):
+        overlapping.append(1)
+        inside.set()
+        hold.wait(5)
+        assert len(overlapping) == 1, "two verifications overlapped"
+        overlapping.pop()
+        return "REPORT"
+
+    state["impl"] = impl
+    winner = threading.Thread(target=lambda: results.append(
+        ns["_on_verify_sources_click"]("J:/A", True, request)), daemon=True)
+    winner.start()
+    assert inside.wait(5)
+    refused = [ns["_on_verify_sources_click"]("J:/A", True, request) for _ in range(5)]
+    hold.set()
+    winner.join(5)
+    assert refused == ["VERIFY_REFUSED_ALREADY_RUNNING"] * 5
+    assert results == ["REPORT"], "the one that won the mutex publishes a current report"
+    assert state["impl_calls"] == [("J:/A", True)], "only one did any work"
+
+
+def test_the_revision_map_is_bounded_and_evicts_least_recently_touched():
+    ns, _state = _load_concurrency_seam()
+    cap = ns["_VERIFY_REVISION_CAP"]
+    for index in range(cap + 50):
+        ns["_bump_verify_revision"](f"session-{index}")
+    assert len(ns["_verify_revisions"]) == cap, len(ns["_verify_revisions"])
+    assert "session-0" not in ns["_verify_revisions"], "the oldest must be evicted"
+    assert f"session-{cap + 49}" in ns["_verify_revisions"]
+
+
+def test_reading_a_revision_never_creates_an_entry():
+    """A session that never edits its folder must never occupy a slot."""
+    ns, _state = _load_concurrency_seam()
+    assert ns["_verify_revision"]("never-seen") == 0
+    assert ns["_verify_revisions"] == {}
+
+
+def test_touching_a_revision_protects_it_from_eviction():
+    ns, _state = _load_concurrency_seam()
+    cap = ns["_VERIFY_REVISION_CAP"]
+    ns["_bump_verify_revision"]("long-lived")
+    for index in range(cap + 20):
+        ns["_bump_verify_revision"](f"filler-{index}")
+        ns["_verify_revision"]("long-lived")      # an active session keeps reading its own
+    assert "long-lived" in ns["_verify_revisions"]
+
+
+def test_the_revision_map_holds_integers_only():
+    ns, _state = _load_concurrency_seam()
+    ns["_bump_verify_revision"]("s")
+    ns["_on_verify_invalidate"](_FakeRequest("t"))
+    assert all(isinstance(v, int) and not isinstance(v, bool)
+               for v in ns["_verify_revisions"].values())
+    assert all(isinstance(k, str) for k in ns["_verify_revisions"])
+
+
+# ---------------------------------------------------------------------------
+# resource bounds survive the correction
+# ---------------------------------------------------------------------------
+
+def test_the_submitted_work_window_stays_bounded_whatever_the_library_size(tmp_path):
+    """Closes R2's MINOR-5: the sliding SUBMISSION window had no assertion of its own.
+
+    Counting probes that have *entered* does not work -- the thread pool caps that at `workers`
+    whether a window exists or not, which is exactly why the earlier attempt at this test passed
+    with the window deleted. What the window actually bounds is the number of WORK ITEMS handed to
+    the executor, so that is what is counted here, by recording `submit` calls on the real
+    executor while every worker is blocked.
+    """
+    import beatsync_fork.media_verify as module
+    sources = [_video(tmp_path, f"s{i:04d}.mp4") for i in range(400)]
+    release = threading.Event()
+    submitted = []
+    entered = []
+    guard = threading.Lock()
+    real_executor = module.ThreadPoolExecutor
+
+    class _RecordingExecutor(real_executor):
+        def submit(self, fn, /, *args, **kwargs):
+            with guard:
+                submitted.append(1)
+            return super().submit(fn, *args, **kwargs)
+
+    def blocking_probe(path, timeout=None):
+        with guard:
+            entered.append(path)
+        release.wait(15)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    module.ThreadPoolExecutor = _RecordingExecutor
+    worker = threading.Thread(target=lambda: verify_media_health(
+        sources, blocking_probe, workers=4, baselines=fingerprint_sources(sources)),
+        daemon=True)
+    try:
+        worker.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with guard:
+                if len(entered) >= MAX_PROBE_WORKERS:
+                    break
+            time.sleep(0.01)
+        time.sleep(0.3)          # let any unbounded submission burst finish
+        with guard:
+            outstanding = len(submitted)
+    finally:
+        release.set()
+        worker.join(60)
+        module.ThreadPoolExecutor = real_executor
+    assert not worker.is_alive(), "the run must drain and return"
+    assert outstanding <= MAX_PROBE_WORKERS * 2, \
+        f"{outstanding} work items were submitted while every worker was blocked; the window is " \
+        f"workers*2 = {MAX_PROBE_WORKERS * 2}"
+    assert outstanding < len(sources), "the whole library must not be submitted up front"
+
+
+def test_baselines_do_not_change_the_bounds(tmp_path):
+    sources = [_video(tmp_path, f"s{i:03d}.mp4") for i in range(60)]
+    live = {"now": 0, "peak": 0}
+    timeouts = set()
+    guard = threading.Lock()
+
+    def probe(path, timeout=None):
+        timeouts.add(timeout)
+        with guard:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        time.sleep(0.001)
+        with guard:
+            live["now"] -= 1
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    run = verify_media_health(sources, probe, workers=99,
+                              baselines=fingerprint_sources(sources))
+    assert live["peak"] <= MAX_PROBE_WORKERS and run.workers == MAX_PROBE_WORKERS
+    assert timeouts == {DEFAULT_PROBE_TIMEOUT_SECONDS}
+    assert [v.path for v in run.verdicts] == sources, "source order survives"
+    assert DEFAULT_BUDGET_SECONDS == 600, "the global scheduling budget is unchanged"
+
+
+def test_a_budget_exhausted_run_with_baselines_still_reports_not_checked(tmp_path):
+    sources = [_video(tmp_path, f"s{i:03d}.mp4") for i in range(20)]
+    ticks = iter([0.0] * 9 + [10_000.0] * 100_000)
+    started, finished = [], []
+
+    def probe(path, timeout=None):
+        started.append(path)
+        finished.append(path)
+        return ProbeOutcome(returncode=0, stdout=_payload())
+
+    run = verify_media_health(sources, probe, workers=1, budget_seconds=5.0,
+                              baselines=fingerprint_sources(sources),
+                              clock=lambda: next(ticks))
+    assert run.budget_exhausted and not run.complete
+    assert any(v.status is MediaStatus.NOT_CHECKED for v in run.verdicts)
+    assert run.scheduled < len(sources)
+    assert started == finished, "every started probe was reaped before anything was reported"

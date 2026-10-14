@@ -966,9 +966,23 @@ PREP_VERIFY_RENDER_BUSY_TEXT = (
     "time out in the first place. Wait for the render to finish, then press Verify Sources again."
 )
 #: The mirror image: shown by the render path when verification holds the shared mutex.
+#
+#: [FORK] R3 reworded: it previously said renders "wait for it", which was never what happened —
+#: the render path refuses on a non-blocking acquire and does not queue behind verification. A
+#: message that promises waiting when the request was actually declined is the same class of
+#: inaccuracy R3 removed from the Verify side.
 VERIFY_BUSY_MESSAGE = (
-    "⏳ Source verification is running. It reads the same drive a render reads from, so renders "
-    "wait for it — it is bounded and read-only. Try again once it finishes."
+    "⏳ Source verification is running. It reads the same drive a render reads from, so this render "
+    "was not started — verification is bounded and read-only, so it will not be long. Press Create "
+    "Music Video again once it finishes."
+)
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): the Verify-side refusal when the mutex is held by
+#: another VERIFICATION rather than by a render. Telling the operator a render is running when one
+#: is not is a wrong answer, and the two situations need different advice.
+PREP_VERIFY_ALREADY_RUNNING_TEXT = (
+    "⏳ A source verification is already running. Only one runs at a time, because they read the "
+    "same drive. Nothing was started or cancelled — wait for the running check to finish, then "
+    "press Verify Sources again."
 )
 
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):

@@ -30,6 +30,20 @@ metadata read into a decode claim.
 A probe timeout is likewise **not** a corruption verdict. A 5400-RPM drive under a concurrent read
 load times out for reasons that have nothing to do with the file's bytes, so a timeout is reported
 as a timeout and the source is left unverified.
+
+One click, one snapshot — and where it is not
+---------------------------------------------
+A verification click answers the cache question and the media question in sequence, so the two
+answers are taken at different moments. R3 made that gap observable instead of assumed: one cheap
+``(size, mtime_ns)`` baseline is taken per source *before* the cache phase, and
+:func:`_verify_one` compares it against the two observations it already took around FFprobe. A
+source that moved in **either** window is :attr:`MediaStatus.CHANGED_DURING_CHECK` with the window
+recorded in :class:`ChangeWindow`, and the report says plainly that the cache verdict recorded for
+it is inconclusive too. Before R3 such a source reported ``PREPARED`` beside ``METADATA_OK`` —
+two confident verdicts about two different versions of one file, under a single ``COMPLETE``
+banner. :data:`CHANGE_DETECTION_LIMIT_TEXT` states the bound of the detector in every report: it
+catches an accidental overwrite, which is what the owner actually does, and it is not a byte-level
+integrity proof.
 """
 
 from __future__ import annotations
@@ -43,12 +57,15 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 __all__ = [
+    "CHANGE_DETECTION_LIMIT_TEXT",
     "DEFAULT_BUDGET_SECONDS",
     "DEFAULT_PROBE_TIMEOUT_SECONDS",
     "DEFAULT_PROBE_WORKERS",
     "MAX_PROBE_WORKERS",
     "MAX_REPORT_DETAIL_LINES",
     "METADATA_NOT_DECODE_TEXT",
+    "NO_BASELINE",
+    "ChangeWindow",
     "MediaStatus",
     "MediaVerdict",
     "ProbeOutcome",
@@ -58,6 +75,7 @@ __all__ = [
     "aggregate_media",
     "classify_probe",
     "fingerprint_source",
+    "fingerprint_sources",
     "format_verification_report",
     "resolve_worker_count",
     "verify_media_health",
@@ -98,6 +116,14 @@ MAX_REPORT_DETAIL_LINES = 25
 #: in every report.
 METADATA_NOT_DECODE_TEXT = "Metadata readable — full video decoding not verified."
 
+#: The second honesty sentence, added in R3 alongside cross-phase change detection. Every window
+#: this module brackets is bracketed with ``(size, mtime_ns)``, so the detector catches the
+#: accidental overwrite the milestone exists to find and makes no stronger claim than that.
+CHANGE_DETECTION_LIMIT_TEXT = (
+    "Change detection compares size and modification time only: it catches an accidental "
+    "overwrite, and it is not whole-file byte-integrity proof."
+)
+
 
 class MediaStatus(str, Enum):
     """Read-only media-health reporting labels.
@@ -119,6 +145,32 @@ class MediaStatus(str, Enum):
 #: Every status except ``METADATA_OK`` needs operator attention. Derived, never hand-maintained, so
 #: a status added later cannot be silently omitted from the problem list.
 _PROBLEM_STATUSES = tuple(s for s in MediaStatus if s is not MediaStatus.METADATA_OK)
+
+
+class ChangeWindow(str, Enum):
+    """*Which* window a detected source change was observed in.
+
+    R3 added the first of these. Before it, stability was only bracketed around the FFprobe call,
+    so a file overwritten after its Stage-5 cache classification but before its probe produced
+    ``PREPARED`` (describing the old bytes) beside ``METADATA_OK`` (describing the new ones), under
+    one "Verified at" header and a ``COMPLETE`` banner — two verdicts about different files,
+    presented as one snapshot.
+
+    The window is carried as a field rather than folded into the detail text so the report, and a
+    test, can distinguish the two cases structurally instead of by reading prose.
+    """
+
+    NONE = ""
+    #: Changed after the cache phase observed it and before its probe began. The cache verdict
+    #: recorded for this source is as inconclusive as the media verdict.
+    CROSS_PHASE = "cross_phase"
+    #: Changed while FFprobe was reading it — the original S2-A bracket.
+    DURING_PROBE = "during_probe"
+    #: Both windows. Reported as both, never collapsed to the narrower one.
+    BOTH = "both"
+
+
+_CHANGED_WINDOWS = (ChangeWindow.CROSS_PHASE, ChangeWindow.DURING_PROBE, ChangeWindow.BOTH)
 
 
 def _bounded(text: Any, limit: int = 200) -> str:
@@ -153,6 +205,38 @@ def fingerprint_source(path: str, *, stat=os.stat) -> SourceFingerprint | None:
     except (OSError, ValueError):
         return None
     return SourceFingerprint(size=int(info.st_size), mtime_ns=int(info.st_mtime_ns))
+
+
+class _Unobserved:
+    """The "no baseline was taken for this source" sentinel type.
+
+    A distinct object rather than ``None``, because ``None`` already means something different and
+    load-bearing: *a baseline WAS taken and the file could not be stat-ed*. Collapsing the two
+    would make "we never looked" indistinguishable from "it was missing when we looked", and the
+    second of those is a cross-phase change the moment the file reappears.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "NO_BASELINE"
+
+
+#: Default baseline for a source nobody observed before the cache phase. A run without baselines
+#: behaves exactly as S2-A did: the probe bracket only.
+NO_BASELINE = _Unobserved()
+
+
+def fingerprint_sources(paths: Sequence[str], *,
+                        stat=os.stat) -> List[SourceFingerprint | None]:
+    """One baseline observation per source, **by position**.
+
+    Positional, never a path-keyed mapping: the Stage-5 classifier treats position as the
+    authority, so a library containing the same path twice is two independent entries with two
+    independent verdicts. A dict would silently merge them and then hand the merged observation to
+    both. One ``os.stat`` per source and nothing else — no open, no read, no hash.
+    """
+    return [fingerprint_source(str(path), stat=stat) for path in paths]
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +311,28 @@ class MediaVerdict:
     fps: float = 0.0
     duration: float = 0.0
     probe_seconds: float = 0.0
+    change_window: ChangeWindow = ChangeWindow.NONE
+    """Which stability window a change was observed in, if any. Appended last so every existing
+    keyword construction is unaffected, and defaulted to ``NONE`` so a verdict that never observed
+    a change cannot accidentally claim one."""
 
     @property
     def is_problem(self) -> bool:
         return self.status is not MediaStatus.METADATA_OK
+
+    @property
+    def changed(self) -> bool:
+        """Was this source observed to change in ANY bracketed window?"""
+        return self.change_window in _CHANGED_WINDOWS
+
+    @property
+    def changed_before_probe(self) -> bool:
+        """Did it change between the cache phase observing it and the probe starting?
+
+        This is the one that makes the *cache* verdict inconclusive: the classification was taken
+        against bytes that were already gone by the time the probe ran.
+        """
+        return self.change_window in (ChangeWindow.CROSS_PHASE, ChangeWindow.BOTH)
 
 
 def _finite(value: Any) -> float:
@@ -354,50 +456,124 @@ class VerificationRun:
 
     @property
     def complete(self) -> bool:
-        """True only when every source got a real verdict. Drives the PARTIAL banner."""
+        """True only when every source got a real verdict. Drives the PARTIAL banner.
+
+        Deliberately unchanged by R3: ``complete`` is about probe *coverage*, and a source that
+        changed mid-click was still probed. Its inconclusiveness is reported by its own status,
+        its ``change_window`` and the dedicated report lines — folding it in here would make one
+        flag mean two different things.
+        """
         return not self.budget_exhausted and not any(
             v.status is MediaStatus.NOT_CHECKED for v in self.verdicts)
 
+    @property
+    def changed_before_probe(self) -> List[MediaVerdict]:
+        """Sources that changed between the cache phase and their probe. Order preserved."""
+        return [v for v in self.verdicts if v.changed_before_probe]
 
-def _verify_one(path: str, probe, per_file_timeout: float, clock) -> MediaVerdict:
-    """Fingerprint, probe, re-fingerprint. Total by construction.
+    @property
+    def changed_during_probe(self) -> List[MediaVerdict]:
+        """Sources that changed while FFprobe was reading them. Order preserved."""
+        return [v for v in self.verdicts
+                if v.change_window in (ChangeWindow.DURING_PROBE, ChangeWindow.BOTH)]
 
-    The stability check brackets the probe rather than preceding it, because the window that matters
-    is exactly the one in which we were reading the file. A source that changed inside that window
-    gets ``CHANGED_DURING_CHECK`` **whatever the probe said** — including a clean read, because the
-    bytes FFprobe described are not the bytes now on disk, and the cache classification taken
-    earlier in the click describes neither with certainty.
+
+#: The three inconclusive-change details, keyed by window. Written out rather than assembled from
+#: fragments so each sentence can be read as a whole and none of them can accidentally become a
+#: clean verdict.
+_CHANGE_DETAIL = {
+    ChangeWindow.CROSS_PHASE: (
+        "The file changed on disk AFTER its Stage-5 cache classification and BEFORE this probe "
+        "started. Both verdicts are inconclusive: the cache record was matched against bytes that "
+        "are no longer there. Nothing was reclassified, re-analysed or written."),
+    ChangeWindow.DURING_PROBE: (
+        "The file changed on disk while it was being verified; this result is inconclusive and "
+        "its cache classification may describe different bytes."),
+    ChangeWindow.BOTH: (
+        "The file changed on disk after its Stage-5 cache classification AND again while it was "
+        "being probed. Neither the cache verdict nor this probe describes the bytes now on disk. "
+        "Nothing was reclassified, re-analysed or written."),
+}
+
+
+def _change_window(cross_phase: bool, during_probe: bool) -> ChangeWindow:
+    """Which window(s) a change was seen in. ``BOTH`` is never collapsed to the narrower one."""
+    if cross_phase and during_probe:
+        return ChangeWindow.BOTH
+    if cross_phase:
+        return ChangeWindow.CROSS_PHASE
+    if during_probe:
+        return ChangeWindow.DURING_PROBE
+    return ChangeWindow.NONE
+
+
+def _verify_one(path: str, probe, per_file_timeout: float, clock,
+                baseline: Any = NO_BASELINE) -> MediaVerdict:
+    """Observe, probe, observe again — and compare against the pre-classification observation.
+
+    Total by construction. **Three** ``(size, mtime_ns)`` observations are compared, not two:
+
+    1. ``baseline`` — taken by the caller once per source immediately *before* the Stage-5 cache
+       phase, so this function can see a file that was overwritten between being classified and
+       being probed. That window is the R3 correction; it was previously invisible, and a source
+       inside it reported ``PREPARED`` + ``METADATA_OK`` for two different versions of the file.
+    2. ``before`` — immediately before FFprobe.
+    3. ``after`` — immediately after FFprobe.
+
+    Any disagreement yields ``CHANGED_DURING_CHECK`` **whatever the probe said**, including a
+    perfectly clean read: the bytes FFprobe described are not the bytes the classification saw, or
+    not the bytes on disk now, and a definite verdict about either would be invented.
+    ``change_window`` records *which* window, because the cache half of the report needs to know.
+
+    ``NO_BASELINE`` (the default, and what every caller that passes no baselines gets) disables
+    comparison 1 and leaves S2-A's probe bracket exactly as it was.
     """
     started = clock()
     before = fingerprint_source(path)
+    observed = baseline is not NO_BASELINE
     if before is None:
+        # Disappeared, locked or denied. UNREADABLE is the accurate media verdict and is already a
+        # problem status, so it cannot be mistaken for a clean read -- but if a baseline existed
+        # and was readable, this is also a cross-phase change, and the cache verdict recorded for
+        # it is no more conclusive than this one.
+        vanished = observed and baseline is not None
         return MediaVerdict(
             path=path, status=MediaStatus.UNREADABLE,
             probe_seconds=float(clock() - started),
-            detail="Source could not be opened for inspection (missing, locked or denied).")
+            change_window=ChangeWindow.CROSS_PHASE if vanished else ChangeWindow.NONE,
+            detail=("Source could not be opened for inspection (missing, locked or denied); it "
+                    "WAS readable when the cache phase classified it, so that verdict is "
+                    "inconclusive too."
+                    if vanished else
+                    "Source could not be opened for inspection (missing, locked or denied)."))
+
+    cross_phase = observed and baseline != before
 
     try:
         outcome = probe(path, timeout=per_file_timeout)
     except BaseException as exc:  # noqa: BLE001 — a worker that raised must not kill the run
         # Our own tooling failed, so we have NO verdict on this file. Reported as not-checked with
-        # the cause stated, never as a clean read and never as corruption.
+        # the cause stated, never as a clean read and never as corruption. The window is still
+        # carried: a cross-phase change is a fact about the file, not about the probe.
         return MediaVerdict(
             path=path, status=MediaStatus.NOT_CHECKED,
             probe_seconds=float(clock() - started),
+            change_window=_change_window(cross_phase, False),
             detail=f"Verification worker raised {type(exc).__name__}: {_bounded(exc, 120)}")
 
     probe_seconds = float(clock() - started)
     if not isinstance(outcome, ProbeOutcome):
         return MediaVerdict(
             path=path, status=MediaStatus.NOT_CHECKED, probe_seconds=probe_seconds,
+            change_window=_change_window(cross_phase, False),
             detail=f"Probe seam returned {type(outcome).__name__}, not a ProbeOutcome.")
 
     after = fingerprint_source(path)
-    if after != before:
+    window = _change_window(cross_phase, after != before)
+    if window is not ChangeWindow.NONE:
         return MediaVerdict(
             path=path, status=MediaStatus.CHANGED_DURING_CHECK, probe_seconds=probe_seconds,
-            detail="The file changed on disk while it was being verified; this result is "
-                   "inconclusive and its cache classification may describe different bytes.")
+            change_window=window, detail=_CHANGE_DETAIL[window])
 
     return classify_probe(path, outcome, probe_seconds=probe_seconds)
 
@@ -406,12 +582,20 @@ def verify_media_health(sources: Sequence[str], probe: Callable[..., ProbeOutcom
                         workers: Any = None,
                         per_file_timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
                         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+                        baselines: Sequence[Any] | None = None,
                         clock: Callable[[], float] = None) -> VerificationRun:
     """Probe every source under a bounded worker pool and a bounded overall budget.
 
     ``probe`` is injected — the real one is ``ffmpeg_processing.probe_media_metadata``. That is what
     lets the whole policy (ordering, budget, partial reporting, worker-exception containment) be
     tested on a bare interpreter with no FFmpeg present.
+
+    ``baselines`` is the R3 addition: one pre-cache-phase observation per source, **aligned by
+    position** with ``sources`` (see :func:`fingerprint_sources`). Supplying it lets each verdict
+    see the window between its own cache classification and its own probe. Omitting it is
+    S2-A behaviour exactly — the probe bracket only. A sequence of the wrong length degrades the
+    unmatched positions to :data:`NO_BASELINE` rather than raising, because a bad caller must not
+    be able to fail a read-only verification click.
 
     Three properties the implementation is shaped around:
 
@@ -438,6 +622,12 @@ def verify_media_health(sources: Sequence[str], probe: Callable[..., ProbeOutcom
         return run
 
     verdicts: List[MediaVerdict | None] = [None] * len(paths)
+    # Positional, never path-keyed: a duplicate path is two independent entries and must keep two
+    # independent baselines. A short or long sequence pads/truncates to NO_BASELINE instead of
+    # raising or silently reusing a neighbour's observation.
+    observed = list(baselines) if baselines is not None else []
+    per_source_baseline = [observed[i] if i < len(observed) else NO_BASELINE
+                           for i in range(len(paths))]
     # Two per worker: enough that a worker never idles waiting for the scheduler, small enough that
     # the budget check below is reached promptly instead of after thousands of submissions.
     window = max(1, worker_count * 2)
@@ -457,7 +647,8 @@ def verify_media_health(sources: Sequence[str], probe: Callable[..., ProbeOutcom
                     drained = True
                     break
                 pending[executor.submit(
-                    _verify_one, path, probe, per_file_timeout, clock)] = index
+                    _verify_one, path, probe, per_file_timeout, clock,
+                    per_source_baseline[index])] = index
                 run.scheduled += 1
 
             if not pending:
@@ -517,6 +708,45 @@ def _detail_block(title: str, rows: Sequence[Tuple[str, str]],
         lines.append(f"    ... and {omitted} more not shown "
                      f"(showing the first {limit} of {len(rows)}).")
     return lines
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Case-insensitive, absolute path equality. Never raises."""
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _cross_phase_cache_rows(run: "VerificationRun | None",
+                            classifications: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
+    """``(path, reason)`` for each source whose CACHE verdict the probe phase outdated.
+
+    The classifier's own list and the media verdicts are both built from one ``sources`` list, so
+    they align **by position** — and position, not path, is the authority, because a library may
+    legitimately contain the same path twice. The recorded path is still compared as a guard: if
+    the two lists ever stop aligning, this says so instead of attributing one source's
+    classification to another.
+    """
+    if run is None:
+        return []
+    items = list(classifications or ())
+    rows: List[Tuple[str, str]] = []
+    for index, verdict in enumerate(run.verdicts):
+        if not verdict.changed_before_probe:
+            continue
+        item = items[index] if index < len(items) else {}
+        recorded_path = str((item or {}).get("path") or "")
+        recorded_status = str((item or {}).get("status") or "")
+        if not recorded_status or (recorded_path and not _same_path(recorded_path, verdict.path)):
+            rows.append((verdict.path,
+                         "The file changed on disk before it was probed; its cache classification "
+                         "could not be matched by position and is treated as inconclusive."))
+            continue
+        rows.append((verdict.path,
+                     f"Classified as {recorded_status}, then the file changed on disk before it "
+                     f"was probed — that verdict may describe different bytes."))
+    return rows
 
 
 def format_verification_report(*, folder: str, recursive: bool, verified_at: str,
@@ -586,8 +816,27 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
         lines.extend(_detail_block("Needs analysis - new or changed", changed_rows))
         lines.extend(_detail_block("Needs analysis - incomplete record", incomplete_rows))
         lines.extend(_detail_block("Identity unavailable", unavailable_rows))
+
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): sources the probe phase found had changed
+        # since classification. The classifier's counts above are its REAL output and are never
+        # silently adjusted -- doing that would publish a new classification nobody computed. What
+        # is added is the boundary between "what was classified" and "what is on disk now".
+        cross_rows = _cross_phase_cache_rows(run, cache_classifications)
+        lines.extend(_detail_block(
+            "Changed after classification - cache verdict INCONCLUSIVE", cross_rows))
+        if cross_rows:
+            lines.append(f"  The counts above are the classifier's own output, describing each "
+                         f"source as it was WHEN CLASSIFIED. For the {len(cross_rows)} source(s) "
+                         f"listed immediately above, the file changed afterwards, so whether "
+                         f"those records still apply is INCONCLUSIVE. Nothing was reclassified, "
+                         f"re-analysed, repaired or written.")
+
         if not (changed_rows or incomplete_rows or unavailable_rows):
-            lines.append("  Every source has a reusable Stage-5 cache record.")
+            if cross_rows:
+                lines.append("  Every source had a reusable Stage-5 cache record when it was "
+                             "classified, but the inconclusive source(s) above changed since.")
+            else:
+                lines.append("  Every source has a reusable Stage-5 cache record.")
     lines.append("")
 
     # ---- media health -----------------------------------------------------
@@ -596,6 +845,7 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
     if run is None:
         lines.append("  Not run.")
         return "\n".join(lines)
+    lines.append(f"  {CHANGE_DETECTION_LIMIT_TEXT}")
 
     counts = aggregate_media(run.verdicts)
     lines.append(f"  Metadata verified:             {counts[MediaStatus.METADATA_OK.value]}")
@@ -614,6 +864,17 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
                      "Unchecked sources have NO health verdict.")
     else:
         lines.append("  STATUS: COMPLETE — every source was probed (metadata only).")
+
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): a COMPLETE probe sweep is not the same claim as
+    # "every source is fine as it stands now". A source that moved under us has no current verdict
+    # on either side, and that has to sit next to the banner, not three blocks below it.
+    cross_phase_count = len(run.changed_before_probe)
+    during_probe_count = len(run.changed_during_probe)
+    if cross_phase_count or during_probe_count:
+        lines.append(f"  INCONCLUSIVE: {cross_phase_count} source(s) changed between the cache "
+                     f"phase and their probe; {during_probe_count} changed while being probed. "
+                     f"Those sources have NO current media verdict, and their cache verdict is "
+                     f"inconclusive for the same reason.")
 
     for status in _PROBLEM_STATUSES:
         rows = [(v.path, v.detail) for v in run.verdicts if v.status is status]

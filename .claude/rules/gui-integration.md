@@ -53,6 +53,30 @@ automatically.
   Verification holds no `RenderLifecycle`, is not cancellable, and is not a render. See
   `.claude/rules/source-verification.md`.
 
+  **A mutex cannot refuse an event the queue never delivers (S2-A R3).** `concurrency_id` grouping
+  is described above as "cooperative", and that is exactly why the Verify event must **not** join
+  `RENDER_CONCURRENCY_ID`. S2-A did, with `concurrency_limit=1`; measured on the pinned
+  `gradio==6.19.0`, `Queue.get_events()` skips a group already at its limit and leaves the event
+  queued, so the handler was not entered until the render finished — then it ran automatically
+  against the folder captured at *click* time and overwrote the newer invalidation notice. The
+  mutex was never reached and both busy messages were unreachable. `prep_verify_btn.click`
+  therefore carries no `concurrency_id` and `concurrency_limit=None` (unlimited — a lane of 1 would
+  queue a *second* Verify click instead of letting the mutex refuse it). Both render events keep
+  `concurrency_id=RENDER_CONCURRENCY_ID, concurrency_limit=1`, and `CANCEL_CONCURRENCY_ID` is
+  untouched. **Before claiming any Gradio queuing behaviour in this repository, measure it against
+  the pinned version** — this is the second time a plausible reading of a `concurrency_*` parameter
+  turned out to describe something the operator could not observe.
+
+  **`gr.Request` is an injected per-request value, not a widget and not session state.**
+  `_on_verify_sources_click(folder_path, recursive, request: gr.Request = None)` and
+  `_on_verify_invalidate(request: gr.Request = None)` both take it; neither lists it in `inputs`,
+  both default it to `None` so they stay callable without Gradio, and both read only
+  `session_hash`. It keys a bounded `str -> int` map (`_verify_revisions`, cap 512, LRU eviction)
+  that exists solely so a verification finishing after a folder change can withhold its now-stale
+  report. Session-scoped deliberately: a process-global counter would let one browser session
+  invalidate another's legitimate run. Nothing live — no lock, thread, handle or lifecycle — may
+  enter that map, and it is not a persistence layer.
+
   **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
   `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
   event, an exception while draining — the frame unwinds immediately. Without a finalizer the
