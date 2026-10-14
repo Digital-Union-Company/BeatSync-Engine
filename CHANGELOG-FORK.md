@@ -20,6 +20,70 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R5: an active verification's revision could be evicted)
+
+A second independent review of this branch passed with no blocker and no major finding, and
+confirmed both R3 corrections, but reproduced one remaining correctness defect in the
+stale-report suppression that R3 added. It is corrected here. Nothing else changes: Stage-5 cache
+identity and payloads, the classifier, source fingerprinting and cross-phase stability, the
+FFprobe argv, the 20 s per-file timeout, the 600 s budget, the four-worker cap, the bounded
+submission window, the report's cache/media separation, the immediate-refusal behaviour,
+`RENDER_CONCURRENCY_ID`, the Cancel lane, Scan/Analyze, Stage-4/6 and rendering are all untouched.
+
+**The bounded revision map could drop the entry of a verification that was still running, and
+absence reads back as revision zero.** `_verify_revision` returns `0` for a key that is not
+present, which made "this session was invalidated" and "nothing has changed" the same observation:
+
+1. Session A clicks Verify with no map entry yet, so it captures revision `0`.
+2. A's folder changes. `_bump_verify_revision` stores `A = 1`.
+3. `_VERIFY_REVISION_CAP` other sessions invalidate their own folders. A — whose verification is
+   still running — is evicted as least-recently-touched.
+4. The terminal check reads A again, finds it absent, and gets `0` back. `0 == 0`, so the report
+   describing the folder the operator has already left is published as current.
+
+Measured against the pre-correction branch: 511 competing sessions were safe, 512 published the
+stale report, and the same hole had an ABA form — an entry evicted at revision N and recreated at
+N by a later invalidation. R3's code comment and the scoped rule both asserted the opposite
+("eviction ... can never let a stale report be published as current"); that claim was simply
+wrong, and the owner chose to fix the behaviour rather than weaken the documented guarantee.
+
+The correction uses an invariant that already exists instead of adding a mechanism. `_RENDER_LOCK`
+permits at most **one** verification at a time, so at most one session's revision is load-bearing
+at any instant. `_verify_active_session` — a plain string, capacity one — names that session for
+exactly the span of its own run, and the eviction loop in `_bump_verify_revision` skips it. The cap
+still bounds the map *including* the pinned entry: when the cap is exceeded there are always at
+least `_VERIFY_REVISION_CAP` droppable keys, because only one key can ever be pinned. Other
+sessions evict exactly as before, reads still never insert, a session that never edits its folder
+still never appears, and once the run ends the entry is ordinary and evictable again.
+
+Two orderings are load-bearing and both are now fixed by tests as well as by comments.
+`_begin_verify_session` pins and captures the baseline in **one** locked step, and only on the
+accepted path — pinning and reading separately would let an invalidation land between them and be
+folded into the baseline, and capturing before the mutex would make a *refused* click leave state
+behind. `_end_verify_session` compares and then unpins in one locked step, called from the
+`finally` that also releases the mutex, so success, a reported exception, a `BaseException`
+propagating out of an abandoned request and a withheld stale answer all drop the pin exactly once.
+Because both statements sit inside the same critical section the two orders behave identically
+today — a reviewer's mutation of exactly that swap survived the suite — so the source order is
+pinned by a structural test, against the day the lock block is ever split.
+
+Also corrected, from the same review: the test seam `_load_concurrency_seam` injected
+`_VERIFY_REVISION_CAP = 512` as a literal of its own instead of reading `src/gui.py`. That made
+the eviction tests blind to the production constant — the reviewer mutated the shipped cap to `2`,
+which makes this defect trivially reachable, and all 151 tests stayed green. The seam now reads the
+real module-level assignments, and a test pins the shipped value. One existing test's comment
+claimed "an active session keeps reading its own" revision; a running verification reads its
+revision exactly twice, at the start and at the end, and that false model of the lifecycle is why
+eviction of a running entry looked impossible. The comment is corrected and the test now says what
+it actually covers.
+
+No new module, no new Gradio component, no schema change, no persistence, and nothing live in
+`_verify_revisions`, the pin or `gr.State`. Tests: 5992 passed, 8 skipped (6000 collected), from
+the 5962/8/5970 pre-correction baseline — exactly +31, all in `tests/test_media_verify.py`
+(151 -> 182). Skips unchanged. Eight targeted mutations applied, all eight caught, including the
+exact pre-correction eviction body, the unpin/compare swap, capturing before the mutex, a leaked
+pin, and the cap mutation that previously survived.
+
 ### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R3: two independently reproduced defects in Verify Sources)
 
 An independent review reproduced two MAJOR defects against the S2-A commit. Both are corrected

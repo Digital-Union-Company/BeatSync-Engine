@@ -77,6 +77,17 @@ automatically.
   invalidate another's legitimate run. Nothing live — no lock, thread, handle or lifecycle — may
   enter that map, and it is not a persistence layer.
 
+  **The running verification's own entry is exempt from that eviction (R5).** An absent key reads
+  back as revision `0`, so evicting the entry of a verification that is still running made "I was
+  invalidated" indistinguishable from "nothing changed" and published a stale report as current —
+  reproduced by independent review at exactly 512 competing sessions. `_RENDER_LOCK` already
+  permits only one verification, so `_verify_active_session` pins that one session for the span of
+  its run and `_bump_verify_revision` skips it; the cap still holds including the pinned entry.
+  `_begin_verify_session` pins and captures in one locked step **after** the mutex is taken, and
+  `_end_verify_session` compares and unpins in one locked step from the `finally`, so a refused
+  click pins nothing and no terminal path can leak a pin. The pin is a plain string and never
+  reaches `gr.State`. Full contract: `.claude/rules/source-verification.md`.
+
   **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
   `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
   event, an exception while draining — the frame unwinds immediately. Without a finalizer the

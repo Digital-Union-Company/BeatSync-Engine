@@ -2978,10 +2978,42 @@ _verification_running = False
 # API client on this version, so no end-of-session hook is relied on. Instead the map holds at most
 # `_VERIFY_REVISION_CAP` entries with least-recently-touched eviction, and an entry is only ever
 # created by an actual invalidation -- a session that never edits the folder never appears here.
-# Eviction can only ever make a comparison fail, i.e. show the "folder changed" notice instead of a
-# report; it can never let a stale report be published as current.
+#
+# **R5: eviction used to be able to publish a stale report, and now cannot.** The R3 text claimed
+# eviction "can only ever make a comparison fail". That was wrong, and an independent review
+# reproduced it against these functions. `_verify_revision` returns 0 for an ABSENT key, so absence
+# and "revision zero" were indistinguishable:
+#
+#   1. Session A starts a verification with no entry yet -- it captures revision 0.
+#   2. A's folder changes; `_bump_verify_revision` stores A = 1.
+#   3. `_VERIFY_REVISION_CAP` OTHER sessions invalidate, and A -- whose verification is still
+#      running -- is evicted as least-recently-touched.
+#   4. The terminal check reads A again, finds it absent, and gets 0 back. `0 == 0`, so the report
+#      for the folder the operator has already left is published as current.
+#
+# Measured exactly: 511 other sessions were safe, 512 published the stale report. The same hole had
+# an ABA form -- an entry evicted at revision N and recreated at N by a later invalidation.
+#
+# The fix uses the invariant that already exists. `_RENDER_LOCK` permits at most ONE verification at
+# a time, so at most one session's revision is load-bearing at any instant. That session is pinned
+# in `_verify_active_session` for exactly the span of its own verification, and the eviction loop
+# skips it. Everything else is unchanged: other sessions evict normally, the cap still bounds the
+# map INCLUDING the pinned entry (there are always >= cap evictable keys when the cap is exceeded,
+# because only one key can be pinned), reads still never insert, and an unedited session still
+# never appears. Once the verification ends the pin is dropped and that entry is ordinary again.
+#
+# The pin is a plain string and nothing else -- no lock, thread, event, handle or lifecycle object
+# enters `_verify_revisions` or `gr.State`, and nothing is persisted.
 _VERIFY_REVISION_CAP = 512
 _verify_revisions: Dict[str, int] = {}
+
+#: The session whose verification is running right now, or `''`. Capacity exactly one, because
+#: `_RENDER_LOCK` already guarantees exactly one verification -- this is not a second authority on
+#: whether a verification may start, only a note of whose revision must survive eviction while it
+#: does. Set by `_begin_verify_session` after the mutex is held and cleared by
+#: `_end_verify_session` in a `finally`, so a refused click never pins anything and no terminal
+#: path can leave it set.
+_verify_active_session: str = ''
 
 
 def _mark_verification(active: bool) -> None:
@@ -3027,27 +3059,93 @@ def _verify_session_key(request) -> str:
     return str(session) if session else "__no_session__"
 
 
+def _touch_verify_revision_locked(session: str) -> int:
+    """This session's revision, moved to the most-recently-touched end. Caller holds the lock.
+
+    A read, never an insert: an absent session reports 0 and STAYS absent, so a session that never
+    edits its folder never occupies a slot. Absence reporting 0 is exactly what made eviction
+    dangerous before R5, which is why the active session is pinned rather than inserted here --
+    inserting on read would let any idle session hold a slot, and the R3 contract rules that out.
+    """
+    value = _verify_revisions.get(session)
+    if value is None:
+        return 0
+    del _verify_revisions[session]
+    _verify_revisions[session] = value
+    return value
+
+
 def _verify_revision(session: str) -> int:
-    """This session's current revision. A read, never an insert -- an unedited session stays absent."""
+    """This session's current revision. A read, never an insert -- an unedited session stays absent.
+
+    The standalone accessor. The verification click does NOT use it: capturing a revision and
+    pinning the session have to happen in one locked step (see `_begin_verify_session`), because a
+    read-then-pin sequence would let an invalidation land in between and be captured as the
+    baseline instead of being detected.
+    """
     with _VERIFY_FLAG_LOCK:
-        value = _verify_revisions.get(session)
-        if value is None:
-            return 0
-        # Touch: least-recently-used eviction must not drop a session that is still in use.
-        del _verify_revisions[session]
-        _verify_revisions[session] = value
-        return value
+        return _touch_verify_revision_locked(session)
 
 
 def _bump_verify_revision(session: str) -> int:
-    """Invalidate this session's pending verification result. Bounded, with LRU eviction."""
+    """Invalidate this session's pending verification result. Bounded, with LRU eviction.
+
+    Eviction skips `_verify_active_session`. That one exemption is the R5 correction: the running
+    verification's revision is the only one whose disappearance could be misread as "revision 0,
+    nothing has changed", and publishing an answer about a folder the operator has already left is
+    the exact failure this map exists to prevent.
+
+    The cap still bounds the map including the pinned entry. When the cap is exceeded there are at
+    least `_VERIFY_REVISION_CAP` keys available to drop, since at most one key is ever pinned, so
+    the loop always makes progress; the `break` is a belt-and-braces guard, not a reachable path.
+    """
     with _VERIFY_FLAG_LOCK:
         value = _verify_revisions.pop(session, 0) + 1
         _verify_revisions[session] = value
         while len(_verify_revisions) > _VERIFY_REVISION_CAP:
-            # Insertion order is touch order, so the first key is the least recently touched.
-            del _verify_revisions[next(iter(_verify_revisions))]
+            # Insertion order is touch order, so the first key is the least recently touched --
+            # except the active verification's, which must outlive every other session's churn.
+            victim = next((key for key in _verify_revisions
+                           if key != _verify_active_session), None)
+            if victim is None:
+                break
+            del _verify_revisions[victim]
         return value
+
+
+def _begin_verify_session(session: str) -> int:
+    """Pin `session` as the active verification AND capture its revision, in one locked step.
+
+    Called only after `_RENDER_LOCK` has been acquired and before any verification work, so a
+    refused click never pins and never leaves active state behind.
+
+    Atomic on purpose. Pinning and reading as two separate locked operations would reopen the race
+    in a new place: an invalidation arriving between them would already be folded into the captured
+    baseline, and the terminal comparison would then see no change and publish the stale report.
+    """
+    global _verify_active_session
+    with _VERIFY_FLAG_LOCK:
+        _verify_active_session = session
+        return _touch_verify_revision_locked(session)
+
+
+def _end_verify_session(session: str, revision: int) -> bool:
+    """Decide staleness and release the pin, in one locked step. True means withhold the answer.
+
+    The order inside the lock is load-bearing and is the whole point of this function existing:
+    the comparison happens while the entry is still protected, and only then is the pin dropped.
+    Unpinning first and comparing afterwards would restore the original defect, because the entry
+    could be evicted in that gap and read back as 0.
+
+    Safe to call on every terminal path, including one where `_begin_verify_session` never ran:
+    clearing the pin is conditional on this session actually holding it.
+    """
+    global _verify_active_session
+    with _VERIFY_FLAG_LOCK:
+        current = _touch_verify_revision_locked(session)
+        if _verify_active_session == session:
+            _verify_active_session = ''
+        return current != revision
 
 # ---------------------------------------------------------------------------
 # [FORK] Digital-Union (C3-R1A): the capacity-one active-render slot.
@@ -4005,26 +4103,48 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     to decide, at the very end, whether this answer is still about the library the operator has
     selected. It is read for `session_hash` and nothing else, defaults to `None` so the function
     stays callable without Gradio, and never reaches `gr.State`.
+
+    Four states, and the revision bookkeeping exists to keep them distinguishable
+    ---------------------------------------------------------------------------
+    *Starting* (mutex taken, pin and baseline established together), *running* (an invalidation may
+    arrive at any moment and must survive other sessions' churn), *finished but not published* (the
+    comparison is made while the entry is still pinned), *published or withheld*. R5's correction is
+    entirely about the third state: before it, the entry could be evicted between the second and
+    third, and its absence read back as "revision 0, nothing changed".
     """
-    # Captured BEFORE the work starts, so an invalidation that arrives at any point during it is
-    # visible as a difference afterwards.
     session = _verify_session_key(request)
-    revision = _verify_revision(session)
 
     if not _RENDER_LOCK.acquire(blocking=False):
-        # Names the real holder: a render, or another verification already underway.
+        # Names the real holder: a render, or another verification already underway. Nothing is
+        # pinned and no revision is captured on this path -- a refused click leaves no state at all.
         return _verify_busy_message()
     _mark_verification(True)
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5): pinned and captured together, AFTER the mutex is
+    # held and BEFORE any work, so this session's revision cannot be evicted by other sessions'
+    # churn while the verification it belongs to is still running. `stale` is decided inside the
+    # same `finally` that drops the pin, so there is no window between the two.
+    #
+    # `revision` is pre-set because the `finally` below reads it: if `_begin_verify_session` itself
+    # ever failed, the cleanup still has to run with a defined baseline. `stale` needs no such
+    # default -- the `finally` always assigns it, and the only way past it without one is an
+    # exception propagating, which never reaches the comparison.
+    revision = 0
     try:
-        report = _verify_sources_impl(folder_path, recursive)
-    except Exception as exc:
-        # Total: a verification that raised must report, not vanish behind Gradio's generic error
-        # and not leave the operator unable to tell whether anything ran.
-        import traceback
-        traceback.print_exc()
-        report = (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
-                  f"No analysis, cache change, media change or render was performed.")
+        revision = _begin_verify_session(session)
+        try:
+            report = _verify_sources_impl(folder_path, recursive)
+        except Exception as exc:
+            # Total: a verification that raised must report, not vanish behind Gradio's generic
+            # error and not leave the operator unable to tell whether anything ran.
+            import traceback
+            traceback.print_exc()
+            report = (f"SOURCE VERIFICATION FAILED\n  {type(exc).__name__}: {exc}\n\n"
+                      f"No analysis, cache change, media change or render was performed.")
     finally:
+        # The staleness decision happens HERE, while the entry is still pinned, and the pin is
+        # released by the same locked call. Reached on every terminal path including a
+        # `BaseException` propagating out, so the pin can never outlive its verification.
+        stale = _end_verify_session(session, revision)
         # Cleared BEFORE the release, so a caller that fails the acquire a moment later attributes
         # the mutex to whoever actually holds it next.
         _mark_verification(False)
@@ -4034,7 +4154,7 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     # Gradio lane, so it can complete WHILE this is working. Publishing now would overwrite the
     # newer "the folder changed" notice with an older answer about a folder that is no longer
     # selected. The failure text is withheld for the same reason: it names a folder too.
-    if _verify_revision(session) != revision:
+    if stale:
         return PREP_VERIFY_STALE_TEXT
     return report
 

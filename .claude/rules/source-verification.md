@@ -139,9 +139,14 @@ The folder/recursive `change` listeners run in their own Gradio lane and can the
 answer would simply overwrite the newer notice.
 
 - `_on_verify_invalidate` bumps a **per-session** revision; `_on_verify_sources_click` captures that
-  revision before it starts and, if it has moved by the time it finishes, returns
+  revision once the mutex is held and, if it has moved by the time it finishes, returns
   `PREP_VERIFY_STALE_TEXT` instead of its report. The failure text is withheld on the same
   condition — it names a folder too.
+- **The baseline is captured AFTER the mutex is taken, never before.** A refused click must leave
+  nothing behind: no captured revision, no map entry and no pin. `_begin_verify_session` therefore
+  runs on the accepted path only, and it both pins and captures in **one** locked step —
+  pin-then-read as two steps would let an invalidation land in between and be folded into the
+  baseline, so the terminal comparison would see no change and publish the stale report.
 - **Session-scoped, never one process-global counter.** A global counter would let a folder edit in
   one browser session invalidate a legitimate, still-running verification in another. The key is
   `gr.Request.session_hash`, injected by Gradio into both the `.click` and the `inputs=None`
@@ -154,9 +159,31 @@ answer would simply overwrite the newer notice.
   created by an actual invalidation — a session that never edits its folder never appears. Reading
   a revision must stay a read; a lookup that inserts would let an idle session occupy a slot. The
   map holds `str -> int` and nothing else: no lock, thread, handle or lifecycle may enter it.
-- Eviction is safe in one direction only, which is the correct one: a dropped entry can make the
-  comparison fail and show the "folder changed" notice, and can never let a stale report be
-  published as current.
+- **The ACTIVE verification's revision is exempt from eviction, and that exemption is the
+  correctness guarantee.** This rule previously claimed eviction "is safe in one direction only"
+  and "can never let a stale report be published as current". That was **false**, and an
+  independent review reproduced it: `_verify_revision` reports `0` for an **absent** key, so
+  dropping a running verification's entry made "I was invalidated" and "nothing changed"
+  indistinguishable. Session A captures `0`, A's folder changes storing `A = 1`, 512 other
+  sessions invalidate and evict A, the terminal read finds A absent and gets `0`, `0 == 0`, and
+  the report for the folder the operator already left is published as current. Measured: 511
+  other sessions were safe, 512 published it. The same hole had an ABA form — evicted at
+  revision N, recreated at N by a later invalidation.
+- The fix uses an invariant that already exists rather than adding a mechanism: `_RENDER_LOCK`
+  permits at most **one** verification, so at most one revision is load-bearing at any instant.
+  `_verify_active_session` names it for exactly the span of its own run and the eviction loop in
+  `_bump_verify_revision` skips it. The cap still bounds the map **including** the pinned entry —
+  when the cap is exceeded there are always at least `_VERIFY_REVISION_CAP` droppable keys,
+  because only one key can ever be pinned. Other sessions evict normally, reads still never
+  insert, and once the run ends the entry is ordinary again.
+- **The staleness decision is made while the entry is still pinned.** `_end_verify_session`
+  compares and then unpins inside one lock block, and it is called from the `finally` that also
+  releases the mutex, so every terminal path — success, a reported exception, a `BaseException`
+  propagating out, a withheld stale answer — drops the pin exactly once. Unpinning before the
+  comparison would restore the original defect the moment that lock block is ever split, so the
+  source order is fixed by a test as well as by the single critical section.
+- The pin is a plain string. No lock, thread, event, handle or lifecycle object enters
+  `_verify_revisions`, the pin or `gr.State`, and nothing is persisted.
 - This is not a persistence layer and it is not `gr.State`. Do not promote it to one, and do not
   route it through `prep_state` or `source_state`.
 - **Deliberately NOT extended to preparation Scan/Analyze.** Those are the operator's own

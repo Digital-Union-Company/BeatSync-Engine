@@ -886,18 +886,49 @@ class _FakeGradio:
     Request = _FakeRequest
 
 
-def _load_concurrency_seam():
+#: The verification concurrency seam, in the order the shipped module defines it.
+_CONCURRENCY_SEAM_FUNCTIONS = (
+    "_mark_verification", "_busy_message", "_verify_busy_message",
+    "_verify_session_key", "_touch_verify_revision_locked", "_verify_revision",
+    "_bump_verify_revision", "_begin_verify_session", "_end_verify_session",
+    "_on_verify_sources_click", "_on_verify_invalidate",
+)
+
+
+def _module_constant(tree, name):
+    """The shipped module-level value of `name`, as a literal.
+
+    [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5, accepted R4 review finding): the seam used to
+    inject `_VERIFY_REVISION_CAP = 512` as a literal of its own. That made the eviction tests
+    blind to the production constant -- the R4 reviewer mutated the shipped cap to 2, which makes
+    the stale-publication defect trivially reachable, and the whole file stayed green. Reading the
+    real assignment is what makes a cap change observable here.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == name:
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"module-level assignment {name} not found in {_GUI}")
+
+
+def _load_concurrency_seam(cap=None):
     """Execute the REAL verification concurrency seam over a real Lock and a stubbed impl.
 
     Every function in the chain is the shipped source, extracted by AST: the mutex gate, the two
-    busy-message helpers and the whole session-revision mechanism. Only `_verify_sources_impl` (the
-    disk work) is stubbed, because that is the part that would need a library.
+    busy-message helpers and the whole session-revision mechanism including the R5 active-session
+    pin. Only `_verify_sources_impl` (the disk work) is stubbed, because that is the part that
+    would need a library.
+
+    `_VERIFY_REVISION_CAP` and `_verify_active_session` come from the shipped assignments, not from
+    literals here. `cap` overrides the capacity for the tests that need eviction pressure to be
+    cheap -- it shrinks the bound in the TEST namespace only and never edits production source.
     """
     tree = _tree(_GUI)
-    nodes = [_func(tree, name) for name in
-             ("_mark_verification", "_busy_message", "_verify_busy_message",
-              "_verify_session_key", "_verify_revision", "_bump_verify_revision",
-              "_on_verify_sources_click", "_on_verify_invalidate")]
+    nodes = [_func(tree, name) for name in _CONCURRENCY_SEAM_FUNCTIONS]
     state = {"impl_calls": [], "impl": lambda folder, recursive: "REPORT"}
     namespace = {
         "gr": _FakeGradio,
@@ -905,8 +936,10 @@ def _load_concurrency_seam():
         "_RENDER_LOCK": threading.Lock(),
         "_VERIFY_FLAG_LOCK": threading.Lock(),
         "_verification_running": False,
-        "_verify_revisions": {},
-        "_VERIFY_REVISION_CAP": 512,
+        "_verify_revisions": dict(_module_constant(tree, "_verify_revisions") or {}),
+        "_VERIFY_REVISION_CAP": (_module_constant(tree, "_VERIFY_REVISION_CAP")
+                                 if cap is None else int(cap)),
+        "_verify_active_session": _module_constant(tree, "_verify_active_session"),
         "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
         "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "VERIFY_REFUSED_RENDER_ACTIVE",
@@ -2013,12 +2046,21 @@ def test_reading_a_revision_never_creates_an_entry():
 
 
 def test_touching_a_revision_protects_it_from_eviction():
+    """A REPEATEDLY READ entry survives churn, which is a property of the touch, not of a run.
+
+    [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5): the loop below used to be commented "an active
+    session keeps reading its own", which described a lifecycle that does not exist -- a running
+    verification reads its revision exactly twice, once at the start and once at the end, and
+    reads nothing in between. That mistaken model is why eviction of a RUNNING verification's
+    entry looked impossible. What actually protects a running verification is the pin, covered by
+    `test_an_active_verification_survives_*` below; this test covers only the touch itself.
+    """
     ns, _state = _load_concurrency_seam()
     cap = ns["_VERIFY_REVISION_CAP"]
     ns["_bump_verify_revision"]("long-lived")
     for index in range(cap + 20):
         ns["_bump_verify_revision"](f"filler-{index}")
-        ns["_verify_revision"]("long-lived")      # an active session keeps reading its own
+        ns["_verify_revision"]("long-lived")
     assert "long-lived" in ns["_verify_revisions"]
 
 
@@ -2029,6 +2071,389 @@ def test_the_revision_map_holds_integers_only():
     assert all(isinstance(v, int) and not isinstance(v, bool)
                for v in ns["_verify_revisions"].values())
     assert all(isinstance(k, str) for k in ns["_verify_revisions"])
+
+
+def test_the_active_session_pin_is_a_plain_string():
+    """No lock, thread, event, handle or lifecycle object may become the pin."""
+    ns, _state = _load_concurrency_seam()
+    assert ns["_verify_active_session"] == ""
+    ns["_begin_verify_session"]("abc")
+    assert isinstance(ns["_verify_active_session"], str)
+    assert ns["_verify_active_session"] == "abc"
+    ns["_end_verify_session"]("abc", 0)
+    assert ns["_verify_active_session"] == ""
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-A R5): LRU eviction of an ACTIVE verification's revision.
+# ---------------------------------------------------------------------------
+#
+# The R4 independent review reproduced a stale report being published as current. `_verify_revision`
+# returns 0 for an absent key, so eviction of a running verification's entry made "we were
+# invalidated" indistinguishable from "nothing has changed":
+#
+#   A captures 0 (no entry yet) -> A's folder changes, storing A = 1 -> `_VERIFY_REVISION_CAP`
+#   other sessions invalidate and evict A -> the terminal read finds A absent and gets 0 ->
+#   `0 == 0` -> the report for the folder the operator has already left is published.
+#
+# Measured on the pre-correction branch: 511 other sessions were safe, 512 published the stale
+# report. The ABA form -- evicted at revision N, recreated at N by a later invalidation -- did the
+# same thing from a non-zero start.
+#
+# These tests drive the SHIPPED `_on_verify_sources_click` with a barrier inside the stubbed impl,
+# so the invalidation and the eviction pressure land while the verification is genuinely running,
+# and they assert the TERMINAL DECISION (what the operator is shown), never that a helper was
+# called. `_load_concurrency_seam(cap=...)` shrinks the bound in the test namespace so the
+# pressure is cheap; the production constant is never edited.
+
+
+def _verification_with_interference(interfere, *, cap=None, session="A", pre_bumps=0):
+    """Run one real verification click; `interfere(ns)` runs while it is inside the impl.
+
+    Returns `(returned_text, ns, state)`. The impl blocks on an Event so the interference is
+    guaranteed to happen in the "running, not yet published" window rather than racing it.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    ns, state = _load_concurrency_seam(cap=cap)
+
+    def blocking_impl(_folder, _recursive):
+        entered.set()
+        assert release.wait(30), "the test never released the verification"
+        return "REPORT"
+
+    state["impl"] = blocking_impl
+    for _ in range(pre_bumps):
+        ns["_bump_verify_revision"](session)
+
+    out = {}
+
+    def click():
+        out["result"] = ns["_on_verify_sources_click"](
+            "J:/lib", True, _FakeRequest(session))
+
+    worker = threading.Thread(target=click, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(30), "the verification never started"
+        out["pinned_while_running"] = ns["_verify_active_session"]
+        interfere(ns)
+        out["present_while_running"] = session in ns["_verify_revisions"]
+        out["map_len_while_running"] = len(ns["_verify_revisions"])
+    finally:
+        release.set()
+        worker.join(30)
+    assert not worker.is_alive(), "the verification must finish"
+    return out, ns, state
+
+
+def _evict_with_other_sessions(count):
+    def interfere(ns):
+        ns["_on_verify_invalidate"](_FakeRequest("A"))          # the operator edits A's folder
+        for index in range(count):                              # other sessions churn the map
+            ns["_bump_verify_revision"](f"other-{index}")
+    return interfere
+
+
+@pytest.mark.parametrize("others", [0, 1, 7, 8, 9, 16, 40])
+def test_an_active_verification_survives_any_number_of_other_invalidations(others):
+    """Scenario A, at and far beyond the cap. The stale report must ALWAYS be suppressed.
+
+    `cap=8` makes "more other sessions than the whole map can hold" cheap to express; the
+    production cap is asserted separately by `test_the_revision_cap_is_the_shipped_constant`.
+    """
+    out, ns, _state = _verification_with_interference(
+        _evict_with_other_sessions(others), cap=8)
+    assert out["result"] == "STALE_FOLDER_CHANGED", (
+        f"{others} other sessions invalidated and the stale report was published anyway: "
+        f"{out['result']!r}")
+    assert out["pinned_while_running"] == "A"
+    assert out["present_while_running"], "the active session's entry must survive eviction"
+    assert out["map_len_while_running"] <= 8, "the cap must hold INCLUDING the pinned entry"
+
+
+@pytest.mark.parametrize("others", [511, 512, 513, 1024])
+def test_the_reproduced_defect_thresholds_are_all_suppressed_at_the_real_cap(others):
+    """The exact numbers R4 measured, against the real shipped cap.
+
+    Pre-correction: 511 withheld, 512 and above published the stale report. All four must now
+    withhold it.
+    """
+    out, _ns, _state = _verification_with_interference(_evict_with_other_sessions(others))
+    assert out["result"] == "STALE_FOLDER_CHANGED", f"{others} others -> {out['result']!r}"
+    assert out["present_while_running"]
+
+
+@pytest.mark.parametrize("captured", [1, 2, 9])
+def test_the_aba_recreation_case_is_suppressed(captured):
+    """Scenario B: a non-zero captured revision, eviction pressure, then another invalidation.
+
+    Before R5 the entry could be dropped and recreated at the same integer, so the comparison
+    saw no change. The pin makes the eviction impossible, so the second invalidation increments
+    from the surviving value instead of from zero.
+    """
+    out, ns, _state = _verification_with_interference(
+        _evict_with_other_sessions(40), cap=8, pre_bumps=captured)
+    assert out["result"] == "STALE_FOLDER_CHANGED"
+    assert ns["_verify_revisions"]["A"] == captured + 1, (
+        "the invalidation must increment the surviving revision, not restart from 0")
+
+
+def test_an_evicting_storm_without_any_invalidation_still_publishes():
+    """The other direction: eviction pressure alone must not fabricate a stale notice."""
+    def interfere(ns):
+        for index in range(40):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, _ns, _state = _verification_with_interference(interfere, cap=8)
+    assert out["result"] == "REPORT", "no invalidation happened, so the report is current"
+
+
+def test_an_unaffected_session_is_not_invalidated_by_another_sessions_edit():
+    """Session isolation survives the pin: B's edit plus heavy churn must not stale A's report."""
+    def interfere(ns):
+        ns["_on_verify_invalidate"](_FakeRequest("B"))
+        for index in range(40):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, _ns, _state = _verification_with_interference(interfere, cap=8)
+    assert out["result"] == "REPORT"
+
+
+def test_multiple_edits_of_the_active_session_stay_detectable():
+    def interfere(ns):
+        for _ in range(5):
+            ns["_on_verify_invalidate"](_FakeRequest("A"))
+        for index in range(40):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, ns, _state = _verification_with_interference(interfere, cap=8)
+    assert out["result"] == "STALE_FOLDER_CHANGED"
+    assert ns["_verify_revisions"]["A"] == 5
+
+
+def test_the_terminal_decision_is_made_before_the_pin_is_released():
+    """The ordering requirement, driven at the last possible instant.
+
+    The invalidation AND the eviction storm happen inside the impl, i.e. after the baseline was
+    captured and before the comparison. An implementation that unpinned first and compared second
+    would read A back as 0 here and publish.
+    """
+    def interfere(ns):
+        ns["_on_verify_invalidate"](_FakeRequest("A"))
+        for index in range(200):
+            ns["_bump_verify_revision"](f"late-{index}")
+
+    out, ns, _state = _verification_with_interference(interfere, cap=8)
+    assert out["result"] == "STALE_FOLDER_CHANGED"
+    assert ns["_verify_active_session"] == "", "the pin must be released afterwards"
+
+
+def test_a_finished_verifications_entry_becomes_evictable_again():
+    """The pin is for the span of one run, not a permanent reservation."""
+    out, ns, _state = _verification_with_interference(
+        _evict_with_other_sessions(0), cap=8)
+    assert out["result"] == "STALE_FOLDER_CHANGED"
+    assert "A" in ns["_verify_revisions"]
+    for index in range(20):
+        ns["_bump_verify_revision"](f"after-{index}")
+    assert "A" not in ns["_verify_revisions"], (
+        "once the run is over the former active entry must evict like any other")
+    assert len(ns["_verify_revisions"]) <= 8
+
+
+def test_a_refused_verification_leaves_no_pin_and_no_entry():
+    """Requirement J: a click that never got the mutex must leave nothing behind."""
+    ns, state = _load_concurrency_seam()
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: a render holds the mutex"
+    try:
+        out = ns["_on_verify_sources_click"]("J:/lib", True, _FakeRequest("A"))
+    finally:
+        ns["_RENDER_LOCK"].release()
+    assert out == "VERIFY_REFUSED_RENDER_ACTIVE"
+    assert ns["_verify_active_session"] == "", "a refusal must not pin"
+    assert ns["_verify_revisions"] == {}, "a refusal must not insert"
+    assert state["impl_calls"] == []
+
+
+def test_rapid_verify_clicks_never_create_a_second_pin():
+    entered = threading.Event()
+    release = threading.Event()
+    ns, state = _load_concurrency_seam()
+    observed = []
+
+    def blocking_impl(_folder, _recursive):
+        observed.append(ns["_verify_active_session"])
+        entered.set()
+        assert release.wait(30)
+        return "REPORT"
+
+    state["impl"] = blocking_impl
+    results = []
+    workers = [threading.Thread(
+        target=lambda index=index: results.append(ns["_on_verify_sources_click"](
+            "J:/lib", True, _FakeRequest(f"S{index}"))), daemon=True)
+        for index in range(6)]
+    for worker in workers:
+        worker.start()
+    try:
+        assert entered.wait(30)
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(30)
+    assert len(state["impl_calls"]) == 1, "the mutex must admit exactly one"
+    assert len(set(observed)) == 1, f"only one session may ever be pinned: {set(observed)}"
+    assert ns["_verify_active_session"] == ""
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "the mutex must not leak"
+
+
+def test_the_pin_is_cleared_and_the_mutex_freed_when_the_work_raises():
+    ns, state = _load_concurrency_seam()
+
+    def boom(_folder, _recursive):
+        raise RuntimeError("verification blew up")
+
+    state["impl"] = boom
+    out = ns["_on_verify_sources_click"]("J:/lib", True, _FakeRequest("A"))
+    assert "SOURCE VERIFICATION FAILED" in out
+    assert ns["_verify_active_session"] == ""
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+
+
+def test_the_pin_is_cleared_when_a_base_exception_propagates():
+    """Requirement H's hardest path: not an `Exception`, so the inner handler cannot catch it."""
+    ns, state = _load_concurrency_seam()
+
+    def abandoned(_folder, _recursive):
+        raise KeyboardInterrupt("request abandoned")
+
+    state["impl"] = abandoned
+    with pytest.raises(KeyboardInterrupt):
+        ns["_on_verify_sources_click"]("J:/lib", True, _FakeRequest("A"))
+    assert ns["_verify_active_session"] == "", "a BaseException must still release the pin"
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "and still release the mutex"
+
+
+def test_a_stale_suppressed_verification_also_clears_the_pin():
+    out, ns, _state = _verification_with_interference(
+        _evict_with_other_sessions(3), cap=8)
+    assert out["result"] == "STALE_FOLDER_CHANGED"
+    assert ns["_verify_active_session"] == ""
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+
+
+def test_the_revision_cap_is_the_shipped_constant_not_a_test_literal(gui_tree):
+    """Closes the R4 review's test-seam finding.
+
+    The seam used to inject `512` itself, so mutating the production constant was invisible and
+    the suite stayed green with the cap at 2. The cap must come from `src/gui.py`.
+    """
+    shipped = _module_constant(gui_tree, "_VERIFY_REVISION_CAP")
+    ns, _state = _load_concurrency_seam()
+    assert ns["_VERIFY_REVISION_CAP"] == shipped
+    assert shipped == 512, (
+        "the documented bound is 512; changing it changes how many sessions the map remembers "
+        "and must be a deliberate, documented decision")
+
+
+def test_the_eviction_loop_actually_exempts_the_active_session():
+    """The mechanism, asserted directly rather than only through the handler.
+
+    A bare `del _verify_revisions[next(iter(...))]` -- the pre-correction body -- drops the
+    oldest key unconditionally, which is the active one here.
+    """
+    ns, _state = _load_concurrency_seam(cap=4)
+    ns["_bump_verify_revision"]("A")            # A is the OLDEST entry
+    ns["_begin_verify_session"]("A")
+    for index in range(20):
+        ns["_bump_verify_revision"](f"other-{index}")
+    assert "A" in ns["_verify_revisions"], "the oldest key was evicted despite being pinned"
+    assert len(ns["_verify_revisions"]) <= 4
+    ns["_end_verify_session"]("A", 1)
+    for index in range(20):
+        ns["_bump_verify_revision"](f"later-{index}")
+    assert "A" not in ns["_verify_revisions"]
+
+
+def test_begin_and_end_are_each_one_atomic_step(gui_tree):
+    """Requirement I: no read/pin or unpin/compare gap may exist in the shipped source.
+
+    One lock block each is what actually closes the gap. Because `_bump_verify_revision` needs the
+    same lock, nothing can be evicted part-way through either function, which is why the single
+    block -- not the statement order inside it -- is the load-bearing property. The order is
+    pinned separately by `test_the_end_step_reads_before_it_unpins` so a later refactor that
+    splits the block cannot inherit a dangerous order.
+    """
+    for name in ("_begin_verify_session", "_end_verify_session"):
+        node = _func(gui_tree, name)
+        withs = [n for n in ast.walk(node) if isinstance(n, ast.With)]
+        assert len(withs) == 1, f"{name} must do its work under exactly one lock block"
+        guard = ast.dump(withs[0].items[0].context_expr)
+        assert "_VERIFY_FLAG_LOCK" in guard, f"{name} must use _VERIFY_FLAG_LOCK"
+
+
+def test_the_end_step_reads_before_it_unpins(gui_tree):
+    """Requirement G, as source order rather than as a comment.
+
+    Inside one critical section the two orders behave identically, so no runtime test can tell
+    them apart -- an independent review's mutation of exactly this swap survived the suite. The
+    order still has to be fixed: if the lock block is ever split, reading after the unpin is the
+    original defect again, and this is the assertion that refuses the swap today.
+    """
+    node = _func(gui_tree, "_end_verify_session")
+    block = next(n for n in ast.walk(node) if isinstance(n, ast.With))
+    read_at = unpin_at = None
+    for index, statement in enumerate(block.body):
+        dumped = ast.dump(statement)
+        if read_at is None and "_touch_verify_revision_locked" in dumped:
+            read_at = index
+        if unpin_at is None and isinstance(statement, ast.If) \
+                and "_verify_active_session" in dumped:
+            unpin_at = index
+    assert read_at is not None, "_end_verify_session must read the current revision"
+    assert unpin_at is not None, "_end_verify_session must release the pin"
+    assert read_at < unpin_at, (
+        "the revision must be read while the entry is still pinned, before the pin is released")
+
+
+def test_only_the_begin_end_pair_ever_assigns_the_pin(gui_tree):
+    """The pin must have exactly one writer at each end of a run, and no other.
+
+    A third writer somewhere else would be a second lifecycle for the same fact, which is how the
+    unpin-then-compare ordering gets reintroduced by accident.
+    """
+    writers = {}
+    for node in ast.walk(gui_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            targets = []
+            if isinstance(inner, ast.Assign):
+                targets = inner.targets
+            elif isinstance(inner, ast.AnnAssign):
+                targets = [inner.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == "_verify_active_session":
+                    writers.setdefault(node.name, 0)
+                    writers[node.name] += 1
+    assert set(writers) == {"_begin_verify_session", "_end_verify_session"}, (
+        f"unexpected writers of the active-session pin: {sorted(writers)}")
+    assert writers["_begin_verify_session"] == 1
+    assert writers["_end_verify_session"] == 1
+
+
+def test_the_click_captures_its_baseline_after_taking_the_mutex(gui_tree):
+    """Requirement A/J, structurally: the capture must not precede the acquire."""
+    body = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
+    acquire_at = body.index("_RENDER_LOCK.acquire(blocking=False)")
+    begin_at = body.index("_begin_verify_session(session)")
+    end_at = body.index("_end_verify_session(session, revision)")
+    release_at = body.index("_RENDER_LOCK.release()")
+    assert acquire_at < begin_at, "a refused click must not capture or pin"
+    assert begin_at < end_at
+    assert end_at < release_at, (
+        "the staleness decision must be made before the mutex is released, while still pinned")
 
 
 # ---------------------------------------------------------------------------
