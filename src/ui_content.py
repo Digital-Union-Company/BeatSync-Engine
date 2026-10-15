@@ -996,6 +996,13 @@ PREP_VERIFY_ALREADY_RUNNING_TEXT = (
 LABEL_PREP_SAMPLE = "🎞️ Sample Decode — Check One Video"
 LABEL_PREP_SAMPLE_PATH = "Video file to sample"
 LABEL_PREP_SAMPLE_SEEK = "Position to sample (seconds)"
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, R1 MINOR-3): the sample field takes ONE FILE, so it
+#: needs its own example. It previously borrowed `PLACEHOLDER_SOURCE_FOLDER`, which shows a
+#: directory with no filename and no extension -- an operator following it would enter a folder and
+#: get `SAMPLE_INVALID_REQUEST`, while the field's own label says "Video file to sample". A
+#: placeholder is an illustrative path only: it is not a default value, is never submitted, and
+#: promises nothing about the file existing.
+PLACEHOLDER_SAMPLE_VIDEO = r"J:\New folder\Cuts\clip.mp4"
 LABEL_PREP_SAMPLE_REPORT = "🎞️ Sample Decode (read-only)"
 INFO_PREP_SAMPLE = (
     "Ask FFmpeg to produce up to 30 output frames at the chosen position in ONE video. The output "

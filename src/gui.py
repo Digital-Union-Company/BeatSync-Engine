@@ -3481,9 +3481,6 @@ def process_video_guarded(audio_file: str,
         # it. The gate itself is the same single non-blocking acquire.
         yield gr.skip(), _busy_message(), session_state, gr.skip(), gr.skip(), ''
         return
-    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): state the holder instead of letting it be
-    # inferred. Immediately after the successful acquire and before any work, mirroring the
-    # verification path; cleared in the `finally` below, immediately before the release.
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for this whole render event, constructed and
     # installed here, before any expensive work -- the mutex-owning wrapper owns
     # installation/uninstallation, exactly as the frozen authorization requires.
@@ -3611,9 +3608,6 @@ def render_selected_variants_guarded(
         _busy = _busy_message()
         yield gr.skip(), _busy, session_state, _busy, ''
         return
-
-    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): same holder marking as the single-render
-    # wrapper, in the same position relative to the acquire.
 
     # [FORK] Digital-Union (C3-R1A): ONE lifecycle for the WHOLE batch -- every selected candidate
     # shares it,
@@ -5285,7 +5279,7 @@ def create_ui() -> gr.Blocks:
                     gr.Markdown(INFO_PREP_SAMPLE)
                     sample_path = gr.Textbox(
                         label=LABEL_PREP_SAMPLE_PATH,
-                        placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                        placeholder=PLACEHOLDER_SAMPLE_VIDEO,
                         elem_id='prep-sample-path',
                     )
                     # Seconds, never a frame number: the diagnostic's own contract forbids
