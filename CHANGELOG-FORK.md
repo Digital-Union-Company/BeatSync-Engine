@@ -20,6 +20,68 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-15 (MEDIA-VERIFY-S2-B P1: sample-decode diagnostic core and FFmpeg seam)
+
+A bounded answer to the question S2-A deliberately cannot answer. `MEDIA_METADATA_OK` means the
+container header parsed; a file whose header is intact and whose middle is shredded passes it. S2-B
+takes **one source, one seek position** and makes the decoder actually produce frames there.
+
+**P1 is the pure core, the execution seam and the tests only.** There is no Gradio control and no
+event handler — the UI and per-session stale-result suppression are P2 — and nothing here runs
+FFmpeg: both child processes arrive as injected callables, so all fifteen statuses are reachable on
+a bare interpreter with no FFmpeg, no FFprobe and no media. S2-A's behaviour is unchanged.
+
+- **New `src/beatsync_fork/media_sample.py`** (stdlib-only, per CLAUDE.md's hard rule): fifteen
+  statuses whose single positive member is `SAMPLE_OUTPUT_FRAMES_OK`, renderer-equivalent stream
+  selection, a total `-progress` parser, the classifier and the operator report.
+- **New seam in `src/ffmpeg_processing.py`**: `build_sample_decode_command` (a pure argv builder,
+  assertable without running anything) and `sample_decode_video`, which reuses the existing
+  `_run_media_command` with `lifecycle=None`. No new subprocess implementation, no new
+  `RenderLifecycle`, no new cancellation authority.
+
+**It validates the stream the renderer would actually decode, not the first one.** `classify_probe`
+selects the first `codec_type == "video"` stream and validates *that* stream; FFmpeg's documented
+automatic selection — which the renderer gets, since `extract_clip_segment_ffmpeg_detailed` passes
+no `-map` — takes the highest-resolution stream, ties broken by lowest index. Those differ on a
+multi-video container, so gating the decode on `classify_probe` would both refuse files whose
+unselected first stream has a bad duration and bless a stream nobody validated. `probe_media_metadata`
+is reused for FFprobe execution, timeout and launch-error semantics **only**; the selected stream is
+validated on its own metadata, pinned by absolute index, and every verdict records that index plus
+the duration's provenance (stream or container — not interchangeable). Genuine ambiguity (no usable
+index; two or more video streams where any is an attached picture or lacks geometry) fails closed. A
+pixel-area tie is resolvable, not ambiguous.
+
+**No frame-rate arithmetic anywhere.** An earlier design diagnosed end-of-file from
+`seek + frames/fps` versus the reported duration. `classify_probe` returns `METADATA_OK` without
+ever validating `fps`, so that divisor can legitimately be `0`; `r_frame_rate` is a base/maximum
+rate that for VFR sits far above the true average, which biases the test toward *claiming damage* on
+healthy files; and for VFR the quantity is not the time span of those frames at all. Underproduction
+is therefore always `SAMPLE_UNDERFILLED_UNVERIFIED` — inconclusive, never damage, never confirmed
+EOF — reporting observed and requested counts. A test walks the classifier AST and fails on any
+division by a frame rate.
+
+**Evidence handling is deliberately pessimistic.** Timeout and non-zero exit are judged *before* any
+frame count, so partial progress reaching the requested total can never become success. `-frames:v`
+bounds **output** frames, and `-ss` pre-roll frames are decoded but never counted, which is why the
+status says "output frames" rather than "decoded" or "verified". `-fps_mode passthrough` replaces the
+renderer's `cfr` because CFR can reach the count by duplicating one good frame. Missing
+`dup_frames`/`drop_frames` are UNKNOWN — never converted to zero, never read as proof of zero —
+while an explicitly positive one downgrades the result. Three `(size, mtime_ns)` observations bracket
+the work; a change before the decode suppresses the child entirely, since the metadata that chose the
+`-map` target describes bytes that are gone, and a failed post-decode observation fails closed.
+`change_window` and `stability` are separate fields so a timeout that also saw the file move keeps
+both facts.
+
+Bounds are conservative policy, not measured optima: 30 output frames, FFprobe 20 s (S2-A's constant,
+reused), decode 30 s, 60 s scheduling budget, one source, one worker. The budget gates scheduling and
+is re-measured after the last pre-decode stat so no child starts without room for its full timeout;
+`os.stat`, process creation, termination and post-timeout pipe draining sit outside it, so **no hard
+end-to-end bound is claimed**. `_run_media_command`'s stderr capture remains unbounded in principle.
+**Portable-build acceptance of `-progress`, `-fps_mode passthrough` and `-f null -` is UNVERIFIED**
+pending a separately authorized integration test.
+
+143 new tests (6001 → 6144 collected). Contract: `.claude/rules/source-verification.md`.
+
 ### Fixed — 2026-10-14 (MEDIA-VERIFY-S2-A R5: an active verification's revision could be evicted)
 
 A second independent review of this branch passed with no blocker and no major finding, and

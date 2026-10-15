@@ -1,8 +1,10 @@
 ---
 paths:
   - "src/beatsync_fork/media_verify.py"
+  - "src/beatsync_fork/media_sample.py"
   - "src/ffmpeg_processing.py"
   - "tests/test_media_verify.py"
+  - "tests/test_media_sample.py"
 ---
 <!-- `src/gui.py` is deliberately ABSENT from this list. `docs/claude/README.md` records the
      architecture: gui.py loads only `gui-integration.md`, and each subsystem rule is scoped to its
@@ -291,3 +293,109 @@ count stated explicitly and the true total in the block header. The bound is on 
 rows** — a displayed failure's own path is never shortened, because the path is the identification
 the operator needs in order to act. That is S1's MAJOR-1 restated for this surface: a diagnostic
 must not truncate away its own subject. A test drives a 900-character path through the report.
+
+## Sample decode (MEDIA-VERIFY-S2-B, P1 — pure core + seam, NOT wired to the UI)
+
+S2-A answers "did the header parse?". S2-B asks the next bounded question: **take one source, one
+seek position, and make the decoder actually produce frames there.** `beatsync_fork/media_sample.py`
+owns the fifteen statuses, renderer-equivalent stream selection, the progress parser, the classifier
+and the report; `ffmpeg_processing.build_sample_decode_command` / `sample_decode_video` own the one
+child process. P1 ships **no Gradio control and no event handler** — GUI and per-session
+stale-result suppression are P2.
+
+`probe` and `decode` arrive as **injected callables**, like `verify_media_health`'s `probe`. That is
+what makes all fifteen statuses reachable with no FFmpeg, no FFprobe and no media, and it is why
+`media_sample` never imports `ffmpeg_processing` (the hard rule runs one way only).
+
+### `classify_probe` is NOT a prerequisite for a sample decode
+
+The trap this contract exists to prevent. `classify_probe` selects the **first**
+`codec_type == "video"` stream and validates *that* stream's geometry and duration. FFmpeg's
+documented automatic selection — which is what `extract_clip_segment_ffmpeg_detailed` gets, because
+it passes no `-map` — takes the **highest-resolution** video stream, ties broken by lowest index. On
+a multi-video container those are different streams, so gating the decode on `classify_probe` would
+both refuse files whose *unselected* first stream has a bad duration and bless a selected stream
+nobody validated.
+
+So: `probe_media_metadata` is reused for FFprobe **execution, timeout and launch-error semantics
+only**. Its classifier is not consulted. `select_renderer_equivalent_stream` re-reads the raw
+`-show_streams` payload and validates the stream that will actually be decoded. Every verdict
+records the absolute stream index, codec, geometry, duration, **duration provenance**
+(`stream`/`container`, because those are not interchangeable) and a renderer-equivalence label.
+No report may imply equivalence that was not established. Do not change `classify_probe` to fix
+this; the two subjects are meant to differ.
+
+Fail closed (`SAMPLE_STREAM_AMBIGUOUS`) only where the renderer's pick genuinely cannot be
+determined: a video stream with no usable absolute index; two or more video streams where any is an
+`attached_pic` (the docs give the resolution rule and the `V` specifier's exclusion, but not how
+automatic selection ranks an attached picture); or two or more where any lacks usable geometry. **A
+pixel-area tie is resolvable, not ambiguous** — lowest index wins, per the documented rule. A lone
+stream that is undescribable is `SAMPLE_METADATA_UNUSABLE`, not ambiguity: "I cannot tell which
+stream" and "the stream I must test is undescribable" are different operator problems.
+
+### No frame-rate arithmetic. Ever.
+
+An earlier design classified a short sample as end-of-file when `seek + frames/fps` exceeded the
+reported duration. It is unsound three times over: `classify_probe` returns `METADATA_OK` **without
+validating `fps`**, so the divisor can legitimately be `0`; `r_frame_rate` is a base/maximum rate
+that for VFR sits far above the true average, biasing the comparison toward *claiming damage* on
+healthy files; and for VFR `frames/fps` is not the time span of those frames at all. A test walks
+the classifier AST and fails on any division whose right operand names a frame rate.
+
+Underproduction is therefore **always** `SAMPLE_UNDERFILLED_UNVERIFIED` — inconclusive, never
+"damaged", never "confirmed EOF" — and always reports observed *and* requested counts. `fps` is
+report context only. The one surviving duration use is the division-free precondition
+`seek >= duration → SAMPLE_SEEK_OUT_OF_RANGE`, a refusal rather than a verdict on the bytes.
+
+### The argv, and why `frame=` is named "output frames"
+
+`-frames:v` is documented as "stop writing to the stream after framecount frames" — a bound on
+**output** frames. With `-ss` before `-i`, accurate-seek pre-roll frames are decoded but never
+counted, so the counter *understates* decoder work. Hence `SAMPLE_OUTPUT_FRAMES_OK`: never describe
+it as "frames decoded" or "frames verified".
+
+`-fps_mode passthrough` is the one deliberate divergence from the renderer's `cfr` and is
+load-bearing: under CFR, FFmpeg can reach the requested count by **duplicating a single good
+frame**, which would let a damaged source pass. `-v error` means a clean run prints nothing, so a
+non-empty stderr *is* the decoder-error signal — no pattern matching, and the bias is toward
+withholding success. `-f null -` writes no file; no `-y` is needed. Forbidden: a filter chain, any
+encoder argument, `-y`, `-xerror`, `-noaccurate_seek`, a second output-side seek, any retry. The
+diagnostic is **not** the render: a clean sample says the decoder produced frames, never that the
+production NVENC extraction would succeed.
+
+### Status precedence
+
+Timeout and non-zero exit are checked **before any frame count**, so partial progress that happens
+to reach the requested total can never become a success. Then: a failed post-decode observation
+(fails closed — claims no change, permits no success), a change observed during the decode, the
+evidence tier (no terminal `progress=end`, missing/malformed count, a count *above* the request, or
+an explicitly positive dup/drop), `frame=0`, underfill, stderr-at-exit-0, and finally the one
+positive status. `change_window` and `stability` are **separate fields, never statuses**, so a
+timeout that also saw the file move reports both facts instead of hiding one behind the other.
+
+Missing `dup_frames`/`drop_frames` are **UNKNOWN**, never converted to zero and never read as proof
+of zero; unknown does not block success (FFmpeg need not emit those keys, and requiring them would
+make success unreachable rather than rigorous), while an explicitly positive one does.
+
+### Bounds, and what is not claimed
+
+30 output frames, FFprobe 20 s (S2-A's constant, reused not redefined), decode 30 s, 60 s
+scheduling budget, one source, one worker. **Every one is a conservative policy choice, not a
+measured optimum.** The budget gates *scheduling*: it is re-measured after the last pre-decode stat
+and must leave room for the whole decode timeout, so no child starts that the budget could not let
+finish. `os.stat`, Windows process creation, termination and post-timeout pipe draining all sit
+outside it — **no hard end-to-end wall-clock bound is claimed anywhere.**
+
+`lifecycle=None` is passed to `_run_media_command`, matching `probe_media_metadata`: a diagnostic is
+not a render. That also preserves evidence — `subprocess.run` attaches the partial capture to
+`TimeoutExpired`, whereas the lifecycle branch raises a bare `TimeoutExpired(cmd, timeout)` with no
+output. Those attributes are documented as **always bytes when any output was captured, regardless
+of `text=True`**, and may be `None`, so every parser entry point goes through
+`coerce_stream_text`. No new runner, no new `RenderLifecycle`, no new cancellation authority; there
+is no Cancel control in P1, and a browser disconnect does not necessarily interrupt the child.
+`_run_media_command` captures stderr without a size limit — `-v error` makes large output unlikely
+and the bounds cap how long a pathological file can write, but neither establishes a hard memory
+bound. Do not claim otherwise.
+
+**Portable-build acceptance of `-progress`, `-fps_mode passthrough` and `-f null -` is UNVERIFIED**
+until a separately authorized real-FFmpeg integration test. P1 executes no FFmpeg at all.
