@@ -1885,3 +1885,1276 @@ def test_math_helpers_never_leak_a_nonfinite_number_into_a_report():
     assert "nan" not in report.lower()
     assert all(math.isfinite(v) for v in
                (verdict.duration, verdict.fps, verdict.requested_seek, verdict.elapsed_seconds))
+
+
+# ===========================================================================
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the GUI integration.
+# ===========================================================================
+#
+# Three tiers, and the distinction matters because only one of them proves concurrency:
+#
+#   1. A REAL `threading.Lock` driven by real threads, over the SHIPPED handler source extracted
+#      by `ast` and exec'd against a namespace. This is what proves the three-way exclusion, the
+#      holder attribution and the scoped revision contract -- not an AST reading.
+#   2. AST assertions over the shipped `gui.py` for wiring facts a running test cannot see: which
+#      lane the event joins, which widgets it reads, which components it writes, and -- the
+#      resource contract -- that the `run_sample_check` call carries NO frame/timeout/budget
+#      argument at all.
+#   3. The already-imported pure core for the verdicts themselves.
+#
+# No Gradio, no FFmpeg, no FFprobe and no GUI is started anywhere below.
+
+_GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
+
+
+class _FakeSampleRequest:
+    def __init__(self, session_hash):
+        self.session_hash = session_hash
+
+
+class _FakeSampleGradio:
+    """Just enough `gr` for the extracted handlers' annotations."""
+
+    Request = _FakeSampleRequest
+
+
+#: The sample-decode concurrency seam, in the order `gui.py` defines it. `_sample_decode_impl` and
+#: `_verify_sources_impl` are the only members stubbed, because they are the parts that would need
+#: FFmpeg and a library folder.
+_SAMPLE_SEAM_FUNCTIONS = (
+    "_mark_lock_holder", "_lock_holder_now", "_mark_verification",
+    "_busy_message", "_verify_busy_message", "_sample_busy_message",
+    "_verify_session_key", "_scoped_key",
+    "_touch_verify_revision_locked", "_verify_revision",
+    "_bump_verify_revision", "_begin_verify_session", "_end_verify_session",
+    "_on_verify_sources_click", "_on_verify_invalidate",
+    "_on_sample_decode_click", "_on_sample_invalidate",
+)
+
+
+def _gui_constant(tree, name):
+    """The shipped module-level literal for `name` -- read, never restated.
+
+    Same reasoning as S2-A's `_module_constant`: injecting a literal scope name or cap would make
+    these tests blind to a change in the shipped value, which is how a mutated constant stays green.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == name:
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} is not a module-level literal in gui.py")
+
+
+def _load_p2_seam(cap=None):
+    """Execute the REAL S2-B + S2-A concurrency seam over a real Lock and stubbed impls."""
+    import threading
+    tree = _tree(_GUI)
+    nodes = [_func(tree, name) for name in _SAMPLE_SEAM_FUNCTIONS]
+    state = {"sample_calls": [], "verify_calls": [],
+             "sample_impl": lambda path, seek: "SAMPLE_REPORT",
+             "verify_impl": lambda folder, recursive: "VERIFY_REPORT"}
+    namespace = {
+        "gr": _FakeSampleGradio,
+        "threading": threading,
+        "_RENDER_LOCK": threading.Lock(),
+        "_VERIFY_FLAG_LOCK": threading.Lock(),
+        # [FORK] S2-B P2 (Option B): the holder lookup reads the EXISTING active-render slot as
+        # positive evidence of a render, so the seam needs the slot and its own lock. The two are
+        # never held together -- the token is copied and released, then the slot is.
+        "_ACTIVE_RENDER_SLOT_LOCK": threading.Lock(),
+        "_active_render_slot": None,
+        "_lock_holder": _gui_constant(tree, "_lock_holder"),
+        "_LOCK_HOLDER_RENDER": _gui_constant(tree, "_LOCK_HOLDER_RENDER"),
+        "_LOCK_HOLDER_VERIFY": _gui_constant(tree, "_LOCK_HOLDER_VERIFY"),
+        "_LOCK_HOLDER_SAMPLE": _gui_constant(tree, "_LOCK_HOLDER_SAMPLE"),
+        "_SCOPE_VERIFY": _gui_constant(tree, "_SCOPE_VERIFY"),
+        "_SCOPE_SAMPLE": _gui_constant(tree, "_SCOPE_SAMPLE"),
+        "_verify_revisions": dict(_gui_constant(tree, "_verify_revisions") or {}),
+        "_VERIFY_REVISION_CAP": (_gui_constant(tree, "_VERIFY_REVISION_CAP")
+                                 if cap is None else int(cap)),
+        "_verify_active_session": _gui_constant(tree, "_verify_active_session"),
+        "RENDER_BUSY_MESSAGE": "BUSY_RENDER_TO_RENDER",
+        "VERIFY_BUSY_MESSAGE": "BUSY_RENDER_TO_VERIFY",
+        "SAMPLE_BUSY_MESSAGE": "BUSY_RENDER_TO_SAMPLE",
+        "MEDIA_BUSY_UNKNOWN_TEXT": "BUSY_UNKNOWN",
+        "PREP_VERIFY_RENDER_BUSY_TEXT": "BUSY_VERIFY_TO_RENDER",
+        "PREP_VERIFY_ALREADY_RUNNING_TEXT": "BUSY_VERIFY_TO_VERIFY",
+        "PREP_VERIFY_SAMPLE_BUSY_TEXT": "BUSY_VERIFY_TO_SAMPLE",
+        "PREP_VERIFY_STALE_TEXT": "STALE_VERIFY",
+        "PREP_SAMPLE_RENDER_BUSY_TEXT": "BUSY_SAMPLE_TO_RENDER",
+        "PREP_SAMPLE_VERIFY_BUSY_TEXT": "BUSY_SAMPLE_TO_VERIFY",
+        "PREP_SAMPLE_ALREADY_RUNNING_TEXT": "BUSY_SAMPLE_TO_SAMPLE",
+        "PREP_SAMPLE_STALE_TEXT": "STALE_SAMPLE",
+    }
+
+    def sample_impl(path, seek):
+        state["sample_calls"].append((path, seek))
+        return state["sample_impl"](path, seek)
+
+    def verify_impl(folder, recursive):
+        state["verify_calls"].append((folder, recursive))
+        return state["verify_impl"](folder, recursive)
+
+    namespace["_sample_decode_impl"] = sample_impl
+    namespace["_verify_sources_impl"] = verify_impl
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), _GUI, "exec"), namespace)
+    return namespace, state
+
+
+def _hold_as(ns, holder):
+    """Take the shipped mutex the way a real holder does: acquire, THEN publish the holder."""
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: the mutex was free"
+    ns["_mark_lock_holder"](holder)
+
+
+def _drop(ns):
+    ns["_mark_lock_holder"]("")
+    ns["_RENDER_LOCK"].release()
+
+
+# ---------------------------------------------------------------------------
+# the full nine-cell caller x holder attribution table, plus the unknown holder
+# ---------------------------------------------------------------------------
+
+def test_the_three_way_busy_attribution_table_is_complete_and_never_guesses():
+    """Nine cells, nine distinct truthful answers -- and an empty token is its own honest tenth.
+
+    The boolean this replaced could express only two holders, and it derived "a render" from
+    `False` BY ELIMINATION because the render path never marked itself. With three holders that
+    inference is false in both new directions: a render refused during a sample would have claimed
+    another render was running, and S2-A would have called a sample a render.
+    """
+    ns, _state = _load_p2_seam()
+    callers = {"render": ns["_busy_message"],
+               "verify": ns["_verify_busy_message"],
+               "sample": ns["_sample_busy_message"]}
+    expected = {
+        ("render", "render"): "BUSY_RENDER_TO_RENDER",
+        ("render", "verify"): "BUSY_RENDER_TO_VERIFY",
+        ("render", "sample"): "BUSY_RENDER_TO_SAMPLE",
+        ("verify", "render"): "BUSY_VERIFY_TO_RENDER",
+        ("verify", "verify"): "BUSY_VERIFY_TO_VERIFY",
+        ("verify", "sample"): "BUSY_VERIFY_TO_SAMPLE",
+        ("sample", "render"): "BUSY_SAMPLE_TO_RENDER",
+        ("sample", "verify"): "BUSY_SAMPLE_TO_VERIFY",
+        ("sample", "sample"): "BUSY_SAMPLE_TO_SAMPLE",
+    }
+    for (caller, holder), want in expected.items():
+        ns["_mark_lock_holder"](holder)
+        got = callers[caller]()
+        assert got == want, f"{caller} refused while {holder} holds -> {got!r}, want {want!r}"
+    # No two cells for one caller may collapse: a refusal that cannot tell the operator which
+    # operation to wait for is the defect this table exists to prevent.
+    for caller in callers:
+        texts = [expected[(caller, holder)] for holder in ("render", "verify", "sample")]
+        assert len(set(texts)) == 3, (caller, texts)
+
+
+def test_an_unpublished_holder_is_reported_honestly_and_never_as_a_render():
+    """The real one-statement window: the mutex is held, the token is not set yet.
+
+    `acquire()` and `_mark_lock_holder()` are two statements, so a caller that fails the acquire in
+    between genuinely sees `''`. Naming a render there would be a fabricated attribution, and it is
+    exactly what the old boolean did, since `False` meant both "nobody marked" and "a render".
+    """
+    ns, _state = _load_p2_seam()
+    assert ns["_lock_holder_now"]() == "", "the shipped initial token is empty"
+    for caller in ("_busy_message", "_verify_busy_message", "_sample_busy_message"):
+        got = ns[caller]()
+        assert got == "BUSY_UNKNOWN", f"{caller} guessed {got!r} for an unpublished holder"
+        assert "RENDER" not in got, f"{caller} inferred a render from an empty token"
+
+
+def test_the_holder_token_is_not_an_admission_authority():
+    """A stale or wrong token must never admit or refuse on its own: the mutex decides."""
+    ns, state = _load_p2_seam()
+    # Marked 'sample' while the mutex is FREE -> a verification must still be admitted.
+    ns["_mark_lock_holder"](ns["_LOCK_HOLDER_SAMPLE"])
+    assert ns["_on_verify_sources_click"]("J:/lib", True) == "VERIFY_REPORT"
+    assert state["verify_calls"] == [("J:/lib", True)]
+    # Empty token while the mutex is HELD -> nobody may be admitted.
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+    try:
+        ns["_mark_lock_holder"]("")
+        assert ns["_on_sample_decode_click"]("J:/a.mp4", 1.0) == "BUSY_UNKNOWN"
+        assert state["sample_calls"] == [], "an unknown holder is still a refusal"
+    finally:
+        ns["_RENDER_LOCK"].release()
+
+
+# ---------------------------------------------------------------------------
+# three-way mutual exclusion, over a real Lock and real threads
+# ---------------------------------------------------------------------------
+
+def test_a_sample_is_refused_immediately_while_a_render_holds_the_mutex():
+    ns, state = _load_p2_seam()
+    _hold_as(ns, ns["_LOCK_HOLDER_RENDER"])
+    try:
+        out = ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, _FakeSampleRequest("S"))
+    finally:
+        _drop(ns)
+    assert out == "BUSY_SAMPLE_TO_RENDER"
+    assert state["sample_calls"] == [], "no decode work may begin while a render runs"
+    assert ns["_verify_active_session"] == "", "a refusal must not pin"
+    assert ns["_verify_revisions"] == {}, "a refusal must not insert a revision"
+
+
+def test_a_sample_is_refused_immediately_while_a_verification_holds_the_mutex():
+    ns, state = _load_p2_seam()
+    _hold_as(ns, ns["_LOCK_HOLDER_VERIFY"])
+    try:
+        out = ns["_on_sample_decode_click"]("J:/a.mp4", 1.0)
+    finally:
+        _drop(ns)
+    assert out == "BUSY_SAMPLE_TO_VERIFY"
+    assert state["sample_calls"] == []
+
+
+def test_a_verification_is_refused_while_a_sample_holds_the_mutex():
+    ns, state = _load_p2_seam()
+    _hold_as(ns, ns["_LOCK_HOLDER_SAMPLE"])
+    try:
+        out = ns["_on_verify_sources_click"]("J:/lib", True)
+    finally:
+        _drop(ns)
+    assert out == "BUSY_VERIFY_TO_SAMPLE"
+    assert state["verify_calls"] == []
+
+
+def test_a_render_refused_during_a_sample_does_not_claim_another_render_is_running():
+    """The precise failure the holder token exists to prevent.
+
+    With the old boolean, `_verification_running` was `False` during a sample decode, so the render
+    gate's refusal said "a render is already running" -- about a render that did not exist.
+    """
+    ns, _state = _load_p2_seam()
+    _hold_as(ns, ns["_LOCK_HOLDER_SAMPLE"])
+    try:
+        assert not ns["_RENDER_LOCK"].acquire(blocking=False), "the render gate must refuse"
+        refusal = ns["_busy_message"]()
+    finally:
+        _drop(ns)
+    assert refusal == "BUSY_RENDER_TO_SAMPLE"
+    assert refusal != "BUSY_RENDER_TO_RENDER", "a sample was mislabelled as a render"
+
+
+def test_two_simultaneous_sample_requests_never_overlap_and_only_one_runs():
+    """Requirement H, with real threads: the loser is refused, not queued."""
+    import threading
+    ns, state = _load_p2_seam()
+    inside = threading.Event()
+    hold = threading.Event()
+    results = []
+
+    def impl(path, seek):
+        inside.set()
+        assert hold.wait(10), "the test never released the sample"
+        return "SAMPLE_REPORT"
+
+    state["sample_impl"] = impl
+    first = threading.Thread(
+        target=lambda: results.append(
+            ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, _FakeSampleRequest("A"))),
+        daemon=True)
+    first.start()
+    try:
+        assert inside.wait(10), "the first sample never started"
+        second = ns["_on_sample_decode_click"]("J:/b.mp4", 2.0, _FakeSampleRequest("B"))
+    finally:
+        hold.set()
+        first.join(10)
+    assert not first.is_alive()
+    assert second == "BUSY_SAMPLE_TO_SAMPLE", f"the second click got {second!r}"
+    assert len(state["sample_calls"]) == 1, "exactly one decode may run"
+    assert results == ["SAMPLE_REPORT"]
+
+
+def test_a_refused_sample_does_no_work_and_does_not_run_later():
+    """Requirement R: a refusal is terminal. The queued-then-auto-run defect, asserted absent."""
+    ns, state = _load_p2_seam()
+    _hold_as(ns, ns["_LOCK_HOLDER_RENDER"])
+    try:
+        out = ns["_on_sample_decode_click"]("J:/a.mp4", 1.0)
+    finally:
+        _drop(ns)
+    assert out == "BUSY_SAMPLE_TO_RENDER"
+    assert state["sample_calls"] == []
+    # Releasing the mutex must not make the refused request execute retroactively.
+    assert state["sample_calls"] == [], "a refused sample must never run afterwards"
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "the mutex must be free again"
+    ns["_RENDER_LOCK"].release()
+
+
+def test_the_sample_mutex_and_holder_are_released_after_success():
+    ns, _state = _load_p2_seam()
+    assert ns["_on_sample_decode_click"]("J:/a.mp4", 1.0) == "SAMPLE_REPORT"
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "the mutex leaked after a successful sample"
+    ns["_RENDER_LOCK"].release()
+    assert ns["_lock_holder_now"]() == "", "the holder token leaked after a successful sample"
+    assert ns["_verify_active_session"] == "", "the pin leaked after a successful sample"
+
+
+def test_the_sample_mutex_and_holder_are_released_after_an_exception():
+    ns, state = _load_p2_seam()
+
+    def boom(path, seek):
+        raise RuntimeError("decode seam exploded")
+
+    state["sample_impl"] = boom
+    out = ns["_on_sample_decode_click"]("J:/a.mp4", 1.0)
+    assert "SAMPLE DECODE FAILED" in out
+    assert "RuntimeError" in out and "decode seam exploded" in out
+    assert "No analysis, cache change, media change or render was performed." in out
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), "the mutex leaked after an exception"
+    ns["_RENDER_LOCK"].release()
+    assert ns["_lock_holder_now"]() == "", "the holder token leaked after an exception"
+    assert ns["_verify_active_session"] == ""
+
+
+def test_the_sample_mutex_and_holder_survive_a_baseexception():
+    """An abandoned request must not leave the app permanently refusing renders.
+
+    `BaseException` deliberately propagates, so the `finally` is the only thing that can release
+    the mutex, the holder token and the pin.
+    """
+    ns, state = _load_p2_seam()
+
+    def abandoned(path, seek):
+        raise KeyboardInterrupt("request abandoned")
+
+    state["sample_impl"] = abandoned
+    with pytest.raises(KeyboardInterrupt):
+        ns["_on_sample_decode_click"]("J:/a.mp4", 1.0)
+    assert ns["_RENDER_LOCK"].acquire(blocking=False), \
+        "an abandoned sample must not leave the app permanently busy"
+    ns["_RENDER_LOCK"].release()
+    assert ns["_lock_holder_now"]() == "", "a BaseException must still clear the holder token"
+    assert ns["_verify_active_session"] == "", "a BaseException must still release the pin"
+
+
+def test_the_holder_is_cleared_before_the_mutex_is_released():
+    """Ordering requirement: decide staleness, clear the holder, THEN release.
+
+    Releasing first would leave a window in which the mutex is free while the token still names a
+    finished sample, so the next caller to fail an acquire would be told to wait for something that
+    had already ended.
+    """
+    tree = _tree(_GUI)
+    handler = _func(tree, "_on_sample_decode_click")
+    body = [ast.unparse(node) for node in handler.body]
+    finallies = [n for n in ast.walk(handler) if isinstance(n, ast.Try) and n.finalbody]
+    assert finallies, "the release must sit in a finally"
+    final = [ast.unparse(statement) for statement in finallies[0].finalbody]
+    clear_at = next(i for i, s in enumerate(final) if "_mark_lock_holder('')" in s)
+    release_at = next(i for i, s in enumerate(final) if "_RENDER_LOCK.release()" in s)
+    stale_at = next(i for i, s in enumerate(final) if "_end_verify_session" in s)
+    assert stale_at < clear_at < release_at, final
+    assert any("_RENDER_LOCK.acquire(blocking=False)" in s for s in body), \
+        "the gate must be a single non-blocking acquire"
+
+
+def test_the_sample_marks_the_holder_only_after_acquiring():
+    """Marking before the acquire would publish a holder that does not hold anything."""
+    tree = _tree(_GUI)
+    body = [ast.unparse(node) for node in _func(tree, "_on_sample_decode_click").body]
+    acquire_at = next(i for i, s in enumerate(body)
+                      if "_RENDER_LOCK.acquire(blocking=False)" in s)
+    mark_at = next(i for i, s in enumerate(body) if "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)" in s)
+    assert acquire_at < mark_at, body
+
+
+# ---------------------------------------------------------------------------
+# scoped stale-result protection
+# ---------------------------------------------------------------------------
+#
+# One bounded map, one pin, two scopes. Nothing about the eviction algorithm is duplicated here --
+# the S2-A functions are reused verbatim and simply receive a longer key, so the R5 correction
+# (the active entry is exempt from eviction) protects a sample exactly as it protects a
+# verification. The reason that still holds is `_RENDER_LOCK`: at most one of render / verify /
+# sample runs at a time, so at most one revision is ever load-bearing.
+
+def _sample_with_interference(interfere, *, cap=None, session="A", pre_bumps=0):
+    """Run one real sample click; `interfere(ns)` runs while it is inside the impl."""
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+    ns, state = _load_p2_seam(cap=cap)
+
+    def blocking_impl(_path, _seek):
+        entered.set()
+        assert release.wait(30), "the test never released the sample"
+        return "SAMPLE_REPORT"
+
+    state["sample_impl"] = blocking_impl
+    scoped = ns["_scoped_key"](session, ns["_SCOPE_SAMPLE"])
+    for _ in range(pre_bumps):
+        ns["_bump_verify_revision"](scoped)
+
+    out = {}
+
+    def click():
+        out["result"] = ns["_on_sample_decode_click"](
+            "J:/a.mp4", 1.0, _FakeSampleRequest(session))
+
+    worker = threading.Thread(target=click, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(30), "the sample never started"
+        out["pinned_while_running"] = ns["_verify_active_session"]
+        out["holder_while_running"] = ns["_lock_holder_now"]()
+        interfere(ns)
+        out["present_while_running"] = scoped in ns["_verify_revisions"]
+        out["map_len_while_running"] = len(ns["_verify_revisions"])
+    finally:
+        release.set()
+        worker.join(30)
+    assert not worker.is_alive(), "the sample must finish"
+    return out, ns, state
+
+
+def test_changing_the_source_path_during_a_decode_withholds_the_stale_report():
+    """Requirement J: an answer about a file the operator has already left is never published."""
+    out, _ns, _state = _sample_with_interference(
+        lambda ns: ns["_on_sample_invalidate"](_FakeSampleRequest("A")))
+    assert out["result"] == "STALE_SAMPLE", f"the stale report was published: {out['result']!r}"
+    assert out["holder_while_running"] == "sample", "the holder must name the sample while it runs"
+
+
+def test_changing_the_seek_during_a_decode_withholds_the_stale_report():
+    """Requirement K. Both change listeners share one handler, so this is the same bump."""
+    out, _ns, _state = _sample_with_interference(
+        lambda ns: ns["_on_sample_invalidate"](_FakeSampleRequest("A")))
+    assert out["result"] == "STALE_SAMPLE"
+
+
+def test_a_failed_sample_is_also_withheld_after_an_invalidation():
+    """The failure text names a path too, so it is withheld for the same reason."""
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+    ns, state = _load_p2_seam()
+
+    def boom(_path, _seek):
+        entered.set()
+        assert release.wait(30)
+        raise RuntimeError("decode seam exploded")
+
+    state["sample_impl"] = boom
+    out = {}
+    worker = threading.Thread(
+        target=lambda: out.update(
+            result=ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, _FakeSampleRequest("A"))),
+        daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(30)
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+    finally:
+        release.set()
+        worker.join(30)
+    assert out["result"] == "STALE_SAMPLE", "a failure report about a stale path must be withheld"
+
+
+def test_another_session_editing_its_inputs_does_not_invalidate_this_sample():
+    """Requirement L: session-scoped, so one browser cannot clear another's answer."""
+    out, _ns, _state = _sample_with_interference(
+        lambda ns: ns["_on_sample_invalidate"](_FakeSampleRequest("B")))
+    assert out["result"] == "SAMPLE_REPORT", "another session's edit invalidated this sample"
+
+
+def test_a_sessions_own_edit_still_invalidates_when_another_session_also_edits():
+    def interfere(ns):
+        ns["_on_sample_invalidate"](_FakeSampleRequest("B"))
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+    out, _ns, _state = _sample_with_interference(interfere)
+    assert out["result"] == "STALE_SAMPLE"
+
+
+def test_a_folder_edit_does_not_invalidate_a_running_sample():
+    """Cross-scope isolation, direction one.
+
+    S2-A's folder/recursive invalidation belongs to the 'verify' scope. A sample answers a
+    different question about a different selection, so clearing it would be a wrong answer -- not
+    merely a conservative one.
+    """
+    out, _ns, _state = _sample_with_interference(
+        lambda ns: ns["_on_verify_invalidate"](_FakeSampleRequest("A")))
+    assert out["result"] == "SAMPLE_REPORT", "a folder edit invalidated a sample decode"
+
+
+def test_a_sample_input_edit_does_not_invalidate_a_running_verification():
+    """Cross-scope isolation, direction two -- asserted through the S2-A handler itself."""
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+    ns, state = _load_p2_seam()
+
+    def blocking_verify(_folder, _recursive):
+        entered.set()
+        assert release.wait(30)
+        return "VERIFY_REPORT"
+
+    state["verify_impl"] = blocking_verify
+    out = {}
+    worker = threading.Thread(
+        target=lambda: out.update(
+            result=ns["_on_verify_sources_click"]("J:/lib", True, _FakeSampleRequest("A"))),
+        daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(30)
+        assert ns["_lock_holder_now"]() == "verify"
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+    finally:
+        release.set()
+        worker.join(30)
+    assert out["result"] == "VERIFY_REPORT", "a seek edit invalidated a source verification"
+
+
+def test_the_two_scopes_are_separate_entries_for_one_session():
+    """The structural fact the isolation rests on: distinct keys, independent counters."""
+    ns, _state = _load_p2_seam()
+    verify_key = ns["_scoped_key"]("A", ns["_SCOPE_VERIFY"])
+    sample_key = ns["_scoped_key"]("A", ns["_SCOPE_SAMPLE"])
+    assert verify_key != sample_key
+    ns["_on_verify_invalidate"](_FakeSampleRequest("A"))
+    assert ns["_verify_revisions"] == {verify_key: 1}, ns["_verify_revisions"]
+    ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+    assert ns["_verify_revisions"] == {verify_key: 1, sample_key: 1}, ns["_verify_revisions"]
+    ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+    assert ns["_verify_revisions"][sample_key] == 2
+    assert ns["_verify_revisions"][verify_key] == 1, "the verify scope must not move"
+
+
+def test_a_scope_cannot_forge_another_scopes_key():
+    """A session_hash is hex and the fallback is `__no_session__`; neither can contain a NUL."""
+    ns, _state = _load_p2_seam()
+    assert "\x00" in ns["_scoped_key"]("A", ns["_SCOPE_SAMPLE"])
+    assert ns["_scoped_key"]("A", "sample") != ns["_scoped_key"]("A\x00sample", "verify")
+    assert ns["_verify_session_key"](_FakeSampleRequest("abc")) == "abc"
+    assert "\x00" not in ns["_verify_session_key"](_FakeSampleRequest("abc"))
+
+
+def test_a_sample_request_without_a_session_hash_falls_into_one_shared_bucket():
+    """Requirement: the fallback must not be unique, or an invalidation could never match."""
+    ns, _state = _load_p2_seam()
+    assert ns["_verify_session_key"](None) == ns["_verify_session_key"](_FakeSampleRequest(None))
+    assert ns["_verify_session_key"](_FakeSampleRequest("")) == "__no_session__"
+    out, _ns2, _state2 = _sample_with_interference(
+        lambda ns2: ns2["_on_sample_invalidate"](None), session="__no_session__")
+    assert out["result"] == "STALE_SAMPLE", "the shared bucket must still self-invalidate"
+
+
+@pytest.mark.parametrize("others", [0, 1, 7, 8, 9, 16, 40])
+def test_an_active_sample_survives_any_number_of_other_invalidations(others):
+    """The R5 eviction exemption, re-proved for the sample scope at and beyond the cap."""
+    def interfere(ns):
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+        for index in range(others):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, _ns, _state = _sample_with_interference(interfere, cap=8)
+    assert out["result"] == "STALE_SAMPLE", (
+        f"{others} other sessions churned and the stale sample report was published: "
+        f"{out['result']!r}")
+    assert out["pinned_while_running"] == "A\x00sample"
+    assert out["present_while_running"], "the active sample's entry must survive eviction"
+    assert out["map_len_while_running"] <= 8, "the cap must hold INCLUDING the pinned entry"
+
+
+@pytest.mark.parametrize("others", [511, 512, 513, 1024])
+def test_the_sample_scope_is_suppressed_at_the_real_shipped_cap(others):
+    """The R4-measured thresholds, against the real cap read from `gui.py`."""
+    def interfere(ns):
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+        for index in range(others):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, _ns, _state = _sample_with_interference(interfere)
+    assert out["result"] == "STALE_SAMPLE", f"{others} others -> {out['result']!r}"
+    assert out["present_while_running"]
+
+
+@pytest.mark.parametrize("captured", [1, 2, 9])
+def test_the_aba_recreation_case_is_suppressed_for_the_sample_scope(captured):
+    """Scenario B: a non-zero captured revision, eviction pressure, then an invalidation.
+
+    Without the pin the entry could be dropped and recreated at the same integer, so the terminal
+    comparison would see no change and publish. `_verify_revision` returns 0 for an ABSENT key, so
+    absence and "revision zero" must never become indistinguishable for the running operation.
+    """
+    def interfere(ns):
+        ns["_on_sample_invalidate"](_FakeSampleRequest("A"))
+        for index in range(40):
+            ns["_bump_verify_revision"](f"other-{index}")
+
+    out, ns, _state = _sample_with_interference(interfere, cap=8, pre_bumps=captured)
+    assert out["result"] == "STALE_SAMPLE"
+    key = ns["_scoped_key"]("A", ns["_SCOPE_SAMPLE"])
+    assert ns["_verify_revisions"][key] == captured + 1, (
+        "the invalidation must increment the surviving revision, not restart from 0")
+
+
+def test_a_finished_samples_entry_becomes_evictable_again():
+    """The pin is for the span of one run, not a permanent reservation."""
+    out, ns, _state = _sample_with_interference(
+        lambda ns2: ns2["_on_sample_invalidate"](_FakeSampleRequest("A")), cap=8)
+    assert out["result"] == "STALE_SAMPLE"
+    key = ns["_scoped_key"]("A", ns["_SCOPE_SAMPLE"])
+    assert key in ns["_verify_revisions"]
+    assert ns["_verify_active_session"] == "", "the pin must be released afterwards"
+    for index in range(20):
+        ns["_bump_verify_revision"](f"after-{index}")
+    assert key not in ns["_verify_revisions"], (
+        "once the run is over the former active entry must evict like any other")
+    assert len(ns["_verify_revisions"]) <= 8
+
+
+def test_an_invalidation_after_the_sample_was_published_does_not_rewrite_it():
+    """A bump that arrives after the answer was returned cannot retroactively withhold it."""
+    ns, _state = _load_p2_seam()
+    request = _FakeSampleRequest("A")
+    assert ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, request) == "SAMPLE_REPORT"
+    assert ns["_on_sample_invalidate"](request) == "STALE_SAMPLE"
+    assert ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, request) == "SAMPLE_REPORT"
+
+
+def test_rapid_sample_clicks_never_create_a_second_pin():
+    import threading
+    ns, state = _load_p2_seam()
+    entered = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    def blocking_impl(_path, _seek):
+        observed.append(ns["_verify_active_session"])
+        entered.set()
+        assert release.wait(30)
+        return "SAMPLE_REPORT"
+
+    state["sample_impl"] = blocking_impl
+    results = []
+    workers = [threading.Thread(
+        target=lambda index=index: results.append(ns["_on_sample_decode_click"](
+            "J:/a.mp4", 1.0, _FakeSampleRequest(f"S{index}"))), daemon=True)
+        for index in range(6)]
+    for worker in workers:
+        worker.start()
+    try:
+        assert entered.wait(30)
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(30)
+    assert len(state["sample_calls"]) == 1, "exactly one sample may run"
+    assert results.count("SAMPLE_REPORT") == 1
+    assert results.count("BUSY_SAMPLE_TO_SAMPLE") == 5
+    assert len(observed) == 1 and observed[0].endswith("\x00sample")
+    assert ns["_verify_active_session"] == ""
+
+
+# ---------------------------------------------------------------------------
+# UI wiring, the resource contract, and isolation from everything else
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def p2_gui_tree():
+    return _tree(_GUI)
+
+
+def _p2_click_keywords(tree, widget, attr="click"):
+    """The keyword arguments of `<widget>.<attr>(...)`, read from the AST, not from a text window."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != attr or not isinstance(node.func.value, ast.Name):
+            continue
+        if node.func.value.id != widget:
+            continue
+        return {keyword.arg: ast.unparse(keyword.value) for keyword in node.keywords}
+    raise AssertionError(f"{widget}.{attr}(...) not found")
+
+
+def test_the_sample_event_has_its_own_unlimited_lane(p2_gui_tree):
+    """Sharing the render lane is what made Gradio queue S2-A instead of refusing it.
+
+    Measured on the pinned gradio==6.19.0 during S2-A's R3 correction: `Queue.get_events()` skips a
+    concurrency group that is at its limit and leaves the event QUEUED, so the handler was entered
+    only after the render finished and then ran automatically against click-time values. A lane of
+    1 would re-create that one step in -- a second Sample Decode click would queue behind the first
+    instead of being refused by the mutex.
+    """
+    keywords = _p2_click_keywords(p2_gui_tree, "sample_btn")
+    assert "concurrency_id" not in keywords, keywords
+    assert keywords.get("concurrency_limit") == "None", keywords
+    assert keywords.get("fn") == "_on_sample_decode_click", keywords
+    assert keywords.get("inputs") == "[sample_path, sample_seek]", keywords
+    assert keywords.get("outputs") == "[sample_report]", keywords
+    assert keywords.get("show_progress") == "'hidden'", keywords
+
+
+def test_the_sample_event_joins_neither_the_render_nor_the_cancel_lane(p2_gui_tree):
+    source = ast.unparse(p2_gui_tree)
+    wiring = source.split("sample_btn.click(")[1].split(")")[0]
+    assert "RENDER_CONCURRENCY_ID" not in wiring
+    assert "CANCEL_CONCURRENCY_ID" not in wiring
+    assert "concurrency_id" not in wiring
+
+
+def test_both_render_events_keep_the_shared_render_lane(p2_gui_tree):
+    """The render lane is untouched by P2 -- asserted from the sample side as well."""
+    for widget in ("process_btn", "render_selected_variants_btn"):
+        keywords = _p2_click_keywords(p2_gui_tree, widget)
+        assert keywords.get("concurrency_id") == "RENDER_CONCURRENCY_ID", (widget, keywords)
+        assert keywords.get("concurrency_limit") == "1", (widget, keywords)
+
+
+def test_the_verify_event_wiring_is_unchanged_by_p2(p2_gui_tree):
+    keywords = _p2_click_keywords(p2_gui_tree, "prep_verify_btn")
+    assert "concurrency_id" not in keywords, keywords
+    assert keywords.get("concurrency_limit") == "None", keywords
+    assert keywords.get("inputs") == "[prep_folder, prep_recursive]", keywords
+    assert keywords.get("outputs") == "[prep_verify_report]", keywords
+
+
+def test_the_click_takes_only_the_live_sample_widgets(p2_gui_tree):
+    """The live widget values, not `gr.State`: a queued change event must not be read as current.
+
+    `request` is injected by annotation and must NOT be an input -- listing it would consume a
+    widget slot and shift every positional argument.
+    """
+    keywords = _p2_click_keywords(p2_gui_tree, "sample_btn")
+    assert keywords.get("inputs") == "[sample_path, sample_seek]"
+    assert "request" not in keywords.get("inputs", "")
+    handler = _func(p2_gui_tree, "_on_sample_decode_click")
+    names = [argument.arg for argument in handler.args.args]
+    assert names == ["video_path", "seek_seconds", "request"], names
+    annotation = ast.unparse(handler.args.args[-1].annotation)
+    assert annotation == "gr.Request", annotation
+    assert ast.unparse(handler.args.defaults[-1]) == "None", "request must default to None"
+
+
+def test_both_sample_change_listeners_share_the_one_invalidating_handler(p2_gui_tree):
+    for widget in ("sample_path", "sample_seek"):
+        keywords = _p2_click_keywords(p2_gui_tree, widget, attr="change")
+        assert keywords.get("fn") == "_on_sample_invalidate", (widget, keywords)
+        assert keywords.get("inputs") == "None", (widget, keywords)
+        assert keywords.get("outputs") == "[sample_report]", (widget, keywords)
+
+
+def test_no_change_listener_can_start_disk_work(p2_gui_tree):
+    """A change listener must never probe, decode, stat or scan -- it only invalidates."""
+    referenced = _referenced(_func(p2_gui_tree, "_on_sample_invalidate"))
+    for forbidden in ("probe_media_metadata", "sample_decode_video", "run_sample_check",
+                      "scan_library_folder", "os.stat", "stat", "subprocess", "_RENDER_LOCK"):
+        assert forbidden not in referenced, f"{forbidden} is reachable from a change listener"
+
+
+def test_the_sample_report_is_the_only_component_the_sample_events_write(p2_gui_tree):
+    source = ast.unparse(p2_gui_tree)
+    for block in ("sample_btn.click(", "sample_path.change(", "sample_seek.change("):
+        wiring = source.split(block)[1].split(")")[0]
+        assert "outputs=[sample_report]" in wiring, block
+        for protected in ("source_outputs", "prep_outputs", "process_btn", "source_state",
+                          "prep_state", "render_invocation_state", "video_output",
+                          "status_output", "prep_verify_report", "prep_report"):
+            assert protected not in wiring, (block, protected)
+
+
+def test_the_sample_report_is_in_no_shared_output_list(p2_gui_tree):
+    """It cannot touch the Create Music Video gate or the preparation state machine."""
+    source = ast.unparse(p2_gui_tree)
+    for listname in ("source_outputs = ", "prep_outputs = "):
+        assert listname in source, listname
+        declaration = source.split(listname)[1].split("]")[0]
+        assert "sample_report" not in declaration, listname
+
+
+def test_the_resource_policy_cannot_be_widened_from_the_gui(p2_gui_tree):
+    """Requirement Q, and it is enforced BY OMISSION rather than by validation.
+
+    The call passes `probe=` and `decode=` and nothing else, so `requested_frames`,
+    `decode_timeout` and `budget_seconds` all come from the module constants. There is no argument
+    for a widget value to reach -- which is a stronger guarantee than clamping one would be.
+    """
+    impl = _func(p2_gui_tree, "_sample_decode_impl")
+    calls = [n for n in ast.walk(impl) if isinstance(n, ast.Call)
+             and ast.unparse(n.func).endswith("run_sample_check")]
+    assert len(calls) == 1, "exactly one orchestrator call"
+    keywords = {keyword.arg for keyword in calls[0].keywords}
+    assert keywords == {"probe", "decode"}, f"unexpected keywords: {keywords}"
+    for forbidden in ("requested_frames", "decode_timeout", "budget_seconds", "stat", "clock"):
+        assert forbidden not in keywords, forbidden
+    assert len(calls[0].args) == 2, "path and seek positionally, nothing else"
+
+
+def test_no_frame_timeout_or_budget_control_exists_in_the_ui(p2_gui_tree):
+    """No slider, number or textbox may offer to change the approved policy."""
+    source = ast.unparse(p2_gui_tree)
+    block = source[source.index("INFO_PREP_SAMPLE"):source.index("sample_btn.click(")]
+    for forbidden in ("MAX_SAMPLE_FRAMES", "DEFAULT_SAMPLE_FRAMES", "requested_frames",
+                      "decode_timeout", "budget_seconds", "DEFAULT_SAMPLE_DECODE_TIMEOUT_SECONDS",
+                      "DEFAULT_SAMPLE_BUDGET_SECONDS", "gr.Slider"):
+        assert forbidden not in block, f"{forbidden} is exposed in the sample UI block"
+
+
+def test_the_gui_adds_no_second_runner_parser_selector_or_classifier(p2_gui_tree):
+    """The accepted core decides everything; this layer only calls it and shows the result."""
+    for name in ("_sample_decode_impl", "_on_sample_decode_click", "_on_sample_invalidate"):
+        referenced = _referenced(_func(p2_gui_tree, name))
+        for forbidden in ("subprocess", "Popen", "_run_media_command", "classify_decode",
+                          "parse_progress_output", "select_renderer_equivalent_stream",
+                          "build_sample_decode_command", "SampleStatus", "DecodeExecution"):
+            assert forbidden not in referenced, f"{name} reaches {forbidden}"
+
+
+def test_the_impl_calls_the_accepted_core_and_renders_its_report(p2_gui_tree):
+    referenced = _referenced(_func(p2_gui_tree, "_sample_decode_impl"))
+    assert "run_sample_check" in referenced
+    assert "format_sample_report" in referenced
+    assert "probe_media_metadata" in referenced
+    assert "sample_decode_video" in referenced
+    assert "fork_media_sample" in referenced, "the core is reached through the fork package"
+
+
+def test_the_sample_handler_stores_nothing_concurrency_shaped_in_gradio_state(p2_gui_tree):
+    for name in ("_on_sample_decode_click", "_sample_decode_impl", "_on_sample_invalidate"):
+        referenced = _referenced(_func(p2_gui_tree, name))
+        for forbidden in ("gr.State", "State", "session_state", "Thread", "Popen", "Event",
+                          "RenderLifecycle", "_verify_revisions", "Lock"):
+            assert forbidden not in referenced, f"{name} reaches {forbidden}"
+
+
+def test_the_sample_touches_no_cache_qwen_analysis_or_render(p2_gui_tree):
+    """Unlike `_verify_sources_impl`, the sample consults no classifier at all."""
+    for name in ("_sample_decode_impl", "_on_sample_decode_click"):
+        referenced = _referenced(_func(p2_gui_tree, name))
+        for forbidden in ("classify_library_sources", "_resolve_prep_qwen_runtime",
+                          "video_analysis", "create_music_video", "analyze_beats_auto",
+                          "scan_library_folder", "CACHE_CONTRACT_VERSION", "ANALYSIS_VERSION"):
+            assert forbidden not in referenced, f"{name} reaches {forbidden}"
+
+
+def test_the_sample_controls_sit_inside_the_preparation_accordion(p2_gui_tree):
+    source = ast.unparse(p2_gui_tree)
+    accordion_at = source.index("gr.Accordion(label=LABEL_PREP_SECTION, open=False)")
+    sample_at = source.index("elem_id='prep-sample-button'")
+    verify_at = source.index("elem_id='prep-verify-report-box'")
+    output_at = source.index("### 📺 Output")
+    assert accordion_at < verify_at < sample_at < output_at, (
+        "the sample block must follow Verify Sources and stay inside the accordion")
+
+
+def test_the_sample_button_is_always_interactive(p2_gui_tree):
+    """The mutex, not a disabled button, is what prevents a sample during a render.
+
+    Interactivity is per-session UX; the mutex is process-global truth. A disabled button would
+    also have to be re-enabled on every terminal path, which is a second state machine.
+    """
+    source = ast.unparse(p2_gui_tree)
+    block = source[source.index("sample_btn = gr.Button"):source.index("sample_report = gr.Textbox")]
+    assert "interactive=False" not in block, block
+
+
+def test_the_sample_report_textbox_is_read_only(p2_gui_tree):
+    source = ast.unparse(p2_gui_tree)
+    block = source[source.index("sample_report = gr.Textbox"):]
+    block = block[:block.index(")")]
+    assert "interactive=False" in block
+    assert "LABEL_PREP_SAMPLE_REPORT" in block
+    assert "PREP_SAMPLE_INITIAL_TEXT" in block
+
+
+def test_the_seek_control_is_seconds_with_a_conservative_default(p2_gui_tree):
+    source = ast.unparse(p2_gui_tree)
+    block = source[source.index("sample_seek = gr.Number"):source.index("sample_btn = gr.Button")]
+    assert "value=1.0" in block, block
+    assert "minimum=0" in block, block
+    assert "LABEL_PREP_SAMPLE_SEEK" in block
+    # A frame-number control would require frames/fps arithmetic, which the core forbids.
+    for forbidden in ("frame", "fps"):
+        assert forbidden not in block.lower(), f"the seek control mentions {forbidden}"
+
+
+def test_an_empty_path_is_refused_before_any_core_call(p2_gui_tree):
+    """Fail closed with no child, and say which control to use."""
+    ns, state = _load_p2_seam()
+    # The seam stubs the impl, so drive the REAL impl directly against the real core instead.
+    assert state["sample_calls"] == []
+    for empty in ("", "   "):
+        verdict = run_sample_check(
+            empty, 1.0,
+            probe=lambda _p: ProbeOutcome(returncode=0, stdout="{}"),
+            decode=lambda *a, **k: SampleDecodeOutcome(returncode=0),
+            stat=lambda _p: (_ for _ in ()).throw(AssertionError("stat must not be reached")))
+        assert verdict.status is SampleStatus.INVALID_REQUEST, empty
+
+
+@pytest.mark.parametrize("seek", [None, "", -1.0, float("inf"), float("nan"), "abc"])
+def test_an_invalid_seek_fails_closed_with_no_child(seek):
+    """The GUI performs no validation of its own: the accepted core owns this, and already did."""
+    launched = []
+
+    def decode(path, **kwargs):
+        launched.append(path)
+        return SampleDecodeOutcome(returncode=0)
+
+    verdict = run_sample_check(
+        "J:/a.mp4", seek,
+        probe=lambda _p: _probe_ok(_stream()),
+        decode=decode,
+        stat=_stat_seq(_St(10, 7), _St(10, 7), _St(10, 7)),
+        clock=iter_clock())
+    assert verdict.status is SampleStatus.INVALID_REQUEST, (seek, verdict.status)
+    assert launched == [], "no decode child may be started for an invalid seek"
+    assert format_sample_report(verdict), "an invalid request still produces a report"
+
+
+def test_the_report_shown_is_the_cores_own_report_not_a_ui_summary():
+    """No green/red badge, no "healthy": the operator sees `format_sample_report` verbatim."""
+    verdict, _launched = _check()
+    report = format_sample_report(verdict)
+    assert report.startswith("Sample decode check")
+    assert SAMPLE_ONLY_TEXT in report, "the sample-only limit must survive into the UI"
+    low = report.lower()
+    for overclaim in ("healthy", "fully verified", "video is fine", "no problems found"):
+        assert overclaim not in low, overclaim
+
+
+def test_the_ui_text_distinguishes_output_frames_from_decoded_frames():
+    """`-frames:v` bounds OUTPUT frames; decoder pre-roll is unbounded and invisible.
+
+    Claiming "30 frames were decoded" would be a statement the diagnostic cannot support, so the
+    operator-facing text has to say "output frames".
+    """
+    with open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8") as handle:
+        content = handle.read()
+    block = content[content.index("INFO_PREP_SAMPLE = ("):]
+    block = block[:block.index("\n)")]
+    assert "output frames" in block, block
+    assert "up to 30" in block, "the cap must be stated as a bound, not as a promise"
+    assert "does not verify the entire video" in block
+    for overclaim in ("healthy", "fully verified", "guarantee"):
+        assert overclaim not in block.lower(), overclaim
+
+
+def test_the_budget_is_never_described_as_a_wall_clock_deadline():
+    with open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8") as handle:
+        content = handle.read()
+    sample_text = content[content.index("LABEL_PREP_SAMPLE = "):content.index(
+        "def get_gpu_status_info")]
+    low = sample_text.lower()
+    for forbidden in ("60 second", "60s", "deadline", "within a minute", "guaranteed"):
+        assert forbidden not in low, f"the UI text promises {forbidden!r}"
+
+
+def test_the_unrelated_render_and_source_wiring_is_untouched(p2_gui_tree):
+    """Requirement P: the Create Music Video gate and the render events are unchanged."""
+    source = ast.unparse(p2_gui_tree)
+    clicks = [n for n in ast.walk(p2_gui_tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "click" and isinstance(n.func.value, ast.Name)
+              and n.func.value.id == "process_btn"]
+    assert len(clicks) == 1, "exactly one process_btn.click registration"
+    keywords = {keyword.arg for keyword in clicks[0].keywords}
+    assert "concurrency_id" in keywords and "inputs" in keywords and "outputs" in keywords
+    # Read the keywords from the AST: the render registration carries dozens of inputs, so a text
+    # window around the call name is not a reliable way to find the end of it.
+    render_wiring = " ".join(_p2_click_keywords(p2_gui_tree, "process_btn").values())
+    for forbidden in ("sample_report", "sample_path", "sample_seek", "sample_btn"):
+        assert forbidden not in render_wiring, f"{forbidden} leaked into the render request"
+    assert "_RENDER_LOCK.locked()" not in source, "check-then-act is the race this avoids"
+    assert "_RENDER_LOCK.acquire(blocking=True)" not in source
+    assert "RenderLifecycle" not in ast.unparse(_func(p2_gui_tree, "_on_sample_decode_click")), \
+        "the sample owns no render lifecycle"
+
+
+def test_the_render_holder_marks_do_not_disturb_the_generator_contracts(p2_gui_tree):
+    """The marks are standalone statements: no yield is added, moved or reshaped.
+
+    The render wrappers stream fixed-width tuples to Gradio. A holder mark that became part of a
+    yield -- or that shifted one -- would change the output contract, so the yield shapes are
+    asserted directly.
+    """
+    for name, width in (("process_video_guarded", 6), ("_render_selected_variants", 5)):
+        try:
+            func = _func(p2_gui_tree, name)
+        except AssertionError:
+            continue
+        yields = [n for n in ast.walk(func) if isinstance(n, ast.Yield) and n.value is not None]
+        tuples = [n.value for n in yields if isinstance(n.value, ast.Tuple)]
+        assert tuples, f"{name} must still yield tuples"
+        assert {len(t.elts) for t in tuples} == {width}, (
+            f"{name} yield width changed: {sorted({len(t.elts) for t in tuples})}")
+        for node in yields:
+            assert "_mark_lock_holder" not in ast.unparse(node), \
+                f"{name} folded the holder mark into a yield"
+
+
+def _calls_named(tree, rendered):
+    """Every `ast.Call` whose unparsed form equals `rendered`.
+
+    Structural on purpose. `ast.unparse` emits docstrings, so counting occurrences in the unparsed
+    TEXT also counts the mutex contract that `_lock_holder_now`'s docstring explains -- a census
+    that searches prose fails on the prose documenting it. (Measured: it reported five acquire
+    sites for four.)
+    """
+    return [node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node) == rendered]
+
+
+def test_the_mutex_census_is_four_acquires_and_four_releases(p2_gui_tree):
+    """Two renders, one verification, one sample -- each a single atomic test-and-set."""
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=False)")) == 4
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.release()")) == 4
+    assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.locked()"), \
+        "check-then-act is the race the non-blocking acquire avoids"
+    assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.acquire()")
+    assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=True)")
+
+
+def test_the_render_wrappers_contain_no_holder_marking_at_all(p2_gui_tree):
+    """Option B's defining property: the render path is untouched.
+
+    Render attribution comes from the EXISTING active-render slot, so the wrappers need no mark.
+    A mark reappearing here would mean the wrappers had diverged from the pinned implementation,
+    which is what keeps every render lifecycle, cancellation and generator regression valid.
+    """
+    for name in ("process_video_guarded", "render_selected_variants_guarded",
+                 "_process_video_guarded_unlocked"):
+        rendered = ast.unparse(_func(p2_gui_tree, name))
+        assert "_mark_lock_holder" not in rendered, f"{name} marks the holder"
+        assert "_lock_holder" not in rendered, f"{name} touches the holder token"
+
+
+def test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release(p2_gui_tree):
+    """Exactly two marking paths, and neither may release before clearing."""
+    marks = _calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)")
+    assert len(marks) == 1, "only the sample marks itself directly"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder('')")) == 1, \
+        "only the sample clears directly; the verification clears via _mark_verification(False)"
+    assert len(_calls_named(p2_gui_tree, "_mark_verification(True)")) == 1
+    assert len(_calls_named(p2_gui_tree, "_mark_verification(False)")) == 1
+    # Both diagnostic handlers must clear inside the same finally that releases, clear-then-release.
+    for handler, clear in (("_on_sample_decode_click", "_mark_lock_holder('')"),
+                           ("_on_verify_sources_click", "_mark_verification(False)")):
+        finallies = [n for n in ast.walk(_func(p2_gui_tree, handler))
+                     if isinstance(n, ast.Try) and n.finalbody]
+        assert finallies, handler
+        final = [ast.unparse(statement) for statement in finallies[0].finalbody]
+        clear_at = next(i for i, s in enumerate(final) if clear in s)
+        release_at = next(i for i, s in enumerate(final) if "_RENDER_LOCK.release()" in s)
+        assert clear_at < release_at, (handler, final)
+
+
+def test_p2_adds_no_import_time_subprocess_activity(p2_gui_tree):
+    """A2 NOTE-1 carried forward: P2 must not add a new import-time child.
+
+    `ffmpeg_processing`, `logger` and `gpu_cpu_utils` are already module-level imports, so the
+    existing `check_nvenc()` probe fires today regardless. The S2-B core is stdlib-only and the
+    EXECUTION seam is imported inside the impl, so nothing new runs at import.
+    """
+    module_level = []
+    for node in p2_gui_tree.body:
+        if isinstance(node, (ast.Expr, ast.Assign)):
+            module_level.append(ast.unparse(node))
+    joined = "\n".join(module_level)
+    for forbidden in ("run_sample_check", "probe_media_metadata", "sample_decode_video",
+                      "subprocess.run", "subprocess.Popen"):
+        assert forbidden not in joined, f"{forbidden} is called at import time"
+    impl = _func(p2_gui_tree, "_sample_decode_impl")
+    local_imports = [ast.unparse(n) for n in ast.walk(impl) if isinstance(n, ast.ImportFrom)]
+    assert any("probe_media_metadata" in line and "sample_decode_video" in line
+               for line in local_imports), \
+        "the execution seam must be imported locally, mirroring _verify_sources_impl"
+
+
+# ---------------------------------------------------------------------------
+# Option B: render attribution from the EXISTING active-render slot
+# ---------------------------------------------------------------------------
+#
+# The render wrappers are byte-identical to the pinned implementation, so "a render holds the
+# mutex" is read from the slot they already install. These tests drive the real `_lock_holder_now`
+# over a real slot and a real token, because the whole point is a behavioural contract rather than
+# a string present in the source.
+
+class _FakeLifecycleSlot:
+    """Stands in for the `(invocation_id, RenderLifecycle)` tuple the wrappers install."""
+
+    def __init__(self, invocation_id="inv-1"):
+        self.invocation_id = invocation_id
+
+
+def _install_slot(ns, invocation_id="inv-1"):
+    """What `_install_active_render` does, without importing RenderLifecycle."""
+    with ns["_ACTIVE_RENDER_SLOT_LOCK"]:
+        ns["_active_render_slot"] = (invocation_id, _FakeLifecycleSlot(invocation_id))
+
+
+def _clear_slot(ns):
+    with ns["_ACTIVE_RENDER_SLOT_LOCK"]:
+        ns["_active_render_slot"] = None
+
+
+def test_an_installed_render_slot_positively_identifies_the_render_holder():
+    """The substitute for the removed render mark: positive evidence, not elimination."""
+    ns, _state = _load_p2_seam()
+    assert ns["_lock_holder_now"]() == "", "no token and no slot is unknown, not render"
+    _install_slot(ns)
+    assert ns["_lock_holder_now"]() == "render", "an installed slot IS the render evidence"
+    assert ns["_busy_message"]() == "BUSY_RENDER_TO_RENDER"
+    assert ns["_verify_busy_message"]() == "BUSY_VERIFY_TO_RENDER"
+    assert ns["_sample_busy_message"]() == "BUSY_SAMPLE_TO_RENDER"
+
+
+def test_an_absent_render_slot_produces_neutral_attribution_never_render():
+    """Requirement: absence of evidence is reported as unknown.
+
+    This is the exact inaccuracy the old boolean shipped -- `False` meant both "nobody published"
+    and "a render", so a refusal during a sample decode named a render that did not exist.
+    """
+    ns, _state = _load_p2_seam()
+    _clear_slot(ns)
+    assert ns["_lock_holder_now"]() == ""
+    for caller in ("_busy_message", "_verify_busy_message", "_sample_busy_message"):
+        got = ns[caller]()
+        assert got == "BUSY_UNKNOWN", f"{caller} invented {got!r} with no evidence at all"
+        assert "RENDER" not in got
+
+
+def test_the_slot_is_cleared_before_the_release_so_attribution_cannot_go_stale():
+    """Window 3: slot cleared, then mutex released. A freed mutex must not still read 'render'."""
+    ns, _state = _load_p2_seam()
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+    _install_slot(ns)
+    assert ns["_lock_holder_now"]() == "render"
+    # the wrappers' own order: clear the slot, THEN release
+    _clear_slot(ns)
+    ns["_RENDER_LOCK"].release()
+    assert ns["_lock_holder_now"]() == "", "a released mutex must not still be attributed"
+
+
+def test_the_window_between_acquire_and_slot_install_is_unknown_not_render():
+    """Window 1: the mutex is taken but the lifecycle is not installed yet.
+
+    One statement wide in the shipped wrapper. Reporting it as unknown is honest; reporting it as a
+    render would be a guess that happens to be right, and the same guess is wrong for a sample.
+    """
+    ns, _state = _load_p2_seam()
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+    try:
+        assert ns["_lock_holder_now"]() == "", "no evidence yet -- must be unknown"
+        assert ns["_sample_busy_message"]() == "BUSY_UNKNOWN"
+    finally:
+        ns["_RENDER_LOCK"].release()
+
+
+def test_an_explicit_diagnostic_token_outranks_the_render_slot():
+    """A stale slot must never mislabel a diagnostic that has published itself.
+
+    The slot cannot legitimately be installed while a sample holds the mutex, so this pins the
+    precedence rather than a reachable state: explicit evidence wins over inferred evidence.
+    """
+    ns, _state = _load_p2_seam()
+    _install_slot(ns)
+    for token, expected in (("sample", "sample"), ("verify", "verify")):
+        ns["_mark_lock_holder"](token)
+        assert ns["_lock_holder_now"]() == expected, token
+    ns["_mark_lock_holder"]("")
+    assert ns["_lock_holder_now"]() == "render", "clearing the token falls back to the slot"
+
+
+def test_a_sample_during_an_installed_render_slot_is_refused_as_a_render():
+    """Window 2 end-to-end: a real render holds the mutex AND has its lifecycle installed."""
+    ns, state = _load_p2_seam()
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+    _install_slot(ns)
+    try:
+        out = ns["_on_sample_decode_click"]("J:/a.mp4", 1.0, _FakeSampleRequest("S"))
+    finally:
+        _clear_slot(ns)
+        ns["_RENDER_LOCK"].release()
+    assert out == "BUSY_SAMPLE_TO_RENDER"
+    assert state["sample_calls"] == []
+
+
+def test_a_render_finishing_lets_a_new_sample_start_while_a_third_is_refused():
+    """Window 7: the handover must not leave a stale attribution or a leaked mutex."""
+    import threading
+    ns, state = _load_p2_seam()
+    # a render holds the mutex with its slot installed
+    assert ns["_RENDER_LOCK"].acquire(blocking=False)
+    _install_slot(ns)
+    assert ns["_on_sample_decode_click"]("J:/a.mp4", 1.0) == "BUSY_SAMPLE_TO_RENDER"
+    # the render finishes exactly as the wrappers do
+    _clear_slot(ns)
+    ns["_RENDER_LOCK"].release()
+    # now a sample may start, and a concurrent second one is refused as a SAMPLE, not a render
+    inside = threading.Event()
+    hold = threading.Event()
+
+    def impl(path, seek):
+        inside.set()
+        assert hold.wait(10)
+        return "SAMPLE_REPORT"
+
+    state["sample_impl"] = impl
+    worker = threading.Thread(
+        target=lambda: ns["_on_sample_decode_click"]("J:/b.mp4", 2.0), daemon=True)
+    worker.start()
+    try:
+        assert inside.wait(10)
+        assert ns["_lock_holder_now"]() == "sample", "the handover must re-attribute"
+        assert ns["_on_sample_decode_click"]("J:/c.mp4", 3.0) == "BUSY_SAMPLE_TO_SAMPLE"
+    finally:
+        hold.set()
+        worker.join(10)
+    assert len(state["sample_calls"]) == 1
+    assert ns["_lock_holder_now"]() == ""
+
+
+def test_the_holder_lookup_never_nests_the_two_attribution_locks():
+    """Requirement: the token lock and the slot lock are taken SEQUENTIALLY.
+
+    Nesting them would create an acquisition order to get wrong. Asserted structurally: each `with`
+    in `_lock_holder_now` guards exactly one lock, and no `with` body contains another `with`.
+    """
+    tree = _tree(_GUI)
+    lookup = _func(tree, "_lock_holder_now")
+    withs = [node for node in ast.walk(lookup) if isinstance(node, ast.With)]
+    assert len(withs) == 2, [ast.unparse(w.items[0].context_expr) for w in withs]
+    guarded = {ast.unparse(w.items[0].context_expr) for w in withs}
+    assert guarded == {"_VERIFY_FLAG_LOCK", "_ACTIVE_RENDER_SLOT_LOCK"}, guarded
+    for block in withs:
+        assert len(block.items) == 1, "one lock per with-statement"
+        nested = [n for n in ast.walk(block) if isinstance(n, ast.With) and n is not block]
+        assert not nested, "the two attribution locks must never be held together"
+    # And neither lock may be held while the decision is made.
+    returns = [ast.unparse(n) for n in ast.walk(lookup) if isinstance(n, ast.Return)]
+    assert any("_LOCK_HOLDER_RENDER if render_active" in r for r in returns), returns
+
+
+def test_the_holder_lookup_reads_the_slot_only_under_its_own_lock():
+    """NC3's target: an unsynchronized read of the slot is a data race, not a shortcut."""
+    tree = _tree(_GUI)
+    lookup = _func(tree, "_lock_holder_now")
+    slot_reads = [n for n in ast.walk(lookup)
+                  if isinstance(n, ast.Name) and n.id == "_active_render_slot"]
+    assert slot_reads, "the lookup must consult the slot"
+    guarded_source = ""
+    for block in [n for n in ast.walk(lookup) if isinstance(n, ast.With)]:
+        if "_ACTIVE_RENDER_SLOT_LOCK" in ast.unparse(block.items[0].context_expr):
+            guarded_source = "\n".join(ast.unparse(s) for s in block.body)
+    assert "_active_render_slot" in guarded_source, \
+        "the slot must be read inside the _ACTIVE_RENDER_SLOT_LOCK block"
+
+
+def test_the_lookup_is_diagnostic_only_and_admits_nothing():
+    """It must not acquire, release or test the admission mutex."""
+    referenced = _referenced(_func(_tree(_GUI), "_lock_holder_now"))
+    for forbidden in ("acquire", "release", "locked", "_RENDER_LOCK"):
+        assert forbidden not in referenced, f"the lookup reaches {forbidden}"

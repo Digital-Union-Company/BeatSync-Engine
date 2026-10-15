@@ -20,6 +20,85 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-15 (MEDIA-VERIFY-S2-B P2: the Sample Decode GUI integration)
+
+The accepted sample-decode diagnostic is now reachable from the UI. **Sample Decode — Check One
+Video** sits inside the Media Library Preparation accordion, immediately after Verify Sources: one
+operator-entered `.mp4`/`.mkv` path, one seek position in seconds (default `1.0`), one explicit
+button, one read-only report. No library dropdown, no browser upload, no bulk mode, no automatic
+decode on an input change, and no Cancel control.
+
+The accepted core and the FFmpeg seam are **untouched** — `src/beatsync_fork/media_sample.py` and
+`src/ffmpeg_processing.py` keep their exact blobs from `c3e1a273`. The GUI contributes no
+classification, no stream selection, no progress parsing and no subprocess handling: it calls
+`run_sample_check(path, seek, probe=probe_media_metadata, decode=sample_decode_video)` and shows
+`format_sample_report(verdict)` verbatim, so all fifteen statuses, all four execution states and
+both disclaimer sentences survive to the operator. `SAMPLE_OUTPUT_FRAMES_OK` is never rendered as
+"healthy" or "verified", and the text says "up to 30 **output** frames" because `-frames:v` bounds
+output while decoder pre-roll is unbounded and invisible.
+
+**The resource policy is enforced by omission rather than validation.** The orchestrator call
+carries no keyword beyond `probe=` and `decode=`, so 30 frames / 20 s probe / 30 s decode / 60 s
+budget / one source / one worker all come from the module constants — there is no parameter a widget
+value could reach, and no frame, timeout or budget control exists. The 60 s budget gates scheduling
+and is nowhere described as a wall-clock deadline.
+
+**S2-B is the third holder of the one `_RENDER_LOCK`, and that broke the two-holder boolean.**
+`_verification_running == False` meant "a render" **by elimination**, which was only ever true
+because the render path never marked itself. With three holders it is false in both new directions: a
+render refused during a sample decode would have claimed another render was running, and S2-A would
+have called a sample a render. `_lock_holder_now()` replaces the boolean and reports
+`render` / `verify` / `sample` / unknown from two **positive** sources — the explicit diagnostic
+token, and the **existing** `_active_render_slot` as evidence of a render.
+
+Reusing the slot is the load-bearing choice. `_install_active_render` is called by a mutex-owning
+wrapper immediately after its acquire and `_clear_active_render` immediately before its release, and
+the Cancel path only ever reads or clears it, so an installed slot means a render owns the mutex.
+That keeps `process_video_guarded` and `render_selected_variants_guarded` **byte-identical** to the
+pre-S2-B implementation, which keeps every render lifecycle, cancellation and generator-shape
+regression valid unchanged. A first attempt added four `_mark_lock_holder` calls to those wrappers
+instead; it was **measured to break 62 tests** across four AST-extracting harnesses, which is the
+evidence behind this design rather than an aesthetic preference. Tests now assert the AST identity
+of both wrappers against the pinned commit, and that no holder mark reappears in either.
+
+Absence of evidence is reported as **unknown** with neutral text, never as a render: an acquire and
+the holder becoming observable are two statements, so an empty token with no installed slot is a
+genuine window. The two attribution locks are taken **sequentially and never nested**, so no
+acquisition order exists to get wrong. The lookup is diagnostic only — a stale, missing or delayed
+answer can word one refusal and nothing more, because `_RENDER_LOCK.acquire(blocking=False)` remains
+the sole admission authority.
+
+**Two revision scopes share the one bounded map.** S2-A invalidates on folder/recursive, S2-B on
+file/seek, and cross-invalidation would be a wrong answer rather than a conservative one, so the key
+became `_scoped_key(session, scope)` with a NUL separator. Every revision function, the
+active-session pin and the eviction loop are reused **byte-identical**; scoping happens only at the
+two key-production sites. The R5 eviction correction therefore needed no restatement — it rests on
+the mutex permitting one operation at a time, not on the key shape. `_VERIFY_REVISION_CAP` stays
+512, now spanning both scopes.
+
+`sample_btn.click` carries no `concurrency_id` and `concurrency_limit=None`, matching the Verify
+event for the same measured reason: on the pinned `gradio==6.19.0` a shared lane leaves the event
+queued and later runs it automatically against click-time values, and a lane of 1 would re-create
+that for a second click. `sample_report` is the only component any sample event writes; the section
+appears in no `source_outputs` and no `prep_outputs`, consults no classifier, reads no cache, starts
+no Qwen worker, writes no media, and puts nothing concurrency-shaped into `gr.State`.
+
+88 new tests — 86 in `tests/test_media_sample.py` (249 → 335) and 2 in
+`tests/test_gui_guard_seam.py` (91 → 93); the full suite goes 6250 → 6338 collected, 6242 → 6330
+passed, 8 skipped either way, with **zero** tests removed. They cover the nine-cell caller × holder
+attribution table, the unknown-holder window, slot-derived render attribution and its install/clear
+boundaries, three-way exclusion over a real `threading.Lock` with real threads, mutex/holder/pin
+release after an exception and a `BaseException`, cross-scope isolation in both directions, and the
+eviction and ABA regressions re-proved for the sample scope. Eleven assertions in
+`tests/test_media_verify.py` were migrated for the scoped key and the holder token — three now
+assert the holder token directly instead of inferring "no leak" from a refusal message, and four now
+exercise the real marking contract rather than an inference. No test was weakened or skipped.
+
+**P2 code acceptance is not GUI runtime acceptance.** No Gradio was started, no FFmpeg or FFprobe
+executed, and no real media touched. Actual click behaviour, immediate refusal under a live render,
+input-change stale suppression and two-browser-session isolation on `gradio==6.19.0` remain a
+separately authorized milestone.
+
 ### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P1-M2: the two residual R5 minor findings)
 
 The final independent review of PR #61 passed it with zero blockers and zero majors, and the PR was

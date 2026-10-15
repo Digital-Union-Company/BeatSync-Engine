@@ -466,11 +466,104 @@ def test_a_busy_renderer_refuses_without_touching_anything():
 
         helper = _gui_body("_busy_message")
         assert "RENDER_BUSY_MESSAGE" in helper, \
-            "the default refusal must still be the render-busy message"
+            "a render holder must still produce the render-busy message"
         assert "VERIFY_BUSY_MESSAGE" in helper
-        assert "_verification_running" in helper
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): `_verification_running` is gone -- a boolean
+        # cannot distinguish three holders, and `False` used to be read as "a render" BY
+        # ELIMINATION because the render path never marked itself. The refusal now consults
+        # `_lock_holder_now()`, and the two facts that matters are asserted BEHAVIOURALLY below
+        # rather than by the presence of a name: an installed active-render slot must positively
+        # identify a render, and no evidence at all must produce neutral text instead of a guess.
+        assert "_lock_holder_now()" in helper, "the refusal must consult the shared holder lookup"
+        assert "_verification_running" not in helper, \
+            "the boolean must not survive alongside its replacement"
+        assert "SAMPLE_BUSY_MESSAGE" in helper, "a sample decode is a third possible holder"
+        assert "MEDIA_BUSY_UNKNOWN_TEXT" in helper, "an unestablished holder needs neutral text"
     finally:
         gui_lock.release()
+
+
+def test_the_render_refusal_names_a_render_only_on_positive_slot_evidence():
+    """[FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): behavioural, not a string match.
+
+    `_lock_holder_now` is executed for real over a real token, a real slot and its real lock. Two
+    properties are load-bearing and neither can be read off the source:
+
+      * an installed active-render slot -- which the two render wrappers already install right
+        after their acquire and clear right before their release -- POSITIVELY identifies a render,
+        which is what let the wrappers stay byte-identical to the pre-S2-B implementation;
+      * no token and no slot yields neutral text, never a fabricated render.
+    """
+    import threading as _threading
+
+    tree = _gui_tree()
+    names = ("_mark_lock_holder", "_lock_holder_now", "_busy_message",
+             "_verify_busy_message", "_sample_busy_message")
+    nodes = [_gui_func(name) for name in names]
+    namespace = {
+        "_VERIFY_FLAG_LOCK": _threading.Lock(),
+        "_ACTIVE_RENDER_SLOT_LOCK": _threading.Lock(),
+        "_lock_holder": "",
+        "_active_render_slot": None,
+        "_LOCK_HOLDER_RENDER": "render",
+        "_LOCK_HOLDER_VERIFY": "verify",
+        "_LOCK_HOLDER_SAMPLE": "sample",
+        "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
+        "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
+        "SAMPLE_BUSY_MESSAGE": "SAMPLE_BUSY",
+        "MEDIA_BUSY_UNKNOWN_TEXT": "UNKNOWN_BUSY",
+        "PREP_VERIFY_RENDER_BUSY_TEXT": "V_RENDER",
+        "PREP_VERIFY_ALREADY_RUNNING_TEXT": "V_VERIFY",
+        "PREP_VERIFY_SAMPLE_BUSY_TEXT": "V_SAMPLE",
+        "PREP_SAMPLE_RENDER_BUSY_TEXT": "S_RENDER",
+        "PREP_SAMPLE_VERIFY_BUSY_TEXT": "S_VERIFY",
+        "PREP_SAMPLE_ALREADY_RUNNING_TEXT": "S_SAMPLE",
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), _GUI_PATH, "exec"), namespace)
+
+    # 1. no evidence at all -> neutral, and emphatically NOT a render
+    assert namespace["_lock_holder_now"]() == ""
+    assert namespace["_busy_message"]() == "UNKNOWN_BUSY"
+    assert namespace["_busy_message"]() != "RENDER_BUSY", \
+        "a render must never be inferred from the absence of other evidence"
+
+    # 2. an installed slot IS the render evidence, for all three callers
+    with namespace["_ACTIVE_RENDER_SLOT_LOCK"]:
+        namespace["_active_render_slot"] = ("inv-1", object())
+    assert namespace["_lock_holder_now"]() == "render"
+    assert namespace["_busy_message"]() == "RENDER_BUSY"
+    assert namespace["_verify_busy_message"]() == "V_RENDER"
+    assert namespace["_sample_busy_message"]() == "S_RENDER"
+
+    # 3. clearing the slot (as the wrappers do before releasing) drops the attribution again
+    with namespace["_ACTIVE_RENDER_SLOT_LOCK"]:
+        namespace["_active_render_slot"] = None
+    assert namespace["_lock_holder_now"]() == ""
+    assert namespace["_busy_message"]() == "UNKNOWN_BUSY"
+
+    # 4. the explicit diagnostic tokens still win, and each caller gets its own wording
+    namespace["_mark_lock_holder"]("sample")
+    assert namespace["_busy_message"]() == "SAMPLE_BUSY"
+    assert namespace["_verify_busy_message"]() == "V_SAMPLE"
+    assert namespace["_sample_busy_message"]() == "S_SAMPLE"
+    namespace["_mark_lock_holder"]("verify")
+    assert namespace["_busy_message"]() == "VERIFY_BUSY"
+    assert namespace["_sample_busy_message"]() == "S_VERIFY"
+
+
+def test_the_render_wrappers_do_not_mark_the_holder_token():
+    """Option B's defining property, asserted from the render side.
+
+    If a holder mark ever appears in a wrapper, the wrapper has diverged from the implementation
+    every render lifecycle and cancellation regression in this file was written against.
+    """
+    for name in ("process_video_guarded", "render_selected_variants_guarded"):
+        body = _gui_body(name)
+        assert "_mark_lock_holder" not in body, f"{name} marks the holder"
+        assert "_lock_holder" not in body, f"{name} touches the holder token"
+        assert "_install_active_render(lifecycle)" in body, \
+            f"{name} must still install the lifecycle the attribution reads"
+        assert "_clear_active_render(lifecycle.invocation_id)" in body
 
 
 def test_the_busy_refusal_writes_no_state_and_no_report():

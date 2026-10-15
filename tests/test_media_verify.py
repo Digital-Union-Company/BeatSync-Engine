@@ -887,9 +887,16 @@ class _FakeGradio:
 
 
 #: The verification concurrency seam, in the order the shipped module defines it.
+#
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): `_mark_lock_holder` / `_lock_holder_now` /
+# `_scoped_key` joined the seam when the two-holder boolean became a three-way holder token and the
+# revision key gained a scope. `_mark_verification` is retained as the verification path's own
+# spelling and still extracted, so every assertion below still exercises the shipped call chain.
 _CONCURRENCY_SEAM_FUNCTIONS = (
-    "_mark_verification", "_busy_message", "_verify_busy_message",
-    "_verify_session_key", "_touch_verify_revision_locked", "_verify_revision",
+    "_mark_lock_holder", "_lock_holder_now", "_mark_verification",
+    "_busy_message", "_verify_busy_message", "_sample_busy_message",
+    "_verify_session_key", "_scoped_key",
+    "_touch_verify_revision_locked", "_verify_revision",
     "_bump_verify_revision", "_begin_verify_session", "_end_verify_session",
     "_on_verify_sources_click", "_on_verify_invalidate",
 )
@@ -935,16 +942,35 @@ def _load_concurrency_seam(cap=None):
         "threading": threading,
         "_RENDER_LOCK": threading.Lock(),
         "_VERIFY_FLAG_LOCK": threading.Lock(),
-        "_verification_running": False,
+        # [FORK] S2-B P2: the holder token and its three shipped values, read from the module
+        # rather than restated, for the same reason `_VERIFY_REVISION_CAP` is.
+        # [FORK] S2-B P2 (Option B): the holder lookup reads the EXISTING active-render slot as
+        # positive evidence of a render, so the seam needs the slot and its own lock. The two are
+        # never held together -- the token is copied and released, then the slot is.
+        "_ACTIVE_RENDER_SLOT_LOCK": threading.Lock(),
+        "_active_render_slot": None,
+        "_lock_holder": _module_constant(tree, "_lock_holder"),
+        "_LOCK_HOLDER_RENDER": _module_constant(tree, "_LOCK_HOLDER_RENDER"),
+        "_LOCK_HOLDER_VERIFY": _module_constant(tree, "_LOCK_HOLDER_VERIFY"),
+        "_LOCK_HOLDER_SAMPLE": _module_constant(tree, "_LOCK_HOLDER_SAMPLE"),
+        "_SCOPE_VERIFY": _module_constant(tree, "_SCOPE_VERIFY"),
+        "_SCOPE_SAMPLE": _module_constant(tree, "_SCOPE_SAMPLE"),
         "_verify_revisions": dict(_module_constant(tree, "_verify_revisions") or {}),
         "_VERIFY_REVISION_CAP": (_module_constant(tree, "_VERIFY_REVISION_CAP")
                                  if cap is None else int(cap)),
         "_verify_active_session": _module_constant(tree, "_verify_active_session"),
         "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
         "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
+        "SAMPLE_BUSY_MESSAGE": "SAMPLE_BUSY",
+        "MEDIA_BUSY_UNKNOWN_TEXT": "BUSY_UNKNOWN_HOLDER",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "VERIFY_REFUSED_RENDER_ACTIVE",
         "PREP_VERIFY_ALREADY_RUNNING_TEXT": "VERIFY_REFUSED_ALREADY_RUNNING",
+        "PREP_VERIFY_SAMPLE_BUSY_TEXT": "VERIFY_REFUSED_SAMPLE_ACTIVE",
         "PREP_VERIFY_STALE_TEXT": "STALE_FOLDER_CHANGED",
+        "PREP_SAMPLE_RENDER_BUSY_TEXT": "SAMPLE_REFUSED_RENDER_ACTIVE",
+        "PREP_SAMPLE_VERIFY_BUSY_TEXT": "SAMPLE_REFUSED_VERIFY_ACTIVE",
+        "PREP_SAMPLE_ALREADY_RUNNING_TEXT": "SAMPLE_REFUSED_ALREADY_RUNNING",
+        "PREP_SAMPLE_STALE_TEXT": "STALE_SAMPLE_CHANGED",
     }
 
     def impl(folder, recursive):
@@ -959,6 +985,9 @@ def _load_concurrency_seam(cap=None):
 def test_verification_refuses_immediately_while_a_render_holds_the_mutex():
     ns, state = _load_concurrency_seam()
     assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: a render takes the lock"
+    # [FORK] S2-B P2: a real render marks itself after acquiring, so the simulation must too. An
+    # acquire with no holder published is a genuinely DIFFERENT state, covered by its own tests.
+    ns["_mark_lock_holder"](ns["_LOCK_HOLDER_RENDER"])
     try:
         out = ns["_on_verify_sources_click"]("J:/lib", True)
     finally:
@@ -990,7 +1019,7 @@ def test_the_mutex_is_released_after_success():
     ns["_on_verify_sources_click"]("J:/lib", True)
     assert ns["_RENDER_LOCK"].acquire(blocking=False), "the lock leaked after a successful run"
     ns["_RENDER_LOCK"].release()
-    assert ns["_busy_message"]() == "RENDER_BUSY", "the verification flag leaked"
+    assert ns["_lock_holder_now"]() == "", "the holder token leaked after a success"
 
 
 def test_the_mutex_is_released_after_a_failure():
@@ -1006,7 +1035,7 @@ def test_the_mutex_is_released_after_a_failure():
     assert "No analysis, cache change, media change or render was performed." in out
     assert ns["_RENDER_LOCK"].acquire(blocking=False), "the lock leaked after an exception"
     ns["_RENDER_LOCK"].release()
-    assert ns["_busy_message"]() == "RENDER_BUSY"
+    assert ns["_lock_holder_now"]() == "", "the holder token leaked after an exception"
 
 
 def test_the_mutex_is_released_even_when_the_impl_raises_basexception():
@@ -1021,7 +1050,7 @@ def test_the_mutex_is_released_even_when_the_impl_raises_basexception():
     assert ns["_RENDER_LOCK"].acquire(blocking=False), \
         "an abandoned request must not leave the app permanently busy"
     ns["_RENDER_LOCK"].release()
-    assert ns["_busy_message"]() == "RENDER_BUSY"
+    assert ns["_lock_holder_now"]() == "", "a BaseException must clear the holder token too"
 
 
 def test_two_concurrent_verifications_do_not_overlap():
@@ -1122,13 +1151,26 @@ def test_the_preparation_event_wiring_is_unchanged(gui_tree):
 def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree):
     """The exclusion must stay a test-and-set, never a `locked()` check-then-act."""
     source = ast.unparse(gui_tree)
-    assert source.count("_RENDER_LOCK.acquire(blocking=False)") == 3, \
-        "two render sites plus verification, each a single atomic acquire"
-    assert "_RENDER_LOCK.locked()" not in source, "check-then-act is the race this avoids"
-    assert "_RENDER_LOCK.acquire(blocking=True)" not in source
-    assert "_RENDER_LOCK.acquire()" not in source
+    # [FORK] S2-B P2: counted STRUCTURALLY over `ast.Call` nodes, not by substring.
+    # `ast.unparse` emits docstrings too, so a census over the unparsed text counted the mutex
+    # contract explained in `_lock_holder_now`'s own docstring as a fifth call site. A ban or a
+    # census that searches prose fails on the prose that documents it.
+    acquires = [node for node in ast.walk(gui_tree)
+                if isinstance(node, ast.Call)
+                and ast.unparse(node).startswith("_RENDER_LOCK.acquire")]
+    assert len(acquires) == 4, \
+        f"two render sites plus verification plus sample decode: {[ast.unparse(a) for a in acquires]}"
+    for call in acquires:
+        rendered = ast.unparse(call)
+        assert rendered == "_RENDER_LOCK.acquire(blocking=False)", \
+            f"every acquire must be the single non-blocking test-and-set, got {rendered}"
+    locked = [node for node in ast.walk(gui_tree)
+              if isinstance(node, ast.Call) and ast.unparse(node) == "_RENDER_LOCK.locked()"]
+    assert not locked, "check-then-act is the race this avoids"
     # Every acquire has a matching release, and verification's is in a finally.
-    assert source.count("_RENDER_LOCK.release()") == 3
+    releases = [node for node in ast.walk(gui_tree)
+                if isinstance(node, ast.Call) and ast.unparse(node) == "_RENDER_LOCK.release()"]
+    assert len(releases) == 4, f"one release per acquire, got {len(releases)}"
     handler = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
     tried = [n for n in ast.walk(_func(gui_tree, "_on_verify_sources_click"))
              if isinstance(n, ast.Try) and n.finalbody]
@@ -1790,6 +1832,7 @@ def test_a_refused_verification_does_no_work_and_does_not_run_later():
     """The queued-then-auto-run behaviour, asserted as absent: a refusal is terminal."""
     ns, state = _load_concurrency_seam()
     assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: a render holds the mutex"
+    ns["_mark_lock_holder"](ns["_LOCK_HOLDER_RENDER"])
     out = ns["_on_verify_sources_click"]("J:/lib", True)
     assert out == "VERIFY_REFUSED_RENDER_ACTIVE"
     assert state["impl_calls"] == []
@@ -1805,6 +1848,7 @@ def test_the_verify_refusal_names_a_render_or_another_verification():
     ns, state = _load_concurrency_seam()
     ns["_RENDER_LOCK"].acquire(blocking=False)
     try:
+        ns["_mark_lock_holder"](ns["_LOCK_HOLDER_RENDER"])
         assert ns["_on_verify_sources_click"]("J:/l", True) == "VERIFY_REFUSED_RENDER_ACTIVE"
     finally:
         ns["_RENDER_LOCK"].release()
@@ -2123,8 +2167,12 @@ def _verification_with_interference(interfere, *, cap=None, session="A", pre_bum
         return "REPORT"
 
     state["impl"] = blocking_impl
+    # [FORK] S2-B P2: the handler now keys the map by (session, scope), so a pre-bump that wants to
+    # be the SAME entry the click will capture has to use the scoped key too. Keying it raw would
+    # silently make `pre_bumps` touch a different entry and quietly destroy the ABA premise below.
+    scoped = ns["_scoped_key"](session, ns["_SCOPE_VERIFY"])
     for _ in range(pre_bumps):
-        ns["_bump_verify_revision"](session)
+        ns["_bump_verify_revision"](scoped)
 
     out = {}
 
@@ -2138,7 +2186,7 @@ def _verification_with_interference(interfere, *, cap=None, session="A", pre_bum
         assert entered.wait(30), "the verification never started"
         out["pinned_while_running"] = ns["_verify_active_session"]
         interfere(ns)
-        out["present_while_running"] = session in ns["_verify_revisions"]
+        out["present_while_running"] = scoped in ns["_verify_revisions"]
         out["map_len_while_running"] = len(ns["_verify_revisions"])
     finally:
         release.set()
@@ -2167,7 +2215,8 @@ def test_an_active_verification_survives_any_number_of_other_invalidations(other
     assert out["result"] == "STALE_FOLDER_CHANGED", (
         f"{others} other sessions invalidated and the stale report was published anyway: "
         f"{out['result']!r}")
-    assert out["pinned_while_running"] == "A"
+    assert out["pinned_while_running"] == ns["_scoped_key"]("A", ns["_SCOPE_VERIFY"]), (
+        "the pin must be the SCOPED key the click captured")
     assert out["present_while_running"], "the active session's entry must survive eviction"
     assert out["map_len_while_running"] <= 8, "the cap must hold INCLUDING the pinned entry"
 
@@ -2195,7 +2244,7 @@ def test_the_aba_recreation_case_is_suppressed(captured):
     out, ns, _state = _verification_with_interference(
         _evict_with_other_sessions(40), cap=8, pre_bumps=captured)
     assert out["result"] == "STALE_FOLDER_CHANGED"
-    assert ns["_verify_revisions"]["A"] == captured + 1, (
+    assert ns["_verify_revisions"][ns["_scoped_key"]("A", ns["_SCOPE_VERIFY"])] == captured + 1, (
         "the invalidation must increment the surviving revision, not restart from 0")
 
 
@@ -2229,7 +2278,7 @@ def test_multiple_edits_of_the_active_session_stay_detectable():
 
     out, ns, _state = _verification_with_interference(interfere, cap=8)
     assert out["result"] == "STALE_FOLDER_CHANGED"
-    assert ns["_verify_revisions"]["A"] == 5
+    assert ns["_verify_revisions"][ns["_scoped_key"]("A", ns["_SCOPE_VERIFY"])] == 5
 
 
 def test_the_terminal_decision_is_made_before_the_pin_is_released():
@@ -2254,10 +2303,11 @@ def test_a_finished_verifications_entry_becomes_evictable_again():
     out, ns, _state = _verification_with_interference(
         _evict_with_other_sessions(0), cap=8)
     assert out["result"] == "STALE_FOLDER_CHANGED"
-    assert "A" in ns["_verify_revisions"]
+    scoped_a = ns["_scoped_key"]("A", ns["_SCOPE_VERIFY"])
+    assert scoped_a in ns["_verify_revisions"]
     for index in range(20):
         ns["_bump_verify_revision"](f"after-{index}")
-    assert "A" not in ns["_verify_revisions"], (
+    assert scoped_a not in ns["_verify_revisions"], (
         "once the run is over the former active entry must evict like any other")
     assert len(ns["_verify_revisions"]) <= 8
 
@@ -2266,6 +2316,7 @@ def test_a_refused_verification_leaves_no_pin_and_no_entry():
     """Requirement J: a click that never got the mutex must leave nothing behind."""
     ns, state = _load_concurrency_seam()
     assert ns["_RENDER_LOCK"].acquire(blocking=False), "precondition: a render holds the mutex"
+    ns["_mark_lock_holder"](ns["_LOCK_HOLDER_RENDER"])
     try:
         out = ns["_on_verify_sources_click"]("J:/lib", True, _FakeRequest("A"))
     finally:
