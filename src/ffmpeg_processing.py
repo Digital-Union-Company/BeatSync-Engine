@@ -40,6 +40,14 @@ from beatsync_fork.media_verify import (
     DEFAULT_PROBE_TIMEOUT_SECONDS as _MEDIA_VERIFY_PROBE_TIMEOUT,
     ProbeOutcome,
 )
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P1): the sample-decode contract (stdlib-only fork
+# module). Same one-way direction as the import above -- the runtime may import the fork package,
+# never the reverse, which is what keeps `media_sample` testable on a bare interpreter.
+from beatsync_fork.media_sample import (
+    DEFAULT_SAMPLE_DECODE_TIMEOUT_SECONDS as _MEDIA_SAMPLE_DECODE_TIMEOUT,
+    DEFAULT_SAMPLE_FRAMES as _MEDIA_SAMPLE_FRAMES,
+    SampleDecodeOutcome,
+)
 
 # Initialize environment
 setup_environment()
@@ -367,6 +375,104 @@ def probe_media_metadata(video_file: str,
     except (OSError, ValueError) as exc:
         return ProbeOutcome(error=f"{type(exc).__name__}: {exc}")
     return ProbeOutcome(
+        returncode=int(result.returncode),
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+    )
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P1): the one bounded sample-decode child.
+#
+# A pure argv builder plus the smallest bounded execution seam, beside the FFprobe pair above and
+# sharing their `FFMPEG_PATH` / `_run_media_command` conventions. Nothing here classifies: the
+# outcome travels verbatim into `beatsync_fork.media_sample`, whose decision table is pure and
+# therefore assertable without a child process.
+#
+# This is a DIAGNOSTIC, not a render. It writes no media, reads no cache record, launches no Qwen
+# worker and touches no source bytes. Unlike `extract_clip_segment_ffmpeg_detailed` it deliberately
+# does NOT reproduce the render pipeline -- no filter chain, no NVENC, no output file -- so a clean
+# result says the decoder produced frames, never that the production extraction would succeed.
+def build_sample_decode_command(video_file: str, seek_seconds: float, stream_index: int,
+                                requested_frames: int = _MEDIA_SAMPLE_FRAMES) -> List[str]:
+    """The argv for one bounded sample decode. An ARRAY, never a shell string.
+
+    Each option earns its place, and several are load-bearing rather than cosmetic:
+
+    * ``-v error`` -- at this loglevel a clean run prints nothing, so a non-empty stderr IS the
+      decoder-error signal and `media_sample` needs no fragile pattern matching. It also keeps the
+      capture small (see `_run_media_command`'s unbounded-capture caveat below).
+    * ``-nostdin`` -- a UI-launched child must never consume the parent's stdin.
+    * exactly one ``-ss``, BEFORE ``-i`` -- input seeking, matching what the renderer actually does.
+      There is no second output-side seek.
+    * ``-map 0:<absolute index>`` -- the renderer passes no ``-map`` and so gets FFmpeg's automatic
+      selection (highest resolution, ties by lowest index). `media_sample` reproduces that rule from
+      metadata and pins the result by ABSOLUTE index, which is unambiguous in a way ``0:v:N`` is
+      not.
+    * ``-frames:v`` -- documented as "stop writing to the stream after framecount frames", i.e. a
+      bound on OUTPUT frames. Frames decoded during accurate-seek pre-roll are exercised but never
+      counted, which is why the status is named OUTPUT_FRAMES_OK.
+    * ``-fps_mode passthrough`` -- the one deliberate divergence from the renderer's ``cfr``. Under
+      CFR, FFmpeg can reach the requested count by DUPLICATING a single good frame, which would let
+      a damaged source pass; passthrough removes that false-pass path entirely.
+    * ``-progress pipe:1`` -- machine-readable ``key=value`` evidence on stdout, which
+      `_run_media_command` already captures.
+    * ``-f null -`` -- the null muxer, which generates no output file. No ``-y`` is needed because
+      nothing is written.
+
+    Deliberately absent: ``-xerror`` (we want FFmpeg to finish and report, not abort on the first
+    complaint), ``-noaccurate_seek`` (we want the frames actually at the requested position), any
+    retry, and any ``-vf``/encoder argument.
+    """
+    return [
+        FFMPEG_PATH,
+        '-hide_banner',
+        '-v', 'error',
+        '-nostdin',
+        '-ss', str(seek_seconds),
+        '-i', video_file,
+        '-map', f'0:{int(stream_index)}',
+        '-an', '-sn', '-dn',
+        '-frames:v', str(int(requested_frames)),
+        '-fps_mode', 'passthrough',
+        '-progress', 'pipe:1',
+        '-f', 'null', '-',
+    ]
+
+
+def sample_decode_video(video_file: str, *, seek_seconds: float, stream_index: int,
+                        requested_frames: int = _MEDIA_SAMPLE_FRAMES,
+                        timeout: float = _MEDIA_SAMPLE_DECODE_TIMEOUT) -> SampleDecodeOutcome:
+    """Run one bounded sample decode and report the outcome verbatim.
+
+    Total by construction: every failure mode becomes a reported outcome, because the caller is a
+    read-only diagnostic whose entire purpose is to describe failure accurately.
+
+    No ``lifecycle`` is passed to `_run_media_command`, matching `probe_media_metadata`: that
+    parameter is the render cancellation path, and a diagnostic is not a render. The plain
+    ``timeout`` branch it takes is the original unchanged ``subprocess.run(..., timeout=timeout)``.
+    That choice also PRESERVES EVIDENCE -- `subprocess.run` attaches the partial capture to
+    `TimeoutExpired`, whereas the lifecycle branch raises a bare `TimeoutExpired(cmd, timeout)` with
+    no output at all. On timeout we therefore still learn how far the decode got.
+
+    Those partial attributes are documented as **always bytes when any output was captured,
+    regardless of the ``text=True`` setting**, and may be ``None``. They are handed on untouched;
+    `media_sample.coerce_stream_text` owns the decoding, so this seam never has to guess an
+    encoding. A timeout remains a timeout: partial progress reaching the requested count is never a
+    successful decode.
+
+    Caveat carried deliberately rather than papered over: `_run_media_command` captures stderr
+    without a size limit. ``-v error`` makes large output unlikely, and the frame/timeout bounds cap
+    how long a pathological file can keep writing, but neither establishes a hard memory bound.
+    """
+    cmd = build_sample_decode_command(video_file, seek_seconds, stream_index, requested_frames)
+    try:
+        result = _run_media_command(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return SampleDecodeOutcome(timed_out=True, stdout=exc.stdout, stderr=exc.stderr)
+    except (OSError, ValueError) as exc:
+        return SampleDecodeOutcome(error=f"{type(exc).__name__}: {exc}")
+    return SampleDecodeOutcome(
         returncode=int(result.returncode),
         stdout=result.stdout or "",
         stderr=result.stderr or "",

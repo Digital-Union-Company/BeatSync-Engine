@@ -1,8 +1,10 @@
 ---
 paths:
   - "src/beatsync_fork/media_verify.py"
+  - "src/beatsync_fork/media_sample.py"
   - "src/ffmpeg_processing.py"
   - "tests/test_media_verify.py"
+  - "tests/test_media_sample.py"
 ---
 <!-- `src/gui.py` is deliberately ABSENT from this list. `docs/claude/README.md` records the
      architecture: gui.py loads only `gui-integration.md`, and each subsystem rule is scoped to its
@@ -291,3 +293,204 @@ count stated explicitly and the true total in the block header. The bound is on 
 rows** — a displayed failure's own path is never shortened, because the path is the identification
 the operator needs in order to act. That is S1's MAJOR-1 restated for this surface: a diagnostic
 must not truncate away its own subject. A test drives a 900-character path through the report.
+
+## Sample decode (MEDIA-VERIFY-S2-B, P1 — pure core + seam, NOT wired to the UI)
+
+S2-A answers "did the header parse?". S2-B asks the next bounded question: **take one source, one
+seek position, and make the decoder actually produce frames there.** `beatsync_fork/media_sample.py`
+owns the fifteen statuses, renderer-equivalent stream selection, the progress parser, the classifier
+and the report; `ffmpeg_processing.build_sample_decode_command` / `sample_decode_video` own the one
+child process. P1 ships **no Gradio control and no event handler** — GUI and per-session
+stale-result suppression are P2.
+
+`probe` and `decode` arrive as **injected callables**, like `verify_media_health`'s `probe`. That is
+what makes all fifteen statuses reachable with no FFmpeg, no FFprobe and no media, and it is why
+`media_sample` never imports `ffmpeg_processing` (the hard rule runs one way only).
+
+### `classify_probe` is NOT a prerequisite for a sample decode
+
+The trap this contract exists to prevent. `classify_probe` selects the **first**
+`codec_type == "video"` stream and validates *that* stream's geometry and duration. FFmpeg's
+documented automatic selection — which is what `extract_clip_segment_ffmpeg_detailed` gets, because
+it passes no `-map` — takes the **highest-resolution** video stream, ties broken by lowest index. On
+a multi-video container those are different streams, so gating the decode on `classify_probe` would
+both refuse files whose *unselected* first stream has a bad duration and bless a selected stream
+nobody validated.
+
+So: `probe_media_metadata` is reused for FFprobe **execution, timeout and launch-error semantics
+only**. Its classifier is not consulted. `select_renderer_equivalent_stream` re-reads the raw
+`-show_streams` payload and validates the stream that will actually be decoded. Every verdict
+records the absolute stream index, codec, geometry, duration, **duration provenance**
+(`stream`/`container`, because those are not interchangeable) and a renderer-equivalence label.
+No report may imply equivalence that was not established. Do not change `classify_probe` to fix
+this; the two subjects are meant to differ.
+
+Fail closed (`SAMPLE_STREAM_AMBIGUOUS`) only where the renderer's pick genuinely cannot be
+determined: a video stream with no usable absolute index; **two video streams declaring the same
+absolute index** (whichever we ranked, `-map 0:<index>` then names two streams, so the pinned target
+is not the one we described); two or more video streams where any is an `attached_pic` (the docs
+give the resolution rule and the `V` specifier's exclusion, but not how automatic selection ranks an
+attached picture); or two or more where any lacks usable geometry. **A pixel-area tie between
+streams with distinct indices is resolvable, not ambiguous** — lowest index wins, per the documented
+rule, and that stays true. A lone stream that is undescribable is `SAMPLE_METADATA_UNUSABLE`, not
+ambiguity: "I cannot tell which stream" and "the stream I must test is undescribable" are different
+operator problems.
+
+A **lone** `attached_pic` stream is selectable — the renderer has no other choice — and the verdict
+carries `attached_pic` all the way into the report, which says so in words and says why: a one-frame
+cover art will legitimately underfill a 30-frame request, so a short result there is expected and
+is not evidence of damage. Computing that flag at selection and dropping it before the verdict was
+the original defect; a field the report never sees is not a disclosure.
+
+### No frame-rate arithmetic. Ever.
+
+An earlier design classified a short sample as end-of-file when `seek + frames/fps` exceeded the
+reported duration. It is unsound three times over: `classify_probe` returns `METADATA_OK` **without
+validating `fps`**, so the divisor can legitimately be `0`; `r_frame_rate` is a base/maximum rate
+that for VFR sits far above the true average, biasing the comparison toward *claiming damage* on
+healthy files; and for VFR `frames/fps` is not the time span of those frames at all. A test walks
+the classifier AST and fails on any division whose right operand names a frame rate.
+
+Underproduction is therefore **always** `SAMPLE_UNDERFILLED_UNVERIFIED` — inconclusive, never
+"damaged", never "confirmed EOF" — and always reports observed *and* requested counts. `fps` is
+report context only. The one surviving duration use is the division-free precondition
+`seek >= duration → SAMPLE_SEEK_OUT_OF_RANGE`, a refusal rather than a verdict on the bytes.
+
+### The argv, and why `frame=` is named "output frames"
+
+`-frames:v` is documented as "stop writing to the stream after framecount frames" — a bound on
+**output** frames. With `-ss` before `-i`, accurate-seek pre-roll frames are decoded but never
+counted, so the counter *understates* decoder work. Hence `SAMPLE_OUTPUT_FRAMES_OK`: never describe
+it as "frames decoded" or "frames verified".
+
+`-fps_mode passthrough` is the one deliberate divergence from the renderer's `cfr` and is
+load-bearing: under CFR, FFmpeg can reach the requested count by **duplicating a single good
+frame**, which would let a damaged source pass. `-v error` means a clean run prints nothing, so a
+non-empty stderr *is* the decoder-error signal — no pattern matching, and the bias is toward
+withholding success. `-f null -` writes no file; no `-y` is needed. Forbidden: a filter chain, any
+encoder argument, `-y`, `-xerror`, `-noaccurate_seek`, a second output-side seek, any retry. The
+diagnostic is **not** the render: a clean sample says the decoder produced frames, never that the
+production NVENC extraction would succeed.
+
+### Progress evidence comes from one completed block
+
+`parse_progress_output` accumulates keys into the **current** block, completes that block when its
+`progress` marker arrives, and reads every field from the **last completed block alone**. The
+`progress` key is a block terminator, so treating the stream as one last-seen-value dictionary is
+what let `frame=30 / progress=continue / progress=end` report `frames=30` for a terminal block that
+carried no count — and the sole positive status may never rest on a number no terminal block
+emitted. That exact sequence must stay `SAMPLE_EVIDENCE_UNTRUSTWORTHY`.
+
+Nothing is inherited across a boundary: a missing terminal `frame` stays `None`, a malformed
+terminal `frame` is never replaced by an earlier valid one, an earlier `progress=end` is superseded
+by a later completed block, and a `dup_frames=0` from an earlier block is not a measurement of the
+final one. A trailing partial write completes no block, so it neither becomes the evidence nor
+inflates `blocks`. `str`, `bytes`, `None`, CRLF and invalid UTF-8 all still parse.
+
+### Nothing in a report may claim what did not happen
+
+`SAMPLE_ONLY_TEXT` is unconditional, so it is phrased **hypothetically** — "even a successful sample
+checks only one short window of one stream". The earlier past-tense phrasing ("one window *was
+decoded*") was appended to every report, which made it a false statement of fact on
+`SAMPLE_SOURCE_MISSING`, `SAMPLE_INVALID_REQUEST`, `SAMPLE_NOT_RUN`, `SAMPLE_BUDGET_EXHAUSTED`,
+`SAMPLE_SEEK_OUT_OF_RANGE` and every other non-executed outcome. It appears **exactly once** per
+report; the success detail no longer embeds a second copy. A test walks all fifteen statuses.
+
+What did happen is stated, not implied. `DecodeExecution` is its own field and its own report line,
+distinguishing four facts: the decode was **not requested**; it was requested but **no child was
+confirmed to have started** (a refused spawn or a seam exception — child-start evidence is never
+invented); a child **ran without a clean result**; a child ran and **produced the requested
+frames**. A timeout is a launch, because the child had to start in order to be killed by its own
+clock.
+
+**`DecodeExecution` describes process execution only — never frame completeness.** The two are
+separate evidence and may never be derived from one another. `RAN_WITHOUT_CLEAN_RESULT` means
+"a child ran and the sample did not earn `SAMPLE_OUTPUT_FRAMES_OK`", which is *not* "a child
+produced fewer frames than requested": tiers 1–6 of `classify_decode` outrank every frame tier, so
+`SAMPLE_OUTPUT_WITH_DECODER_ERRORS`, `SAMPLE_SOURCE_CHANGED`, `SAMPLE_EVIDENCE_UNTRUSTWORTHY`,
+`SAMPLE_TIMEOUT` and `SAMPLE_FFMPEG_FAILED` are all reachable with a terminal block reporting the
+full requested count. An earlier wording derived a shortfall claim from "not the success status"
+and was therefore false on all five — on `SAMPLE_OUTPUT_WITH_DECODER_ERRORS` it contradicted the
+`Detail` line and the `Observed output frames` line of the *same* report. The general rule it cost
+a blocker to learn: **a label derived from a verdict will eventually contradict the evidence that
+verdict outranked.** Only `REQUESTED_FRAMES_PRODUCED` may speak about frames, because it is
+assigned solely from a status that already required `frame == requested` in a completed terminal
+block. The model stays at four states; a fifth "ran, completeness unknown" would split the single
+question `decoder_was_launched` exists to answer.
+
+`decoder_was_launched` reads that field and **never a status label**. Deriving it from
+`SAMPLE_NOT_RUN` was wrong twice over: that status means the seam reported `error`, so no child
+existed, and on the pre-decode path it means *FFprobe* could not start, before a decode was even
+requested. No line reports an unmeasured quantity either: geometry, frame rate and duration read
+"unknown"/"not established" when no stream was selected, never `0x0` and `0.000`.
+
+`elapsed_seconds` is the **whole check on every path**; the decode call is its own
+`decode_seconds`, `None` when no decode was requested. One field that silently switched between
+"the whole check" and "the decode only" could not be read correctly by anyone.
+
+### The request is bounded here, not by the caller's good manners
+
+`MAX_SAMPLE_FRAMES` is a **hard ceiling**, not just the default: `1..30`, and anything above it is
+`SAMPLE_INVALID_REQUEST` with no child started. The **pure orchestrator is the single owner** of
+this bound. `build_sample_decode_command` stays a serializer and deliberately does not re-decide
+policy — a second cap there would be a second policy owner, and the one that mattered would stop
+being obvious — and no future P2 GUI validator is relied upon. Callers reaching the diagnostic go
+through `run_sample_check`.
+
+The path is validated before any `stat`, probe or child: a non-empty `str` (a non-string is
+`SAMPLE_INVALID_REQUEST`, never an escaping `TypeError`), a
+`SUPPORTED_VIDEO_EXTENSIONS` suffix compared case-insensitively so `.MP4`/`.MKV` are accepted, and a
+**regular file** by `S_ISREG`. The extension list is **imported from `input_manager`, never
+restated** — a third copy of ".mp4/.mkv" is drift waiting to happen. The mode comes from the
+baseline observation's own `stat` result, so the stability bracket stays exactly **three**
+observations; `os.stat` is the only `os` use in the module and a test pins that.
+
+### Total means every ordinary failure becomes a verdict
+
+Contained: an injected `probe` or `stat` that raises, a probe whose exit code is malformed or
+absent, a `decode` that raises, and a `decode` that returns a record the module cannot read.
+Containment is `except Exception` — **never `BaseException`**, so `KeyboardInterrupt` and
+`SystemExit` still propagate and a cancelled operation is never reported as a file problem. A
+malformed or absent exit code becomes a seam failure, **never a zero**: `int(x) or 0` both raised on
+junk and invented a success code out of `None`. The detail distinguishes an environmental refusal
+(`OSError`/`ValueError`) from an unexpected internal error, because those lead the operator
+somewhere different. `fingerprint_source` and `probe_media_metadata` contracts are **unchanged** —
+the containment is a wrapper here, not a widening there.
+
+### Status precedence
+
+Timeout and non-zero exit are checked **before any frame count**, so partial progress that happens
+to reach the requested total can never become a success. Then: a failed post-decode observation
+(fails closed — claims no change, permits no success), a change observed during the decode, the
+evidence tier (no terminal `progress=end`, missing/malformed count, a count *above* the request, or
+an explicitly positive dup/drop), `frame=0`, underfill, stderr-at-exit-0, and finally the one
+positive status. `change_window` and `stability` are **separate fields, never statuses**, so a
+timeout that also saw the file move reports both facts instead of hiding one behind the other.
+
+Missing `dup_frames`/`drop_frames` are **UNKNOWN**, never converted to zero and never read as proof
+of zero; unknown does not block success (FFmpeg need not emit those keys, and requiring them would
+make success unreachable rather than rigorous), while an explicitly positive one does.
+
+### Bounds, and what is not claimed
+
+30 output frames (`DEFAULT_SAMPLE_FRAMES` **and** `MAX_SAMPLE_FRAMES` — the default and the
+enforced ceiling are the same number), FFprobe 20 s (S2-A's constant, reused not redefined), decode
+30 s, 60 s scheduling budget, one source, one worker. **Every one is a conservative policy choice,
+not a measured optimum.** The budget gates *scheduling*: it is re-measured after the last pre-decode stat
+and must leave room for the whole decode timeout, so no child starts that the budget could not let
+finish. `os.stat`, Windows process creation, termination and post-timeout pipe draining all sit
+outside it — **no hard end-to-end wall-clock bound is claimed anywhere.**
+
+`lifecycle=None` is passed to `_run_media_command`, matching `probe_media_metadata`: a diagnostic is
+not a render. That also preserves evidence — `subprocess.run` attaches the partial capture to
+`TimeoutExpired`, whereas the lifecycle branch raises a bare `TimeoutExpired(cmd, timeout)` with no
+output. Those attributes are documented as **always bytes when any output was captured, regardless
+of `text=True`**, and may be `None`, so every parser entry point goes through
+`coerce_stream_text`. No new runner, no new `RenderLifecycle`, no new cancellation authority; there
+is no Cancel control in P1, and a browser disconnect does not necessarily interrupt the child.
+`_run_media_command` captures stderr without a size limit — `-v error` makes large output unlikely
+and the bounds cap how long a pathological file can write, but neither establishes a hard memory
+bound. Do not claim otherwise.
+
+**Portable-build acceptance of `-progress`, `-fps_mode passthrough` and `-f null -` is UNVERIFIED**
+until a separately authorized real-FFmpeg integration test. P1 executes no FFmpeg at all.
