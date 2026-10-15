@@ -20,6 +20,55 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P1-M2: the two residual R5 minor findings)
+
+The final independent review of PR #61 passed it with zero blockers and zero majors, and the PR was
+merged as `4feaa74d`. It also left two minor findings, accepted at merge as non-blocking for P1 and
+**mandatory before P2 acceptance**. Both are closed here, in the same two code paths the earlier
+corrections used. No P1 contract moves: the fifteen statuses, four execution states, stream
+selection, the progress parser, the 30-frame cap, the three stability observations, timeout and
+exit-code precedence, the whole argv and `src/ffmpeg_processing.py` are all untouched.
+
+**MINOR-1 — a malformed exit code no longer carries untrusted frame evidence.** The conversion that
+rewrites an unreadable decode record into a seam error was preserving its `stdout`, so a record with
+a non-int-coercible `returncode` *and* a full 30-frame terminal block produced a report showing
+`Observed output frames: 30` beside a `Decode:` line stating that no FFmpeg child was confirmed to
+have started. That is the **same defect class as the R4 blocker, in the opposite direction**: one
+report, two lines, sourced from facts of different strength. A record whose exit code cannot be read
+is not a completed decode record, so its progress stream is not evidence; the `stdout` is now
+dropped with the code, `observed_frames` stays `None`, and the line reads "not established" exactly
+as it does for a refused spawn. `stderr` survives — bounded diagnostic context is not a measurement
+— and the malformed value is quoted in the detail.
+
+The fix is deliberately one keyword argument, and the existing guards are what keep it narrow: a
+genuine `timed_out` never reaches that branch, so a timeout's partial progress (the evidence most
+worth having, and the reason `lifecycle=None` was chosen) is preserved; a legitimate non-zero exit
+has a readable code, so its frame evidence is untouched. A test pins both against the over-broad
+alternative of discarding `stdout` whenever the result is not clean.
+
+The finding was **not reachable through the shipped seam** — `sample_decode_video` does
+`int(result.returncode)` on a `subprocess.run` result, which is always an int — so this is
+hardening against the P2 GUI caller and any future decode adapter, not a live operator-facing bug.
+
+**MINOR-2 — the report-consistency matrix now reads the report.** It compared the `Decode:` line
+against `verdict.observed_frames` while its docstring claimed it compared the two rendered lines.
+The consequence was measured, not theorised: a formatter rendering `min(observed, requested)`
+passed all 241 tests, hiding the one case the pin exists for — an observed count **above** the
+request, which is not a cosmetic oddity but the actual evidence behind
+`SAMPLE_EVIDENCE_UNTRUSTWORTHY`, since it contradicts `-frames:v`. Both frame quantities, the
+result and the requested count are now read via `_field(report, …)`; the verdict field is the
+expectation, never the measurement. A third rule joins the matrix: a `Decode:` line denying
+confirmed child-start evidence may not print a count either.
+
+8 new tests (241 → 249 in `tests/test_media_sample.py`; full suite 6242 → 6250 collected, 6242
+passed, 8 skipped), including the mandatory 31-against-30 case, a parametrised malformed-exit-code
+sweep over five unreadable values, and a guard that the legitimate timeout and non-zero-exit paths
+keep their progress. Six disposable negative controls — the old stdout-preserving conversion, a
+formatter clamp, a malformed code promoted to zero, a timeout promoted to success, a refused spawn
+claiming a child start, and a lost final stability observation — are each caught by a behavioural
+assertion. No FFmpeg or FFprobe was executed; portable-build acceptance of `-progress`,
+`-fps_mode passthrough` and `-f null -` remains **UNVERIFIED**.
+
 ### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P1-R4: DecodeExecution truthfulness)
 
 A second independent review of the R2 commit below confirmed all sixteen of its corrections and

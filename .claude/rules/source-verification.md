@@ -418,11 +418,44 @@ assigned solely from a status that already required `frame == requested` in a co
 block. The model stays at four states; a fifth "ran, completeness unknown" would split the single
 question `decoder_was_launched` exists to answer.
 
+**The same rule has a second edge: a line that DENIES child-start evidence may not print a frame
+count either.** The malformed-exit-code conversion in `run_sample_check` used to rewrite an
+unreadable record into a seam error while **carrying its `stdout` forward**, so a `START_NOT_CONFIRMED`
+report could show `Observed output frames: 30` beside "no FFmpeg child was confirmed to have
+started". A record whose exit code cannot be read is **not a completed decode record**, so its
+progress stream is not trustworthy evidence: that `stdout` is now dropped with the exit code,
+`observed_frames` stays `None`, and the line reads "not established" exactly as it does for a
+refused spawn. `stderr` is kept — bounded diagnostic context is not a measurement — and the
+malformed value itself is quoted in the detail.
+
+Keep that fix **narrow**, and note which guards make it narrow: `not result.timed_out` means a
+timeout never enters the branch, so its partial progress (the evidence most worth having) survives;
+a legitimate non-zero exit has a readable code, so its frame evidence is untouched. The over-broad
+version — discard `stdout` whenever the result is not clean — would destroy both, and a test pins
+against it.
+
+`Observed output frames` renders `observed_frames` **verbatim**: never clamped to the request,
+never defaulted to zero, never substituted from `requested_frames`. A count *above* the request is
+real evidence, not a cosmetic oddity — it is precisely what makes `SAMPLE_EVIDENCE_UNTRUSTWORTHY`
+the correct verdict, because it contradicts `-frames:v` — so displaying a plausible-looking `30`
+would hide the only visible reason for the status.
+
 `decoder_was_launched` reads that field and **never a status label**. Deriving it from
 `SAMPLE_NOT_RUN` was wrong twice over: that status means the seam reported `error`, so no child
 existed, and on the pre-decode path it means *FFprobe* could not start, before a decode was even
 requested. No line reports an unmeasured quantity either: geometry, frame rate and duration read
 "unknown"/"not established" when no stream was selected, never `0x0` and `0.000`.
+
+### Test the rendered surface, not the field behind it
+
+A report-truthfulness test must read the **report**. The consistency matrix once compared the
+`Decode:` line against `verdict.observed_frames` while its own docstring claimed it compared the
+two rendered lines — so a formatter rendering `min(observed, requested)` passed the entire 241-test
+suite, concealing exactly the above-request case the pin existed for. Assertions about what the
+operator is shown go through `_field(report, …)`; the verdict field is the expectation, not the
+measurement. Generalisable: **when a test and its docstring disagree about which surface is under
+assertion, the docstring is the claim and the code is the coverage — and only one of them is load-
+bearing.**
 
 `elapsed_seconds` is the **whole check on every path**; the decode call is its own
 `decode_seconds`, `None` when no decode was requested. One field that silently switched between

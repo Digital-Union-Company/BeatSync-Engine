@@ -1604,6 +1604,35 @@ def test_a_full_frame_count_with_a_non_clean_status_is_never_reported_as_underpr
     assert _field(report, "Result") == expected_status.value, label
 
 
+#: Every case the report-consistency matrix walks, keyed by label. Kept as a module-level table of
+#: FACTORIES for the same reason :data:`_FULL_COUNT_BUT_NOT_CLEAN` is (``_stat_seq`` is stateful),
+#: and shared so the rendered-line matrix and the field matrix cannot drift apart.
+_REPORT_MATRIX_CASES = {
+    "clean success": lambda: {},
+    "underfilled": lambda: {"outcome": _decoded(stdout=_progress(frames=3))},
+    "zero frames": lambda: {"outcome": _decoded(stdout=_progress(frames=0, blocks=1))},
+    "no terminal block": lambda: {"outcome": _decoded(stdout="frame=30\nfps=30\n")},
+    "malformed frame count": lambda: {"outcome": _decoded(stdout="frame=abc\nprogress=end\n")},
+    "count above the request": lambda: {
+        "outcome": _decoded(stdout=_progress(frames=31, blocks=1))},
+    "dup frames positive": lambda: {"outcome": _decoded(stdout=_progress(dup=4))},
+    "timeout, no output": lambda: {"outcome": SampleDecodeOutcome(timed_out=True)},
+    "refused spawn": lambda: {"outcome": SampleDecodeOutcome(error="WinError 2")},
+    "malformed exit code": lambda: {"outcome": SampleDecodeOutcome(
+        returncode="x", stdout=_progress(), stderr="junk on stderr")},
+    "seek out of range": lambda: {"seek_seconds": 999.0},
+    "invalid request": lambda: {"requested_frames": 0},
+    "budget exhausted": lambda: {"budget_seconds": 1.0},
+}
+
+
+def _matrix_cases():
+    """Fresh kwargs for every case, including the five full-count-but-not-clean shapes."""
+    cases = {label: make_kw() for label, make_kw in _REPORT_MATRIX_CASES.items()}
+    cases.update({label: make_kw() for label, make_kw, _ in _FULL_COUNT_BUT_NOT_CLEAN})
+    return cases
+
+
 def test_the_decode_line_never_contradicts_the_observed_frame_evidence():
     """Full execution-state x status matrix: no report may argue with itself.
 
@@ -1611,38 +1640,40 @@ def test_the_decode_line_never_contradicts_the_observed_frame_evidence():
     the ``Observed output frames`` line in the SAME report. A shortfall claim is permitted only
     where the evidence actually shows one; a production claim only where the count reached the
     request. Anything else is a report that contradicts itself.
-    """
-    cases = {
-        "clean success": {},
-        "underfilled": {"outcome": _decoded(stdout=_progress(frames=3))},
-        "zero frames": {"outcome": _decoded(stdout=_progress(frames=0, blocks=1))},
-        "no terminal block": {"outcome": _decoded(stdout="frame=30\nfps=30\n")},
-        "malformed frame count": {"outcome": _decoded(stdout="frame=abc\nprogress=end\n")},
-        "count above the request": {"outcome": _decoded(stdout=_progress(frames=31, blocks=1))},
-        "dup frames positive": {"outcome": _decoded(stdout=_progress(dup=4))},
-        "timeout, no output": {"outcome": SampleDecodeOutcome(timed_out=True)},
-        "refused spawn": {"outcome": SampleDecodeOutcome(error="WinError 2")},
-        "seek out of range": {"seek_seconds": 999.0},
-        "invalid request": {"requested_frames": 0},
-        "budget exhausted": {"budget_seconds": 1.0},
-    }
-    cases.update({label: make_kw() for label, make_kw, _ in _FULL_COUNT_BUT_NOT_CLEAN})
 
+    Both frame quantities are read from the **rendered report**, not from the verdict, which is the
+    whole point: this test's job is to police what the operator is shown. An earlier version read
+    ``verdict.observed_frames`` while its docstring claimed otherwise, and a formatter that clamped
+    the displayed count to the request survived the entire suite as a result. See
+    :func:`test_the_rendered_observed_frame_line_is_the_verdicts_own_evidence` for the direct pin.
+    """
     seen_executions = set()
-    for label, kw in cases.items():
+    for label, kw in _matrix_cases().items():
         verdict, _ = _check(**kw)
         seen_executions.add(verdict.execution)
         report = format_sample_report(verdict)
         decode_line = _field(report, "Decode").lower()
-        observed = verdict.observed_frames
-        shortfall_known = observed is not None and observed < verdict.requested_frames
+
+        # Read BOTH quantities off the report. "not established" is the rendered unknown.
+        shown = _field(report, "Observed output frames")
+        requested = _field(report, "Requested output frames")
+        assert requested.isdigit(), f"{label}: requested count must always render as a number"
+        observed = None if shown == "not established" else int(shown)
+        assert shown == "not established" or shown.isdigit(), \
+            f"{label}: observed count renders as a number or 'not established', got {shown!r}"
+        shortfall_known = observed is not None and observed < int(requested)
 
         if "did not produce the full" in decode_line or "underproduc" in decode_line:
-            assert shortfall_known, f"{label}: shortfall claimed, evidence says {observed}"
+            assert shortfall_known, f"{label}: shortfall claimed, report shows {shown!r}"
         if "produced the requested output frames" in decode_line:
-            assert observed is not None and observed >= verdict.requested_frames, \
-                f"{label}: production claimed, evidence says {observed}"
-            assert verdict.status is SampleStatus.OUTPUT_FRAMES_OK, label
+            assert observed is not None and observed >= int(requested), \
+                f"{label}: production claimed, report shows {shown!r}"
+            assert _field(report, "Result") == SampleStatus.OUTPUT_FRAMES_OK.value, label
+        # A Decode line that DENIES confirmed child-start evidence may not print a count either.
+        if "no ffmpeg child was confirmed to have started" in decode_line:
+            assert shown == "not established", \
+                (f"{label}: report denies a confirmed child start while showing {shown!r} "
+                 f"output frames from that child's own progress stream")
         # decoder_was_launched must agree with the execution field on every single pair.
         assert verdict.decoder_was_launched is (
             verdict.execution in (DecodeExecution.RAN_WITHOUT_CLEAN_RESULT,
@@ -1650,6 +1681,110 @@ def test_the_decode_line_never_contradicts_the_observed_frame_evidence():
 
     assert seen_executions == set(DecodeExecution), \
         f"matrix must exercise every execution state, missed {set(DecodeExecution) - seen_executions}"
+
+
+def test_the_rendered_observed_frame_line_is_the_verdicts_own_evidence():
+    """``Observed output frames`` renders ``observed_frames`` verbatim -- never clamped, never faked.
+
+    The gap this closes: every other report-truthfulness test either compared the Decode line to
+    the verdict *field*, or pinned the rendered line only where it happened to equal the request.
+    A formatter rendering ``min(observed, requested)`` therefore passed all 241 tests while hiding
+    the one case the pin exists for -- a count ABOVE the request, which is not a cosmetic oddity
+    but the actual evidence behind ``SAMPLE_EVIDENCE_UNTRUSTWORTHY``.
+    """
+    for label, kw in _matrix_cases().items():
+        verdict, _ = _check(**kw)
+        report = format_sample_report(verdict)
+        expected = ("not established" if verdict.observed_frames is None
+                    else str(verdict.observed_frames))
+        assert _field(report, "Observed output frames") == expected, label
+        assert _field(report, "Requested output frames") == str(verdict.requested_frames), label
+        assert _field(report, "Result") == verdict.status.value, label
+
+
+def test_an_output_count_above_the_request_is_shown_not_clamped():
+    """The mandatory case: 31 observed against 30 requested renders as 31.
+
+    ``-frames:v 30`` bounds output frames, so 31 contradicts the flag and the counter itself is
+    what stops being trustworthy. Clamping the display to 30 would conceal the anomaly behind a
+    number that looks correct, leaving an operator a status with no visible reason.
+    """
+    verdict, launched = _check(outcome=_decoded(stdout=_progress(frames=31, blocks=1)))
+    assert verdict.status is SampleStatus.EVIDENCE_UNTRUSTWORTHY
+    assert verdict.requested_frames == DEFAULT_SAMPLE_FRAMES == 30
+    assert verdict.observed_frames == 31, "the verdict keeps the real count"
+    assert len(launched) == 1
+
+    report = format_sample_report(verdict)
+    assert _field(report, "Observed output frames") == "31", "shown verbatim, never clamped to 30"
+    assert _field(report, "Requested output frames") == "30"
+    assert _field(report, "Result") == "SAMPLE_EVIDENCE_UNTRUSTWORTHY"
+    assert "31" in _field(report, "Detail") and "30" in _field(report, "Detail"), \
+        "the detail names both counts so the contradiction is legible"
+    # And the execution line must not turn a counter anomaly into a shortfall or a success.
+    decode_line = _field(report, "Decode").lower()
+    assert "no clean sample verdict was established" in decode_line
+    for lie in ("did not produce the full", "underproduc", "produced the requested output frames"):
+        assert lie not in decode_line
+
+
+@pytest.mark.parametrize("returncode", ["x", None, 1.5, [0], object()])
+def test_a_malformed_exit_code_discards_its_untrusted_progress_evidence(returncode):
+    """MINOR-1: a record whose exit code cannot be read is not a completed decode record.
+
+    Its ``stdout`` carried a full 30-frame terminal block straight into the report, which then
+    showed ``Observed output frames: 30`` beside a ``Decode:`` line denying any confirmed child
+    start. Same defect class as deriving an execution label from a status: one report, two lines,
+    sourced from facts of different strength. The progress stream is now dropped with the exit
+    code, so the count reads "not established" exactly as it does for a refused spawn.
+    """
+    verdict, launched = _check(outcome=SampleDecodeOutcome(
+        returncode=returncode, stdout=_progress(), stderr="some bounded stderr text"))
+    assert len(launched) == 1, "the decode WAS requested"
+    assert verdict.status is SampleStatus.NOT_RUN
+    assert verdict.execution is DecodeExecution.START_NOT_CONFIRMED
+    assert verdict.decoder_was_launched is False
+    assert verdict.returncode is None, "never fabricated as a zero"
+    assert "malformed exit code" in verdict.detail
+    assert repr(returncode) in verdict.detail, "the malformed value itself is quoted"
+
+    assert verdict.observed_frames is None, "untrusted progress is not evidence"
+    assert verdict.dup_frames is None and verdict.drop_frames is None
+
+    report = format_sample_report(verdict)
+    assert _field(report, "Observed output frames") == "not established"
+    assert _field(report, "Duplicated / dropped") == "unknown / unknown"
+    assert _field(report, "FFmpeg exit code") == "not reached"
+    assert "no FFmpeg child was confirmed to have started" in _field(report, "Decode")
+    # stderr is bounded diagnostic context, not a measurement -- it SURVIVES.
+    assert verdict.diagnostic == "some bounded stderr text"
+    assert "some bounded stderr text" in report
+
+
+def test_dropping_malformed_progress_does_not_touch_the_legitimate_paths():
+    """The MINOR-1 guard is narrow: only an unreadable exit code loses its progress stream.
+
+    A timeout's partial progress is the evidence most worth having, and a legitimate non-zero exit
+    still has a readable code, so neither enters that branch. Pinned because the obvious over-broad
+    fix -- discarding stdout whenever the result is not clean -- would destroy both.
+    """
+    timed_out, _ = _check(outcome=SampleDecodeOutcome(
+        timed_out=True, stdout=_progress(frames=17, end=False).encode("utf-8")))
+    assert timed_out.status is SampleStatus.TIMEOUT
+    assert timed_out.observed_frames == 17, "a timeout KEEPS its partial progress"
+    assert _field(format_sample_report(timed_out), "Observed output frames") == "17"
+
+    failed, _ = _check(outcome=_decoded(returncode=1, stderr="muxer failed"))
+    assert failed.status is SampleStatus.FFMPEG_FAILED
+    assert failed.observed_frames == DEFAULT_SAMPLE_FRAMES, "a real exit code KEEPS its evidence"
+
+    partial, _ = _check(outcome=_decoded(returncode=1, stdout=_progress(frames=4, blocks=1)))
+    assert partial.status is SampleStatus.FFMPEG_FAILED
+    assert partial.observed_frames == 4
+
+    clean, _ = _check()
+    assert clean.status is SampleStatus.OUTPUT_FRAMES_OK
+    assert clean.observed_frames == DEFAULT_SAMPLE_FRAMES
 
 
 def test_the_execution_model_stays_four_states_over_fifteen_statuses():

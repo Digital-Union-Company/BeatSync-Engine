@@ -224,7 +224,11 @@ class DecodeExecution(str, Enum):
     #: range, a cross-phase source change and an exhausted scheduling budget.
     NOT_REQUESTED = "not_requested"
     #: The decode callable was invoked, but no FFmpeg child is positively known to have started --
-    #: a refused spawn, or an unexpected exception from the seam itself.
+    #: a refused spawn, an unexpected exception from the seam itself, or a returned record whose
+    #: exit code could not be read. Because this member denies confirmed child-start evidence, a
+    #: report carrying it must not also print a frame count: :attr:`SampleVerdict.observed_frames`
+    #: is always ``None`` here, and ``run_sample_check`` guarantees that by discarding the untrusted
+    #: ``stdout`` of a record it could not read an exit code from.
     START_NOT_CONFIRMED = "start_not_confirmed"
     #: A child demonstrably ran (it returned an exit code, or it was killed by its own timeout) and
     #: the sample did not reach :attr:`SampleStatus.OUTPUT_FRAMES_OK`. It says **nothing about how
@@ -1110,8 +1114,21 @@ def run_sample_check(path: str, seek_seconds: Any, *,
     if not result.timed_out and not result.error and exit_code is None:
         # A malformed exit code is a tooling failure, not a file verdict -- and specifically not a
         # zero. Converting it to a seam error keeps it out of every success tier.
+        #
+        # Its ``stdout`` is deliberately DROPPED, which is the one thing this branch must do beyond
+        # renaming the failure. A record whose exit code cannot be read is not a completed decode
+        # record, so its progress stream is not trustworthy evidence either -- and carrying it
+        # forward put a frame count in a report that simultaneously said no child was confirmed to
+        # have started. That is the same defect class as deriving an execution label from a status:
+        # two lines of one report sourced from facts of different strength. ``observed_frames``
+        # therefore stays ``None`` here and the report reads "not established", exactly as it does
+        # for a refused spawn. ``stderr`` is kept -- it is bounded diagnostic context about the
+        # malformed outcome, not a measurement -- and the malformed value itself is quoted in the
+        # detail. Note the guards: a genuine ``timed_out`` never enters this branch, so a timeout's
+        # partial progress is still preserved, and a legitimate non-zero exit has a readable code,
+        # so its frame evidence is untouched.
         result = SampleDecodeOutcome(
-            stdout=result.stdout, stderr=result.stderr,
+            stderr=result.stderr,
             error=f"the decode seam reported a malformed exit code {result.returncode!r}")
 
     # Observation three, on EVERY terminal path above -- success, non-zero exit, timeout, spawn
@@ -1187,6 +1204,18 @@ def format_sample_report(verdict: SampleVerdict) -> str:
     ``SAMPLE_OUTPUT_WITH_DECODER_ERRORS`` sat in the same report as a ``Detail`` confirming all
     requested frames were produced and an ``Observed output frames`` equal to the request. A report
     that argues with itself tells the operator nothing.
+
+    That rule has a second edge, closed separately: a ``Decode:`` line **denying** confirmed
+    child-start evidence may not sit beside a frame count either. Both halves are now structural
+    rather than editorial -- ``run_sample_check`` discards the untrusted ``stdout`` of a record
+    whose exit code it could not read, so ``START_NOT_CONFIRMED`` always renders "not established".
+
+    ``Observed output frames`` renders :attr:`SampleVerdict.observed_frames` **verbatim**, and that
+    is load-bearing in both directions: it is never clamped to the request, never defaulted to zero
+    and never substituted from ``requested_frames``. A count *above* the request is real evidence --
+    it is exactly what makes ``SAMPLE_EVIDENCE_UNTRUSTWORTHY`` the right verdict, because it
+    contradicts ``-frames:v`` -- so hiding it behind a plausible-looking 30 would conceal the very
+    anomaly the status is reporting.
     """
     frames = "not established" if verdict.observed_frames is None else str(verdict.observed_frames)
     dup = "unknown" if verdict.dup_frames is None else str(verdict.dup_frames)
