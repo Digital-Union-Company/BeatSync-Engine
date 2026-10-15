@@ -15,14 +15,34 @@ one seek position, and ask the decoder to actually produce frames there*.
 
 The honesty boundary that matters most
 --------------------------------------
-:data:`SAMPLE_ONLY_TEXT` is the sentence every report carries. A successful sample is
-**one window of one stream** -- it is not proof of whole-file integrity, not proof the production
-NVENC extraction would succeed, and not proof of renderability. The single positive status is named
-:attr:`SampleStatus.OUTPUT_FRAMES_OK` rather than anything resembling a health claim, and the word
-"output" in it is load-bearing: FFmpeg's ``frame=`` counter counts frames **written to the output
-pipeline**, so with ``-ss`` before ``-i`` the frames decoded during accurate-seek pre-roll are
-exercised but never counted. The counter therefore understates decoder work and must never be
-described as "frames decoded" or "frames verified".
+:data:`SAMPLE_ONLY_TEXT` is the sentence every report carries, and it is phrased **hypothetically**
+("even a successful sample...") for one reason: it is unconditional, so it must be true of a report
+whose decode never started. A past-tense "one window was decoded" would be a false statement on
+:attr:`SampleStatus.SOURCE_MISSING`, :attr:`SampleStatus.INVALID_REQUEST`,
+:attr:`SampleStatus.NOT_RUN` and every other non-executed outcome. What actually happened is carried
+separately and factually by :class:`DecodeExecution`, which distinguishes *not requested*, *start
+not confirmed*, *ran without full output* and *requested frames produced* -- and which is also the
+only basis for :attr:`SampleVerdict.decoder_was_launched`, so that property can never claim a child
+started when the seam refused to spawn one.
+
+Even where a sample does succeed it is **one window of one stream** -- not proof of whole-file
+integrity, not proof the production NVENC extraction would succeed, not proof of renderability. The
+single positive status is named :attr:`SampleStatus.OUTPUT_FRAMES_OK` rather than anything
+resembling a health claim, and the word "output" in it is load-bearing: FFmpeg's ``frame=`` counter
+counts frames **written to the output pipeline**, so with ``-ss`` before ``-i`` the frames decoded
+during accurate-seek pre-roll are exercised but never counted. The counter therefore understates
+decoder work and must never be described as "frames decoded" or "frames verified".
+
+Progress evidence is read from one completed block, never assembled across blocks
+---------------------------------------------------------------------------------
+:func:`parse_progress_output` accumulates keys into the **current** block and only completes that
+block when its ``progress`` marker arrives. Evidence comes from the last completed block alone. An
+earlier design kept one last-seen-value dictionary across the whole stream, which let
+``frame=30 / progress=continue / progress=end`` report ``frames=30`` for a terminal block that
+carried no frame count at all -- and that is the one combination that must stay
+:attr:`SampleStatus.EVIDENCE_UNTRUSTWORTHY`, because the sole positive status may never rest on a
+number no terminal block ever emitted. Counters inherit nothing either: a ``dup_frames=0`` from an
+earlier block is not a measurement of the final one.
 
 Two things this module deliberately does NOT do
 -----------------------------------------------
@@ -53,14 +73,18 @@ semantics; its classifier is not.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
+from stat import S_ISREG
 from typing import Any, Callable, Dict, List, Tuple
 
+from beatsync_fork.input_manager import SUPPORTED_VIDEO_EXTENSIONS
 from beatsync_fork.media_verify import (
     CHANGE_DETECTION_LIMIT_TEXT,
     DEFAULT_PROBE_TIMEOUT_SECONDS,
+    SourceFingerprint,
     WorkBudget,
     fingerprint_source,
 )
@@ -72,9 +96,12 @@ __all__ = [
     "DEFAULT_SAMPLE_DECODE_TIMEOUT_SECONDS",
     "DEFAULT_SAMPLE_FRAMES",
     "MAX_DIAGNOSTIC_CHARS",
+    "MAX_SAMPLE_FRAMES",
     "SAMPLE_ONLY_TEXT",
     "SOURCE_COUNT_CAP",
+    "SUPPORTED_VIDEO_EXTENSIONS",
     "WORKER_CAP",
+    "DecodeExecution",
     "DurationSource",
     "FrameEvidence",
     "SampleChangeWindow",
@@ -103,6 +130,14 @@ __all__ = [
 #: NOT coverage -- on a long-GOP source 30 frames may not even cross a GOP boundary.
 DEFAULT_SAMPLE_FRAMES = 30
 
+#: The HARD ceiling, not merely the default. :func:`run_sample_check` refuses a larger request with
+#: :attr:`SampleStatus.INVALID_REQUEST` and starts no child, because the whole bounded-risk argument
+#: for P1 is a property of this module rather than a promise about its callers: a mistaken or
+#: hostile ``requested_frames`` must not be able to widen the work a diagnostic performs. The pure
+#: orchestrator is the single owner of this bound -- ``build_sample_decode_command`` stays a
+#: serializer and deliberately does not re-decide policy, and no future GUI validator is relied on.
+MAX_SAMPLE_FRAMES = DEFAULT_SAMPLE_FRAMES
+
 #: Wall clock for the one decode child. Sized to stop a *stall* (a dying drive, a disconnected
 #: share), not to race a healthy decode. Unmeasured: no real decode has been timed under this
 #: design, so a file that exceeds it is reported :attr:`SampleStatus.TIMEOUT`, never corrupt.
@@ -124,11 +159,14 @@ WORKER_CAP = 1
 MAX_DIAGNOSTIC_CHARS = 400
 
 #: The sentence that keeps one sampled window from being read as a verdict on the file. Carried
-#: verbatim in every report.
+#: verbatim in exactly one place in every report -- and phrased **hypothetically**, because it is
+#: unconditional: it has to be true of a report whose decode never started. It therefore states what
+#: a successful sample *would* bound, and never that a decode occurred. What did occur is
+#: :class:`DecodeExecution`, reported on its own line.
 SAMPLE_ONLY_TEXT = (
-    "One sampled window of one stream was decoded to a discarded output -- this is not proof of "
-    "whole-file integrity, not proof the render's NVENC extraction would succeed, and not proof of "
-    "full renderability."
+    "Even a successful sample checks only one short window of one stream, decoded to a discarded "
+    "output: it is not proof of whole-file integrity, not proof the render's NVENC extraction "
+    "would succeed, and not proof of full renderability."
 )
 
 
@@ -158,6 +196,44 @@ class SampleStatus(str, Enum):
     EVIDENCE_UNTRUSTWORTHY = "SAMPLE_EVIDENCE_UNTRUSTWORTHY"
     OUTPUT_WITH_DECODER_ERRORS = "SAMPLE_OUTPUT_WITH_DECODER_ERRORS"
     SOURCE_CHANGED = "SAMPLE_SOURCE_CHANGED"
+
+
+class DecodeExecution(str, Enum):
+    """How far the decode actually got. The factual counterpart to the hypothetical coverage text.
+
+    This exists because a report must be able to say *what happened* without a status having to
+    carry that load, and because :attr:`SampleVerdict.decoder_was_launched` must never be inferred
+    from a status label. The distinction that matters most is the middle one: the seam reporting
+    ``error`` (executable missing, OS refusal) or raising means **no FFmpeg child is known to have
+    started**, which is a different fact from one that started and failed. Where child-start
+    evidence cannot be established it is not invented.
+    """
+
+    #: No decode was requested: the check refused or failed before scheduling a child. Covers an
+    #: invalid request, a missing source, unusable metadata, an ambiguous stream, a seek out of
+    #: range, a cross-phase source change and an exhausted scheduling budget.
+    NOT_REQUESTED = "not_requested"
+    #: The decode callable was invoked, but no FFmpeg child is positively known to have started --
+    #: a refused spawn, or an unexpected exception from the seam itself.
+    START_NOT_CONFIRMED = "start_not_confirmed"
+    #: A child demonstrably ran (it returned an exit code, or it was killed by its own timeout) but
+    #: did not deliver the full requested output.
+    RAN_WITHOUT_FULL_OUTPUT = "ran_without_full_output"
+    #: A child ran and the requested output frames were produced.
+    REQUESTED_FRAMES_PRODUCED = "requested_frames_produced"
+
+
+#: Prose for each execution stage. Factual, past tense only where a child provably ran.
+_EXECUTION_TEXT = {
+    DecodeExecution.NOT_REQUESTED:
+        "no decode was requested (the check stopped before any child was scheduled)",
+    DecodeExecution.START_NOT_CONFIRMED:
+        "a decode was requested, but no FFmpeg child was confirmed to have started",
+    DecodeExecution.RAN_WITHOUT_FULL_OUTPUT:
+        "an FFmpeg child ran but did not produce the full requested output",
+    DecodeExecution.REQUESTED_FRAMES_PRODUCED:
+        "an FFmpeg child ran and produced the requested output frames",
+}
 
 
 class SampleChangeWindow(str, Enum):
@@ -373,6 +449,10 @@ def select_renderer_equivalent_stream(payload: Any) -> StreamSelection:
     determined from metadata:
 
     * any video stream lacks a usable absolute index -- it can neither be ranked nor ``-map``ped;
+    * two video streams declare the **same** absolute index -- ``-map 0:<index>`` then names two
+      streams, so whichever we ranked, the pinned target is not the one we described. A resolution
+      tie between streams with *distinct* indices is unaffected: that is resolvable by the
+      documented lowest-index rule, and stays resolvable;
     * two or more video streams and any is flagged ``attached_pic`` -- the documentation states the
       resolution rule and the ``V`` specifier's exclusion of cover art, but does not state how
       automatic selection ranks an attached picture, so equivalence cannot be *established*;
@@ -399,6 +479,13 @@ def select_renderer_equivalent_stream(payload: Any) -> StreamSelection:
                 ambiguous_reason="A video stream has no usable absolute index, so neither the "
                                  "renderer's choice nor an explicit -map target can be determined.")
         indexed.append((index, stream))
+
+    if len({index for index, _ in indexed}) != len(indexed):
+        return StreamSelection(
+            ambiguous_reason=f"{len(indexed)} video streams declare only "
+                             f"{len({i for i, _ in indexed})} distinct absolute index(es), so a "
+                             f"-map target cannot name exactly one of them and renderer "
+                             f"equivalence cannot be established.")
 
     if len(indexed) > 1 and any(_attached_pic(s) for _, s in indexed):
         return StreamSelection(
@@ -461,40 +548,57 @@ def select_renderer_equivalent_stream(payload: Any) -> StreamSelection:
 
 @dataclass(frozen=True)
 class FrameEvidence:
-    """What FFmpeg's ``-progress`` stream actually said. ``None`` always means *unavailable*."""
+    """What FFmpeg's ``-progress`` stream actually said. ``None`` always means *unavailable*.
+
+    Every field describes the **last completed block only**. Nothing is carried across a block
+    boundary, so ``None`` really does mean "the terminal block did not report this".
+    """
 
     saw_end: bool = False
-    """Did the final ``progress`` key carry the documented terminal value ``end``?"""
+    """Did the last completed block's ``progress`` key carry the terminal value ``end``?"""
     frames: int | None = None
-    """Output frames reported, or ``None`` when the key was missing or malformed."""
+    """Output frames reported **by that block**, or ``None`` when it carried no usable ``frame``."""
     dup_frames: int | None = None
     """``None`` is UNKNOWN -- never silently converted to zero, and never read as proof of zero."""
     drop_frames: int | None = None
     malformed_frame: bool = False
-    """A ``frame`` key existed but did not parse as a non-negative integer."""
+    """That block carried a ``frame`` key that did not parse as a non-negative integer."""
     blocks: int = 0
-    """How many progress blocks were seen (a terminal block counts)."""
+    """How many blocks were COMPLETED by a ``progress`` marker. A trailing partial write is not
+    one, so it can neither become the evidence nor inflate this count."""
 
 
 def parse_progress_output(raw: Any) -> FrameEvidence:
     """Parse ``-progress`` key/value output. Pure and total -- never raises, never fabricates.
 
     The documented wire format is ``key=value`` lines where *"the last key of a sequence of progress
-    information is always 'progress' with the value 'continue' or 'end'"*. So blocks repeat, and the
-    **last** value seen for each key is the operative one.
+    information is always 'progress' with the value 'continue' or 'end'"*. That marker is therefore
+    a **block terminator**, and this parser treats it as one: keys accumulate into the current
+    block, the ``progress`` key completes it, and all evidence is then read from the last
+    **completed** block alone.
 
-    Deliberately tolerant of anything that is not a ``key=value`` line: a banner, a muxer byte, a
-    partial trailing write. That tolerance is also what makes the choice of null output target
-    harmless -- stray bytes on the progress channel cannot corrupt the frame evidence, because they
-    are not ``key=value`` and are skipped.
+    Scoping blocks independently is the whole point, not an implementation detail. A single
+    last-seen-value dictionary spanning the stream reports ``frames=30`` for
+    ``frame=30 / progress=continue / progress=end``, whose terminal block carried no frame count --
+    and that would let the sole positive status rest on a number no terminal block emitted. Nothing
+    is inherited across a boundary: a missing terminal ``frame`` stays ``None``, a malformed
+    terminal ``frame`` is never replaced by an earlier valid one, and a ``dup_frames=0`` from an
+    earlier block is not a measurement of the final one. An earlier ``progress=end`` cannot
+    authorize success either -- a later completed block supersedes it.
+
+    A trailing partial write completes no block, so it contributes nothing; the last completed
+    block remains the evidence. Deliberately tolerant of anything that is not a ``key=value`` line:
+    a banner, a muxer byte, a half-written line. That tolerance is also what makes the null output
+    target harmless -- stray bytes cannot corrupt the frame evidence, because they are not
+    ``key=value`` and are skipped.
 
     Accepts ``str``, ``bytes``, ``None`` and invalid UTF-8 (see :func:`coerce_stream_text`), and
     handles CRLF and LF alike via :meth:`str.splitlines`.
     """
     text = coerce_stream_text(raw)
-    last: Dict[str, str] = {}
+    block: Dict[str, str] = {}
+    final: Dict[str, str] = {}
     blocks = 0
-    saw_frame_key = False
     for line in text.splitlines():
         if "=" not in line:
             continue
@@ -502,19 +606,19 @@ def parse_progress_output(raw: Any) -> FrameEvidence:
         key = key.strip()
         if not key:
             continue
-        value = value.strip()
-        last[key] = value
-        if key == "frame":
-            saw_frame_key = True
-        elif key == "progress":
+        block[key] = value.strip()
+        if key == "progress":
             blocks += 1
+            final = block
+            block = {}
 
-    frames = _non_negative_int(last.get("frame")) if saw_frame_key else None
+    saw_frame_key = "frame" in final
+    frames = _non_negative_int(final.get("frame")) if saw_frame_key else None
     return FrameEvidence(
-        saw_end=last.get("progress") == "end",
+        saw_end=final.get("progress") == "end",
         frames=frames,
-        dup_frames=_non_negative_int(last.get("dup_frames")),
-        drop_frames=_non_negative_int(last.get("drop_frames")),
+        dup_frames=_non_negative_int(final.get("dup_frames")),
+        drop_frames=_non_negative_int(final.get("drop_frames")),
         malformed_frame=saw_frame_key and frames is None,
         blocks=blocks,
     )
@@ -564,6 +668,15 @@ class SampleVerdict:
     drop_frames: int | None = None
     returncode: int | None = None
     elapsed_seconds: float = 0.0
+    """The WHOLE check, on every path: validation, FFprobe, the stat observations and any decode.
+    Set identically whether the check returned early or ran a child, so the number means one thing.
+    """
+    decode_seconds: float | None = None
+    """Just the decode call, or ``None`` when no decode was requested. Kept separate from
+    :attr:`elapsed_seconds` because one field that silently switches between "the whole check" and
+    "the decode only" cannot be read correctly by anyone."""
+    execution: DecodeExecution = DecodeExecution.NOT_REQUESTED
+    """What actually happened to the child. The only basis for :attr:`decoder_was_launched`."""
     stream_index: int | None = None
     codec: str = ""
     width: int = 0
@@ -572,6 +685,11 @@ class SampleVerdict:
     duration: float = 0.0
     duration_source: DurationSource = DurationSource.NONE
     equivalence: StreamEquivalence = StreamEquivalence.UNKNOWN
+    attached_pic: bool = False
+    """The selected stream is flagged as cover art / a thumbnail. Reachable only when it is the one
+    video stream in the container (two or more with an attached picture fails closed as ambiguous),
+    and surfaced in the report because a one-frame cover art will legitimately underfill the
+    request -- an underfill that says nothing about damage."""
     change_window: SampleChangeWindow = SampleChangeWindow.NONE
     stability: Stability = Stability.UNVERIFIED
     diagnostic: str = ""
@@ -587,9 +705,17 @@ class SampleVerdict:
 
     @property
     def decoder_was_launched(self) -> bool:
-        """Did a decode child actually run? ``returncode``/``timed_out`` are only set when it did."""
-        return self.returncode is not None or self.status in (
-            SampleStatus.TIMEOUT, SampleStatus.NOT_RUN)
+        """Is an FFmpeg child **positively known** to have started?
+
+        Read from :attr:`execution`, never inferred from a status. The two false readings this
+        replaces both came from treating :attr:`SampleStatus.NOT_RUN` as a launch: that status means
+        the seam reported ``error`` -- a missing executable or an OS refusal -- so no child existed,
+        and on the pre-decode path it means *FFprobe* could not start, before a decode was even
+        requested. A refused spawn is :attr:`DecodeExecution.START_NOT_CONFIRMED`, which is not a
+        launch; a timeout is, because the child had to start in order to be killed by one.
+        """
+        return self.execution in (DecodeExecution.RAN_WITHOUT_FULL_OUTPUT,
+                                  DecodeExecution.REQUESTED_FRAMES_PRODUCED)
 
 
 # ---------------------------------------------------------------------------
@@ -687,13 +813,124 @@ def classify_decode(outcome: SampleDecodeOutcome, evidence: FrameEvidence, reque
             f"-v error loglevel: {_bounded(outcome.stderr)}")
 
     return SampleStatus.OUTPUT_FRAMES_OK, (
-        f"{requested_frames} output frames were produced at the requested position. "
-        f"{SAMPLE_ONLY_TEXT}")
+        f"{requested_frames} output frames were produced at the requested position.")
 
 
 # ---------------------------------------------------------------------------
 # the bounded check
 # ---------------------------------------------------------------------------
+
+#: Exception classes that mean "the environment refused", as opposed to a defect in our own code.
+#: Both are contained -- the difference is only what the operator is told, because "the probe could
+#: not start" and "the probe hit an internal error" lead to different next actions.
+_ENVIRONMENTAL = (OSError, ValueError)
+
+
+def _seam_detail(what: str, exc: BaseException) -> str:
+    """One bounded sentence describing a contained seam failure, honest about which kind it was."""
+    kind = ("could not be run" if isinstance(exc, _ENVIRONMENTAL)
+            else "hit an unexpected internal error")
+    return f"The {what} {kind}: {_bounded(f'{type(exc).__name__}: {exc}')}"
+
+
+def _exit_code(raw: Any) -> int | None:
+    """An exit code as an ``int``, or ``None`` for missing/malformed. **Never fabricates a zero.**
+
+    ``int(x) or 0`` was the original coercion and it had two failure modes that both end in a false
+    clean result: it raises on an unparseable value, and it turns ``None`` into ``0`` -- a success
+    code invented out of an absent one.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(coerce_stream_text(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_outcome(result: Any) -> SampleDecodeOutcome:
+    """Normalize whatever the decode seam returned into a real record. Total, never raises.
+
+    The seam always returns a :class:`SampleDecodeOutcome`; an injected or future one might not, and
+    a duck-typed object missing ``.error`` or ``.timed_out`` would otherwise raise ``AttributeError``
+    out of a function that promises a verdict. A malformed return is a *tooling* failure, so it
+    becomes a seam error -- never a returncode of zero.
+    """
+    if isinstance(result, SampleDecodeOutcome):
+        return result
+    missing = [name for name in ("returncode", "stdout", "stderr", "timed_out", "error")
+               if not hasattr(result, name)]
+    if missing:
+        return SampleDecodeOutcome(
+            error=f"the decode seam returned {type(result).__name__}, which is missing "
+                  f"{', '.join(missing)}")
+    try:
+        return SampleDecodeOutcome(
+            returncode=result.returncode, stdout=result.stdout, stderr=result.stderr,
+            timed_out=bool(result.timed_out), error=coerce_stream_text(result.error))
+    except Exception as exc:  # noqa: BLE001 - a malformed record is reported, never raised
+        return SampleDecodeOutcome(
+            error=f"the decode seam returned an unreadable record: {type(exc).__name__}: {exc}")
+
+
+def _observe(path: Any, stat) -> SourceFingerprint | None:
+    """One stability observation, made total. ``None`` means "could not be taken" -- fails closed.
+
+    :func:`~beatsync_fork.media_verify.fingerprint_source` is used unchanged; this only widens the
+    containment around it, because an *injected* ``stat`` may raise anything at all and S2-A's
+    narrower ``(OSError, ValueError)`` contract is not ours to alter.
+    """
+    try:
+        return fingerprint_source(path, **({} if stat is None else {"stat": stat}))
+    except Exception:  # noqa: BLE001 - an unobservable source is a verdict, never a raise
+        return None
+
+
+def _observe_with_mode(path: Any, stat) -> Tuple[SourceFingerprint | None, int | None]:
+    """The baseline observation: ONE stat call yielding both the fingerprint and the file mode.
+
+    One call rather than ``fingerprint_source`` plus a separate mode read, because the stability
+    bracket is exactly three observations and a fourth ``stat`` would widen it. The two-line
+    fingerprint construction mirrors :func:`~beatsync_fork.media_verify.fingerprint_source` instead
+    of changing it -- S2-A's contract is untouched, and observations two and three still go through
+    it. ``os.stat`` is the only ``os`` use in this module: the mode is not reachable otherwise.
+    """
+    try:
+        info = (stat or os.stat)(path)
+        return (SourceFingerprint(size=int(info.st_size), mtime_ns=int(info.st_mtime_ns)),
+                _non_negative_int(getattr(info, "st_mode", None)))
+    except Exception:  # noqa: BLE001 - same reason as _observe
+        return None, None
+
+
+def _bad_request(path: Any, requested_frames: Any) -> str:
+    """Pure request validation, before any ``stat``, probe or child. ``""`` means acceptable.
+
+    The extension list is :data:`~beatsync_fork.input_manager.SUPPORTED_VIDEO_EXTENSIONS`, imported
+    rather than restated so a third copy of ".mp4/.mkv" cannot drift. Comparison is
+    case-insensitive, so ``.MP4`` and ``.MKV`` are accepted.
+    """
+    frames = _non_negative_int(requested_frames)
+    if frames is None or frames < 1:
+        return f"A sample needs at least one requested frame, not {requested_frames!r}."
+    if frames > MAX_SAMPLE_FRAMES:
+        return (f"A sample is capped at {MAX_SAMPLE_FRAMES} output frames and {frames} were "
+                f"requested. The cap is the bound, not a default to be raised by a caller.")
+    if not isinstance(path, str):
+        return f"The source path must be a string, not {type(path).__name__}."
+    if not path.strip():
+        return "The source path is empty."
+    name = path.replace("\\", "/").rpartition("/")[2]
+    base, dot, ext = name.rpartition(".")
+    suffix = f".{ext}".lower() if (dot and base) else ""
+    if suffix not in SUPPORTED_VIDEO_EXTENSIONS:
+        return (f"{name!r} is not a supported video source "
+                f"({', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))} only), so there is no video "
+                f"stream to sample.")
+    return ""
+
 
 def _window(cross_phase: bool, during_decode: bool) -> SampleChangeWindow:
     if cross_phase and during_decode:
@@ -724,35 +961,59 @@ def run_sample_check(path: str, seek_seconds: Any, *,
     gate -- if the file moved in that window, the metadata that chose the ``-map`` target and the
     duration describes bytes that are gone, so the decoder is never launched. Matching size and
     mtime_ns is not byte-integrity proof; :data:`CHANGE_DETECTION_LIMIT_TEXT` states that bound.
+
+    What "total" means here, precisely
+    ----------------------------------
+    Every *ordinary* failure becomes a verdict: an injected ``probe`` or ``stat`` that raises, a
+    probe whose exit code is malformed or absent, a ``decode`` that raises, and a ``decode`` that
+    returns a record this module cannot read. Each is contained with ``except Exception`` --
+    never ``BaseException``, so ``KeyboardInterrupt`` and ``SystemExit`` still propagate and a
+    cancelled operation is not silently reported as a file problem. Containment is not silence: the
+    detail says whether the environment refused (``OSError``/``ValueError``) or the seam hit an
+    unexpected internal error, because those lead the operator somewhere different.
+
+    The request itself is bounded before anything is touched. ``requested_frames`` must land in
+    ``1..``:data:`MAX_SAMPLE_FRAMES`; the path must be a non-empty ``str`` with a
+    :data:`~beatsync_fork.input_manager.SUPPORTED_VIDEO_EXTENSIONS` suffix (case-insensitively) and
+    must resolve to a **regular file**. Each failure is :attr:`SampleStatus.INVALID_REQUEST` with no
+    child started -- a diagnostic that would sample a directory, a device or a ``.txt`` is not
+    bounded by its caller's good manners.
     """
     clock = clock or time.perf_counter
-    stat_kwargs = {} if stat is None else {"stat": stat}
     started = clock()
     budget = WorkBudget(budget_seconds, started=started)
 
     def verdict(status: SampleStatus, detail: str, **extra: Any) -> SampleVerdict:
         extra.setdefault("stability", Stability.UNVERIFIED)
         return SampleVerdict(
-            path=path, status=status, detail=detail,
+            path=path if isinstance(path, str) else repr(path),
+            status=status, detail=detail,
             requested_seek=_finite(seek_seconds),
             requested_frames=(_non_negative_int(requested_frames) or 0),
             elapsed_seconds=float(clock() - started), **extra)
 
+    bad = _bad_request(path, requested_frames)
+    if bad:
+        return verdict(SampleStatus.INVALID_REQUEST, bad)
     frames = _non_negative_int(requested_frames)
-    if frames is None or frames < 1:
-        return verdict(SampleStatus.INVALID_REQUEST,
-                       f"A sample needs at least one requested frame, not {requested_frames!r}.")
     if not _is_finite(seek_seconds) or _finite(seek_seconds) < 0:
         return verdict(SampleStatus.INVALID_REQUEST,
                        f"The seek position must be a finite, non-negative number of seconds, not "
                        f"{seek_seconds!r}.")
 
-    baseline = fingerprint_source(path, **stat_kwargs)
+    baseline, mode = _observe_with_mode(path, stat)
     if baseline is None:
         return verdict(SampleStatus.SOURCE_MISSING,
                        "The source could not be observed at all (missing, locked or denied).")
+    if mode is None or not S_ISREG(mode):
+        return verdict(SampleStatus.INVALID_REQUEST,
+                       "The source path exists but is not a regular file (a directory, a device or "
+                       "another special object), so there is nothing to sample.")
 
-    outcome = probe(path)
+    try:
+        outcome = probe(path)
+    except Exception as exc:  # noqa: BLE001 - BaseException deliberately NOT caught; see below
+        return verdict(SampleStatus.NOT_RUN, _seam_detail("metadata probe", exc))
     if getattr(outcome, "error", ""):
         return verdict(SampleStatus.NOT_RUN,
                        f"The metadata probe could not be run: "
@@ -761,9 +1022,11 @@ def run_sample_check(path: str, seek_seconds: Any, *,
         return verdict(SampleStatus.METADATA_UNUSABLE,
                        "FFprobe exceeded its timeout, so the metadata needed to choose a stream is "
                        "UNAVAILABLE. The file is unverified, not corrupt.")
-    if int(getattr(outcome, "returncode", 0) or 0) != 0:
+    probe_exit = _exit_code(getattr(outcome, "returncode", 0))
+    if probe_exit != 0:
         return verdict(SampleStatus.METADATA_UNUSABLE,
-                       f"FFprobe exit {outcome.returncode}: "
+                       f"FFprobe exit "
+                       f"{probe_exit if probe_exit is not None else '(malformed/absent)'}: "
                        f"{_bounded(getattr(outcome, 'stderr', '')) or 'no error output'}")
 
     try:
@@ -787,7 +1050,7 @@ def run_sample_check(path: str, seek_seconds: Any, *,
         "stream_index": chosen.index, "codec": chosen.codec,
         "width": chosen.width, "height": chosen.height, "fps": chosen.fps,
         "duration": chosen.duration, "duration_source": chosen.duration_source,
-        "equivalence": chosen.equivalence,
+        "equivalence": chosen.equivalence, "attached_pic": chosen.attached_pic,
     }
 
     seek = _finite(seek_seconds)
@@ -797,7 +1060,7 @@ def run_sample_check(path: str, seek_seconds: Any, *,
                        f"reported duration {chosen.duration:.3f}s "
                        f"({chosen.duration_source.value}).", **stream_fields)
 
-    pre = fingerprint_source(path, **stat_kwargs)
+    pre = _observe(path, stat)
     if pre is None:
         return verdict(SampleStatus.SOURCE_MISSING,
                        "The source stopped being observable before the decode could start.",
@@ -821,19 +1084,28 @@ def run_sample_check(path: str, seek_seconds: Any, *,
 
     decode_started = clock()
     try:
-        result = decode(path, seek_seconds=seek, stream_index=chosen.index,
-                        requested_frames=frames, timeout=decode_timeout)
+        raw_result = decode(path, seek_seconds=seek, stream_index=chosen.index,
+                            requested_frames=frames, timeout=decode_timeout)
     except Exception as exc:  # noqa: BLE001 - a seam crash is a reported outcome, never a raise
-        result = SampleDecodeOutcome(error=f"{type(exc).__name__}: {exc}")
+        raw_result = SampleDecodeOutcome(error=_seam_detail("decode", exc))
     decode_seconds = float(clock() - decode_started)
+
+    result = _as_outcome(raw_result)
+    exit_code = _exit_code(result.returncode)
+    if not result.timed_out and not result.error and exit_code is None:
+        # A malformed exit code is a tooling failure, not a file verdict -- and specifically not a
+        # zero. Converting it to a seam error keeps it out of every success tier.
+        result = SampleDecodeOutcome(
+            stdout=result.stdout, stderr=result.stderr,
+            error=f"the decode seam reported a malformed exit code {result.returncode!r}")
 
     # Observation three, on EVERY terminal path above -- success, non-zero exit, timeout, spawn
     # error and an unexpected seam exception alike.
-    post = fingerprint_source(path, **stat_kwargs)
+    post = _observe(path, stat)
     during_decode = post is not None and post != pre
     post_stat_ok = post is not None
 
-    evidence = parse_progress_output(getattr(result, "stdout", ""))
+    evidence = parse_progress_output(result.stdout)
     window = _window(False, during_decode)
     status, detail = classify_decode(result, evidence, frames,
                                      change_window=window, post_stat_ok=post_stat_ok)
@@ -844,15 +1116,25 @@ def run_sample_check(path: str, seek_seconds: Any, *,
     else:
         stability = Stability.STABLE
 
+    # A refused spawn and an unexpected seam exception both leave child-start UNCONFIRMED; a
+    # timeout confirms one started, because it had to in order to be killed by its own clock.
+    if result.error:
+        execution = DecodeExecution.START_NOT_CONFIRMED
+    elif status is SampleStatus.OUTPUT_FRAMES_OK:
+        execution = DecodeExecution.REQUESTED_FRAMES_PRODUCED
+    else:
+        execution = DecodeExecution.RAN_WITHOUT_FULL_OUTPUT
+
     return SampleVerdict(
         path=path, status=status, detail=detail,
         requested_seek=seek, requested_frames=frames,
         observed_frames=evidence.frames,
         dup_frames=evidence.dup_frames, drop_frames=evidence.drop_frames,
-        returncode=(None if (result.timed_out or result.error) else int(result.returncode)),
-        elapsed_seconds=decode_seconds,
+        returncode=(None if (result.timed_out or result.error) else _exit_code(result.returncode)),
+        elapsed_seconds=float(clock() - started), decode_seconds=decode_seconds,
+        execution=execution,
         change_window=window, stability=stability,
-        diagnostic=_bounded(getattr(result, "stderr", "")),
+        diagnostic=_bounded(result.stderr),
         **stream_fields)
 
 
@@ -864,40 +1146,60 @@ def format_sample_report(verdict: SampleVerdict) -> str:
     """One operator-facing report for one sample check.
 
     The full source path is never shortened -- this runs locally for the one person who owns the
-    files, and a truncated path is useless for finding the file again. Every report carries
-    :data:`SAMPLE_ONLY_TEXT` and :data:`CHANGE_DETECTION_LIMIT_TEXT`, and no line ever upgrades a
-    sampled window into a statement about the whole file.
+    files, and a truncated path is useless for finding the file again.
+
+    Two honesty rules govern the wording. First, **what happened is stated, not implied**: the
+    ``Decode:`` line carries :class:`DecodeExecution` verbatim, so a report whose child never
+    started says so in its own words rather than leaving the reader to infer it from a status code.
+    Second, **the unconditional coverage sentence is hypothetical**. It appears exactly once, it is
+    phrased "even a successful sample...", and it is therefore true on a report where nothing was
+    decoded -- which the previous past-tense phrasing was not. No line upgrades a sampled window
+    into a statement about the whole file, and no line claims a measurement that was not taken:
+    geometry, frame rate and duration all read "unknown"/"not established" when no stream was ever
+    selected, rather than ``0x0`` and ``0.000``.
     """
     frames = "not established" if verdict.observed_frames is None else str(verdict.observed_frames)
     dup = "unknown" if verdict.dup_frames is None else str(verdict.dup_frames)
     drop = "unknown" if verdict.drop_frames is None else str(verdict.drop_frames)
-    stream = "not selected" if verdict.stream_index is None else str(verdict.stream_index)
+    selected = verdict.stream_index is not None
+    stream = str(verdict.stream_index) if selected else "not selected"
     equivalence = verdict.equivalence.value or "unknown"
-    duration_source = verdict.duration_source.value or "unavailable"
+    geometry = (f"{verdict.codec or 'unknown'} / {verdict.width}x{verdict.height} / "
+                f"{verdict.fps:.3f}" if selected else "unknown / unknown / unknown")
+    duration = (f"{verdict.duration:.3f}s (from {verdict.duration_source.value or 'unavailable'})"
+                if selected and verdict.duration > 0 else "not established")
+    decode_time = ("not reached" if verdict.decode_seconds is None
+                   else f"{verdict.decode_seconds:.2f}s")
 
     lines = [
         "Sample decode check",
         f"  Source:                      {verdict.path}",
         f"  Result:                      {verdict.status.value}",
         f"  Detail:                      {verdict.detail}",
+        f"  Decode:                      {_EXECUTION_TEXT[verdict.execution]}",
         f"  Tested stream index:         {stream}",
         f"  Renderer equivalence:        {equivalence}",
-        f"  Stream codec / size / fps:   {verdict.codec or 'unknown'} / "
-        f"{verdict.width}x{verdict.height} / {verdict.fps:.3f}",
-        f"  Reported duration:           {verdict.duration:.3f}s (from {duration_source})",
+        f"  Stream codec / size / fps:   {geometry}",
+        f"  Reported duration:           {duration}",
         f"  Requested seek:              {verdict.requested_seek:.3f}s",
         f"  Requested output frames:     {verdict.requested_frames}",
         f"  Observed output frames:      {frames}",
         f"  Duplicated / dropped:        {dup} / {drop}",
         f"  FFmpeg exit code:            "
         f"{'not reached' if verdict.returncode is None else verdict.returncode}",
-        f"  Elapsed:                     {verdict.elapsed_seconds:.2f}s",
+        f"  Elapsed (whole check):       {verdict.elapsed_seconds:.2f}s",
+        f"  Decode call:                 {decode_time}",
         f"  Source stability:            {verdict.stability.value}"
         + (f" ({verdict.change_window.value})" if verdict.changed else ""),
     ]
     if verdict.diagnostic:
         lines.append(f"  FFmpeg output:               {verdict.diagnostic}")
     lines.append("")
+    if verdict.attached_pic:
+        lines.append("  The selected video stream is flagged as an attached picture (cover art or "
+                     "a thumbnail), not an ordinary moving-picture stream. A one-frame attached "
+                     "picture will legitimately underfill the request, so a short result here is "
+                     "expected and says nothing about damage.")
     lines.append(f"  {SAMPLE_ONLY_TEXT}")
     lines.append(f"  {CHANGE_DETECTION_LIMIT_TEXT}")
     if verdict.observed_frames is not None and verdict.dup_frames is None:

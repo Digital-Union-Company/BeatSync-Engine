@@ -27,22 +27,27 @@ import ast
 import json
 import math
 import os
+import stat as stat_module
 
 import pytest
 
+from beatsync_fork.input_manager import SUPPORTED_VIDEO_EXTENSIONS
 from beatsync_fork.media_verify import DEFAULT_PROBE_TIMEOUT_SECONDS, ProbeOutcome, WorkBudget
 from beatsync_fork.media_sample import (
     DEFAULT_SAMPLE_BUDGET_SECONDS,
     DEFAULT_SAMPLE_DECODE_TIMEOUT_SECONDS,
     DEFAULT_SAMPLE_FRAMES,
+    MAX_SAMPLE_FRAMES,
     SAMPLE_ONLY_TEXT,
     SOURCE_COUNT_CAP,
     WORKER_CAP,
+    DecodeExecution,
     DurationSource,
     FrameEvidence,
     SampleChangeWindow,
     SampleDecodeOutcome,
     SampleStatus,
+    SampleVerdict,
     Stability,
     StreamEquivalence,
     classify_decode,
@@ -153,9 +158,17 @@ def _decoded(stdout=None, stderr="", returncode=0, **kw):
 
 
 class _St:
-    def __init__(self, size, mtime_ns):
+    """A synthetic ``os.stat_result``: the stability pair plus the mode the core now inspects.
+
+    ``st_mode`` defaults to a regular file because that is what every source in this suite is
+    meant to be; the non-regular cases pass a directory or device mode explicitly, which is the
+    only way to exercise the ``S_ISREG`` gate without creating a device node.
+    """
+
+    def __init__(self, size, mtime_ns, mode=stat_module.S_IFREG | 0o644):
         self.st_size = size
         self.st_mtime_ns = mtime_ns
+        self.st_mode = mode
 
 
 def _stat_seq(*results):
@@ -230,11 +243,34 @@ def test_the_taxonomy_is_exactly_fifteen_statuses_with_one_positive():
     assert all(s.value.startswith("SAMPLE_") for s in SampleStatus)
 
 
-@pytest.mark.parametrize("frames", [0, -1, None, "", "abc", 2.5, True])
+@pytest.mark.parametrize("frames", [0, -1, None, "", "abc", 2.5, True,
+                                    float("nan"), float("inf")])
 def test_a_request_for_a_nonsense_frame_count_is_invalid(frames):
     verdict, launched = _check(requested_frames=frames)
     assert verdict.status is SampleStatus.INVALID_REQUEST
     assert launched == [], "no child may be started for an invalid request"
+
+
+@pytest.mark.parametrize("frames", [MAX_SAMPLE_FRAMES + 1, 31, 1000, 10 ** 20, 2 ** 63])
+def test_a_request_above_the_frame_cap_never_reaches_the_decoder(frames):
+    """The cap is the bound, not a default. The pure core owns it, not a future GUI validator."""
+    verdict, launched = _check(requested_frames=frames)
+    assert verdict.status is SampleStatus.INVALID_REQUEST
+    assert launched == [], "an oversized request must not widen the work a diagnostic performs"
+    assert str(MAX_SAMPLE_FRAMES) in verdict.detail
+    assert verdict.execution is DecodeExecution.NOT_REQUESTED
+
+
+@pytest.mark.parametrize("frames", [1, 2, 29, MAX_SAMPLE_FRAMES])
+def test_every_frame_count_inside_the_cap_is_accepted(frames):
+    verdict, launched = _check(requested_frames=frames,
+                               outcome=_decoded(stdout=_progress(frames=frames, blocks=1)))
+    assert verdict.status is SampleStatus.OUTPUT_FRAMES_OK
+    assert launched[0]["requested_frames"] == frames
+
+
+def test_the_cap_equals_the_approved_policy_and_is_not_merely_the_default():
+    assert MAX_SAMPLE_FRAMES == DEFAULT_SAMPLE_FRAMES == 30
 
 
 @pytest.mark.parametrize("seek", [-1.0, -0.001, float("nan"), float("inf"), "abc", None])
@@ -370,7 +406,10 @@ def test_a_full_clean_sample_is_the_only_positive_status():
     assert verdict.observed_frames == DEFAULT_SAMPLE_FRAMES
     assert verdict.stability is Stability.STABLE
     assert verdict.change_window is SampleChangeWindow.NONE
-    assert SAMPLE_ONLY_TEXT in verdict.detail
+    assert SAMPLE_ONLY_TEXT not in verdict.detail, \
+        "the coverage sentence belongs to the report footer once, not also to the detail"
+    assert verdict.execution is DecodeExecution.REQUESTED_FRAMES_PRODUCED
+    assert verdict.decoder_was_launched is True
     assert launched[0]["requested_frames"] == DEFAULT_SAMPLE_FRAMES
     assert launched[0]["stream_index"] == 0
 
@@ -632,13 +671,67 @@ def test_no_classifier_divides_by_a_frame_rate():
 # the progress parser
 # ---------------------------------------------------------------------------
 
-def test_multiple_progress_blocks_resolve_to_the_last_values():
+def test_multiple_progress_blocks_resolve_to_the_last_COMPLETED_block():
     evidence = parse_progress_output(
         "frame=10\nprogress=continue\nframe=20\nprogress=continue\n"
         "frame=30\ndup_frames=0\ndrop_frames=0\nprogress=end\n")
     assert evidence.frames == 30
     assert evidence.saw_end is True
     assert evidence.blocks == 3
+
+
+def test_a_terminal_block_without_a_frame_key_inherits_nothing_and_cannot_succeed():
+    """The regression that makes the sole positive status unreachable on unverified evidence.
+
+    ``frame=30`` belongs to a block that said ``progress=continue``. The terminal block carried no
+    count at all, so there is no output-frame evidence — and a clean verdict assembled from an
+    earlier block's number would be a verdict about a measurement nobody made.
+    """
+    evidence = parse_progress_output("frame=30\nprogress=continue\nprogress=end\n")
+    assert evidence.frames is None, "an earlier block's count is not the terminal block's"
+    assert evidence.saw_end is True
+    assert evidence.malformed_frame is False, "no frame key was in that block, so nothing malformed"
+    status, detail = classify_decode(_decoded(stdout="irrelevant", stderr=""), evidence,
+                                     DEFAULT_SAMPLE_FRAMES)
+    assert status is SampleStatus.EVIDENCE_UNTRUSTWORTHY
+    assert "no frame count" in detail
+
+
+def test_terminal_block_counters_are_independent_of_earlier_blocks():
+    """``dup_frames=0`` seen earlier is not a measurement of the final block."""
+    evidence = parse_progress_output(
+        "frame=29\ndup_frames=0\ndrop_frames=0\nprogress=continue\n"
+        "frame=30\nprogress=end\n")
+    assert evidence.frames == 30
+    assert evidence.dup_frames is None and evidence.drop_frames is None
+    report = format_sample_report(SampleVerdict(
+        path="J:/a.mp4", status=SampleStatus.OUTPUT_FRAMES_OK, observed_frames=30,
+        dup_frames=evidence.dup_frames, execution=DecodeExecution.REQUESTED_FRAMES_PRODUCED))
+    assert "UNKNOWN is not a measurement of zero" in report
+
+
+def test_a_malformed_terminal_count_is_not_replaced_by_an_earlier_valid_one():
+    evidence = parse_progress_output("frame=30\nprogress=continue\nframe=abc\nprogress=end\n")
+    assert evidence.frames is None and evidence.malformed_frame is True
+    status, _ = classify_decode(_decoded(stdout="x"), evidence, DEFAULT_SAMPLE_FRAMES)
+    assert status is SampleStatus.EVIDENCE_UNTRUSTWORTHY
+
+
+def test_an_earlier_terminal_marker_cannot_authorize_a_later_contradiction():
+    evidence = parse_progress_output(
+        "frame=30\ndup_frames=0\ndrop_frames=0\nprogress=end\n"
+        "frame=0\ndup_frames=0\ndrop_frames=0\nprogress=end\n")
+    assert evidence.frames == 0, "the last completed block wins, even over an earlier end"
+    status, _ = classify_decode(_decoded(stdout="x", stderr=""), evidence, DEFAULT_SAMPLE_FRAMES)
+    assert status is SampleStatus.ZERO_FRAMES
+
+
+def test_a_lower_final_count_is_not_raised_by_an_earlier_higher_one():
+    evidence = parse_progress_output(
+        "frame=30\nprogress=continue\nframe=7\ndup_frames=0\ndrop_frames=0\nprogress=end\n")
+    assert evidence.frames == 7
+    status, _ = classify_decode(_decoded(stdout="x", stderr=""), evidence, DEFAULT_SAMPLE_FRAMES)
+    assert status is SampleStatus.UNDERFILLED_UNVERIFIED
 
 
 def test_crlf_and_lf_are_both_understood():
@@ -676,10 +769,17 @@ def test_invalid_bytes_fused_into_a_key_yield_no_frame_evidence():
     assert status is SampleStatus.EVIDENCE_UNTRUSTWORTHY
 
 
-def test_partial_trailing_output_is_not_a_terminal_block():
+def test_partial_trailing_output_completes_no_block_and_contributes_nothing():
+    """A half-written block is not evidence, and must not displace the block that completed.
+
+    This previously asserted ``frames == 2`` — reading a count out of a block whose ``progress``
+    marker never arrived. The trailing write is discarded instead, so the last COMPLETED block
+    remains the evidence.
+    """
     evidence = parse_progress_output("frame=10\nprogress=continue\nframe=2")
-    assert evidence.frames == 2
+    assert evidence.frames == 10, "the completed block's count, not the partial one's"
     assert evidence.saw_end is False
+    assert evidence.blocks == 1, "a partial write completes no block"
 
 
 def test_junk_lines_on_the_progress_channel_cannot_corrupt_the_evidence():
@@ -1021,13 +1121,360 @@ def test_the_pure_core_reaches_no_cache_no_model_and_no_runtime():
             roots.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             roots.add(node.module.split(".")[0])
-    assert roots <= {"__future__", "json", "time", "dataclasses", "enum", "typing",
+    assert roots <= {"__future__", "json", "os", "stat", "time", "dataclasses", "enum", "typing",
                      "beatsync_fork"}, roots
 
     used = _referenced(tree)
     for banned in ("CACHE_CONTRACT_VERSION", "ANALYSIS_VERSION", "qwen", "llama",
                    "stage5", "subprocess", "open", "os.remove", "shutil"):
         assert banned not in used, banned
+
+
+def test_the_only_os_call_in_the_pure_core_is_the_default_stat():
+    """``os`` is imported for exactly one reason: ``st_mode`` is unreachable without a stat call.
+
+    The module performs no other filesystem operation, and this pins that — an ``os.`` attribute
+    creeping in later is how a read-only diagnostic quietly acquires the ability to write.
+    """
+    tree = _tree(_MEDIA_SAMPLE)
+    os_calls = {ast.unparse(node) for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "os"}
+    assert os_calls == {"os.stat"}, os_calls
+
+
+# ---------------------------------------------------------------------------
+# totality: an ordinary failure anywhere becomes a verdict, never an escape
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("exc", [OSError("refused"), ValueError("bad"), RuntimeError("boom"),
+                                 AttributeError("attr"), KeyError("k"), TypeError("type"),
+                                 Exception("plain")])
+def test_a_probe_that_raises_becomes_a_no_opinion_verdict(exc):
+    """``decode`` was contained and ``probe`` was not. An injected callable may raise anything."""
+    verdict, launched = _check(probe=lambda _p: (_ for _ in ()).throw(exc))
+    assert verdict.status is SampleStatus.NOT_RUN, "tooling failed; we hold no opinion on the file"
+    assert type(exc).__name__ in verdict.detail
+    assert launched == []
+    assert verdict.execution is DecodeExecution.NOT_REQUESTED
+    assert verdict.decoder_was_launched is False
+
+
+def test_the_probe_detail_distinguishes_a_refusal_from_an_internal_error():
+    refused, _ = _check(probe=lambda _p: (_ for _ in ()).throw(OSError("ffprobe denied")))
+    internal, _ = _check(probe=lambda _p: (_ for _ in ()).throw(RuntimeError("logic slip")))
+    assert "could not be run" in refused.detail
+    assert "unexpected internal error" in internal.detail
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("stat exploded"), AttributeError("mode"),
+                                 MemoryError()])
+def test_an_unexpected_source_observation_failure_fails_closed(exc):
+    verdict, launched = _check(stat=_stat_seq(exc))
+    assert verdict.status is SampleStatus.SOURCE_MISSING
+    assert launched == []
+
+
+def test_an_unexpected_post_decode_observation_failure_never_grants_a_clean_result():
+    verdict, launched = _check(stat=_stat_seq(_St(10, 7), _St(10, 7), RuntimeError("vanished")))
+    assert verdict.status is SampleStatus.EVIDENCE_UNTRUSTWORTHY
+    assert verdict.stability is Stability.UNVERIFIED
+    assert len(launched) == 1
+
+
+def test_a_timeout_survives_an_unverifiable_post_decode_observation():
+    """D: real timeout and FFmpeg-failure evidence outranks the stability gate."""
+    timeout, _ = _check(stat=_stat_seq(_St(10, 7), _St(10, 7), OSError("locked")),
+                        outcome=SampleDecodeOutcome(timed_out=True))
+    assert timeout.status is SampleStatus.TIMEOUT
+    assert timeout.stability is Stability.UNVERIFIED
+    failed, _ = _check(stat=_stat_seq(_St(10, 7), _St(10, 7), OSError("locked")),
+                       outcome=_decoded(returncode=1, stderr="boom"))
+    assert failed.status is SampleStatus.FFMPEG_FAILED
+
+
+@pytest.mark.parametrize("returncode", ["x", "", None, object(), 1.5])
+def test_a_malformed_probe_exit_code_is_never_read_as_success(returncode):
+    class _Outcome:
+        error = ""
+        timed_out = False
+        stdout = ""
+        stderr = "nothing useful"
+
+    _Outcome.returncode = returncode
+    verdict, launched = _check(probe=lambda _p: _Outcome())
+    assert verdict.status is SampleStatus.METADATA_UNUSABLE
+    assert launched == []
+
+
+@pytest.mark.parametrize("returncode", ["x", object(), None, 1.5])
+def test_a_malformed_decode_exit_code_becomes_a_seam_failure_not_a_zero(returncode):
+    verdict, _ = _check(outcome=SampleDecodeOutcome(
+        returncode=returncode, stdout=_progress(), stderr=""))
+    assert verdict.status is SampleStatus.NOT_RUN
+    assert verdict.returncode is None
+    assert "malformed exit code" in verdict.detail
+    assert verdict.execution is DecodeExecution.START_NOT_CONFIRMED
+    assert verdict.decoder_was_launched is False
+
+
+def test_a_malformed_decoder_outcome_object_is_reported_not_raised():
+    class _Junk:
+        stdout = ""
+        stderr = ""
+
+    verdict, _ = _check(outcome=_Junk())
+    assert verdict.status is SampleStatus.NOT_RUN
+    assert "missing" in verdict.detail
+    assert verdict.decoder_was_launched is False
+
+
+def test_a_decode_that_returns_none_is_reported_not_raised():
+    verdict, _ = _check(decode=lambda _p, **_kw: None)
+    assert verdict.status is SampleStatus.NOT_RUN
+    assert "NoneType" in verdict.detail
+    assert verdict.decoder_was_launched is False
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_base_exceptions_still_propagate_from_every_seam(exc):
+    """Containment is for ordinary failures. A cancelled operation is not a file problem.
+
+    ``_stat_seq`` cannot carry these — it re-raises ``Exception`` instances only, and neither of
+    these is one — so the stat seam gets its own raiser here.
+    """
+    def raiser(*_a, **_kw):
+        raise exc()
+
+    with pytest.raises(exc):
+        _check(probe=raiser)
+    with pytest.raises(exc):
+        _check(decode=raiser)
+    with pytest.raises(exc):
+        _check(stat=raiser)
+
+
+# ---------------------------------------------------------------------------
+# decoder_was_launched: "requested" is not "a child started"
+# ---------------------------------------------------------------------------
+
+def test_decoder_was_launched_is_false_wherever_no_child_is_known_to_have_started():
+    cases = {
+        "probe seam refused": {"probe": lambda _p: ProbeOutcome(error="FileNotFoundError")},
+        "probe raised": {"probe": lambda _p: (_ for _ in ()).throw(OSError("x"))},
+        "invalid request": {"requested_frames": 0},
+        "source missing": {"stat": _stat_seq(OSError("gone"))},
+        "metadata unusable": {"probe": lambda _p: ProbeOutcome(returncode=1, stderr="moov")},
+        "seek out of range": {"seek_seconds": 999.0},
+        "budget exhausted": {"budget_seconds": 10, "decode_timeout": 30},
+        "cross-phase change": {"stat": _stat_seq(_St(10, 7), _St(99, 8), _St(99, 8))},
+        "spawn refused": {"outcome": SampleDecodeOutcome(error="OSError: denied")},
+        "seam raised": {"decode": lambda _p, **_kw: (_ for _ in ()).throw(RuntimeError("h"))},
+    }
+    for label, kw in cases.items():
+        verdict, _ = _check(**kw)
+        assert verdict.decoder_was_launched is False, label
+        assert verdict.execution in (DecodeExecution.NOT_REQUESTED,
+                                     DecodeExecution.START_NOT_CONFIRMED), label
+
+
+def test_decoder_was_launched_is_true_only_once_a_child_demonstrably_ran():
+    for kw in ({}, {"outcome": _decoded(returncode=1, stderr="x")},
+               {"outcome": SampleDecodeOutcome(timed_out=True)},
+               {"outcome": _decoded(stdout=_progress(frames=4))}):
+        verdict, _ = _check(**kw)
+        assert verdict.decoder_was_launched is True, kw
+    timed_out, _ = _check(outcome=SampleDecodeOutcome(timed_out=True))
+    assert timed_out.execution is DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, \
+        "a child had to start in order to be killed by its own timeout"
+
+
+def test_decoder_was_launched_reads_the_execution_field_not_a_status_label():
+    """Structural: inferring a launch from NOT_RUN is exactly the defect being prevented.
+
+    Asserted over REFERENCED names, not over unparsed text — the docstring legitimately explains
+    which status label must not be consulted, and a substring ban would trip on its own
+    explanation.
+    """
+    used = _referenced(_func(_tree(_MEDIA_SAMPLE), "decoder_was_launched"))
+    assert "execution" in used and "DecodeExecution" in used
+    assert "SampleStatus" not in used, "a status label is not launch evidence"
+
+
+# ---------------------------------------------------------------------------
+# attached pictures survive into the report
+# ---------------------------------------------------------------------------
+
+def test_a_lone_attached_picture_is_disclosed_all_the_way_into_the_report():
+    verdict, launched = _check(
+        probe=lambda _p: _probe_ok(_stream(index=0, disposition={"attached_pic": 1})),
+        outcome=_decoded(stdout=_progress(frames=1, blocks=1)))
+    assert verdict.attached_pic is True, "computed at selection and carried, not discarded"
+    report = format_sample_report(verdict)
+    assert "attached picture" in report
+    assert "cover art" in report
+    assert "underfill" in report, "a one-frame cover art explains a short result"
+    assert verdict.status is SampleStatus.UNDERFILLED_UNVERIFIED
+    assert len(launched) == 1
+
+
+def test_an_ordinary_stream_is_never_described_as_an_attached_picture():
+    verdict, _ = _check()
+    assert verdict.attached_pic is False
+    assert "attached picture" not in format_sample_report(verdict)
+
+
+def test_multiple_video_streams_with_an_attached_picture_still_fail_closed():
+    """The accepted ambiguity policy is unchanged by the disclosure fix."""
+    verdict, launched = _check(probe=lambda _p: _probe_ok(
+        _stream(index=0, width=1920, height=1080),
+        _stream(index=1, width=600, height=600, disposition={"attached_pic": 1})))
+    assert verdict.status is SampleStatus.STREAM_AMBIGUOUS
+    assert verdict.equivalence is StreamEquivalence.NOT_ESTABLISHED
+    assert launched == []
+
+
+# ---------------------------------------------------------------------------
+# request and path validation, before any child
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [None, 123, b"J:/lib/clip.mp4", object(), ["J:/a.mp4"]])
+def test_a_path_that_is_not_a_string_is_an_invalid_request_not_a_TypeError(path):
+    verdict, launched = _check(path=path)
+    assert verdict.status is SampleStatus.INVALID_REQUEST
+    assert "must be a string" in verdict.detail
+    assert launched == []
+
+
+@pytest.mark.parametrize("path", ["", "   "])
+def test_an_empty_path_is_an_invalid_request(path):
+    verdict, launched = _check(path=path)
+    assert verdict.status is SampleStatus.INVALID_REQUEST
+    assert launched == []
+
+
+@pytest.mark.parametrize("path", ["J:/lib/clip.mp4", "J:/lib/clip.MP4", "J:/lib/show.mkv",
+                                  "J:/lib/show.MKV", r"J:\lib\sub dir\ロゴ 01.mkv"])
+def test_supported_extensions_are_accepted_case_insensitively(path):
+    verdict, launched = _check(path=path)
+    assert verdict.status is SampleStatus.OUTPUT_FRAMES_OK, path
+    assert len(launched) == 1
+
+
+@pytest.mark.parametrize("path", ["J:/lib/notes.txt", "J:/lib/clip.avi", "J:/lib/clip.mp4.part",
+                                  "J:/lib/clip", "J:/lib/.mkv", "J:/lib/clip.mp4/"])
+def test_an_unsupported_extension_is_refused_before_any_child(path):
+    verdict, launched = _check(path=path)
+    assert verdict.status is SampleStatus.INVALID_REQUEST, path
+    assert launched == []
+    assert verdict.execution is DecodeExecution.NOT_REQUESTED
+
+
+def test_the_extension_list_is_imported_not_restated():
+    """Structural: a third copy of ".mp4/.mkv" is a drift waiting to happen."""
+    tree = _tree(_MEDIA_SAMPLE)
+    assert "SUPPORTED_VIDEO_EXTENSIONS" in _referenced(tree)
+    literals = {node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.value.lower() in (".mp4", ".mkv")}
+    assert literals == set(), literals
+    assert SUPPORTED_VIDEO_EXTENSIONS == frozenset({".mp4", ".mkv"})
+
+
+@pytest.mark.parametrize("mode", [stat_module.S_IFDIR | 0o755, stat_module.S_IFCHR | 0o666,
+                                  stat_module.S_IFIFO | 0o644, 0])
+def test_a_non_regular_source_is_refused_before_any_child(mode):
+    verdict, launched = _check(stat=_stat_seq(_St(4096, 7, mode=mode)))
+    assert verdict.status is SampleStatus.INVALID_REQUEST
+    assert "not a regular file" in verdict.detail
+    assert launched == []
+
+
+def test_a_real_directory_with_a_video_suffix_is_refused(tmp_path):
+    """Injected success must not be able to bless a directory."""
+    folder = tmp_path / "season one.mkv"
+    folder.mkdir()
+    verdict = run_sample_check(str(folder), 1.0, probe=lambda _p: _probe_ok(_stream()),
+                               decode=lambda _p, **_kw: _decoded(), clock=iter_clock())
+    assert verdict.status is SampleStatus.INVALID_REQUEST
+    assert verdict.decoder_was_launched is False
+
+
+def test_a_real_regular_file_passes_the_new_gates(tmp_path):
+    source = tmp_path / "clip.MKV"
+    source.write_bytes(b"not really a video")
+    verdict = run_sample_check(str(source), 1.0, probe=lambda _p: _probe_ok(_stream()),
+                               decode=lambda _p, **_kw: _decoded(), clock=iter_clock())
+    assert verdict.status is SampleStatus.OUTPUT_FRAMES_OK
+
+
+# ---------------------------------------------------------------------------
+# duplicate absolute stream indices
+# ---------------------------------------------------------------------------
+
+def test_duplicate_absolute_video_indices_fail_closed():
+    selection = select_renderer_equivalent_stream(_payload(
+        _stream(index=1, width=1920, height=1080),
+        _stream(index=1, width=640, height=360)))
+    assert not selection.ok
+    assert "distinct absolute index" in selection.ambiguous_reason
+    assert selection.invalid_reason == ""
+
+
+def test_a_duplicate_index_container_never_reaches_the_decoder():
+    verdict, launched = _check(probe=lambda _p: _probe_ok(
+        _stream(index=2, width=1920, height=1080),
+        _stream(index=2, width=1280, height=720)))
+    assert verdict.status is SampleStatus.STREAM_AMBIGUOUS
+    assert verdict.equivalence is StreamEquivalence.NOT_ESTABLISHED
+    assert launched == []
+
+
+def test_a_resolution_tie_between_distinct_indices_is_still_resolvable():
+    """The documented lowest-index rule is unchanged; only true duplicates fail closed."""
+    selection = select_renderer_equivalent_stream(_payload(
+        _stream(index=3, width=1920, height=1080),
+        _stream(index=1, width=1920, height=1080)))
+    assert selection.ok
+    assert selection.stream.index == 1
+    assert selection.stream.equivalence is StreamEquivalence.BY_HIGHEST_RESOLUTION
+
+
+# ---------------------------------------------------------------------------
+# timing means one thing per field
+# ---------------------------------------------------------------------------
+
+def test_elapsed_covers_the_whole_check_on_every_path_and_the_decode_is_its_own_field():
+    """One field that silently switched between "whole check" and "decode only" is unreadable."""
+    # 1 s per clock read: the early return still bills the probe phase it actually spent.
+    early, _ = _check(seek_seconds=999.0, clock=iter_clock(step=1.0))
+    assert early.elapsed_seconds > 0
+    assert early.decode_seconds is None, "no decode was requested, so there is no decode time"
+    assert _field(format_sample_report(early), "Decode call") == "not reached"
+
+    full, _ = _check(clock=iter_clock(step=1.0))
+    assert full.decode_seconds == pytest.approx(1.0)
+    assert full.elapsed_seconds > full.decode_seconds, \
+        "the whole check includes the probe and the stat observations, not just the child"
+    report = format_sample_report(full)
+    assert _field(report, "Elapsed (whole check)").endswith("s")
+    assert _field(report, "Decode call").endswith("s")
+
+
+def test_an_unselected_stream_is_never_reported_as_a_zero_measurement():
+    verdict, _ = _check(probe=lambda _p: ProbeOutcome(returncode=0, stdout="not json"))
+    assert verdict.status is SampleStatus.METADATA_UNUSABLE
+    report = format_sample_report(verdict)
+    assert _field(report, "Stream codec / size / fps") == "unknown / unknown / unknown"
+    assert _field(report, "Reported duration") == "not established"
+    assert "0x0" not in report and "0.000s (from" not in report
+
+
+def test_a_selected_stream_still_reports_its_real_geometry():
+    verdict, _ = _check()
+    report = format_sample_report(verdict)
+    assert _field(report, "Stream codec / size / fps") == "h264 / 1920x1080 / 30.000"
+    assert "60.000s (from stream)" in _field(report, "Reported duration")
 
 
 def test_the_bounds_are_the_approved_conservative_defaults():
@@ -1043,14 +1490,47 @@ def test_the_bounds_are_the_approved_conservative_defaults():
 # the report
 # ---------------------------------------------------------------------------
 
-def test_the_report_states_the_sample_only_boundary_in_every_outcome():
-    for kw in ({}, {"outcome": _decoded(stdout=_progress(frames=2))},
-               {"outcome": SampleDecodeOutcome(timed_out=True)},
-               {"seek_seconds": 999.0}):
-        verdict, _ = _check(**kw)
-        report = format_sample_report(verdict)
-        assert SAMPLE_ONLY_TEXT in report
+def test_the_coverage_statement_is_hypothetical_and_appears_exactly_once():
+    """It is unconditional, so it must be true of a report whose decode never started.
+
+    The previous wording — "One sampled window of one stream WAS DECODED..." — was a false
+    statement of fact on every non-executed outcome, and it was appended to the footer while also
+    being embedded in the success detail, so a clean result carried it twice.
+    """
+    for status in SampleStatus:
+        report = format_sample_report(SampleVerdict(path="J:/a.mp4", status=status, detail="d"))
+        assert report.count(SAMPLE_ONLY_TEXT) == 1, status
         assert "size and modification time only" in report
+        assert report.lower().count("even a successful sample") == 1, status
+
+
+@pytest.mark.parametrize("execution", list(DecodeExecution))
+def test_no_report_claims_a_decode_that_did_not_happen(execution):
+    """No past-tense successful-decode wording outside the stages where a child provably ran."""
+    report = format_sample_report(SampleVerdict(
+        path="J:/a.mp4", status=SampleStatus.NOT_RUN, detail="d", execution=execution))
+    for lie in ("was decoded to a discarded output", "frames were produced at the requested",
+                "window of one stream was decoded"):
+        assert lie not in report, f"{execution.value} claims: {lie}"
+    assert _field(report, "Decode") , "every report states what actually happened"
+
+
+def test_every_status_report_states_its_execution_stage_factually():
+    cases = [
+        ({"seek_seconds": 999.0}, DecodeExecution.NOT_REQUESTED, "no decode was requested"),
+        ({"requested_frames": 0}, DecodeExecution.NOT_REQUESTED, "no decode was requested"),
+        ({"outcome": SampleDecodeOutcome(error="OSError: nope")},
+         DecodeExecution.START_NOT_CONFIRMED, "no FFmpeg child was confirmed to have started"),
+        ({"outcome": SampleDecodeOutcome(timed_out=True)},
+         DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, "did not produce the full requested output"),
+        ({"outcome": _decoded(stdout=_progress(frames=3))},
+         DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, "did not produce the full requested output"),
+        ({}, DecodeExecution.REQUESTED_FRAMES_PRODUCED, "produced the requested output frames"),
+    ]
+    for kw, expected, needle in cases:
+        verdict, _ = _check(**kw)
+        assert verdict.execution is expected, (kw, verdict.status)
+        assert needle in _field(format_sample_report(verdict), "Decode"), kw
 
 
 def test_the_report_never_claims_health_or_full_verification():
