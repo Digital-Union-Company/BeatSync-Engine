@@ -21,9 +21,11 @@ whose decode never started. A past-tense "one window was decoded" would be a fal
 :attr:`SampleStatus.SOURCE_MISSING`, :attr:`SampleStatus.INVALID_REQUEST`,
 :attr:`SampleStatus.NOT_RUN` and every other non-executed outcome. What actually happened is carried
 separately and factually by :class:`DecodeExecution`, which distinguishes *not requested*, *start
-not confirmed*, *ran without full output* and *requested frames produced* -- and which is also the
-only basis for :attr:`SampleVerdict.decoder_was_launched`, so that property can never claim a child
-started when the seam refused to spawn one.
+not confirmed*, *ran without a clean result* and *requested frames produced* -- and which is also
+the only basis for :attr:`SampleVerdict.decoder_was_launched`, so that property can never claim a
+child started when the seam refused to spawn one. It describes **process execution only**: how many
+frames a child produced is separate evidence, and no execution label may assert underproduction
+that the reported frame count contradicts.
 
 Even where a sample does succeed it is **one window of one stream** -- not proof of whole-file
 integrity, not proof the production NVENC extraction would succeed, not proof of renderability. The
@@ -207,6 +209,14 @@ class DecodeExecution(str, Enum):
     ``error`` (executable missing, OS refusal) or raising means **no FFmpeg child is known to have
     started**, which is a different fact from one that started and failed. Where child-start
     evidence cannot be established it is not invented.
+
+    This enum describes **process execution only**. How much output a child produced is separate
+    evidence, carried by :attr:`SampleVerdict.observed_frames`, and the two are never conflated:
+    :attr:`RAN_WITHOUT_CLEAN_RESULT` means "ran, and did not earn the sole positive status", which
+    is emphatically *not* "ran, and produced fewer frames than requested". An earlier phrasing
+    asserted the latter, and was therefore false on five reachable paths where the terminal block
+    reported the full requested count but an earlier precedence tier -- decoder errors, a source
+    change, an unobservable post-decode source, a timeout, a non-zero exit -- withheld success.
     """
 
     #: No decode was requested: the check refused or failed before scheduling a child. Covers an
@@ -216,9 +226,13 @@ class DecodeExecution(str, Enum):
     #: The decode callable was invoked, but no FFmpeg child is positively known to have started --
     #: a refused spawn, or an unexpected exception from the seam itself.
     START_NOT_CONFIRMED = "start_not_confirmed"
-    #: A child demonstrably ran (it returned an exit code, or it was killed by its own timeout) but
-    #: did not deliver the full requested output.
-    RAN_WITHOUT_FULL_OUTPUT = "ran_without_full_output"
+    #: A child demonstrably ran (it returned an exit code, or it was killed by its own timeout) and
+    #: the sample did not reach :attr:`SampleStatus.OUTPUT_FRAMES_OK`. It says **nothing about how
+    #: many frames were produced**: ``classify_decode``'s early tiers -- a timeout, a non-zero exit,
+    #: an unobservable post-decode source, a source change -- all outrank the frame tiers, so a run
+    #: that reported the full requested count lands here too. Asserting underproduction from this
+    #: member would contradict the ``observed_frames`` evidence printed beside it.
+    RAN_WITHOUT_CLEAN_RESULT = "ran_without_clean_result"
     #: A child ran and the requested output frames were produced.
     REQUESTED_FRAMES_PRODUCED = "requested_frames_produced"
 
@@ -229,8 +243,9 @@ _EXECUTION_TEXT = {
         "no decode was requested (the check stopped before any child was scheduled)",
     DecodeExecution.START_NOT_CONFIRMED:
         "a decode was requested, but no FFmpeg child was confirmed to have started",
-    DecodeExecution.RAN_WITHOUT_FULL_OUTPUT:
-        "an FFmpeg child ran but did not produce the full requested output",
+    DecodeExecution.RAN_WITHOUT_CLEAN_RESULT:
+        "an FFmpeg child ran, but no clean sample verdict was established; see the result and "
+        "observed output frames",
     DecodeExecution.REQUESTED_FRAMES_PRODUCED:
         "an FFmpeg child ran and produced the requested output frames",
 }
@@ -714,7 +729,7 @@ class SampleVerdict:
         requested. A refused spawn is :attr:`DecodeExecution.START_NOT_CONFIRMED`, which is not a
         launch; a timeout is, because the child had to start in order to be killed by one.
         """
-        return self.execution in (DecodeExecution.RAN_WITHOUT_FULL_OUTPUT,
+        return self.execution in (DecodeExecution.RAN_WITHOUT_CLEAN_RESULT,
                                   DecodeExecution.REQUESTED_FRAMES_PRODUCED)
 
 
@@ -1118,12 +1133,19 @@ def run_sample_check(path: str, seek_seconds: Any, *,
 
     # A refused spawn and an unexpected seam exception both leave child-start UNCONFIRMED; a
     # timeout confirms one started, because it had to in order to be killed by its own clock.
+    #
+    # The remaining split is "did the sample earn the sole positive status?", NOT "how many frames
+    # came out". Those are different questions and the status cannot answer the second one: tiers
+    # 1-6 of classify_decode outrank every frame tier, so OUTPUT_WITH_DECODER_ERRORS, SOURCE_CHANGED,
+    # EVIDENCE_UNTRUSTWORTHY, TIMEOUT and FFMPEG_FAILED are all reachable with a terminal block
+    # reporting the full requested count. RAN_WITHOUT_CLEAN_RESULT is therefore worded to assert
+    # only what this branch establishes; the frame count travels separately as observed_frames.
     if result.error:
         execution = DecodeExecution.START_NOT_CONFIRMED
     elif status is SampleStatus.OUTPUT_FRAMES_OK:
         execution = DecodeExecution.REQUESTED_FRAMES_PRODUCED
     else:
-        execution = DecodeExecution.RAN_WITHOUT_FULL_OUTPUT
+        execution = DecodeExecution.RAN_WITHOUT_CLEAN_RESULT
 
     return SampleVerdict(
         path=path, status=status, detail=detail,
@@ -1148,7 +1170,7 @@ def format_sample_report(verdict: SampleVerdict) -> str:
     The full source path is never shortened -- this runs locally for the one person who owns the
     files, and a truncated path is useless for finding the file again.
 
-    Two honesty rules govern the wording. First, **what happened is stated, not implied**: the
+    Three honesty rules govern the wording. First, **what happened is stated, not implied**: the
     ``Decode:`` line carries :class:`DecodeExecution` verbatim, so a report whose child never
     started says so in its own words rather than leaving the reader to infer it from a status code.
     Second, **the unconditional coverage sentence is hypothetical**. It appears exactly once, it is
@@ -1157,6 +1179,14 @@ def format_sample_report(verdict: SampleVerdict) -> str:
     into a statement about the whole file, and no line claims a measurement that was not taken:
     geometry, frame rate and duration all read "unknown"/"not established" when no stream was ever
     selected, rather than ``0x0`` and ``0.000``.
+
+    Third, **no two lines of one report may contradict each other.** The ``Decode:`` line describes
+    process execution; ``Observed output frames`` reports the frame evidence; ``Result`` and
+    ``Detail`` carry the verdict. Each states only what its own source establishes. An earlier
+    ``Decode:`` wording claimed underproduction for every non-clean outcome, which on
+    ``SAMPLE_OUTPUT_WITH_DECODER_ERRORS`` sat in the same report as a ``Detail`` confirming all
+    requested frames were produced and an ``Observed output frames`` equal to the request. A report
+    that argues with itself tells the operator nothing.
     """
     frames = "not established" if verdict.observed_frames is None else str(verdict.observed_frames)
     dup = "unknown" if verdict.dup_frames is None else str(verdict.dup_frames)

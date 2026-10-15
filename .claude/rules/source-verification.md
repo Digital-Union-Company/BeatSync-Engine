@@ -399,8 +399,24 @@ report; the success detail no longer embeds a second copy. A test walks all fift
 What did happen is stated, not implied. `DecodeExecution` is its own field and its own report line,
 distinguishing four facts: the decode was **not requested**; it was requested but **no child was
 confirmed to have started** (a refused spawn or a seam exception — child-start evidence is never
-invented); a child **ran without full output**; a child ran and **produced the requested frames**.
-A timeout is a launch, because the child had to start in order to be killed by its own clock.
+invented); a child **ran without a clean result**; a child ran and **produced the requested
+frames**. A timeout is a launch, because the child had to start in order to be killed by its own
+clock.
+
+**`DecodeExecution` describes process execution only — never frame completeness.** The two are
+separate evidence and may never be derived from one another. `RAN_WITHOUT_CLEAN_RESULT` means
+"a child ran and the sample did not earn `SAMPLE_OUTPUT_FRAMES_OK`", which is *not* "a child
+produced fewer frames than requested": tiers 1–6 of `classify_decode` outrank every frame tier, so
+`SAMPLE_OUTPUT_WITH_DECODER_ERRORS`, `SAMPLE_SOURCE_CHANGED`, `SAMPLE_EVIDENCE_UNTRUSTWORTHY`,
+`SAMPLE_TIMEOUT` and `SAMPLE_FFMPEG_FAILED` are all reachable with a terminal block reporting the
+full requested count. An earlier wording derived a shortfall claim from "not the success status"
+and was therefore false on all five — on `SAMPLE_OUTPUT_WITH_DECODER_ERRORS` it contradicted the
+`Detail` line and the `Observed output frames` line of the *same* report. The general rule it cost
+a blocker to learn: **a label derived from a verdict will eventually contradict the evidence that
+verdict outranked.** Only `REQUESTED_FRAMES_PRODUCED` may speak about frames, because it is
+assigned solely from a status that already required `frame == requested` in a completed terminal
+block. The model stays at four states; a fifth "ran, completeness unknown" would split the single
+question `decoder_was_launched` exists to answer.
 
 `decoder_was_launched` reads that field and **never a status label**. Deriving it from
 `SAMPLE_NOT_RUN` was wrong twice over: that status means the seam reported `error`, so no child

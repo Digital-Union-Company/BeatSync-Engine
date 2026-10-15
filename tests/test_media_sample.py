@@ -41,6 +41,7 @@ from beatsync_fork.media_sample import (
     SAMPLE_ONLY_TEXT,
     SOURCE_COUNT_CAP,
     WORKER_CAP,
+    _EXECUTION_TEXT,
     DecodeExecution,
     DurationSource,
     FrameEvidence,
@@ -1285,7 +1286,7 @@ def test_decoder_was_launched_is_true_only_once_a_child_demonstrably_ran():
         verdict, _ = _check(**kw)
         assert verdict.decoder_was_launched is True, kw
     timed_out, _ = _check(outcome=SampleDecodeOutcome(timed_out=True))
-    assert timed_out.execution is DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, \
+    assert timed_out.execution is DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, \
         "a child had to start in order to be killed by its own timeout"
 
 
@@ -1515,6 +1516,34 @@ def test_no_report_claims_a_decode_that_did_not_happen(execution):
     assert _field(report, "Decode") , "every report states what actually happened"
 
 
+#: The five outcomes where a terminal block reports the FULL requested count and the sample is
+#: still non-clean, because an earlier precedence tier outranked the frame tiers. Each is the exact
+#: shape that makes a frame-completeness claim on the ``Decode:`` line false, so they are kept in
+#: one table and reused by every execution-truthfulness test below.
+#:
+#: Stored as kwarg FACTORIES, not literal kwargs: ``_stat_seq`` returns a stateful closure whose
+#: call counter clamps to the last result once exhausted, so a shared instance would silently
+#: report a stable source on its second use and quietly turn these cases back into clean successes.
+_FULL_COUNT_BUT_NOT_CLEAN = [
+    ("decoder errors at -v error",
+     lambda: {"outcome": _decoded(stderr="decoder reported an error")},
+     SampleStatus.OUTPUT_WITH_DECODER_ERRORS),
+    ("source changed during the decode",
+     lambda: {"stat": _stat_seq(_St(10, 7), _St(10, 7), _St(99, 99))},
+     SampleStatus.SOURCE_CHANGED),
+    ("post-decode observation could not be taken",
+     lambda: {"stat": _stat_seq(_St(10, 7), _St(10, 7), OSError("vanished"))},
+     SampleStatus.EVIDENCE_UNTRUSTWORTHY),
+    ("timeout after partial progress reached the full count",
+     lambda: {"outcome": SampleDecodeOutcome(
+         timed_out=True, stdout=_progress(end=False).encode("utf-8"))},
+     SampleStatus.TIMEOUT),
+    ("non-zero exit after the full count was reported",
+     lambda: {"outcome": _decoded(returncode=1, stderr="muxer failed")},
+     SampleStatus.FFMPEG_FAILED),
+]
+
+
 def test_every_status_report_states_its_execution_stage_factually():
     cases = [
         ({"seek_seconds": 999.0}, DecodeExecution.NOT_REQUESTED, "no decode was requested"),
@@ -1522,15 +1551,145 @@ def test_every_status_report_states_its_execution_stage_factually():
         ({"outcome": SampleDecodeOutcome(error="OSError: nope")},
          DecodeExecution.START_NOT_CONFIRMED, "no FFmpeg child was confirmed to have started"),
         ({"outcome": SampleDecodeOutcome(timed_out=True)},
-         DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, "did not produce the full requested output"),
+         DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, "no clean sample verdict was established"),
         ({"outcome": _decoded(stdout=_progress(frames=3))},
-         DecodeExecution.RAN_WITHOUT_FULL_OUTPUT, "did not produce the full requested output"),
+         DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, "no clean sample verdict was established"),
+        ({"outcome": _decoded(stdout=_progress(frames=0, blocks=1))},
+         DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, "no clean sample verdict was established"),
         ({}, DecodeExecution.REQUESTED_FRAMES_PRODUCED, "produced the requested output frames"),
     ]
+    # The axis that matters most, and the one an earlier version of this test never varied: a
+    # NON-CLEAN status whose frame count REACHED the request. Underfilled cases alone cannot
+    # detect a Decode line that claims underproduction, because there it happens to be true.
+    cases += [(make_kw(), DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, "no clean sample verdict was "
+               "established") for _label, make_kw, _status in _FULL_COUNT_BUT_NOT_CLEAN]
     for kw, expected, needle in cases:
         verdict, _ = _check(**kw)
         assert verdict.execution is expected, (kw, verdict.status)
         assert needle in _field(format_sample_report(verdict), "Decode"), kw
+
+
+@pytest.mark.parametrize("label,make_kw,expected_status", _FULL_COUNT_BUT_NOT_CLEAN,
+                         ids=[c[0] for c in _FULL_COUNT_BUT_NOT_CLEAN])
+def test_a_full_frame_count_with_a_non_clean_status_is_never_reported_as_underproduction(
+        label, make_kw, expected_status):
+    """The R3 blocker: five paths where the status is right and the execution label lied.
+
+    ``classify_decode``'s tiers 1-6 outrank every frame tier, so "did not earn the sole positive
+    status" and "produced fewer frames than requested" are different facts. Deriving the second
+    from the first put a false sentence in the report -- on OUTPUT_WITH_DECODER_ERRORS it sat in
+    the same report as a Detail line confirming all the requested frames came out.
+    """
+    verdict, launched = _check(**make_kw())
+    assert verdict.status is expected_status, label
+    assert len(launched) == 1, "a child was requested in every one of these cases"
+    assert verdict.observed_frames == DEFAULT_SAMPLE_FRAMES, \
+        f"{label}: the premise is a terminal block reporting the full count"
+    assert verdict.requested_frames == DEFAULT_SAMPLE_FRAMES
+
+    assert verdict.execution is DecodeExecution.RAN_WITHOUT_CLEAN_RESULT, label
+    assert verdict.decoder_was_launched is True, "the child demonstrably ran"
+
+    report = format_sample_report(verdict)
+    decode_line = _field(report, "Decode")
+    # The line may not assert a shortfall the frame evidence in the same report contradicts...
+    for lie in ("did not produce the full", "did not produce the requested",
+                "fewer than", "underproduc", "incomplete output"):
+        assert lie not in decode_line.lower(), f"{label}: Decode line claims {lie!r}"
+    # ...nor may it claim the success it did not earn.
+    for overclaim in ("produced the requested output frames", "succeeded", "verified"):
+        assert overclaim not in decode_line.lower(), f"{label}: Decode line claims {overclaim!r}"
+    assert "no clean sample verdict was established" in decode_line.lower(), label
+    assert _field(report, "Observed output frames") == str(DEFAULT_SAMPLE_FRAMES), label
+    assert _field(report, "Result") == expected_status.value, label
+
+
+def test_the_decode_line_never_contradicts_the_observed_frame_evidence():
+    """Full execution-state x status matrix: no report may argue with itself.
+
+    Walks every reachable (status, execution) pair and cross-checks the ``Decode:`` line against
+    the ``Observed output frames`` line in the SAME report. A shortfall claim is permitted only
+    where the evidence actually shows one; a production claim only where the count reached the
+    request. Anything else is a report that contradicts itself.
+    """
+    cases = {
+        "clean success": {},
+        "underfilled": {"outcome": _decoded(stdout=_progress(frames=3))},
+        "zero frames": {"outcome": _decoded(stdout=_progress(frames=0, blocks=1))},
+        "no terminal block": {"outcome": _decoded(stdout="frame=30\nfps=30\n")},
+        "malformed frame count": {"outcome": _decoded(stdout="frame=abc\nprogress=end\n")},
+        "count above the request": {"outcome": _decoded(stdout=_progress(frames=31, blocks=1))},
+        "dup frames positive": {"outcome": _decoded(stdout=_progress(dup=4))},
+        "timeout, no output": {"outcome": SampleDecodeOutcome(timed_out=True)},
+        "refused spawn": {"outcome": SampleDecodeOutcome(error="WinError 2")},
+        "seek out of range": {"seek_seconds": 999.0},
+        "invalid request": {"requested_frames": 0},
+        "budget exhausted": {"budget_seconds": 1.0},
+    }
+    cases.update({label: make_kw() for label, make_kw, _ in _FULL_COUNT_BUT_NOT_CLEAN})
+
+    seen_executions = set()
+    for label, kw in cases.items():
+        verdict, _ = _check(**kw)
+        seen_executions.add(verdict.execution)
+        report = format_sample_report(verdict)
+        decode_line = _field(report, "Decode").lower()
+        observed = verdict.observed_frames
+        shortfall_known = observed is not None and observed < verdict.requested_frames
+
+        if "did not produce the full" in decode_line or "underproduc" in decode_line:
+            assert shortfall_known, f"{label}: shortfall claimed, evidence says {observed}"
+        if "produced the requested output frames" in decode_line:
+            assert observed is not None and observed >= verdict.requested_frames, \
+                f"{label}: production claimed, evidence says {observed}"
+            assert verdict.status is SampleStatus.OUTPUT_FRAMES_OK, label
+        # decoder_was_launched must agree with the execution field on every single pair.
+        assert verdict.decoder_was_launched is (
+            verdict.execution in (DecodeExecution.RAN_WITHOUT_CLEAN_RESULT,
+                                  DecodeExecution.REQUESTED_FRAMES_PRODUCED)), label
+
+    assert seen_executions == set(DecodeExecution), \
+        f"matrix must exercise every execution state, missed {set(DecodeExecution) - seen_executions}"
+
+
+def test_the_execution_model_stays_four_states_over_fifteen_statuses():
+    """The R4 correction renamed one member; it did not grow the model or the taxonomy.
+
+    Pinned because the cheap way to "fix" a contradicting label is to add a fifth state for
+    "ran, completeness unknown", which would split the one question operators ask -- did a child
+    run? -- across two members and give ``decoder_was_launched`` a third thing to read.
+    """
+    assert [m.name for m in DecodeExecution] == [
+        "NOT_REQUESTED", "START_NOT_CONFIRMED", "RAN_WITHOUT_CLEAN_RESULT",
+        "REQUESTED_FRAMES_PRODUCED"]
+    assert len(list(SampleStatus)) == 15, "the status taxonomy is unchanged by this correction"
+    assert set(_EXECUTION_TEXT) == set(DecodeExecution), "every state has operator prose"
+
+
+@pytest.mark.parametrize("execution", list(DecodeExecution))
+def test_no_execution_prose_asserts_a_frame_count_it_cannot_know(execution):
+    """Only the one evidence-backed member may speak about frames produced.
+
+    ``REQUESTED_FRAMES_PRODUCED`` is assigned solely from ``SAMPLE_OUTPUT_FRAMES_OK``, which
+    already requires ``frame == requested`` in a completed terminal block, so it alone has the
+    evidence. Every other member describes process state only.
+    """
+    prose = _EXECUTION_TEXT[execution].lower()
+    if execution is DecodeExecution.REQUESTED_FRAMES_PRODUCED:
+        assert "produced the requested output frames" in prose
+        return
+    for quantitative in ("did not produce the full", "fewer", "underproduc", "all frames",
+                         "frames were produced"):
+        assert quantitative not in prose, f"{execution.value} asserts {quantitative!r}"
+
+
+def test_decoder_was_launched_contract_is_exact_over_all_four_states():
+    launched = {DecodeExecution.RAN_WITHOUT_CLEAN_RESULT,
+                DecodeExecution.REQUESTED_FRAMES_PRODUCED}
+    for execution in DecodeExecution:
+        verdict = SampleVerdict(path="J:/a.mp4", status=SampleStatus.NOT_RUN, detail="d",
+                                execution=execution)
+        assert verdict.decoder_was_launched is (execution in launched), execution
 
 
 def test_the_report_never_claims_health_or_full_verification():

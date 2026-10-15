@@ -20,6 +20,41 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P1-R4: DecodeExecution truthfulness)
+
+A second independent review of the R2 commit below confirmed all sixteen of its corrections and
+found **one new blocker, introduced by the R2 fix for the first one**. `DecodeExecution` was
+derived from the status label — anything that was not `SAMPLE_OUTPUT_FRAMES_OK` became
+`RAN_WITHOUT_FULL_OUTPUT`, whose operator prose asserted that the full requested output had not
+been produced. That inference does not hold. Tiers 1–6 of `classify_decode` outrank every frame
+tier, so five outcomes are reachable with a terminal block reporting the **full** requested count:
+`SAMPLE_OUTPUT_WITH_DECODER_ERRORS`, `SAMPLE_SOURCE_CHANGED`, `SAMPLE_EVIDENCE_UNTRUSTWORTHY`,
+`SAMPLE_TIMEOUT` and `SAMPLE_FFMPEG_FAILED`. On the first of those the report contradicted itself:
+a `Detail` line confirming all thirty frames were produced, an `Observed output frames` of 30, and
+a `Decode` line denying it. That is the same class of defect as the R2 blocker it replaced — a
+false statement of fact in the one surface whose entire purpose is truthful reporting.
+
+The correction is a rename and a rewording, not a redesign. `RAN_WITHOUT_FULL_OUTPUT` becomes
+**`RAN_WITHOUT_CLEAN_RESULT`** ("an FFmpeg child ran, but no clean sample verdict was established;
+see the result and observed output frames"), which asserts only what its branch establishes: a
+child ran, and the sample did not earn the sole positive status. Frame completeness stays where
+the evidence is — `observed_frames`, reported on its own line. Nothing else moved: the fifteen
+statuses, the four-member execution model, the progress parser, the 30-frame cap, stream
+selection, stability observations, precedence, `WorkBudget` and the argv are all untouched, and
+`src/ffmpeg_processing.py` is byte-identical to the P1 commit. `decoder_was_launched` keeps its
+exact contract — true for `RAN_WITHOUT_CLEAN_RESULT` and `REQUESTED_FRAMES_PRODUCED`, false for
+`NOT_REQUESTED` and `START_NOT_CONFIRMED`.
+
+Unlike the two R2 blockers this one was **not pinned by a passing test** — the correction left all
+232 existing assertions green. The suite simply never built the case that mattered: its
+walks-every-status test only ever paired a non-clean status with a count *below* the request
+(a timeout with no output, an underfill at 3), where a shortfall claim happens to be true. The
+transferable lesson is about parametrised tests: when one axis is exhaustive, check that the
+*other* axis is varied too, or the exhaustive one creates false confidence. Twelve new assertions
+close it, including a full execution-state × status matrix that cross-checks the `Decode` line
+against the `Observed output frames` line of the same report, and a guard that no execution prose
+except `REQUESTED_FRAMES_PRODUCED` may make a quantitative claim at all.
+
 ### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P1-R2: independent-review corrections)
 
 An independent adversarial review of the P1 commit below reproduced two blocking defects, four
@@ -40,7 +75,9 @@ than follow-ups: correcting the behaviour required correcting the test that had 
   now hypothetical ("*even a successful sample* checks only one short window of one stream"), true
   of every report, and present **exactly once** — the success detail no longer embeds a second copy.
   What actually happened is a new `DecodeExecution` field and its own report line, distinguishing
-  *not requested* / *start not confirmed* / *ran without full output* / *requested frames produced*.
+  *not requested* / *start not confirmed* / *ran without a clean result* / *requested frames
+  produced*. (The third member was named and worded differently as shipped in R2; see the R4 entry
+  above for why that wording was itself false and how it was corrected.)
 - **Progress evidence is read from one completed block.** The parser kept a single last-seen-value
   dictionary across the whole stream, so `frame=30 / progress=continue / progress=end` reported
   `frames=30` for a terminal block that carried no count — and `SAMPLE_OUTPUT_FRAMES_OK` could be
