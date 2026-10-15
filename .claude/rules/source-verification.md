@@ -527,3 +527,122 @@ bound. Do not claim otherwise.
 
 **Portable-build acceptance of `-progress`, `-fps_mode passthrough` and `-f null -` is UNVERIFIED**
 until a separately authorized real-FFmpeg integration test. P1 executes no FFmpeg at all.
+
+
+## The GUI integration (MEDIA-VERIFY-S2-B P2)
+
+**Sample Decode** sits inside the Media Library Preparation accordion, immediately after Verify
+Sources. One operator-entered `.mp4`/`.mkv` path, one seek position in seconds (default `1.0`), one
+explicit button, one read-only report. No dropdown of the library, no browser upload, no bulk mode,
+no automatic decode on an input change.
+
+**The source is one typed path, deliberately not confined to the library folder.** A dropdown would
+have to enumerate the folder — ~2,000 files on a mechanical drive — on every selection change, and
+populating it from `prep_state` would couple this diagnostic to the preparation state machine's
+lifecycle. It needs no new validation either: `run_sample_check` already rejects a non-`str`, an
+empty path, a suffix outside `SUPPORTED_VIDEO_EXTENSIONS` and anything that is not a regular file,
+each as `SAMPLE_INVALID_REQUEST` with no child started. Confinement was considered and rejected as
+a new restriction inconsistent with `prep_folder`/`source_folder`, which already accept arbitrary
+typed paths.
+
+**The resource policy is enforced by OMISSION, which is stronger than validation.**
+`_sample_decode_impl` calls `run_sample_check(path, seek, probe=…, decode=…)` and passes **no other
+keyword at all**, so 30 frames / 20 s probe / 30 s decode / 60 s budget / one source / one worker
+all come from the module constants. There is no parameter for a widget value to reach, and no
+frame, timeout or budget control exists in the UI. A test asserts the keyword set is exactly
+`{probe, decode}`. The 60 s budget gates scheduling and is never described as a wall-clock deadline.
+
+**Seconds, never a frame number.** Out-of-range is decided only by the selected stream's reported
+duration; nothing is clamped, so the report's requested position is always the one asked for. No
+`.change` listener performs any FFprobe, stat or scan — metadata is read only inside the click.
+
+### Three holders, one mutex, and attribution that never guesses
+
+S2-B is the **third** holder of the one `_RENDER_LOCK`, joining renders and S2-A verification. One
+non-blocking `acquire` is the test and the acquisition; the release is in a `finally`; a refusal is
+terminal and performs no work.
+
+The two-holder **boolean had to go**. `_verification_running` was sufficient only because the render
+path never marked itself, so `_busy_message` derived "a render" from `False` **by elimination**. With
+three holders that is false in both new directions: a render refused during a sample decode would
+claim another render was running, and S2-A would call a sample a render. `_lock_holder_now()`
+replaces it and reports `render` / `verify` / `sample` / unknown from two **positive** sources:
+
+- the diagnostic token (`_lock_holder`), set explicitly by the verification and sample paths;
+- the **existing** `_active_render_slot`, which is positive evidence of a render.
+
+**The render wrappers are untouched, and that is the point.** `_install_active_render` is called by
+a mutex-owning wrapper immediately after its acquire and `_clear_active_render` immediately before
+its release, and the Cancel path only ever reads or clears the slot — never installs it. So an
+installed slot means a render owns the mutex, and reusing that fact keeps `process_video_guarded`
+and `render_selected_variants_guarded` **byte-identical** to the pre-S2-B implementation. An earlier
+attempt added four `_mark_lock_holder` calls to those wrappers instead; it was measured to break 62
+tests across four AST-extracting harnesses, because every one of them execs the wrapper bodies into
+a synthetic namespace. Tests assert the AST identity of both wrappers against the pinned commit.
+
+**Absence of evidence is reported as unknown, never as a render.** `acquire()` and the holder
+becoming observable are two statements, so an empty token with no installed slot is a genuine
+window — it gets `MEDIA_BUSY_UNKNOWN_TEXT`, not a guess. A brief neutral refusal beats a falsely
+specific one.
+
+**The two attribution locks are taken sequentially and never nested.** The token is copied under
+`_VERIFY_FLAG_LOCK` and that lock released, then the slot's presence is copied under
+`_ACTIVE_RENDER_SLOT_LOCK` and that lock released, and only then is the decision made — so there is
+no acquisition order to get wrong and no inversion is expressible. This mirrors the existing read in
+`_signal_active_render`.
+
+The lookup is **diagnostic only**. `_RENDER_LOCK.acquire(blocking=False)` remains the sole authority
+on whether any operation may start, so a stale, missing or delayed answer can only word one refusal
+— never admit a second worker. A test pins that: a token naming a holder while the mutex is free
+still admits work, and an empty token while the mutex is held still refuses it.
+
+### Two revision scopes, one bounded map
+
+S2-A invalidates on folder/recursive; S2-B on file/seek. They are independent diagnostics, so one
+must not clear the other's pending answer — a seek edit cancelling a running source verification
+would be a wrong answer, not a conservative one. The key is therefore
+`_scoped_key(session, scope)` with a NUL separator (a `session_hash` is hex and the fallback is
+`__no_session__`, so neither can contain one and no scope can forge another's key).
+
+**Every revision function is reused byte-identical** — `_touch_verify_revision_locked`,
+`_verify_revision`, `_bump_verify_revision`, `_begin_verify_session`, `_end_verify_session`, the pin
+and the eviction loop. Scoping happens only at the two key-production sites, so the bound, the LRU
+order and the R5 active-session exemption are not duplicated, not re-derived and not re-proved. The
+R5 argument survives because it rests on the mutex, not the key shape: at most **one** of render /
+verify / sample runs at a time, so at most one revision is load-bearing, so pinning one key and
+skipping it during eviction is still sufficient. `_VERIFY_REVISION_CAP` stays 512 and now spans both
+scopes.
+
+### Gradio wiring, and what it must not touch
+
+`sample_btn.click` carries **no `concurrency_id`** and `concurrency_limit=None`, exactly like the
+Verify event and for the same measured reason: on the pinned `gradio==6.19.0` a shared lane leaves
+the event queued and then runs it automatically against click-time values, so the mutex is never
+reached. A lane of 1 would re-create that one step in — a second Sample Decode click would queue
+instead of being refused. `CANCEL_CONCURRENCY_ID` is untouched. `request: gr.Request = None` is
+injected by annotation and is absent from `inputs`.
+
+`sample_report` is the **only** component any sample event writes. The sample section appears in no
+`source_outputs` and no `prep_outputs`, so it cannot confirm or invalidate a source selection,
+cannot enable or disable Create Music Video, cannot move the preparation state machine and cannot
+alter the render output. It consults **no** classifier at all — unlike `_verify_sources_impl` there
+is no `classify_library_sources`, no Qwen resolution, no cache read or write. Nothing
+concurrency-shaped enters `gr.State`.
+
+**No Cancel control in P2.** The bound is the approved 30 s decode timeout inside the accepted seam,
+which takes the unchanged blocking `subprocess.run` path and therefore preserves the partial capture
+on timeout. A browser disconnect is not cancellation and proves nothing about the child.
+
+**`SAMPLE_OUTPUT_FRAMES_OK` is never rendered as "healthy" or "verified".** The GUI shows
+`format_sample_report(verdict)` verbatim, so all fifteen statuses, all four execution states and
+both disclaimer sentences survive to the operator. The UI text says "up to 30 **output** frames"
+because `-frames:v` bounds output while decoder pre-roll is unbounded and invisible — "30 frames
+were decoded" is a claim the diagnostic cannot support.
+
+**P2 adds no import-time subprocess activity.** `logger`, `gpu_cpu_utils` and `ffmpeg_processing` are
+already module-level imports in `gui.py`, so the `check_nvenc()` encoder probe already fires on every
+GUI start; `media_sample` is stdlib-only and the execution seam is imported inside the impl.
+
+**P2 code acceptance is not GUI runtime acceptance.** No Gradio was started, no FFmpeg executed and
+no real media touched. Actual click behaviour, immediate refusal under a live render, and
+two-browser-session isolation on `gradio==6.19.0` remain a separately authorized milestone.

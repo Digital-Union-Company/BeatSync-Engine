@@ -985,6 +985,87 @@ PREP_VERIFY_ALREADY_RUNNING_TEXT = (
     "press Verify Sources again."
 )
 
+# ----------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample-decode diagnostic.
+#
+# Worded to keep S2-B's question distinct from S2-A's. S2-A reads container metadata; this asks
+# FFmpeg to actually produce frames. The phrasing says "up to 30 OUTPUT frames" on purpose:
+# `-frames:v` bounds what is written out, while decoder pre-roll is unbounded and invisible, so
+# "30 frames were decoded" would be a claim the diagnostic cannot make. And it says what it is NOT
+# proof of, because a clean short sample is exactly the result most likely to be over-read.
+LABEL_PREP_SAMPLE = "🎞️ Sample Decode — Check One Video"
+LABEL_PREP_SAMPLE_PATH = "Video file to sample"
+LABEL_PREP_SAMPLE_SEEK = "Position to sample (seconds)"
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, R1 MINOR-3): the sample field takes ONE FILE, so it
+#: needs its own example. It previously borrowed `PLACEHOLDER_SOURCE_FOLDER`, which shows a
+#: directory with no filename and no extension -- an operator following it would enter a folder and
+#: get `SAMPLE_INVALID_REQUEST`, while the field's own label says "Video file to sample". A
+#: placeholder is an illustrative path only: it is not a default value, is never submitted, and
+#: promises nothing about the file existing.
+PLACEHOLDER_SAMPLE_VIDEO = r"J:\New folder\Cuts\clip.mp4"
+LABEL_PREP_SAMPLE_REPORT = "🎞️ Sample Decode (read-only)"
+INFO_PREP_SAMPLE = (
+    "Ask FFmpeg to produce up to 30 output frames at the chosen position in ONE video. The output "
+    "is discarded. This does not verify the entire video or its renderability — it answers a "
+    "different question from Verify Sources, which reads metadata only. Nothing is analyzed, "
+    "cached, repaired, re-rendered or modified."
+)
+PREP_SAMPLE_INITIAL_TEXT = (
+    "Enter one .mp4 or .mkv file above, choose a position, then press Sample Decode.\n"
+    "Read-only: no analysis, no cache changes, no rendering, no file modification."
+)
+#: Shown when the file or the position changes. The previous report described a different sample,
+#: so it is cleared rather than left on screen looking current.
+PREP_SAMPLE_STALE_TEXT = (
+    "The video file or sample position changed; the previous sample decode no longer applies.\n"
+    "Press Sample Decode again to check the current selection."
+)
+PREP_SAMPLE_NO_PATH_TEXT = (
+    "No video file selected. Enter the full path to one .mp4 or .mkv file above, then press "
+    "Sample Decode."
+)
+#: The sample decode reads the same drive a render reads from, so it is refused rather than queued.
+PREP_SAMPLE_RENDER_BUSY_TEXT = (
+    "⏳ A render is running. A sample decode reads the same drive the render is reading from, so it "
+    "was not started. Nothing was cancelled — wait for the render to finish, then press Sample "
+    "Decode again."
+)
+PREP_SAMPLE_VERIFY_BUSY_TEXT = (
+    "⏳ A source verification is running. It reads the same drive, so this sample decode was not "
+    "started. Nothing was cancelled — wait for the verification to finish, then press Sample "
+    "Decode again."
+)
+PREP_SAMPLE_ALREADY_RUNNING_TEXT = (
+    "⏳ A sample decode is already running. Only one runs at a time, because they read the same "
+    "drive. Nothing was started or cancelled — wait for the running sample to finish, then press "
+    "Sample Decode again."
+)
+#: The render-side refusal when a SAMPLE DECODE holds the shared mutex. A third holder means the
+#: render path can no longer say "another render is running" by elimination.
+SAMPLE_BUSY_MESSAGE = (
+    "⏳ A sample decode is running. It reads the same drive a render reads from, so this render was "
+    "not started — the sample is bounded and read-only, so it will not be long. Press Create Music "
+    "Video again once it finishes."
+)
+#: The verify-side refusal when a SAMPLE DECODE holds the mutex.
+PREP_VERIFY_SAMPLE_BUSY_TEXT = (
+    "⏳ A sample decode is running. It reads the same drive, so source verification was not "
+    "started. Nothing was cancelled — wait for the sample to finish, then press Verify Sources "
+    "again."
+)
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the NEUTRAL refusal, for the one window where the
+#: mutex is provably held but the diagnostic holder token has not been published yet.
+#
+# `acquire()` succeeding and `_mark_lock_holder()` running are two statements, so a caller that
+# fails the acquire in between reads an empty token while the lock is genuinely held. The previous
+# boolean hid that window by attributing it to a render BY ELIMINATION, which is exactly the
+# inaccuracy a third holder makes untenable. An unknown holder now says so instead of naming the
+# wrong operation: the refusal is still truthful and still terminal, it just declines to guess.
+MEDIA_BUSY_UNKNOWN_TEXT = (
+    "⏳ A bounded media operation is already running. Only one runs at a time, because they read "
+    "the same drive. Nothing was started or cancelled — wait for it to finish, then try again."
+)
+
 def get_gpu_status_info(gpu_available, gpu_info, nvenc_available):
     """GPU status info."""
     if gpu_available and nvenc_available:

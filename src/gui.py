@@ -319,6 +319,11 @@ DIRECTOR_MODEL = os.path.join(ROOT_DIR, 'bin', 'models', 'qwen3-4b-instruct-2507
 from beatsync_fork import library_prep as fork_prep
 # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification (stdlib-only fork module).
 from beatsync_fork import media_verify as fork_media_verify
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the accepted sample-decode core. Stdlib-only and
+# therefore import-safe: it spawns nothing, reads no cache and adds no import-time subprocess
+# activity. The EXECUTION seam (`probe_media_metadata` / `sample_decode_video`) is imported
+# locally in the impl, mirroring `_verify_sources_impl`.
+from beatsync_fork import media_sample as fork_media_sample
 from beatsync_fork.library_prep import initial_state as initial_prep_state
 from beatsync_fork.input_manager import InputScanError, scan_folder as scan_library_folder
 
@@ -2960,7 +2965,31 @@ RENDER_BUSY_MESSAGE = (
 # throughput and nothing else -- unlike a render, which has a hard per-clip timeout that contention
 # can actually break.
 _VERIFY_FLAG_LOCK = threading.Lock()
-_verification_running = False
+
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): WHO holds `_RENDER_LOCK` right now, or `''`.
+#
+# This replaces the `_verification_running` boolean, and the reason is a correctness one rather
+# than tidiness. With two holders a boolean was sufficient only because the render path never
+# marked itself: `_busy_message` read `False` and concluded "a render" BY ELIMINATION. A third
+# holder makes that inference false in both directions -- a render refused while a sample decode
+# ran would have claimed another render was running, and S2-A would have called a sample a render.
+#
+# So the holder is now stated, never inferred. Three facts make this safe to add:
+#
+#   * It is NOT an admission authority. `_RENDER_LOCK.acquire(blocking=False)` remains the one
+#     indivisible test-and-set that decides whether any operation may start. This token is read
+#     only AFTER an acquire has already failed, and only to word the refusal.
+#   * A missed, delayed or stale token can therefore never permit a second worker. The worst it can
+#     do is word one refusal badly, which is why the unknown case has its own honest message
+#     instead of a guess (see `MEDIA_BUSY_UNKNOWN_TEXT`).
+#   * Every holder marks immediately AFTER a successful acquire and clears immediately BEFORE the
+#     release, inside the same `finally` that releases. An exception, a `BaseException` or an
+#     abandoned generator cannot leave the token set, because the clear sits on the same path as
+#     the release it precedes -- if the mutex is free, the token is empty.
+_LOCK_HOLDER_RENDER = 'render'
+_LOCK_HOLDER_VERIFY = 'verify'
+_LOCK_HOLDER_SAMPLE = 'sample'
+_lock_holder: str = ''
 
 #: [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): per-session verification revisions.
 #
@@ -3016,24 +3045,86 @@ _verify_revisions: Dict[str, int] = {}
 _verify_active_session: str = ''
 
 
-def _mark_verification(active: bool) -> None:
-    """Publish whether the shared mutex is currently held by verification.
+def _mark_lock_holder(holder: str) -> None:
+    """Publish WHO holds the shared mutex, or `''` for nobody.
 
     Called immediately after acquiring `_RENDER_LOCK` and immediately before releasing it, so a
     reader that has just FAILED to acquire sees the correct holder. The one-statement window
-    between the two acquisitions can only mislabel a refusal message, never admit a second worker:
-    the mutex, not this flag, is the exclusion.
+    between the acquire and this call can only mislabel a refusal message, never admit a second
+    worker: the mutex, not this token, is the exclusion. That window is why `''` has its own honest
+    message rather than being folded into any particular holder.
     """
-    global _verification_running
+    global _lock_holder
     with _VERIFY_FLAG_LOCK:
-        _verification_running = bool(active)
+        _lock_holder = str(holder or '')
+
+
+def _lock_holder_now() -> str:
+    """WHO holds `_RENDER_LOCK` right now: `'render'`, `'verify'`, `'sample'` or `''` for unknown.
+
+    Two sources, both POSITIVE, neither an elimination:
+
+      * the diagnostic token, set explicitly by the verification and sample paths;
+      * the **existing** active-render slot, which is positive evidence of a render.
+
+    The render case deliberately needs no new marking in the render wrappers. `_install_active_render`
+    is called by a mutex-owning wrapper immediately after its acquire, and `_clear_active_render`
+    immediately before its release, so an installed slot means a render owns the mutex -- that is
+    the invariant `_install_active_render`'s own docstring already states, and the Cancel path only
+    ever reads or clears the slot, never installs it. Reusing it keeps `process_video_guarded` and
+    `render_selected_variants_guarded` byte-identical to the pre-S2-B implementation, which is what
+    keeps every render lifecycle, cancellation and generator-shape regression valid unchanged.
+
+    **Absence of evidence is reported as unknown, never as a render.** The old boolean read `False`
+    as "a render" because the render path never marked itself; that inference is what a third holder
+    makes false. Here, `''` plus no installed slot is the genuine one-statement window between an
+    acquire and the holder becoming observable, and it gets its own honest message.
+
+    **The two locks are taken SEQUENTIALLY and never nested**, so there is no acquisition order to
+    get wrong and no inversion is even expressible: the token is copied under `_VERIFY_FLAG_LOCK`
+    and that lock released, then the slot's presence is copied under `_ACTIVE_RENDER_SLOT_LOCK` and
+    that lock released, and only then is the decision made. Mirrors the existing read in
+    `_signal_active_render`, which copies the slot under its lock and acts outside it.
+
+    This is diagnostic only. `_RENDER_LOCK.acquire(blocking=False)` remains the sole authority on
+    whether any operation may start, so a stale, missing or delayed answer here can never admit a
+    second worker -- it can only word one refusal.
+    """
+    with _VERIFY_FLAG_LOCK:
+        token = _lock_holder
+    if token:
+        return token
+    with _ACTIVE_RENDER_SLOT_LOCK:
+        render_active = _active_render_slot is not None
+    return _LOCK_HOLDER_RENDER if render_active else ''
+
+
+def _mark_verification(active: bool) -> None:
+    """[FORK] Digital-Union (MEDIA-VERIFY-S2-A): retained verification-side spelling.
+
+    Kept as the verification path's own call so that path reads exactly as it did, while the shared
+    state underneath is now the three-way token. It is a thin alias, never a second flag.
+    """
+    _mark_lock_holder(_LOCK_HOLDER_VERIFY if active else '')
 
 
 def _busy_message() -> str:
-    """The accurate refusal for a RENDER caller that just failed to take `_RENDER_LOCK`."""
-    with _VERIFY_FLAG_LOCK:
-        running = _verification_running
-    return VERIFY_BUSY_MESSAGE if running else RENDER_BUSY_MESSAGE
+    """The accurate refusal for a RENDER caller that just failed to take `_RENDER_LOCK`.
+
+    Three named holders and one honest unknown. Nothing here is decided by elimination: before
+    S2-B, `False` was read as "a render", which was only ever true because the render path did not
+    mark itself. It now does, so an empty token means the holder has not published yet -- a real
+    window of one statement -- and that is reported as an unattributed media operation rather than
+    guessed at.
+    """
+    holder = _lock_holder_now()
+    if holder == _LOCK_HOLDER_VERIFY:
+        return VERIFY_BUSY_MESSAGE
+    if holder == _LOCK_HOLDER_SAMPLE:
+        return SAMPLE_BUSY_MESSAGE
+    if holder == _LOCK_HOLDER_RENDER:
+        return RENDER_BUSY_MESSAGE
+    return MEDIA_BUSY_UNKNOWN_TEXT
 
 
 def _verify_busy_message() -> str:
@@ -3041,11 +3132,34 @@ def _verify_busy_message() -> str:
 
     The mirror of `_busy_message`, and it exists for the same reason: telling the operator "a
     render is running" when another verification actually owns the mutex is a wrong answer, and the
-    two cases need different advice (wait for the render, versus this one is already underway).
+    cases need different advice (wait for the render, versus this one is already underway, versus a
+    sample decode is using the drive).
     """
-    with _VERIFY_FLAG_LOCK:
-        running = _verification_running
-    return PREP_VERIFY_ALREADY_RUNNING_TEXT if running else PREP_VERIFY_RENDER_BUSY_TEXT
+    holder = _lock_holder_now()
+    if holder == _LOCK_HOLDER_VERIFY:
+        return PREP_VERIFY_ALREADY_RUNNING_TEXT
+    if holder == _LOCK_HOLDER_SAMPLE:
+        return PREP_VERIFY_SAMPLE_BUSY_TEXT
+    if holder == _LOCK_HOLDER_RENDER:
+        return PREP_VERIFY_RENDER_BUSY_TEXT
+    return MEDIA_BUSY_UNKNOWN_TEXT
+
+
+def _sample_busy_message() -> str:
+    """The accurate refusal for a SAMPLE DECODE caller that just failed to take `_RENDER_LOCK`.
+
+    The third face of the same table. Added rather than reusing `_verify_busy_message` because the
+    operator is told which control to press again, and "press Verify Sources again" is the wrong
+    instruction for someone who pressed Sample Decode.
+    """
+    holder = _lock_holder_now()
+    if holder == _LOCK_HOLDER_SAMPLE:
+        return PREP_SAMPLE_ALREADY_RUNNING_TEXT
+    if holder == _LOCK_HOLDER_VERIFY:
+        return PREP_SAMPLE_VERIFY_BUSY_TEXT
+    if holder == _LOCK_HOLDER_RENDER:
+        return PREP_SAMPLE_RENDER_BUSY_TEXT
+    return MEDIA_BUSY_UNKNOWN_TEXT
 
 
 def _verify_session_key(request) -> str:
@@ -3057,6 +3171,36 @@ def _verify_session_key(request) -> str:
     """
     session = getattr(request, "session_hash", None) if request is not None else None
     return str(session) if session else "__no_session__"
+
+
+#: [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the two revision SCOPES sharing one bounded map.
+#
+# S2-A invalidates on folder/recursive; S2-B invalidates on file/seek. They are independent
+# diagnostics, so one must not invalidate the other's pending answer -- a seek edit clearing a
+# running source verification would be a wrong answer, not merely a conservative one.
+#
+# Scoping the KEY rather than adding a second map is the whole point. Every function below
+# (`_touch_verify_revision_locked`, `_verify_revision`, `_bump_verify_revision`,
+# `_begin_verify_session`, `_end_verify_session`) is key-agnostic and is reused UNCHANGED, so the
+# bound, the LRU order, the active-session pin and the R5 eviction exemption are not duplicated,
+# not re-derived and not re-proved -- they are the same code operating on a longer string.
+#
+# The R5 correctness argument survives intact because it rests on `_RENDER_LOCK`, not on the key
+# shape: at most ONE of {render, verification, sample} runs at a time, so at most one revision is
+# load-bearing at any instant, so pinning one key and skipping it during eviction is still
+# sufficient. The pinned value is simply a scoped key now.
+_SCOPE_VERIFY = 'verify'
+_SCOPE_SAMPLE = 'sample'
+
+
+def _scoped_key(session: str, scope: str) -> str:
+    """One revision key for `(session, scope)`.
+
+    `\\x00` is the separator because a Gradio `session_hash` is a hex string and the fallback
+    bucket is `__no_session__`, so neither can contain a NUL -- two scopes of one session can
+    therefore never collide, and no scope can forge another's key by naming.
+    """
+    return f"{session}\x00{scope}"
 
 
 def _touch_verify_revision_locked(session: str) -> int:
@@ -4112,7 +4256,9 @@ def _on_verify_sources_click(folder_path: str, recursive: bool,
     entirely about the third state: before it, the entry could be evicted between the second and
     third, and its absence read back as "revision 0, nothing changed".
     """
-    session = _verify_session_key(request)
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): scoped to 'verify' so a sample-decode input edit
+    # cannot invalidate this verification, and this folder edit cannot invalidate a sample.
+    session = _scoped_key(_verify_session_key(request), _SCOPE_VERIFY)
 
     if not _RENDER_LOCK.acquire(blocking=False):
         # Names the real holder: a render, or another verification already underway. Nothing is
@@ -4171,8 +4317,138 @@ def _on_verify_invalidate(request: gr.Request = None) -> str:
     folder edit here must not invalidate a legitimate verification running in a different browser
     session.
     """
-    _bump_verify_revision(_verify_session_key(request))
+    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the 'verify' scope only -- a folder edit must not
+    # invalidate a sample decode that is running for a different question.
+    _bump_verify_revision(_scoped_key(_verify_session_key(request), _SCOPE_VERIFY))
     return PREP_VERIFY_STALE_TEXT
+
+
+# ---------------------------------------------------------------------------
+# [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample-decode diagnostic.
+# ---------------------------------------------------------------------------
+#
+# S2-A asks whether a library's container metadata can be read; this asks whether FFmpeg can
+# actually produce output frames at one position in one video. Everything that decides anything is
+# the ACCEPTED P1 core: `run_sample_check` orchestrates, `classify_decode` decides the status,
+# `parse_progress_output` reads the evidence and `format_sample_report` writes the report. This
+# layer contributes no classification, no stream selection, no progress parsing and no subprocess
+# handling -- and it deliberately passes NO resource arguments, so there is no parameter for a
+# widget value to widen (see `_sample_decode_impl`).
+def _sample_decode_impl(video_path: str, seek_seconds) -> str:
+    """Run one bounded sample decode and return the operator report. Nothing else.
+
+    Takes no `gr.State` and returns none, exactly like `_verify_sources_impl`: a sample is a pure
+    read of the disk and owns no session state.
+
+    The resource policy is enforced BY OMISSION, which is stronger than validation: this calls
+    `run_sample_check` with `probe=` and `decode=` only, so `requested_frames`,
+    `decode_timeout` and `budget_seconds` all come from the module's own constants
+    (30 frames / 20 s probe / 30 s decode / 60 s budget, one source, one worker). There is no
+    argument here for a GUI value to reach, and no widget exists that could supply one.
+
+    Validation is also inherited rather than rewritten. `run_sample_check` already rejects a
+    non-string, empty or wrong-suffix path, a path that is not a regular file, and a seek that is
+    not finite and non-negative -- each as `SAMPLE_INVALID_REQUEST` with no child started. A seek
+    at or past the selected stream's reported duration is `SAMPLE_SEEK_OUT_OF_RANGE`. Nothing is
+    clamped, so the report's requested position is always the one the operator asked for.
+    """
+    from ffmpeg_processing import probe_media_metadata, sample_decode_video
+
+    path = (video_path or "").strip() if isinstance(video_path, str) else video_path
+    if isinstance(path, str) and not path:
+        return PREP_SAMPLE_NO_PATH_TEXT
+
+    verdict = fork_media_sample.run_sample_check(
+        path, seek_seconds,
+        probe=probe_media_metadata,
+        decode=sample_decode_video,
+    )
+    return fork_media_sample.format_sample_report(verdict)
+
+
+def _on_sample_decode_click(video_path: str, seek_seconds,
+                            request: gr.Request = None) -> str:
+    """The Sample Decode click: take the shared render mutex, or refuse immediately.
+
+    Structurally identical to `_on_verify_sources_click`, and that is the point -- it is the third
+    holder of ONE mutex, not a new exclusion mechanism. A single non-blocking `acquire` is both the
+    test and the acquisition, so there is no window in which a render, a verification or a second
+    sample could run alongside this one. A render arriving while this holds the lock hits the
+    EXISTING non-blocking acquire in `process_video_guarded` / the batch wrapper and refuses;
+    nothing in the render path needed a new check.
+
+    The refusal is *immediate* only because this event has no shared `concurrency_id` and
+    `concurrency_limit=None` -- the same wiring S2-A's R3 correction established after measuring
+    that a shared lane leaves the event QUEUED and then runs it automatically against click-time
+    values. A refusal here is terminal: it performs no work and schedules nothing.
+
+    The release is in `finally`, so an exception, an early return or an abandoned request cannot
+    leave the application permanently refusing renders, and the holder token is cleared on the same
+    path immediately before that release.
+
+    `request` is Gradio's injected `gr.Request`, not a widget: it is read for `session_hash` only,
+    defaults to `None` so the function stays callable without Gradio, and never reaches `gr.State`.
+    """
+    # Scoped to 'sample': this session's own file/seek edits invalidate it, a folder edit does not,
+    # and another session's edits never do.
+    session = _scoped_key(_verify_session_key(request), _SCOPE_SAMPLE)
+
+    if not _RENDER_LOCK.acquire(blocking=False):
+        # Names the real holder -- render, verification, another sample, or honestly unknown for
+        # the one-statement window before a holder publishes itself. Nothing is pinned and no
+        # revision is captured on this path: a refused click leaves no state at all.
+        return _sample_busy_message()
+    _mark_lock_holder(_LOCK_HOLDER_SAMPLE)
+    # Pinned and captured together, AFTER the mutex is held and BEFORE any work, so this session's
+    # revision cannot be evicted by other sessions' churn while the sample it belongs to is still
+    # running. `stale` is decided inside the same `finally` that drops the pin.
+    revision = 0
+    try:
+        revision = _begin_verify_session(session)
+        try:
+            report = _sample_decode_impl(video_path, seek_seconds)
+        except Exception as exc:
+            # Total: a sample that raised must report, not vanish behind Gradio's generic error.
+            import traceback
+            traceback.print_exc()
+            report = (f"SAMPLE DECODE FAILED\n  {type(exc).__name__}: {exc}\n\n"
+                      f"No analysis, cache change, media change or render was performed.")
+    finally:
+        # The staleness decision happens HERE, while the entry is still pinned, and the pin is
+        # released by the same locked call. Reached on every terminal path including a
+        # `BaseException` propagating out, so neither the pin, the holder token nor the mutex can
+        # outlive this sample.
+        stale = _end_verify_session(session, revision)
+        _mark_lock_holder('')
+        _RENDER_LOCK.release()
+
+    # The file/seek change listeners run in their own Gradio lane, so one can complete WHILE this
+    # is working. Publishing now would overwrite the newer "selection changed" notice with an older
+    # answer about a file or position that is no longer selected. The failure text is withheld for
+    # the same reason: it names a path too.
+    if stale:
+        return PREP_SAMPLE_STALE_TEXT
+    return report
+
+
+def _on_sample_invalidate(request: gr.Request = None) -> str:
+    """Clear the sample report when the video file or the seek position changes.
+
+    A separate listener rather than an entry in `prep_outputs` or the S2-A outputs: this writes
+    ONLY the sample textbox, so neither the preparation state machine nor the verification report
+    can be moved by it.
+
+    It bumps this SESSION's SAMPLE revision, which is what stops a sample already in flight from
+    publishing its older answer over this notice. Scoped on purpose, twice over: session-scoped so
+    an edit here cannot invalidate a sample running in a different browser session, and
+    sample-scoped so it cannot invalidate a source verification, which answers a different
+    question about a different selection.
+
+    It performs NO FFprobe, no decode, no stat and no scan -- a change listener must never start
+    disk work, which is why metadata is only ever read inside the click handler.
+    """
+    _bump_verify_revision(_scoped_key(_verify_session_key(request), _SCOPE_SAMPLE))
+    return PREP_SAMPLE_STALE_TEXT
 
 
 def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
@@ -4983,6 +5259,68 @@ def create_ui() -> gr.Blocks:
                         elem_id='prep-verify-report-box',
                     )
 
+                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample decode.
+                    # Immediately after Verify Sources because it is the natural follow-up
+                    # question -- "the metadata reads fine, but can FFmpeg actually produce frames
+                    # here?" -- and it is deliberately a DIFFERENT question, on one file rather
+                    # than the whole library.
+                    #
+                    # Like the rest of this accordion it is absent from `source_outputs` and
+                    # `prep_outputs`: it cannot touch the Create Music Video gate and cannot move
+                    # the preparation state machine. Also ALWAYS interactive, for the same reason
+                    # Verify Sources is -- the render mutex, not a disabled button, is what
+                    # prevents it running during a render, because interactivity is per-session UX
+                    # while the mutex is process-global truth.
+                    #
+                    # One file, one position, one explicit button. No dropdown of the library (a
+                    # ~2,000-source folder on a mechanical drive would have to be enumerated to
+                    # build it), no browser upload (it would copy large media into a temp folder),
+                    # no frame-count control and no timeout control.
+                    gr.Markdown(INFO_PREP_SAMPLE)
+                    sample_path = gr.Textbox(
+                        label=LABEL_PREP_SAMPLE_PATH,
+                        placeholder=PLACEHOLDER_SAMPLE_VIDEO,
+                        elem_id='prep-sample-path',
+                    )
+                    # Seconds, never a frame number: the diagnostic's own contract forbids
+                    # frames/fps arithmetic, and the selected stream's reported duration is what
+                    # decides whether a position is out of range.
+                    #
+                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
+                    # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
+                    # client-side courtesy while `run_sample_check` owns the real rejection. GUI
+                    # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
+                    # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
+                    # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
+                    # `_on_sample_decode_click` was ever entered. The operator saw a framework error
+                    # toast instead of the diagnostic's own report, and the core's
+                    # finite-and-non-negative branch was unreachable from this widget.
+                    #
+                    # Removing the bound hands the decision back to the accepted core, which refuses
+                    # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
+                    # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
+                    # work. No GUI-side validation, clamping or normalisation is added here: a
+                    # second opinion about what a valid seek is would be exactly the duplication
+                    # this integration exists to avoid.
+                    sample_seek = gr.Number(
+                        value=1.0,
+                        step=0.5,
+                        label=LABEL_PREP_SAMPLE_SEEK,
+                        elem_id='prep-sample-seek',
+                    )
+                    sample_btn = gr.Button(
+                        LABEL_PREP_SAMPLE, variant='secondary',
+                        elem_id='prep-sample-button',
+                    )
+                    sample_report = gr.Textbox(
+                        label=LABEL_PREP_SAMPLE_REPORT,
+                        value=PREP_SAMPLE_INITIAL_TEXT,
+                        interactive=False,
+                        lines=14,
+                        max_lines=28,
+                        elem_id='prep-sample-report-box',
+                    )
+
             with gr.Column(scale=1):
                 gr.Markdown('### 📺 Output')
                 status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
@@ -5471,6 +5809,41 @@ def create_ui() -> gr.Blocks:
             fn=_on_verify_invalidate,
             inputs=None,
             outputs=[prep_verify_report],
+        )
+
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the sample-decode event, wired exactly like
+        # the Verify event above and for the same MEASURED reason. No `concurrency_id`, because a
+        # shared lane is what made S2-A's handler never reach its mutex -- Gradio's
+        # `Queue.get_events()` skips a group at its limit and leaves the event queued, then runs it
+        # automatically once the render finishes, against the values captured at click time.
+        # `concurrency_limit=None` rather than the default of 1, because a lane of 1 would re-create
+        # that defect one step in: a SECOND Sample Decode click would queue behind the first instead
+        # of being refused by the mutex. A refusal is microseconds, so unlimited costs nothing --
+        # the mutex, not the lane, is what bounds the disk reads to one at a time.
+        #
+        # Deliberately NOT `CANCEL_CONCURRENCY_ID`: that lane belongs to Cancel and is untouched.
+        #
+        # `request: gr.Request` is injected by annotation and is deliberately absent from `inputs`.
+        sample_btn.click(
+            fn=_on_sample_decode_click,
+            inputs=[sample_path, sample_seek],
+            outputs=[sample_report],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        # Separate `change` listeners, writing ONLY the sample textbox: a changed file or position
+        # makes the old sample describe a different selection, so it is visibly cleared. They also
+        # bump this session's SAMPLE revision, which keeps an in-flight sample from publishing over
+        # this notice. Neither listener does any disk work.
+        sample_path.change(
+            fn=_on_sample_invalidate,
+            inputs=None,
+            outputs=[sample_report],
+        )
+        sample_seek.change(
+            fn=_on_sample_invalidate,
+            inputs=None,
+            outputs=[sample_report],
         )
 
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the

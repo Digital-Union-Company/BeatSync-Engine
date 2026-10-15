@@ -88,6 +88,24 @@ automatically.
   click pins nothing and no terminal path can leak a pin. The pin is a plain string and never
   reaches `gr.State`. Full contract: `.claude/rules/source-verification.md`.
 
+  **Three holders share that one mutex, and the refusal may not guess (S2-B P2).** Sample Decode
+  joined renders and verification on `_RENDER_LOCK`, which broke the two-holder boolean:
+  `_verification_running == False` used to mean "a render" **by elimination**, so a render refused
+  during a sample would have claimed another render was running. `_lock_holder_now()` replaces it
+  and reports `render` / `verify` / `sample` / unknown from two **positive** sources — the explicit
+  diagnostic token, and the **existing** `_active_render_slot` as evidence of a render. Reusing the
+  slot is what keeps `process_video_guarded` and `render_selected_variants_guarded`
+  **byte-identical** to the pre-S2-B implementation, so every render lifecycle, cancellation and
+  generator-shape regression in `tests/test_gui_progress_seam.py`,
+  `tests/test_render_failure_classification.py` and `tests/test_delivery_share.py` stays valid
+  unchanged — adding holder marks to those wrappers instead was measured to break 62 tests across
+  those harnesses. No token and no slot is reported as unknown with neutral text, never as a
+  render; the two attribution locks are taken sequentially and never nested; and the lookup is
+  diagnostic only, so `_RENDER_LOCK` remains the sole admission authority. The sample event has its
+  own unlimited lane for the same R3 reason as Verify, writes only `sample_report`, and passes no
+  frame/timeout/budget argument to the core at all. Full contract:
+  `.claude/rules/source-verification.md`.
+
   **The mutex protects the render WORKER's lifetime, not the Gradio generator frame (R1).**
   `process_video` starts a daemon thread; if its generator is abandoned — `close()`, a dropped
   event, an exception while draining — the frame unwinds immediately. Without a finalizer the
