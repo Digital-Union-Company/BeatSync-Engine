@@ -5284,12 +5284,26 @@ def create_ui() -> gr.Blocks:
                     )
                     # Seconds, never a frame number: the diagnostic's own contract forbids
                     # frames/fps arithmetic, and the selected stream's reported duration is what
-                    # decides whether a position is out of range. `minimum=0` is a client-side
-                    # courtesy only -- the authoritative rejection of a negative or non-finite
-                    # value lives in `run_sample_check`.
+                    # decides whether a position is out of range.
+                    #
+                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
+                    # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
+                    # client-side courtesy while `run_sample_check` owns the real rejection. GUI
+                    # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
+                    # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
+                    # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
+                    # `_on_sample_decode_click` was ever entered. The operator saw a framework error
+                    # toast instead of the diagnostic's own report, and the core's
+                    # finite-and-non-negative branch was unreachable from this widget.
+                    #
+                    # Removing the bound hands the decision back to the accepted core, which refuses
+                    # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
+                    # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
+                    # work. No GUI-side validation, clamping or normalisation is added here: a
+                    # second opinion about what a valid seek is would be exactly the duplication
+                    # this integration exists to avoid.
                     sample_seek = gr.Number(
                         value=1.0,
-                        minimum=0,
                         step=0.5,
                         label=LABEL_PREP_SAMPLE_SEEK,
                         elem_id='prep-sample-seek',

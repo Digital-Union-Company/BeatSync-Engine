@@ -2770,14 +2770,41 @@ def test_the_sample_report_textbox_is_read_only(p2_gui_tree):
 
 
 def test_the_seek_control_is_seconds_with_a_conservative_default(p2_gui_tree):
-    source = ast.unparse(p2_gui_tree)
-    block = source[source.index("sample_seek = gr.Number"):source.index("sample_btn = gr.Button")]
-    assert "value=1.0" in block, block
-    assert "minimum=0" in block, block
-    assert "LABEL_PREP_SAMPLE_SEEK" in block
+    """Seconds, default 1.0, step 0.5 -- and deliberately NO `minimum`.
+
+    [FORK] Digital-Union (runtime R1 MINOR-1): this asserted `minimum=0` on the theory that a
+    widget bound is a client-side courtesy. GUI runtime acceptance measured otherwise: on the
+    pinned gradio==6.19.0, `Number.preprocess` enforces the bound SERVER-SIDE, so a negative seek
+    raised `gradio.exceptions.Error` before `_on_sample_decode_click` ran -- the operator got a
+    framework toast instead of the diagnostic's report, and the core's own
+    finite-and-non-negative branch was unreachable from the UI. The bound is gone, so the keyword
+    must now be ABSENT, and that absence is what keeps `SAMPLE_INVALID_REQUEST` reachable.
+
+    Read from the widget's own `ast.Call` keywords rather than a text window, so a `minimum`
+    reappearing anywhere in the call is caught no matter how it is spelled or ordered.
+    """
+    call = None
+    for node in ast.walk(p2_gui_tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "sample_seek" for t in node.targets):
+            call = node.value
+    assert call is not None and ast.unparse(call.func) == "gr.Number", \
+        "the seek control must remain a gr.Number"
+    keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert keywords.get("value") == "1.0", keywords
+    assert keywords.get("step") == "0.5", keywords
+    assert keywords.get("label") == "LABEL_PREP_SAMPLE_SEEK", keywords
+    assert keywords.get("elem_id") == "'prep-sample-seek'", keywords
+    assert "minimum" not in keywords, (
+        "a server-side enforced minimum pre-empts the core's SAMPLE_INVALID_REQUEST; "
+        "the core owns seek validation")
+    assert "maximum" not in keywords, "a maximum would pre-empt SAMPLE_SEEK_OUT_OF_RANGE the same way"
+    # The widget must not grow into a resource control either.
+    assert set(keywords) == {"value", "step", "label", "elem_id"}, keywords
     # A frame-number control would require frames/fps arithmetic, which the core forbids.
+    rendered = ast.unparse(call).lower()
     for forbidden in ("frame", "fps"):
-        assert forbidden not in block.lower(), f"the seek control mentions {forbidden}"
+        assert forbidden not in rendered, f"the seek control mentions {forbidden}"
 
 
 def test_an_empty_path_is_refused_before_any_core_call(p2_gui_tree):

@@ -20,6 +20,40 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P2 runtime R1 MINOR-1: seek validation reaches the core)
+
+GUI runtime acceptance on the pinned `gradio==6.19.0` found one defect, and it was only findable at
+runtime. The Sample Decode seek control carried `minimum=0` on the stated theory that a widget bound
+is a client-side courtesy while `run_sample_check` owns the authoritative rejection. **That theory
+was wrong.** Gradio enforces the bound server-side: `Number.preprocess` calls
+`raise_if_out_of_bounds`, so entering `-5` raised
+`gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` **before
+`_on_sample_decode_click` was entered at all**. The operator therefore saw a framework error toast
+instead of the diagnostic's own report, and the accepted core's finite-and-non-negative branch was
+unreachable from the UI — a status the offline suite proves reachable and the GUI could never show.
+
+`minimum=0` is removed from that one widget. Nothing replaces it: no GUI-side validation, clamping
+or normalisation is added, because a second opinion about what a valid seek is would be exactly the
+duplication this integration exists to avoid. The decision returns to the accepted core, which
+refuses a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any `stat`, FFprobe or
+FFmpeg child** — so no resource policy is widened and no work is started. `value=1.0`, `step=0.5`,
+the label and the `elem_id` are unchanged, as are every other `gr.Number` in the application, the
+event registrations, the handler, the mutex and holder attribution, the scoped revision map and the
+30-output-frame / 20 s probe / 30 s decode / 60 s budget limits.
+
+The regression test that asserted `minimum=0` now asserts its **absence**, reading the widget's own
+`ast.Call` keywords instead of a text window so a bound reappearing in any spelling or order is
+caught; it also pins out `maximum`, which would pre-empt `SAMPLE_SEEK_OUT_OF_RANGE` in the same way,
+and asserts the keyword set is exactly `{value, step, label, elem_id}` so the control cannot grow
+into a resource knob. The core tests proving a negative and non-finite seek are refused with zero
+decode children are untouched. No test was added, removed, skipped or weakened: the suite stays at
+6338 collected / 6330 passed / 8 skipped.
+
+Verified in a real browser against the isolated app: seek `-5` now returns
+`SAMPLE_INVALID_REQUEST` in the report textbox with no Gradio error toast, zero FFprobe and zero
+FFmpeg children, and the mutex, holder token and revision pin all released; the positive control at
+seek `1.0` still produces `SAMPLE_OUTPUT_FRAMES_OK` with 30 of 30 output frames.
+
 ### Added — 2026-10-15 (MEDIA-VERIFY-S2-B P2: the Sample Decode GUI integration)
 
 The accepted sample-decode diagnostic is now reachable from the UI. **Sample Decode — Check One
