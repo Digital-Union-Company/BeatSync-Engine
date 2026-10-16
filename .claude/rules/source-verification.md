@@ -53,6 +53,72 @@ decode files, repair or invalidate cache, retry a render, or change Stage 6.
   `classify_library_sources` returns `ai_cache_disabled`, no per-source cache verdict can exist, so
   none is invented. Printing "0 reusable" there would be a fabricated verdict; a test forbids it.
 
+### The classification vocabulary is owned by `library_prep` (R2)
+
+The cache section **renders**; it does not classify. Its input is whatever
+`video_analysis.classify_library_sources()` produced, and that producer emits the **values** of
+`library_prep.PrepStatus` / `NeedReason` — `prepared`, `needs_analysis`,
+`source_identity_unavailable`, `new_or_changed`, `incomplete_or_invalid`. `gui.py` passes the
+classifier's list straight through, so there is no normalisation layer and the two sides must agree
+exactly.
+
+`media_verify` therefore **imports those enums and compares against `.value`**. Five comparisons
+depend on it: the two reason counts (`New or changed`, `Incomplete / invalid record`) and the three
+per-source detail filters (new-or-changed, incomplete, identity-unavailable).
+
+This is a correctness contract, not a style note. R2 fixed those five comparisons, which had been
+written against the enum *member names* (`"NEW_OR_CHANGED"`). Uppercase never matched, so every one
+of them was unreachable for genuine data: both reason counts always rendered `0`, all three detail
+blocks were always empty, and the report consequently named **no** affected path while asserting
+that every source had a reusable record — the opposite of the truth, on any library that was not
+already wholly prepared. Three rules follow:
+
+- **Never restate a status as a literal here.** A second spelling is a second source of truth, and
+  this module has no authority to mint one. `beatsync_fork` modules may import each other (see
+  `fork-package.md`); only the *upstream runtime* is forbidden.
+- **Never add a layer that accepts both spellings.** Tolerating input the producer cannot emit buys
+  nothing and hides the next drift.
+- **Fixtures must be production-shaped**, built from `PrepStatus` / `NeedReason`. The uppercase
+  fixture is what let four MAJOR findings survive a fully green suite: it agreed with the broken
+  comparisons and with nothing in production. It is a shape *neither* consumer handles —
+  `SourceClassification.from_mapping` fail-closes it to `SOURCE_IDENTITY_UNAVAILABLE` and discards
+  the reason. Pin fidelity by **enum round-trip or AST**, never by scanning source text: a text
+  scan fails on the documentation that explains the historical spelling, which this repository has
+  shipped four times.
+
+A recognised status renders as its member name in the cross-phase sentence (`Classified as
+PREPARED`); an unrecognised value is passed through **unchanged** so it stays visibly unknown
+rather than being promoted to a recognised cache state.
+
+### A positive cache claim requires affirmative evidence (R2)
+
+`Every source has a reusable Stage-5 cache record.` is a universal claim about the whole library,
+and so is its qualified cross-phase variant (`…had a reusable … when it was classified`). Both are
+gated on `_all_sources_prepared`, which requires **all** of:
+
+- a non-empty classification set and a folder source count greater than zero;
+- agreement between the folder count, the classifier's `source_count` and the number of
+  classifications — a partial or misaligned list describes a subset, and a library-wide claim read
+  off a subset is a statistic nobody computed (`PrepScanResult.is_fully_prepared` refuses the same
+  extrapolation);
+- every item's status actually `PrepStatus.PREPARED.value`;
+- `prepared_count` equal to the item count, with `needs_analysis_count` and `unavailable_count`
+  both zero.
+
+The predicate is total: unknown or malformed input yields `False`, never an exception and never a
+claim. **Never gate this on the absence of populated error lists** — the pre-R2 spelling
+(`if not (changed_rows or incomplete_rows or unavailable_rows)`). Three empty lists are also what
+an unrecognised vocabulary, a missing key and a *zero-source library* produce, and none of those is
+evidence of reuse; a valid folder containing no supported video printed the positive sentence for
+exactly that reason. Absence of evidence is not evidence, which is the same principle this rule
+already states for the sample decode: *the sole positive status may never rest on a number no
+terminal block emitted*.
+
+**Deferred MINOR-3.** Arithmetically contradictory aggregate counts are still printed **verbatim**
+with no dedicated integrity banner, because reconciling them in the report would publish a
+classification nobody ran. The affirmative predicate only ensures such totals can never *earn* a
+positive claim. Adding a reconciliation mechanism needs its own authorisation.
+
 ### Bounds — all of them load-bearing
 
 - `MAX_PROBE_WORKERS = 4`, a hard cap, with `DEFAULT_PROBE_WORKERS = 4`. D0 measured a 41-file
@@ -243,7 +309,10 @@ re-analysed in response.
 - With a cross-phase change present, `Every source has a reusable Stage-5 cache record.` is
   withdrawn in favour of the "…when it was classified, but the inconclusive source(s) above changed
   since" wording. `No metadata problems found in any source.` cannot appear either, because
-  `CHANGED_DURING_CHECK` is a problem status.
+  `CHANGED_DURING_CHECK` is a problem status. Since R2 that substitution happens **only** when the
+  classification actually supports a library-wide claim: the qualified sentence is still universal,
+  so a mixed classification plus a cross-phase change yields **neither** sentence rather than being
+  upgraded into the historical one. See *A positive cache claim requires affirmative evidence*.
 - `STATUS: COMPLETE` is about probe **coverage** and stays accurate, so `VerificationRun.complete`
   is deliberately unchanged. An `INCONCLUSIVE:` line sits next to the banner with both window
   counts, because a complete sweep is not the claim "everything is fine as it stands".
