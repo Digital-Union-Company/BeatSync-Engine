@@ -20,6 +20,109 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-16 (Random Freestyle V2: a sixth section style that generates)
+
+Freestyle V1 asked the user to assign one of four named presets to each of ten section types by
+hand, and shipped with every dropdown on `Base`. V2 adds a sixth choice and makes it the default:
+
+```
+Base                 inherit the live global control            (V1, unchanged)
+Balanced / Cinematic / Dynamic / High Energy
+                     the four named recipes                     (V1, unchanged)
+Random               GENERATE this section's five numbers        <- V2, now the default
+```
+
+**`Random` is a seeded generator, not a model.** It runs no inference, loads no weights and asks
+nothing of the local text model — it is arithmetic over a stable pseudorandom stream, and it is
+labelled Random Freestyle everywhere rather than AI. A future AI-assisted section director is a
+separate feature with a separate contract.
+
+**It generates real numbers, not a preset pick.** Each section type draws its own values for the
+five permitted controls inside a *character band*: calmer intros and outros, harder drops and
+finales, near-neutral `body` (Stage 3's label for a track it could not divide). Bands overlap so two
+seeds differ audibly without either becoming wrong, and none spans the full 0-100 — an
+unconstrained draw is what makes "random" feel broken rather than experimental. A test pins that a
+generated intro stays calmer than a generated drop at every seed.
+
+**Reproducible, and domain-separated.** Generation is a pure function of `(seed, section_type)`. The
+stream is seeded with a *string*, because CPython derives `random.Random(str)` through SHA-512 — not
+through `hash()`, which PYTHONHASHSEED randomises per process; a tuple seed would have been exactly
+that trap. Each section type draws from its own stream, so the planner's `_stable_rng` sequence is
+untouched and adding a section type cannot shift the numbers another type already produced.
+
+**`Surprise me`** rolls a new Variation Seed through the existing `variation.random_seed()` and
+previews what the generated sections become. It **does not rewrite the dropdowns**, and that is the
+central UX decision: the dropdown is the user's *intent*, where `Random` means "this may be
+regenerated" and a named style means "I fixed this". Replacing a `Random` entry with the concrete
+style it produced would destroy that distinction and make the next press a no-op for that section.
+So the dropdowns are an input to the handler and never an output — which also keeps Freestyle's
+"nothing ever writes a Freestyle widget programmatically" invariant intact. Manual selections never
+reach the generator at all, so regeneration cannot disturb them by construction rather than by care.
+
+Because generated values are a pure function of the **global** Variation Seed, "give me a different
+roll" and "move the seed" are necessarily the same action; the button's help text says so plainly.
+No Freestyle-local seed was introduced — V1 kept the Variation Seed global so the one number a user
+writes down still describes the whole render, and `freestyle_seed` stays banned by name.
+
+**`freestyle.py` is byte-for-byte unchanged.** The generator is a sibling module,
+`beatsync_fork/freestyle_random.py`, because `test_freestyle.py` pins that module's **exact** import
+set and scans its source for forbidden substrings — a generator needs a pseudorandom import that pin
+forbids. Keeping V1 untouched means every guarantee its suite already proves (the five-field record,
+the structurally absent Micro Cuts and Variation Seed, canonical ordering, the one-way dependency on
+`presets`) keeps holding without being re-argued.
+
+Resolution happens once, at the one existing conversion `auto_mode._resolve_freestyle`, which gained
+a `seed` parameter defaulting to the legacy `0` so every pre-V2 caller keeps its signature and its
+result. Stage 4 and Stage 6 receive a single already-resolved declaration off `beat_info` and neither
+learns that a generator exists. Repeated section types still share one rule
+(`REPEATED_SECTION_POLICY` unchanged): there is one draw for `drop`, and every drop in the track uses
+it — per **type**, never per occurrence.
+
+Unchanged: Freestyle OFF output, every manual Freestyle behaviour (a screen with no `Random` entry
+produces exactly V1's declaration, at any seed), the creative presets and global sliders, Variant Lab
+and AI Director contracts, Stage-5 cache identity and Qwen analysis, source confirmation and render
+safety, and the render/output paths. `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3` and
+`ANALYSIS_VERSION` stays `auto_av_analysis_v8_llama_vulkan_batched`.
+
+Two pinned seam matrices were extended by **exactly one entry each**, by exact list rather than
+relaxed to containment, following the precedent AI Director V1 set: the Variation Seed writer matrix
+(five → six, adding `surprise_btn.click`) and the `random_seed()` minting-site list in
+`test_variant_lab.py` (three → four, adding `_on_surprise_me`). Both additions are *surfaced* draws —
+the seed lands in the visible Variation Seed box and is previewed in the same response.
+
+**R1 — the summary told the opposite of the truth, and it was the default screen.**
+`_on_freestyle_change` still resolved the screen through V1's
+`FreestyleDeclaration.from_styles`, whose `override_from_style("Random")` answers `None` because
+`Random` is not a preset name. Ten Random sections therefore read as ten *Base* sections, and the
+panel printed *"every section is set to Base — this render is exactly what it would be with
+Freestyle off"* while `auto_mode._resolve_freestyle` was building ten active generated rules. Since
+V2 made `Random` the default, every user enabling Freestyle would have seen it. Found by independent
+review.
+
+The fix is a V2 formatter, `freestyle_random.summary_text(enabled, styles)`. It takes the **styles**
+rather than a declaration, because once a `Random` section is generated its rule is indistinguishable
+from a hand-picked one — a declaration cannot say which sections will be regenerated. It reuses the
+V2 generator as the single source of truth and duplicates none of its logic.
+
+**It prints no generated number.** Values depend on the live Variation Seed, which has six
+legitimate writers, so a number copied into the live panel would stop being true the moment any of
+them fired. A `Random` row names its *source* instead. Numbers appear only in `describe_resolved`,
+reached from Surprise me, which states the exact seed that produced them. Like V1's formatter it
+takes **no global control as an argument**, so "the read-out cannot print a stale global" stays
+structural; a test pins that with string literals blanked, since the user-facing copy legitimately
+mentions the seed while explaining where values come from.
+
+Also corrected: Surprise me with Freestyle **off** claimed *"this render is unchanged"*. False in the
+half that matters — the Variation Seed is global and the button really did move it, so the next
+ordinary render varies too; only the section rules are inactive. It now reports the new seed and says
+exactly that.
+
+No `variation_seed.change` handler was added, deliberately: Gradio fires `.change()` on programmatic
+writes too, so one would re-render the summary immediately after Surprise me wrote the seed and
+clobber the preview it had just produced — the feedback-loop failure mode, avoided rather than
+debugged later. Sixteen regression tests reproduce the defect itself (summary versus the
+declaration the renderer actually uses, across disabled / all-Random / mixed / all-Base screens)
+rather than only asserting which widgets exist.
 ### Added — 2026-10-16 (Stage-6 P3: shot variety in the final GUI panel)
 
 The planner's three shot diagnostics now appear in the success panel:

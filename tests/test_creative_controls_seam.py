@@ -685,16 +685,22 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
             f"{generator} must write no execution widget — generating is not applying")
 
 
-def test_the_variation_seed_writer_matrix_is_exactly_five_registrations():
-    """**Measured from main and extended by exactly one (AI Director V1).**
+def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
+    """**Measured from main and extended by exactly one, twice.**
 
     Before the Director the seed had four writers: Randomize, and the three Variant Lab
     registrations that write it through `variant_lab_outputs`. Director Apply is a fifth
     legitimate writer, because a proposal *is* a `CreativeRecipe` and a recipe carries the
     Variation Seed.
 
+    **Random Freestyle V2 adds the sixth: `surprise_btn.click`.** Generated section values are a
+    pure function of the global Variation Seed, so "give me a different roll" and "move the seed"
+    are necessarily the same action — which is why the button's own help text says so plainly. The
+    alternative, a Freestyle-local seed, is exactly the second seed V1 refused to introduce, and
+    `freestyle_seed` stays banned by name below.
+
     An exact sorted list, never a containment check, and never inferred from memory — the
-    indirection through `variant_lab_outputs` / `director_apply_outputs` is resolved, so a sixth
+    indirection through `variant_lab_outputs` / `director_apply_outputs` is resolved, so a seventh
     writer hidden behind one more list cannot arrive unreviewed.
     """
     writers = _writers_of(_gui_tree(), "variation_seed")
@@ -703,7 +709,8 @@ def test_the_variation_seed_writer_matrix_is_exactly_five_registrations():
                                "apply_variant_btn.click",
                                "generate_variant_btn.click",
                                "new_variant_btn.click",
-                               "randomize_btn.click"], writers
+                               "randomize_btn.click",
+                               "surprise_btn.click"], writers
     assert "generate_director_btn.click" not in writers, (
         "generating a proposal must not move the Variation Seed")
     assert "generate_variants_btn.click" not in writers
