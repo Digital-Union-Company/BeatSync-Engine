@@ -2740,13 +2740,33 @@ def test_the_sample_touches_no_cache_qwen_analysis_or_render(p2_gui_tree):
 
 
 def test_the_sample_controls_sit_inside_the_preparation_accordion(p2_gui_tree):
-    source = ast.unparse(p2_gui_tree)
-    accordion_at = source.index("gr.Accordion(label=LABEL_PREP_SECTION, open=False)")
-    sample_at = source.index("elem_id='prep-sample-button'")
-    verify_at = source.index("elem_id='prep-verify-report-box'")
-    output_at = source.index("### 📺 Output")
-    assert accordion_at < verify_at < sample_at < output_at, (
-        "the sample block must follow Verify Sources and stay inside the accordion")
+    """Amended by GUI Refresh A, and STRENGTHENED rather than relaxed.
+
+    This used to bound the block with `source.index("### 📺 Output")`, which worked only because
+    the Output column happened to follow the preparation accordion in source order. The refresh
+    moved Output into the Quick Render tab, so that anchor stopped measuring containment at all.
+
+    Containment is now read off the AST: the two elem_ids must appear inside the subtree of the
+    `with gr.Accordion(label=LABEL_PREP_SECTION, ...)` statement itself. That is the property the
+    test is named for, it no longer depends on what follows the accordion, and no future layout
+    move can make it pass vacuously.
+    """
+    accordion = None
+    for node in ast.walk(p2_gui_tree):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            rendered = ast.unparse(item.context_expr)
+            if "gr.Accordion" in rendered and "LABEL_PREP_SECTION" in rendered:
+                accordion = node
+    assert accordion is not None, "no Media Library Preparation accordion"
+
+    inside = ast.unparse(ast.Module(body=accordion.body, type_ignores=[]))
+    assert "elem_id='prep-verify-report-box'" in inside, "Verify Sources left the accordion"
+    assert "elem_id='prep-sample-button'" in inside, "Sample Decode left the accordion"
+    assert inside.index("elem_id='prep-verify-report-box'") \
+        < inside.index("elem_id='prep-sample-button'"), \
+        "the sample block must follow Verify Sources"
 
 
 def test_the_sample_button_is_always_interactive(p2_gui_tree):

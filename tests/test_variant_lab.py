@@ -873,14 +873,20 @@ def test_no_cli_variant_lab_flag_was_added():
 
 
 def test_the_variant_lab_accordion_exists_and_is_collapsed():
+    """Amended by GUI Refresh A: the bounding anchors moved from the `### 🎨 Creative Direction`
+    group heading and the `Processing Mode` heading to the Creative Studio / Advanced Tools tabs,
+    which is the same containment over a tighter span. The lab stays COLLAPSED — it is the one
+    block the refresh deliberately left shut, because it is large, detailed configuration rather
+    than an entry point someone could overlook to their cost.
+    """
     source = open(_GUI, encoding="utf-8").read()
     assert "gr.Accordion(label=LABEL_VARIANT_LAB, open=False)" in source
-    # inside Creative Direction, below the six sliders it writes
-    heading = source.index("Creative Direction")
-    following = source.index("Processing Mode", heading)
-    position = source.index("LABEL_VARIANT_LAB", heading)
-    assert heading < position < following
-    assert source.index("semantic_emphasis = gr.", heading) < position
+    # inside Creative Studio, below the six sliders it writes
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
+    following = source.index("gr.Tab(LABEL_TAB_ADVANCED", studio)
+    position = source.index("LABEL_VARIANT_LAB", studio)
+    assert studio < position < following
+    assert source.index("semantic_emphasis = gr.") < position, "the lab must follow the sliders"
 
 
 def test_the_master_seed_box_is_visible_and_defaults_to_unset():

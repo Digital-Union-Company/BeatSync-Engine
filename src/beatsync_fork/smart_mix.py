@@ -358,6 +358,26 @@ class SmartMixConfig:
         return self.amount > 0 and bool(self.enabled_roles)
 
 
+def plans_anything_from(enabled_roles: Any, amount: Any) -> bool:
+    """Would these two raw control values place any SFX at all?
+
+    :attr:`SmartMixConfig.plans_anything` answered through a throwaway config, so the rule stays in
+    one place. It exists for *read-only* callers — a GUI read-out that wants to say whether Smart
+    Mix is armed — which must not construct a `SmartMixConfig` of their own: a seam test asserts
+    there is exactly **one** construction from widget values in `gui.py`, because two places
+    collapsing widgets into a config is two chances to disagree about what the widgets mean.
+
+    Answering the question here rather than exporting the rule is the point. A caller that wrote
+    ``amount > 0 and roles`` would be a second copy of this policy, and would not follow if Amount 0
+    ever stopped meaning off.
+
+    Normalisation is the config's, so this agrees with a real render by construction: a malformed
+    amount becomes :data:`DEFAULT_AMOUNT` and an unrecognised role is dropped, exactly as they are
+    at the render boundary. Total — it never raises.
+    """
+    return SmartMixConfig(enabled_roles=enabled_roles, amount=amount).plans_anything
+
+
 @dataclass(frozen=True)
 class SfxLibraryDiagnostics:
     """What the library scan *ignored*, carried from the runtime scan to the report.
@@ -971,6 +991,7 @@ __all__ = [
     "order_sfx_paths",
     "percentile",
     "plan_sfx",
+    "plans_anything_from",
     "project_structure",
     "role_for_folder",
     "sort_unknown_folders",

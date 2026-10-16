@@ -529,17 +529,43 @@ def test_the_declared_defaults_really_are_the_neutral_values():
     assert fork_creative.NEUTRAL_PROFILE.is_neutral()
 
 
-def test_the_controls_live_in_the_creative_direction_group():
+def test_the_controls_live_in_the_creative_studio_tab():
     """Grouped with the seed, not inside Video Source: their placement is what tells the user they
-    are render-request creative state rather than part of the source declaration."""
+    are render-request creative state rather than part of the source declaration.
+
+    Amended by GUI Refresh A. The anchor used to be the `### 🎨 Creative Direction` group heading,
+    bounded by the next heading (`Processing Mode`). That group became the Creative Studio tab, so
+    the same containment is now measured between the Creative Studio and Advanced Tools tabs — a
+    strictly tighter span than the old one, since the tab contains nothing else.
+
+    `creative_preset` is deliberately NOT in this list: GUI Refresh A moved the preset radio to
+    Quick Render because selecting a preset is the one creative act that needs no studio, and it
+    writes these six sliders from there. See `test_the_preset_radio_sits_in_the_quick_render_tab`.
+    """
     source = open(_GUI, encoding="utf-8").read()
-    heading = source.index("Creative Direction")
-    # the next group heading after Creative Direction
-    following = source.index("Processing Mode", heading)
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
+    following = source.index("gr.Tab(LABEL_TAB_ADVANCED", studio)
 
     for widget in _ALL_CREATIVE_WIDGETS:
-        position = source.index(f"{widget} = gr.", heading - 4000)
-        assert heading < position < following, f"{widget} is outside the Creative Direction group"
+        if widget == "creative_preset":
+            continue
+        position = source.index(f"{widget} = gr.")
+        assert studio < position < following, f"{widget} is outside the Creative Studio tab"
+
+
+def test_the_preset_radio_sits_in_the_quick_render_tab():
+    """GUI Refresh A. The preset is the only creative control on the render tab, and that is the
+    point of it: one click sets all six sliders, so a user who never opens Creative Studio can
+    still change the edit style. It is also the one creative widget the summary read-out must NOT
+    report, because its radio is on the same screen.
+
+    There is still exactly ONE preset radio — moving it is not duplicating it.
+    """
+    source = open(_GUI, encoding="utf-8").read()
+    quick = source.index("gr.Tab(LABEL_TAB_QUICK_RENDER")
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
+    assert quick < source.index("creative_preset = gr.") < studio
+    assert source.count("creative_preset = gr.") == 1, "the preset radio was duplicated"
 
 
 #: Everything a creative control's handler must never write. These are the widgets that make up the

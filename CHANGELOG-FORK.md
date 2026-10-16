@@ -20,6 +20,100 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-16 (GUI Refresh Phase A: three tabs)
+
+The whole app was one scrolling column with six collapsed accordions. Create Music Video sat far
+below the fold, and the two newest features — Random Freestyle and the Stage-6 shot diagnostics —
+were among the easiest things in the interface to miss. The interface is now three tabs:
+
+```
+⚡ Quick Render     everything one ordinary render needs      3:2 against the video preview
+🎨 Creative Studio  AI Director · Variation Seed · the six Creative Controls · Freestyle · Variant Lab
+🔧 Advanced Tools   Audio Layers · Smart Mix · Media Library Preparation
+```
+
+**This is a pure re-parenting.** Every component definition, keyword argument and event
+registration moved verbatim inside new `with` blocks; only the enclosing containers and the
+indentation changed. No handler was rewritten, no positional `inputs` list reordered, and no
+execution setting was duplicated — there is still exactly one widget per control, which
+`tests/test_gui_tabs.py` asserts for every widget the refresh moved. A widget's tab has no bearing
+on which handler reads it, so the Creative Preset can sit on Quick Render and still write the six
+sliders in Creative Studio through its existing, unchanged `.input()` graph.
+
+**AI Director and Freestyle are no longer collapsed.** That was the actual complaint: they looked
+like options you could overlook. Variant Lab, Audio Layers, Smart Mix and Media Library Preparation
+stay collapsed — they are long, occasional configuration rather than entry points, and each one's
+collapsed state is independently pinned by its own subsystem suite.
+
+**Quick Render's controls sit in two sub-columns, and that was measured rather than styled.**
+Stacked in one column the tab ran to 1980 px and put Create Music Video at y=1714. The audio picker
+and the Video Source group alone account for 877 px of that, so tightening the settings could never
+have recovered it. Side by side: 1481 px, button at y=1032. Still not above a 1000 px fold — that
+is stated rather than glossed — but the whole render workflow is now one short scroll instead of
+being buried under six accordions.
+
+**New: an "Active optional settings" read-out on Quick Render**, so arming something in another tab
+is visible from the render screen. It is deliberately a read-out and not a settings authority: it
+writes nothing, no render path reads it, it stores no state, and it is recomputed from the live
+widgets every time the tab is selected, so it cannot go stale. It is bound to the tab's own
+`.select()` rather than to `.change()` on a dozen widgets — the six creative sliders carry exactly
+one `.input()` registration each by pinned contract, and the Freestyle widgets write only their own
+summary, so feeding a cosmetic read-out from them would add a second binding to widgets whose
+single binding *is* the contract. It does not echo the Creative Preset, whose radio is on the same
+screen.
+
+Verified in a real browser at 1500×1000 against an isolated runtime (no production media, cache or
+output directories): all three tabs render and switch, zero console errors, AI Director open on
+arrival while the four bulky blocks stay collapsed, and arming Freestyle in Creative Studio then
+returning to Quick Render is correctly reported on the read-out.
+
+### Fixed — 2026-10-16 (GUI Refresh A / R1: the read-out told three small lies)
+
+The "Active optional settings" box answered two questions itself that belong to the subsystems that
+own them, and got both wrong in the same direction — claiming a render would be changed when it
+would not:
+
+* **Freestyle ON with every section on `Base`.** The checkbox was the whole test. But `Base` means
+  "inherit the live global value", so the declaration has no overrides, `is_active()` is False and
+  the renderer takes the ordinary global path. The gate was never the checkbox; it is
+  `enabled AND overrides` — the single question Stage 4 and Stage 6 both ask. The read-out now asks
+  the real declaration, through the **V2** builder, so ten `Random` sections are not misread as ten
+  `Base` ones.
+* **Smart Mix with a folder and roles but Amount 0.** Amount was ignored entirely. Amount 0 is a
+  hard off-branch however many roles are ticked, which is exactly what `SmartMixConfig` says, so the
+  verdict now comes from `smart_mix.plans_anything_from(...)` — a new total helper that answers the
+  question through the real record. `gui.py` deliberately does **not** construct a `SmartMixConfig`
+  of its own: a seam test pins exactly one construction from widget values in that file, because two
+  places collapsing widgets into a config is two chances to disagree about what the widgets mean.
+
+The third was staleness rather than a wrong answer, and the fix was to **delete a line**. The
+read-out refreshes on tab selection, so anything the *Quick Render tab itself* can change could
+leave it showing an old assessment — and exactly one thing could: the Creative Preset, which writes
+all six sliders. It fed the "Creative Controls away from neutral" line.
+
+That line was also redundant, and provably so: `PRESETS["Balanced"]` is six 50s — `DEFAULT_CONTROL`
+six times — and `matching_preset` recomputes the selector from the live sliders on every write. So
+"some control is off neutral" is *exactly* "the selector does not read Balanced", and that selector
+sits on the same tab, permanently correct. Removing the line loses no information and closes the
+hole at its source.
+
+The alternative, a second `creative_preset` registration to refresh the line, was implemented and
+then rejected: rebuilding the whole string needs `sfx_folder`, `sfx_roles` and `sfx_amount` wired
+into a `creative_preset` event, which one seam test forbids outright, and it would have taken the
+selector to two registrations against a pin that exists to keep it at one. A fix that has to relax
+two guards in order to restate a value already on screen is the wrong fix. Both guards remain
+un-relaxed, and a test now pins that the selector still carries exactly one handler.
+
+Everything the read-out still reports lives in another tab, so the `.select()` that fires on the way
+back keeps all of it current — it cannot be stale about anything it says. No new binding was added
+to any slider, no feedback loop is possible (it writes one read-only textbox that triggers nothing),
+and it remains informational with no execution authority.
+
+Verified by executing the real handler body against the real fork modules — not by asserting widgets
+exist, since all three failures had perfectly good structure and a wrong answer — plus a browser
+check: the default screen reports nothing active, and arming Freestyle with its ten `Random`
+defaults reports ten edited section types, with zero console errors.
+
 ### Added — 2026-10-16 (Random Freestyle V2: a sixth section style that generates)
 
 Freestyle V1 asked the user to assign one of four named presets to each of ten section types by

@@ -1053,12 +1053,32 @@ def widget_call(name: str) -> ast.Call:
     raise AssertionError(f"no widget assignment for {name}")
 
 
-def test_the_accordion_is_collapsed_and_sits_under_the_audio_input():
+def test_the_accordion_is_collapsed_and_sits_in_the_advanced_tools_tab():
+    """Amended by GUI Refresh A. The block used to sit directly under the main audio input, and
+    this asserted that adjacency. It now lives in the Advanced Tools tab, so the assertion moved
+    to the property that adjacency was standing in for: Audio Layers is an optional extra that is
+    **not** part of the render flow, and it must not reappear in Quick Render alongside the audio
+    picker, the source declaration or Create Music Video.
+
+    Still collapsed, and still the first of the two mixing blocks (Smart Mix layers onto the same
+    master and reads as its sibling).
+    """
     with open(_GUI, encoding="utf-8") as handle:
         source = handle.read()
     assert "gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False)" in source
-    assert source.index("audio_input = gr.File") < source.index("LABEL_AUDIO_LAYERS")
-    assert source.index("LABEL_AUDIO_LAYERS") < source.index("### 🎬 Video Source")
+
+    tab = source.index("gr.Tab(LABEL_TAB_ADVANCED")
+    position = source.index("gr.Accordion(label=LABEL_AUDIO_LAYERS")
+    assert tab < position, "Audio Layers escaped the Advanced Tools tab"
+    assert position < source.index("gr.Accordion(label=LABEL_SMART_MIX")
+
+    # Not back in the render flow: the Quick Render tab opens before Creative Studio, which opens
+    # before Advanced Tools, so landing inside Quick Render would place it ahead of this tab.
+    quick = source.index("gr.Tab(LABEL_TAB_QUICK_RENDER")
+    creative = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
+    assert quick < creative < tab, "the three tabs are not in the documented order"
+    assert quick < source.index("audio_input = gr.File") < creative, \
+        "the audio picker must stay in Quick Render"
 
 
 def test_the_voice_picker_accepts_exactly_the_music_formats():
