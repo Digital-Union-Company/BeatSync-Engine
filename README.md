@@ -69,6 +69,9 @@ This exists because a real run rendered from only 329 of ~701 selected files, wi
 *   **🌐 Local Web UI:** Launches a Gradio interface at `http://127.0.0.1:7860` by default.
 *   **🧹 Local Caches:** Reuses visual analysis data so repeated runs can be faster.
 
+> **What is next:** see [`ROADMAP.md`](ROADMAP.md) for the planned Raw Cutter work — transition
+> detection, AI-assisted shot selection and batch operation. Nothing there is a scheduled release.
+
 ---
 
 ## 📦 Portable Folder Layout

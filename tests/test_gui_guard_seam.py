@@ -508,9 +508,12 @@ def test_the_render_refusal_names_a_render_only_on_positive_slot_evidence():
         "_LOCK_HOLDER_RENDER": "render",
         "_LOCK_HOLDER_VERIFY": "verify",
         "_LOCK_HOLDER_SAMPLE": "sample",
+        # [FORK] Raw Cutter V1: a fourth named holder of the same mutex.
+        "_LOCK_HOLDER_CUTTER": "cutter",
         "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
         "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
         "SAMPLE_BUSY_MESSAGE": "SAMPLE_BUSY",
+        "CUTTER_BUSY_MESSAGE": "CUTTER_BUSY",
         "MEDIA_BUSY_UNKNOWN_TEXT": "UNKNOWN_BUSY",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "V_RENDER",
         "PREP_VERIFY_ALREADY_RUNNING_TEXT": "V_VERIFY",

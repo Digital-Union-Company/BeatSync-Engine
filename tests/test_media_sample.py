@@ -1971,6 +1971,10 @@ def _load_p2_seam(cap=None):
         "_LOCK_HOLDER_RENDER": _gui_constant(tree, "_LOCK_HOLDER_RENDER"),
         "_LOCK_HOLDER_VERIFY": _gui_constant(tree, "_LOCK_HOLDER_VERIFY"),
         "_LOCK_HOLDER_SAMPLE": _gui_constant(tree, "_LOCK_HOLDER_SAMPLE"),
+        # [FORK] Raw Cutter V1: the FIFTH acquirer and FOURTH named holder of this one mutex.
+        # The seam needs its token and message for the same reason it needs the other three --
+        # the busy-message tables are executed here, not read.
+        "_LOCK_HOLDER_CUTTER": _gui_constant(tree, "_LOCK_HOLDER_CUTTER"),
         "_SCOPE_VERIFY": _gui_constant(tree, "_SCOPE_VERIFY"),
         "_SCOPE_SAMPLE": _gui_constant(tree, "_SCOPE_SAMPLE"),
         "_verify_revisions": dict(_gui_constant(tree, "_verify_revisions") or {}),
@@ -1980,6 +1984,7 @@ def _load_p2_seam(cap=None):
         "RENDER_BUSY_MESSAGE": "BUSY_RENDER_TO_RENDER",
         "VERIFY_BUSY_MESSAGE": "BUSY_RENDER_TO_VERIFY",
         "SAMPLE_BUSY_MESSAGE": "BUSY_RENDER_TO_SAMPLE",
+        "CUTTER_BUSY_MESSAGE": "BUSY_ANY_TO_CUTTER",
         "MEDIA_BUSY_UNKNOWN_TEXT": "BUSY_UNKNOWN",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "BUSY_VERIFY_TO_RENDER",
         "PREP_VERIFY_ALREADY_RUNNING_TEXT": "BUSY_VERIFY_TO_VERIFY",
@@ -2032,16 +2037,22 @@ def test_the_three_way_busy_attribution_table_is_complete_and_never_guesses():
     callers = {"render": ns["_busy_message"],
                "verify": ns["_verify_busy_message"],
                "sample": ns["_sample_busy_message"]}
+    # Raw Cutter V1 added a fourth HOLDER, so each of these three tables gained a cell. The three
+    # callers are unchanged here; the cutter's own caller-side table is asserted in
+    # `tests/test_raw_cutter_seam.py`, beside the handler it belongs to.
     expected = {
         ("render", "render"): "BUSY_RENDER_TO_RENDER",
         ("render", "verify"): "BUSY_RENDER_TO_VERIFY",
         ("render", "sample"): "BUSY_RENDER_TO_SAMPLE",
+        ("render", "cutter"): "BUSY_ANY_TO_CUTTER",
         ("verify", "render"): "BUSY_VERIFY_TO_RENDER",
         ("verify", "verify"): "BUSY_VERIFY_TO_VERIFY",
         ("verify", "sample"): "BUSY_VERIFY_TO_SAMPLE",
+        ("verify", "cutter"): "BUSY_ANY_TO_CUTTER",
         ("sample", "render"): "BUSY_SAMPLE_TO_RENDER",
         ("sample", "verify"): "BUSY_SAMPLE_TO_VERIFY",
         ("sample", "sample"): "BUSY_SAMPLE_TO_SAMPLE",
+        ("sample", "cutter"): "BUSY_ANY_TO_CUTTER",
     }
     for (caller, holder), want in expected.items():
         ns["_mark_lock_holder"](holder)
@@ -2954,10 +2965,19 @@ def _calls_named(tree, rendered):
             if isinstance(node, ast.Call) and ast.unparse(node) == rendered]
 
 
-def test_the_mutex_census_is_four_acquires_and_four_releases(p2_gui_tree):
-    """Two renders, one verification, one sample -- each a single atomic test-and-set."""
-    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=False)")) == 4
-    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.release()")) == 4
+def test_the_mutex_census_is_five_acquires_and_five_releases(p2_gui_tree):
+    """Two renders, one verification, one sample, one Raw Cutter job -- each a single atomic
+    test-and-set.
+
+    Amended by Raw Cutter V1, which joined this mutex as a FIFTH holder rather than inventing a
+    second lock. Cutting re-encodes a long source against the same drive a render extracts clips
+    from, so the two must be exclusive; reusing the existing mutex gives both directions for one
+    acquire and required no change to the render path, which already refuses when the lock is held
+    without caring who holds it. The census is pinned so a SIXTH cannot arrive unreviewed, and the
+    bans below -- which are the substance -- are unchanged.
+    """
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=False)")) == 5
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.release()")) == 5
     assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.locked()"), \
         "check-then-act is the race the non-blocking acquire avoids"
     assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.acquire()")
@@ -2979,15 +2999,26 @@ def test_the_render_wrappers_contain_no_holder_marking_at_all(p2_gui_tree):
 
 
 def test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release(p2_gui_tree):
-    """Exactly two marking paths, and neither may release before clearing."""
-    marks = _calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)")
-    assert len(marks) == 1, "only the sample marks itself directly"
-    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder('')")) == 1, \
-        "only the sample clears directly; the verification clears via _mark_verification(False)"
+    """Exactly three marking paths, and none may release before clearing.
+
+    Amended by Raw Cutter V1. The cutter marks and clears itself directly, exactly as the sample
+    does -- the render path still marks nothing, because `_lock_holder_now` reads its active-render
+    slot as positive evidence instead. Each count is pinned individually, so a fourth marker
+    cannot arrive by being lumped into a total.
+    """
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)")) == 1, \
+        "the sample marks itself exactly once"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_CUTTER)")) == 1, \
+        "the Raw Cutter marks itself exactly once"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_RENDER)")) == 0, \
+        "the render path must keep marking nothing; its slot is the positive evidence"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder('')")) == 2, \
+        "the sample and the cutter clear directly; the verification uses _mark_verification(False)"
     assert len(_calls_named(p2_gui_tree, "_mark_verification(True)")) == 1
     assert len(_calls_named(p2_gui_tree, "_mark_verification(False)")) == 1
-    # Both diagnostic handlers must clear inside the same finally that releases, clear-then-release.
+    # Every mutex-owning diagnostic clears inside the same finally that releases, clear-then-release.
     for handler, clear in (("_on_sample_decode_click", "_mark_lock_holder('')"),
+                           ("_on_cut_run", "_mark_lock_holder('')"),
                            ("_on_verify_sources_click", "_mark_verification(False)")):
         finallies = [n for n in ast.walk(_func(p2_gui_tree, handler))
                      if isinstance(n, ast.Try) and n.finalbody]

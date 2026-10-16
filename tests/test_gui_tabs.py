@@ -103,20 +103,41 @@ def _registrations(tree: ast.Module, suffix: str) -> list[ast.Call]:
 # The containers themselves
 # ---------------------------------------------------------------------------------------------
 
-_TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_ADVANCED")
+#: Amended by Raw Cutter V1: a FOURTH top-level tab, placed third. It is a tool the operator
+#: opens the app specifically to use -- curating footage before any of the render workflow applies
+#: -- so it sits beside the other workflows rather than inside Advanced Tools, which is exactly
+#: the discoverability problem the three-tab refresh existed to fix.
+_TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
+         "LABEL_TAB_ADVANCED")
 
 
-def test_there_are_exactly_three_tabs(tree: ast.Module):
+def test_there_are_exactly_four_tabs(tree: ast.Module):
     items = [i for i in _with_items(tree) if i.startswith("gr.Tab(")]
-    assert len(items) == 3, f"expected three tabs, found {len(items)}: {items}"
+    assert len(items) == 4, f"expected four tabs, found {len(items)}: {items}"
     assert len([i for i in _with_items(tree) if i.startswith("gr.Tabs(")]) == 1
 
 
-def test_the_tabs_are_the_documented_three_in_order(source: str):
+def test_the_tabs_are_the_documented_four_in_order(source: str):
     positions = [source.index(f"gr.Tab({label}") for label in _TABS]
     assert positions == sorted(positions), (
-        "Quick Render must come first, then Creative Studio, then Advanced Tools — the order is "
+        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools — the order is "
         "load-bearing for several containment assertions in other suites")
+
+
+def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: ast.Module):
+    """The whole placement decision, pinned. Burying the cutter inside Advanced Tools would
+    reproduce the problem the tab refresh fixed, so it must be a `gr.Tab` of its own and its
+    widgets must not end up inside any accordion."""
+    assert "gr.Tab(LABEL_TAB_RAW_CUTTER" in source
+    cutter = source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
+    advanced = source.index("gr.Tab(LABEL_TAB_ADVANCED")
+    assert cutter < advanced
+    block = source[cutter:advanced]
+    assert "gr.Accordion" not in block, "the Raw Cutter must not hide its controls in an accordion"
+    for widget in ("cut_source", "cut_output", "cut_sensitivity", "cut_min_seconds",
+                   "cut_max_seconds", "cut_remove_audio", "cut_analyze_btn", "cut_run_btn",
+                   "cut_cancel_btn", "cut_summary", "cut_table", "cut_report"):
+        assert f"{widget} = gr." in block, f"{widget} is not in the Raw Cutter tab"
 
 
 def test_every_tab_label_is_defined_in_ui_content(source: str):
@@ -295,7 +316,8 @@ def test_the_creative_state_is_on_the_creative_studio_tab(source: str, widget: s
     "prep_verify_btn", "prep_verify_report", "sample_btn", "sample_report",
 ])
 def test_the_occasional_tools_are_on_the_advanced_tab(source: str, widget: str):
-    start, end = _tab_span(source, 2)
+    # Index 3 since Raw Cutter V1 inserted a tab at position 2.
+    start, end = _tab_span(source, 3)
     assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Advanced Tools"
 
 
@@ -308,7 +330,7 @@ def test_library_prep_is_the_last_block_in_the_advanced_tab(source: str):
     defect. Audio Layers and Smart Mix both contain sliders, so they must not sit between the
     preparation block and the event wiring.
     """
-    start, end = _tab_span(source, 2)
+    start, end = _tab_span(source, 3)
     block = source[start:end]
     assert block.index("LABEL_AUDIO_LAYERS") < block.index("LABEL_PREP_SECTION")
     assert block.index("LABEL_SMART_MIX") < block.index("LABEL_PREP_SECTION")

@@ -539,12 +539,16 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
     states = [n for n in ast.walk(_tree(_GUI)) if isinstance(n, ast.Call)
               and ast.unparse(n.func) == "gr.State"]
     assert len(states) == _EXPECTED_STATE_COUNT, \
-        f"{len(states)} gr.State objects; S2 must add none"
+        f"{len(states)} gr.State objects; the count is pinned - add one only under review"
     assert "open_output_folder_state" not in source
 
 
-#: The number of `gr.State` objects on main before S2. S2 adds no state, so this must not move.
-_EXPECTED_STATE_COUNT = 6
+#: The number of `gr.State` objects in `gui.py`. S2 itself adds none; the count is pinned so that
+#: any new state has to be a reviewed decision rather than a side effect.
+#:
+#: 6 before Raw Cutter V1; 7 since, for `cut_plan_state`, which carries the Raw Cutter's segment
+#: plan between Analyze and Cut as a plain dict of primitives. Nothing live enters it.
+_EXPECTED_STATE_COUNT = 7
 
 
 def test_the_expected_state_count_matches_the_named_states():

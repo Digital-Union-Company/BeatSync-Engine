@@ -631,7 +631,120 @@ INFO_FREESTYLE_ENABLED = (
 
 LABEL_TAB_QUICK_RENDER = "⚡ Quick Render"
 LABEL_TAB_CREATIVE_STUDIO = "🎨 Creative Studio"
+LABEL_TAB_RAW_CUTTER = "✂️ Raw Cutter"
 LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
+
+# ============================================================================
+# [FORK] Digital-Union: Raw Cutter V1
+# Split one long source video at its existing edits, to curate footage before
+# it enters the media library. Independent of the render pipeline.
+# ============================================================================
+
+INFO_TAB_RAW_CUTTER = (
+    "**Pull the usable shots out of one long video.** Point it at a single file, press Analyze to "
+    "see which shots it would keep, then press Cut Video to write them into a new folder. "
+    "It needs no audio track, no confirmed source set and no prepared library — it is a standalone "
+    "footage-prep tool, and it never modifies the file you give it.\n\n"
+    "**It keeps clean shots and skips the rest.** Material shorter than your minimum is left "
+    "behind rather than glued to its neighbour, because a clip that cuts in the middle is not "
+    "worth having in a source library. Gaps between the exported clips are normal and the plan "
+    "tells you exactly how much was skipped and why."
+)
+
+LABEL_CUT_SOURCE = "🎬 Source video (full path to one file)"
+INFO_CUT_SOURCE = (
+    "The file is read in place — nothing is uploaded or copied, so a multi-gigabyte source costs "
+    "nothing to point at. MP4, MKV, MOV, M4V, AVI and WebM are accepted."
+)
+PLACEHOLDER_CUT_SOURCE = r"J:\Footage\long_recording.mkv"
+
+LABEL_CUT_SOURCE_INFO = "Source details"
+PLACEHOLDER_CUT_SOURCE_INFO = "Press Analyze to probe the file."
+
+LABEL_CUT_OUTPUT = "📁 Output folder"
+INFO_CUT_OUTPUT = (
+    "Each run creates its own fresh, timestamped subfolder here, so a second run can never "
+    "overwrite the first. Existing files are never replaced."
+)
+PLACEHOLDER_CUT_OUTPUT = r"J:\Raw Parts"
+
+LABEL_CUT_SENSITIVITY = "🔍 Scene detection sensitivity"
+INFO_CUT_SENSITIVITY = (
+    "How eager the detector is to call something a cut. Higher finds more scene changes, including "
+    "softer ones like a fast pan or a lighting change; lower keeps only hard cuts. 50 is the same "
+    "threshold the rest of BeatSync uses."
+)
+
+LABEL_CUT_MIN_SECONDS = "⏱️ Minimum clip length (seconds)"
+INFO_CUT_MIN_SECONDS = (
+    "The shortest shot worth keeping. A shot below this is **skipped entirely** — it is never "
+    "glued to the shot next to it to make up the length, because that would produce a clip with "
+    "a cut in the middle of it."
+)
+
+LABEL_CUT_MAX_SECONDS = "⏳ Maximum clip length (seconds)"
+INFO_CUT_MAX_SECONDS = (
+    "The longest single clip to write. A longer shot is divided into several clips — all from "
+    "inside that same continuous take, so nothing ever spans a scene change."
+)
+
+LABEL_CUT_REMOVE_AUDIO = "🔇 Remove audio from the clips"
+INFO_CUT_REMOVE_AUDIO = (
+    "On by default: source clips for a music video do not need their own sound, and dropping the "
+    "stream makes the files smaller. Turn it off to keep the original audio (re-encoded to AAC). "
+    "A source with no audio works either way."
+)
+
+LABEL_CUT_ANALYZE = "🔎 Analyze / Preview"
+LABEL_CUT_RUN = "✂️ Cut Video"
+LABEL_CUT_CANCEL = "⏹️ Cancel cutting"
+
+LABEL_CUT_PLAN_SUMMARY = "Plan summary"
+PLACEHOLDER_CUT_PLAN_SUMMARY = (
+    "Analyze a video to see which shots it found, which ones it would export, and which it would "
+    "skip for being too short."
+)
+LABEL_CUT_PLAN_TABLE = "Detected shots — kept and skipped"
+LABEL_CUT_RUN_REPORT = "Cut report"
+PLACEHOLDER_CUT_RUN_REPORT = "Nothing has been cut yet."
+
+INFO_CUT_ACTIONS = (
+    "Analyze never writes anything. Cut Video re-checks the file and your settings first and "
+    "refuses a plan that no longer matches them."
+)
+
+CUT_NO_PLAN_TEXT = "Press Analyze / Preview first — there is no plan to cut yet."
+CUT_STALE_PLAN_TEXT = (
+    "The source file or the detection settings changed since this plan was made, so it no longer "
+    "describes this video. Press Analyze / Preview again."
+)
+CUT_BUSY_TEXT = "A cut job is already running. Wait for it to finish, or press Cancel cutting."
+CUT_RENDER_BUSY_TEXT = (
+    "A music video render is running. The Raw Cutter waits rather than competing with it for the "
+    "same drive — try again once the render has finished."
+)
+CUT_CANCELLED_TEXT = "Cutting cancelled. Clips already written were kept; the partial one was removed."
+CUT_CANCEL_REQUESTED_TEXT = "Cancellation requested — finishing the current clip, then stopping."
+CUT_NOTHING_RUNNING_TEXT = "No cut job is running."
+
+CUT_NOTHING_TO_EXPORT_TEXT = (
+    "This plan has no clips to export — nothing in the source is long enough at these settings. "
+    "That is a real answer about the footage, not an error. Lower the minimum clip length, or "
+    "lower the sensitivity so fewer scene changes are detected, then Analyze again."
+)
+
+#: Shown to a RENDER / VERIFY / SAMPLE caller that found the mutex held by a Raw Cutter job.
+CUTTER_BUSY_MESSAGE = (
+    "✂️ A Raw Cutter job is running. It is writing video to disk, so BeatSync is not starting "
+    "anything else against the same drive until it finishes — wait for it, or cancel it on the "
+    "Raw Cutter tab."
+)
+
+#: Shown to the CUT caller when one of the read-only media diagnostics holds the mutex.
+CUT_MEDIA_BUSY_TEXT = (
+    "A media check (Verify Sources or Sample Decode) is using the drive right now. It is short — "
+    "try Cut Video again in a moment."
+)
 
 INFO_TAB_CREATIVE_STUDIO = (
     "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
