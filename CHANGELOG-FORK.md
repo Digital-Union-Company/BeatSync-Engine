@@ -20,6 +20,53 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-16 (GUI Refresh Phase A: three tabs)
+
+The whole app was one scrolling column with six collapsed accordions. Create Music Video sat far
+below the fold, and the two newest features — Random Freestyle and the Stage-6 shot diagnostics —
+were among the easiest things in the interface to miss. The interface is now three tabs:
+
+```
+⚡ Quick Render     everything one ordinary render needs      3:2 against the video preview
+🎨 Creative Studio  AI Director · Variation Seed · the six Creative Controls · Freestyle · Variant Lab
+🔧 Advanced Tools   Audio Layers · Smart Mix · Media Library Preparation
+```
+
+**This is a pure re-parenting.** Every component definition, keyword argument and event
+registration moved verbatim inside new `with` blocks; only the enclosing containers and the
+indentation changed. No handler was rewritten, no positional `inputs` list reordered, and no
+execution setting was duplicated — there is still exactly one widget per control, which
+`tests/test_gui_tabs.py` asserts for every widget the refresh moved. A widget's tab has no bearing
+on which handler reads it, so the Creative Preset can sit on Quick Render and still write the six
+sliders in Creative Studio through its existing, unchanged `.input()` graph.
+
+**AI Director and Freestyle are no longer collapsed.** That was the actual complaint: they looked
+like options you could overlook. Variant Lab, Audio Layers, Smart Mix and Media Library Preparation
+stay collapsed — they are long, occasional configuration rather than entry points, and each one's
+collapsed state is independently pinned by its own subsystem suite.
+
+**Quick Render's controls sit in two sub-columns, and that was measured rather than styled.**
+Stacked in one column the tab ran to 1980 px and put Create Music Video at y=1714. The audio picker
+and the Video Source group alone account for 877 px of that, so tightening the settings could never
+have recovered it. Side by side: 1481 px, button at y=1032. Still not above a 1000 px fold — that
+is stated rather than glossed — but the whole render workflow is now one short scroll instead of
+being buried under six accordions.
+
+**New: an "Active optional settings" read-out on Quick Render**, so arming something in another tab
+is visible from the render screen. It is deliberately a read-out and not a settings authority: it
+writes nothing, no render path reads it, it stores no state, and it is recomputed from the live
+widgets every time the tab is selected, so it cannot go stale. It is bound to the tab's own
+`.select()` rather than to `.change()` on a dozen widgets — the six creative sliders carry exactly
+one `.input()` registration each by pinned contract, and the Freestyle widgets write only their own
+summary, so feeding a cosmetic read-out from them would add a second binding to widgets whose
+single binding *is* the contract. It does not echo the Creative Preset, whose radio is on the same
+screen.
+
+Verified in a real browser at 1500×1000 against an isolated runtime (no production media, cache or
+output directories): all three tabs render and switch, zero console errors, AI Director open on
+arrival while the four bulky blocks stay collapsed, and arming Freestyle in Creative Studio then
+returning to Quick Render correctly reports *"Freestyle is ON — sections are edited differently"*.
+
 ### Added — 2026-10-16 (Random Freestyle V2: a sixth section style that generates)
 
 Freestyle V1 asked the user to assign one of four named presets to each of ten section types by

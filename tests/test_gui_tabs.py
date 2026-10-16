@@ -100,6 +100,57 @@ def test_the_render_column_split_is_three_to_two(source: str):
     assert "gr.Column(scale=2)" in block
 
 
+def test_the_quick_render_controls_are_two_side_by_side_sub_columns(tree: ast.Module):
+    """Measured, not cosmetic. Stacked in one column this content ran to 1980 px and put Create
+    Music Video at y=1714 — still below the fold, which defeats the point of a Quick Render tab.
+    The audio picker and the Video Source group alone are 877 px of that, so no amount of
+    tightening the settings could have recovered it; declaring inputs and choosing settings had to
+    sit beside each other. Measured again afterwards: 1481 px, button at y=1032.
+
+    A later "simplification" that flattens this back into one column would silently undo that, so
+    the nesting is pinned: the scale=3 control column must contain a `gr.Row` holding two more
+    columns, and the audio picker and the settings must be in different ones.
+    """
+    tab = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                if "LABEL_TAB_QUICK_RENDER" in ast.unparse(item.context_expr):
+                    tab = node
+    assert tab is not None
+
+    control_columns = []
+    for node in ast.walk(tab):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            if ast.unparse(item.context_expr) != "gr.Column(scale=3)":
+                continue
+            rendered = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+            if "audio_input" in rendered:
+                control_columns.append(node)
+
+    assert control_columns, "no scale=3 column holding the render controls"
+    outer = max(control_columns, key=lambda n: len(list(ast.walk(n))))
+    body = ast.unparse(ast.Module(body=outer.body, type_ignores=[]))
+
+    rows = [n for n in ast.walk(outer) if isinstance(n, ast.With)
+            and any(ast.unparse(i.context_expr) == "gr.Row()" for i in n.items)]
+    assert rows, "the control column no longer splits into a row of sub-columns"
+
+    split = max(rows, key=lambda n: len(list(ast.walk(n))))
+    sub = [n for n in split.body if isinstance(n, ast.With)
+           and any(ast.unparse(i.context_expr).startswith("gr.Column(") for i in n.items)]
+    assert len(sub) == 2, f"expected two sub-columns, found {len(sub)}"
+
+    left = ast.unparse(ast.Module(body=sub[0].body, type_ignores=[]))
+    right = ast.unparse(ast.Module(body=sub[1].body, type_ignores=[]))
+    assert "audio_input" in left and "source_mode" in left, "the inputs are not in the first column"
+    assert "process_btn" in right and "processing_mode" in right, \
+        "the settings and the render button are not in the second column"
+    assert "audio_input" not in right, "the audio picker is duplicated across sub-columns"
+
+
 # ---------------------------------------------------------------------------------------------
 # Nothing was duplicated
 # ---------------------------------------------------------------------------------------------

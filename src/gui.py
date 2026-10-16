@@ -4742,112 +4742,128 @@ def create_ui() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab(LABEL_TAB_QUICK_RENDER, id='tab-quick-render') as tab_quick_render:
                 with gr.Row():
-                    # 3:2 -- the controls need the width, the preview needs enough to be
-                    # watchable. Everything required for one render lives in this column.
+                    # [FORK] Digital-Union (GUI Refresh A): 3:2 at the top level -- the controls
+                    # need the width, the preview needs enough to be watchable.
                     with gr.Column(scale=3):
-                        gr.Markdown('### 📁 Input Files')
-                        audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
-                        # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
-                        with gr.Group():
-                            gr.Markdown('### 🎬 Video Source')
-                            source_mode = gr.Radio(
-                                choices=[
-                                    (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
-                                    (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
-                                ],
-                                value=SourceMode.LOCAL_FOLDER.value,
-                                label=LABEL_SOURCE_MODE,
-                                info=INFO_SOURCE_MODE,
-                                elem_id='source-mode-radio',
-                            )
+                        # Two sub-columns rather than one tall one, and the reason is measured:
+                        # stacked, this content ran to 1980 px and put Create Music Video at
+                        # y=1714, still below the fold on a 1000 px viewport. The audio picker
+                        # and the Video Source group alone are 877 px of that, so tightening the
+                        # settings could never have recovered it -- declaring the inputs and
+                        # choosing the settings had to sit side by side. Side by side, the whole
+                        # render workflow including the button fits without scrolling.
+                        with gr.Row():
+                            # Wider: it holds a drop zone and a file path.
+                            with gr.Column(scale=3):
+                                gr.Markdown('### 📁 Input Files')
+                                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
+                                # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
+                                with gr.Group():
+                                    gr.Markdown('### 🎬 Video Source')
+                                    source_mode = gr.Radio(
+                                        choices=[
+                                            (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
+                                            (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
+                                        ],
+                                        value=SourceMode.LOCAL_FOLDER.value,
+                                        label=LABEL_SOURCE_MODE,
+                                        info=INFO_SOURCE_MODE,
+                                        elem_id='source-mode-radio',
+                                    )
 
-                            with gr.Group(visible=True) as folder_group:
-                                source_folder = gr.Textbox(
-                                    label=LABEL_SOURCE_FOLDER,
-                                    placeholder=PLACEHOLDER_SOURCE_FOLDER,
-                                    info=INFO_SOURCE_FOLDER,
-                                    elem_id='source-folder-input',
+                                    with gr.Group(visible=True) as folder_group:
+                                        source_folder = gr.Textbox(
+                                            label=LABEL_SOURCE_FOLDER,
+                                            placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                                            info=INFO_SOURCE_FOLDER,
+                                            elem_id='source-folder-input',
+                                        )
+                                        source_recursive = gr.Checkbox(
+                                            value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
+                                        )
+                                        scan_btn = gr.Button(LABEL_SCAN_FOLDER, elem_id='scan-folder-button')
+
+                                    with gr.Group(visible=False) as browser_group:
+                                        video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
+
+                                    source_report = gr.Textbox(
+                                        label=LABEL_SOURCE_REPORT,
+                                        value=initial_source_state().report_text,
+                                        interactive=False,
+                                        lines=9,
+                                        max_lines=14,
+                                        elem_id='source-report-box',
+                                    )
+                                    confirm_btn = gr.Button(
+                                        LABEL_CONFIRM_SOURCES, interactive=False, elem_id='confirm-sources-button'
+                                    )
+                                    confirm_status = gr.Markdown(
+                                        initial_source_state().confirmation_status_text(),
+                                        elem_id='confirm-status',
+                                    )
+                            with gr.Column(scale=2):
+                                with gr.Group():
+                                    gr.Markdown('### ⚙️ Video Settings')
+                                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
+
+                                # [FORK] Digital-Union (GUI Refresh A): the preset selector is the one
+                                # creative control on Quick Render, because it is the single choice that
+                                # sets all six sliders at once. The sliders themselves live in Creative
+                                # Studio; the `.input()` graph between them is unchanged and crosses tabs
+                                # perfectly well.
+                                # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
+                                # directly above the six sliders it writes, and below the seed — the layout is
+                                # the first statement that a preset moves those six and nothing else. It is NOT
+                                # a `process_btn` input: the sliders already are, and they stay the only thing
+                                # the render request carries. `Custom` is the last choice because it is a state
+                                # the selector reports, not a recipe a user picks.
+                                creative_preset = gr.Radio(
+                                    choices=list(fork_presets.PRESET_NAMES),
+                                    value=fork_presets.BALANCED_PRESET,
+                                    label=LABEL_CREATIVE_PRESET,
+                                    info=INFO_CREATIVE_PRESET,
+                                    elem_id='creative-preset-radio',
                                 )
-                                source_recursive = gr.Checkbox(
-                                    value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
+                                with gr.Group():
+                                    gr.Markdown(f'### 🎬 Processing Mode')
+                                    if NVENC_AVAILABLE:
+                                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                                    else:
+                                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                                with gr.Group():
+                                    gr.Markdown('### 📁 Output Settings')
+                                    output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
+                                # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
+                                process_btn = gr.Button(
+                                    '🎬 Create Music Video', variant='primary', size='lg', interactive=False
                                 )
-                                scan_btn = gr.Button(LABEL_SCAN_FOLDER, elem_id='scan-folder-button')
+                                gr.Markdown(INFO_CONFIRMATION_GATE)
+                                # [FORK] Digital-Union (C3-R1A): deliberately ALWAYS interactive -- unlike
+                                # `process_btn`, this is never gated by the source-confirmation state, because a
+                                # render already in flight has nothing to do with whether a NEW one could start.
+                                # It is also never disabled while a render runs: that disabling is what would make
+                                # it useless, since it is the only way to reach a render already in progress.
+                                cancel_render_btn = gr.Button(LABEL_CANCEL_RENDER, variant='stop', size='sm')
+                                gr.Markdown(INFO_CANCEL_RENDER)
 
-                            with gr.Group(visible=False) as browser_group:
-                                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
-
-                            source_report = gr.Textbox(
-                                label=LABEL_SOURCE_REPORT,
-                                value=initial_source_state().report_text,
-                                interactive=False,
-                                lines=9,
-                                max_lines=14,
-                                elem_id='source-report-box',
-                            )
-                            confirm_btn = gr.Button(
-                                LABEL_CONFIRM_SOURCES, interactive=False, elem_id='confirm-sources-button'
-                            )
-                            confirm_status = gr.Markdown(
-                                initial_source_state().confirmation_status_text(),
-                                elem_id='confirm-status',
-                            )
-                        with gr.Group():
-                            gr.Markdown('### ⚙️ Video Settings')
-                            custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
-
-                        # [FORK] Digital-Union (GUI Refresh A): the preset selector is the one
-                        # creative control on Quick Render, because it is the single choice that
-                        # sets all six sliders at once. The sliders themselves live in Creative
-                        # Studio; the `.input()` graph between them is unchanged and crosses tabs
-                        # perfectly well.
-                        # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
-                        # directly above the six sliders it writes, and below the seed — the layout is
-                        # the first statement that a preset moves those six and nothing else. It is NOT
-                        # a `process_btn` input: the sliders already are, and they stay the only thing
-                        # the render request carries. `Custom` is the last choice because it is a state
-                        # the selector reports, not a recipe a user picks.
-                        creative_preset = gr.Radio(
-                            choices=list(fork_presets.PRESET_NAMES),
-                            value=fork_presets.BALANCED_PRESET,
-                            label=LABEL_CREATIVE_PRESET,
-                            info=INFO_CREATIVE_PRESET,
-                            elem_id='creative-preset-radio',
-                        )
-                        with gr.Group():
-                            gr.Markdown(f'### 🎬 Processing Mode')
-                            if NVENC_AVAILABLE:
-                                processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
-                            else:
-                                processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
-                        with gr.Group():
-                            gr.Markdown('### 📁 Output Settings')
-                            output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
-                        # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
-                        process_btn = gr.Button(
-                            '🎬 Create Music Video', variant='primary', size='lg', interactive=False
-                        )
-                        gr.Markdown(INFO_CONFIRMATION_GATE)
-                        # [FORK] Digital-Union (C3-R1A): deliberately ALWAYS interactive -- unlike
-                        # `process_btn`, this is never gated by the source-confirmation state, because a
-                        # render already in flight has nothing to do with whether a NEW one could start.
-                        # It is also never disabled while a render runs: that disabling is what would make
-                        # it useless, since it is the only way to reach a render already in progress.
-                        cancel_render_btn = gr.Button(LABEL_CANCEL_RENDER, variant='stop', size='sm')
-                        gr.Markdown(INFO_CANCEL_RENDER)
-
-                        # [FORK] Digital-Union (GUI Refresh A): a read-only note saying which
-                        # optional settings from the other tabs will affect the next render.
-                        # Derived from the live widgets each time this tab is selected, so it
-                        # cannot go stale and is not a second settings authority -- it writes
-                        # nothing and no render path reads it.
-                        active_settings_summary = gr.Textbox(
-                            label=LABEL_ACTIVE_SETTINGS,
-                            value=ACTIVE_SETTINGS_PLACEHOLDER,
-                            lines=3,
-                            max_lines=8,
-                            interactive=False,
-                            elem_id='active-settings-summary',
-                        )
+                                # [FORK] Digital-Union (GUI Refresh A): a read-only note saying which
+                                # optional settings from the other tabs will affect the next render.
+                                # Derived from the live widgets each time this tab is selected, so it
+                                # cannot go stale and is not a second settings authority -- it writes
+                                # nothing and no render path reads it.
+                                #
+                                # It trails the buttons rather than heading this column, and that was
+                                # measured rather than assumed: heading the column pushed Create Music
+                                # Video from y=1032 down to y=1177, because this box is 145 px tall and
+                                # the button sits below it either way.
+                                active_settings_summary = gr.Textbox(
+                                    label=LABEL_ACTIVE_SETTINGS,
+                                    value=ACTIVE_SETTINGS_PLACEHOLDER,
+                                    lines=3,
+                                    max_lines=8,
+                                    interactive=False,
+                                    elem_id='active-settings-summary',
+                                )
                     with gr.Column(scale=2):
                         gr.Markdown('### 📺 Output')
                         status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
