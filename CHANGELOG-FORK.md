@@ -65,7 +65,54 @@ screen.
 Verified in a real browser at 1500×1000 against an isolated runtime (no production media, cache or
 output directories): all three tabs render and switch, zero console errors, AI Director open on
 arrival while the four bulky blocks stay collapsed, and arming Freestyle in Creative Studio then
-returning to Quick Render correctly reports *"Freestyle is ON — sections are edited differently"*.
+returning to Quick Render is correctly reported on the read-out.
+
+### Fixed — 2026-10-16 (GUI Refresh A / R1: the read-out told three small lies)
+
+The "Active optional settings" box answered two questions itself that belong to the subsystems that
+own them, and got both wrong in the same direction — claiming a render would be changed when it
+would not:
+
+* **Freestyle ON with every section on `Base`.** The checkbox was the whole test. But `Base` means
+  "inherit the live global value", so the declaration has no overrides, `is_active()` is False and
+  the renderer takes the ordinary global path. The gate was never the checkbox; it is
+  `enabled AND overrides` — the single question Stage 4 and Stage 6 both ask. The read-out now asks
+  the real declaration, through the **V2** builder, so ten `Random` sections are not misread as ten
+  `Base` ones.
+* **Smart Mix with a folder and roles but Amount 0.** Amount was ignored entirely. Amount 0 is a
+  hard off-branch however many roles are ticked, which is exactly what `SmartMixConfig` says, so the
+  verdict now comes from `smart_mix.plans_anything_from(...)` — a new total helper that answers the
+  question through the real record. `gui.py` deliberately does **not** construct a `SmartMixConfig`
+  of its own: a seam test pins exactly one construction from widget values in that file, because two
+  places collapsing widgets into a config is two chances to disagree about what the widgets mean.
+
+The third was staleness rather than a wrong answer, and the fix was to **delete a line**. The
+read-out refreshes on tab selection, so anything the *Quick Render tab itself* can change could
+leave it showing an old assessment — and exactly one thing could: the Creative Preset, which writes
+all six sliders. It fed the "Creative Controls away from neutral" line.
+
+That line was also redundant, and provably so: `PRESETS["Balanced"]` is six 50s — `DEFAULT_CONTROL`
+six times — and `matching_preset` recomputes the selector from the live sliders on every write. So
+"some control is off neutral" is *exactly* "the selector does not read Balanced", and that selector
+sits on the same tab, permanently correct. Removing the line loses no information and closes the
+hole at its source.
+
+The alternative, a second `creative_preset` registration to refresh the line, was implemented and
+then rejected: rebuilding the whole string needs `sfx_folder`, `sfx_roles` and `sfx_amount` wired
+into a `creative_preset` event, which one seam test forbids outright, and it would have taken the
+selector to two registrations against a pin that exists to keep it at one. A fix that has to relax
+two guards in order to restate a value already on screen is the wrong fix. Both guards remain
+un-relaxed, and a test now pins that the selector still carries exactly one handler.
+
+Everything the read-out still reports lives in another tab, so the `.select()` that fires on the way
+back keeps all of it current — it cannot be stale about anything it says. No new binding was added
+to any slider, no feedback loop is possible (it writes one read-only textbox that triggers nothing),
+and it remains informational with no execution authority.
+
+Verified by executing the real handler body against the real fork modules — not by asserting widgets
+exist, since all three failures had perfectly good structure and a wrong answer — plus a browser
+check: the default screen reports nothing active, and arming Freestyle with its ten `Random`
+defaults reports ten edited section types, with zero console errors.
 
 ### Added — 2026-10-16 (Random Freestyle V2: a sixth section style that generates)
 

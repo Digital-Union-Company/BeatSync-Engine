@@ -1438,3 +1438,47 @@ def test_project_structure_only_ever_raises_its_own_error_type():
             pass
         except Exception as exc:                              # noqa: BLE001 - that is the point
             pytest.fail(f"{shape} escaped as {type(exc).__name__}: {exc}")
+
+
+# ======================================================================================
+# plans_anything_from (GUI Refresh A / R1)
+# ======================================================================================
+
+
+def test_plans_anything_from_agrees_with_the_config_property():
+    """It is the same rule asked a different way, so it must never disagree with the property.
+
+    That equivalence is the whole justification for the helper existing: a read-only caller gets
+    the answer without constructing a config, and cannot drift from the render boundary.
+    """
+    for amount in (0, 1, 25, 50, 99, 100, -5, 1000, None, "junk", 3.7):
+        for roles in ((), ("impact",), ("impact", "riser"), tuple(sm.ALL_ROLES), None, "impact"):
+            expected = sm.SmartMixConfig(enabled_roles=roles, amount=amount).plans_anything
+            assert sm.plans_anything_from(roles, amount) is expected, (roles, amount)
+
+
+def test_amount_zero_is_off_however_many_roles_are_enabled():
+    assert sm.plans_anything_from(tuple(sm.ALL_ROLES), 0) is False
+    assert sm.plans_anything_from(("impact",), 0) is False
+
+
+def test_an_empty_role_selection_is_off_at_any_amount():
+    for amount in (1, 50, 100):
+        assert sm.plans_anything_from((), amount) is False
+
+
+def test_roles_and_a_positive_amount_are_on():
+    for amount in (1, 50, 100):
+        assert sm.plans_anything_from(("impact",), amount) is True
+
+
+def test_plans_anything_from_is_total():
+    """It runs on live widget values during a UI interaction, so it may never raise."""
+
+    class Hostile:
+        def __iter__(self):
+            raise RuntimeError("no")
+
+    for roles in (None, 0, "", "impact", object(), Hostile(), [None, 1, "impact"]):
+        for amount in (None, "", "abc", object(), float("nan"), float("inf"), True):
+            assert isinstance(sm.plans_anything_from(roles, amount), bool)

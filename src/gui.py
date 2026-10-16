@@ -2109,10 +2109,9 @@ def _on_surprise_me(freestyle_enabled, *styles):
     return seed, preview
 
 
-def _on_quick_render_tab_select(freestyle_enabled, cut_density_value, micro_cuts_value,
-                                semantic_emphasis_value, energy_response_value, motion_bias_value,
-                                source_diversity_value, variation_seed_value, voice_files_value,
-                                sfx_folder_value, sfx_roles_value) -> str:
+def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_files_value,
+                                sfx_folder_value, sfx_roles_value, sfx_amount_value,
+                                *styles) -> str:
     """[FORK] Digital-Union (GUI Refresh A): what optional settings will affect the next render.
 
     Three tabs mean a user can arm something in Creative Studio or Advanced Tools and then look at
@@ -2120,45 +2119,59 @@ def _on_quick_render_tab_select(freestyle_enabled, cut_density_value, micro_cuts
 
     **It is a read-out, not an authority.** It writes nothing, no render path reads it, and it
     stores no state: it is recomputed from the LIVE widget values every time Quick Render is
-    selected, so it cannot drift from the controls it describes. Reporting "not default" is also
-    deliberately weaker than reporting a value — the numbers are a click away in the tab it names,
-    and a number copied here would be the stale-preview problem Freestyle's summary already avoids.
+    selected, so it cannot drift from the controls it describes.
 
     Bound to the tab's own `.select()` rather than to `.change()` on a dozen existing widgets: the
     creative sliders carry exactly one `.input()` registration each by contract, and the Freestyle
     widgets write only their own summary. Adding handlers to them to feed a cosmetic read-out would
     put a second binding on widgets whose single binding is itself a pinned contract.
 
+    **R1 — every claim here is now decided by the subsystem that owns it.** The first version
+    answered two of them locally and got both wrong in the same direction, claiming a render would
+    be changed when it would not:
+
+    * *Freestyle ON with every section on `Base`* has no overrides, so `is_active()` is False and
+      the renderer takes the ordinary global path. The checkbox alone was never the gate; the gate
+      is `enabled AND overrides`, which is the single question Stage 4 and Stage 6 both ask.
+    * *Amount 0* is a hard off-branch for Smart Mix however many roles are ticked — exactly what
+      `SmartMixConfig.plans_anything` says. The first version ignored Amount entirely.
+
+    Both now go through the real record, which is the maintainable version as well as the correct
+    one: if a subsystem changes its mind about what "on" means, this follows automatically.
+
+    **R1 also removed the "Creative Controls away from neutral" line, and removing it was the fix
+    rather than a simplification.** That line was the one thing here the *Quick Render tab itself*
+    could invalidate: the Creative Preset writes all six sliders, so picking `Cinematic` moved them
+    off neutral while this box — refreshed only on tab selection — still read "Nothing optional is
+    active". It was also redundant, and provably so rather than approximately: `PRESETS["Balanced"]`
+    is `(50, 50, 50, 50, 50, 50)`, which is `DEFAULT_CONTROL` six times, and `matching_preset`
+    recomputes the selector from the live sliders on every write. So "some control is off neutral"
+    is *exactly* "the selector does not read Balanced", and that selector sits on this tab, two
+    inches away, permanently correct.
+
+    Deleting the line therefore loses no information and closes the staleness hole at the source --
+    strictly better than keeping it and adding a second `creative_preset` registration to refresh
+    it, which is what an earlier draft of R1 did. That draft had to wire `sfx_folder`, `sfx_roles`
+    and `sfx_amount` into a `creative_preset` event to rebuild the whole string, which
+    `test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring` forbids outright, and it
+    pushed the selector to two registrations against a pin that exists to keep it at one. A fix
+    that has to relax two guards to describe a value already on screen is the wrong fix.
+
+    What remains is exactly the set of things that live in *other* tabs, every one of which is
+    refreshed by the `.select()` that fires on the way back here.
+
     Total: never raises, so selecting a tab can never fail.
     """
     notes: list[str] = []
 
-    if freestyle_enabled:
-        notes.append("Freestyle is ON — sections are edited differently (Creative Studio)")
-
-    # Declared in CREATIVE_CONTROL_FIELDS order, which is also this function's parameter order
-    # and the order every other creative seam in the file uses.
-    controls = (
-        ("Cut Density", cut_density_value),
-        ("Micro Cuts", micro_cuts_value),
-        ("Semantic Emphasis", semantic_emphasis_value),
-        ("Energy Response", energy_response_value),
-        ("Motion Bias", motion_bias_value),
-        ("Source Diversity", source_diversity_value),
-    )
-    moved = []
-    for name, value in controls:
-        try:
-            if int(value) != fork_creative.DEFAULT_CONTROL:
-                moved.append(name)
-        except (TypeError, ValueError):
-            continue
-    if moved:
-        notes.append("Creative Controls away from neutral: " + ", ".join(moved)
-                     + " (Creative Studio)")
-
-    # The Creative Preset is deliberately NOT reported: its radio is on this very tab, so echoing
-    # it would be the one thing here that duplicates something already on screen.
+    # Freestyle: the declaration decides, not the checkbox. The live seed is passed because it is
+    # already in scope, but activity cannot depend on it -- a `Random` section yields a rule for
+    # every seed, so this asks only whether any rule exists at all.
+    declaration = fork_freestyle_random.declaration_from_styles(
+        freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)), variation_seed_value)
+    if declaration.is_active():
+        ruled = len(declaration.ruled_types())
+        notes.append(f"Freestyle: {ruled} section type(s) edited differently (Creative Studio)")
 
     try:
         if int(variation_seed_value) != 0:
@@ -2170,9 +2183,26 @@ def _on_quick_render_tab_select(freestyle_enabled, cut_density_value, micro_cuts
         count = len(voice_files_value) if isinstance(voice_files_value, (list, tuple)) else 1
         notes.append(f"Audio Layers: {count} voice clip(s) (Advanced Tools)")
 
-    roles = sfx_roles_value if isinstance(sfx_roles_value, (list, tuple)) else []
-    if (isinstance(sfx_folder_value, str) and sfx_folder_value.strip()) and roles:
-        notes.append(f"Smart Mix: {len(roles)} SFX role(s) (Advanced Tools)")
+    # Smart Mix: `plans_anything_from` is the authority on Amount 0 and on an empty role set.
+    #
+    # The question is asked of the fork module rather than answered here, and this handler builds
+    # NO `SmartMixConfig`: `test_the_public_wrapper_owns_the_mutex_and_duplicates_no_gate_logic`
+    # pins exactly one construction from widget values in this file, because two places collapsing
+    # widgets into a config is two chances to disagree about what the widgets mean. A read-out has
+    # no business being the second one.
+    #
+    # An empty role selection is passed through as an explicit empty set rather than as the raw
+    # falsey value: `normalize_roles` treats a non-iterable as *malformed* and falls back to all
+    # five roles, which would read an untouched control as "everything on".
+    #
+    # The folder is checked separately because the config does not carry one -- without a library
+    # there is nothing to place, whatever the three controls say.
+    roles = fork_smart_mix.normalize_roles(sfx_roles_value) if sfx_roles_value else frozenset()
+    amount = fork_smart_mix.normalize_control(sfx_amount_value)
+    has_folder = isinstance(sfx_folder_value, str) and bool(sfx_folder_value.strip())
+    if has_folder and fork_smart_mix.plans_anything_from(roles, amount):
+        notes.append(f"Smart Mix: {len(roles)} SFX role(s) at Amount "
+                     f"{amount} (Advanced Tools)")
 
     if not notes:
         return ("Nothing optional is active — this render uses the defaults shown on this tab.")
@@ -5724,11 +5754,21 @@ def create_ui() -> gr.Blocks:
         # Reads nothing from `gr.State`, writes no execution widget, and is absent from
         # `source_outputs` and `prep_outputs`: looking at a tab cannot invalidate a confirmed
         # source set or a prepared library.
+        # [FORK] Digital-Union (GUI Refresh A / R1): the ten section dropdowns ride LAST so the
+        # handler can take them as `*styles`, and in `_FREESTYLE_WIDGET_ORDER` — the same explicit
+        # ordering the render wrappers use, because Gradio passes `inputs` positionally and a
+        # reordering here would silently mislabel which section carries which rule.
+        #
+        # Note what is NOT in this list any more: the six creative sliders. R1 dropped the
+        # "away from neutral" line they fed, because the Creative Preset selector on this very tab
+        # already states that fact and cannot go stale (Balanced IS the all-neutral recipe, and the
+        # selector is recomputed from the live sliders). Every remaining input lives in another
+        # tab, so the `.select()` that fires on the way back here is sufficient to keep all of them
+        # current — no creative control needs a second binding, and no event here can be stale.
         tab_quick_render.select(
             fn=_on_quick_render_tab_select,
-            inputs=[freestyle_enabled, cut_density, micro_cuts, semantic_emphasis,
-                    energy_response, motion_bias, source_diversity, variation_seed,
-                    voice_files, sfx_folder, sfx_roles],
+            inputs=[freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
+                    sfx_amount] + freestyle_section_dropdowns,
             outputs=[active_settings_summary])
 
         # Each widget refreshes the summary and writes NOTHING else. `.change()` is correct here
