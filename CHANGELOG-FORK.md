@@ -20,6 +20,78 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-16 (Raw Cutter V1: split one long video at its existing edits)
+
+A fourth top-level tab, **✂️ Raw Cutter**, between Creative Studio and Advanced Tools. It takes one
+long source video, finds the cuts that are already in it, and writes the shots out as separate
+files — footage prep for *before* anything enters the media library.
+
+It is deliberately a tool *beside* the render pipeline, not a branch of it. It needs **no audio
+track, no confirmed source set, no prepared Stage-5 library and no render**, and it reaches none of
+them: a structural test walks all three handlers and fails on any mention of `process_video*`,
+`analyze_beats_auto`, `create_music_video`, the promotion helpers, `resolve_for_render`,
+`RenderLifecycle`, the Stage-5 cache identity constants or any creative-state module.
+
+```
+Source video      one absolute path, read in place -- nothing is uploaded or copied
+                  mp4 · mkv · mov · m4v · avi · webm
+Output folder     each run gets its own fresh <stem>_raw_parts_<timestamp>\ subfolder
+Sensitivity       0-100, default 50   (50 IS the detector's existing 0.27 threshold)
+Minimum length    seconds, default 5    short scenes are COMBINED, never discarded
+Maximum length    seconds, default 300  long takes are split, preferring a real scene change
+Remove audio      default ON, and it removes the STREAM (`-an`), not just the signal
+```
+
+**Two separate actions, and cutting never starts by itself.** *Analyze / Preview* probes, detects
+and plans, then shows the source details, a summary and a per-segment table (start, end, seconds,
+and whether that cut came from a scene change or from the length limit) — it writes nothing. *Cut
+Video* re-probes the live file, recomputes the plan signature from the live widgets, and refuses a
+plan that no longer matches. `Remove Audio` is deliberately **not** in that signature: it changes
+how a segment is exported, never where it begins or ends, so including it would refuse a still-valid
+plan and force a needless re-analysis of a long video.
+
+**The segmentation planner is its own small pure module** (`beatsync_fork/raw_cutter.py`, stdlib
+only). Stage 5's `_make_candidate_windows` builds ~5.2-second scoring windows that never become
+files; the Raw Cutter's output is physical video, so its policy is the opposite and sharing that
+code would have forced one of the two to bend. The *detector* is shared; only the segmentation is
+new. Four invariants are enforced on every plan in production, not just under test: complete
+coverage of `[0, duration]` with no gap or overlap, no zero-length segment, bounds honoured
+whenever arithmetic allows, and deterministic output for identical inputs. When a bound *cannot* be
+honoured — a 3-second source against a 5-second minimum — the footage is kept and the plan says so.
+
+**Scene detection distinguishes "no cuts" from "the detector did not run."**
+`ffmpeg_processing.detect_video_scene_changes` returns `[]` for both, which is correct for Stage 5
+and would be a lie here: it would present one giant time-split clip as the footage's own structure.
+`raw_cutter_export.detect_scenes` is a separate small wrapper around the same FFmpeg invocation
+that reports `succeeded` explicitly, and Analyze refuses on failure.
+
+**Export** is H.264 MP4 — NVENC when available, `libx264` otherwise — with no `-vf`, `-s` or `-r`,
+so resolution, aspect ratio and frame rate are whatever the source had. Commands are argument
+lists, never shell strings; there is **no `-y`**, so a name collision is a refusal rather than an
+overwrite; every finished file is validated (exists, non-empty, probes as readable video) before it
+counts as a success; and a failed or cancelled segment's partial file is removed — only that file,
+which the call exclusively created moments earlier. Completed clips are never touched by a later
+failure, and the source is only ever an input.
+
+**Concurrency reuses the one existing mutex rather than inventing a second.** The Raw Cutter is the
+**fifth** `_RENDER_LOCK` acquirer and the **fourth** named holder, joining renders, Verify Sources
+and Sample Decode. Cutting re-encodes a long source against the same drive a render extracts clips
+from, and D0 traced clip-extraction timeouts to exactly that contention. One non-blocking acquire
+gives both directions — a cut refuses during a render, and the render path already refuses while
+the lock is held without caring who holds it — and **no render code changed**. The alternative, a
+private cutter lock plus `if not _RENDER_LOCK.locked()`, is the check-then-act race this repository
+bans outright. Cancel is cooperative, observed between segments, with its own concurrency lane.
+
+Fast keyframe-aligned stream copy was **deferred**, not attempted and hidden: it is only honest if
+the report says which clips moved to a keyframe and by how much, and that is more surface than V1
+should carry. Every clip is re-encoded and frame-accurate.
+
+Tested on synthetic fixtures through the real FFmpeg binary: hard cuts detected, rapid cuts merged,
+long takes split, `-an` verified to leave **no audio stream in the container**, every exported clip
+probed as playable, durations tiling the source exactly, the original byte-identical afterwards,
+collisions refused without overwriting, and cancellation keeping completed clips while leaving no
+partial behind.
+
 ### Changed — 2026-10-16 (GUI Refresh Phase A: three tabs)
 
 The whole app was one scrolling column with six collapsed accordions. Create Music Video sat far

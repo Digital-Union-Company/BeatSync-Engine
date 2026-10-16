@@ -203,6 +203,11 @@ from beatsync_fork import audio_mix as fork_audio_mix
 # library scan, probing and the FFmpeg streams reuse src/audio_mixdown.py — there is no second
 # mix engine, and SFX reach only the final render audio.
 from beatsync_fork import smart_mix as fork_smart_mix
+# [FORK] Digital-Union (Raw Cutter V1): the pure segmentation planner. The FFmpeg adapter
+# (src/raw_cutter_export.py) is imported INSIDE the two handlers rather than here, deliberately:
+# it is only reached when the operator presses a Raw Cutter button, and a module-level import
+# would add an FFmpeg-touching dependency to every GUI start for a tool most sessions never open.
+from beatsync_fork import raw_cutter as fork_cutter
 import audio_mixdown
 
 #: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
@@ -3113,6 +3118,12 @@ RENDER_CONCURRENCY_ID = 'beatsync-render'
 #: it would only run after the render it was meant to interrupt had already finished.
 CANCEL_CONCURRENCY_ID = 'beatsync-cancel'
 
+#: [FORK] Digital-Union (Raw Cutter V1): the cutter Cancel button's own lane, deliberately neither
+#: `RENDER_CONCURRENCY_ID` nor `CANCEL_CONCURRENCY_ID`. Same reasoning as the render Cancel -- a
+#: stop queued behind the job it is meant to stop would only run once that job had finished -- and
+#: its own id so a cutter stop and a render stop can never queue behind one another.
+CUTTER_CANCEL_CONCURRENCY_ID = 'beatsync-cutter-cancel'
+
 RENDER_BUSY_MESSAGE = (
     "⏳ A render is already running. Wait for it to finish before starting another — "
     "BeatSync renders one video at a time."
@@ -3189,6 +3200,17 @@ _VERIFY_FLAG_LOCK = threading.Lock()
 _LOCK_HOLDER_RENDER = 'render'
 _LOCK_HOLDER_VERIFY = 'verify'
 _LOCK_HOLDER_SAMPLE = 'sample'
+#: [FORK] Digital-Union (Raw Cutter V1): the FOURTH holder of the one `_RENDER_LOCK`.
+#
+# Cutting a long source re-encodes it segment by segment against the same drive a render extracts
+# clips from, which is heavier disk work than either diagnostic already sharing this mutex. D0
+# traced clip-extraction timeouts to exactly that contention, so the two must be exclusive.
+#
+# Reusing the existing mutex is what buys BOTH directions for one acquire and no new primitive: a
+# cut refuses while a render runs, and the render path already refuses when the lock is held
+# without caring who holds it, so no render code changed. The alternative -- a private cutter lock
+# plus `if not _RENDER_LOCK.locked()` -- is the check-then-act race this file bans outright.
+_LOCK_HOLDER_CUTTER = 'cutter'
 _lock_holder: str = ''
 
 #: [FORK] Digital-Union (MEDIA-VERIFY-S2-A R3): per-session verification revisions.
@@ -3322,6 +3344,8 @@ def _busy_message() -> str:
         return VERIFY_BUSY_MESSAGE
     if holder == _LOCK_HOLDER_SAMPLE:
         return SAMPLE_BUSY_MESSAGE
+    if holder == _LOCK_HOLDER_CUTTER:
+        return CUTTER_BUSY_MESSAGE
     if holder == _LOCK_HOLDER_RENDER:
         return RENDER_BUSY_MESSAGE
     return MEDIA_BUSY_UNKNOWN_TEXT
@@ -3340,6 +3364,8 @@ def _verify_busy_message() -> str:
         return PREP_VERIFY_ALREADY_RUNNING_TEXT
     if holder == _LOCK_HOLDER_SAMPLE:
         return PREP_VERIFY_SAMPLE_BUSY_TEXT
+    if holder == _LOCK_HOLDER_CUTTER:
+        return CUTTER_BUSY_MESSAGE
     if holder == _LOCK_HOLDER_RENDER:
         return PREP_VERIFY_RENDER_BUSY_TEXT
     return MEDIA_BUSY_UNKNOWN_TEXT
@@ -3357,6 +3383,8 @@ def _sample_busy_message() -> str:
         return PREP_SAMPLE_ALREADY_RUNNING_TEXT
     if holder == _LOCK_HOLDER_VERIFY:
         return PREP_SAMPLE_VERIFY_BUSY_TEXT
+    if holder == _LOCK_HOLDER_CUTTER:
+        return CUTTER_BUSY_MESSAGE
     if holder == _LOCK_HOLDER_RENDER:
         return PREP_SAMPLE_RENDER_BUSY_TEXT
     return MEDIA_BUSY_UNKNOWN_TEXT
@@ -4631,6 +4659,255 @@ def _on_sample_decode_click(video_path: str, seek_seconds,
     return report
 
 
+# ============================================================================================
+# [FORK] Digital-Union (Raw Cutter V1): split ONE long source video at its existing edits.
+#
+# A standalone footage-prep tool. It reaches NO render, no source-confirmation gate, no Stage-5
+# cache, no Qwen worker, no Variant Lab / Director / Freestyle state, no output promotion and no
+# `RenderLifecycle`. Cutting raw footage is not a render and must not acquire a render's
+# machinery -- a structural test walks both handlers and enforces that.
+#
+# The division of labour is deliberate and is what keeps this out of `gui.py`'s weight class:
+#
+#   beatsync_fork/raw_cutter.py   PURE: threshold mapping, the segmentation planner, naming,
+#                                 staleness identity, report text. Stdlib only, so the whole
+#                                 policy is testable on a bare interpreter.
+#   raw_cutter_export.py          the FFmpeg adapter: probe, scene detection, segment export.
+#   here                          widgets, the mutex, cancellation and progress.
+# ============================================================================================
+
+#: Guards the Cancel button's view of the running job. Small and separate from `_RENDER_LOCK`:
+#: this protects a one-slot reference, not admission. Admission is `_RENDER_LOCK` and nothing else.
+_CUTTER_JOB_LOCK = threading.Lock()
+_cutter_job = None
+
+
+def _install_cutter_job(job):
+    global _cutter_job
+    with _CUTTER_JOB_LOCK:
+        _cutter_job = job
+
+
+def _clear_cutter_job() -> None:
+    global _cutter_job
+    with _CUTTER_JOB_LOCK:
+        _cutter_job = None
+
+
+def _cut_busy_message() -> str:
+    """The accurate refusal for a CUT caller that just failed to take `_RENDER_LOCK`.
+
+    The fourth face of the same table. Like its three siblings it names the real holder rather
+    than deducing one, and it gives advice a Raw Cutter user can act on.
+    """
+    holder = _lock_holder_now()
+    if holder == _LOCK_HOLDER_CUTTER:
+        return CUT_BUSY_TEXT
+    if holder == _LOCK_HOLDER_RENDER:
+        return CUT_RENDER_BUSY_TEXT
+    if holder in (_LOCK_HOLDER_VERIFY, _LOCK_HOLDER_SAMPLE):
+        return CUT_MEDIA_BUSY_TEXT
+    return MEDIA_BUSY_UNKNOWN_TEXT
+
+
+def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
+    """Analyze / Preview. Probes, detects scene changes, plans — and writes NOTHING.
+
+    Returns `(summary_text, table_rows, plan_state, source_details)`. The plan travels in `gr.State` as a plain
+    dict of primitives, never a live object: nothing with a thread, handle or lock may enter Gradio
+    state, and a dict is also what makes the staleness signature comparable later.
+
+    Detection failure is reported as failure. `ffmpeg_processing.detect_video_scene_changes`
+    answers `[]` for both "no cuts" and "the detector did not run", which is fine for Stage 5 but
+    would be a lie here: it would present one giant time-split clip as the footage's own structure.
+    `raw_cutter_export.detect_scenes` keeps the two apart and this refuses on the failure.
+    """
+    import raw_cutter_export as cutter_export
+
+    probe = cutter_export.probe_source(source_path)
+    if not probe.ok:
+        return f"❌ {probe.error}", [], None, ""
+    source = probe.source
+    details = source.describe()
+
+    try:
+        low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
+    except fork_cutter.RawCutterError as exc:
+        return f"❌ {exc}", [], None, details
+
+    level = fork_cutter.normalize_sensitivity(sensitivity)
+    threshold = fork_cutter.sensitivity_to_threshold(level)
+
+    scenes = cutter_export.detect_scenes(source.path, threshold)
+    if not scenes.succeeded:
+        return (f"❌ Scene detection failed, so no plan was made.\n{scenes.error}\n\n"
+                f"Nothing was written and your source file was not touched."), [], None, details
+
+    try:
+        plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high, level)
+    except fork_cutter.RawCutterError as exc:
+        return f"❌ {exc}", [], None, details
+
+    summary = fork_cutter.plan_summary_text(plan, source)
+    summary = (f"{summary}\n\nScene detection took {scenes.elapsed_seconds:g}s.")
+    state = {
+        'signature': fork_cutter.plan_signature(source, level, low, high),
+        'source': {
+            'path': source.path, 'duration': source.duration, 'width': source.width,
+            'height': source.height, 'fps': source.fps, 'has_audio': source.has_audio,
+            'size_bytes': source.size_bytes, 'mtime_ns': source.mtime_ns,
+        },
+        'segments': [[s.index, s.start, s.end, s.boundary_kind, s.below_minimum]
+                     for s in plan.segments],
+        'sensitivity': level, 'min_seconds': low, 'max_seconds': high,
+        'threshold': plan.threshold, 'detected': plan.detected_scene_count,
+    }
+    return summary, fork_cutter.plan_table_rows(plan), state, details
+
+
+def _restore_plan(state):
+    """Rebuild the typed records from `gr.State`. Returns `(source, plan)` or `(None, None)`."""
+    if not isinstance(state, dict) or not state.get('segments'):
+        return None, None
+    try:
+        raw = state['source']
+        source = fork_cutter.SourceInfo(
+            path=raw['path'], duration=float(raw['duration']), width=int(raw['width']),
+            height=int(raw['height']), fps=float(raw['fps']), has_audio=bool(raw['has_audio']),
+            size_bytes=int(raw['size_bytes']), mtime_ns=int(raw['mtime_ns']))
+        segments = tuple(
+            fork_cutter.Segment(index=int(i), start=float(a), end=float(b),
+                                boundary_kind=str(kind), below_minimum=bool(short))
+            for i, a, b, kind, short in state['segments'])
+        plan = fork_cutter.SegmentPlan(
+            segments=segments, source_duration=source.duration,
+            sensitivity=int(state['sensitivity']), threshold=float(state['threshold']),
+            min_seconds=float(state['min_seconds']), max_seconds=float(state['max_seconds']),
+            detected_scene_count=int(state['detected']))
+        return source, plan
+    except (KeyError, TypeError, ValueError):
+        return None, None
+
+
+def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds, max_seconds,
+                remove_audio):
+    """Cut Video. A generator, so clip X / total is visible while FFmpeg works.
+
+    The staleness gate is the first real step and it is deliberately strict: the plan is refused
+    unless the LIVE widgets and the LIVE file still produce the identical planning signature. A
+    plan describes where this specific file's cuts fall, so a re-saved source or a changed
+    sensitivity makes it fiction. `Remove Audio` is intentionally absent from the signature -- it
+    changes how a segment is exported, never where it begins or ends, so it would refuse a plan
+    that is still perfectly valid.
+    """
+    import raw_cutter_export as cutter_export
+
+    source, plan = _restore_plan(plan_state)
+    if source is None:
+        yield CUT_NO_PLAN_TEXT
+        return
+
+    probe = cutter_export.probe_source(source_path)
+    if not probe.ok:
+        yield f"❌ {probe.error}"
+        return
+    try:
+        low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
+    except fork_cutter.RawCutterError as exc:
+        yield f"❌ {exc}"
+        return
+    live_signature = fork_cutter.plan_signature(probe.source, sensitivity, low, high)
+    if live_signature != plan_state.get('signature'):
+        yield CUT_STALE_PLAN_TEXT
+        return
+
+    if not _RENDER_LOCK.acquire(blocking=False):
+        # Names the real holder, exactly as the three sibling guards do. A refused click performs
+        # no work, creates no directory and leaves no state.
+        yield _cut_busy_message()
+        return
+    _mark_lock_holder(_LOCK_HOLDER_CUTTER)
+    job = cutter_export.CutterJob()
+    _install_cutter_job(job)
+
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    results = []
+    run_directory = ''
+    try:
+        run_directory, error = cutter_export.prepare_run_directory(
+            output_folder, source.path, timestamp)
+        if error:
+            yield f"❌ {error}"
+            return
+
+        encoder = 'h264_nvenc' if NVENC_AVAILABLE else 'libx264'
+        yield (f"✂️ Cutting {plan.count} clip(s) into:\n{run_directory}\n\n"
+               f"Encoder: {encoder}. Audio: "
+               f"{'removed' if remove_audio else 'kept'}.")
+
+        progress: List[str] = []
+
+        def note(index, total, name):
+            progress.append(f"  {index}/{total}  {name}")
+
+        results = cutter_export.export_segments(
+            source=source, plan=plan, run_directory=run_directory,
+            remove_audio=bool(remove_audio), encoder=encoder, job=job, on_progress=note)
+
+        done = [r for r in results if r.ok]
+        failed = [r for r in results if not r.ok]
+        lines = [
+            f"{'✅' if not failed else '⚠️'} Finished: {len(done)} of {plan.count} clip(s) written.",
+            f"Output folder:\n{run_directory}",
+            "",
+            f"Encoder: {encoder}   Audio: {'removed (-an)' if remove_audio else 'kept (AAC)'}",
+        ]
+        if done:
+            total_bytes = sum(r.size_bytes for r in done)
+            lines.append(f"Total written: {fork_cutter.format_size(total_bytes)}")
+        if failed:
+            lines.append("")
+            lines.append(f"{len(failed)} clip(s) failed:")
+            lines.extend(f"  #{r.index}: {r.error}" for r in failed[:20])
+            if len(failed) > 20:
+                lines.append(f"  ... and {len(failed) - 20} more")
+        lines.append("")
+        lines.append("Your source file was not modified.")
+        yield "\n".join(lines)
+
+    except cutter_export.CutterCancelled:
+        written = [r for r in results if r.ok]
+        yield (f"⏹️ {CUT_CANCELLED_TEXT}\n\n"
+               f"{len(written)} clip(s) were completed and kept"
+               + (f" in:\n{run_directory}" if run_directory else ".")
+               + "\n\nYour source file was not modified.")
+    except Exception as exc:
+        # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
+        import traceback
+        traceback.print_exc()
+        yield (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
+               f"Your source file was not modified.")
+    finally:
+        _clear_cutter_job()
+        _mark_lock_holder('')
+        _RENDER_LOCK.release()
+
+
+def _on_cut_cancel() -> str:
+    """Signal the running cut job. Writes only the cutter's own report line.
+
+    Cooperative, exactly like the render Cancel: the flag is observed between segments, so the
+    clip currently encoding finishes or is discarded cleanly rather than being torn up mid-write.
+    Completed clips are always kept.
+    """
+    with _CUTTER_JOB_LOCK:
+        job = _cutter_job
+    if job is None:
+        return CUT_NOTHING_RUNNING_TEXT
+    job.cancel()
+    return CUT_CANCEL_REQUESTED_TEXT
+
+
 def _on_sample_invalidate(request: gr.Request = None) -> str:
     """Clear the sample report when the video file or the seek position changes.
 
@@ -5360,6 +5637,113 @@ def create_ui() -> gr.Blocks:
                             elem_id='render-batch-summary',
                         )
 
+            # [FORK] Digital-Union (Raw Cutter V1): a top-level tab, not an accordion inside
+            # Advanced Tools. It is a tool the operator comes to the app specifically to use --
+            # curating footage BEFORE any of the render workflow applies -- so burying it would
+            # repeat the discoverability problem the three-tab refresh existed to fix.
+            #
+            # Nothing in here is wired to `source_outputs`, `prep_outputs`, the render request or
+            # any creative state, so using the cutter cannot clear a source confirmation, disturb
+            # a prepared library or change what Create Music Video would produce.
+            with gr.Tab(LABEL_TAB_RAW_CUTTER, id='tab-raw-cutter'):
+                gr.Markdown(INFO_TAB_RAW_CUTTER)
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        with gr.Group():
+                            cut_source = gr.Textbox(
+                                label=LABEL_CUT_SOURCE,
+                                placeholder=PLACEHOLDER_CUT_SOURCE,
+                                info=INFO_CUT_SOURCE,
+                                elem_id='cut-source-input',
+                            )
+                            cut_source_info = gr.Textbox(
+                                label=LABEL_CUT_SOURCE_INFO,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_SOURCE_INFO,
+                                interactive=False,
+                                lines=2,
+                                max_lines=3,
+                                elem_id='cut-source-info-box',
+                            )
+                            cut_output = gr.Textbox(
+                                label=LABEL_CUT_OUTPUT,
+                                placeholder=PLACEHOLDER_CUT_OUTPUT,
+                                info=INFO_CUT_OUTPUT,
+                                elem_id='cut-output-input',
+                            )
+                        with gr.Group():
+                            cut_sensitivity = gr.Slider(
+                                minimum=fork_cutter.SENSITIVITY_MIN,
+                                maximum=fork_cutter.SENSITIVITY_MAX,
+                                step=1,
+                                value=fork_cutter.SENSITIVITY_DEFAULT,
+                                label=LABEL_CUT_SENSITIVITY,
+                                info=INFO_CUT_SENSITIVITY,
+                                elem_id='cut-sensitivity-slider',
+                            )
+                            with gr.Row():
+                                cut_min_seconds = gr.Number(
+                                    value=fork_cutter.MIN_CLIP_SECONDS_DEFAULT,
+                                    minimum=0,
+                                    label=LABEL_CUT_MIN_SECONDS,
+                                    info=INFO_CUT_MIN_SECONDS,
+                                    elem_id='cut-min-seconds',
+                                )
+                                cut_max_seconds = gr.Number(
+                                    value=fork_cutter.MAX_CLIP_SECONDS_DEFAULT,
+                                    minimum=0,
+                                    label=LABEL_CUT_MAX_SECONDS,
+                                    info=INFO_CUT_MAX_SECONDS,
+                                    elem_id='cut-max-seconds',
+                                )
+                            cut_remove_audio = gr.Checkbox(
+                                value=True,
+                                label=LABEL_CUT_REMOVE_AUDIO,
+                                info=INFO_CUT_REMOVE_AUDIO,
+                                elem_id='cut-remove-audio',
+                            )
+                        with gr.Row():
+                            cut_analyze_btn = gr.Button(
+                                LABEL_CUT_ANALYZE, variant='secondary',
+                                elem_id='cut-analyze-button')
+                            cut_run_btn = gr.Button(
+                                LABEL_CUT_RUN, variant='primary',
+                                elem_id='cut-run-button')
+                        cut_cancel_btn = gr.Button(
+                            LABEL_CUT_CANCEL, variant='stop', size='sm',
+                            elem_id='cut-cancel-button')
+                        gr.Markdown(INFO_CUT_ACTIONS)
+                    with gr.Column(scale=3):
+                        cut_summary = gr.Textbox(
+                            label=LABEL_CUT_PLAN_SUMMARY,
+                            value='',
+                            placeholder=PLACEHOLDER_CUT_PLAN_SUMMARY,
+                            interactive=False,
+                            lines=10,
+                            max_lines=18,
+                            elem_id='cut-plan-summary',
+                        )
+                        cut_table = gr.Dataframe(
+                            headers=list(fork_cutter.PLAN_TABLE_HEADERS),
+                            value=[],
+                            interactive=False,
+                            wrap=True,
+                            elem_id='cut-plan-table',
+                        )
+                        cut_report = gr.Textbox(
+                            label=LABEL_CUT_RUN_REPORT,
+                            value='',
+                            placeholder=PLACEHOLDER_CUT_RUN_REPORT,
+                            interactive=False,
+                            lines=8,
+                            max_lines=20,
+                            elem_id='cut-run-report',
+                        )
+                # The plan rides as a plain dict of primitives. Nothing live -- no thread, lock,
+                # handle or lifecycle -- may enter `gr.State`, and a dict is also what lets the
+                # Cut handler recompute the staleness signature and compare it.
+                cut_plan_state = gr.State(None)
+
             with gr.Tab(LABEL_TAB_ADVANCED, id='tab-advanced-tools'):
                 gr.Markdown(INFO_TAB_ADVANCED)
                 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed.
@@ -5622,6 +6006,44 @@ def create_ui() -> gr.Blocks:
         # clears the confirmation and disables Create Music Video. Note which inputs are absent:
         # FPS, encoder, output filename and audio are never wired here, so changing them cannot
         # invalidate a source confirmation — they are not source-video identity.
+        # [FORK] Digital-Union (Raw Cutter V1): three registrations, and what they write is the
+        # whole isolation story.
+        #
+        # Analyze writes the summary, the table and the plan state. Cut writes the report. Cancel
+        # writes the report. NONE of them writes `status_output`, `video_output`, `process_btn`,
+        # `source_state`, any element of `source_outputs` or `prep_outputs`, any creative widget,
+        # or any render state -- so no Raw Cutter action can clear a source confirmation, enable
+        # or disable Create Music Video, move the preparation state machine or alter a render.
+        #
+        # Neither Analyze nor Cut joins `RENDER_CONCURRENCY_ID`, and both keep
+        # `concurrency_limit=None`. That is the measured S2-A R3 rule rather than a preference: on
+        # the pinned gradio 6.19.0 a full concurrency group leaves the event QUEUED instead of
+        # delivering it, so the handler is never entered and the mutex that was supposed to refuse
+        # it is never reached. A lane of 1 recreates the same defect one step in.
+        #
+        # Cancel gets its own lane for the same reason the render Cancel does: queuing a stop
+        # behind the job it is meant to stop makes it useless.
+        cut_analyze_btn.click(
+            fn=_on_cut_analyze,
+            inputs=[cut_source, cut_sensitivity, cut_min_seconds, cut_max_seconds],
+            outputs=[cut_summary, cut_table, cut_plan_state, cut_source_info],
+            concurrency_limit=None,
+        )
+        cut_run_btn.click(
+            fn=_on_cut_run,
+            inputs=[cut_plan_state, cut_source, cut_output, cut_sensitivity,
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio],
+            outputs=[cut_report],
+            concurrency_limit=None,
+        )
+        cut_cancel_btn.click(
+            fn=_on_cut_cancel,
+            inputs=[],
+            outputs=[cut_report],
+            concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
+            concurrency_limit=None,
+        )
+
         source_outputs = [source_report, confirm_btn, confirm_status, process_btn, source_state]
 
         source_mode.change(

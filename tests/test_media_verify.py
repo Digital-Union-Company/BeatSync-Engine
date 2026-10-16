@@ -967,6 +967,8 @@ def _load_concurrency_seam(cap=None):
         "_LOCK_HOLDER_RENDER": _module_constant(tree, "_LOCK_HOLDER_RENDER"),
         "_LOCK_HOLDER_VERIFY": _module_constant(tree, "_LOCK_HOLDER_VERIFY"),
         "_LOCK_HOLDER_SAMPLE": _module_constant(tree, "_LOCK_HOLDER_SAMPLE"),
+        # [FORK] Raw Cutter V1: a fourth named holder of the same mutex.
+        "_LOCK_HOLDER_CUTTER": _module_constant(tree, "_LOCK_HOLDER_CUTTER"),
         "_SCOPE_VERIFY": _module_constant(tree, "_SCOPE_VERIFY"),
         "_SCOPE_SAMPLE": _module_constant(tree, "_SCOPE_SAMPLE"),
         "_verify_revisions": dict(_module_constant(tree, "_verify_revisions") or {}),
@@ -976,6 +978,7 @@ def _load_concurrency_seam(cap=None):
         "RENDER_BUSY_MESSAGE": "RENDER_BUSY",
         "VERIFY_BUSY_MESSAGE": "VERIFY_BUSY",
         "SAMPLE_BUSY_MESSAGE": "SAMPLE_BUSY",
+        "CUTTER_BUSY_MESSAGE": "CUTTER_BUSY",
         "MEDIA_BUSY_UNKNOWN_TEXT": "BUSY_UNKNOWN_HOLDER",
         "PREP_VERIFY_RENDER_BUSY_TEXT": "VERIFY_REFUSED_RENDER_ACTIVE",
         "PREP_VERIFY_ALREADY_RUNNING_TEXT": "VERIFY_REFUSED_ALREADY_RUNNING",
@@ -1172,8 +1175,9 @@ def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree)
     acquires = [node for node in ast.walk(gui_tree)
                 if isinstance(node, ast.Call)
                 and ast.unparse(node).startswith("_RENDER_LOCK.acquire")]
-    assert len(acquires) == 4, \
-        f"two render sites plus verification plus sample decode: {[ast.unparse(a) for a in acquires]}"
+    assert len(acquires) == 5, (
+        "two render sites plus verification plus sample decode plus the Raw Cutter: "
+        f"{[ast.unparse(a) for a in acquires]}")
     for call in acquires:
         rendered = ast.unparse(call)
         assert rendered == "_RENDER_LOCK.acquire(blocking=False)", \
@@ -1184,7 +1188,7 @@ def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree)
     # Every acquire has a matching release, and verification's is in a finally.
     releases = [node for node in ast.walk(gui_tree)
                 if isinstance(node, ast.Call) and ast.unparse(node) == "_RENDER_LOCK.release()"]
-    assert len(releases) == 4, f"one release per acquire, got {len(releases)}"
+    assert len(releases) == 5, f"one release per acquire, got {len(releases)}"
     handler = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
     tried = [n for n in ast.walk(_func(gui_tree, "_on_verify_sources_click"))
              if isinstance(n, ast.Try) and n.finalbody]
