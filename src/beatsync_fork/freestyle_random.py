@@ -191,6 +191,68 @@ def declaration_from_styles(enabled: Any, styles: Any,
     return fork_freestyle.FreestyleDeclaration(enabled=enabled, overrides=tuple(collected))
 
 
+def summary_text(enabled: Any, styles: Any) -> str:
+    """The read-only Freestyle summary, for a screen that may contain :data:`RANDOM_STYLE`.
+
+    The V2 counterpart of ``freestyle.summary_text``, and it exists because that one takes a
+    *declaration*: once a ``Random`` section has been generated, its rule is indistinguishable from
+    a hand-picked one, so a declaration cannot say which sections will be regenerated. Worse,
+    handing V1's parser a V2 screen reported the exact opposite of the truth — ``override_from_style
+    ("Random")`` is ``None`` (not a preset name), so ten Random sections read as ten Base sections
+    and the panel claimed the render was unmodified while the renderer was generating ten rules.
+
+    **It prints no generated number**, and that is the stale-preview rule rather than caution: the
+    values depend on the live Variation Seed, which has six legitimate writers, so a number copied
+    in here would stop being true the moment any of them fired. A ``Random`` row therefore names its
+    *source* instead of a value. Numbers are shown only by :func:`describe_resolved`, which is
+    reached from Surprise me and states the exact seed that produced them.
+
+    Like V1's, this takes **no global control as an argument** — not the sliders and not the seed —
+    so "the read-out cannot print a stale global" stays structural rather than promised.
+
+    Total: never raises. A non-mapping ``styles`` reads as no rules at all.
+    """
+    if not enabled:
+        return fork_freestyle.SUMMARY_DISABLED
+
+    mapping = dict(styles) if isinstance(styles, Mapping) else {}
+    generated = [t for t in fork_freestyle.SECTION_TYPES if is_random_style(mapping.get(t))]
+    fixed = [
+        (t, fork_freestyle.override_from_style(mapping.get(t)))
+        for t in fork_freestyle.SECTION_TYPES
+    ]
+    fixed = [(t, override) for t, override in fixed if override is not None]
+
+    if not generated and not fixed:
+        return fork_freestyle.SUMMARY_NO_RULES
+
+    ruled = [t for t, _ in fixed] + generated
+    width = max(len(t) for t in ruled)
+    lines = [
+        "Freestyle is on. Micro Cuts and the Variation Seed stay global for the whole render.",
+        "Base means the section inherits your global Creative Control at render time.",
+    ]
+    if generated:
+        lines.append(
+            "Random generates that section's five controls from the Variation Seed when you "
+            "render. Press Surprise me to roll a new seed and see the values.")
+    lines.append("")
+
+    overrides = dict(fixed)
+    for section_type in fork_freestyle.SECTION_TYPES:
+        if section_type in overrides:
+            lines.append(f"{section_type:<{width}}  {overrides[section_type].summarize()}")
+        elif section_type in generated:
+            lines.append(f"{section_type:<{width}}  {RANDOM_STYLE} — generated from the "
+                         f"Variation Seed at render time")
+
+    inherited = [t for t in fork_freestyle.SECTION_TYPES if t not in ruled]
+    if inherited:
+        lines.append("")
+        lines.append("Base for every control: " + ", ".join(inherited))
+    return "\n".join(lines)
+
+
 def describe_resolved(styles: Mapping[str, Any], seed: Any) -> str:
     """A readable preview of what the generated sections currently resolve to.
 
@@ -222,5 +284,6 @@ __all__ = [
     "stream_for",
     "generate_override",
     "declaration_from_styles",
+    "summary_text",
     "describe_resolved",
 ]

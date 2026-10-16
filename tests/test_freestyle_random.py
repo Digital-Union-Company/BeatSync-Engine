@@ -429,3 +429,169 @@ def test_the_five_v1_choices_keep_their_meaning_and_position(style):
     assert fork_random.SECTION_STYLE_CHOICES.index(style) == \
         fork_freestyle.SECTION_STYLE_CHOICES.index(style)
     assert fork_random.is_random_style(style) is False
+
+
+# ======================================================================================
+# 9. R1 — the summary must agree with what the renderer actually does
+#
+# The defect these pin: `_on_freestyle_change` resolved a V2 screen through V1's
+# `FreestyleDeclaration.from_styles`, whose `override_from_style("Random")` is `None`
+# because "Random" is not a preset name. Ten Random sections therefore read as ten Base
+# sections and the panel claimed the render was unmodified -- while the renderer built
+# ten active rules. It was the DEFAULT screen, so every user would have hit it.
+# ======================================================================================
+
+
+def _summary_and_declaration(enabled, styles, seed=_SEED):
+    return (fork_random.summary_text(enabled, styles),
+            fork_random.declaration_from_styles(enabled, styles, seed))
+
+
+def test_r1_the_all_random_summary_no_longer_claims_the_render_is_unmodified():
+    """The exact regression. V1's wording for an all-Base screen must not appear here."""
+    summary, declaration = _summary_and_declaration(True, _all_random())
+
+    assert declaration.is_active() is True
+    assert fork_freestyle.SUMMARY_NO_RULES not in summary
+    assert "exactly what it" not in summary
+    assert summary.count(fork_random.RANDOM_STYLE) >= len(fork_freestyle.SECTION_TYPES)
+
+
+def test_r1_v1_parser_really_does_disagree_with_the_renderer():
+    """Pins the cause, so a future refactor cannot quietly reintroduce the V1 route."""
+    styles = _all_random()
+    v1_declaration = fork_freestyle.FreestyleDeclaration.from_styles(True, styles)
+    v2_declaration = fork_random.declaration_from_styles(True, styles, _SEED)
+
+    assert v1_declaration.is_active() is False     # what the panel used to believe
+    assert v2_declaration.is_active() is True      # what the renderer actually does
+    # and the V2 summary sides with the renderer
+    assert fork_freestyle.SUMMARY_NO_RULES in fork_freestyle.summary_text(v1_declaration)
+    assert fork_freestyle.SUMMARY_NO_RULES not in fork_random.summary_text(True, styles)
+
+
+@pytest.mark.parametrize("enabled,styles_builder,expect_active", [
+    (False, _all_random, False),
+    (True, _all_random, True),
+    (True, lambda: {t: fork_freestyle.BASE_STYLE for t in fork_freestyle.SECTION_TYPES}, False),
+    (True, lambda: {**{t: fork_freestyle.BASE_STYLE for t in fork_freestyle.SECTION_TYPES},
+                    "drop": "High Energy"}, True),
+    (True, lambda: {**_all_random(), "intro": "Cinematic",
+                    "outro": fork_freestyle.BASE_STYLE}, True),
+])
+def test_r1_the_summary_agrees_with_the_declaration_for_every_screen(
+        enabled, styles_builder, expect_active):
+    """One rule, checked on every shape: if the renderer will modify the edit, the panel says so."""
+    styles = styles_builder()
+    summary, declaration = _summary_and_declaration(enabled, styles)
+
+    assert declaration.is_active() is expect_active
+    claims_no_effect = (fork_freestyle.SUMMARY_DISABLED in summary
+                        or fork_freestyle.SUMMARY_NO_RULES in summary)
+    assert claims_no_effect is (not expect_active), summary
+
+
+def test_r1_a_mixed_screen_names_each_section_truthfully():
+    styles = _all_random()
+    styles["intro"] = "Cinematic"
+    styles["outro"] = fork_freestyle.BASE_STYLE
+    summary = fork_random.summary_text(True, styles)
+
+    # the manual section shows its own numbers, exactly as V1 does
+    cinematic = fork_freestyle.override_from_style("Cinematic")
+    assert cinematic.summarize() in summary
+    # the Base section is listed as inherited, not as a rule
+    assert "Base for every control: outro" in summary
+    # and a generated section names its source rather than a value
+    assert "drop" in summary and "generated from the Variation Seed" in summary
+
+
+def test_r1_the_live_summary_prints_no_generated_number():
+    """No stale preview: generated values depend on the live seed, which has six writers."""
+    styles = _all_random()
+    for seed in (_SEED, _OTHER_SEED, 1, 999999):
+        summary = fork_random.summary_text(True, styles)
+        generated = fork_random.declaration_from_styles(True, styles, seed)
+        for section_type, override in generated.overrides:
+            for name in fork_freestyle.FREESTYLE_CONTROL_FIELDS:
+                token = f"{fork_freestyle.CONTROL_LABELS[name]} {getattr(override, name)}"
+                assert token not in summary, (seed, token)
+    # the summary is therefore identical whatever the seed is
+    assert fork_random.summary_text(True, styles) == fork_random.summary_text(True, styles)
+
+
+def test_r1_numbers_are_shown_only_with_the_seed_that_produced_them():
+    """`describe_resolved` is the one place generated values appear, and it names its seed."""
+    styles = _all_random()
+    for seed in (_SEED, _OTHER_SEED):
+        text = fork_random.describe_resolved(styles, seed)
+        assert str(seed) in text
+        assert "Variation Seed" in text
+
+
+def test_r1_summary_text_takes_no_global_control():
+    """Same structural guarantee as V1's: no slider and no seed is in scope to print."""
+    tree = _tree(_RANDOM)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "summary_text")
+    assert [a.arg for a in fn.args.args] == ["enabled", "styles"]
+    # Strings blanked: the user-facing copy legitimately says "seed" while telling the reader
+    # where the values come from. What must be absent is a seed *in scope* to print.
+    code = ast.unparse(_BlankStrings().visit(_strip_docstrings(fn)))
+    assert "seed" not in code, code
+
+
+def test_r1_summary_text_is_total():
+    for bad in (None, "styles", 42, [], object()):
+        assert isinstance(fork_random.summary_text(True, bad), str)
+        assert isinstance(fork_random.summary_text(False, bad), str)
+    assert fork_random.summary_text(False, _all_random()) == fork_freestyle.SUMMARY_DISABLED
+
+
+def test_r1_v1_summary_text_still_serves_v1_declarations_unchanged():
+    """The V1 formatter keeps its contract; V2 adds a second entry point, never a replacement."""
+    styles = {t: fork_freestyle.BASE_STYLE for t in fork_freestyle.SECTION_TYPES}
+    styles["drop"] = "High Energy"
+    declaration = fork_freestyle.FreestyleDeclaration.from_styles(True, styles)
+    expected = fork_freestyle.override_from_style("High Energy").summarize()
+    assert expected in fork_freestyle.summary_text(declaration)
+
+
+# ---- the GUI seam for the corrected handler -------------------------------------------
+
+
+def test_r1_the_change_handler_uses_the_v2_formatter_not_the_v1_parser():
+    tree = _tree(_GUI)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_freestyle_change")
+    body = ast.unparse(_strip_docstrings(fn))
+    assert "fork_freestyle_random.summary_text" in body
+    # the V1 route that caused the defect must not come back
+    assert "FreestyleDeclaration.from_styles" not in body
+    # and it still takes no global control
+    assert [a.arg for a in fn.args.args] == ["freestyle_enabled"]
+    assert fn.args.vararg is not None and fn.args.vararg.arg == "styles"
+
+
+def test_r1_surprise_me_when_freestyle_is_off_admits_the_seed_moved():
+    """The earlier wording claimed the render was unchanged. The seed is GLOBAL, so it is not."""
+    tree = _tree(_GUI)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_surprise_me")
+    body = ast.unparse(_strip_docstrings(fn))
+    assert "this render is unchanged" not in body
+    assert "Variation Seed is now" in body
+    assert "still vary" in body
+
+
+def test_r1_no_extra_seed_draw_and_no_feedback_loop_was_introduced():
+    """One draw per press, and the seed widget gains no `.change()` that could overwrite a preview."""
+    tree = _tree(_GUI)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_surprise_me")
+    assert ast.unparse(_strip_docstrings(fn)).count("fork_variation.random_seed()") == 1
+    # a variation_seed.change writing the summary would immediately clobber Surprise me's preview
+    for call in _registration(tree, "variation_seed", "change"):
+        outputs = _names(_kwargs(call).get("outputs", ast.List(elts=[])))
+        assert "freestyle_summary" not in outputs
+

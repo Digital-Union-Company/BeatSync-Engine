@@ -2008,9 +2008,15 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
     It takes no global slider as an input, which is what makes that guarantee structural rather
     than a promise: there is no global value in scope to print.
     """
-    declaration = fork_freestyle.FreestyleDeclaration.from_styles(
+    # [FORK] Digital-Union (Random Freestyle V2 / R1): the V2 formatter, because the V1 one takes a
+    # *declaration* and a generated rule is indistinguishable from a hand-picked one once resolved.
+    # Routing a V2 screen through V1's parser reported the exact opposite of the truth: it resolves
+    # styles with `override_from_style`, which answers None for "Random" (not a preset name), so ten
+    # Random sections read as ten Base sections and the panel claimed the render was unmodified
+    # while the renderer was generating ten active rules. It was the DEFAULT screen, so every user
+    # would have seen it.
+    return fork_freestyle_random.summary_text(
         freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)))
-    return fork_freestyle.summary_text(declaration)
 
 
 def _on_surprise_me(freestyle_enabled, *styles):
@@ -2037,8 +2043,14 @@ def _on_surprise_me(freestyle_enabled, *styles):
     preview = fork_freestyle_random.describe_resolved(
         dict(zip(_FREESTYLE_WIDGET_ORDER, styles)), seed)
     if not freestyle_enabled:
-        preview = ("Freestyle is switched off, so this render is unchanged.\n"
-                   "Tick Enable Freestyle to use the sections below.\n\n") + preview
+        # R1: the earlier wording ("so this render is unchanged") was false in the half that
+        # matters. The Variation Seed is GLOBAL and this button really did move it, so the next
+        # ordinary render changes too — clip choice is seeded from it. Only the *section rules*
+        # are inactive while the switch is off.
+        preview = (f"Variation Seed is now {seed}. Freestyle is switched OFF, so the section "
+                   f"rules below are not applied — but the seed is global, so your next render "
+                   f"will still vary.\nTick Enable Freestyle to use the sections below.\n\n"
+                   ) + preview
     return seed, preview
 
 
