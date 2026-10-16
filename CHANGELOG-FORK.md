@@ -20,11 +20,11 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
-### Added — 2026-10-16 (Raw Cutter V1: split one long video at its existing edits)
+### Added — 2026-10-16 (Raw Cutter V1: pull the usable shots out of one long video)
 
 A fourth top-level tab, **✂️ Raw Cutter**, between Creative Studio and Advanced Tools. It takes one
-long source video, finds the cuts that are already in it, and writes the shots out as separate
-files — footage prep for *before* anything enters the media library.
+long source video, finds the cuts that are already in it, and writes the usable shots out as
+separate files — footage prep for *before* anything enters the media library.
 
 It is deliberately a tool *beside* the render pipeline, not a branch of it. It needs **no audio
 track, no confirmed source set, no prepared Stage-5 library and no render**, and it reaches none of
@@ -37,60 +37,86 @@ Source video      one absolute path, read in place -- nothing is uploaded or cop
                   mp4 · mkv · mov · m4v · avi · webm
 Output folder     each run gets its own fresh <stem>_raw_parts_<timestamp>\ subfolder
 Sensitivity       0-100, default 50   (50 IS the detector's existing 0.27 threshold)
-Minimum length    seconds, default 5    short scenes are COMBINED, never discarded
-Maximum length    seconds, default 300  long takes are split, preferring a real scene change
+Minimum length    seconds, default 5    the shortest shot worth keeping
+Maximum length    seconds, default 300  the longest single clip to write
 Remove audio      default ON, and it removes the STREAM (`-an`), not just the signal
 ```
 
-**Two separate actions, and cutting never starts by itself.** *Analyze / Preview* probes, detects
-and plans, then shows the source details, a summary and a per-segment table (start, end, seconds,
-and whether that cut came from a scene change or from the length limit) — it writes nothing. *Cut
-Video* re-probes the live file, recomputes the plan signature from the live widgets, and refuses a
-plan that no longer matches. `Remove Audio` is deliberately **not** in that signature: it changes
-how a segment is exported, never where it begins or ends, so including it would refuse a still-valid
-plan and force a needless re-analysis of a long video.
+**Quality first, not coverage first.** The Raw Cutter curates footage; it is not an archive tool.
+A **shot** — the continuous interval between two confirmed scene changes — is the unit of the whole
+policy:
 
-**The segmentation planner is its own small pure module** (`beatsync_fork/raw_cutter.py`, stdlib
-only). Stage 5's `_make_candidate_windows` builds ~5.2-second scoring windows that never become
-files; the Raw Cutter's output is physical video, so its policy is the opposite and sharing that
-code would have forced one of the two to bend. The *detector* is shared; only the segmentation is
-new. Four invariants are enforced on every plan in production, not just under test: complete
-coverage of `[0, duration]` with no gap or overlap, no zero-length segment, bounds honoured
-whenever arithmetic allows, and deterministic output for identical inputs. When a bound *cannot* be
-honoured — a 3-second source against a 5-second minimum — the footage is kept and the plan says so.
+* A shot shorter than the minimum is **skipped entirely**. Nothing is ever merged across a scene
+  change to reach the minimum, because that produces a clip that cuts in the middle, which is the
+  one thing nobody wants in a source library.
+* A shot longer than the maximum is divided **inside itself**, so every piece still comes from one
+  continuous take and the division costs nothing in continuity.
+* **Gaps between exported clips are intended output**, not a defect. The report says how much was
+  skipped and why.
+* A plan with **zero** clips is a legitimate analysis result about footage with nothing worth
+  keeping. It is not an error — and Cut Video declines it rather than writing something unusable.
 
-**Scene detection distinguishes "no cuts" from "the detector did not run."**
-`ffmpeg_processing.detect_video_scene_changes` returns `[]` for both, which is correct for Stage 5
-and would be a lie here: it would present one giant time-split clip as the footage's own structure.
-`raw_cutter_export.detect_scenes` is a separate small wrapper around the same FFmpeg invocation
-that reports `succeeded` explicitly, and Analyze refuses on failure.
+Worked examples, which are also the regression tests: a 14 s source cut at 10 s exports `[0,10]`
+and skips the 4 s tail (**not** 7+7 across the cut); a 32 s source cut at 30 s exports `[0,30]` and
+skips 2 s; one continuous 14 s take at max 10 s becomes `[0,7]` and `[7,14]`; a lone 4 s shot
+exports nothing and says so.
 
-**Export** is H.264 MP4 — NVENC when available, `libx264` otherwise — with no `-vf`, `-s` or `-r`,
-so resolution, aspect ratio and frame rate are whatever the source had. Commands are argument
-lists, never shell strings; there is **no `-y`**, so a name collision is a refusal rather than an
-overwrite; every finished file is validated (exists, non-empty, probes as readable video) before it
-counts as a success; and a failed or cancelled segment's partial file is removed — only that file,
-which the call exclusively created moments earlier. Completed clips are never touched by a later
-failure, and the source is only ever an input.
+The invariants that replace complete coverage, all enforced in production rather than only under
+test: **no exported clip ever spans a confirmed scene change** (structural — clips are built inside
+one shot), **every exported clip satisfies both bounds** (there is no "flagged short" escape
+hatch), clips stay inside the source and never overlap, and the plan is deterministic.
 
-**Concurrency reuses the one existing mutex rather than inventing a second.** The Raw Cutter is the
-**fifth** `_RENDER_LOCK` acquirer and the **fourth** named holder, joining renders, Verify Sources
-and Sample Decode. Cutting re-encodes a long source against the same drive a render extracts clips
-from, and D0 traced clip-extraction timeouts to exactly that contention. One non-blocking acquire
-gives both directions — a cut refuses during a render, and the render path already refuses while
-the lock is held without caring who holds it — and **no render code changed**. The alternative, a
-private cutter lock plus `if not _RENDER_LOCK.locked()`, is the check-then-act race this repository
-bans outright. Cancel is cooperative, observed between segments, with its own concurrency lane.
+**Detection failure is not zero cuts.** `ffmpeg_processing.detect_video_scene_changes` returns `[]`
+for both, which is right for Stage 5 and a lie here — it would present a failed detector as one
+giant time-split clip and call it the footage's own structure. `raw_cutter_export.detect_scenes` is
+a separate small wrapper around the same FFmpeg invocation that reports `succeeded` explicitly.
 
-Fast keyframe-aligned stream copy was **deferred**, not attempted and hidden: it is only honest if
-the report says which clips moved to a keyframe and by how much, and that is more surface than V1
-should carry. Every clip is re-encoded and frame-accurate.
+**Two actions, and cutting never starts by itself.** *Analyze / Preview* probes, detects and plans,
+then shows the source details, a kept/skipped summary and a per-shot table — it writes nothing.
+*Cut Video* re-probes the live file and recomputes the plan signature from the live widgets,
+refusing a plan that no longer matches. `Remove Audio` is deliberately **not** in that signature: it
+changes how a clip is exported, never where it begins or ends.
 
-Tested on synthetic fixtures through the real FFmpeg binary: hard cuts detected, rapid cuts merged,
-long takes split, `-an` verified to leave **no audio stream in the container**, every exported clip
-probed as playable, durations tiling the source exactly, the original byte-identical afterwards,
-collisions refused without overwriting, and cancellation keeping completed clips while leaving no
-partial behind.
+**Export safety.** Argument lists, never shell strings. FFmpeg writes to a **task-owned staging
+file** carrying a per-attempt token, and only a validated staging file is published by a single
+same-directory `os.rename` — which on Windows raises `FileExistsError` rather than replacing, so
+the collision check and the move are one indivisible step and a second run can never destroy the
+first's output. **The destination is never deleted on any path**; the only thing ever removed is
+our own staging artifact. No `-vf`/`-s`/`-r`, so resolution, aspect ratio and frame rate are the
+source's. H.264 MP4 via NVENC when available, `libx264` otherwise.
+
+Cancellation is cooperative, observed between clips, and the completed count is accumulated through
+a callback — `export_segments` raises on a stop and an exception discards its return value, so the
+report would otherwise claim nothing had been written after several clips were already on disk.
+
+**Concurrency reuses the one existing mutex.** The Raw Cutter is the **fifth** `_RENDER_LOCK`
+acquirer and the **fourth** named holder, joining renders, Verify Sources and Sample Decode.
+Cutting re-encodes a long source against the same drive a render extracts clips from, and D0 traced
+clip-extraction timeouts to exactly that contention. One non-blocking acquire gives both directions
+— a cut refuses during a render, and the render path already refuses while the lock is held without
+caring who holds it — and **no render code changed**. The alternative, a private cutter lock plus
+`if not _RENDER_LOCK.locked()`, is the check-then-act race this repository bans outright.
+
+**Transition (Edge Cleaner) trimming is DEFERRED, and the measurement is recorded** in
+`docs/claude/raw-cutter-edge-cleaner.md`. FFmpeg's `scene` score was measured against four
+synthetic fixtures and is structurally the wrong signal: a 2-second cross-dissolve peaks at `0.140`
+while ordinary camera motion with no edit at all reaches `0.045` and peaks at `0.061`, so no
+threshold separates them — and because `scene` compares *adjacent* frames, a longer (better)
+dissolve scores *lower*, which is backwards. No speculative detector was shipped, and no dormant
+scaffolding was left behind. The document carries a concrete long-baseline proposal for V2 and
+states the honest limitation: an edge-only pass can never find a dissolve in the middle of an
+interval the first detector missed.
+
+Fast keyframe-aligned stream copy was deferred for the same reason — it is only honest if the
+report says which clips moved to a keyframe and by how much. Every clip is re-encoded and
+frame-accurate.
+
+Tested on synthetic fixtures through the real FFmpeg binary: the four worked examples end to end,
+hard cuts detected, short shots skipped rather than merged, long takes divided internally, `-an`
+verified to leave **no audio stream in the container**, every exported clip probed as playable, the
+original byte-identical afterwards, collisions refused without overwriting, **a foreign file at the
+destination surviving a failed export**, no staging artifact left behind on success or failure, and
+cancellation reporting exactly the clips that reached disk.
 
 ### Changed — 2026-10-16 (GUI Refresh Phase A: three tabs)
 

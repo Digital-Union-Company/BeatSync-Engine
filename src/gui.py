@@ -4757,8 +4757,10 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
             'height': source.height, 'fps': source.fps, 'has_audio': source.has_audio,
             'size_bytes': source.size_bytes, 'mtime_ns': source.mtime_ns,
         },
-        'segments': [[s.index, s.start, s.end, s.boundary_kind, s.below_minimum]
+        'segments': [[s.index, s.start, s.end, s.shot_index, s.boundary_kind]
                      for s in plan.segments],
+        'shots': [[s.index, s.start, s.end, s.exported, s.skip_reason, s.piece_count]
+                  for s in plan.shots],
         'sensitivity': level, 'min_seconds': low, 'max_seconds': high,
         'threshold': plan.threshold, 'detected': plan.detected_scene_count,
     }
@@ -4777,10 +4779,14 @@ def _restore_plan(state):
             size_bytes=int(raw['size_bytes']), mtime_ns=int(raw['mtime_ns']))
         segments = tuple(
             fork_cutter.Segment(index=int(i), start=float(a), end=float(b),
-                                boundary_kind=str(kind), below_minimum=bool(short))
-            for i, a, b, kind, short in state['segments'])
+                                shot_index=int(shot), boundary_kind=str(kind))
+            for i, a, b, shot, kind in state['segments'])
+        shots = tuple(
+            fork_cutter.Shot(index=int(i), start=float(a), end=float(b), exported=bool(kept),
+                             skip_reason=str(reason), piece_count=int(pieces))
+            for i, a, b, kept, reason, pieces in state.get('shots', ()))
         plan = fork_cutter.SegmentPlan(
-            segments=segments, source_duration=source.duration,
+            segments=segments, shots=shots, source_duration=source.duration,
             sensitivity=int(state['sensitivity']), threshold=float(state['threshold']),
             min_seconds=float(state['min_seconds']), max_seconds=float(state['max_seconds']),
             detected_scene_count=int(state['detected']))
@@ -4805,6 +4811,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     source, plan = _restore_plan(plan_state)
     if source is None:
         yield CUT_NO_PLAN_TEXT
+        return
+    if not plan.has_work:
+        # [FORK] Digital-Union (Raw Cutter R1): a zero-clip plan is a legitimate ANALYSIS result --
+        # the source genuinely has nothing long enough to export -- but it is not something to
+        # execute. Refused clearly here rather than creating an empty run folder.
+        yield CUT_NOTHING_TO_EXPORT_TEXT
         return
 
     probe = cutter_export.probe_source(source_path)
@@ -4832,6 +4844,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
 
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     results = []
+    # [FORK] Digital-Union (Raw Cutter R1): the completed list is accumulated through a callback,
+    # NOT read from the return value. `export_segments` raises `CutterCancelled` on a stop, and an
+    # exception discards its return -- so the earlier version reported "0 clip(s) were completed"
+    # after a cancellation that had already written several files to disk. Declared out here so
+    # the handler below can read it on every terminal path.
+    completed: List[Any] = []
     run_directory = ''
     try:
         run_directory, error = cutter_export.prepare_run_directory(
@@ -4845,14 +4863,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                f"Encoder: {encoder}. Audio: "
                f"{'removed' if remove_audio else 'kept'}.")
 
-        progress: List[str] = []
-
-        def note(index, total, name):
-            progress.append(f"  {index}/{total}  {name}")
+        def finished(result):
+            completed.append(result)
 
         results = cutter_export.export_segments(
             source=source, plan=plan, run_directory=run_directory,
-            remove_audio=bool(remove_audio), encoder=encoder, job=job, on_progress=note)
+            remove_audio=bool(remove_audio), encoder=encoder, job=job, on_complete=finished)
 
         done = [r for r in results if r.ok]
         failed = [r for r in results if not r.ok]
@@ -4876,11 +4892,24 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         yield "\n".join(lines)
 
     except cutter_export.CutterCancelled:
-        written = [r for r in results if r.ok]
-        yield (f"⏹️ {CUT_CANCELLED_TEXT}\n\n"
-               f"{len(written)} clip(s) were completed and kept"
-               + (f" in:\n{run_directory}" if run_directory else ".")
-               + "\n\nYour source file was not modified.")
+        # `completed` is the truth here, never `results`: the exception propagated out of
+        # `export_segments` before it could return, so its list never reached this frame.
+        written = [r for r in completed if r.ok]
+        failed_before_stop = [r for r in completed if not r.ok]
+        lines = [f"⏹️ {CUT_CANCELLED_TEXT}", ""]
+        lines.append(f"{len(written)} of {plan.count} clip(s) were completed and kept"
+                     + (f" in:\n{run_directory}" if run_directory else "."))
+        if written:
+            lines.append("Total written: "
+                         f"{fork_cutter.format_size(sum(r.size_bytes for r in written))}")
+            lines.extend(f"  kept: {os.path.basename(r.path)}" for r in written[:20])
+            if len(written) > 20:
+                lines.append(f"  ... and {len(written) - 20} more")
+        if failed_before_stop:
+            lines.append(f"{len(failed_before_stop)} clip(s) had already failed before the stop.")
+        lines.append("")
+        lines.append("Your source file was not modified.")
+        yield "\n".join(lines)
     except Exception as exc:
         # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
         import traceback

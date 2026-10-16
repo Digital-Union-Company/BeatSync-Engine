@@ -641,10 +641,14 @@ LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
 # ============================================================================
 
 INFO_TAB_RAW_CUTTER = (
-    "**Chop one long video into its separate shots.** Point it at a single file, press Analyze to "
-    "see where the cuts would fall, then press Cut Video to write the pieces into a new folder. "
+    "**Pull the usable shots out of one long video.** Point it at a single file, press Analyze to "
+    "see which shots it would keep, then press Cut Video to write them into a new folder. "
     "It needs no audio track, no confirmed source set and no prepared library — it is a standalone "
-    "footage-prep tool, and it never modifies the file you give it."
+    "footage-prep tool, and it never modifies the file you give it.\n\n"
+    "**It keeps clean shots and skips the rest.** Material shorter than your minimum is left "
+    "behind rather than glued to its neighbour, because a clip that cuts in the middle is not "
+    "worth having in a source library. Gaps between the exported clips are normal and the plan "
+    "tells you exactly how much was skipped and why."
 )
 
 LABEL_CUT_SOURCE = "🎬 Source video (full path to one file)"
@@ -673,14 +677,15 @@ INFO_CUT_SENSITIVITY = (
 
 LABEL_CUT_MIN_SECONDS = "⏱️ Minimum clip length (seconds)"
 INFO_CUT_MIN_SECONDS = (
-    "Scenes shorter than this are joined to their neighbours rather than thrown away. A burst of "
-    "rapid cuts becomes one clip covering all of them."
+    "The shortest shot worth keeping. A shot below this is **skipped entirely** — it is never "
+    "glued to the shot next to it to make up the length, because that would produce a clip with "
+    "a cut in the middle of it."
 )
 
 LABEL_CUT_MAX_SECONDS = "⏳ Maximum clip length (seconds)"
 INFO_CUT_MAX_SECONDS = (
-    "A long unbroken take is split into pieces no longer than this — at another detected scene "
-    "change when one falls in a usable place, otherwise by duration."
+    "The longest single clip to write. A longer shot is divided into several clips — all from "
+    "inside that same continuous take, so nothing ever spans a scene change."
 )
 
 LABEL_CUT_REMOVE_AUDIO = "🔇 Remove audio from the clips"
@@ -696,10 +701,10 @@ LABEL_CUT_CANCEL = "⏹️ Cancel cutting"
 
 LABEL_CUT_PLAN_SUMMARY = "Plan summary"
 PLACEHOLDER_CUT_PLAN_SUMMARY = (
-    "Analyze a video to see how many clips it would produce, where each one starts and ends, and "
-    "whether the cut came from a detected scene change or from the maximum length."
+    "Analyze a video to see which shots it found, which ones it would export, and which it would "
+    "skip for being too short."
 )
-LABEL_CUT_PLAN_TABLE = "Planned segments"
+LABEL_CUT_PLAN_TABLE = "Detected shots — kept and skipped"
 LABEL_CUT_RUN_REPORT = "Cut report"
 PLACEHOLDER_CUT_RUN_REPORT = "Nothing has been cut yet."
 
@@ -721,6 +726,12 @@ CUT_RENDER_BUSY_TEXT = (
 CUT_CANCELLED_TEXT = "Cutting cancelled. Clips already written were kept; the partial one was removed."
 CUT_CANCEL_REQUESTED_TEXT = "Cancellation requested — finishing the current clip, then stopping."
 CUT_NOTHING_RUNNING_TEXT = "No cut job is running."
+
+CUT_NOTHING_TO_EXPORT_TEXT = (
+    "This plan has no clips to export — nothing in the source is long enough at these settings. "
+    "That is a real answer about the footage, not an error. Lower the minimum clip length, or "
+    "lower the sensitivity so fewer scene changes are detected, then Analyze again."
+)
 
 #: Shown to a RENDER / VERIFY / SAMPLE caller that found the mutex held by a Raw Cutter job.
 CUTTER_BUSY_MESSAGE = (

@@ -142,7 +142,7 @@ def adapter():
 
     wanted = ("CutterCancelled", "CutterJob", "ProbeResult", "SceneResult", "SegmentResult",
               "_parse_rate", "probe_source", "detect_scenes", "build_segment_command",
-              "_validate_output", "export_segments", "_discard_partial",
+              "_validate_output", "export_segments", "_discard_staging",
               "prepare_run_directory",
               "SCENE_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS", "EXPORT_TIMEOUT_SECONDS",
               "ANALYSIS_FPS", "ANALYSIS_WIDTH", "SUPPORTED_SOURCE_SUFFIXES")
@@ -173,6 +173,7 @@ def adapter():
 
     namespace = {
         "os": os, "re": __import__("re"), "subprocess": subprocess,
+        "uuid": __import__("uuid"),
         "threading": __import__("threading"), "time": __import__("time"),
         "dataclass": __import__("dataclasses").dataclass,
         "Callable": object, "Sequence": object,
@@ -489,3 +490,145 @@ def test_the_run_directory_is_named_from_the_source_and_timestamp(adapter, tmp_p
         str(tmp_path / "root"), r"J:\F\Holiday Clip.mkv", "20261016_203000")
     assert not error
     assert os.path.basename(created) == "Holiday_Clip_raw_parts_20261016_203000"
+
+
+# =============================================================================================
+# Quality-first selection, through the real detector and the real encoder (R1)
+# =============================================================================================
+
+def test_a_short_tail_shot_is_skipped_rather_than_merged_end_to_end(adapter, tmp_path):
+    """The owner's Example A against real footage: 10s shot + 4s shot, min 5 max 10.
+
+    Exactly one clip is written, it is the 10-second shot, and the 4-second tail is left on the
+    floor -- not glued on to make a 14-second clip with a cut in the middle.
+    """
+    path = _make_video(tmp_path / "tail.mp4", [10, 4])
+    source, plan = _plan_for(adapter, path, minimum=5.0, maximum=10.0)
+
+    assert plan.count == 1, [(s.start, s.end) for s in plan.segments]
+    assert len(plan.skipped_shots) == 1
+    assert plan.skipped_shots[0].skip_reason == rc.SKIP_TOO_SHORT
+
+    run_dir, error = adapter["prepare_run_directory"](str(tmp_path / "out"), path, "qf1")
+    assert not error, error
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    written = sorted(os.listdir(run_dir))
+    assert len(written) == 1, written
+    assert _duration(os.path.join(run_dir, written[0])) == pytest.approx(10.0, abs=0.5)
+
+
+def test_a_source_of_only_short_shots_exports_nothing_at_all(adapter, tmp_path):
+    """The owner's Example D, end to end: four 3-second shots against a 5-second minimum."""
+    path = _make_video(tmp_path / "allshort.mp4", [3, 3, 3, 3])
+    source, plan = _plan_for(adapter, path, minimum=5.0, maximum=300.0)
+    assert plan.count == 0
+    assert plan.has_work is False
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "none"), path, "qf2")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert results == []
+    assert os.listdir(run_dir) == [], "an empty plan must write nothing"
+
+
+def test_a_continuous_shot_is_divided_without_crossing_any_cut(adapter, tmp_path):
+    """Example C: one continuous take, max 10 -> two 7-second clips from inside it."""
+    path = _make_video(tmp_path / "long.mp4", [14])
+    source, plan = _plan_for(adapter, path, minimum=5.0, maximum=10.0)
+    assert plan.count == 2
+    assert all(s.shot_index == 1 for s in plan.segments)
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "split"), path, "qf3")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    total = sum(_duration(r.path) for r in results)
+    assert total == pytest.approx(source.duration, abs=0.6)
+
+
+# =============================================================================================
+# File ownership (R1 finding B)
+# =============================================================================================
+
+def test_a_failed_export_never_removes_a_foreign_file_at_the_destination(adapter, tmp_path):
+    """The exact defect. The earlier version deleted the DESTINATION path whenever a segment
+    failed -- so a file that appeared there after the existence check, belonging to some other
+    process, was destroyed by a failure that had nothing to do with it.
+
+    Reproduced by letting the collision check pass and then making the export fail: the source is
+    removed after planning, so FFmpeg cannot read it, and a foreign file is planted at the
+    destination in the meantime.
+    """
+    path = _make_video(tmp_path / "own.mp4", [6, 6])
+    source, plan = _plan_for(adapter, path, minimum=1.0, maximum=30.0)
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "foreign"), path, "fo1")
+    os.remove(path)                                   # guarantees every export fails
+
+    foreign = os.path.join(run_dir, rc.segment_filename(source.path, 1, plan.count))
+    with open(foreign, "wb") as handle:
+        handle.write(b"SOMEBODY ELSE'S FILE")
+
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert not any(r.ok for r in results)
+    assert os.path.isfile(foreign), "a failed export deleted a file it did not own"
+    with open(foreign, "rb") as handle:
+        assert handle.read() == b"SOMEBODY ELSE'S FILE"
+
+
+def test_a_failed_export_leaves_no_staging_artifact_behind(adapter, tmp_path):
+    path = _make_video(tmp_path / "stale.mp4", [6, 6])
+    source, plan = _plan_for(adapter, path, minimum=1.0, maximum=30.0)
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "staging"), path, "st1")
+    os.remove(path)
+
+    adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                               remove_audio=True, encoder='libx264')
+    leftovers = [n for n in os.listdir(run_dir) if ".part." in n]
+    assert leftovers == [], f"staging artifacts were left behind: {leftovers}"
+
+
+def test_a_successful_export_leaves_no_staging_artifact_either(adapter, tmp_path):
+    path = _make_video(tmp_path / "clean.mp4", [6, 6])
+    source, plan = _plan_for(adapter, path, minimum=1.0, maximum=30.0)
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "cleanout"), path, "st2")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results)
+    assert not [n for n in os.listdir(run_dir) if ".part." in n]
+    assert all(n.endswith(".mp4") and not n.startswith(".") for n in os.listdir(run_dir))
+
+
+# =============================================================================================
+# Cancellation accounting (R1 finding A)
+# =============================================================================================
+
+def test_cancellation_reports_the_files_that_were_actually_written(adapter, tmp_path):
+    """`export_segments` raises, which discards its return value -- so the completed clips are
+    only knowable through the callback. This asserts the callback saw exactly what is on disk."""
+    path = _make_video(tmp_path / "count.mp4", [3, 3, 3, 3, 3, 3])
+    source, plan = _plan_for(adapter, path, minimum=1.0, maximum=3.0)
+    assert plan.count >= 3, plan.count
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "countout"), path, "cc1")
+
+    job = adapter["CutterJob"]()
+    completed = []
+
+    def finished(result):
+        completed.append(result)
+        if len([r for r in completed if r.ok]) == 2:
+            job.cancel()
+
+    with pytest.raises(adapter["CutterCancelled"]):
+        adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                   remove_audio=True, encoder='libx264', job=job,
+                                   on_complete=finished)
+
+    written = sorted(n for n in os.listdir(run_dir) if not n.startswith("."))
+    kept = [r for r in completed if r.ok]
+    assert len(kept) == len(written) == 2, (len(kept), written)
+    assert sorted(os.path.basename(r.path) for r in kept) == written
+    for name in written:
+        assert _duration(os.path.join(run_dir, name)) > 0

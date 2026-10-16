@@ -1,29 +1,42 @@
-"""Raw Cutter V1: the pure segmentation planner.
+"""Raw Cutter V1: the pure shot-selection planner.
 
 [FORK] Digital-Union. Split ONE long source video into smaller physical files at its existing
 edits, so footage can be curated before it enters the media library.
 
-**This module decides; it never acts.** No FFmpeg, no subprocess, no filesystem, no clock, no
+**This module decides; it never acts.** No FFmpeg, no child process, no filesystem, no clock, no
 randomness — per CLAUDE.md's hard rule it imports nothing from the upstream runtime, which is what
-makes the whole segmentation policy testable on a bare interpreter. The execution adapter is
+makes the whole selection policy testable on a bare interpreter. The execution adapter is
 ``src/raw_cutter_export.py`` and the wiring is ``gui.py``.
 
-Why a separate planner rather than reusing Stage 5's windowing
---------------------------------------------------------------
-``video_analysis._make_candidate_windows`` builds ~5.2-second *candidate windows* for scoring —
-an internal sampling grid that never becomes a file. The Raw Cutter's output is physical video, so
-its policy is the opposite: cover the source **exactly once**, honour human-scale minimum and
-maximum lengths, and prefer the editor's own cuts. Sharing that code would have forced one of the
-two policies to bend. The *detector* is shared (the FFmpeg scene score); only the segmentation is
-new.
+Quality first, not coverage first (R1)
+--------------------------------------
+The first version tiled the whole source: every frame ended up in some clip, and short scenes were
+merged forward until they reached the minimum length. **That was the wrong product.** The Raw
+Cutter curates footage for later editing; it is not an archive tool. Merging across a real scene
+change to reach five seconds produces a clip that cuts in the middle — exactly the thing nobody
+wants in a music-video source library — and it does so in the name of saving material that was not
+worth keeping.
 
-The four invariants, enforced in :func:`plan_segments` and asserted by its own tests:
+So the policy is inverted:
 
-1. **Complete coverage** — the segments tile ``[0, duration]`` with no gap and no overlap.
-2. **No zero-length segment** ever reaches the plan.
-3. **Bounds are honoured whenever arithmetic allows**, and when they cannot be, the plan *says so*
-   rather than discarding footage. A 3-second source with a 5-second minimum yields one 3-second
-   segment flagged ``below_minimum`` — never an empty plan.
+* A **shot** is a continuous interval between two confirmed scene changes. Shots are the unit.
+* A shot shorter than the minimum is **skipped entirely**. Nothing is merged across a boundary to
+  rescue it.
+* A shot longer than the maximum is divided **inside itself**. Every piece still comes from one
+  continuous take, so the division costs nothing in continuity.
+* Gaps between exported clips are **intended output**, not a defect, and the report states how much
+  was skipped and why.
+* A plan with **zero** usable clips is a legitimate analysis result. It is not an error, and the
+  Cut button refuses it rather than writing something unusable.
+
+The invariants that replace "complete coverage":
+
+1. **No exported segment ever spans a confirmed scene change.** Structural: segments are built
+   inside one shot and never across two.
+2. **Every exported segment satisfies both bounds** — at least the minimum, at most the maximum.
+   There is no "flagged short" escape hatch any more; material that cannot satisfy them is skipped.
+3. **Segments stay inside the source, are ordered, and never overlap.** Gaps between them are
+   allowed and expected.
 4. **Deterministic** — identical inputs and settings give an identical plan, every time.
 """
 
@@ -33,7 +46,7 @@ import hashlib
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 # ---------------------------------------------------------------------------------------------
@@ -62,7 +75,7 @@ MIN_CLIP_SECONDS_DEFAULT = 5.0
 MAX_CLIP_SECONDS_DEFAULT = 300.0
 
 #: Segment arithmetic is rounded to whole milliseconds before the invariants are checked. Without
-#: it, binary float accumulation makes "no gaps" a statement about 1e-16 rather than about video.
+#: it, binary float accumulation makes "no overlap" a statement about 1e-16 rather than about video.
 TIME_QUANTUM = 0.001
 
 
@@ -126,6 +139,13 @@ def normalize_durations(minimum: Any, maximum: Any) -> tuple[float, float]:
 
     Raises :class:`RawCutterError` rather than clamping: silently repairing ``max < min`` would
     produce a plan the operator did not ask for and could not predict.
+
+    **R1 — a positive bound that quantizes to zero is refused, not accepted.** Times are rounded to
+    whole milliseconds, so ``0.0004`` is positive on the way in and ``0.0`` on the way out. The
+    original check ran before quantization and let that through, which would have planned
+    zero-length clips from a value the operator typed in good faith. Both bounds are therefore
+    re-checked *after* rounding, and the message says what happened rather than reporting a plain
+    "must be positive" about a number that visibly was.
     """
     low = _finite(minimum)
     high = _finite(maximum)
@@ -133,17 +153,32 @@ def normalize_durations(minimum: Any, maximum: Any) -> tuple[float, float]:
         raise RawCutterError("Minimum clip duration must be a positive number of seconds.")
     if high is None or high <= 0:
         raise RawCutterError("Maximum clip duration must be a positive number of seconds.")
-    if high < low:
+
+    low_q, high_q = _quantize(low), _quantize(high)
+    if low_q <= 0:
+        raise RawCutterError(
+            f"Minimum clip duration ({low:g}s) is smaller than one millisecond, so it rounds to "
+            f"zero. Use at least 0.001s.")
+    if high_q <= 0:
+        raise RawCutterError(
+            f"Maximum clip duration ({high:g}s) is smaller than one millisecond, so it rounds to "
+            f"zero. Use at least 0.001s.")
+    if high_q < low_q:
         raise RawCutterError(
             f"Maximum clip duration ({high:g}s) must be greater than or equal to the "
             f"minimum ({low:g}s).")
-    return _quantize(low), _quantize(high)
+    return low_q, high_q
 
 
 # ---------------------------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------------------------
 
+#: Why a shot produced no exported clip. Rendered verbatim in the report.
+SKIP_TOO_SHORT = "shorter than the minimum"
+SKIP_REMAINDER = "leftover tail below the minimum"
+
+#: How a segment's own end was decided.
 SCENE_CUT = "scene"
 TIME_CUT = "time"
 SOURCE_END = "source-end"
@@ -181,14 +216,34 @@ class SourceInfo:
 
 
 @dataclass(frozen=True)
+class Shot:
+    """One continuous interval between two confirmed scene changes.
+
+    The unit of the whole policy. A shot is either exported (possibly as several pieces, all from
+    inside it) or skipped whole — it is never partially merged into a neighbour.
+    """
+
+    index: int
+    start: float
+    end: float
+    exported: bool = False
+    skip_reason: str = ""
+    piece_count: int = 0
+
+    @property
+    def duration(self) -> float:
+        return round(self.end - self.start, 3)
+
+
+@dataclass(frozen=True)
 class Segment:
     """One physical output clip. ``end`` is exclusive, as every interval in this project is."""
 
     index: int
     start: float
     end: float
+    shot_index: int = 0
     boundary_kind: str = SCENE_CUT
-    below_minimum: bool = False
 
     @property
     def duration(self) -> float:
@@ -200,6 +255,7 @@ class SegmentPlan:
     """The complete, validated plan. Produced only by :func:`plan_segments`."""
 
     segments: tuple[Segment, ...] = ()
+    shots: tuple[Shot, ...] = ()
     source_duration: float = 0.0
     sensitivity: int = SENSITIVITY_DEFAULT
     threshold: float = THRESHOLD_AT_DEFAULT_SENSITIVITY
@@ -213,20 +269,31 @@ class SegmentPlan:
         return len(self.segments)
 
     @property
-    def scene_cuts(self) -> int:
-        return sum(1 for s in self.segments if s.boundary_kind == SCENE_CUT)
+    def has_work(self) -> bool:
+        """Is there anything to export? A plan of zero clips is valid analysis, not an error."""
+        return bool(self.segments)
 
     @property
-    def time_cuts(self) -> int:
-        return sum(1 for s in self.segments if s.boundary_kind == TIME_CUT)
+    def exported_shots(self) -> tuple[Shot, ...]:
+        return tuple(s for s in self.shots if s.exported)
 
     @property
-    def short_segments(self) -> tuple[Segment, ...]:
-        return tuple(s for s in self.segments if s.below_minimum)
+    def skipped_shots(self) -> tuple[Shot, ...]:
+        return tuple(s for s in self.shots if not s.exported)
 
     @property
-    def covered_duration(self) -> float:
+    def exported_duration(self) -> float:
         return round(sum(s.duration for s in self.segments), 3)
+
+    @property
+    def skipped_duration(self) -> float:
+        """What the source contains that no clip will carry.
+
+        Computed as source minus exported rather than by summing skipped shots, so dropped
+        remainders are counted too -- the two must agree, and this is the one that cannot drift
+        from what is actually written.
+        """
+        return round(max(0.0, self.source_duration - self.exported_duration), 3)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -246,96 +313,60 @@ def _usable_scene_times(scene_times: Iterable[Any], duration: float) -> list[flo
     return sorted(collected)
 
 
-def _merge_short(boundaries: Sequence[float], duration: float,
-                 min_seconds: float) -> list[tuple[float, float, str]]:
-    """Walk the cut points, opening a segment and closing it once it is long enough.
+def _divide_shot(start: float, end: float, min_seconds: float,
+                 max_seconds: float) -> tuple[list[tuple[float, float]], float]:
+    """Split ONE continuous shot into exportable pieces. Returns ``(pieces, dropped_seconds)``.
 
-    This is the "combine very short adjacent scenes" rule, and it is a forward accumulation rather
-    than a filter: a rapid-fire sequence of half-second cuts becomes ONE segment spanning all of
-    them, so nothing is discarded for being short.
+    There is no scene change inside a shot — that is what makes it a shot — so the division is
+    purely arithmetic and costs nothing in continuity.
+
+    An **even** split is preferred when it keeps every piece above the minimum: three 8-second
+    clips read better than two 10s and a 4s tail. When an even split would push pieces under the
+    minimum, it falls back to filling maximum-length pieces and reports whatever tail is left over
+    as dropped, because a sub-minimum tail is exactly the material this tool is supposed to leave
+    behind.
     """
-    spans: list[tuple[float, float, str]] = []
-    start = 0.0
-    for moment in boundaries:
-        if moment - start >= min_seconds:
-            spans.append((start, moment, SCENE_CUT))
-            start = moment
-    if duration - start > 0:
-        spans.append((start, duration, SOURCE_END))
-    return spans
-
-
-def _choose_split(start: float, scene_times: Sequence[float], target: float,
-                  earliest: float, latest: float) -> tuple[float, str]:
-    """Pick one cut inside ``[earliest, latest]``, preferring a real scene change.
-
-    The window is what keeps both bounds intact: every candidate inside it produces a piece that is
-    at least the minimum and at most the maximum. Among those, the one nearest the even-split
-    target wins, so pieces stay as regular as the footage allows. Ties break toward the EARLIER
-    boundary, which is what makes the result deterministic.
-    """
-    best: float | None = None
-    best_distance = 0.0
-    for moment in scene_times:
-        if moment < earliest or moment > latest:
-            continue
-        distance = abs(moment - target)
-        if best is None or distance < best_distance - 1e-9:
-            best, best_distance = moment, distance
-    if best is not None:
-        return best, SCENE_CUT
-    return _quantize(min(latest, max(earliest, target))), TIME_CUT
-
-
-def _split_long(span: tuple[float, float, str], scene_times: Sequence[float],
-                min_seconds: float, max_seconds: float) -> list[tuple[float, float, str]]:
-    """Break one over-long span into pieces of at most ``max_seconds``."""
-    start, end, kind = span
-    length = end - start
+    length = _quantize(end - start)
+    if length < min_seconds - 1e-9:
+        return [], length
     if length <= max_seconds + 1e-9:
-        return [span]
+        return [(start, end)], 0.0
 
-    pieces: list[tuple[float, float, str]] = []
-    cursor = start
-    while end - cursor > max_seconds + 1e-9:
-        remaining = end - cursor
-        # How many pieces are still needed, and therefore where an even cut would fall.
-        needed = max(2, int(math.ceil(remaining / max_seconds)))
-        target = _quantize(cursor + remaining / needed)
-        # Leave at least `min_seconds` behind for the tail when that is arithmetically possible.
-        latest = min(cursor + max_seconds, end - min_seconds)
-        if latest < cursor + min_seconds:
-            latest = cursor + max_seconds
-        earliest = cursor + min_seconds
-        if earliest > latest:
-            earliest = latest
-        cut, cut_kind = _choose_split(cursor, scene_times, target, _quantize(earliest),
-                                      _quantize(latest))
-        if cut <= cursor or cut >= end:
-            break
-        pieces.append((cursor, cut, cut_kind))
-        cursor = cut
-    if end - cursor > 0:
-        pieces.append((cursor, end, kind))
-    return pieces
+    pieces = max(2, int(math.ceil(length / max_seconds)))
+    if length / pieces >= min_seconds - 1e-9:
+        cuts = [_quantize(start + (length * index) / pieces) for index in range(pieces + 1)]
+        cuts[0], cuts[-1] = start, end
+        return [(cuts[i], cuts[i + 1]) for i in range(pieces)], 0.0
+
+    # An even split would go under the minimum, so fill whole maximum-length pieces instead.
+    whole = int(length // max_seconds)
+    built = [(_quantize(start + index * max_seconds), _quantize(start + (index + 1) * max_seconds))
+             for index in range(whole)]
+    tail_start = built[-1][1] if built else start
+    tail = _quantize(end - tail_start)
+    if tail >= min_seconds - 1e-9:
+        built.append((tail_start, end))
+        return built, 0.0
+    return built, tail
 
 
 def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
                   min_seconds: Any = MIN_CLIP_SECONDS_DEFAULT,
                   max_seconds: Any = MAX_CLIP_SECONDS_DEFAULT,
                   sensitivity: Any = SENSITIVITY_DEFAULT) -> SegmentPlan:
-    """Turn a duration plus detected scene changes into a complete, validated segment plan.
+    """Select the usable shots from a duration plus its detected scene changes.
 
-    Three passes, in this order and for this reason:
-
-    1. **Merge** short adjacent scenes forward until each span reaches the minimum.
-    2. **Split** any span longer than the maximum, preferring an interior scene change.
-    3. **Settle the tail** — a final span below the minimum is folded back into its predecessor
-       when that does not break the maximum, and otherwise kept and flagged.
+    Shot by shot, with no cross-boundary arithmetic anywhere: each interval between confirmed
+    scene changes is judged on its own and is either divided into exportable pieces or skipped
+    whole. That is what makes "no exported clip spans a scene change" structural rather than
+    checked afterwards.
 
     Raises :class:`RawCutterError` for an unusable duration or contradictory bounds. Everything
     else is absorbed: unusable scene times are ignored rather than fatal, because the detector is
     an estimate and a malformed timestamp must not cost the operator their plan.
+
+    A plan with **no** segments is returned normally. It is a truthful answer about footage that
+    has nothing worth exporting, and the caller refuses to cut it.
     """
     total = _finite(duration)
     if total is None or total <= 0:
@@ -345,55 +376,46 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
     level = normalize_sensitivity(sensitivity)
 
     usable = _usable_scene_times(scene_times, total)
-    notes: list[str] = []
+    boundaries = [0.0] + usable + [total]
 
-    spans = _merge_short(usable, total, low)
-    if not spans:
-        spans = [(0.0, total, SOURCE_END)]
-
-    expanded: list[tuple[float, float, str]] = []
-    for span in spans:
-        expanded.extend(_split_long(span, usable, low, high))
-
-    # -- settle the tail ------------------------------------------------------------------------
-    if len(expanded) >= 2:
-        last_start, last_end, _ = expanded[-1]
-        if last_end - last_start < low - 1e-9:
-            prev_start, _prev_end, prev_kind = expanded[-2]
-            if last_end - prev_start <= high + 1e-9:
-                expanded[-2:] = [(prev_start, last_end, prev_kind)]
-
+    shots: list[Shot] = []
     segments: list[Segment] = []
-    for index, (start, end, kind) in enumerate(expanded, start=1):
-        start_q, end_q = _quantize(start), _quantize(end)
-        if end_q - start_q <= 0:
+    dropped_tails = 0.0
+
+    for position in range(len(boundaries) - 1):
+        start, end = boundaries[position], boundaries[position + 1]
+        if end - start <= 0:
             continue
-        segments.append(Segment(
-            index=len(segments) + 1,
-            start=start_q,
-            end=end_q,
-            boundary_kind=kind,
-            below_minimum=(end_q - start_q) < low - 1e-9,
-        ))
+        shot_index = len(shots) + 1
+        pieces, dropped = _divide_shot(start, end, low, high)
 
-    if not segments:
-        raise RawCutterError("No usable segment could be planned for this source.")
+        if not pieces:
+            # A shot skipped whole is NOT a dropped tail. `_divide_shot` reports the entire length
+            # as unused in that case, and adding it here made the report describe a skipped shot
+            # twice -- once truthfully as a skipped shot, and once as "leftover tail dropped from
+            # the end of long shots", which it never was.
+            shots.append(Shot(index=shot_index, start=start, end=end, exported=False,
+                              skip_reason=SKIP_TOO_SHORT))
+            continue
 
-    short = [s for s in segments if s.below_minimum]
-    if short:
-        notes.append(
-            f"{len(short)} segment(s) are shorter than the {low:g}s minimum because the footage "
-            f"left no longer alternative. They are kept, not discarded.")
-    over = [s for s in segments if s.duration > high + 1e-9]
-    if over:
-        notes.append(f"{len(over)} segment(s) exceed the {high:g}s maximum.")
-    if not usable:
-        notes.append("No scene changes were used, so the source was divided by duration alone.")
+        dropped_tails += dropped
 
-    _assert_invariants(segments, total)
+        shots.append(Shot(index=shot_index, start=start, end=end, exported=True,
+                          piece_count=len(pieces),
+                          skip_reason=SKIP_REMAINDER if dropped > 0 else ""))
+        for piece_start, piece_end in pieces:
+            at_shot_end = abs(piece_end - end) <= TIME_QUANTUM
+            kind = SOURCE_END if (at_shot_end and abs(end - total) <= TIME_QUANTUM) else (
+                SCENE_CUT if at_shot_end else TIME_CUT)
+            segments.append(Segment(index=len(segments) + 1, start=piece_start, end=piece_end,
+                                    shot_index=shot_index, boundary_kind=kind))
+
+    notes = _build_notes(shots, segments, low, high, usable, dropped_tails)
+    _assert_invariants(segments, shots, total, low, high, usable)
 
     return SegmentPlan(
         segments=tuple(segments),
+        shots=tuple(shots),
         source_duration=total,
         sensitivity=level,
         threshold=sensitivity_to_threshold(level),
@@ -404,28 +426,62 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
     )
 
 
-def _assert_invariants(segments: Sequence[Segment], duration: float) -> None:
+def _build_notes(shots: Sequence[Shot], segments: Sequence[Segment], low: float, high: float,
+                 usable: Sequence[float], dropped_tails: float) -> list[str]:
+    notes: list[str] = []
+    if not usable:
+        notes.append("No scene changes were detected, so the whole source was treated as one "
+                     "continuous shot.")
+    skipped = [s for s in shots if not s.exported]
+    if skipped:
+        notes.append(f"{len(skipped)} shot(s) were skipped for being shorter than the {low:g}s "
+                     f"minimum. That is deliberate: a clip is not stretched across a scene change "
+                     f"to reach the minimum.")
+    if dropped_tails > 0:
+        notes.append(f"{format_timecode(dropped_tails)} of leftover tail was dropped from the end "
+                     f"of long shots, because what remained was under the {low:g}s minimum.")
+    if not segments:
+        notes.append("Nothing in this source is long enough to export at these settings. Lower "
+                     "the minimum clip length, or lower the sensitivity so fewer scene changes "
+                     "are detected.")
+    return notes
+
+
+def _assert_invariants(segments: Sequence[Segment], shots: Sequence[Shot], duration: float,
+                       low: float, high: float, scene_times: Sequence[float]) -> None:
     """The four guarantees, checked on every plan rather than trusted.
 
-    This is cheap (one pass over at most a few thousand segments) and it runs in production, not
-    only under test: a planner bug that silently dropped footage would otherwise be discovered as a
-    missing clip after an hour of encoding.
+    Cheap, and it runs in production rather than only under test: a selection bug that exported a
+    clip across a scene change would otherwise be discovered as a ruined source clip an hour of
+    encoding later. Note what is NOT asserted any more -- complete coverage. Gaps are the point.
     """
-    if not segments:
-        raise RawCutterError("The plan is empty.")
-    if segments[0].start != 0.0:
-        raise RawCutterError(f"The plan does not start at 0 (starts at {segments[0].start}).")
-    if abs(segments[-1].end - duration) > TIME_QUANTUM:
-        raise RawCutterError(
-            f"The plan ends at {segments[-1].end}, not at the source duration {duration}.")
+    cuts = set(scene_times)
     for previous, following in zip(segments, segments[1:]):
-        if abs(following.start - previous.end) > TIME_QUANTUM:
+        if following.start < previous.end - TIME_QUANTUM:
             raise RawCutterError(
-                f"Segment {following.index} starts at {following.start} but the previous one ends "
-                f"at {previous.end} — the plan has a gap or an overlap.")
+                f"Segment {following.index} starts at {following.start}, before segment "
+                f"{previous.index} ends at {previous.end} — the plan overlaps.")
     for segment in segments:
         if segment.duration <= 0:
             raise RawCutterError(f"Segment {segment.index} has no duration.")
+        if segment.start < -TIME_QUANTUM or segment.end > duration + TIME_QUANTUM:
+            raise RawCutterError(
+                f"Segment {segment.index} ({segment.start}..{segment.end}) leaves the source.")
+        if segment.duration < low - 1e-9:
+            raise RawCutterError(
+                f"Segment {segment.index} is {segment.duration}s, under the {low}s minimum — "
+                f"material that cannot satisfy the bounds must be skipped, not exported.")
+        if segment.duration > high + 1e-9:
+            raise RawCutterError(
+                f"Segment {segment.index} is {segment.duration}s, over the {high}s maximum.")
+        for cut in cuts:
+            if segment.start + TIME_QUANTUM < cut < segment.end - TIME_QUANTUM:
+                raise RawCutterError(
+                    f"Segment {segment.index} ({segment.start}..{segment.end}) spans the scene "
+                    f"change at {cut}.")
+    for shot in shots:
+        if shot.exported and shot.piece_count <= 0:
+            raise RawCutterError(f"Shot {shot.index} is marked exported but produced no clip.")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -465,6 +521,26 @@ def segment_filename(source_path: Any, index: Any, total: Any, extension: str = 
         position = 1
     width = max(3, len(str(count)))
     return f"{safe_stem(source_path)}_part_{position:0{width}d}{extension}"
+
+
+def staging_filename(source_path: Any, index: Any, total: Any, token: Any,
+                     extension: str = ".mp4") -> str:
+    """The task-owned staging name a clip is written to before it is published.
+
+    Carries a per-attempt token so two runs -- or a retry of the same run -- can never collide on
+    it. A predictable ``<name>.part`` is a latent collision in which the second attempt truncates
+    the first's in-flight write, which is the same trap the delivery share file had to be fixed
+    for.
+
+    **It keeps the real extension, and that is functional rather than cosmetic.** FFmpeg infers
+    its muxer from the output extension when no ``-f`` is given, so a name ending in ``.part``
+    makes it fail with "Unable to find a suitable output format" before a single frame is written.
+    The marker therefore sits *before* the extension: ``.clip_part_001.a1b2c3.part.mp4``. The
+    leading dot keeps it out of the way in a file listing.
+    """
+    safe_token = _UNSAFE.sub("", str(token or ""))[:24] or "run"
+    base = segment_filename(source_path, index, total, extension="")
+    return f".{base}.{safe_token}.part{extension}"
 
 
 def plan_signature(source: SourceInfo, sensitivity: Any, min_seconds: Any,
@@ -522,41 +598,74 @@ def format_size(total_bytes: Any) -> str:
     return f"{int(value)} bytes"
 
 
+PLAN_TABLE_HEADERS = ("Shot", "Start", "End", "Seconds", "Status")
+
+
 def plan_table_rows(plan: SegmentPlan) -> list[list[str]]:
-    """Rows for the preview table: one per segment, in order."""
+    """One row per SHOT, in source order, saying plainly whether it will be exported.
+
+    Shots rather than segments, because the skipped ones are the whole point of the new policy and
+    a segment table could not show them -- a skipped shot produces no segment. An exported shot
+    that was divided says so on its row.
+    """
     rows: list[list[str]] = []
+    pieces_by_shot: dict[int, list[Segment]] = {}
     for segment in plan.segments:
-        kind = {SCENE_CUT: "scene", TIME_CUT: "time", SOURCE_END: "source end"}.get(
-            segment.boundary_kind, segment.boundary_kind)
+        pieces_by_shot.setdefault(segment.shot_index, []).append(segment)
+
+    for shot in plan.shots:
+        if shot.exported:
+            pieces = pieces_by_shot.get(shot.index, ())
+            numbers = ", ".join(f"#{p.index}" for p in pieces)
+            status = f"export {numbers}" if len(pieces) == 1 else \
+                f"export {len(pieces)} parts ({numbers})"
+            if shot.skip_reason == SKIP_REMAINDER:
+                status += " • tail dropped"
+        else:
+            status = f"skip — {shot.skip_reason}"
         rows.append([
-            str(segment.index),
-            format_timecode(segment.start),
-            format_timecode(segment.end),
-            f"{segment.duration:.3f}",
-            kind + (" • short" if segment.below_minimum else ""),
+            str(shot.index),
+            format_timecode(shot.start),
+            format_timecode(shot.end),
+            f"{shot.duration:.3f}",
+            status,
         ])
     return rows
 
 
-PLAN_TABLE_HEADERS = ("#", "Start", "End", "Seconds", "Cut")
-
-
 def plan_summary_text(plan: SegmentPlan, source: SourceInfo) -> str:
-    """The operator-facing summary. States what WILL happen, and never more than is known."""
+    """The operator-facing summary.
+
+    States what will be exported AND what will not, without presenting the gaps as a failure:
+    skipping unusable material is the feature. It never claims the source was fully preserved.
+    """
+    exported = plan.exported_shots
+    skipped = plan.skipped_shots
     lines = [
-        f"{plan.count} segment(s) planned from {format_timecode(plan.source_duration)} of video.",
+        f"Detected {len(plan.shots)} shot(s) from {len(plan.shots) - 1} scene change(s) "
+        f"in {format_timecode(plan.source_duration)} of video."
+        if plan.shots else "No shots detected.",
         f"Source: {source.describe()}" if source.path else "",
-        f"Scene changes detected: {plan.detected_scene_count} "
-        f"(sensitivity {plan.sensitivity}, scene threshold {plan.threshold:g})",
-        f"Cuts: {plan.scene_cuts} at a detected scene change, {plan.time_cuts} by duration.",
+        "",
+        f"EXPORT   {len(exported)} shot(s) → {plan.count} clip(s), "
+        f"{format_timecode(plan.exported_duration)} of footage",
+        f"SKIP     {len(skipped)} shot(s), "
+        f"{format_timecode(plan.skipped_duration)} of footage not exported",
+        "",
+        f"Detection: sensitivity {plan.sensitivity}, scene threshold {plan.threshold:g}, "
+        f"{plan.detected_scene_count} scene change(s) found.",
         f"Lengths: {plan.min_seconds:g}s minimum, {plan.max_seconds:g}s maximum.",
-        f"Coverage: {format_timecode(plan.covered_duration)} of "
-        f"{format_timecode(plan.source_duration)} — the whole source, with no gaps or overlaps.",
     ]
+    lines.append("")
+    lines.append("Skipped footage is intentional — the Raw Cutter keeps clean continuous shots "
+                 "and leaves the rest. It is not trying to preserve every frame.")
     lines.extend(f"Note: {note}" for note in plan.notes)
     lines.append("")
-    lines.append("Nothing has been written yet. Press Cut Video to export these segments.")
-    return "\n".join(line for line in lines if line != "")
+    if plan.has_work:
+        lines.append("Nothing has been written yet. Press Cut Video to export these clips.")
+    else:
+        lines.append("There is nothing to export, so Cut Video will decline.")
+    return "\n".join(line for line in lines if line != "" or True).strip("\n")
 
 
 __all__ = [
@@ -568,9 +677,12 @@ __all__ = [
     "SENSITIVITY_DEFAULT",
     "SENSITIVITY_MAX",
     "SENSITIVITY_MIN",
+    "SKIP_REMAINDER",
+    "SKIP_TOO_SHORT",
     "SOURCE_END",
     "Segment",
     "SegmentPlan",
+    "Shot",
     "SourceInfo",
     "TIME_CUT",
     "format_size",
@@ -585,4 +697,5 @@ __all__ = [
     "safe_stem",
     "segment_filename",
     "sensitivity_to_threshold",
+    "staging_filename",
 ]

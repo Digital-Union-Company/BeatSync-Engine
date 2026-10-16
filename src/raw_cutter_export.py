@@ -16,6 +16,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -310,24 +311,45 @@ def _validate_output(path: str) -> tuple[bool, str]:
 def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPlan,
                     run_directory: str, remove_audio: bool, encoder: str,
                     job: CutterJob | None = None,
-                    on_progress: Callable[[int, int, str], None] | None = None
+                    on_progress: Callable[[int, int, str], None] | None = None,
+                    on_complete: Callable[["SegmentResult"], None] | None = None
                     ) -> list[SegmentResult]:
     """Export every planned segment into ``run_directory``.
 
-    Safety properties, each deliberate:
+    **Staged write, then an atomic no-replace publication (R1).** FFmpeg writes to a task-owned
+    staging file; only a validated staging file is renamed into place. The earlier version let
+    FFmpeg write the final name directly and deleted *that path* on failure, which meant a failed
+    export could remove a file some other process had created in the window after the existence
+    check -- a file this run never owned. Now the only thing ever deleted is our own staging
+    artifact, and **the destination is never removed on any path**.
+
+    The publication is a single same-directory ``os.rename``. On Windows that raises
+    ``FileExistsError`` when the destination exists, so the check and the move are one indivisible
+    step: there is no window in which a collision can be missed, and a second run can never destroy
+    the first one's output. Same volume by construction (staging lives inside the run directory),
+    so ``EXDEV`` is structurally impossible rather than merely unlikely.
+
+    Staging names carry a per-attempt token rather than a predictable ``.part`` suffix: a fixed
+    name is a latent collision in which a retry truncates the first attempt's in-flight write.
+
+    Other properties, each deliberate:
 
     * The source is opened read-only by FFmpeg and is never a destination argument.
-    * Destinations are built from the planner's own sanitised names and always resolve INSIDE
-      ``run_directory``, which is checked per file rather than assumed.
-    * No `-y`. A collision is a refusal, not an overwrite, so a second run can never destroy the
-      first one's output.
-    * A failed or cancelled segment's partial file is removed -- but only that file, which this
-      call exclusively created moments earlier.
+    * Destinations resolve INSIDE ``run_directory``, measured with ``commonpath`` rather than
+      assumed from a string prefix.
+    * **`on_complete` fires as each segment finishes**, so a caller that is interrupted by
+      ``CutterCancelled`` still knows exactly what was written. Returning the list is not enough:
+      the exception discards it.
     * Completed segments are never touched by a later failure or by cancellation.
     """
     results: list[SegmentResult] = []
     total = plan.count
     root = os.path.abspath(run_directory)
+
+    def record(result: SegmentResult) -> None:
+        results.append(result)
+        if on_complete is not None:
+            on_complete(result)
 
     for segment in plan.segments:
         if job is not None and job.cancelled:
@@ -335,17 +357,23 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
         name = fork_cutter.segment_filename(source.path, segment.index, total)
         destination = os.path.abspath(os.path.join(root, name))
         if os.path.commonpath([root, destination]) != root:
-            results.append(SegmentResult(index=segment.index, error="Refused an unsafe path."))
+            record(SegmentResult(index=segment.index, error="Refused an unsafe path."))
             continue
         if os.path.exists(destination):
-            results.append(SegmentResult(index=segment.index, path=destination,
-                                         error="A file with this name already exists; refused."))
+            # A courtesy check so a doomed segment costs no encoding. The rename below is the
+            # authority -- this is deliberately not treated as proof the name is free.
+            record(SegmentResult(index=segment.index, path=destination,
+                                 error="A file with this name already exists; refused."))
             continue
+
+        token = uuid.uuid4().hex[:12]
+        staging = os.path.join(root, fork_cutter.staging_filename(
+            source.path, segment.index, total, token))
 
         if on_progress is not None:
             on_progress(segment.index, total, name)
 
-        command = build_segment_command(source.path, destination, segment.start, segment.duration,
+        command = build_segment_command(source.path, staging, segment.start, segment.duration,
                                         remove_audio, encoder, source.has_audio)
         failure = ""
         try:
@@ -358,16 +386,27 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
             failure = f"Could not run FFmpeg: {exc}"
 
         if not failure:
-            valid, message = _validate_output(destination)
+            valid, message = _validate_output(staging)
             if not valid:
                 failure = message
 
+        if not failure:
+            try:
+                os.rename(staging, destination)
+            except FileExistsError:
+                failure = ("Another file appeared with this name while the clip was encoding; "
+                           "refused rather than replacing it.")
+            except OSError as exc:
+                failure = f"Could not publish the finished clip: {exc}"
+
         if failure:
-            _discard_partial(destination)
-            results.append(SegmentResult(index=segment.index, path=destination, error=failure))
+            # ONLY our own staging artifact. The destination is never removed -- if it exists it
+            # belongs to somebody else, and this run has no claim on it.
+            _discard_staging(staging)
+            record(SegmentResult(index=segment.index, path=destination, error=failure))
         else:
-            results.append(SegmentResult(index=segment.index, path=destination, ok=True,
-                                         size_bytes=os.path.getsize(destination)))
+            record(SegmentResult(index=segment.index, path=destination, ok=True,
+                                 size_bytes=os.path.getsize(destination)))
 
         if job is not None and job.cancelled:
             raise CutterCancelled()
@@ -375,8 +414,13 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
     return results
 
 
-def _discard_partial(path: str) -> None:
-    """Remove only the incomplete file this operation just created. Never anything else."""
+def _discard_staging(path: str) -> None:
+    """Remove only the task-owned staging artifact this attempt created. Never anything else.
+
+    Deliberately narrow: no directory sweep, no glob, no pattern match. Another invocation's
+    staging file may be in flight in the same folder, and an interrupted process may legitimately
+    leave one behind -- that is acceptable and must not block a later run.
+    """
     try:
         if os.path.exists(path):
             os.remove(path)

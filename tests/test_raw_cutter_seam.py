@@ -364,14 +364,80 @@ def test_a_completed_file_is_validated_before_being_called_a_success(export_tree
     assert "FFPROBE_PATH" in validator, "a file that is not readable video is not a success"
 
 
-def test_only_this_operations_own_partial_file_is_ever_removed(export_tree):
-    """Cleanup is scoped to the exact file this call exclusively created moments earlier."""
-    discard = _code_only(_func(export_tree, "_discard_partial"))
+def test_only_this_operations_own_staging_file_is_ever_removed(export_tree):
+    """R1 finding B. The earlier version deleted the DESTINATION path on failure, which could
+    remove a file another process created in the window after the existence check — a file this
+    run never owned. Cleanup is now scoped to our own staging artifact, and the destination is
+    never removed on any path."""
+    discard = _code_only(_func(export_tree, "_discard_staging"))
     assert "os.remove(path)" in discard
     for forbidden in ("rmtree", "os.rmdir", "glob", "listdir", "os.walk"):
         assert forbidden not in discard, forbidden
     rendered = _code_only(export_tree)
     assert "shutil" not in rendered
+    assert "_discard_partial" not in rendered, "the destination-deleting helper must be gone"
+
+    export = _code_only(_func(export_tree, "export_segments"))
+    assert "_discard_staging(staging)" in export
+    assert "_discard_staging(destination)" not in export
+    assert "os.remove(destination)" not in export
+
+
+def test_the_clip_is_published_by_an_atomic_no_replace_rename(export_tree):
+    """A single same-directory `os.rename`, which on Windows raises `FileExistsError` rather than
+    replacing. The check and the move are one indivisible step, so a collision cannot be missed in
+    a window — and staging lives inside the run directory, so `EXDEV` is structurally impossible
+    rather than merely unlikely."""
+    export = _code_only(_func(export_tree, "export_segments"))
+    assert "os.rename(staging, destination)" in export
+    assert "FileExistsError" in export
+    for forbidden in ("os.replace", "shutil.move", "copyfile"):
+        assert forbidden not in export, f"publication uses {forbidden}"
+
+
+def test_staging_names_carry_a_per_attempt_token(export_tree):
+    """A predictable `.part` is a latent collision in which a retry truncates the first attempt's
+    in-flight write — the same trap the delivery share file had to be fixed for."""
+    export = _code_only(_func(export_tree, "export_segments"))
+    assert "uuid.uuid4()" in export
+    assert "staging_filename" in export
+
+    from beatsync_fork import raw_cutter as rc
+    first = rc.staging_filename("clip.mkv", 1, 3, "aaaa")
+    second = rc.staging_filename("clip.mkv", 1, 3, "bbbb")
+    assert first != second
+    # `.part` marks it, but the real extension stays LAST: FFmpeg infers its muxer from the
+    # extension when no `-f` is given, so a name ending in `.part` fails before it writes a frame.
+    assert ".part." in first and first.endswith(".mp4")
+    assert ".part." in second and second.endswith(".mp4")
+    assert first.startswith("."), "staging artifacts stay out of the way in a listing"
+    assert ".." not in first.lstrip(".") and "/" not in first and "\\" not in first
+
+
+def test_completion_is_reported_through_a_callback(export_tree):
+    """R1 finding A. `export_segments` raises on a stop, and an exception discards its return —
+    so the caller reported "0 clip(s) completed" after a cancellation that had written several."""
+    signature = [a.arg for a in _func(export_tree, "export_segments").args.args]
+    assert "on_complete" in signature
+    export = _code_only(_func(export_tree, "export_segments"))
+    assert "on_complete(result)" in export
+
+
+def test_the_cut_handler_reports_the_real_completed_count_on_cancellation(gui_tree):
+    """The other half of finding A: the handler must read the callback's list, not the discarded
+    return value."""
+    handler = _func(gui_tree, "_on_cut_run")
+    # Search every Try in the handler, not the first one `ast.walk` happens to reach: the
+    # cancellation clause is on the outer try, and an inner one would be found first.
+    cancelled = next(
+        clause
+        for node in ast.walk(handler) if isinstance(node, ast.Try)
+        for clause in node.handlers
+        if clause.type is not None and ast.unparse(clause.type).endswith("CutterCancelled"))
+    branch = _code_only(ast.Module(body=cancelled.body, type_ignores=[]))
+    assert "completed" in branch, "the cancellation report ignores the completed list"
+    assert "for r in results" not in branch, "`results` is discarded when the exception propagates"
+    assert "on_complete=finished" in _code_only(handler)
 
 
 def test_the_run_directory_refuses_to_reuse_an_existing_folder(export_tree):
