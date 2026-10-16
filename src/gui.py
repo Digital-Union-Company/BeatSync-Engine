@@ -2109,6 +2109,76 @@ def _on_surprise_me(freestyle_enabled, *styles):
     return seed, preview
 
 
+def _on_quick_render_tab_select(freestyle_enabled, cut_density_value, micro_cuts_value,
+                                semantic_emphasis_value, energy_response_value, motion_bias_value,
+                                source_diversity_value, variation_seed_value, voice_files_value,
+                                sfx_folder_value, sfx_roles_value) -> str:
+    """[FORK] Digital-Union (GUI Refresh A): what optional settings will affect the next render.
+
+    Three tabs mean a user can arm something in Creative Studio or Advanced Tools and then look at
+    a Quick Render screen that shows no sign of it. This says so in one read-only box.
+
+    **It is a read-out, not an authority.** It writes nothing, no render path reads it, and it
+    stores no state: it is recomputed from the LIVE widget values every time Quick Render is
+    selected, so it cannot drift from the controls it describes. Reporting "not default" is also
+    deliberately weaker than reporting a value — the numbers are a click away in the tab it names,
+    and a number copied here would be the stale-preview problem Freestyle's summary already avoids.
+
+    Bound to the tab's own `.select()` rather than to `.change()` on a dozen existing widgets: the
+    creative sliders carry exactly one `.input()` registration each by contract, and the Freestyle
+    widgets write only their own summary. Adding handlers to them to feed a cosmetic read-out would
+    put a second binding on widgets whose single binding is itself a pinned contract.
+
+    Total: never raises, so selecting a tab can never fail.
+    """
+    notes: list[str] = []
+
+    if freestyle_enabled:
+        notes.append("Freestyle is ON — sections are edited differently (Creative Studio)")
+
+    # Declared in CREATIVE_CONTROL_FIELDS order, which is also this function's parameter order
+    # and the order every other creative seam in the file uses.
+    controls = (
+        ("Cut Density", cut_density_value),
+        ("Micro Cuts", micro_cuts_value),
+        ("Semantic Emphasis", semantic_emphasis_value),
+        ("Energy Response", energy_response_value),
+        ("Motion Bias", motion_bias_value),
+        ("Source Diversity", source_diversity_value),
+    )
+    moved = []
+    for name, value in controls:
+        try:
+            if int(value) != fork_creative.DEFAULT_CONTROL:
+                moved.append(name)
+        except (TypeError, ValueError):
+            continue
+    if moved:
+        notes.append("Creative Controls away from neutral: " + ", ".join(moved)
+                     + " (Creative Studio)")
+
+    # The Creative Preset is deliberately NOT reported: its radio is on this very tab, so echoing
+    # it would be the one thing here that duplicates something already on screen.
+
+    try:
+        if int(variation_seed_value) != 0:
+            notes.append(f"Variation Seed: {int(variation_seed_value)} (Creative Studio)")
+    except (TypeError, ValueError):
+        pass
+
+    if voice_files_value:
+        count = len(voice_files_value) if isinstance(voice_files_value, (list, tuple)) else 1
+        notes.append(f"Audio Layers: {count} voice clip(s) (Advanced Tools)")
+
+    roles = sfx_roles_value if isinstance(sfx_roles_value, (list, tuple)) else []
+    if (isinstance(sfx_folder_value, str) and sfx_folder_value.strip()) and roles:
+        notes.append(f"Smart Mix: {len(roles)} SFX role(s) (Advanced Tools)")
+
+    if not notes:
+        return ("Nothing optional is active — this render uses the defaults shown on this tab.")
+    return "This render will also use:\n" + "\n".join(f"  • {n}" for n in notes)
+
+
 # [FORK] Digital-Union (AI Director — V1 introduced the split; V2 added the media step): two thin
 # handlers, and the asymmetry between them IS the product.
 #
@@ -4659,181 +4729,156 @@ def create_ui() -> gr.Blocks:
         gr.Markdown(f"# {UI_TITLE}")
         gr.Markdown(UI_MAIN_DESCRIPTION)
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown('### 📁 Input Files')
-                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
+        # [FORK] Digital-Union (GUI Refresh A): three tabs instead of one long column.
+        #
+        # Pure re-parenting. Every component keeps its identity, its `elem_id` and its
+        # handlers; only the enclosing containers changed. A widget's tab has no bearing on
+        # which handler reads it, so the live values still reach the same render events and
+        # no execution setting is duplicated -- there is still exactly ONE of each control.
+        #
+        # Why it was needed: the render workflow shared one scrolling column with six
+        # collapsed accordions, so Create Music Video sat far below the fold and the two
+        # newest features (Random Freestyle and Shot Variety) were the easiest to miss.
+        with gr.Tabs():
+            with gr.Tab(LABEL_TAB_QUICK_RENDER, id='tab-quick-render') as tab_quick_render:
+                with gr.Row():
+                    # 3:2 -- the controls need the width, the preview needs enough to be
+                    # watchable. Everything required for one render lives in this column.
+                    with gr.Column(scale=3):
+                        gr.Markdown('### 📁 Input Files')
+                        audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
+                        # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
+                        with gr.Group():
+                            gr.Markdown('### 🎬 Video Source')
+                            source_mode = gr.Radio(
+                                choices=[
+                                    (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
+                                    (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
+                                ],
+                                value=SourceMode.LOCAL_FOLDER.value,
+                                label=LABEL_SOURCE_MODE,
+                                info=INFO_SOURCE_MODE,
+                                elem_id='source-mode-radio',
+                            )
 
-                # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed, and
-                # directly under the main audio input because that is what it layers onto.
-                #
-                # Every widget here is a render-request input read at click time: none registers a
-                # handler, none appears in `source_outputs` or `prep_outputs`, and none is part of
-                # video-source identity — so changing any of them cannot clear a confirmation.
-                with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
-                    gr.Markdown(INFO_AUDIO_LAYERS)
-                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
-                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
-                    # order is whatever the OS dialog supplies and is not the user's click order.
-                    voice_files = gr.File(
-                        label=LABEL_VOICE_FILES,
-                        file_count='multiple',
-                        file_types=['.mp3', '.wav', '.flac'],
-                        type='filepath',
-                        elem_id='voice-files-input',
-                    )
-                    voice_start_delay = gr.Number(
-                        label=LABEL_VOICE_START_DELAY,
-                        value=fork_audio_mix.DEFAULT_START_DELAY_SECONDS,
-                        minimum=fork_audio_mix.START_DELAY_MIN_SECONDS,
-                        maximum=fork_audio_mix.START_DELAY_MAX_SECONDS,
-                        info=INFO_VOICE_START_DELAY,
-                        elem_id='voice-start-delay-input',
-                    )
-                    voice_min_gap = gr.Number(
-                        label=LABEL_VOICE_MIN_GAP,
-                        value=fork_audio_mix.DEFAULT_MIN_GAP_SECONDS,
-                        minimum=fork_audio_mix.MIN_GAP_MIN_SECONDS,
-                        maximum=fork_audio_mix.MIN_GAP_MAX_SECONDS,
-                        info=INFO_VOICE_MIN_GAP,
-                        elem_id='voice-min-gap-input',
-                    )
-                    voice_avoid_drops = gr.Checkbox(
-                        label=LABEL_VOICE_AVOID_DROPS,
-                        value=True,
-                        info=INFO_VOICE_AVOID_DROPS,
-                        elem_id='voice-avoid-drops-checkbox',
-                    )
-                    music_under_voice = gr.Slider(
-                        minimum=fork_audio_mix.MUSIC_UNDER_VOICE_MIN,
-                        maximum=fork_audio_mix.MUSIC_UNDER_VOICE_MAX,
-                        step=1,
-                        value=fork_audio_mix.DEFAULT_MUSIC_UNDER_VOICE_PERCENT,
-                        label=LABEL_MUSIC_UNDER_VOICE,
-                        info=INFO_MUSIC_UNDER_VOICE,
-                        elem_id='music-under-voice-slider',
-                    )
-                    audio_layers_report = gr.Textbox(
-                        label=LABEL_AUDIO_LAYERS_REPORT,
-                        value='',
-                        placeholder=PLACEHOLDER_AUDIO_LAYERS_REPORT,
-                        lines=6,
-                        max_lines=12,
-                        interactive=False,
-                        elem_id='audio-layers-report-box',
-                    )
+                            with gr.Group(visible=True) as folder_group:
+                                source_folder = gr.Textbox(
+                                    label=LABEL_SOURCE_FOLDER,
+                                    placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                                    info=INFO_SOURCE_FOLDER,
+                                    elem_id='source-folder-input',
+                                )
+                                source_recursive = gr.Checkbox(
+                                    value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
+                                )
+                                scan_btn = gr.Button(LABEL_SCAN_FOLDER, elem_id='scan-folder-button')
 
-                # [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents, a collapsed
-                # sibling of Audio Layers because it layers onto the same final master.
-                #
-                # Five actual components. Exactly like the Audio Layers block, every one of them is
-                # a render-request input read at click time: none registers a handler, none appears
-                # in `source_outputs` or `prep_outputs`, and none is part of video-source identity,
-                # so changing the folder, the roles, Amount or Level cannot clear a confirmation,
-                # start a scan or touch Media Library Preparation. There is deliberately no Scan
-                # button — the library is validated by the Create Music Video preflight.
-                with gr.Accordion(label=LABEL_SMART_MIX, open=False):
-                    gr.Markdown(INFO_SMART_MIX)
-                    sfx_folder = gr.Textbox(
-                        label=LABEL_SFX_FOLDER,
-                        placeholder=PLACEHOLDER_SFX_FOLDER,
-                        info=INFO_SFX_FOLDER,
-                        elem_id='sfx-folder-input',
-                    )
-                    # `(label, value)` choices, so the value Gradio returns IS the exact internal
-                    # role name. Never a lowercase/replace heuristic over the display label: the
-                    # planner keys on these strings, so a derived name would be a silent
-                    # correctness hazard the moment a label is reworded.
-                    sfx_roles = gr.CheckboxGroup(
-                        choices=list(fork_smart_mix.ROLE_CHOICES),
-                        value=[role for _label, role in fork_smart_mix.ROLE_CHOICES],
-                        label=LABEL_SFX_ROLES,
-                        info=INFO_SFX_ROLES,
-                        elem_id='sfx-roles-group',
-                    )
-                    sfx_amount = gr.Slider(
-                        minimum=fork_smart_mix.CONTROL_MIN,
-                        maximum=fork_smart_mix.CONTROL_MAX,
-                        step=1,
-                        value=fork_smart_mix.DEFAULT_AMOUNT,
-                        label=LABEL_SFX_AMOUNT,
-                        info=INFO_SFX_AMOUNT,
-                        elem_id='sfx-amount-slider',
-                    )
-                    sfx_level = gr.Slider(
-                        minimum=fork_smart_mix.CONTROL_MIN,
-                        maximum=fork_smart_mix.CONTROL_MAX,
-                        step=1,
-                        value=fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
-                        label=LABEL_SFX_LEVEL,
-                        info=INFO_SFX_LEVEL,
-                        elem_id='sfx-level-slider',
-                    )
-                    smart_mix_report = gr.Textbox(
-                        label=LABEL_SMART_MIX_REPORT,
-                        value='',
-                        placeholder=PLACEHOLDER_SMART_MIX_REPORT,
-                        lines=6,
-                        max_lines=14,
-                        interactive=False,
-                        elem_id='smart-mix-report-box',
-                    )
+                            with gr.Group(visible=False) as browser_group:
+                                video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
 
-                # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
-                with gr.Group():
-                    gr.Markdown('### 🎬 Video Source')
-                    source_mode = gr.Radio(
-                        choices=[
-                            (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
-                            (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
-                        ],
-                        value=SourceMode.LOCAL_FOLDER.value,
-                        label=LABEL_SOURCE_MODE,
-                        info=INFO_SOURCE_MODE,
-                        elem_id='source-mode-radio',
-                    )
+                            source_report = gr.Textbox(
+                                label=LABEL_SOURCE_REPORT,
+                                value=initial_source_state().report_text,
+                                interactive=False,
+                                lines=9,
+                                max_lines=14,
+                                elem_id='source-report-box',
+                            )
+                            confirm_btn = gr.Button(
+                                LABEL_CONFIRM_SOURCES, interactive=False, elem_id='confirm-sources-button'
+                            )
+                            confirm_status = gr.Markdown(
+                                initial_source_state().confirmation_status_text(),
+                                elem_id='confirm-status',
+                            )
+                        with gr.Group():
+                            gr.Markdown('### ⚙️ Video Settings')
+                            custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
-                    with gr.Group(visible=True) as folder_group:
-                        source_folder = gr.Textbox(
-                            label=LABEL_SOURCE_FOLDER,
-                            placeholder=PLACEHOLDER_SOURCE_FOLDER,
-                            info=INFO_SOURCE_FOLDER,
-                            elem_id='source-folder-input',
+                        # [FORK] Digital-Union (GUI Refresh A): the preset selector is the one
+                        # creative control on Quick Render, because it is the single choice that
+                        # sets all six sliders at once. The sliders themselves live in Creative
+                        # Studio; the `.input()` graph between them is unchanged and crosses tabs
+                        # perfectly well.
+                        # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
+                        # directly above the six sliders it writes, and below the seed — the layout is
+                        # the first statement that a preset moves those six and nothing else. It is NOT
+                        # a `process_btn` input: the sliders already are, and they stay the only thing
+                        # the render request carries. `Custom` is the last choice because it is a state
+                        # the selector reports, not a recipe a user picks.
+                        creative_preset = gr.Radio(
+                            choices=list(fork_presets.PRESET_NAMES),
+                            value=fork_presets.BALANCED_PRESET,
+                            label=LABEL_CREATIVE_PRESET,
+                            info=INFO_CREATIVE_PRESET,
+                            elem_id='creative-preset-radio',
                         )
-                        source_recursive = gr.Checkbox(
-                            value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
+                        with gr.Group():
+                            gr.Markdown(f'### 🎬 Processing Mode')
+                            if NVENC_AVAILABLE:
+                                processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                            else:
+                                processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                        with gr.Group():
+                            gr.Markdown('### 📁 Output Settings')
+                            output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
+                        # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
+                        process_btn = gr.Button(
+                            '🎬 Create Music Video', variant='primary', size='lg', interactive=False
                         )
-                        scan_btn = gr.Button(LABEL_SCAN_FOLDER, elem_id='scan-folder-button')
+                        gr.Markdown(INFO_CONFIRMATION_GATE)
+                        # [FORK] Digital-Union (C3-R1A): deliberately ALWAYS interactive -- unlike
+                        # `process_btn`, this is never gated by the source-confirmation state, because a
+                        # render already in flight has nothing to do with whether a NEW one could start.
+                        # It is also never disabled while a render runs: that disabling is what would make
+                        # it useless, since it is the only way to reach a render already in progress.
+                        cancel_render_btn = gr.Button(LABEL_CANCEL_RENDER, variant='stop', size='sm')
+                        gr.Markdown(INFO_CANCEL_RENDER)
 
-                    with gr.Group(visible=False) as browser_group:
-                        video_input = gr.File(label=LABEL_VIDEO_FILES, file_count='multiple', file_types=['.mp4', '.mkv'], type='filepath', elem_id='video-files-input')
+                        # [FORK] Digital-Union (GUI Refresh A): a read-only note saying which
+                        # optional settings from the other tabs will affect the next render.
+                        # Derived from the live widgets each time this tab is selected, so it
+                        # cannot go stale and is not a second settings authority -- it writes
+                        # nothing and no render path reads it.
+                        active_settings_summary = gr.Textbox(
+                            label=LABEL_ACTIVE_SETTINGS,
+                            value=ACTIVE_SETTINGS_PLACEHOLDER,
+                            lines=3,
+                            max_lines=8,
+                            interactive=False,
+                            elem_id='active-settings-summary',
+                        )
+                    with gr.Column(scale=2):
+                        gr.Markdown('### 📺 Output')
+                        status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
+                        video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
+                        # [FORK] Digital-Union (Deliverable Export V1-B-S2): directly below the preview,
+                        # because the two answer the same question in sequence -- "did it work" then
+                        # "where is it". `secondary`, because it is not an action on the render.
+                        #
+                        # Like `cancel_render_btn` and unlike `process_btn`, this is deliberately ALWAYS
+                        # interactive: it is never gated by the source confirmation and never disabled
+                        # while a render runs. The folder is a fixed property of the installation, so
+                        # there is no state in which pointing at it would be wrong, and it is absent from
+                        # `source_outputs` and `prep_outputs` so no source or preparation event can
+                        # disable it.
+                        open_output_folder_btn = gr.Button(
+                            LABEL_OPEN_OUTPUT_FOLDER, variant='secondary', size='sm',
+                            elem_id='open-output-folder-button',
+                        )
+                        gr.Markdown(INFO_OPEN_OUTPUT_FOLDER)
 
-                    source_report = gr.Textbox(
-                        label=LABEL_SOURCE_REPORT,
-                        value=initial_source_state().report_text,
-                        interactive=False,
-                        lines=9,
-                        max_lines=14,
-                        elem_id='source-report-box',
-                    )
-                    confirm_btn = gr.Button(
-                        LABEL_CONFIRM_SOURCES, interactive=False, elem_id='confirm-sources-button'
-                    )
-                    confirm_status = gr.Markdown(
-                        initial_source_state().confirmation_status_text(),
-                        elem_id='confirm-status',
-                    )
-
-                with gr.Group():
-                    gr.Markdown('### ⚙️ Video Settings')
-                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
-
+            with gr.Tab(LABEL_TAB_CREATIVE_STUDIO, id='tab-creative-studio'):
                 # [FORK] Digital-Union (Phase A + Creative Controls Core): creative direction.
                 # Deliberately outside the Video Source group and never wired into `source_outputs`,
                 # so changing any of these cannot invalidate a confirmed source set. All four are
                 # render-request creative state: they re-plan, they never re-analyse.
+                #
+                # GUI Refresh A promoted that group to a tab of its own. The contract above is
+                # unchanged and is exactly why the promotion was safe: nothing in here was ever
+                # part of source identity, so no amount of moving it can reach the render gate.
+                gr.Markdown(INFO_TAB_CREATIVE_STUDIO)
                 with gr.Group():
-                    gr.Markdown('### 🎨 Creative Direction')
                     # [FORK] Digital-Union (AI Director V1): a compact group at the TOP of this
                     # block, because the order is the explanation — describe the edit, review a
                     # proposal, then the existing Creative Controls below are what actually gets
@@ -4848,7 +4893,7 @@ def create_ui() -> gr.Blocks:
                     # The instruction box registers NOTHING — it is read at click time, exactly
                     # like every Variant Lab configuration widget — so typing an instruction
                     # cannot move a slider, clear a confirmation or start anything.
-                    with gr.Accordion(label=LABEL_AI_DIRECTOR, open=False):
+                    with gr.Accordion(label=LABEL_AI_DIRECTOR, open=True):
                         gr.Markdown(INFO_AI_DIRECTOR)
                         director_instruction = gr.Textbox(
                             label=LABEL_DIRECTOR_INSTRUCTION,
@@ -4891,6 +4936,7 @@ def create_ui() -> gr.Blocks:
                             interactive=False,
                             elem_id='director-status-box',
                         )
+                with gr.Group():
                     variation_seed = gr.Number(
                         label=LABEL_VARIATION_SEED,
                         value=0,
@@ -4900,19 +4946,6 @@ def create_ui() -> gr.Blocks:
                         elem_id='variation-seed-input',
                     )
                     randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
-                    # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
-                    # directly above the six sliders it writes, and below the seed — the layout is
-                    # the first statement that a preset moves those six and nothing else. It is NOT
-                    # a `process_btn` input: the sliders already are, and they stay the only thing
-                    # the render request carries. `Custom` is the last choice because it is a state
-                    # the selector reports, not a recipe a user picks.
-                    creative_preset = gr.Radio(
-                        choices=list(fork_presets.PRESET_NAMES),
-                        value=fork_presets.BALANCED_PRESET,
-                        label=LABEL_CREATIVE_PRESET,
-                        info=INFO_CREATIVE_PRESET,
-                        elem_id='creative-preset-radio',
-                    )
                     # Randomize stays seed-only on purpose; these three have no randomizer and no
                     # reset. 50 is current BeatSync behaviour in every one of them, and the default
                     # is the fork module's constant rather than a literal repeated here.
@@ -4982,6 +5015,7 @@ def create_ui() -> gr.Blocks:
                     # is the explanation: the sliders above are the base, these rules modulate it
                     # per section, and the lab below varies the base.
                     #
+                with gr.Group():
                     # Twelve components: an enable checkbox, ten section-type dropdowns and one
                     # read-only summary. No numeric per-section sliders, no Analyze Music button, no
                     # section-instance timeline, and deliberately no new top-level workflow.
@@ -4989,7 +5023,7 @@ def create_ui() -> gr.Blocks:
                     # These widgets write NO global creative widget. They are also live inputs to
                     # both render events, which is what makes them execution authority rather than
                     # the summary state.
-                    with gr.Accordion(label=LABEL_FREESTYLE, open=False):
+                    with gr.Accordion(label=LABEL_FREESTYLE, open=True):
                         gr.Markdown(INFO_FREESTYLE)
                         freestyle_enabled = gr.Checkbox(
                             value=False,
@@ -5075,6 +5109,7 @@ def create_ui() -> gr.Blocks:
                             elem_id='freestyle-summary',
                         )
 
+                with gr.Group():
                     # [FORK] Digital-Union (Variant Lab V1 / C2): collapsed by default and placed
                     # below the six sliders it generates values for — the layout says what the lab
                     # does. Every widget in here is lab configuration read at click time only: none
@@ -5279,35 +5314,138 @@ def create_ui() -> gr.Blocks:
                             elem_id='render-batch-summary',
                         )
 
-                with gr.Group():
-                    gr.Markdown(f'### 🎬 Processing Mode')
-                    if NVENC_AVAILABLE:
-                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
-                    else:
-                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
-                
-                with gr.Group():
-                    gr.Markdown('### 📁 Output Settings')
-                    output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
+            with gr.Tab(LABEL_TAB_ADVANCED, id='tab-advanced-tools'):
+                gr.Markdown(INFO_TAB_ADVANCED)
+                # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed.
+                # GUI Refresh A moved it out from under the main audio input and into this tab: it
+                # is an occasional extra, and keeping it beside the audio picker cost the render
+                # flow vertical space on every single render. Staying collapsed is pinned by test.
+                #
+                # Every widget here is a render-request input read at click time: none registers a
+                # handler, none appears in `source_outputs` or `prep_outputs`, and none is part of
+                # video-source identity — so changing any of them cannot clear a confirmation.
+                with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
+                    gr.Markdown(INFO_AUDIO_LAYERS)
+                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
+                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
+                    # order is whatever the OS dialog supplies and is not the user's click order.
+                    voice_files = gr.File(
+                        label=LABEL_VOICE_FILES,
+                        file_count='multiple',
+                        file_types=['.mp3', '.wav', '.flac'],
+                        type='filepath',
+                        elem_id='voice-files-input',
+                    )
+                    voice_start_delay = gr.Number(
+                        label=LABEL_VOICE_START_DELAY,
+                        value=fork_audio_mix.DEFAULT_START_DELAY_SECONDS,
+                        minimum=fork_audio_mix.START_DELAY_MIN_SECONDS,
+                        maximum=fork_audio_mix.START_DELAY_MAX_SECONDS,
+                        info=INFO_VOICE_START_DELAY,
+                        elem_id='voice-start-delay-input',
+                    )
+                    voice_min_gap = gr.Number(
+                        label=LABEL_VOICE_MIN_GAP,
+                        value=fork_audio_mix.DEFAULT_MIN_GAP_SECONDS,
+                        minimum=fork_audio_mix.MIN_GAP_MIN_SECONDS,
+                        maximum=fork_audio_mix.MIN_GAP_MAX_SECONDS,
+                        info=INFO_VOICE_MIN_GAP,
+                        elem_id='voice-min-gap-input',
+                    )
+                    voice_avoid_drops = gr.Checkbox(
+                        label=LABEL_VOICE_AVOID_DROPS,
+                        value=True,
+                        info=INFO_VOICE_AVOID_DROPS,
+                        elem_id='voice-avoid-drops-checkbox',
+                    )
+                    music_under_voice = gr.Slider(
+                        minimum=fork_audio_mix.MUSIC_UNDER_VOICE_MIN,
+                        maximum=fork_audio_mix.MUSIC_UNDER_VOICE_MAX,
+                        step=1,
+                        value=fork_audio_mix.DEFAULT_MUSIC_UNDER_VOICE_PERCENT,
+                        label=LABEL_MUSIC_UNDER_VOICE,
+                        info=INFO_MUSIC_UNDER_VOICE,
+                        elem_id='music-under-voice-slider',
+                    )
+                    audio_layers_report = gr.Textbox(
+                        label=LABEL_AUDIO_LAYERS_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_AUDIO_LAYERS_REPORT,
+                        lines=6,
+                        max_lines=12,
+                        interactive=False,
+                        elem_id='audio-layers-report-box',
+                    )
 
-                # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
-                process_btn = gr.Button(
-                    '🎬 Create Music Video', variant='primary', size='lg', interactive=False
-                )
-                gr.Markdown(INFO_CONFIRMATION_GATE)
+                # [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents, a collapsed
+                # sibling of Audio Layers because it layers onto the same final master.
+                #
+                # Five actual components. Exactly like the Audio Layers block, every one of them is
+                # a render-request input read at click time: none registers a handler, none appears
+                # in `source_outputs` or `prep_outputs`, and none is part of video-source identity,
+                # so changing the folder, the roles, Amount or Level cannot clear a confirmation,
+                # start a scan or touch Media Library Preparation. There is deliberately no Scan
+                # button — the library is validated by the Create Music Video preflight.
+                with gr.Accordion(label=LABEL_SMART_MIX, open=False):
+                    gr.Markdown(INFO_SMART_MIX)
+                    sfx_folder = gr.Textbox(
+                        label=LABEL_SFX_FOLDER,
+                        placeholder=PLACEHOLDER_SFX_FOLDER,
+                        info=INFO_SFX_FOLDER,
+                        elem_id='sfx-folder-input',
+                    )
+                    # `(label, value)` choices, so the value Gradio returns IS the exact internal
+                    # role name. Never a lowercase/replace heuristic over the display label: the
+                    # planner keys on these strings, so a derived name would be a silent
+                    # correctness hazard the moment a label is reworded.
+                    sfx_roles = gr.CheckboxGroup(
+                        choices=list(fork_smart_mix.ROLE_CHOICES),
+                        value=[role for _label, role in fork_smart_mix.ROLE_CHOICES],
+                        label=LABEL_SFX_ROLES,
+                        info=INFO_SFX_ROLES,
+                        elem_id='sfx-roles-group',
+                    )
+                    sfx_amount = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_AMOUNT,
+                        label=LABEL_SFX_AMOUNT,
+                        info=INFO_SFX_AMOUNT,
+                        elem_id='sfx-amount-slider',
+                    )
+                    sfx_level = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                        label=LABEL_SFX_LEVEL,
+                        info=INFO_SFX_LEVEL,
+                        elem_id='sfx-level-slider',
+                    )
+                    smart_mix_report = gr.Textbox(
+                        label=LABEL_SMART_MIX_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_SMART_MIX_REPORT,
+                        lines=6,
+                        max_lines=14,
+                        interactive=False,
+                        elem_id='smart-mix-report-box',
+                    )
 
-                # [FORK] Digital-Union (C3-R1A): deliberately ALWAYS interactive -- unlike
-                # `process_btn`, this is never gated by the source-confirmation state, because a
-                # render already in flight has nothing to do with whether a NEW one could start.
-                # It is also never disabled while a render runs: that disabling is what would make
-                # it useless, since it is the only way to reach a render already in progress.
-                cancel_render_btn = gr.Button(LABEL_CANCEL_RENDER, variant='stop', size='sm')
-                gr.Markdown(INFO_CANCEL_RENDER)
-
-                # [FORK] Digital-Union (P V1): media library preparation. A separate, collapsed
-                # section rather than a restructuring of the app into tabs - it is an occasional
-                # maintenance workflow, not part of the render flow. Nothing in here is wired to
+                # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
+                # workflow, not part of the render flow. Nothing in here is wired to
                 # `source_outputs`, so it cannot touch the Create Music Video gate.
+                #
+                # It stays collapsed (pinned by test) even though it now has its own tab, and it is
+                # deliberately the LAST block in that tab: nothing containing a `gr.Slider` may sit
+                # between the sample UI and the event wiring, which is the span
+                # `test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices to prove the
+                # approved sample resource policy is not widenable from the GUI.
+                #
+                # (GUI Refresh A note: this comment used to describe the section as "rather than a
+                # restructuring of the app into tabs". That restructuring has since happened, and
+                # this block was one of the things it moved.)
                 with gr.Accordion(label=LABEL_PREP_SECTION, open=False):
                     gr.Markdown(INFO_PREP_SECTION)
                     prep_folder = gr.Textbox(
@@ -5431,26 +5569,6 @@ def create_ui() -> gr.Blocks:
                         max_lines=28,
                         elem_id='prep-sample-report-box',
                     )
-
-            with gr.Column(scale=1):
-                gr.Markdown('### 📺 Output')
-                status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
-                video_output = gr.Video(label='Generated Music Video', interactive=False, elem_id='generated-video-output')
-                # [FORK] Digital-Union (Deliverable Export V1-B-S2): directly below the preview,
-                # because the two answer the same question in sequence -- "did it work" then
-                # "where is it". `secondary`, because it is not an action on the render.
-                #
-                # Like `cancel_render_btn` and unlike `process_btn`, this is deliberately ALWAYS
-                # interactive: it is never gated by the source confirmation and never disabled
-                # while a render runs. The folder is a fixed property of the installation, so
-                # there is no state in which pointing at it would be wrong, and it is absent from
-                # `source_outputs` and `prep_outputs` so no source or preparation event can
-                # disable it.
-                open_output_folder_btn = gr.Button(
-                    LABEL_OPEN_OUTPUT_FOLDER, variant='secondary', size='sm',
-                    elem_id='open-output-folder-button',
-                )
-                gr.Markdown(INFO_OPEN_OUTPUT_FOLDER)
 
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.
         #
@@ -5576,6 +5694,26 @@ def create_ui() -> gr.Blocks:
             freestyle_verse, freestyle_body,
         ]
         freestyle_live_inputs = [freestyle_enabled] + freestyle_section_dropdowns
+
+        # [FORK] Digital-Union (GUI Refresh A): one registration on the TAB, not on the widgets.
+        #
+        # Reads eleven live values and writes exactly one read-only textbox. Binding it to the
+        # tab's own `.select()` is the whole point: the six creative sliders carry exactly one
+        # `.input()` registration each by pinned contract, and the Freestyle widgets write only
+        # `freestyle_summary`. Hanging a `.change()` on each of them to feed a cosmetic read-out
+        # would put a second binding on widgets whose single binding IS the contract, for no gain —
+        # the summary is only ever visible while this tab is open, so recomputing it on selection
+        # is both sufficient and incapable of going stale.
+        #
+        # Reads nothing from `gr.State`, writes no execution widget, and is absent from
+        # `source_outputs` and `prep_outputs`: looking at a tab cannot invalidate a confirmed
+        # source set or a prepared library.
+        tab_quick_render.select(
+            fn=_on_quick_render_tab_select,
+            inputs=[freestyle_enabled, cut_density, micro_cuts, semantic_emphasis,
+                    energy_response, motion_bias, source_diversity, variation_seed,
+                    voice_files, sfx_folder, sfx_roles],
+            outputs=[active_settings_summary])
 
         # Each widget refreshes the summary and writes NOTHING else. `.change()` is correct here
         # (unlike the preset/slider graph, which needs `.input()` to stay acyclic): nothing ever

@@ -624,6 +624,34 @@ INFO_FREESTYLE_ENABLED = (
     "what it would be without Freestyle at all."
 )
 
+# ============================================================================
+# [FORK] Digital-Union: GUI Refresh A — three tabs
+# Layout only. No execution setting is duplicated and no new authority exists.
+# ============================================================================
+
+LABEL_TAB_QUICK_RENDER = "⚡ Quick Render"
+LABEL_TAB_CREATIVE_STUDIO = "🎨 Creative Studio"
+LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
+
+INFO_TAB_CREATIVE_STUDIO = (
+    "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
+    "alone is exactly the render Quick Render describes. The Creative Preset lives on Quick "
+    "Render because it is the one choice that sets all six sliders at once; change it there and "
+    "the sliders below follow."
+)
+
+INFO_TAB_ADVANCED = (
+    "**Occasional maintenance and diagnostics.** Prepare a media library ahead of time, check "
+    "that sources are readable, or layer voice and SFX over the music. None of this is needed "
+    "for an ordinary render."
+)
+
+LABEL_ACTIVE_SETTINGS = "Active optional settings"
+ACTIVE_SETTINGS_PLACEHOLDER = (
+    "Open this tab again after changing anything in Creative Studio or Advanced Tools and this "
+    "will list what is active."
+)
+
 LABEL_FREESTYLE_SECTION_PREFIX = "🎵"
 
 LABEL_FREESTYLE_SUMMARY = "Freestyle rules"
