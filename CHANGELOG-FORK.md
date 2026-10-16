@@ -20,6 +20,91 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-16 (MEDIA-VERIFY-S2-A R2: truthful Stage-5 cache reporting in Verify Sources)
+
+The Verify Sources cache section asserted the opposite of the truth. Against a folder whose three
+sources had **no** cache records at all it printed `Reusable cache (PREPARED): 0`,
+`New or changed: 0` and then **`Every source has a reusable Stage-5 cache record.`** — naming none
+of the three sources that actually needed analysis. Found in the S2-B D2 production GUI smoke and
+independently reviewed as four MAJOR findings.
+
+**Root cause: the report rendered a vocabulary the producer never emits.**
+`video_analysis.classify_library_sources()` emits the **values** of `library_prep.PrepStatus` and
+`NeedReason` (`needs_analysis`, `new_or_changed`, `incomplete_or_invalid`,
+`source_identity_unavailable`), while `format_verification_report` compared against their member
+**names** (`"NEW_OR_CHANGED"`) at five sites. Uppercase never matched, so all five filters were
+permanently unreachable for genuine data: the two reason counts always rendered `0` and the three
+per-source detail blocks were always empty. `gui.py` passes the classifier's output straight to the
+formatter, so there was no normalisation layer anywhere to absorb the mismatch.
+
+A **second, independent** cause made the positive claim unsafe on its own terms: it was gated on
+`not (changed_rows or incomplete_rows or unavailable_rows)` — the *absence* of populated error
+lists. Three empty lists are also what an unrecognised vocabulary, a missing key and a
+**zero-source library** produce, so a valid folder containing no supported video printed the same
+positive sentence. That branch survives the vocabulary fix and needed correcting separately.
+
+The five comparisons now reference the authoritative enums, which are imported rather than
+restated — `beatsync_fork` modules may build on each other, and a second spelling of a status is a
+second source of truth this module has no authority to mint. No normalisation layer was added:
+accepting a spelling the producer cannot emit would only hide the next drift. The positive claim
+now requires affirmative evidence from `_all_sources_prepared` — a non-empty classification set,
+agreement between the folder count, the classifier's `source_count` and the number of
+classifications, every item's status actually `PREPARED`, `prepared_count` equal to the item count,
+and both `needs_analysis_count` and `unavailable_count` zero. The same predicate guards the
+qualified cross-phase wording, which is also a universal claim: a library where only one of three
+sources was prepared may not report that every source *had* a record either.
+
+Scope is the report sentence and its filters. **Unchanged:** cache keys, the Stage-5 completion
+rule, `classify_library_sources()` semantics, the classifier's aggregate counts (still printed
+verbatim), the `MAX_REPORT_DETAIL_LINES = 25` bound, report section order, the position-alignment
+guard, the `UNVERIFIABLE` backend branch, the independent media-health section, the
+metadata-versus-decode disclaimer, and the module's read-only nature — the only OS call remains the
+`os.stat` behind the fingerprint.
+
+Also corrected: a recognised status now renders as its member name in the cross-phase sentence
+(`Classified as PREPARED`), while an **unrecognised** value is passed through unchanged so it stays
+visibly unknown instead of being promoted to a recognised cache state.
+
+**Deliberately deferred (MINOR-3):** arithmetically contradictory classifier totals are still
+reported verbatim with no dedicated integrity banner. Reconciling them in the report would publish
+a classification nobody ran, which the R3 contract forbids. What R2 fixes is only that such totals
+can no longer earn a positive claim.
+
+The test fixture was the reason a passing suite missed all four findings: `_cache()` built
+*uppercase* statuses and reasons, matching the unreachable comparisons, so fixture and defect
+agreed with each other and with nothing in production. That shape is one **neither** consumer
+handles — `library_prep.SourceClassification.from_mapping` fail-closes it to
+`SOURCE_IDENTITY_UNAVAILABLE` and discards the reason. The fixture is now derived from the enums,
+and a fidelity test pins that by enum round-trip plus an AST pass over the helper body (skipping
+its docstring, which discusses the historical spelling by name).
+
+Nineteen test node IDs were added — sixteen test functions, one of them parametrised four ways.
+**Four** of them are named `test_negative_control_*`: three build an in-memory mutated copy of the
+module (uppercase `NEW_OR_CHANGED`, uppercase `SOURCE_IDENTITY_UNAVAILABLE`, and the restored
+absence-of-error-lists gate) and assert the specific named regression catches each, while the
+fourth drives an intentionally unfaithful local fixture. Two further mutation classes — uppercase
+`INCOMPLETE_OR_INVALID` and reverting the readable-status display — were exercised only in
+disposable out-of-tree scripts, not committed as test functions; the earlier wording of this entry
+said "five negative controls" and so conflated committed test cases with those experiments.
+
+No test was added to make that number true. Instead the independent R3 review measured what the
+committed suite actually protects: all five specified mutation classes were applied to disposable
+copies of the source and tests and the real committed suite was run against each. None survived.
+Every class is killed by permanent committed assertions — including uppercase
+`INCOMPLETE_OR_INVALID`, which has no dedicated negative control but fails two existing tests. So
+the committed coverage is one control short of the original claim and no weaker in substance.
+
+No existing test was removed, renamed, skipped or weakened; all 182 pre-existing tests in the file
+pass unchanged, the two that asserted the uppercase member name needed no behavioural change
+because the readable-status fix preserves their meaning. Suite: 6357 collected / 6349 passed /
+8 skipped, from 6338 / 6330 / 8 — independently re-measured in R3, where the 8 skips are 2
+elevation-dependent symlink tests plus 6 uniform `test_micro_cuts` parameter pairs on both sides.
+
+Offline only — no Gradio, FFmpeg, Qwen, GPU, media or production data is involved in this
+correction. A mixed-state runtime acceptance is still required: the original S2-A acceptance used a
+fully cached library, which is the one case that reported correctly and so could never have caught
+this.
+
 ### Fixed — 2026-10-15 (MEDIA-VERIFY-S2-B P2 runtime R1 MINOR-1: seek validation reaches the core)
 
 GUI runtime acceptance on the pinned `gradio==6.19.0` found one defect, and it was only findable at

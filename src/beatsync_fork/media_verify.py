@@ -44,6 +44,24 @@ two confident verdicts about two different versions of one file, under a single 
 banner. :data:`CHANGE_DETECTION_LIMIT_TEXT` states the bound of the detector in every report: it
 catches an accidental overwrite, which is what the owner actually does, and it is not a byte-level
 integrity proof.
+
+The classification vocabulary is owned elsewhere (R2)
+-----------------------------------------------------
+The cache section does not classify anything. It *renders* what
+``video_analysis.classify_library_sources()`` produced, and that producer emits the **values** of
+:class:`beatsync_fork.library_prep.PrepStatus` and :class:`~beatsync_fork.library_prep.NeedReason`
+— ``prepared``, ``needs_analysis``, ``source_identity_unavailable``, ``new_or_changed``,
+``incomplete_or_invalid``. Those enums are therefore imported and compared against directly.
+
+This is not a style preference. R2 corrected five comparisons here that had been written against
+the enum *member names* (``"NEW_OR_CHANGED"``) instead of the values the producer actually emits.
+Uppercase never matched, so all five filters were unreachable for genuine data: the two reason
+counts always rendered ``0`` and the three per-source detail blocks were always empty, which meant
+the report named **no** affected path while asserting that every source had a reusable record. The
+fix is to share the vocabulary rather than restate it — a second spelling of a status is a second
+source of truth, and this module has no authority to mint one. Do not reintroduce a literal, and
+do not add a normalisation layer that would accept both spellings: accepting a spelling the
+producer cannot emit only hides the next drift.
 """
 
 from __future__ import annotations
@@ -55,6 +73,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Sequence, Tuple
+
+from beatsync_fork.library_prep import NeedReason, PrepStatus
 
 __all__ = [
     "CHANGE_DETECTION_LIMIT_TEXT",
@@ -710,6 +730,82 @@ def _detail_block(title: str, rows: Sequence[Tuple[str, str]],
     return lines
 
 
+def _all_sources_prepared(cache: Dict[str, Any],
+                          classifications: Sequence[Dict[str, str]],
+                          source_count: int) -> bool:
+    """[FORK] Digital-Union (MEDIA-VERIFY-S2-A R2): may the report claim the whole library is warm?
+
+    Affirmative evidence only, and every clause is load-bearing:
+
+    * ``source_count > 0`` — an empty library has no sources to be prepared, so the claim is
+      vacuous at best. Before R2 a valid folder containing no supported video printed the positive
+      sentence, because three empty detail lists look exactly like three satisfied ones.
+    * the three counts must **agree** — the folder's own count, the classifier's ``source_count``
+      and the number of per-item classifications. A partial or misaligned list describes a subset,
+      and a library-wide claim read off a subset is a statistic nobody computed. This mirrors
+      ``library_prep.PrepScanResult.is_fully_prepared``, which refuses the same extrapolation.
+    * every item's status must *be* ``PREPARED`` — the per-item check the aggregate cannot replace.
+    * ``prepared_count`` must equal the item count, and ``needs_analysis_count`` and
+      ``unavailable_count`` must both be zero — so self-contradictory totals (``prepared_count``
+      and ``needs_analysis_count`` both nonzero over the same sources) can never be read as
+      agreement. MINOR-3 is deliberately deferred: those totals are still printed **verbatim**,
+      exactly as the classifier produced them, because silently reconciling them would publish a
+      classification nobody ran. What R2 fixes is only that they can no longer *earn a positive
+      claim*.
+
+    **Input contract** (R3 MINOR-B — the earlier wording claimed more than this function
+    delivers). The supported domain is exactly what the one caller passes:
+
+    * ``source_count`` — an ``int``, the ``len(sources)`` of the folder enumeration;
+    * ``cache`` — the mapping ``classify_library_sources()`` returned;
+    * ``classifications`` — a sequence of that classifier's own per-source mappings.
+
+    Within that contract this is total and never raises: absent positive evidence, an unrecognised
+    status value, a missing key, a non-numeric count and mutually inconsistent counts all yield
+    ``False``, and none of them can produce an all-prepared claim. It reads the classifier's output
+    and recomputes no verdict of its own.
+
+    What is **not** promised is exception-free handling of arbitrary malformed Python objects
+    outside that contract — a non-mapping ``cache``, a non-iterable ``classifications``, non-mapping
+    entries or a non-integer ``source_count`` may raise. That is deliberate. Most such inputs
+    already raise in the surrounding report code and did so before R2; a non-integer
+    ``source_count`` is the one case R2 newly exposes, via the ``source_count > 0`` test. Swallowing
+    them here would convert a caller bug into a silent, confident-looking report, which is the
+    opposite of what this predicate exists to prevent.
+    """
+    items = [item or {} for item in classifications]
+    if not items or source_count <= 0:
+        return False
+    try:
+        classified = int(cache.get("source_count") or 0)
+        prepared = int(cache.get("prepared_count") or 0)
+        needs = int(cache.get("needs_analysis_count") or 0)
+        unavailable = int(cache.get("unavailable_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not (len(items) == source_count == classified):
+        return False
+    if prepared != len(items) or needs or unavailable:
+        return False
+    return all(str(item.get("status") or "") == PrepStatus.PREPARED.value for item in items)
+
+
+def _readable_status(value: str) -> str:
+    """[FORK] Digital-Union (MEDIA-VERIFY-S2-A R2, MINOR-2): display form of a classifier status.
+
+    A recognised :class:`~beatsync_fork.library_prep.PrepStatus` value renders as its member name
+    (``prepared`` → ``PREPARED``), which is the spelling the operator reads everywhere else in this
+    section. An **unrecognised** value is returned unchanged and therefore stays visibly unknown:
+    it is never mapped onto a recognised cache state, because inventing a verdict for a string
+    nobody recognises is the fail-open direction. Purely presentational — it touches no
+    classification value and no persisted record.
+    """
+    try:
+        return PrepStatus(value).name
+    except ValueError:
+        return value
+
+
 def _same_path(a: str, b: str) -> bool:
     """Case-insensitive, absolute path equality. Never raises."""
     try:
@@ -744,8 +840,8 @@ def _cross_phase_cache_rows(run: "VerificationRun | None",
                          "could not be matched by position and is treated as inconclusive."))
             continue
         rows.append((verdict.path,
-                     f"Classified as {recorded_status}, then the file changed on disk before it "
-                     f"was probed — that verdict may describe different bytes."))
+                     f"Classified as {_readable_status(recorded_status)}, then the file changed "
+                     f"on disk before it was probed — that verdict may describe different bytes."))
     return rows
 
 
@@ -787,10 +883,13 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
         prepared = int(cache.get("prepared_count") or 0)
         needs = int(cache.get("needs_analysis_count") or 0)
         unavailable = int(cache.get("unavailable_count") or 0)
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R2): compared against the producer's enum VALUES.
+        # See the module docstring -- these were member names until R2 and matched nothing.
         new_or_changed = sum(1 for item in cache_classifications
-                             if (item or {}).get("reason") == "NEW_OR_CHANGED")
+                             if (item or {}).get("reason") == NeedReason.NEW_OR_CHANGED.value)
         incomplete = sum(1 for item in cache_classifications
-                         if (item or {}).get("reason") == "INCOMPLETE_OR_INVALID")
+                         if (item or {}).get("reason")
+                         == NeedReason.INCOMPLETE_OR_INVALID.value)
         lines.append(f"  Sources classified:            {int(cache.get('source_count') or 0)}")
         lines.append(f"  Reusable cache (PREPARED):     {prepared}")
         lines.append(f"  New or changed:                {new_or_changed}")
@@ -804,15 +903,17 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
                          "No reusable record under the current identity — new, or overwritten "
                          "since it was analysed.")
                         for i in cache_classifications
-                        if (i or {}).get("reason") == "NEW_OR_CHANGED"]
+                        if (i or {}).get("reason") == NeedReason.NEW_OR_CHANGED.value]
         incomplete_rows = [(str(i.get("path") or ""),
                             "A record exists but is deferred, wrong-contract or AI-inconsistent.")
                            for i in cache_classifications
-                           if (i or {}).get("reason") == "INCOMPLETE_OR_INVALID"]
+                           if (i or {}).get("reason")
+                           == NeedReason.INCOMPLETE_OR_INVALID.value]
         unavailable_rows = [(str(i.get("path") or ""),
                              "Source identity could not be computed (file missing or unreadable).")
                             for i in cache_classifications
-                            if (i or {}).get("status") == "SOURCE_IDENTITY_UNAVAILABLE"]
+                            if (i or {}).get("status")
+                            == PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value]
         lines.extend(_detail_block("Needs analysis - new or changed", changed_rows))
         lines.extend(_detail_block("Needs analysis - incomplete record", incomplete_rows))
         lines.extend(_detail_block("Identity unavailable", unavailable_rows))
@@ -831,7 +932,13 @@ def format_verification_report(*, folder: str, recursive: bool, verified_at: str
                          f"those records still apply is INCONCLUSIVE. Nothing was reclassified, "
                          f"re-analysed, repaired or written.")
 
-        if not (changed_rows or incomplete_rows or unavailable_rows):
+        # [FORK] Digital-Union (MEDIA-VERIFY-S2-A R2): the positive claim requires AFFIRMATIVE
+        # evidence that every classified source was PREPARED. Until R2 it rested on the three
+        # detail lists being empty, which is not the same question: an empty list is also what an
+        # unrecognised vocabulary, a missing key and a zero-source library produce, and none of
+        # those is evidence of reuse. `_all_sources_prepared` is a total predicate over the
+        # classifier's own output -- it recomputes no verdict and adjusts no count.
+        if _all_sources_prepared(cache, cache_classifications, source_count):
             if cross_rows:
                 lines.append("  Every source had a reusable Stage-5 cache record when it was "
                              "classified, but the inconclusive source(s) above changed since.")

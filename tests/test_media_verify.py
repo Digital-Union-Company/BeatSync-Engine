@@ -21,11 +21,14 @@ from __future__ import annotations
 import ast
 import json
 import os
+import sys
 import threading
 import time
+import types
 
 import pytest
 
+from beatsync_fork.library_prep import NeedReason, PrepStatus
 from beatsync_fork.media_verify import (
     DEFAULT_BUDGET_SECONDS,
     DEFAULT_PROBE_TIMEOUT_SECONDS,
@@ -609,14 +612,25 @@ def _run_with(pairs):
 # ---------------------------------------------------------------------------
 
 def _cache(prepared=0, new_or_changed=0, incomplete=0, unavailable=0):
+    """Classifier-shaped output: the enum **values** `classify_library_sources` actually emits.
+
+    Built from `PrepStatus` / `NeedReason` rather than from literals, which is the whole of R2's
+    MINOR-1. The previous spelling used the enum *member names* (`"NEEDS_ANALYSIS"`,
+    `"NEW_OR_CHANGED"`, ...) — a shape the producer never emits and that *neither* consumer
+    handles: the report's filters silently matched none of it, and
+    `library_prep.SourceClassification.from_mapping` fail-closes it to
+    `SOURCE_IDENTITY_UNAVAILABLE` and discards the reason. Because the old fixture agreed with the
+    old uppercase comparisons it was self-consistently blind, and that is precisely why four MAJOR
+    reporting defects survived a passing suite. Keep this derived from the enums.
+    """
     items = []
-    items += [{"path": f"J:/new{i}.mp4", "status": "NEEDS_ANALYSIS",
-               "reason": "NEW_OR_CHANGED"} for i in range(new_or_changed)]
-    items += [{"path": f"J:/inc{i}.mp4", "status": "NEEDS_ANALYSIS",
-               "reason": "INCOMPLETE_OR_INVALID"} for i in range(incomplete)]
-    items += [{"path": f"J:/gone{i}.mp4", "status": "SOURCE_IDENTITY_UNAVAILABLE",
+    items += [{"path": f"J:/new{i}.mp4", "status": PrepStatus.NEEDS_ANALYSIS.value,
+               "reason": NeedReason.NEW_OR_CHANGED.value} for i in range(new_or_changed)]
+    items += [{"path": f"J:/inc{i}.mp4", "status": PrepStatus.NEEDS_ANALYSIS.value,
+               "reason": NeedReason.INCOMPLETE_OR_INVALID.value} for i in range(incomplete)]
+    items += [{"path": f"J:/gone{i}.mp4", "status": PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value,
                "reason": ""} for i in range(unavailable)]
-    items += [{"path": f"J:/ok{i}.mp4", "status": "PREPARED", "reason": ""}
+    items += [{"path": f"J:/ok{i}.mp4", "status": PrepStatus.PREPARED.value, "reason": ""}
               for i in range(prepared)]
     return {
         "source_count": len(items),
@@ -651,7 +665,7 @@ def test_the_report_has_two_independent_sections_and_a_snapshot_header():
     assert "1.25s" in report and "2.50s" in report
     # Every problem path is named.
     for item in items:
-        if item["status"] != "PREPARED":
+        if item["status"] != PrepStatus.PREPARED.value:
             assert item["path"] in report
 
 
@@ -1699,7 +1713,8 @@ def test_the_report_states_the_bound_of_size_and_mtime_comparison():
 def test_a_misaligned_classification_list_is_not_attributed_to_the_wrong_source():
     """Position is the authority, and the recorded path is the guard on that assumption."""
     cache, _items = _cache(prepared=1)
-    wrong = [{"path": "J:/a-completely-different-file.mp4", "status": "PREPARED", "reason": ""}]
+    wrong = [{"path": "J:/a-completely-different-file.mp4",
+              "status": PrepStatus.PREPARED.value, "reason": ""}]
     report = format_verification_report(
         folder="J:/l", recursive=True, verified_at="t", source_count=1,
         cache=cache, cache_classifications=wrong, run=_changed_run())
@@ -1730,6 +1745,400 @@ def test_a_clean_run_report_is_unchanged_apart_from_the_new_limit_sentence():
     assert "No metadata problems found" in report
     assert "INCONCLUSIVE" not in report
     assert "Changed after classification" not in report
+
+
+# ---------------------------------------------------------------------------
+# R2: the report must render the producer's real vocabulary, and a positive
+# cache claim must rest on affirmative evidence
+#
+# The defect this section exists to prevent: `classify_library_sources` emits
+# PrepStatus/NeedReason *values* (lowercase), the report compared against their
+# member *names*, so five filters were unreachable -- the two reason counts
+# always rendered 0, the three detail blocks were always empty, and the report
+# asserted that every source had a reusable record while naming none of the
+# sources that did not. Four MAJOR findings, all invisible to a suite whose
+# fixture used the same unreachable spelling.
+# ---------------------------------------------------------------------------
+
+_ALL_PREPARED = "Every source has a reusable Stage-5 cache record."
+_WAS_PREPARED = "Every source had a reusable Stage-5 cache record when it was classified"
+
+
+def test_a_library_with_no_reusable_records_is_never_called_prepared():
+    """R2 MAJOR-1/2/3, and the exact shape the D2 production smoke hit."""
+    cache, items = _cache(new_or_changed=3)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=3,
+        cache=cache, cache_classifications=items, run=_run_with(
+            [(item["path"], ProbeOutcome(returncode=0, stdout=_payload())) for item in items]))
+    assert _ALL_PREPARED not in report, "0 of 3 prepared may never read as a warm library"
+    # The detail count is the classifier's truth, not a zero from a dead filter.
+    assert "Reusable cache (PREPARED):     0" in report
+    assert "New or changed:                3" in report
+    # ...and every affected source is named, because the path IS the actionable part.
+    for item in items:
+        assert item["path"] in report
+
+
+def test_each_classification_kind_reaches_its_own_bounded_detail_block():
+    """R2 MAJOR-2/3: one source of each kind, each in the right block, each named."""
+    cache, items = _cache(prepared=2, new_or_changed=1, incomplete=1, unavailable=1)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=5,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert "New or changed:                1" in report
+    assert "Incomplete / invalid record:   1" in report
+    assert "Needs analysis - new or changed (1):" in report
+    assert "Needs analysis - incomplete record (1):" in report
+    assert "Identity unavailable (1):" in report
+    assert "J:/new0.mp4" in report
+    assert "J:/inc0.mp4" in report
+    assert "J:/gone0.mp4" in report
+    assert _ALL_PREPARED not in report
+    # The prepared sources are counted, never listed as problems.
+    assert "J:/ok0.mp4" not in report
+
+
+def test_the_detail_blocks_stay_bounded_and_state_what_they_omitted():
+    """The R2 filters must feed the EXISTING bound, not bypass it."""
+    over = MAX_REPORT_DETAIL_LINES + 4
+    cache, items = _cache(new_or_changed=over)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=over,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert f"Needs analysis - new or changed ({over}):" in report
+    assert f"... and 4 more not shown (showing the first {MAX_REPORT_DETAIL_LINES} of {over})." \
+        in report
+    # The bound is on rows shown; the total is still stated truthfully.
+    assert f"New or changed:                {over}" in report
+
+
+def test_a_genuinely_prepared_library_keeps_its_positive_statement():
+    """Anti-regression: the correction must not silence the legitimate case."""
+    cache, items = _cache(prepared=3)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=3,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert _ALL_PREPARED in report
+
+
+def test_a_prepared_library_with_a_cross_phase_change_keeps_the_qualified_wording():
+    """Genuinely all-prepared + a later change: the historical claim is still true."""
+    cache, items = _cache(prepared=2)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=2,
+        cache=cache, cache_classifications=items, run=VerificationRun(verdicts=[
+            MediaVerdict(path="J:/ok0.mp4", status=MediaStatus.CHANGED_DURING_CHECK,
+                         change_window=ChangeWindow.CROSS_PHASE, detail="changed"),
+            MediaVerdict(path="J:/ok1.mp4", status=MediaStatus.METADATA_OK),
+        ], scheduled=2))
+    assert _WAS_PREPARED in report
+    assert _ALL_PREPARED not in report, "that sentence is a claim about the CURRENT files"
+    assert "Changed after classification" in report
+
+
+def test_a_mixed_library_with_a_cross_phase_change_claims_neither_wording():
+    """R2 MAJOR-4: a later change must not upgrade a partial classification.
+
+    The qualified sentence is still a universal claim -- "every source *had* a record" -- so it
+    needs the same affirmative evidence as the unqualified one. Only 1 of 3 was prepared here.
+    """
+    cache, items = _cache(prepared=1, new_or_changed=2)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=3,
+        cache=cache, cache_classifications=items, run=VerificationRun(verdicts=[
+            MediaVerdict(path=items[0]["path"], status=MediaStatus.CHANGED_DURING_CHECK,
+                         change_window=ChangeWindow.CROSS_PHASE, detail="changed"),
+            MediaVerdict(path=items[1]["path"], status=MediaStatus.METADATA_OK),
+            MediaVerdict(path=items[2]["path"], status=MediaStatus.METADATA_OK),
+        ], scheduled=3))
+    assert _WAS_PREPARED not in report
+    assert _ALL_PREPARED not in report
+    # The cross-phase disclosure itself is preserved, and the outstanding work is still named.
+    assert "Changed after classification" in report
+    assert "Nothing was reclassified" in report
+    assert "Needs analysis - new or changed (2):" in report
+
+
+def test_an_empty_supported_library_claims_nothing_positive():
+    """R2 MAJOR-4: zero sources is not a warm library. Survives the vocabulary fix alone."""
+    cache, items = _cache()
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=0,
+        cache=cache, cache_classifications=items, run=_run_with([]))
+    assert _ALL_PREPARED not in report
+    assert _WAS_PREPARED not in report
+
+
+@pytest.mark.parametrize("field,value,why", [
+    ("prepared_count", 2, "prepared_count disagrees with the per-item classifications"),
+    ("needs_analysis_count", 1, "needs analysis cannot be outstanding in a prepared library"),
+    ("unavailable_count", 1, "an unreadable source is neither prepared nor analysable"),
+    ("source_count", 2, "the classifier counted a different number of sources"),
+])
+def test_inconsistent_classifier_totals_never_earn_a_positive_claim(field, value, why):
+    """R2 MAJOR-4. The totals are still printed verbatim -- MINOR-3 is deferred, not fixed."""
+    cache, items = _cache(prepared=3)
+    cache = dict(cache)
+    cache[field] = value
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=3,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert _ALL_PREPARED not in report, why
+    # Deferred MINOR-3: the contradictory number is reported as the classifier gave it.
+    assert f"{cache['prepared_count']}" in report
+
+
+def test_a_folder_count_that_exceeds_the_classified_set_claims_nothing():
+    """A partial classification describes a subset; a library-wide claim may not be read off it."""
+    cache, items = _cache(prepared=2)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=5,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert _ALL_PREPARED not in report
+
+
+def test_an_unverifiable_backend_still_fabricates_no_cache_verdict():
+    """R2: the UNVERIFIABLE branch must stay ahead of the affirmative predicate."""
+    cache, items = _cache(prepared=3)
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=3,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]),
+        cache_unverifiable_reason="The Qwen backend identity could not be verified.")
+    assert "UNVERIFIABLE" in report
+    assert _ALL_PREPARED not in report, "an unprovable identity cannot prove reuse either"
+    assert "Reusable cache (PREPARED)" not in report
+    # The two questions stay independent.
+    assert "MEDIA HEALTH" in report
+
+
+def test_a_recognised_status_renders_readably_and_an_unknown_one_stays_unknown():
+    """R2 MINOR-2, both directions."""
+    cache, _items = _cache(prepared=1)
+    known = [{"path": "J:/ok0.mp4", "status": PrepStatus.PREPARED.value, "reason": ""}]
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=known, run=VerificationRun(verdicts=[
+            MediaVerdict(path="J:/ok0.mp4", status=MediaStatus.CHANGED_DURING_CHECK,
+                         change_window=ChangeWindow.CROSS_PHASE, detail="changed"),
+        ], scheduled=1))
+    assert "Classified as PREPARED, then the file changed" in report
+    assert "Classified as prepared," not in report, "the raw value is not the display form"
+
+    # An unrecognised verdict must stay visibly unknown, never promoted to a cache state.
+    odd = [{"path": "J:/ok0.mp4", "status": "something_new", "reason": ""}]
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=odd, run=VerificationRun(verdicts=[
+            MediaVerdict(path="J:/ok0.mp4", status=MediaStatus.CHANGED_DURING_CHECK,
+                         change_window=ChangeWindow.CROSS_PHASE, detail="changed"),
+        ], scheduled=1))
+    assert "Classified as something_new, then the file changed" in report
+    assert "PREPARED" not in report.split("Changed after classification")[1]
+    assert _ALL_PREPARED not in report
+
+
+def test_the_cache_fixture_is_built_from_the_authoritative_vocabulary():
+    """R2 MINOR-1, asserted by enum identity and AST -- never by scanning source text.
+
+    Two independent checks, because either alone can be satisfied by accident:
+
+    1. **Enum identity.** Every status and reason the helper emits must round-trip through the
+       authoritative enums. `PrepStatus(value)` raising is the whole assertion.
+    2. **AST.** No string literal in the helper's body may equal an enum member *name*. That is
+       the spelling the defect was written in, and a fixture that reintroduces it is back to
+       testing an input shape production cannot produce.
+
+    The AST pass deliberately skips the docstring: this helper's own documentation discusses the
+    historical spelling by name, and a check that read prose would fail on its own explanation.
+    This repository has shipped that exact mistake four times -- assert over structure, not text.
+    """
+    statuses = {item.value for item in PrepStatus}
+    reasons = {item.value for item in NeedReason}
+
+    _cache_dict, items = _cache(prepared=1, new_or_changed=1, incomplete=1, unavailable=1)
+    assert items, "the helper must actually produce classifications"
+    for item in items:
+        assert PrepStatus(item["status"]).value in statuses
+        assert item["status"] == PrepStatus(item["status"]).value, "value, not member name"
+        if item["reason"]:
+            assert NeedReason(item["reason"]).value in reasons
+            assert item["reason"] == NeedReason(item["reason"]).value
+
+    member_names = {item.name for item in PrepStatus} | {item.name for item in NeedReason}
+    node = _func(_tree(os.path.abspath(__file__)), "_cache")
+    body = list(node.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]                      # the docstring is prose, not a fixture value
+    literals = {sub.value for statement in body for sub in ast.walk(statement)
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str)}
+    assert not (literals & member_names), (
+        f"fixture reintroduced enum member names as literals: "
+        f"{sorted(literals & member_names)}")
+
+
+# ---------------------------------------------------------------------------
+# R2 negative controls: each mutation must be caught, for its intended reason
+#
+# The point is not that "some test fails" -- a mutation that merely breaks an
+# unrelated assertion proves nothing about the regression we added. Each case
+# below names the regression that must catch it, and asserts that that one
+# fails. The shipped module is never modified: a copy of its source is mutated
+# in memory and executed, which is how the rest of this suite reaches source it
+# must not alter.
+# ---------------------------------------------------------------------------
+
+_MEDIA_VERIFY_SRC = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "media_verify.py")
+
+
+def _formatter_with(old, new):
+    """`format_verification_report` from an in-memory mutated copy of the real module.
+
+    The replacement must actually apply: a mutation that silently matched nothing would make the
+    negative control pass for the wrong reason, which is the failure mode these tests exist to
+    exclude in the first place.
+    """
+    with open(_MEDIA_VERIFY_SRC, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert source.count(old) >= 1, f"mutation target not present: {old!r}"
+    mutated = source.replace(old, new)
+    assert mutated != source, "mutation did not change the source"
+    # A real module object, registered while it executes: the module uses
+    # `from __future__ import annotations`, so `@dataclass` resolves its field annotations by
+    # looking the defining module up in `sys.modules`. A bare dict namespace is not reachable
+    # that way and the dataclasses machinery fails on the first deferred annotation.
+    name = "beatsync_fork._r2_mutated_media_verify"
+    module = types.ModuleType(name)
+    module.__file__ = _MEDIA_VERIFY_SRC
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        exec(compile(mutated, _MEDIA_VERIFY_SRC, "exec"), module.__dict__)
+        return module.__dict__["format_verification_report"]
+    finally:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+
+
+def _d2_case():
+    cache, items = _cache(new_or_changed=3)
+    run = _run_with([(item["path"], ProbeOutcome(returncode=0, stdout=_payload()))
+                     for item in items])
+    return cache, items, run
+
+
+def test_negative_control_an_uppercase_reason_comparison_is_caught():
+    """Mutation: compare the reason against the enum member name again.
+
+    Caught by `test_a_library_with_no_reusable_records_is_never_called_prepared`, on its count
+    clause (`New or changed: 3`) and its per-path clauses — the detail count collapses to 0 and
+    every outstanding source stops being named.
+
+    Note what this mutation does *not* restore: the false positive claim. The affirmative
+    predicate is an independent defence and still refuses it on `prepared_count == 0`. That is
+    the intended design — the two R2 corrections overlap deliberately, and recovering the full
+    original symptom needs both mutations, which
+    `test_negative_control_the_absence_of_error_lists_gate_is_caught` covers.
+    """
+    formatter = _formatter_with("== NeedReason.NEW_OR_CHANGED.value",
+                                '== "NEW_OR_CHANGED"')
+    cache, items, run = _d2_case()
+    report = formatter(folder="J:/l", recursive=True, verified_at="t", source_count=3,
+                       cache=cache, cache_classifications=items, run=run)
+    assert "New or changed:                3" not in report, "the count regression is the catch"
+    assert "New or changed:                0" in report
+    assert all(item["path"] not in report for item in items), "paths stop being named"
+    # The second defence holds, so this mutation alone is not enough to fabricate reuse.
+    assert _ALL_PREPARED not in report
+
+
+def test_negative_control_an_uppercase_unavailable_status_comparison_is_caught():
+    """Mutation: compare the unavailable status against the enum member name again.
+
+    Caught by `test_each_classification_kind_reaches_its_own_bounded_detail_block`, whose
+    `Identity unavailable (1):` block disappears.
+    """
+    formatter = _formatter_with("== PrepStatus.SOURCE_IDENTITY_UNAVAILABLE.value",
+                                '== "SOURCE_IDENTITY_UNAVAILABLE"')
+    cache, items = _cache(prepared=2, new_or_changed=1, incomplete=1, unavailable=1)
+    report = formatter(folder="J:/l", recursive=True, verified_at="t", source_count=5,
+                       cache=cache, cache_classifications=items,
+                       run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0,
+                                                                stdout=_payload()))]))
+    assert "Identity unavailable (1):" not in report
+    assert "J:/gone0.mp4" not in report
+    # The dict-derived count survives, which is exactly why the defect read as cosmetic.
+    assert "Source identity unavailable:   1" in report
+
+
+def test_negative_control_the_absence_of_error_lists_gate_is_caught():
+    """Mutation: restore the original negative gate.
+
+    Caught by `test_an_empty_supported_library_claims_nothing_positive` and by
+    `test_inconsistent_classifier_totals_never_earn_a_positive_claim` -- neither of which the
+    vocabulary fix alone can satisfy.
+    """
+    formatter = _formatter_with(
+        "if _all_sources_prepared(cache, cache_classifications, source_count):",
+        "if not (changed_rows or incomplete_rows or unavailable_rows):")
+
+    # Empty library: three empty lists are not evidence of reuse.
+    cache, items = _cache()
+    report = formatter(folder="J:/l", recursive=True, verified_at="t", source_count=0,
+                       cache=cache, cache_classifications=items, run=_run_with([]))
+    assert _ALL_PREPARED in report, "the mutation must reproduce the empty-library false claim"
+
+    # Contradictory totals: prepared_count and needs_analysis_count cannot both hold.
+    cache, items = _cache(prepared=3)
+    cache = dict(cache)
+    cache["needs_analysis_count"] = 3
+    report = formatter(folder="J:/l", recursive=True, verified_at="t", source_count=3,
+                       cache=cache, cache_classifications=items,
+                       run=_run_with([("J:/a.mp4", ProbeOutcome(returncode=0,
+                                                                stdout=_payload()))]))
+    assert _ALL_PREPARED in report
+
+
+def test_negative_control_a_fixture_that_loses_vocabulary_fidelity_is_caught():
+    """Mutation: build the fixture from enum member names again.
+
+    Caught by `test_the_cache_fixture_is_built_from_the_authoritative_vocabulary`'s enum-identity
+    clause -- `PrepStatus("NEEDS_ANALYSIS")` raises, because that is a member name and the
+    producer emits values. This is asserted on a local stand-in so the shipped fixture stays
+    intact.
+    """
+    def _unfaithful_cache():
+        return [{"path": "J:/new0.mp4", "status": "NEEDS_ANALYSIS",
+                 "reason": "NEW_OR_CHANGED"}]
+
+    items = _unfaithful_cache()
+    with pytest.raises(ValueError):
+        PrepStatus(items[0]["status"])
+    with pytest.raises(ValueError):
+        NeedReason(items[0]["reason"])
+
+    # And such a fixture is invisible to the corrected report: no count, no path, false claim.
+    cache = {"source_count": 1, "prepared_count": 0, "needs_analysis_count": 1,
+             "unavailable_count": 0, "classifications": items}
+    report = format_verification_report(
+        folder="J:/l", recursive=True, verified_at="t", source_count=1,
+        cache=cache, cache_classifications=items,
+        run=_run_with([("J:/new0.mp4", ProbeOutcome(returncode=0, stdout=_payload()))]))
+    assert "New or changed:                1" not in report
+    assert "J:/new0.mp4" not in report
+    # ...but the affirmative predicate still refuses the positive claim, so R2's two corrections
+    # are genuinely independent defences rather than one restated twice.
+    assert _ALL_PREPARED not in report
 
 
 # ---------------------------------------------------------------------------
