@@ -108,8 +108,10 @@ def gui():
         "fork_variation": _Describe,
         "EventKind": EventKind, "ProgressEvent": ProgressEvent,
     }
+    # `_finite_metric` joins the set because `_scale_diagnostics_block` calls it: the extracted
+    # bodies run against this namespace, so every name they use must come out of gui.py too.
     _extract(_GUI, {"StageConsoleLogger", "_fmt_stage_seconds", "_stage5_summary",
-                    "_stage6_summary", "_scale_diagnostics_block"}, ns)
+                    "_stage6_summary", "_scale_diagnostics_block", "_finite_metric"}, ns)
     return ns
 
 
@@ -963,3 +965,120 @@ def test_readable_diagnostic_shape(gui, capsys):
     # no threshold, no warning, no cap anywhere in the rendered diagnostics
     for forbidden in ("too many", "too large", "too slow", "limit", "exceed"):
         assert forbidden not in text.lower(), forbidden
+
+
+# ======================================================================================
+# P3. the planner's shot-variety metrics reach the final panel too
+#
+# The three keys already existed on `plan_summary` (merged by P1) and already printed on
+# the console `Sources used:` line (P2). The GUI discarded them. These tests pin the
+# re-read: same values, same clamps, same omission rule, and nothing recomputed.
+# ======================================================================================
+
+
+def _run_with_shots(**shots):
+    info = _real_run_beat_info()
+    info["render_info"]["plan_summary"] = {"clip_count": 148, "source_count": 41, **shots}
+    return info
+
+
+def test_p3_all_three_shot_metrics_are_shown(gui):
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=72, top_shot_share=0.041, shot_hhi=0.0182))
+    assert "Shot variety: 72 distinct shots · Top shot 4.1% · HHI 0.0182" in block
+    # and it is an addition, not a replacement
+    assert "Stage 5: identity 3.4s · records 0.2s · cache 41/41 · 742 candidates" in block
+    assert "Planner: 148 segments × 742 candidates · 0.4s" in block
+
+
+def test_p3_an_older_plan_summary_without_the_keys_renders_the_block_unchanged(gui):
+    """A pre-P1 summary carries none of the three keys: the panel must look exactly as it did."""
+    before = gui["_scale_diagnostics_block"](0.0, _real_run_beat_info())
+    legacy = _run_with_shots()                      # clip_count/source_count only
+    assert gui["_scale_diagnostics_block"](0.0, legacy) == before
+    assert "Shot variety" not in gui["_scale_diagnostics_block"](0.0, legacy)
+
+
+@pytest.mark.parametrize("plan_summary", [
+    None, {}, "not a dict", 42, [],
+])
+def test_p3_a_missing_or_malformed_plan_summary_is_survivable(gui, plan_summary):
+    info = _real_run_beat_info()
+    info["render_info"]["plan_summary"] = plan_summary
+    block = gui["_scale_diagnostics_block"](0.0, info)
+    assert "Shot variety" not in block
+    assert "Planner: 148 segments × 742 candidates · 0.4s" in block
+
+
+@pytest.mark.parametrize("bad", [
+    float("nan"), float("inf"), float("-inf"), None, "", "seventy-two", object(),
+])
+def test_p3_non_finite_values_are_omitted_never_rendered(gui, bad):
+    """An unusable value is not a measurement of zero, and must never print NaN or inf."""
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=bad, top_shot_share=bad, shot_hhi=bad))
+    assert "Shot variety" not in block
+    lowered = block.lower()
+    for forbidden in ("nan", "inf"):
+        assert forbidden not in lowered, forbidden
+
+
+def test_p3_a_partially_usable_summary_shows_only_what_was_measured(gui):
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=5, top_shot_share=float("nan"), shot_hhi=0.5))
+    assert "Shot variety: 5 distinct shots · HHI 0.5000" in block
+    assert "Top shot" not in block
+
+
+def test_p3_measured_zeroes_are_legitimate_and_shown(gui):
+    """`_shot_metrics`' own empty-plan early return is exactly this shape."""
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=0, top_shot_share=0.0, shot_hhi=0.0))
+    assert "Shot variety: 0 distinct shots · Top shot 0.0% · HHI 0.0000" in block
+
+
+def test_p3_boundary_and_out_of_range_shares_stay_honest(gui):
+    """Both shares are bounded in [0,1] by construction; a clamp can only fire on foreign input."""
+    full = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=1, top_shot_share=1.0, shot_hhi=1.0))
+    assert "Shot variety: 1 distinct shots · Top shot 100.0% · HHI 1.0000" in full
+
+    clamped = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=-3, top_shot_share=-0.4, shot_hhi=7.5))
+    assert "Shot variety: 0 distinct shots · Top shot 0.0% · HHI 1.0000" in clamped
+    assert "-" not in clamped.split("Shot variety: ")[1].splitlines()[0]
+
+
+def test_p3_the_existing_final_diagnostics_are_preserved(gui):
+    """Every pre-P3 assertion about this block still holds, with shot metrics present."""
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=72, top_shot_share=0.041, shot_hhi=0.0182))
+    assert block.splitlines() == [
+        "Scale diagnostics:",
+        "Source verification: 0.0s",
+        "Stage 5: identity 3.4s · records 0.2s · cache 41/41 · 742 candidates",
+        "Planner: 148 segments × 742 candidates · 0.4s",
+        "Shot variety: 72 distinct shots · Top shot 4.1% · HHI 0.0182",
+    ]
+    # nothing supplied at all still yields an empty block, exactly as before
+    assert gui["_scale_diagnostics_block"](None, {}) == ""
+
+
+def test_p3_the_metrics_are_re_read_never_recomputed(gui):
+    """The block must read the three keys off plan_summary and derive nothing of its own."""
+    # `_body_code` goes through ast.unparse, which normalises string quotes to single.
+    body = _body_code(_func(_tree(_GUI), "_scale_diagnostics_block"))
+    for key in ("shot_count", "top_shot_share", "shot_hhi"):
+        assert f"plan_summary.get('{key}')" in body, key
+    # no recomputation primitives leaked into a presentation helper
+    for forbidden in ("Counter", "summarize_clip_plan", "_shot_metrics", "sum(", "len("):
+        assert forbidden not in body, forbidden
+
+
+def test_p3_shot_variety_is_not_presented_as_a_quality_score(gui):
+    block = gui["_scale_diagnostics_block"](0.0, _run_with_shots(
+        shot_count=72, top_shot_share=0.041, shot_hhi=0.0182))
+    lowered = block.lower()
+    for forbidden in ("quality", "score", "good", "bad", "poor", "better", "worse",
+                      "warning", "too low", "too high", "limit", "exceed"):
+        assert forbidden not in lowered, forbidden

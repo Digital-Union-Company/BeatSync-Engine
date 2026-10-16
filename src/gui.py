@@ -562,6 +562,35 @@ def _stage5_summary(console_logger: StageConsoleLogger | None, video_analysis: D
         console_logger.line(f"Cached library: {library_tags} previously tagged candidates")
 
 
+def _finite_metric(value: object) -> float | None:
+    """[FORK] Digital-Union (P3): one usable finite number, or ``None`` for "not a measurement".
+
+    Same totality contract as `_fmt_stage_seconds` above — a diagnostic must never raise inside a
+    render — but it returns ``None`` instead of a zero, because the caller's job is different. A
+    shot metric that is absent, ``None``, ``NaN``, infinite or unparseable is **not** a measurement
+    of zero concentration, and printing ``0.0%`` for it would invent one. The caller omits the
+    segment instead, exactly as `video_processor._planner_sources_line` does for the same three
+    keys on the console side.
+
+    Deliberately a local twin of that helper rather than an import of it: `_scale_diagnostics_block`
+    is AST-extracted and executed against a synthesised namespace by
+    `tests/test_scale_diagnostics.py`, so every name its body uses must be extractable from
+    `gui.py` itself. `video_processor` cannot be imported on a bare interpreter at all. This
+    module already carries `_fmt_stage_seconds` beside `beatsync_fork.input_report.format_seconds`
+    for the same reason.
+
+    `value != value` is the NaN test and the infinity comparison is literal, so this needs no
+    ``math`` import.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
 def _scale_diagnostics_block(verification_seconds: float | None,
                              beat_info: Dict | None) -> str:
     """[FORK] Digital-Union (L0.1): the L0 measurements, repeated in the final success panel.
@@ -614,6 +643,32 @@ def _scale_diagnostics_block(verification_seconds: float | None,
         planner.append(_fmt_stage_seconds(render_info["planner_seconds"]))
     if planner:
         lines.append("Planner: " + " · ".join(planner))
+
+    # [FORK] Digital-Union (P3): the shot diagnostics P1 merged into the plan summary, re-read for
+    # the panel that survives. Reporting only — every value comes straight off `plan_summary`,
+    # which `summarize_clip_plan` already computed, so this can never become a second authority on
+    # what a plan contains. Same three keys, same clamps and same omission rule as
+    # `video_processor._planner_sources_line`, which prints them on the console line the GUI
+    # discards.
+    #
+    # These describe how the selected cuts were SPREAD across the available shots. They are not a
+    # quality score: a low shot count can be the right answer for a short track or a small library,
+    # and a high one does not make an edit good.
+    plan_summary = render_info.get("plan_summary")
+    plan_summary = plan_summary if isinstance(plan_summary, dict) else {}
+
+    variety: list[str] = []
+    shot_count = _finite_metric(plan_summary.get("shot_count"))
+    if shot_count is not None:
+        variety.append(f"{max(0, int(shot_count))} distinct shots")
+    top_shot_share = _finite_metric(plan_summary.get("top_shot_share"))
+    if top_shot_share is not None:
+        variety.append(f"Top shot {min(1.0, max(0.0, top_shot_share)) * 100:.1f}%")
+    shot_hhi = _finite_metric(plan_summary.get("shot_hhi"))
+    if shot_hhi is not None:
+        variety.append(f"HHI {min(1.0, max(0.0, shot_hhi)):.4f}")
+    if variety:
+        lines.append("Shot variety: " + " · ".join(variety))
 
     return "Scale diagnostics:\n" + "\n".join(lines) if lines else ""
 

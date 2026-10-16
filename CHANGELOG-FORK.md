@@ -123,6 +123,46 @@ clobber the preview it had just produced — the feedback-loop failure mode, avo
 debugged later. Sixteen regression tests reproduce the defect itself (summary versus the
 declaration the renderer actually uses, across disabled / all-Random / mixed / all-Base screens)
 rather than only asserting which widgets exist.
+### Added — 2026-10-16 (Stage-6 P3: shot variety in the final GUI panel)
+
+The planner's three shot diagnostics now appear in the success panel:
+
+```
+Shot variety: 72 distinct shots · Top shot 4.1% · HHI 0.0182
+```
+
+`shot_count`, `top_shot_share` and `shot_hhi` have been on `plan_summary` since P1 and on the
+console `Sources used:` line since P2 — but the GUI never read them, so an operator who renders
+through the UI could not see how the selected cuts were spread across the available shots. A real
+41-source production render reproduced exactly that: the metrics were computed and then discarded.
+
+**Reporting only.** Every value is re-read straight off `render_info["plan_summary"]`, which
+`summarize_clip_plan` already computed. Nothing is recomputed, no plan is re-derived and no cache is
+consulted, so the panel can never become a second authority on what a plan contains — a structural
+test asserts the body carries no `Counter`, `_shot_metrics`, `summarize_clip_plan`, `sum(` or `len(`.
+The same clamps and the same omission rule as `video_processor._planner_sources_line` apply, so the
+two surfaces cannot disagree.
+
+**These are not a quality score**, and the wording deliberately avoids implying one: a low shot count
+can be the right answer for a short track or a small library, and a high one does not make an edit
+good. A test pins the absence of `quality`, `score`, `better`, `warning`, `limit` and similar from
+the rendered text — consistent with L0's rule that there are no thresholds, warnings or caps.
+
+A metric that is absent, `None`, `NaN`, infinite or unparseable is **omitted**, never rendered as a
+fabricated `0.0%`; a measured zero *is* shown, because `_shot_metrics`' own empty-plan early return
+produces exactly that shape. A pre-P1 `plan_summary` carrying none of the keys renders the panel
+byte-for-byte as before, and a malformed one (`None`, a string, a list) is survivable.
+
+`_finite_metric` is a deliberate gui-local twin of `video_processor._finite_diagnostic` rather than
+an import of it: `_scale_diagnostics_block` is AST-extracted and executed against a synthesised
+namespace by `tests/test_scale_diagnostics.py`, so every name its body uses must come out of
+`gui.py`, and `video_processor` cannot be imported on a bare interpreter at all. This module already
+carries `_fmt_stage_seconds` alongside `beatsync_fork.input_report.format_seconds` for the same
+reason.
+
+No new Gradio widget, no new state, no change to source selection, Stage-6 planning, scoring,
+rendering, cache identity or Qwen. Existing success-message lines are unchanged and still assert
+byte-for-byte in the pre-existing tests.
 
 ### Fixed — 2026-10-16 (MEDIA-VERIFY-S2-A R2: truthful Stage-5 cache reporting in Verify Sources)
 
