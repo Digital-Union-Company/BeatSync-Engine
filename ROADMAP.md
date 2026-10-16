@@ -32,7 +32,7 @@ so. Anything in this roadmap that appears to conflict with that principle is wro
 
 ---
 
-### R1 — Raw Cutter V1 · IMPLEMENTED IN PR #68, **NOT YET MERGED**
+### R1 — Raw Cutter V1 · **IMPLEMENTED IN PR #68**
 
 Mechanical, deterministic, quality-first shot selection. No AI involved anywhere.
 
@@ -219,7 +219,7 @@ selection). These are worth doing when Playtest feedback justifies them, not bef
 
 | Item | Status |
 |---|---|
-| **R1** — Raw Cutter V1, mechanical quality-first selection | Implemented in PR #68, **not yet merged** |
+| **R1** — Raw Cutter V1, mechanical quality-first selection | **IMPLEMENTED IN PR #68** |
 | **R2** — Transition Detection + Edge Cleaner | **PLANNED** — the measurement is done, the detector is not built |
 | **R3** — AI Director Cutter (Qwen-guided selection) | **PLANNED** — no Qwen in the Raw Cutter today |
 | **R4** — Raw Cutter usability and scale | **PLANNED** |
