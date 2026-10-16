@@ -76,12 +76,29 @@ agreed with each other and with nothing in production. That shape is one **neith
 handles — `library_prep.SourceClassification.from_mapping` fail-closes it to
 `SOURCE_IDENTITY_UNAVAILABLE` and discards the reason. The fixture is now derived from the enums,
 and a fidelity test pins that by enum round-trip plus an AST pass over the helper body (skipping
-its docstring, which discusses the historical spelling by name). Nineteen tests were added,
-including five negative controls that mutate an in-memory copy of the module and assert the
-specific named regression catches each one. No existing test was removed, renamed, skipped or
-weakened; all 182 pre-existing tests in the file pass unchanged, the two that asserted the
-uppercase member name needed no behavioural change because the readable-status fix preserves their
-meaning. Suite: 6357 collected / 6349 passed / 8 skipped, from 6338 / 6330 / 8.
+its docstring, which discusses the historical spelling by name).
+
+Nineteen test node IDs were added — sixteen test functions, one of them parametrised four ways.
+**Four** of them are named `test_negative_control_*`: three build an in-memory mutated copy of the
+module (uppercase `NEW_OR_CHANGED`, uppercase `SOURCE_IDENTITY_UNAVAILABLE`, and the restored
+absence-of-error-lists gate) and assert the specific named regression catches each, while the
+fourth drives an intentionally unfaithful local fixture. Two further mutation classes — uppercase
+`INCOMPLETE_OR_INVALID` and reverting the readable-status display — were exercised only in
+disposable out-of-tree scripts, not committed as test functions; the earlier wording of this entry
+said "five negative controls" and so conflated committed test cases with those experiments.
+
+No test was added to make that number true. Instead the independent R3 review measured what the
+committed suite actually protects: all five specified mutation classes were applied to disposable
+copies of the source and tests and the real committed suite was run against each. None survived.
+Every class is killed by permanent committed assertions — including uppercase
+`INCOMPLETE_OR_INVALID`, which has no dedicated negative control but fails two existing tests. So
+the committed coverage is one control short of the original claim and no weaker in substance.
+
+No existing test was removed, renamed, skipped or weakened; all 182 pre-existing tests in the file
+pass unchanged, the two that asserted the uppercase member name needed no behavioural change
+because the readable-status fix preserves their meaning. Suite: 6357 collected / 6349 passed /
+8 skipped, from 6338 / 6330 / 8 — independently re-measured in R3, where the 8 skips are 2
+elevation-dependent symlink tests plus 6 uniform `test_micro_cuts` parameter pairs on both sides.
 
 Offline only — no Gradio, FFmpeg, Qwen, GPU, media or production data is involved in this
 correction. A mixed-state runtime acceptance is still required: the original S2-A acceptance used a

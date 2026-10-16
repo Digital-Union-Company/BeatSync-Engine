@@ -753,8 +753,25 @@ def _all_sources_prepared(cache: Dict[str, Any],
       classification nobody ran. What R2 fixes is only that they can no longer *earn a positive
       claim*.
 
-    Total by construction: unknown or malformed input makes this ``False``, never an exception and
-    never a claim. It reads the classifier's output and recomputes no verdict of its own.
+    **Input contract** (R3 MINOR-B — the earlier wording claimed more than this function
+    delivers). The supported domain is exactly what the one caller passes:
+
+    * ``source_count`` — an ``int``, the ``len(sources)`` of the folder enumeration;
+    * ``cache`` — the mapping ``classify_library_sources()`` returned;
+    * ``classifications`` — a sequence of that classifier's own per-source mappings.
+
+    Within that contract this is total and never raises: absent positive evidence, an unrecognised
+    status value, a missing key, a non-numeric count and mutually inconsistent counts all yield
+    ``False``, and none of them can produce an all-prepared claim. It reads the classifier's output
+    and recomputes no verdict of its own.
+
+    What is **not** promised is exception-free handling of arbitrary malformed Python objects
+    outside that contract — a non-mapping ``cache``, a non-iterable ``classifications``, non-mapping
+    entries or a non-integer ``source_count`` may raise. That is deliberate. Most such inputs
+    already raise in the surrounding report code and did so before R2; a non-integer
+    ``source_count`` is the one case R2 newly exposes, via the ``source_count > 0`` test. Swallowing
+    them here would convert a caller bug into a silent, confident-looking report, which is the
+    opposite of what this predicate exists to prevent.
     """
     items = [item or {} for item in classifications]
     if not items or source_count <= 0:
