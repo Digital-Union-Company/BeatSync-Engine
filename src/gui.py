@@ -189,6 +189,10 @@ from beatsync_fork import director as fork_director
 # widgets at render-submission time and threads it down the existing render chain. It writes no
 # global creative widget, and nothing downstream of Stage 6 has heard of it.
 from beatsync_fork import freestyle as fork_freestyle
+# [FORK] Digital-Union (Random Freestyle V2): the seeded per-section generator. A sibling module so
+# freestyle.py keeps its pinned import set; it adds one dropdown choice and generates the five
+# numbers for every section left on it. A seeded generator, never a model.
+from beatsync_fork import freestyle_random as fork_freestyle_random
 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. The placement rules live in
 # src/beatsync_fork/audio_mix.py (stdlib-only, Gradio-free) and the FFmpeg mixdown in
 # src/audio_mixdown.py. Both run AFTER the music analysis and feed only the final render audio —
@@ -2007,6 +2011,35 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
     declaration = fork_freestyle.FreestyleDeclaration.from_styles(
         freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)))
     return fork_freestyle.summary_text(declaration)
+
+
+def _on_surprise_me(freestyle_enabled, *styles):
+    """[FORK] Digital-Union (Random Freestyle V2): roll a new Variation Seed and preview the result.
+
+    Returns ``(new_seed, preview_text)`` — it writes the Variation Seed and the Freestyle summary,
+    and nothing else. No slider, no preset, no section dropdown.
+
+    **It deliberately does not rewrite the dropdowns.** The dropdown is the user's *intent*:
+    ``Random`` means "this section may be regenerated", and a named style means "I fixed this".
+    Replacing a ``Random`` dropdown with the concrete style it happened to produce would destroy
+    that distinction and make the next press a no-op for that section. So the dropdowns are an
+    **input** here and never an output, which is also what keeps Freestyle's "nothing ever writes a
+    Freestyle widget programmatically" invariant intact.
+
+    The new seed is minted by the existing `fork_variation.random_seed`, the same producer the
+    Randomize button uses — Freestyle gains no seed of its own and no second source of randomness.
+
+    Unlike `_on_freestyle_change`, this one *may* print numbers: it is a point-in-time preview of
+    what the seed it just minted generates, not a standing claim about inherited globals. The
+    inherited-value staleness argument does not apply, because a generated value is not inherited.
+    """
+    seed = fork_variation.random_seed()
+    preview = fork_freestyle_random.describe_resolved(
+        dict(zip(_FREESTYLE_WIDGET_ORDER, styles)), seed)
+    if not freestyle_enabled:
+        preview = ("Freestyle is switched off, so this render is unchanged.\n"
+                   "Tick Enable Freestyle to use the sections below.\n\n") + preview
+    return seed, preview
 
 
 # [FORK] Digital-Union (AI Director — V1 introduced the split; V2 added the media step): two thin
@@ -4900,60 +4933,71 @@ def create_ui() -> gr.Blocks:
                         # One dropdown per Stage-3 section type, declared explicitly rather than in
                         # a loop so each widget is visible to the per-widget seam assertions — the
                         # same reason the six slider bindings are written out one at a time.
-                        # `Base` is the default and means "inherit the live global value".
+                        # [FORK] Digital-Union (Random Freestyle V2): `Random` is now the default,
+                        # so enabling Freestyle is experimental without ten manual picks. `Base`
+                        # remains available and still means "inherit the live global value"; the
+                        # other four named styles are unchanged. Freestyle OFF is unaffected —
+                        # the switch is still the only gate.
                         freestyle_intro = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
                             elem_id='freestyle-intro')
                         freestyle_hook = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
                             elem_id='freestyle-hook')
                         freestyle_outro = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
                             elem_id='freestyle-outro')
                         freestyle_finale = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
                             elem_id='freestyle-finale')
                         freestyle_drop = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
                             elem_id='freestyle-drop')
                         freestyle_chorus = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
                             elem_id='freestyle-chorus')
                         freestyle_bridge = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
                             elem_id='freestyle-bridge')
                         freestyle_breakdown = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
                             elem_id='freestyle-breakdown')
                         freestyle_verse = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
                             elem_id='freestyle-verse')
                         freestyle_body = gr.Dropdown(
-                            choices=list(fork_freestyle.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle.BASE_STYLE,
+                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                            value=fork_freestyle_random.RANDOM_STYLE,
                             label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
                             elem_id='freestyle-body')
                         # Read-only, and formatted entirely by `freestyle.summary_text()` — one
                         # formatter per read-out, exactly as the Variant Lab, mix and Director
                         # reports work. It never prints an inherited number; see the handler.
+                        # [FORK] Digital-Union (Random Freestyle V2): rolls a new Variation Seed
+                        # and previews what the Random sections become. Placed directly above the
+                        # summary it writes. It reads the dropdowns and never writes one.
+                        surprise_btn = gr.Button(
+                            LABEL_SURPRISE_ME, variant='secondary',
+                            elem_id='freestyle-surprise-button')
+                        gr.Markdown(INFO_SURPRISE_ME)
                         freestyle_summary = gr.Textbox(
                             label=LABEL_FREESTYLE_SUMMARY,
                             value=fork_freestyle.summary_text(
@@ -5471,6 +5515,14 @@ def create_ui() -> gr.Blocks:
         # writes a Freestyle widget programmatically, so there is no cycle to create — and a test
         # pins that absence. Registered explicitly per widget, not in a loop, so each binding is
         # visible to the per-widget seam assertions.
+        # [FORK] Digital-Union (Random Freestyle V2): the one Freestyle registration that is not a
+        # `.change()` and the one that writes the Variation Seed. It READS the eleven live widgets
+        # and writes exactly two things — the seed and the summary — so no section dropdown is ever
+        # written programmatically and the `.change()` graph above stays acyclic.
+        surprise_btn.click(
+            fn=_on_surprise_me, inputs=freestyle_live_inputs,
+            outputs=[variation_seed, freestyle_summary])
+
         freestyle_enabled.change(
             fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
         freestyle_intro.change(

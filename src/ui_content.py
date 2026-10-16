@@ -628,6 +628,23 @@ LABEL_FREESTYLE_SECTION_PREFIX = "🎵"
 
 LABEL_FREESTYLE_SUMMARY = "Freestyle rules"
 
+# [FORK] Digital-Union (Random Freestyle V2)
+LABEL_SURPRISE_ME = "🎲 Surprise me"
+INFO_SURPRISE_ME = (
+    "**Every section type starts on *Random*.** Random generates that section's five controls "
+    "— Cut Density, Semantic Emphasis, Energy Response, Motion Bias and Source Diversity — from "
+    "the Variation Seed, inside a band that suits the section: calmer intros and outros, harder "
+    "drops and finales.\n\n"
+    "**Surprise me rolls a new Variation Seed** and shows what the Random sections become. Because "
+    "the seed is global, it also changes the overall variation of the edit — that is the same one "
+    "number the Randomize button above rolls, and the same one the success panel prints, so any "
+    "render stays reproducible from it.\n\n"
+    "**Anything you set yourself is left alone.** A section switched to Base or to a named style is "
+    "your choice and Surprise me never touches it — only sections still showing *Random* are "
+    "regenerated. This is seeded generation, not an AI model: no inference runs and nothing is "
+    "sent anywhere."
+)
+
 # ============================================================================
 # [FORK] Digital-Union: Variant Lab V1 (C2)
 # See src/beatsync_fork/variant_lab.py for the resolvers these labels describe. Variant Lab writes

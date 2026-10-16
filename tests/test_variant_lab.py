@@ -2598,7 +2598,16 @@ def test_the_mint_switch_is_keyword_only_and_apply_passes_false():
 def test_only_the_shared_helper_owns_the_draw():
     """One `random_seed()` call site for the whole lab, plus Randomize and New Variant's own.
 
-    **Extended by exactly one entry for AI Director V1**, and the list stays exact equality.
+    **Extended by exactly one entry for AI Director V1**, and again by exactly one for Random
+    Freestyle V2 (`_on_surprise_me`). The list stays exact equality.
+
+    Surprise me qualifies under the same rule the Director did. It mints through *this* call rather
+    than inventing a second seed implementation, and its draw is **surfaced** — it is written
+    straight into the visible Variation Seed box and previewed in the Freestyle summary in the same
+    response, so there is no unsurfaced draw deciding anything. It is deliberately not a
+    Freestyle-local seed: V1 kept the Variation Seed global so the one number a user writes down
+    still describes the whole render, and `freestyle_seed` remains banned by name in
+    `test_creative_controls_seam.py`.
 
     This enumerates every `gui.py` function that mints a seed, so that a second, *unsurfaced*
     draw cannot appear beside the lab's — the property C2 R1-B and C3 R1 both rest on. The
@@ -2623,7 +2632,8 @@ def test_only_the_shared_helper_owns_the_draw():
             owners.append(node.name)
     assert sorted(owners) == ["_build_variant_resolution_context",
                               "_fresh_variant_master_seed",
-                              "_on_generate_director_proposal"], owners
+                              "_on_generate_director_proposal",
+                              "_on_surprise_me"], owners
 
     # The lab's own two sites are unchanged, and the Director's is NOT one of the lab's handlers.
     for lab_handler in ("_on_generate_variant", "_on_new_variant", "_on_generate_variants",

@@ -108,6 +108,10 @@ from beatsync_fork import creative as fork_creative
 # it into per-section Stage-4 configs after Stage 3 has produced real sections, and puts it on the
 # shared bus for Stage 6. Stages 1-3 never see it.
 from beatsync_fork import freestyle as fork_freestyle
+# [FORK] Digital-Union (Random Freestyle V2): the seeded per-section generator. A sibling of
+# `freestyle` rather than part of it, so `freestyle.py` keeps its pinned import set and its
+# forbidden-substring guarantees unchanged.
+from beatsync_fork import freestyle_random as fork_freestyle_random
 # [FORK] Digital-Union (L2 V1): the process-local post-Stage-3 cache. Stdlib-only, NumPy-free and
 # media-free: it owns the key, the one entry and the defensive copying, and understands nothing about
 # what the bundle contains. Measured reusable cost on the real Nero track is ~15.735 s (audio load +
@@ -263,8 +267,15 @@ def micro_cut_scaled_config(cfg: AutoWaveConfig,
     )
 
 
-def _resolve_freestyle(freestyle):
+def _resolve_freestyle(freestyle, seed=0):
     """[FORK] Digital-Union (Freestyle V1): one `FreestyleDeclaration`, from whatever was submitted.
+
+    ``seed`` is the render's **global** Variation Seed, and it is used for exactly one thing: to
+    generate the sections a V2 screen marked ``Random``. It defaults to the legacy seed so every
+    pre-V2 caller — the CLI, a direct caller, a test — keeps its existing signature and its existing
+    result. It is **not** a Freestyle-local seed and no such state exists: the one number the user
+    writes down still describes the whole render, which is why the Variation Seed stayed global in
+    V1 and stays global here.
 
     Accepts three shapes, and resolving them here rather than in the GUI is deliberate:
 
@@ -285,7 +296,14 @@ def _resolve_freestyle(freestyle):
     if isinstance(freestyle, (tuple, list)) and freestyle:
         enabled = freestyle[0]
         styles = dict(zip(fork_freestyle.SECTION_TYPES, freestyle[1:]))
-        return fork_freestyle.FreestyleDeclaration.from_styles(enabled, styles)
+        # [FORK] Digital-Union (Random Freestyle V2): generated sections are resolved HERE, at the
+        # one existing conversion, so Stage 4 and Stage 6 keep receiving a single already-resolved
+        # declaration off `beat_info` and neither learns that a generator exists. Resolving once is
+        # what makes the two stages provably agree; resolving per stage would let them disagree.
+        #
+        # A screen with no Random entry produces exactly V1's declaration: the V2 builder sends
+        # every non-Random value through `override_from_style` unchanged.
+        return fork_freestyle_random.declaration_from_styles(enabled, styles, seed)
     return fork_freestyle.FreestyleDeclaration()
 
 
@@ -658,7 +676,11 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     # same boundary as the profile. Anything that is not a real `FreestyleDeclaration` — absent,
     # stale, or a shape from some other caller — degrades to an inactive declaration, so a render
     # can never fail because of it and "Freestyle off" is the default by construction.
-    freestyle_declaration = _resolve_freestyle(freestyle)
+    # [FORK] Digital-Union (Random Freestyle V2): the profile's seed is handed in so a `Random`
+    # section can be generated. Resolved AFTER `profile`, which is where the seed becomes available,
+    # and still once per render — the declaration below is the single copy Stage 4 and Stage 6 both
+    # read off `beat_info`.
+    freestyle_declaration = _resolve_freestyle(freestyle, profile.seed)
 
     print("🤖 AUTO MODE V4 - Audio-Visual Rhythmic GMV/AMV Planner")
     print("   Rhythm-first audio cuts + semantic video moment matching")
