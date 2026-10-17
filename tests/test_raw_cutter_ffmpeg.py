@@ -13,8 +13,10 @@ library is never touched.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1334,3 +1336,556 @@ def test_scene_detection_runs_one_ffmpeg_child_whatever_the_cut_count(adapter, t
         f"scene detection launched {counts['one'][0]} child(ren) for "
         f"{counts['one'][1]} cut(s) and {counts['many'][0]} for {counts['many'][1]} -- the cost "
         f"must not scale with the number of cuts")
+
+
+# =============================================================================================
+# [FORK] Digital-Union (frame-boundary P8): variable-frame-rate preservation
+#
+# P7 established that exporting a genuinely variable-rate source re-timed it to the container's
+# nominal `r_frame_rate` and threw away the frames between the grid points -- 38 of the 78 in the
+# measured interval -- on stock main, on P5-S1 and on P6 alike. The export now states
+# `-fps_mode:v passthrough` and `-enc_time_base:v demux`; these are the behavioural tests for it.
+#
+# The identity used here is each frame's own PRESENTATION TIMESTAMP, read as integer time-base
+# units. That is an exact per-frame identifier -- no two source frames share one -- so comparing
+# the clip's timestamps against the source's proves membership, ordering, spacing and non-collapse
+# in a single assertion, which a frame COUNT alone cannot: passthrough without the encoder time
+# base produced the right count with 38 frames sharing their predecessor's timestamp.
+# =============================================================================================
+
+#: Represents 1/60, 1/30, 1/15, 1/12 and 1/10 exactly, which is what lets an authored variable
+#: timeline be an ORACLE rather than a second approximation. 23.976 and 29.97 do not divide it and
+#: are authored as ordinary constant-rate sources instead.
+_P8_TIMESCALE = 15360
+
+#: One AAC frame at 48 kHz. The audio bound can only land on a frame boundary, so this is the
+#: documented quantum within which the two streams are allowed to disagree. Measured on the P8
+#: fixtures the skew is exactly 0.0; the tolerance states a contract rather than a coincidence.
+_P8_AUDIO_QUANTUM = 1024 / 48000
+
+
+def _p8_time_base(path):
+    """The video stream's time base as `(num, den)` -- exact integers, never a rounded float."""
+    result = _run([FFPROBE, '-v', 'error', '-select_streams', 'v:0',
+                   '-show_entries', 'stream=time_base', '-of', 'csv=p=0', str(path)])
+    assert result.returncode == 0, result.stderr[-1000:]
+    text = (result.stdout or "").strip().splitlines()[0].strip()
+    assert "/" in text, f"no time base for {path}: {text!r}"
+    num, den = text.split("/", 1)
+    return int(num), int(den)
+
+
+def _p8_frame_pts(path):
+    """Every frame's presentation time in seconds, ascending, from INTEGER time-base units.
+
+    Deliberately not FFprobe's `pts_time`: that is already rounded to six decimals, so
+    differencing it turns a perfectly regular 1/60 grid into an alternating 0.016666 / 0.016667
+    pair and "distinct spacings" can no longer tell real jitter from print rounding. Sorting is
+    what recovers PRESENTATION order -- `-show_frames` emits DECODE order, and on a long-GOP
+    B-frame source the two differ.
+    """
+    num, den = _p8_time_base(path)
+    result = _run([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_frames',
+                   '-show_entries', 'frame=pts', '-of', 'csv=p=0', str(path)], timeout=600)
+    assert result.returncode == 0, result.stderr[-1000:]
+    units = []
+    for line in (result.stdout or "").splitlines():
+        field = line.strip().split(",")[0].strip()
+        if not field:
+            continue
+        try:
+            units.append(int(field))
+        except ValueError:
+            continue
+    units.sort()
+    return [unit * num / den for unit in units]
+
+
+def _p8_planner_pts(path):
+    """Frame presentation times on the PLANNER axis, where the file's first frame is 0.0.
+
+    FFprobe answers on the CONTAINER axis, which begins at the stream's own `start_time` and need
+    not be zero; an MP4 edit list delays presentation without moving `start_time` at all.
+    """
+    times = _p8_frame_pts(path)
+    origin = times[0] if times else 0.0
+    return [t - origin for t in times]
+
+
+def _p8_expected(source_pts, start, duration):
+    """The source frames of the half-open planner interval `[start, start + duration)`.
+
+    Returned RELATIVE to the first frame in the interval, which is the axis the exported clip is
+    on after `setpts=PTS-STARTPTS`.
+    """
+    inside = [t for t in source_pts if start - 1e-9 <= t < start + duration - 1e-9]
+    return [t - inside[0] for t in inside] if inside else []
+
+
+def _p8_assert_preserved(clip, expected, label, quantum):
+    """The whole preservation contract, in one place: count, order, spacing, no collapse.
+
+    `quantum` is the output container's own time-base step. Timestamps are compared within half of
+    it because that is the finest distinction the container can store -- anything tighter would be
+    asserting against rounding, and anything looser would stop detecting a one-frame shift.
+    """
+    actual = _p8_planner_pts(clip)
+    assert len(actual) == len(expected), (
+        f"{label}: exported {len(actual)} frames, expected {len(expected)}")
+    assert len(set(actual)) == len(actual), (
+        f"{label}: {len(actual) - len(set(actual))} frames share a timestamp with another")
+    assert all(b > a for a, b in zip(actual, actual[1:])), (
+        f"{label}: timestamps are not strictly increasing")
+    worst = max((abs(a - e) for a, e in zip(actual, expected)), default=0.0)
+    assert worst <= quantum / 2 + 1e-12, (
+        f"{label}: a frame moved by {worst:.9f} s, more than half the "
+        f"{quantum:.9f} s container quantum")
+
+
+def _p8_quantum(path):
+    num, den = _p8_time_base(path)
+    return num / den
+
+
+def _p8_ms(value):
+    """Floor to the millisecond, which is the only kind of start the planner ever emits.
+
+    `build_segment_command` formats `-ss` with three decimals and has since P1, so a start carrying
+    sub-millisecond precision is rounded -- and if it rounds UP past the frame it meant to open on,
+    that frame is seeked past. A test that picks a start straight off a frame's own timestamp will
+    see that: measured at 23.976 fps, start 2.2105417 became `-ss 2.211` and exported 47 frames
+    instead of 48, **identically on frozen main, on P6 and on this candidate**. Flooring reproduces
+    what `plan_segments` does (`_quantize_floor` / `_quantize_ceil`), so the interval under test is
+    one the product can actually ask for.
+    """
+    return math.floor(value * 1000) / 1000.0
+
+
+def _p8_vfr_setpts(blocks, timescale=_P8_TIMESCALE):
+    """`settb` plus a nested-`if` `setpts` placing frame N at an exact integer unit count.
+
+    `blocks` is `[(frame_count, step_units), ...]`. Authoring in units rather than float seconds is
+    load-bearing, not fussiness: the obvious float spelling was measured to jitter individual
+    frames by one 1/60 step, so four frames in every fifteen of a 60 fps passage collided with
+    their predecessor -- the MP4 muxer stored that as a 1-unit delta followed by a 511-unit one,
+    because it cannot write a zero duration. A fixture carrying the very defect under test cannot
+    be the oracle for it.
+    """
+    bounds, at, time = [], 0, 0
+    for count, step in blocks:
+        bounds.append((at, at + count, time, step))
+        at += count
+        time += count * step
+    expression = str(bounds[-1][2])
+    for start, end, base, step in reversed(bounds):
+        expression = "if(lt(N,%d),%d+(N-%d)*%d,%s)" % (end, base, start, step, expression)
+    # The expression is single-quoted because it contains commas, which otherwise separate
+    # FILTERS: unquoted, `setpts=if(lt(N,108),...)` makes FFmpeg look for a filter called `108)`.
+    return "settb=1/%d,setpts='%s'" % (timescale, expression)
+
+
+def _make_vfr_exact(path, blocks, with_audio=False, timescale=_P8_TIMESCALE, container=None):
+    """A genuinely variable-rate source whose timestamps are exact integers of `1/timescale`.
+
+    `blocks` is `[(frame_count, step_units), ...]`; each block is one solid shot, so the shots are
+    both distinguishable by luminance and authored at different rates.
+    """
+    path = str(path)
+    inputs, chains = [], []
+    for index, (count, _step) in enumerate(blocks):
+        inputs.extend(['-f', 'lavfi', '-i',
+                       "color=%s:s=%s:r=60" % (_COLOURS[index % len(_COLOURS)], _SIZE)])
+        chains.append("[%d:v]trim=end_frame=%d,setpts=PTS-STARTPTS[s%d];" % (index, count, index))
+    joins = "".join("[s%d]" % i for i in range(len(blocks)))
+    seconds = sum(count * step for count, step in blocks) / timescale
+
+    command = [FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', *inputs]
+    if with_audio:
+        command.extend(['-f', 'lavfi', '-i',
+                        "sine=frequency=440:sample_rate=48000:duration=%.6f" % seconds])
+    command.extend([
+        '-filter_complex',
+        "".join(chains) + "%sconcat=n=%d:v=1:a=0[v];[v]%s[out]" % (
+            joins, len(blocks), _p8_vfr_setpts(blocks, timescale)),
+        '-map', '[out]'])
+    if with_audio:
+        command.extend(['-map', '%d:a:0' % len(blocks), '-c:a', 'aac', '-b:a', '128k',
+                        '-ar', '48000'])
+    command.extend(['-fps_mode', 'passthrough', '-enc_time_base:v', '1:%d' % timescale,
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '0',
+                    '-pix_fmt', 'yuv420p', '-g', '30'])
+    if container != 'matroska':
+        command.extend(['-video_track_timescale', str(timescale)])
+    command.append(path)
+    result = _run(command, timeout=600)
+    assert result.returncode == 0, result.stderr[-2000:]
+
+    # The fixture must actually BE variable and must carry no duplicate timestamp of its own, or
+    # it could prove nothing about either property.
+    times = _p8_planner_pts(path)
+    authored = sum(count for count, _ in blocks)
+    assert len(times) == authored, (
+        "the fixture decoded %d frames, not the %d it was authored with" % (len(times), authored))
+    assert len(set(times)) == len(times), "the fixture itself has duplicate timestamps"
+    spacings = {round(b - a, 6) for a, b in zip(times, times[1:])}
+    assert len(spacings) >= len({step for _, step in blocks}), (
+        "the authored timeline is not variable as intended: %s" % sorted(spacings))
+    return path
+
+
+def _p8_one_segment_plan(probe_source, start, duration):
+    """A one-segment plan for exactly `[start, start + duration)`.
+
+    Built directly rather than detected, so the planner, the coarse detector and the 0.20 s scene
+    guard are all out of the picture: what gets measured is the export, which is the only thing P8
+    changed. P6's boundary policy is verified separately and must not be re-litigated here.
+    """
+    plan = rc.plan_segments(probe_source.duration, [], 0.05, 10_000.0, 50)
+    template = plan.segments[0]
+    segment = dataclasses.replace(template, index=1, start=start,
+                                  end=round(start + duration, 6))
+    return dataclasses.replace(plan, segments=(segment,))
+
+
+def _p8_export_one(adapter, path, tmp_path, name, start, duration,
+                   encoder='libx264', remove_audio=True):
+    """Export exactly one interval through the REAL adapter and return its clip path."""
+    probe = adapter["probe_source"](path)
+    assert probe.ok, probe.error
+    plan = _p8_one_segment_plan(probe.source, start, duration)
+    run_dir, error = adapter["prepare_run_directory"](str(tmp_path / name), path, name)
+    assert not error, error
+    results = adapter["export_segments"](source=probe.source, plan=plan, run_directory=run_dir,
+                                         remove_audio=remove_audio, encoder=encoder)
+    if encoder == 'h264_nvenc' and not all(r.ok for r in results):
+        pytest.skip("no usable NVENC encoder on this machine")
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    return results[0].path
+
+
+#: The P7 source: 108 frames at 30 fps, then 84 at 15, then 78 at 60. 108/30 + 84/15 = 9.200
+#: exactly, so the 60 fps passage begins on the interval P7 measured and its 78 frames are the
+#: same 78 frames here.
+_P8_VFR_BLOCKS = [(108, 512), (84, 1024), (78, 256)]
+_P8_VFR_START, _P8_VFR_DURATION = 9.200, 1.300
+
+
+def test_a_variable_rate_export_keeps_every_frame_of_the_requested_interval(adapter, tmp_path):
+    """[FORK] P8. The headline: the exact 78 frames, at the source's own times.
+
+    This is the measurement P7 reported as a severe pre-existing defect. Before the correction the
+    same interval exported 40 frames on P6 and 39 on stock main, re-timed to the container's
+    nominal 1/30 grid.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270.mp4", _P8_VFR_BLOCKS, with_audio=True)
+    source_pts = _p8_planner_pts(path)
+    assert len(source_pts) == 270, len(source_pts)
+
+    expected = _p8_expected(source_pts, _P8_VFR_START, _P8_VFR_DURATION)
+    assert len(expected) == 78, (
+        f"the fixture holds {len(expected)} frames in [9.200, 10.500), not the 78 P7 measured")
+
+    clip = _p8_export_one(adapter, path, tmp_path, "vfr_exact",
+                          _P8_VFR_START, _P8_VFR_DURATION)
+    _p8_assert_preserved(clip, expected, "60 fps passage", _p8_quantum(clip))
+
+
+def test_a_variable_rate_export_reproduces_the_sources_own_spacing_not_a_nominal_rate(
+        adapter, tmp_path):
+    """The 60 fps passage must come out spaced 1/60, not at the container's nominal 1/30.
+
+    Asserted as the multiset of adjacent differences rather than as a single average, because an
+    average cannot tell "every frame 1/60 apart" from "half the frames, 1/30 apart".
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_s.mp4", _P8_VFR_BLOCKS)
+    expected = _p8_expected(_p8_planner_pts(path), _P8_VFR_START, _P8_VFR_DURATION)
+    clip = _p8_export_one(adapter, path, tmp_path, "vfr_spacing",
+                          _P8_VFR_START, _P8_VFR_DURATION)
+    actual = _p8_planner_pts(clip)
+
+    wanted = sorted(round(b - a, 5) for a, b in zip(expected, expected[1:]))
+    got = sorted(round(b - a, 5) for a, b in zip(actual, actual[1:]))
+    assert got == wanted, (
+        f"spacing changed: {sorted(set(got))} against the source's {sorted(set(wanted))}")
+    assert sorted(set(got)) == [round(1 / 60, 5)], sorted(set(got))
+
+
+def test_a_variable_rate_export_keeps_audio_and_video_the_same_length(adapter, tmp_path):
+    """The A/V skew P7 recorded: 1.333333 s of video against 1.300000 s of audio.
+
+    The video ran long because 40 frames were written on a 1/30 grid. Both streams must now
+    describe the interval the planner asked for, within one audio frame.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_av.mp4", _P8_VFR_BLOCKS, with_audio=True)
+    clip = _p8_export_one(adapter, path, tmp_path, "vfr_av",
+                          _P8_VFR_START, _P8_VFR_DURATION, remove_audio=False)
+
+    kinds = [s.get('codec_type') for s in _streams(clip)]
+    assert 'audio' in kinds and 'video' in kinds, kinds
+    result = _run([FFPROBE, '-v', 'error', '-show_entries', 'stream=codec_type,duration',
+                   '-of', 'json', str(clip)])
+    assert result.returncode == 0, result.stderr[-1000:]
+    lengths = {s['codec_type']: float(s['duration'])
+               for s in json.loads(result.stdout)['streams'] if s.get('duration')}
+    assert set(lengths) == {'video', 'audio'}, lengths
+    assert abs(lengths['video'] - lengths['audio']) <= _P8_AUDIO_QUANTUM, lengths
+    assert abs(lengths['video'] - _P8_VFR_DURATION) <= _P8_AUDIO_QUANTUM, lengths
+
+
+def test_alternating_fast_and_slow_passages_are_every_one_preserved(adapter, tmp_path):
+    """Six rate changes inside one requested interval, 60/10 fps alternating.
+
+    A correction that only held when the whole interval shared one rate would pass the 78-frame
+    case and fail here, so this is where the "not forced to the average rate" clause is actually
+    tested: the average over this interval is neither 60 nor 10.
+    """
+    blocks = [(40, 256), (20, 1536), (40, 256), (20, 1536), (40, 256), (20, 1536)]
+    path = _make_vfr_exact(tmp_path / "vfr_alt.mp4", blocks)
+    source_pts = _p8_planner_pts(path)
+    assert len(source_pts) == 180, len(source_pts)
+
+    duration = round(source_pts[-1] + 1 / 60, 6)
+    expected = _p8_expected(source_pts, 0.0, duration)
+    assert len(expected) == 180, len(expected)
+
+    clip = _p8_export_one(adapter, path, tmp_path, "vfr_alt_out", 0.0, duration)
+    _p8_assert_preserved(clip, expected, "alternating 60/10 fps", _p8_quantum(clip))
+    assert sorted({round(b - a, 5) for a, b in zip(_p8_planner_pts(clip),
+                                                   _p8_planner_pts(clip)[1:])}) == \
+        sorted({round(1 / 60, 5), round(1 / 10, 5)})
+
+
+@pytest.mark.parametrize("encoder", ["libx264", "h264_nvenc"])
+@pytest.mark.parametrize("remove_audio", [True, False])
+def test_the_variable_rate_preservation_holds_on_both_encoders(adapter, tmp_path, encoder,
+                                                               remove_audio):
+    """Timing is decided before the encoder, so neither encoder nor Remove Audio may move it.
+
+    NVENC is skipped rather than failed where no capable GPU is present -- its absence is an
+    environment fact, not a defect.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_enc.mp4", _P8_VFR_BLOCKS, with_audio=True)
+    expected = _p8_expected(_p8_planner_pts(path), _P8_VFR_START, _P8_VFR_DURATION)
+    name = f"vfr_{encoder}_{int(remove_audio)}"
+    clip = _p8_export_one(adapter, path, tmp_path, name, _P8_VFR_START, _P8_VFR_DURATION,
+                          encoder=encoder, remove_audio=remove_audio)
+    _p8_assert_preserved(clip, expected, f"{encoder}/remove_audio={remove_audio}",
+                         _p8_quantum(clip))
+
+
+def test_a_matroska_variable_rate_source_is_preserved_within_its_own_precision(adapter, tmp_path):
+    """Matroska's millisecond time base cannot hold 1/60 exactly, which is the point.
+
+    `demux` asks for the SOURCE's time base, so the clip is as precise as the source was and no
+    more. A container whose own grid is coarser than the content's spacing is where a
+    timestamp-preserving export has the least room, so it is where it has to be measured -- and
+    the frames must still all be there, in order, none sharing a timestamp.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270.mkv", _P8_VFR_BLOCKS, container='matroska')
+    source_pts = _p8_planner_pts(path)
+    assert len(source_pts) == 270, len(source_pts)
+    expected = _p8_expected(source_pts, _P8_VFR_START, _P8_VFR_DURATION)
+    assert len(expected) == 78, len(expected)
+
+    clip = _p8_export_one(adapter, path, tmp_path, "mkv_vfr", _P8_VFR_START, _P8_VFR_DURATION)
+    _p8_assert_preserved(clip, expected, "matroska VFR", max(_p8_quantum(clip),
+                                                             _p8_quantum(path)))
+
+
+@pytest.mark.parametrize("rate,frames", [("24000/1001", 160), ("25", 165), ("30000/1001", 200),
+                                         ("30", 200), ("60", 400)])
+def test_a_constant_rate_export_keeps_exactly_the_frames_it_always_did(adapter, tmp_path, rate,
+                                                                       frames):
+    """The CFR non-regression: same membership, same spacing, no duplicated frame.
+
+    A rate-preserving option pair must not make a constant-rate source any different. 23.976 and
+    29.97 are in here deliberately -- their frame interval is not a round number of any sensible
+    time base, so they are where a time-base change would show up first.
+    """
+    tag = rate.replace("/", "-")
+    path = _make_three_shots(tmp_path / f"cfr_{tag}.mp4", [frames], rate=rate)
+    source_pts = _p8_planner_pts(path)
+    assert len(source_pts) == frames, len(source_pts)
+
+    start, duration = _p8_ms(source_pts[len(source_pts) // 3]), 2.0
+    expected = _p8_expected(source_pts, start, duration)
+    assert len(expected) > 20, len(expected)
+
+    clip = _p8_export_one(adapter, path, tmp_path, f"cfr_out_{tag}", start, duration)
+    _p8_assert_preserved(clip, expected, f"{rate} CFR", _p8_quantum(clip))
+
+    spacings = {round(b - a, 5) for a, b in zip(_p8_planner_pts(clip), _p8_planner_pts(clip)[1:])}
+    assert len(spacings) <= 2, f"a constant-rate clip came out unevenly spaced: {spacings}"
+
+
+def test_a_long_gop_b_frame_source_is_preserved_from_a_non_keyframe_start(adapter, tmp_path):
+    """GOP 250 with three B-frames: decode order differs from presentation order throughout.
+
+    The requested start deliberately does not land on a keyframe, so FFmpeg must seek back and
+    decode forward -- the case where a timestamp-preserving export could most easily emit the
+    frames in the wrong order or keep the discarded ones.
+    """
+    path = str(tmp_path / "longgop.mp4")
+    result = _run([
+        FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+        '-f', 'lavfi', '-i', "color=black:s=%s:r=30" % _SIZE,
+        '-f', 'lavfi', '-i', "color=white:s=%s:r=30" % _SIZE,
+        '-filter_complex',
+        "[0:v]trim=end_frame=182,setpts=PTS-STARTPTS[a];"
+        "[1:v]trim=end_frame=239,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0[v]",
+        '-map', '[v]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '0',
+        '-pix_fmt', 'yuv420p', '-g', '250', '-bf', '3',
+        '-x264-params', 'bframes=3:b-pyramid=2', '-r', '30', path], timeout=600)
+    assert result.returncode == 0, result.stderr[-2000:]
+
+    source_pts = _p8_planner_pts(path)
+    assert len(source_pts) == 421, len(source_pts)
+    start = _p8_ms(source_pts[137])    # mid-GOP, not a keyframe
+    expected = _p8_expected(source_pts, start, 1.5)
+    clip = _p8_export_one(adapter, path, tmp_path, "longgop_out", start, 1.5)
+    _p8_assert_preserved(clip, expected, "long GOP, B-pyramid", _p8_quantum(clip))
+
+
+def test_a_nonzero_timestamp_origin_exports_the_same_frames_as_a_zero_origin_one(adapter,
+                                                                                 tmp_path):
+    """The planner axis is the file's first frame, whatever the container says it is.
+
+    An output timestamp offset must change nothing about membership -- the same control P6 ran for
+    the boundary, re-run for the timing options because `demux` now reads the source's time base.
+    """
+    plain = _make_three_shots(tmp_path / "origin_plain.mp4", [200], rate="30")
+    shifted = str(tmp_path / "origin_shifted.mp4")
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', '-i', plain,
+                   '-map', '0:v:0', '-c:v', 'copy', '-output_ts_offset', '7.25', shifted])
+    assert result.returncode == 0, result.stderr[-2000:]
+
+    for name, path in (("plain", plain), ("shifted", shifted)):
+        source_pts = _p8_planner_pts(path)
+        expected = _p8_expected(source_pts, 2.0, 2.0)
+        assert len(expected) == 60, (name, len(expected))
+        clip = _p8_export_one(adapter, path, tmp_path, f"origin_out_{name}", 2.0, 2.0)
+        _p8_assert_preserved(clip, expected, f"origin {name}", _p8_quantum(clip))
+
+
+def test_an_mp4_edit_list_exports_the_same_frames_as_the_plain_file(adapter, tmp_path):
+    """An edit list delays presentation without moving `start_time`, so it is a second,
+    independent way for the container axis to disagree with the planner axis."""
+    plain = _make_three_shots(tmp_path / "el_plain.mp4", [200], rate="30")
+    delayed = str(tmp_path / "el_delayed.mp4")
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+                   '-itsoffset', '0.5', '-i', plain, '-map', '0:v:0', '-c:v', 'copy',
+                   '-movflags', '+faststart', delayed])
+    assert result.returncode == 0, result.stderr[-2000:]
+
+    counts = []
+    for name, path in (("plain", plain), ("delayed", delayed)):
+        expected = _p8_expected(_p8_planner_pts(path), 2.0, 2.0)
+        clip = _p8_export_one(adapter, path, tmp_path, f"el_out_{name}", 2.0, 2.0)
+        _p8_assert_preserved(clip, expected, f"edit list {name}", _p8_quantum(clip))
+        counts.append(len(expected))
+    assert counts[0] == counts[1], counts
+
+
+def test_a_short_segment_at_the_minimum_threshold_is_still_exact(adapter, tmp_path):
+    """The shortest clip the planner will ever ask for, on a variable-rate source.
+
+    Short intervals are where an off-by-one in frame membership is proportionally largest and
+    where a muxer's own start-up quantisation has the least content to hide in.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_short.mp4", _P8_VFR_BLOCKS)
+    source_pts = _p8_planner_pts(path)
+    for name, (start, duration) in (("min_5", (9.200, 0.05)),
+                                    ("tiny", (9.200, 1 / 60 + 1e-6)),
+                                    ("slow", (3.600, 0.2))):
+        expected = _p8_expected(source_pts, start, duration)
+        assert expected, (name, "the interval holds no frame, so it proves nothing")
+        clip = _p8_export_one(adapter, path, tmp_path, f"short_{name}", start, duration)
+        _p8_assert_preserved(clip, expected, name, _p8_quantum(clip))
+
+
+def test_negative_control_passthrough_without_the_encoder_time_base_collapses_timestamps(
+        adapter, tmp_path):
+    """The behavioural control for the second half of the fix, run through real FFmpeg.
+
+    `-fps_mode:v passthrough` alone keeps all 78 frames, which is why a frame-count assertion
+    would have called it a fix. It is not one: the encoder still quantises to a nominal-rate time
+    base and 38 of those frames are handed their predecessor's timestamp. This asserts the defect
+    is really there without the second option, so the passing test above is known to be measuring
+    something.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_ctl.mp4", _P8_VFR_BLOCKS)
+    expected = _p8_expected(_p8_planner_pts(path), _P8_VFR_START, _P8_VFR_DURATION)
+    assert len(expected) == 78, len(expected)
+
+    actual = _p8_without(adapter, path, str(tmp_path / "collapsed.mp4"), ['-enc_time_base:v'])
+    assert len(actual) == len(expected), (
+        "passthrough alone should still keep every frame; the control is not reproducing the "
+        "measured case")
+    collapsed = len(actual) - len(set(actual))
+    assert collapsed > 0, (
+        "without the encoder time base the timestamps must collapse -- they did not, so the "
+        "positive test above may be passing for a reason other than the fix")
+
+
+def _p8_without(adapter, path, destination, options, start=_P8_VFR_START,
+                duration=_P8_VFR_DURATION):
+    """Run the shipped command with `options` deleted, and return the clip's planner timestamps.
+
+    Deleting from the REAL argv rather than hand-writing a command: a transcription could drift
+    from what ships, and then the control would be measuring a command nobody runs.
+    """
+    argv = adapter["build_segment_command"](path, destination, start, duration,
+                                            True, 'libx264', False)
+    for option in options:
+        at = argv.index(option)
+        argv = argv[:at] + argv[at + 2:]
+        assert option not in argv, option
+    result = _run(argv, timeout=600)
+    assert result.returncode == 0, result.stderr[-2000:]
+    return _p8_planner_pts(destination)
+
+
+def test_negative_control_the_pre_p8_command_drops_variable_rate_frames(adapter, tmp_path):
+    """The defect P7 measured, reproduced from the shipped command by deleting both options.
+
+    So the suite carries the before as well as the after: 40 of 78 frames, re-timed to the
+    container's nominal 1/30 grid. If this ever stops losing frames, either FFmpeg changed or the
+    fixture stopped being variable, and the passing test above would no longer mean what it says.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_ctl2.mp4", _P8_VFR_BLOCKS)
+    expected = _p8_expected(_p8_planner_pts(path), _P8_VFR_START, _P8_VFR_DURATION)
+    assert len(expected) == 78, len(expected)
+
+    actual = _p8_without(adapter, path, str(tmp_path / "dropped.mp4"),
+                         ['-fps_mode:v', '-enc_time_base:v'])
+    assert len(actual) < len(expected), (
+        f"the pre-P8 command exported {len(actual)} of {len(expected)} frames; it was measured at "
+        f"40 of 78, so this control is no longer reproducing the defect")
+    assert sorted({round(b - a, 5) for a, b in zip(actual, actual[1:])}) == [round(1 / 30, 5)], (
+        "the pre-P8 command should re-time the clip to the nominal 1/30 grid")
+
+
+def test_the_encoder_time_base_alone_happens_to_be_enough_which_is_why_both_are_stated(
+        adapter, tmp_path):
+    """The asymmetry between the two options, pinned so it is not rediscovered as a surprise.
+
+    Measured: deleting `-fps_mode:v` and keeping `-enc_time_base:v demux` still preserves all 78
+    frames at the source's spacing. `-fps_mode auto` evidently stops converting once the encoder
+    time base matches the source. Deleting the time base and keeping passthrough does NOT work --
+    that is the collapsed-timestamp control above.
+
+    So on these fixtures only the time base is strictly load-bearing, and `passthrough` is stated
+    anyway because `auto` is a heuristic over the muxer's capabilities and the stream's apparent
+    rate, not a contract. This test exists so that reading is explicit: if a later FFmpeg makes
+    `auto` convert again, the shipped command is already immune and this test simply flips to
+    telling us the heuristic moved.
+    """
+    path = _make_vfr_exact(tmp_path / "vfr270_ctl3.mp4", _P8_VFR_BLOCKS)
+    expected = _p8_expected(_p8_planner_pts(path), _P8_VFR_START, _P8_VFR_DURATION)
+    actual = _p8_without(adapter, path, str(tmp_path / "auto_mode.mp4"), ['-fps_mode:v'])
+    assert len(actual) == len(expected), (
+        f"`-fps_mode auto` with the source time base exported {len(actual)} of {len(expected)} "
+        f"frames. That is not a defect in the shipped command, which states `passthrough`, but the "
+        f"recorded asymmetry no longer holds and the docstring in raw_cutter_export.py should be "
+        f"corrected.")
+    assert len(set(actual)) == len(actual), "auto collapsed timestamps"

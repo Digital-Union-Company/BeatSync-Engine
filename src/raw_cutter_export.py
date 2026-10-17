@@ -320,11 +320,65 @@ def build_segment_command(source_path: str, destination: str, start: float, dura
     back at zero, which a container-absolute ``-to`` does not.
 
     `trim`/`setpts` change no geometry: no `-s`, no `-r`, no `scale`, no `setsar`/`setdar`, so the
-    source's resolution, aspect ratio and frame rate are still preserved by saying nothing about
-    them. `-map 0:v:0` pins the video stream explicitly so a multi-stream container cannot silently
+    source's resolution and aspect ratio are still preserved by saying nothing about them.
+    `-map 0:v:0` pins the video stream explicitly so a multi-stream container cannot silently
     export a different one than was probed. The function stays pure argument assembly and
     deliberately names no module constant but `FFMPEG_PATH`, which is what lets the seam suite
     extract and execute it on its own -- the read guard is written inline for that reason.
+
+    **[FORK] Digital-Union (frame-boundary P8): frame RATE is the one thing silence did not
+    preserve, so it is now stated.** Saying nothing works for geometry because FFmpeg carries
+    width, height and SAR through unchanged. It does not work for timing: with no rate option at
+    all, `-fps_mode auto` re-times the clip to the container's nominal `r_frame_rate` and
+    DISCARDS the frames that do not land on that grid. Measured on a 270-frame source authored at
+    30, then 15, then 60 fps (time base 1/15360, `r_frame_rate` 30/1), exporting the 60 fps
+    passage `[9.200, 10.500)` which holds exactly 78 frames, Gray-barcode IDs 192..269:
+
+    ====================================== ======== ======== ================ =================
+    output options                         frames   missing  output spacing   video vs audio
+    ====================================== ======== ======== ================ =================
+    (none -- the P1..P6 command)           **40**   **38**   1/30 s           1.333 vs 1.300
+    ``-fps_mode passthrough``              78       0        **38 dt = 0**    1.333 vs 1.300
+    ``-fps_mode:v passthrough``
+    ``  -enc_time_base:v demux``           **78**   **0**    **1/60 s**       **1.300 = 1.300**
+    ====================================== ======== ======== ================ =================
+
+    What each option does, and why both are stated when only one is strictly required:
+
+    * `-enc_time_base:v demux` is the one that fixes it. It encodes on the SOURCE's own time base,
+      which is the principled choice rather than a large constant: a source's timestamps are by
+      definition exactly representable in its own time base, so nothing can collapse two of them.
+      A fixed ratio such as `1:90000` also passed this fixture but imposes a container time base
+      unrelated to the source, and can only ever approximate somebody else's grid.
+    * `-fps_mode:v passthrough` stops the frame-rate conversion outright. **Measured honestly: it
+      is not strictly necessary here** -- with the time base pinned, `-fps_mode auto` was observed
+      to stop converting too. It is stated anyway because `auto` decides from the muxer's
+      capabilities and the stream's apparent rate, which is a heuristic's current behaviour and not
+      a contract, and because with no time base pinned `passthrough` ALONE is actively wrong: all
+      78 frames survive but 38 are handed their predecessor's timestamp. Distinct frames with
+      collapsed presentation times are not preserved frames, which is why the frame count is never
+      the test on its own.
+
+    **The flip side of `demux`, measured, because it changes clips that are not VFR at all:** the
+    clip is now as precise as the source was and no more. A source whose time base cannot hold its
+    own frame interval exactly carries that imprecision into the clip instead of having it tidied
+    away. Matroska's time base is milliseconds, which cannot represent 1/30, so an MKV source's
+    clips come out on the source's own 33/34/33 ms grid rather than a re-idealised constant one --
+    same frames, same order, no duplicate timestamp, and no drift, since 33/34/33 averages exactly
+    1/30. P1..P6 idealised it; this does not, and preserving the source's spacing is the whole
+    point. Note the property is the source's TIME BASE and not its container: an MP4 authored with
+    a 1000 timescale behaves identically, while 1/600 and 1/90000 divide 1/30 exactly and come out
+    bit-identical to P6.
+
+    Measured, not assumed, on the pinned FFmpeg 8.1.2: `demux`, the sibling `filter`, and the older
+    `-1` spelling all produce identical output on every field recorded above -- but 8.1.2 answers
+    `-1` with "-enc_time_base -1 is deprecated, use -enc_time_base demux", so the non-deprecated
+    name is the one used here. The `:v` specifiers are likewise measured equivalent to the bare
+    spellings, and preferred for scoping each option to the stream it governs.
+
+    This says nothing about the AUDIO rate, sample format or layout, and nothing about the video
+    frame rate as a *target* -- there is still no `-r`, no `fps` filter and no `-vsync`. The clip
+    keeps the source's timing instead of being told what its timing should be.
     """
     command = [
         FFMPEG_PATH, '-nostdin', '-hide_banner', '-v', 'error',
@@ -334,6 +388,13 @@ def build_segment_command(source_path: str, destination: str, start: float, dura
         '-i', source_path,
         '-map', '0:v:0',
         '-vf', f"trim=end={duration:.6f},setpts=PTS-STARTPTS",
+        # [FORK] P8: keep the frames' OWN presentation times rather than the container's nominal
+        # rate. Without both of these a variable-rate source is silently re-timed to
+        # `r_frame_rate` and the frames between the grid points are thrown away -- 38 of 78 on the
+        # measured fixture. See the docstring for the three-way measurement and why neither option
+        # works alone.
+        '-fps_mode:v', 'passthrough',
+        '-enc_time_base:v', 'demux',
     ]
     if remove_audio or not has_audio:
         # `-an` drops the stream itself, not merely its level: the output container ends up with
