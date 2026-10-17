@@ -5056,6 +5056,51 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     items: List[Any] = []
     batch_directory = ''
     cancelled = False
+    finalised = False
+
+    def finalise(is_cancelled, fatal=''):
+        """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
+
+        Every terminal path calls exactly this -- normal end, cancellation, and the unexpected
+        error -- which is what fixes R1 finding F-1. Before R2 the `not_attempted` backfill sat
+        at the end of the `try`, so an exception jumped straight over it and the manifest was
+        written short (or, when nothing had been recorded yet, not written at all because of an
+        `and items` guard). Sources then vanished from a record whose own contract is one entry
+        per DISCOVERED source.
+
+        Idempotent by construction: the backfill range is empty once every source has a record,
+        so a second call adds nothing and can never duplicate one. Returns the manifest error
+        string ('' means saved) so the caller can REPORT the write instead of predicting it.
+
+        It never raises. A failure here must not be able to skip the caller's `finally` -- which
+        is where the cutter job is cleared and `_RENDER_LOCK` is released -- because that would
+        strand the one process-global mutex and lock the operator out of every render, batch and
+        verification until the app was restarted.
+        """
+        nonlocal finalised
+        finalised = True
+        try:
+            # Only sources never opened at all become `not_attempted`; anything the loop touched
+            # has already recorded itself, including on the fatal path.
+            for index in range(len(items) + 1, total + 1):
+                items.append(fork_cutter_batch.BatchItem(
+                    index=index, source_path=sources[index - 1],
+                    relative_parts=layout[index - 1],
+                    outcome=fork_cutter_batch.OUTCOME_NOT_ATTEMPTED))
+            if not batch_directory:
+                return ''
+            return cutter_export.write_batch_manifest(
+                batch_directory,
+                fork_cutter_batch.manifest_payload(
+                    items, total, settings, batch_directory, found.root,
+                    started_at.isoformat(timespec='seconds'),
+                    datetime.datetime.now().isoformat(timespec='seconds'),
+                    time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal))
+        except Exception as exc:                      # noqa: BLE001 - see the docstring
+            import traceback
+            traceback.print_exc()
+            return f"the batch record could not be built: {type(exc).__name__}: {exc}"
+
     try:
         batch_directory, error = cutter_export.prepare_batch_directory(
             output_root, started_at.strftime('%Y%m%d_%H%M%S'))
@@ -5074,101 +5119,142 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
             parts = layout[position - 1]
             basename = os.path.basename(source_path)
             file_clock = time.perf_counter()
+            recorded = False
 
             def progress(phase):
                 return fork_cutter_batch.progress_text(position, total, basename, phase, items,
                                                 batch_directory)
 
             def record(outcome, **extra):
+                nonlocal recorded
                 items.append(fork_cutter_batch.BatchItem(
                     index=position, source_path=source_path, relative_parts=parts,
                     outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
+                recorded = True
 
-            yield progress(fork_cutter_batch.PHASE_PROBE), ''
-            probe = cutter_export.probe_source(source_path)
-            if not probe.ok:
-                record(fork_cutter_batch.OUTCOME_UNREADABLE, error=probe.error)
-                continue
-            source = probe.source
-
-            yield progress(fork_cutter_batch.PHASE_DETECT), ''
+            # [FORK] R2 (F-3): a source the loop has OPENED always leaves a record, even when the
+            # fault is one nothing here anticipated. Without this the record was simply never
+            # appended, the backfill then labelled the file `not_attempted`, and clips already on
+            # disk were reported as never produced. `CutterCancelled` is deliberately NOT caught
+            # here -- it is an ordinary `Exception`, it is already handled at the two safe
+            # boundaries below, and swallowing it would turn a Stop into a crash.
             try:
-                scenes = cutter_export.detect_scenes(source.path, threshold, job=job)
+                yield progress(fork_cutter_batch.PHASE_PROBE), ''
+                probe = cutter_export.probe_source(source_path)
+                if not probe.ok:
+                    record(fork_cutter_batch.OUTCOME_UNREADABLE, error=probe.error)
+                    continue
+                source = probe.source
+
+                yield progress(fork_cutter_batch.PHASE_DETECT), ''
+                try:
+                    scenes = cutter_export.detect_scenes(source.path, threshold, job=job)
+                except cutter_export.CutterCancelled:
+                    cancelled = True
+                    record(fork_cutter_batch.OUTCOME_CANCELLED)
+                    break
+                if not scenes.succeeded:
+                    # A failed detector is NEVER recorded as a successful zero-cut analysis. That
+                    # distinction is the reason `SceneResult` exists, and in a batch it matters
+                    # more: one giant time-split clip per unreadable file would look like a
+                    # working run.
+                    record(fork_cutter_batch.OUTCOME_DETECTION_FAILED, error=scenes.error)
+                    continue
+
+                yield progress(fork_cutter_batch.PHASE_PLAN), ''
+                try:
+                    plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high,
+                                                     level)
+                except fork_cutter.RawCutterError as exc:
+                    record(fork_cutter_batch.OUTCOME_PLAN_FAILED, error=str(exc))
+                    continue
+                if not plan.has_work:
+                    # A truthful answer about this footage, not a failure: nothing in it is long
+                    # enough at these settings. No folder is created for it.
+                    record(fork_cutter_batch.OUTCOME_NO_CLIPS)
+                    continue
+
+                item_directory, error = cutter_export.prepare_item_directory(batch_directory,
+                                                                             parts)
+                if error:
+                    record(fork_cutter_batch.OUTCOME_EXPORT_FAILED, clips_planned=plan.count,
+                           error=error)
+                    continue
+
+                yield progress(fork_cutter_batch.PHASE_EXPORT), ''
+                lengths = {segment.index: segment.duration for segment in plan.segments}
+                written: List[Any] = []
+                stopped = False
+                fatal_export = None
+                try:
+                    cutter_export.export_segments(
+                        source=source, plan=plan, run_directory=item_directory,
+                        remove_audio=bool(remove_audio), encoder=encoder, job=job,
+                        on_complete=written.append)
+                except cutter_export.CutterCancelled:
+                    # `written` is the truth on this path: the exception discards
+                    # `export_segments`' return value, so the callback's list is the only record
+                    # of what reached disk.
+                    stopped = True
+                    cancelled = True
+                except Exception as exc:                  # noqa: BLE001 - re-raised below
+                    # [FORK] R2 (F-3): `written` is the truth here for exactly the same reason,
+                    # and an unexpected fault is precisely when it matters most. The clips it
+                    # names are already validated and already on disk; losing them from the
+                    # accounting was the worst of the R1 findings. Classified from that evidence
+                    # below, recorded, and only THEN re-raised, so the batch still stops and the
+                    # error still reaches the operator.
+                    fatal_export = exc
+
+                good = [result for result in written if result.ok]
+                if stopped:
+                    outcome = fork_cutter_batch.OUTCOME_CANCELLED
+                elif len(good) == plan.count:
+                    # Every planned clip fired `on_complete` validated, so the source really did
+                    # finish -- even if the adapter then raised on its way out.
+                    outcome = fork_cutter_batch.OUTCOME_COMPLETED
+                elif good:
+                    outcome = fork_cutter_batch.OUTCOME_PARTIAL
+                elif fatal_export is not None:
+                    outcome = fork_cutter_batch.OUTCOME_UNEXPECTED_ERROR
+                else:
+                    outcome = fork_cutter_batch.OUTCOME_EXPORT_FAILED
+                failures = [result for result in written if not result.ok]
+                detail = ("; ".join(f"#{r.index}: {r.error}" for r in failures[:5])
+                          if failures else '')
+                if fatal_export is not None:
+                    detail = (f"{type(fatal_export).__name__}: {fatal_export}"
+                              + (f"; {detail}" if detail else ''))
+                record(outcome,
+                       clips_planned=plan.count,
+                       clips_written=len(good),
+                       exported_seconds=round(sum(lengths.get(r.index, 0.0) for r in good), 3),
+                       bytes_written=sum(result.size_bytes for result in good),
+                       output_directory=item_directory,
+                       error=detail)
+                if fatal_export is not None:
+                    raise fatal_export
+                if stopped:
+                    break
             except cutter_export.CutterCancelled:
-                cancelled = True
-                record(fork_cutter_batch.OUTCOME_CANCELLED)
-                break
-            if not scenes.succeeded:
-                # A failed detector is NEVER recorded as a successful zero-cut analysis. That
-                # distinction is the reason `SceneResult` exists, and in a batch it matters more:
-                # one giant time-split clip per unreadable file would look like a working run.
-                record(fork_cutter_batch.OUTCOME_DETECTION_FAILED, error=scenes.error)
-                continue
+                raise
+            except Exception as exc:                      # noqa: BLE001 - re-raised immediately
+                # A fault anywhere else in this source's processing (probe, detection, planning,
+                # directory preparation). No clip evidence exists, so the honest record is that
+                # the tool broke on a file it HAD opened -- never `not_attempted`.
+                if not recorded:
+                    record(fork_cutter_batch.OUTCOME_UNEXPECTED_ERROR,
+                           error=f"{type(exc).__name__}: {exc}")
+                raise
 
-            yield progress(fork_cutter_batch.PHASE_PLAN), ''
-            try:
-                plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high, level)
-            except fork_cutter.RawCutterError as exc:
-                record(fork_cutter_batch.OUTCOME_PLAN_FAILED, error=str(exc))
-                continue
-            if not plan.has_work:
-                # A truthful answer about this footage, not a failure: nothing in it is long enough
-                # at these settings. No folder is created for it.
-                record(fork_cutter_batch.OUTCOME_NO_CLIPS)
-                continue
-
-            item_directory, error = cutter_export.prepare_item_directory(batch_directory, parts)
-            if error:
-                record(fork_cutter_batch.OUTCOME_EXPORT_FAILED, clips_planned=plan.count, error=error)
-                continue
-
-            yield progress(fork_cutter_batch.PHASE_EXPORT), ''
-            lengths = {segment.index: segment.duration for segment in plan.segments}
-            written: List[Any] = []
-            stopped = False
-            try:
-                cutter_export.export_segments(
-                    source=source, plan=plan, run_directory=item_directory,
-                    remove_audio=bool(remove_audio), encoder=encoder, job=job,
-                    on_complete=written.append)
-            except cutter_export.CutterCancelled:
-                # `written` is the truth on this path: the exception discards `export_segments`'
-                # return value, so the callback's list is the only record of what reached disk.
-                stopped = True
-                cancelled = True
-
-            good = [result for result in written if result.ok]
-            if stopped:
-                outcome = fork_cutter_batch.OUTCOME_CANCELLED
-            elif len(good) == plan.count:
-                outcome = fork_cutter_batch.OUTCOME_COMPLETED
-            elif good:
-                outcome = fork_cutter_batch.OUTCOME_PARTIAL
-            else:
-                outcome = fork_cutter_batch.OUTCOME_EXPORT_FAILED
-            failures = [result for result in written if not result.ok]
-            record(outcome,
-                   clips_planned=plan.count,
-                   clips_written=len(good),
-                   exported_seconds=round(sum(lengths.get(r.index, 0.0) for r in good), 3),
-                   bytes_written=sum(result.size_bytes for result in good),
-                   output_directory=item_directory,
-                   error=("; ".join(f"#{r.index}: {r.error}" for r in failures[:5])
-                          if failures else ''))
-            if stopped:
-                break
-
-        # Every discovered source gets a record, including the ones a cancellation meant we never
-        # opened. A manifest that silently omitted them would read as a complete run.
-        for position in range(len(items) + 1, total + 1):
-            items.append(fork_cutter_batch.BatchItem(
-                index=position, source_path=sources[position - 1],
-                relative_parts=layout[position - 1],
-                outcome=fork_cutter_batch.OUTCOME_NOT_ATTEMPTED))
-
+        # [FORK] R2 (F-1/F-4): finalise BEFORE the terminal yield, so the report states what the
+        # manifest write actually did instead of predicting it, and so the operator never sees a
+        # result that is still waiting on persistence.
+        manifest_error = finalise(cancelled)
         elapsed = time.perf_counter() - clock_started
         summary = fork_cutter_batch.summary_text(
-            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root)
+            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
+            manifest_error=manifest_error)
         yield (CUT_BATCH_CANCELLED_STATUS if cancelled else CUT_BATCH_DONE_STATUS), summary
 
     except cutter_export.CutterCancelled:
@@ -5177,34 +5263,53 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         # report the operator's own Stop as a crash. Cancellation is normally handled at the two
         # safe boundaries inside the loop; this clause covers a stop observed anywhere else and
         # still produces the truthful report rather than an error.
-        elapsed = time.perf_counter() - clock_started
         cancelled = True
+        manifest_error = finalise(True)
+        elapsed = time.perf_counter() - clock_started
         yield CUT_BATCH_CANCELLED_STATUS, fork_cutter_batch.summary_text(
-            items, total, settings, batch_directory, elapsed, True, input_root=found.root)
+            items, total, settings, batch_directory, elapsed, True, input_root=found.root,
+            manifest_error=manifest_error)
     except Exception as exc:
         # Total: a batch that raised must report rather than vanish behind Gradio's generic error,
         # and it must still say what it had already written.
+        #
+        # [FORK] R2 (F-2): `cancelled` is passed THROUGH, never forced. This clause used to hand
+        # `summary_text` a literal `True`, so every crash was headlined "Batch cancelled" -- an
+        # operator was told they had stopped a run they had not touched, while the manifest
+        # beside it recorded `cancelled: false`. The failure now travels as `fatal_error`, which
+        # outranks the cancellation flag in both the report and the record, so the two agree.
         import traceback
         traceback.print_exc()
+        fatal = f"{type(exc).__name__}: {exc}"
+        manifest_error = finalise(cancelled, fatal=fatal)
         elapsed = time.perf_counter() - clock_started
         partial = fork_cutter_batch.summary_text(
-            items, total, settings, batch_directory, elapsed, True, input_root=found.root)
-        yield (f"❌ The batch stopped on an unexpected error.\n"
-               f"  {type(exc).__name__}: {exc}"), partial
+            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
+            fatal_error=fatal, manifest_error=manifest_error)
+        yield (f"❌ The batch stopped on an unexpected error.\n  {fatal}"), partial
     finally:
-        # The manifest is written from `finally` so it exists after a failure or a cancellation
-        # too. It never raises and its failure is reported separately -- a batch that wrote clips
-        # must not be called failed because its bookkeeping file could not be saved.
-        if batch_directory and items:
-            manifest_error = cutter_export.write_batch_manifest(
-                batch_directory,
-                fork_cutter_batch.manifest_payload(
-                    items, total, settings, batch_directory, found.root,
-                    started_at.isoformat(timespec='seconds'),
-                    datetime.datetime.now().isoformat(timespec='seconds'),
-                    time.perf_counter() - clock_started, cancelled))
-            if manifest_error:
-                print(f"[raw-cutter-batch] {manifest_error}")
+        # [FORK] R2: the terminal paths above already finalised, each one before its own yield.
+        # This is the net for the path that has no terminal yield at all -- an abandoned Gradio
+        # stream, where the frame unwinds under `GeneratorExit` and nothing may be yielded. The
+        # manifest is still worth writing there; the report simply has nobody to go to.
+        #
+        # Nothing in this block may raise. `finalise` is total by construction, and the three
+        # cleanup calls below must run even if it somehow were not: stranding `_RENDER_LOCK`
+        # would lock the operator out of every render, batch and verification in the process
+        # until the app was restarted.
+        # The net is wrapped, and the three cleanup calls deliberately stay TOP-LEVEL statements
+        # of this `finally` -- the shape every other mutex-owning handler in this file uses, and
+        # the one `test_the_batch_clears_its_holder_token_and_job_before_releasing` and
+        # `test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release` both read.
+        # Nesting them inside a second `try` protects nothing extra here (`finalise` is already
+        # total) and breaks that documented ordering contract in two suites at once.
+        try:
+            if not finalised:
+                leftover = finalise(cancelled)
+                if leftover:
+                    print(f"[raw-cutter-batch] {leftover}")
+        except Exception:                             # noqa: BLE001 - cleanup must still run
+            pass
         _clear_cutter_job()
         _mark_lock_holder('')
         _RENDER_LOCK.release()

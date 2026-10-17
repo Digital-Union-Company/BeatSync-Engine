@@ -340,6 +340,10 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
     * **`on_complete` fires as each segment finishes**, so a caller that is interrupted by
       ``CutterCancelled`` still knows exactly what was written. Returning the list is not enough:
       the exception discards it.
+    * **Nothing fallible runs between a successful publication and `on_complete` (R4).** The
+      clip's size is measured on the staging file *before* the rename, so a published clip can
+      never be lost from the caller's accounting because a later metadata read failed. See the
+      comment at the measurement itself for the reproduction this came from.
     * Completed segments are never touched by a later failure or by cancellation.
     """
     results: list[SegmentResult] = []
@@ -390,6 +394,32 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
             if not valid:
                 failure = message
 
+        # [FORK] R4 (R3-F6): the size is measured on the STAGING file, BEFORE publication.
+        #
+        # It used to be read off the destination immediately after the rename, which put one
+        # fallible filesystem call between a successful publication and the `record()` that
+        # fires `on_complete`. An independent review reproduced the consequence: with a one-shot
+        # `OSError` injected there, six clips were encoded, validated and published -- the sixth
+        # independently FFprobed as a valid 4 s h264 file -- yet only five callbacks fired, so the
+        # batch reported "5 of 6" and classified a source that had published EVERY planned clip as
+        # a partial export. `on_complete` is the only evidence the batch layer has, so a clip that
+        # never reaches it is a clip the manifest denies producing.
+        #
+        # Measuring first removes the window instead of trying to recover from it: once the rename
+        # succeeds there is nothing left that can fail before the callback. The value is identical
+        # either way -- a same-directory rename relinks a directory entry and does not touch the
+        # bytes -- so this is strictly a reordering, not a different measurement.
+        #
+        # A failure HERE is an ordinary segment failure: the rename has not run, so no destination
+        # exists, and the only thing discarded below is this attempt's own staging file. Validation
+        # passing is deliberately not treated as licence to report success without a size.
+        published_size = 0
+        if not failure:
+            try:
+                published_size = os.path.getsize(staging)
+            except OSError as exc:
+                failure = f"Could not measure the finished clip: {exc}"
+
         if not failure:
             try:
                 os.rename(staging, destination)
@@ -405,8 +435,10 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
             _discard_staging(staging)
             record(SegmentResult(index=segment.index, path=destination, error=failure))
         else:
+            # No filesystem call between the rename above and this record(). That is the R3-F6
+            # invariant; do not reintroduce one.
             record(SegmentResult(index=segment.index, path=destination, ok=True,
-                                 size_bytes=os.path.getsize(destination)))
+                                 size_bytes=published_size))
 
         if job is not None and job.cancelled:
             raise CutterCancelled()

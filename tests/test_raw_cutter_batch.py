@@ -509,14 +509,29 @@ def test_a_refused_batch_does_no_work_at_all(gui_tree):
 
 
 def test_the_batch_clears_its_holder_token_and_job_before_releasing(gui_tree):
+    """Order inside the outer `finally`, read in document order rather than by top-level index.
+
+    The flat-index version of this test read `finalbody` one statement at a time, so wrapping the
+    block in a `try/finally` -- which R2 did, so that a finalisation fault can never skip the
+    release -- collapsed all three calls into statement 0 and compared `0 < 0`. The guarantee was
+    untouched; only the measurement broke. Walking the body recursively measures the same
+    ordering without caring how it is nested. `test_the_cleanup_order_survives_a_finalisation_
+    fault` then proves it by execution.
+    """
     finallies = [n for n in ast.walk(_func(gui_tree, "_on_cut_batch_run"))
                  if isinstance(n, ast.Try) and n.finalbody]
     assert finallies
-    final = [ast.unparse(s) for s in finallies[0].finalbody]
-    release_at = next(i for i, s in enumerate(final) if "_RENDER_LOCK.release()" in s)
+    ordered = []
+    for statement in finallies[0].finalbody:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Call):
+                ordered.append((node.lineno, node.col_offset, ast.unparse(node)))
+    ordered.sort()
+    rendered = [text for _line, _col, text in ordered]
+    release_at = next(i for i, s in enumerate(rendered) if "_RENDER_LOCK.release()" in s)
     for token in ("_mark_lock_holder('')", "_clear_cutter_job()"):
-        at = next(i for i, s in enumerate(final) if token in s)
-        assert at < release_at, (token, final)
+        at = next(i for i, s in enumerate(rendered) if token in s)
+        assert at < release_at, (token, rendered)
 
 
 def test_the_batch_names_cancellation_before_the_generic_handler(gui_tree):
@@ -530,14 +545,34 @@ def test_the_batch_names_cancellation_before_the_generic_handler(gui_tree):
     assert "Exception" in caught[-1], caught
 
 
-def test_the_manifest_is_written_from_the_finally_so_it_survives_a_failure(gui_tree):
-    """A manifest that only appeared on the happy path would be worthless exactly when it is
-    needed."""
-    finallies = [n for n in ast.walk(_func(gui_tree, "_on_cut_batch_run"))
-                 if isinstance(n, ast.Try) and n.finalbody]
-    final = _code_only(ast.Module(body=finallies[0].finalbody, type_ignores=[]))
-    assert "write_batch_manifest" in final
-    assert "manifest_payload" in final
+def test_every_terminal_path_finalises_through_one_shared_helper(gui_tree):
+    """Structure only -- the behaviour is proved by execution in section 9.
+
+    This replaces a test that asserted `'write_batch_manifest' in <the finally body>`. That
+    assertion passed against the implementation R1 measured as writing a manifest covering ONE of
+    three discovered sources, and as writing none at all when the fault landed before the first
+    record -- because the string was present either way. A substring cannot see a guard, and
+    `if batch_directory and items:` was the guard that made the test's own name false.
+    """
+    handler = _func(gui_tree, "_on_cut_batch_run")
+    finalise = next((n for n in ast.walk(handler)
+                     if isinstance(n, ast.FunctionDef) and n.name == "finalise"), None)
+    assert finalise is not None, "the single finalisation helper is gone"
+    body = _code_only(finalise)
+    assert "write_batch_manifest" in body
+    assert "manifest_payload" in body
+    assert "OUTCOME_NOT_ATTEMPTED" in body, "the backfill must live with the manifest write"
+
+    # Every terminal path delegates to it, so no path can forget one half of finalisation.
+    calls = [n for n in ast.walk(handler) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "finalise"]
+    assert len(calls) >= 4, f"expected normal + cancelled + fatal + the net, got {len(calls)}"
+
+    # And the manifest is no longer written from anywhere else in the handler.
+    outer = [n for n in ast.walk(handler) if isinstance(n, ast.Call)
+             and "write_batch_manifest" in ast.unparse(n)]
+    assert all(call.lineno >= finalise.lineno and call.lineno <= finalise.end_lineno
+               for call in outer), "write_batch_manifest escaped the one finalisation helper"
 
 
 # =============================================================================================
@@ -739,9 +774,24 @@ def test_cancellation_is_checked_at_the_top_of_every_iteration(gui_tree):
     assert any("break" == ast.unparse(s) for s in first.body), ast.unparse(first)
 
 
-def test_unattempted_sources_are_recorded_after_the_loop(gui_tree):
-    body = _code_only(_func(gui_tree, "_on_cut_batch_run"))
-    assert "OUTCOME_NOT_ATTEMPTED" in body
+def test_unattempted_sources_are_recorded_on_every_terminal_path(gui_tree):
+    """Structure only -- the behaviour is proved by execution in section 9.
+
+    The previous version of this test was `assert "OUTCOME_NOT_ATTEMPTED" in body`. The identifier
+    was in the body the whole time R1 was measuring sources silently vanishing from the manifest,
+    because the backfill sat inside the `try` and the fault jumped over it. Presence of a name is
+    not execution of a loop. What is checkable here is that the backfill lives in the one helper
+    every terminal path calls; `test_a_fatal_error_*` below measures the result.
+    """
+    handler = _func(gui_tree, "_on_cut_batch_run")
+    finalise = next(n for n in ast.walk(handler)
+                    if isinstance(n, ast.FunctionDef) and n.name == "finalise")
+    assert "OUTCOME_NOT_ATTEMPTED" in _code_only(finalise)
+    # Nowhere else: a second backfill loop would be a second place to forget.
+    others = [n for n in ast.walk(handler)
+              if isinstance(n, ast.Attribute) and n.attr == "OUTCOME_NOT_ATTEMPTED"
+              and not (finalise.lineno <= n.lineno <= finalise.end_lineno)]
+    assert not others, "the `not_attempted` backfill must exist in exactly one place"
 
 
 def test_the_batch_never_deletes_an_output_directory_or_a_source(gui_tree):
@@ -826,3 +876,388 @@ def test_the_adapter_is_still_imported_inside_the_handlers(gui_tree):
     assert "raw_cutter_export" not in top_level
     for handler in ("_on_cut_batch_run", "_on_cut_batch_count"):
         assert "import raw_cutter_export" in ast.unparse(_func(gui_tree, handler))
+
+
+# =============================================================================================
+# 9. [R2] The terminal paths, EXECUTED
+# =============================================================================================
+# Everything above reaches `_on_cut_batch_run` with `ast`, which is the right tool for structure:
+# "is cancellation named before the generic handler", "is the lock taken exactly once". It is the
+# wrong tool for the question the R1 independent review actually asked -- what does the handler
+# DO on its way out when something fails -- and answering that question with substring checks is
+# how three reporting defects shipped under green tests.
+#
+# So this section runs the real body. The export adapter is synthesised rather than imported:
+# `raw_cutter_export` pulls in `ffmpeg_processing` and `gpu_cpu_utils` at module scope, the second
+# of which probes FFmpeg on import, and neither belongs in a bare-interpreter suite. The manifest
+# writer here writes real JSON into a real `tmp_path`, so manifest completeness is measured from
+# the file on disk rather than from the arguments the handler passed.
+
+import datetime as _datetime
+import json as _json
+import sys as _sys
+import threading as _threading
+import time as _time
+import types as _types
+
+
+class _FakeCancelled(Exception):
+    """Stands in for `raw_cutter_export.CutterCancelled` -- an ordinary Exception, as there."""
+
+
+class _FakeJob:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _Res:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _BatchRun:
+    """What one executed batch did: on disk, on screen, and to the mutex."""
+
+    def __init__(self, yields, batch_dir, manifest, clips, events, lock, released):
+        self.yields, self.batch_dir, self.manifest = yields, batch_dir, manifest
+        self.clips, self.events, self.lock, self.released = clips, events, lock, released
+
+    @property
+    def status(self):
+        return self.yields[-1][0] if self.yields else ""
+
+    @property
+    def summary(self):
+        return self.yields[-1][1] if self.yields else ""
+
+    @property
+    def headline(self):
+        return self.summary.splitlines()[0] if self.summary else ""
+
+    @property
+    def outcomes(self):
+        return [s["outcome"] for s in self.manifest["sources"]] if self.manifest else []
+
+    @property
+    def escaped(self):
+        return [y for y in self.yields if y[0] == "__ESCAPED__"]
+
+
+def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
+               probe_fault=None, export_hook=None, manifest_error="", manifest_raises=False,
+               prelock=False):
+    """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem."""
+    handler_node = _strip_docstrings(_func(_tree(_GUI), "_on_cut_batch_run"))
+    module = ast.fix_missing_locations(ast.Module(body=[handler_node], type_ignores=[]))
+    namespace: dict = {}
+    exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    src_root = tmp_path / "in"
+    src_root.mkdir()
+    for name in sources:
+        (src_root / name).write_bytes(b"\0" * 2048)
+    out_root = tmp_path / "out"
+    events: list = []
+
+    exporter = _types.ModuleType("raw_cutter_export")
+    exporter.CutterCancelled = _FakeCancelled
+    exporter.CutterJob = _FakeJob
+
+    def discover_batch_sources(folder, recursive):
+        found = sorted(str(src_root / n) for n in sources)
+        return _Res(ok=True, root=str(src_root), paths=tuple(found), rejected_count=0, error="")
+
+    def resolve_batch_roots(a, b):
+        return str(src_root), str(out_root), ""
+
+    def prepare_batch_directory(root, stamp):
+        target = os.path.join(root, "RawCutter_Batch_" + str(stamp))
+        os.makedirs(target, exist_ok=False)
+        return target, ""
+
+    def prepare_item_directory(batch_directory, parts):
+        target = os.path.join(batch_directory, *parts)
+        os.makedirs(target, exist_ok=False)
+        return target, ""
+
+    def probe_source(path):
+        events.append("probe:" + os.path.basename(path))
+        if probe_fault:
+            probe_fault(path)
+        return _Res(ok=True, error="", source=_Res(path=path, duration=60.0))
+
+    def detect_scenes(path, threshold, job=None):
+        events.append("detect:" + os.path.basename(path))
+        return _Res(succeeded=True, times=[10.0, 20.0, 30.0, 40.0], error="")
+
+    def export_segments(source=None, plan=None, run_directory=None, remove_audio=True,
+                        encoder="", job=None, on_complete=None):
+        events.append("export:" + os.path.basename(source.path))
+        if export_hook:
+            return export_hook(source, plan, run_directory, job, on_complete)
+        for segment in plan.segments:
+            target = os.path.join(run_directory, "clip_%03d.mp4" % segment.index)
+            with open(target, "wb") as handle:
+                handle.write(b"\0" * 1024)
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=1024, error=""))
+        return None
+
+    def write_batch_manifest(batch_directory, payload):
+        events.append("manifest")
+        if manifest_raises:
+            raise RuntimeError("injected unexpected finalisation error")
+        if manifest_error:
+            return manifest_error
+        with open(os.path.join(batch_directory, batch.MANIFEST_FILENAME), "w",
+                  encoding="utf-8") as handle:
+            _json.dump(payload, handle)
+        return ""
+
+    for _name, _value in dict(
+            discover_batch_sources=discover_batch_sources, resolve_batch_roots=resolve_batch_roots,
+            prepare_batch_directory=prepare_batch_directory,
+            prepare_item_directory=prepare_item_directory, probe_source=probe_source,
+            detect_scenes=detect_scenes, export_segments=export_segments,
+            write_batch_manifest=write_batch_manifest).items():
+        setattr(exporter, _name, _value)
+    monkeypatch.setitem(_sys.modules, "raw_cutter_export", exporter)
+
+    lock = _threading.Lock()
+    if prelock:
+        lock.acquire()
+    released = []
+
+    class _Lock:
+        def acquire(self, blocking=False):
+            return lock.acquire(blocking=blocking)
+
+        def release(self):
+            released.append(True)
+            lock.release()
+
+    namespace.update(
+        os=os, time=_time, datetime=_datetime, List=list, Any=object,
+        fork_cutter=cutter, fork_cutter_batch=batch, _RENDER_LOCK=_Lock(),
+        _mark_lock_holder=lambda token: events.append("holder:" + (token or "cleared")),
+        _LOCK_HOLDER_CUTTER="cutter",
+        _install_cutter_job=lambda job: events.append("job:installed"),
+        _clear_cutter_job=lambda: events.append("job:cleared"),
+        _cut_busy_message=lambda: "BUSY", NVENC_AVAILABLE=False,
+        CUT_BATCH_DONE_STATUS="DONE", CUT_BATCH_CANCELLED_STATUS="CANCELLED")
+
+    yields = []
+    try:
+        for value in namespace["_on_cut_batch_run"](
+                str(src_root), False, str(out_root), 50, 1.0, 8.0, True):
+            yields.append(value)
+    except BaseException as exc:                              # noqa: BLE001 - must be observable
+        yields.append(("__ESCAPED__", type(exc).__name__ + ": " + str(exc)))
+
+    batch_dir = ""
+    if out_root.exists():
+        batch_dir = next((str(p) for p in sorted(out_root.iterdir())
+                          if p.name.startswith("RawCutter_Batch_")), "")
+    manifest = None
+    if batch_dir and os.path.exists(os.path.join(batch_dir, batch.MANIFEST_FILENAME)):
+        with open(os.path.join(batch_dir, batch.MANIFEST_FILENAME), encoding="utf-8") as handle:
+            manifest = _json.load(handle)
+    clips = []
+    if batch_dir:
+        clips = [os.path.join(b, f) for b, _d, fs in os.walk(batch_dir)
+                 for f in fs if f.endswith(".mp4")]
+    if prelock and lock.locked():
+        lock.release()
+    return _BatchRun(yields, batch_dir, manifest, clips, events, lock, len(released))
+
+
+def _assert_complete_manifest(run, discovered):
+    """The invariant the whole manifest exists to carry."""
+    assert run.manifest is not None, "no manifest was written at all"
+    assert len(run.manifest["sources"]) == discovered
+    assert run.manifest["totals"]["discovered"] == discovered
+    assert [s["index"] for s in run.manifest["sources"]] == list(range(1, discovered + 1))
+
+
+# --- the control arm: without this the fault cases below prove nothing -----------------------
+
+def test_executed_normal_batch_is_complete_and_consistent(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] * 3
+    assert run.manifest["cancelled"] is False
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED
+    assert run.manifest["totals"]["clips_written"] == len(run.clips)
+    assert run.status == "DONE"
+    assert run.headline.endswith("Batch finished")
+    assert run.released == 1
+
+
+# --- F-1: the manifest survives a fault, complete --------------------------------------------
+
+def test_a_fatal_error_before_the_first_record_still_writes_a_complete_manifest(
+        tmp_path, monkeypatch):
+    """R1 measured: no manifest at ALL, and three sources absent from every artifact."""
+    def boom(path):
+        raise RuntimeError("injected: first probe")
+
+    run = _run_batch(tmp_path, monkeypatch, probe_fault=boom)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_UNEXPECTED_ERROR,
+                            batch.OUTCOME_NOT_ATTEMPTED, batch.OUTCOME_NOT_ATTEMPTED]
+    assert run.released == 1
+
+
+def test_a_fatal_error_after_one_source_records_all_three(tmp_path, monkeypatch):
+    """R1 measured `len(sources) == 1` while `totals.discovered == 3` -- invariant violated."""
+    def boom(path):
+        if os.path.basename(path) == "b.mp4":
+            raise RuntimeError("injected: second source")
+
+    run = _run_batch(tmp_path, monkeypatch, probe_fault=boom)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED, batch.OUTCOME_UNEXPECTED_ERROR,
+                            batch.OUTCOME_NOT_ATTEMPTED]
+    # The source that WAS opened is never laundered into "we never touched it".
+    assert run.manifest["sources"][1]["outcome"] != batch.OUTCOME_NOT_ATTEMPTED
+    assert "injected: second source" in run.manifest["sources"][1]["error"]
+
+
+# --- F-2: a crash is never dressed up as the operator's own Stop ------------------------------
+
+def test_an_unexpected_failure_is_never_reported_as_a_cancellation(tmp_path, monkeypatch):
+    """R1 measured a three-way contradiction: the status said error, the headline said
+    "Batch cancelled", and the manifest beside them said `cancelled: false`."""
+    def boom(path):
+        raise RuntimeError("injected: fatal")
+
+    run = _run_batch(tmp_path, monkeypatch, probe_fault=boom)
+    assert "cancel" not in run.headline.lower(), run.headline
+    assert run.manifest["cancelled"] is False
+    assert run.manifest["terminal_status"] == batch.TERMINAL_FAILED
+    assert "injected: fatal" in run.manifest["fatal_error"]
+    assert "injected: fatal" in run.summary
+
+
+def test_the_four_terminal_classifications_are_distinguishable(tmp_path, monkeypatch):
+    """Normal, cancellation and fatal must not collapse into each other."""
+    def cancel_after_first(source, plan, run_directory, job, on_complete):
+        for segment in plan.segments:
+            with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
+                handle.write(b"\0")
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=1, error=""))
+        if os.path.basename(source.path) == "a.mp4":
+            job.cancel()
+        return None
+
+    def boom(path):
+        raise RuntimeError("injected: fatal")
+
+    normal = _run_batch(tmp_path / "n", monkeypatch)
+    cancelled = _run_batch(tmp_path / "c", monkeypatch, export_hook=cancel_after_first)
+    fatal = _run_batch(tmp_path / "f", monkeypatch, probe_fault=boom)
+    assert normal.manifest["terminal_status"] == batch.TERMINAL_COMPLETED
+    assert cancelled.manifest["terminal_status"] == batch.TERMINAL_CANCELLED
+    assert fatal.manifest["terminal_status"] == batch.TERMINAL_FAILED
+    assert len({normal.headline, cancelled.headline, fatal.headline}) == 3
+    assert cancelled.manifest["cancelled"] is True
+    assert fatal.manifest["cancelled"] is False
+
+
+# --- F-3: published clips are never erased from the accounting --------------------------------
+
+def test_clips_published_before_a_fatal_export_fault_stay_counted(tmp_path, monkeypatch):
+    """R1 measured 2 real files on disk reported as `Clips exported 0`, with the source absent
+    from every artifact."""
+    def publish_two_then_raise(source, plan, run_directory, job, on_complete):
+        for segment in plan.segments[:2]:
+            with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
+                handle.write(b"\0" * 64)
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=64, error=""))
+        raise OSError("injected: export fault after 2 published clips")
+
+    run = _run_batch(tmp_path, monkeypatch, export_hook=publish_two_then_raise)
+    _assert_complete_manifest(run, 3)
+    first = run.manifest["sources"][0]
+    assert first["clips_written"] == 2, "a published, validated clip was lost from the record"
+    assert len(run.clips) == 2, "the clips must still be on disk"
+    assert run.manifest["totals"]["clips_written"] == len(run.clips)
+    assert first["outcome"] == batch.OUTCOME_PARTIAL
+    assert run.manifest["terminal_status"] == batch.TERMINAL_FAILED
+    assert run.outcomes[1:] == [batch.OUTCOME_NOT_ATTEMPTED] * 2
+
+
+def test_a_fault_after_the_final_clip_loses_no_clip_accounting(tmp_path, monkeypatch):
+    def publish_all_then_raise(source, plan, run_directory, job, on_complete):
+        for segment in plan.segments:
+            with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
+                handle.write(b"\0" * 64)
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=64, error=""))
+        raise OSError("injected: fault after the final clip")
+
+    run = _run_batch(tmp_path, monkeypatch, export_hook=publish_all_then_raise)
+    _assert_complete_manifest(run, 3)
+    assert run.manifest["totals"]["clips_written"] == len(run.clips)
+    assert len(run.clips) > 0
+    assert run.manifest["terminal_status"] == batch.TERMINAL_FAILED
+
+
+# --- F-4: the manifest claim reports rather than predicts -------------------------------------
+
+_SAVED = "A full per-source record was written"
+
+
+def test_a_manifest_write_failure_is_warned_about_and_never_claimed_as_saved(
+        tmp_path, monkeypatch):
+    """R1 measured 33 clips written, no manifest file, and the report asserting it was saved."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_error="disk is full")
+    assert run.manifest is None, "the harness should have suppressed the write"
+    assert _SAVED not in run.summary, "the report claimed a manifest that does not exist"
+    assert "could NOT be saved" in run.summary
+    assert "disk is full" in run.summary
+    # ...and the clips are still reported as the successes they are.
+    assert run.status == "DONE"
+    assert run.headline.endswith("Batch finished")
+    assert len(run.clips) > 0
+
+
+def test_a_successful_manifest_write_is_still_reported_as_saved(tmp_path, monkeypatch):
+    """The negative control for the test above: the claim must remain when it is true."""
+    run = _run_batch(tmp_path, monkeypatch)
+    assert _SAVED in run.summary
+    assert "could NOT be saved" not in run.summary
+
+
+def test_the_manifest_is_persisted_before_the_terminal_result_is_emitted(tmp_path, monkeypatch):
+    """Order of real operations, not the presence of a call: the operator must never be handed a
+    final result that is still waiting on persistence."""
+    run = _run_batch(tmp_path, monkeypatch)
+    assert "manifest" in run.events
+    assert run.events.index("manifest") < run.events.index("job:cleared")
+    assert run.status == "DONE" and run.summary
+
+
+# --- cleanup can never be skipped --------------------------------------------------------------
+
+def test_the_cleanup_order_survives_a_finalisation_fault(tmp_path, monkeypatch):
+    """A finalisation fault used to propagate out of `finally`, skipping the release and
+    stranding the one process-global mutex for the lifetime of the app."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_raises=True)
+    assert not run.escaped, "the fault escaped to Gradio: %s" % (run.escaped,)
+    assert run.released == 1, "the mutex was not released"
+    assert not run.lock.locked(), "the mutex is still held"
+    assert "job:cleared" in run.events
+    assert run.events.index("job:cleared") < len(run.events) - 1
+    assert run.events[-1] == "holder:cleared"
+    assert _SAVED not in run.summary
+
+
+def test_a_refused_batch_releases_nothing_and_creates_nothing(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch, prelock=True)
+    assert run.status == "BUSY"
+    assert run.batch_dir == ""
+    assert run.released == 0, "a refused batch released a lock it never acquired"
+    assert "probe:a.mp4" not in run.events

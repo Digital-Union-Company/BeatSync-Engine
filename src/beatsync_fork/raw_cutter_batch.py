@@ -61,6 +61,12 @@ OUTCOME_EXPORT_FAILED = "export_failed"
 OUTCOME_CANCELLED = "cancelled"
 #: Never started, because the operator cancelled first.
 OUTCOME_NOT_ATTEMPTED = "not_attempted"
+#: [FORK] R2 (F-3): the batch hit an UNEXPECTED fault while this source was being processed, and
+#: no clip evidence survived to classify it more precisely. Distinct from every outcome above
+#: because those all describe a decision the tool made about the footage; this one describes the
+#: tool itself breaking. It exists so a source that was genuinely opened can never be backfilled
+#: as `not_attempted`, which would claim the batch never touched it.
+OUTCOME_UNEXPECTED_ERROR = "unexpected_error"
 
 #: Display order and operator-facing wording. A plain mapping rather than a class so the report can
 #: be rendered without the batch ever having run.
@@ -74,6 +80,7 @@ OUTCOME_LABELS: dict[str, str] = {
     OUTCOME_EXPORT_FAILED: "export failed",
     OUTCOME_CANCELLED: "cancelled mid-export",
     OUTCOME_NOT_ATTEMPTED: "not attempted",
+    OUTCOME_UNEXPECTED_ERROR: "stopped by an unexpected error",
 }
 
 #: Outcomes that mean the operator has usable new clips from that source.
@@ -81,7 +88,44 @@ _PRODUCED_CLIPS = frozenset({OUTCOME_COMPLETED, OUTCOME_PARTIAL, OUTCOME_CANCELL
 
 #: Outcomes that are failures of the tool or the file, as opposed to a truthful "nothing here".
 _FAILED = frozenset({OUTCOME_UNREADABLE, OUTCOME_DETECTION_FAILED, OUTCOME_PLAN_FAILED,
-                     OUTCOME_PARTIAL, OUTCOME_EXPORT_FAILED})
+                     OUTCOME_PARTIAL, OUTCOME_EXPORT_FAILED, OUTCOME_UNEXPECTED_ERROR})
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] R2 (F-2): how the WHOLE batch ended
+# ---------------------------------------------------------------------------------------------
+# A per-source outcome says what happened to one file. None of them says what happened to the
+# RUN, and before R2 that distinction was carried by a single `cancelled` boolean -- which forced
+# an unexpected fatal error to be reported through the one flag that means "the operator stopped
+# this", because it was the only non-success terminal state the model could express.
+#
+# These four are additive. `cancelled` keeps its exact original meaning and its place in the
+# manifest, so every existing reader stays correct; `terminal_status` is the new, finer answer.
+
+#: Ran to the end of the frozen list, nothing failed.
+TERMINAL_COMPLETED = "completed"
+#: Ran to the end of the frozen list; some sources failed but the batch itself was fine.
+TERMINAL_COMPLETED_WITH_FAILURES = "completed_with_failures"
+#: The operator pressed Cancel Batch. Finished clips are kept.
+TERMINAL_CANCELLED = "cancelled"
+#: The batch stopped on an unexpected error. NOT a cancellation and never reported as one.
+TERMINAL_FAILED = "failed"
+
+
+def terminal_status(items: Sequence[BatchItem], discovered: int, cancelled: bool,
+                    fatal_error: str = "") -> str:
+    """Classify how the whole run ended. One rule, used by the report AND the manifest.
+
+    Order is the point: a fatal error outranks a cancellation flag, because a batch that crashed
+    after the operator pressed Cancel still crashed, and calling that a clean cancellation is the
+    exact misreport R2 exists to remove.
+    """
+    if str(fatal_error or "").strip():
+        return TERMINAL_FAILED
+    if cancelled:
+        return TERMINAL_CANCELLED
+    if summarise(items, discovered).failed:
+        return TERMINAL_COMPLETED_WITH_FAILURES
+    return TERMINAL_COMPLETED
 
 #: Phase names used in the live progress line. Detection and export are the two slow ones.
 PHASE_PROBE = "probing"
@@ -371,21 +415,44 @@ def progress_text(position: int, total: int, basename: str, phase: str,
 
 def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSettings,
                  batch_directory: str, elapsed_seconds: float, cancelled: bool,
-                 input_root: str = "", max_listed: int = 40) -> str:
+                 input_root: str = "", max_listed: int = 40, *,
+                 fatal_error: str = "", manifest_error: str = "") -> str:
     """The end-of-batch report. Honest after failure and after cancellation.
 
     It never calls a partial source complete, never presents unattempted sources as clean, and
     never implies the whole source folder was preserved -- skipping unusable material is what the
     Raw Cutter is for.
+
+    `fatal_error` and `manifest_error` are keyword-only and default to empty, so every pre-R2
+    call site keeps its exact behaviour and output. They exist because this function used to
+    assert two things it could not know:
+
+    * that an unexpected crash was a cancellation (R1 finding F-2) -- `fatal_error` now outranks
+      `cancelled`, because the caller passing a crash must not be able to render a Stop; and
+    * that the manifest had been saved (R1 finding F-4) -- the sentence was unconditional, and
+      was composed BEFORE the write had even been attempted. The caller now measures the write
+      and passes the result in, so the claim reports rather than predicts.
     """
     totals = summarise(items, discovered)
-    headline = "Batch cancelled" if cancelled else (
-        "Batch finished" if not totals.failed else "Batch finished with failures")
-    icon = "⏹️" if cancelled else ("✅" if not totals.failed else "⚠️")
+    status = terminal_status(items, discovered, cancelled, fatal_error)
+    headline, icon = {
+        TERMINAL_FAILED: ("Batch stopped on an unexpected error", "❌"),
+        TERMINAL_CANCELLED: ("Batch cancelled", "⏹️"),
+        TERMINAL_COMPLETED_WITH_FAILURES: ("Batch finished with failures", "⚠️"),
+        TERMINAL_COMPLETED: ("Batch finished", "✅"),
+    }[status]
 
     lines = [
         f"{icon} {headline}",
-        "",
+        "",]
+    if status == TERMINAL_FAILED:
+        lines.extend([
+            f"The batch did not run to the end: {str(fatal_error).strip()}",
+            "Everything below is what had already been done when it stopped. Clips that were "
+            "written are still on disk, and your source files were not modified.",
+            "",
+        ])
+    lines.extend([
         f"Discovered       {totals.discovered} video(s)" + (f" under {input_root}"
                                                             if input_root else ""),
         f"Attempted        {totals.attempted}",
@@ -393,7 +460,7 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
         f"No usable shots  {totals.no_clips}",
         f"Failed / partial {totals.failed}"
         + (f"   (of which partial: {totals.partial})" if totals.partial else ""),
-    ]
+    ])
     if totals.cancelled:
         lines.append(f"Cancelled        {totals.cancelled} (mid-export; finished clips kept)")
     if totals.not_attempted:
@@ -424,12 +491,23 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
             lines.append(f"  ... and {len(interesting) - max_listed} more "
                          f"(the manifest lists every source)")
 
-    lines.extend([
-        "",
-        f"A full per-source record was written to {MANIFEST_FILENAME} in the output folder.",
-        "Your source files were not modified. Skipped footage is intentional - the Raw Cutter "
-        "keeps clean continuous shots and leaves the rest.",
-    ])
+    lines.append("")
+    # [FORK] R2 (F-4): report the write, never predict it. A batch that exported clips is NOT
+    # failed because its bookkeeping file could not be saved -- so a manifest failure is a
+    # warning that names the clips as still good, and never changes a single source outcome.
+    if not batch_directory:
+        pass
+    elif manifest_error:
+        lines.extend([
+            f"⚠️ The per-source record could NOT be saved: {manifest_error}",
+            f"The clips counted above were still exported and are on disk. Only "
+            f"{MANIFEST_FILENAME} is missing.",
+        ])
+    else:
+        lines.append(f"A full per-source record was written to {MANIFEST_FILENAME} in the "
+                     f"output folder.")
+    lines.append("Your source files were not modified. Skipped footage is intentional - the Raw "
+                 "Cutter keeps clean continuous shots and leaves the rest.")
     if not cancelled and totals.no_clips and not totals.clips_written:
         lines.append("Nothing was long enough to export at these settings. Lower the minimum clip "
                      "length, or lower the sensitivity so fewer scene changes are detected.")
@@ -438,17 +516,25 @@ def summary_text(items: Sequence[BatchItem], discovered: int, settings: BatchSet
 
 def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: BatchSettings,
                      batch_directory: str, input_root: str, started_at: str, finished_at: str,
-                     elapsed_seconds: float, cancelled: bool) -> dict:
+                     elapsed_seconds: float, cancelled: bool, *,
+                     fatal_error: str = "") -> dict:
     """The machine-readable record, as a plain dict of primitives.
 
     A dict rather than serialised text so this module needs no ``json`` import and the adapter owns
     the write. One record per DISCOVERED source, including the ones never attempted -- a manifest
     that silently omitted them would read as a complete run.
+
+    [FORK] R2 (F-2): `terminal_status` and `fatal_error` are ADDED; `cancelled` is unchanged in
+    both name and meaning, so an existing reader keeps working and keeps being right. The new
+    field is what lets a reader tell `cancelled=False because it finished` from `cancelled=False
+    because it crashed` -- which before R2 looked identical in the record.
     """
     totals = summarise(items, discovered)
     return {
         "schema": MANIFEST_SCHEMA,
         "cancelled": bool(cancelled),
+        "terminal_status": terminal_status(items, discovered, cancelled, fatal_error),
+        "fatal_error": str(fatal_error or ""),
         "started_at": str(started_at),
         "finished_at": str(finished_at),
         "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
@@ -539,11 +625,16 @@ __all__ = [
     "OUTCOME_NO_CLIPS",
     "OUTCOME_PARTIAL",
     "OUTCOME_PLAN_FAILED",
+    "OUTCOME_UNEXPECTED_ERROR",
     "OUTCOME_UNREADABLE",
     "PHASE_DETECT",
     "PHASE_EXPORT",
     "PHASE_PLAN",
     "PHASE_PROBE",
+    "TERMINAL_CANCELLED",
+    "TERMINAL_COMPLETED",
+    "TERMINAL_COMPLETED_WITH_FAILURES",
+    "TERMINAL_FAILED",
     "batch_directory_name",
     "cutter_supported_suffixes",
     "discovery_text",
@@ -554,4 +645,5 @@ __all__ = [
     "safe_component",
     "summarise",
     "summary_text",
+    "terminal_status",
 ]
