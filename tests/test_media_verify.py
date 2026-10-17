@@ -1175,9 +1175,10 @@ def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree)
     acquires = [node for node in ast.walk(gui_tree)
                 if isinstance(node, ast.Call)
                 and ast.unparse(node).startswith("_RENDER_LOCK.acquire")]
-    assert len(acquires) == 5, (
-        "two render sites plus verification plus sample decode plus the Raw Cutter: "
-        f"{[ast.unparse(a) for a in acquires]}")
+    assert len(acquires) == 6, (
+        "two render sites plus verification plus sample decode plus the single-video Raw Cutter "
+        "plus the Raw Cutter batch -- the batch acquires ONCE for its whole lifetime, never per "
+        f"source file: {[ast.unparse(a) for a in acquires]}")
     for call in acquires:
         rendered = ast.unparse(call)
         assert rendered == "_RENDER_LOCK.acquire(blocking=False)", \
@@ -1188,7 +1189,7 @@ def test_the_render_gate_still_refuses_on_a_single_nonblocking_acquire(gui_tree)
     # Every acquire has a matching release, and verification's is in a finally.
     releases = [node for node in ast.walk(gui_tree)
                 if isinstance(node, ast.Call) and ast.unparse(node) == "_RENDER_LOCK.release()"]
-    assert len(releases) == 5, f"one release per acquire, got {len(releases)}"
+    assert len(releases) == 6, f"one release per acquire, got {len(releases)}"
     handler = ast.unparse(_func(gui_tree, "_on_verify_sources_click"))
     tried = [n for n in ast.walk(_func(gui_tree, "_on_verify_sources_click"))
              if isinstance(n, ast.Try) and n.finalbody]

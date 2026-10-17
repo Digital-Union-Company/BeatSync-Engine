@@ -2965,19 +2965,25 @@ def _calls_named(tree, rendered):
             if isinstance(node, ast.Call) and ast.unparse(node) == rendered]
 
 
-def test_the_mutex_census_is_five_acquires_and_five_releases(p2_gui_tree):
-    """Two renders, one verification, one sample, one Raw Cutter job -- each a single atomic
-    test-and-set.
+def test_the_mutex_census_is_six_acquires_and_six_releases(p2_gui_tree):
+    """Two renders, one verification, one sample, one single-video cut, one batch -- each a single
+    atomic test-and-set.
 
     Amended by Raw Cutter V1, which joined this mutex as a FIFTH holder rather than inventing a
     second lock. Cutting re-encodes a long source against the same drive a render extracts clips
     from, so the two must be exclusive; reusing the existing mutex gives both directions for one
     acquire and required no change to the render path, which already refuses when the lock is held
-    without caring who holds it. The census is pinned so a SIXTH cannot arrive unreviewed, and the
-    bans below -- which are the substance -- are unchanged.
+    without caring who holds it.
+
+    Amended again by Raw Cutter Batch V1, the SIXTH acquire. It is a sixth *call site*, not a sixth
+    concurrent holder and not a per-file acquire: one batch takes the mutex **once** for its whole
+    lifetime and processes every source inside that one acquisition. Taking it per source would
+    deadlock on the second file, because `_RENDER_LOCK` is a plain non-reentrant `Lock` on purpose
+    and the batch still holds it. The census is pinned so a SEVENTH cannot arrive unreviewed, and
+    the bans below -- which are the substance -- are unchanged and now cover the batch too.
     """
-    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=False)")) == 5
-    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.release()")) == 5
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.acquire(blocking=False)")) == 6
+    assert len(_calls_named(p2_gui_tree, "_RENDER_LOCK.release()")) == 6
     assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.locked()"), \
         "check-then-act is the race the non-blocking acquire avoids"
     assert not _calls_named(p2_gui_tree, "_RENDER_LOCK.acquire()")
@@ -3005,20 +3011,26 @@ def test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release(p2_
     does -- the render path still marks nothing, because `_lock_holder_now` reads its active-render
     slot as positive evidence instead. Each count is pinned individually, so a fourth marker
     cannot arrive by being lumped into a total.
+
+    Amended again by Raw Cutter Batch V1, which marks the SAME `_LOCK_HOLDER_CUTTER` token rather
+    than introducing a fifth one. That is the point: a batch and a single-video cut are the same
+    kind of holder as far as every other caller's refusal message is concerned, so
+    `_cut_busy_message` and its three siblings needed no new branch. Two marking sites, one token.
     """
     assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_SAMPLE)")) == 1, \
         "the sample marks itself exactly once"
-    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_CUTTER)")) == 1, \
-        "the Raw Cutter marks itself exactly once"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_CUTTER)")) == 2, \
+        "the single-video cut and the batch each mark once, with the SAME token"
     assert len(_calls_named(p2_gui_tree, "_mark_lock_holder(_LOCK_HOLDER_RENDER)")) == 0, \
         "the render path must keep marking nothing; its slot is the positive evidence"
-    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder('')")) == 2, \
-        "the sample and the cutter clear directly; the verification uses _mark_verification(False)"
+    assert len(_calls_named(p2_gui_tree, "_mark_lock_holder('')")) == 3, \
+        "the sample, the cut and the batch clear directly; verification uses _mark_verification"
     assert len(_calls_named(p2_gui_tree, "_mark_verification(True)")) == 1
     assert len(_calls_named(p2_gui_tree, "_mark_verification(False)")) == 1
     # Every mutex-owning diagnostic clears inside the same finally that releases, clear-then-release.
     for handler, clear in (("_on_sample_decode_click", "_mark_lock_holder('')"),
                            ("_on_cut_run", "_mark_lock_holder('')"),
+                           ("_on_cut_batch_run", "_mark_lock_holder('')"),
                            ("_on_verify_sources_click", "_mark_verification(False)")):
         finallies = [n for n in ast.walk(_func(p2_gui_tree, handler))
                      if isinstance(n, ast.Try) and n.finalbody]

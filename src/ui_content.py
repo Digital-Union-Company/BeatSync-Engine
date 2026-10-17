@@ -746,6 +746,71 @@ CUT_MEDIA_BUSY_TEXT = (
     "try Cut Video again in a moment."
 )
 
+# ============================================================================
+# [FORK] Digital-Union: Raw Cutter Batch V1
+# One Start Batch press processes a whole folder with no further interaction.
+# It shares the Raw Cutter tab and every execution setting with Single Video
+# mode — there is exactly one sensitivity, minimum, maximum and Remove Audio
+# control on the screen, not two.
+# ============================================================================
+
+LABEL_CUT_MODE = "How much do you want to cut?"
+CUT_MODE_SINGLE = "Single Video"
+CUT_MODE_BATCH = "Folder Batch"
+INFO_CUT_MODE = (
+    "**Single Video** is the original workflow: Analyze to preview the plan, then Cut Video. "
+    "**Folder Batch** processes an entire folder automatically — one press, no per-file preview "
+    "and no confirmation, which is the point of it."
+)
+
+LABEL_CUT_BATCH_FOLDER = "📂 Source folder (every video inside it)"
+INFO_CUT_BATCH_FOLDER = (
+    "Read in place — nothing is uploaded or copied. Every MP4, MKV, MOV, M4V, AVI and WebM found "
+    "here is processed in turn, in a fixed order."
+)
+PLACEHOLDER_CUT_BATCH_FOLDER = r"J:\Footage\Camera A"
+
+LABEL_CUT_BATCH_RECURSIVE = "📁 Include subfolders"
+INFO_CUT_BATCH_RECURSIVE = (
+    "On by default. The folder structure is mirrored in the output, so clips from different "
+    "subfolders never land in the same place even when the filenames are identical."
+)
+
+LABEL_CUT_BATCH_COUNT = "🔢 Count files"
+LABEL_CUT_BATCH_DISCOVERY = "Files found"
+PLACEHOLDER_CUT_BATCH_DISCOVERY = (
+    "Optional: press Count files to see how many videos are in the folder. It reads nothing but "
+    "the file list."
+)
+
+LABEL_CUT_BATCH_START = "🚀 Start Batch"
+LABEL_CUT_BATCH_CANCEL = "⏹️ Cancel Batch"
+
+LABEL_CUT_BATCH_STATUS = "Batch progress"
+PLACEHOLDER_CUT_BATCH_STATUS = "No batch is running."
+LABEL_CUT_BATCH_SUMMARY = "Batch summary"
+PLACEHOLDER_CUT_BATCH_SUMMARY = (
+    "The final per-source report appears here, and a full machine-readable record is written into "
+    "the batch folder."
+)
+
+INFO_CUT_BATCH_ACTIONS = (
+    "Start Batch runs the whole folder without stopping to ask. One broken or empty video does not "
+    "end the batch — it is recorded and the next one starts. Cancel Batch stops at the next safe "
+    "point and keeps every finished clip."
+)
+
+#: There is deliberately no batch-specific "busy" text: a refused Start Batch goes through the same
+#: audited four-way `_cut_busy_message()` table Single Video mode uses, so the refusal names the
+#: real mutex holder (cutter / render / verify / sample) instead of guessing.
+CUT_BATCH_NOTHING_RUNNING_TEXT = "No batch is running."
+CUT_BATCH_CANCEL_REQUESTED_TEXT = (
+    "Cancel requested — finishing the clip being written now, then stopping. No further source "
+    "video will be started, and everything already written is kept."
+)
+CUT_BATCH_DONE_STATUS = "Batch finished. See the summary below."
+CUT_BATCH_CANCELLED_STATUS = "Batch cancelled. Finished clips were kept — see the summary below."
+
 INFO_TAB_CREATIVE_STUDIO = (
     "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
     "alone is exactly the render Quick Render describes. The Creative Preset lives on Quick "

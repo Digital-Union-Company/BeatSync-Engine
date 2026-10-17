@@ -208,6 +208,11 @@ from beatsync_fork import smart_mix as fork_smart_mix
 # it is only reached when the operator presses a Raw Cutter button, and a module-level import
 # would add an FFmpeg-touching dependency to every GUI start for a tool most sessions never open.
 from beatsync_fork import raw_cutter as fork_cutter
+# [FORK] Digital-Union (Raw Cutter Batch V1): the pure batch bookkeeping — the outcome vocabulary,
+# the collision-safe output layout, the totals, the manifest payload and every line of report text.
+# Stdlib-only like its sibling, so it imports here at module scope; only the FFmpeg adapter is
+# deferred into the handlers.
+from beatsync_fork import raw_cutter_batch as fork_cutter_batch
 import audio_mixdown
 
 #: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
@@ -4937,6 +4942,395 @@ def _on_cut_cancel() -> str:
     return CUT_CANCEL_REQUESTED_TEXT
 
 
+# ============================================================================================
+# [FORK] Digital-Union (Raw Cutter Batch V1): the whole folder, one press.
+#
+# The product decision this implements: process MANY sources automatically with minimal operator
+# interaction. "Detect what we can, cut what we can, skip short unusable shots, and keep going."
+# There is deliberately no per-file preview, no confirmation step and no transition detection --
+# a missed cross-dissolve is an accepted V1 limitation, recorded in ROADMAP.md R2 and in the R2-A
+# research, not something this loop tries to repair.
+#
+# It adds no second planner and no second detector. `probe_source`, `detect_scenes`,
+# `plan_segments` and `export_segments` are the V1 functions, called unchanged once per source.
+# What is new is bookkeeping: the frozen input list, the collision-safe output layout, the
+# per-source outcome classification and the manifest -- all of it in
+# `beatsync_fork.raw_cutter_batch`, which is pure.
+#
+# ONE mutex acquisition for the WHOLE batch, and one `CutterJob` for the whole batch. Taking
+# `_RENDER_LOCK` per source would deadlock on the second file: it is a plain non-reentrant `Lock`
+# on purpose, and the batch still holds it.
+# ============================================================================================
+
+def _on_cut_mode_change(mode):
+    """Show the controls for the chosen mode. Writes nothing but four visibilities.
+
+    No execution setting moves and no state is cleared, so switching modes cannot change what
+    either workflow would do. The sensitivity, minimum, maximum and Remove Audio controls are
+    SHARED between the modes and are deliberately outside both groups -- one value per execution
+    setting on the screen, which is also why this handler cannot touch them.
+    """
+    batch = (mode == CUT_MODE_BATCH)
+    return (
+        gr.update(visible=not batch),   # cut_single_inputs
+        gr.update(visible=batch),       # cut_batch_inputs
+        gr.update(visible=not batch),   # cut_single_actions
+        gr.update(visible=batch),       # cut_batch_actions
+        gr.update(visible=not batch),   # cut_single_readouts
+        gr.update(visible=batch),       # cut_batch_readouts
+    )
+
+
+def _on_cut_batch_count(input_folder, recursive) -> str:
+    """The optional read-only file count. Reads the file list and nothing else.
+
+    No mutex: this is a metadata-only directory walk with `detect_duplicates=False`, so it opens no
+    media, starts no FFmpeg child and competes with nothing for the drive. Cheaper than Verify
+    Sources, which does probe, and that is why it does not need the admission control Verify does.
+    """
+    import raw_cutter_export as cutter_export
+
+    found = cutter_export.discover_batch_sources(input_folder, recursive)
+    if not found.ok:
+        return f"❌ {found.error}"
+    return fork_cutter_batch.discovery_text(len(found.paths), found.root, bool(recursive),
+                                     found.rejected_count)
+
+
+def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_seconds,
+                      max_seconds, remove_audio):
+    """Start Batch. A generator, so the current file and phase stay visible for a long job.
+
+    Yields `(live_status, final_summary)`. The summary stays empty until the end, so the operator
+    is never shown a half-built report as if it were the result.
+
+    Validation order is deliberate and all of it happens BEFORE the mutex is taken, so a refused
+    batch creates no directory and holds nothing: the length bounds once for the whole run, then
+    the two roots resolved and checked for nesting, then discovery. Only then is admission
+    attempted.
+    """
+    import raw_cutter_export as cutter_export
+
+    try:
+        low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
+    except fork_cutter.RawCutterError as exc:
+        yield f"❌ {exc}", ''
+        return
+    level = fork_cutter.normalize_sensitivity(sensitivity)
+    threshold = fork_cutter.sensitivity_to_threshold(level)
+
+    source_root, output_root, error = cutter_export.resolve_batch_roots(
+        input_folder, output_folder)
+    if error:
+        yield f"❌ {error}", ''
+        return
+
+    found = cutter_export.discover_batch_sources(source_root, recursive)
+    if not found.ok:
+        yield f"❌ {found.error}", ''
+        return
+    if not found.paths:
+        yield fork_cutter_batch.discovery_text(0, found.root, bool(recursive)), ''
+        return
+
+    # The input list is frozen here, before anything is written: the manifest, the output layout
+    # and the progress counter all refer to this exact ordered tuple.
+    sources = found.paths
+    layout = fork_cutter_batch.plan_item_directories(sources, found.root)
+    total = len(sources)
+
+    if not _RENDER_LOCK.acquire(blocking=False):
+        yield _cut_busy_message(), ''
+        return
+    _mark_lock_holder(_LOCK_HOLDER_CUTTER)
+    job = cutter_export.CutterJob()
+    _install_cutter_job(job)
+
+    clock_started = time.perf_counter()
+    started_at = datetime.datetime.now()
+    encoder = 'h264_nvenc' if NVENC_AVAILABLE else 'libx264'
+    settings = fork_cutter_batch.BatchSettings(
+        sensitivity=level, threshold=threshold, min_seconds=low, max_seconds=high,
+        remove_audio=bool(remove_audio), encoder=encoder, recursive=bool(recursive))
+
+    items: List[Any] = []
+    batch_directory = ''
+    cancelled = False
+    finalised = False
+
+    def finalise(is_cancelled, fatal=''):
+        """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
+
+        Every terminal path calls exactly this -- normal end, cancellation, and the unexpected
+        error -- which is what fixes R1 finding F-1. Before R2 the `not_attempted` backfill sat
+        at the end of the `try`, so an exception jumped straight over it and the manifest was
+        written short (or, when nothing had been recorded yet, not written at all because of an
+        `and items` guard). Sources then vanished from a record whose own contract is one entry
+        per DISCOVERED source.
+
+        Idempotent by construction: the backfill range is empty once every source has a record,
+        so a second call adds nothing and can never duplicate one. Returns the manifest error
+        string ('' means saved) so the caller can REPORT the write instead of predicting it.
+
+        It never raises. A failure here must not be able to skip the caller's `finally` -- which
+        is where the cutter job is cleared and `_RENDER_LOCK` is released -- because that would
+        strand the one process-global mutex and lock the operator out of every render, batch and
+        verification until the app was restarted.
+        """
+        nonlocal finalised
+        finalised = True
+        try:
+            # Only sources never opened at all become `not_attempted`; anything the loop touched
+            # has already recorded itself, including on the fatal path.
+            for index in range(len(items) + 1, total + 1):
+                items.append(fork_cutter_batch.BatchItem(
+                    index=index, source_path=sources[index - 1],
+                    relative_parts=layout[index - 1],
+                    outcome=fork_cutter_batch.OUTCOME_NOT_ATTEMPTED))
+            if not batch_directory:
+                return ''
+            return cutter_export.write_batch_manifest(
+                batch_directory,
+                fork_cutter_batch.manifest_payload(
+                    items, total, settings, batch_directory, found.root,
+                    started_at.isoformat(timespec='seconds'),
+                    datetime.datetime.now().isoformat(timespec='seconds'),
+                    time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal))
+        except Exception as exc:                      # noqa: BLE001 - see the docstring
+            import traceback
+            traceback.print_exc()
+            return f"the batch record could not be built: {type(exc).__name__}: {exc}"
+
+    try:
+        batch_directory, error = cutter_export.prepare_batch_directory(
+            output_root, started_at.strftime('%Y%m%d_%H%M%S'))
+        if error:
+            yield f"❌ {error}", ''
+            return
+
+        yield (f"🚀 Batch starting: {total} video(s) from\n{found.root}\n\n"
+               f"Output: {batch_directory}\n"
+               f"Settings: {settings.describe()}"), ''
+
+        for position, source_path in enumerate(sources, start=1):
+            if job.cancelled:
+                cancelled = True
+                break
+            parts = layout[position - 1]
+            basename = os.path.basename(source_path)
+            file_clock = time.perf_counter()
+            recorded = False
+
+            def progress(phase):
+                return fork_cutter_batch.progress_text(position, total, basename, phase, items,
+                                                batch_directory)
+
+            def record(outcome, **extra):
+                nonlocal recorded
+                items.append(fork_cutter_batch.BatchItem(
+                    index=position, source_path=source_path, relative_parts=parts,
+                    outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
+                recorded = True
+
+            # [FORK] R2 (F-3): a source the loop has OPENED always leaves a record, even when the
+            # fault is one nothing here anticipated. Without this the record was simply never
+            # appended, the backfill then labelled the file `not_attempted`, and clips already on
+            # disk were reported as never produced. `CutterCancelled` is deliberately NOT caught
+            # here -- it is an ordinary `Exception`, it is already handled at the two safe
+            # boundaries below, and swallowing it would turn a Stop into a crash.
+            try:
+                yield progress(fork_cutter_batch.PHASE_PROBE), ''
+                probe = cutter_export.probe_source(source_path)
+                if not probe.ok:
+                    record(fork_cutter_batch.OUTCOME_UNREADABLE, error=probe.error)
+                    continue
+                source = probe.source
+
+                yield progress(fork_cutter_batch.PHASE_DETECT), ''
+                try:
+                    scenes = cutter_export.detect_scenes(source.path, threshold, job=job)
+                except cutter_export.CutterCancelled:
+                    cancelled = True
+                    record(fork_cutter_batch.OUTCOME_CANCELLED)
+                    break
+                if not scenes.succeeded:
+                    # A failed detector is NEVER recorded as a successful zero-cut analysis. That
+                    # distinction is the reason `SceneResult` exists, and in a batch it matters
+                    # more: one giant time-split clip per unreadable file would look like a
+                    # working run.
+                    record(fork_cutter_batch.OUTCOME_DETECTION_FAILED, error=scenes.error)
+                    continue
+
+                yield progress(fork_cutter_batch.PHASE_PLAN), ''
+                try:
+                    plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high,
+                                                     level)
+                except fork_cutter.RawCutterError as exc:
+                    record(fork_cutter_batch.OUTCOME_PLAN_FAILED, error=str(exc))
+                    continue
+                if not plan.has_work:
+                    # A truthful answer about this footage, not a failure: nothing in it is long
+                    # enough at these settings. No folder is created for it.
+                    record(fork_cutter_batch.OUTCOME_NO_CLIPS)
+                    continue
+
+                item_directory, error = cutter_export.prepare_item_directory(batch_directory,
+                                                                             parts)
+                if error:
+                    record(fork_cutter_batch.OUTCOME_EXPORT_FAILED, clips_planned=plan.count,
+                           error=error)
+                    continue
+
+                yield progress(fork_cutter_batch.PHASE_EXPORT), ''
+                lengths = {segment.index: segment.duration for segment in plan.segments}
+                written: List[Any] = []
+                stopped = False
+                fatal_export = None
+                try:
+                    cutter_export.export_segments(
+                        source=source, plan=plan, run_directory=item_directory,
+                        remove_audio=bool(remove_audio), encoder=encoder, job=job,
+                        on_complete=written.append)
+                except cutter_export.CutterCancelled:
+                    # `written` is the truth on this path: the exception discards
+                    # `export_segments`' return value, so the callback's list is the only record
+                    # of what reached disk.
+                    stopped = True
+                    cancelled = True
+                except Exception as exc:                  # noqa: BLE001 - re-raised below
+                    # [FORK] R2 (F-3): `written` is the truth here for exactly the same reason,
+                    # and an unexpected fault is precisely when it matters most. The clips it
+                    # names are already validated and already on disk; losing them from the
+                    # accounting was the worst of the R1 findings. Classified from that evidence
+                    # below, recorded, and only THEN re-raised, so the batch still stops and the
+                    # error still reaches the operator.
+                    fatal_export = exc
+
+                good = [result for result in written if result.ok]
+                if stopped:
+                    outcome = fork_cutter_batch.OUTCOME_CANCELLED
+                elif len(good) == plan.count:
+                    # Every planned clip fired `on_complete` validated, so the source really did
+                    # finish -- even if the adapter then raised on its way out.
+                    outcome = fork_cutter_batch.OUTCOME_COMPLETED
+                elif good:
+                    outcome = fork_cutter_batch.OUTCOME_PARTIAL
+                elif fatal_export is not None:
+                    outcome = fork_cutter_batch.OUTCOME_UNEXPECTED_ERROR
+                else:
+                    outcome = fork_cutter_batch.OUTCOME_EXPORT_FAILED
+                failures = [result for result in written if not result.ok]
+                detail = ("; ".join(f"#{r.index}: {r.error}" for r in failures[:5])
+                          if failures else '')
+                if fatal_export is not None:
+                    detail = (f"{type(fatal_export).__name__}: {fatal_export}"
+                              + (f"; {detail}" if detail else ''))
+                record(outcome,
+                       clips_planned=plan.count,
+                       clips_written=len(good),
+                       exported_seconds=round(sum(lengths.get(r.index, 0.0) for r in good), 3),
+                       bytes_written=sum(result.size_bytes for result in good),
+                       output_directory=item_directory,
+                       error=detail)
+                if fatal_export is not None:
+                    raise fatal_export
+                if stopped:
+                    break
+            except cutter_export.CutterCancelled:
+                raise
+            except Exception as exc:                      # noqa: BLE001 - re-raised immediately
+                # A fault anywhere else in this source's processing (probe, detection, planning,
+                # directory preparation). No clip evidence exists, so the honest record is that
+                # the tool broke on a file it HAD opened -- never `not_attempted`.
+                if not recorded:
+                    record(fork_cutter_batch.OUTCOME_UNEXPECTED_ERROR,
+                           error=f"{type(exc).__name__}: {exc}")
+                raise
+
+        # [FORK] R2 (F-1/F-4): finalise BEFORE the terminal yield, so the report states what the
+        # manifest write actually did instead of predicting it, and so the operator never sees a
+        # result that is still waiting on persistence.
+        manifest_error = finalise(cancelled)
+        elapsed = time.perf_counter() - clock_started
+        summary = fork_cutter_batch.summary_text(
+            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
+            manifest_error=manifest_error)
+        yield (CUT_BATCH_CANCELLED_STATUS if cancelled else CUT_BATCH_DONE_STATUS), summary
+
+    except cutter_export.CutterCancelled:
+        # Named BEFORE the generic handler, for the same reason `_on_cut_run` does it:
+        # `CutterCancelled` is an ordinary `Exception`, so a generic clause listed first would
+        # report the operator's own Stop as a crash. Cancellation is normally handled at the two
+        # safe boundaries inside the loop; this clause covers a stop observed anywhere else and
+        # still produces the truthful report rather than an error.
+        cancelled = True
+        manifest_error = finalise(True)
+        elapsed = time.perf_counter() - clock_started
+        yield CUT_BATCH_CANCELLED_STATUS, fork_cutter_batch.summary_text(
+            items, total, settings, batch_directory, elapsed, True, input_root=found.root,
+            manifest_error=manifest_error)
+    except Exception as exc:
+        # Total: a batch that raised must report rather than vanish behind Gradio's generic error,
+        # and it must still say what it had already written.
+        #
+        # [FORK] R2 (F-2): `cancelled` is passed THROUGH, never forced. This clause used to hand
+        # `summary_text` a literal `True`, so every crash was headlined "Batch cancelled" -- an
+        # operator was told they had stopped a run they had not touched, while the manifest
+        # beside it recorded `cancelled: false`. The failure now travels as `fatal_error`, which
+        # outranks the cancellation flag in both the report and the record, so the two agree.
+        import traceback
+        traceback.print_exc()
+        fatal = f"{type(exc).__name__}: {exc}"
+        manifest_error = finalise(cancelled, fatal=fatal)
+        elapsed = time.perf_counter() - clock_started
+        partial = fork_cutter_batch.summary_text(
+            items, total, settings, batch_directory, elapsed, cancelled, input_root=found.root,
+            fatal_error=fatal, manifest_error=manifest_error)
+        yield (f"❌ The batch stopped on an unexpected error.\n  {fatal}"), partial
+    finally:
+        # [FORK] R2: the terminal paths above already finalised, each one before its own yield.
+        # This is the net for the path that has no terminal yield at all -- an abandoned Gradio
+        # stream, where the frame unwinds under `GeneratorExit` and nothing may be yielded. The
+        # manifest is still worth writing there; the report simply has nobody to go to.
+        #
+        # Nothing in this block may raise. `finalise` is total by construction, and the three
+        # cleanup calls below must run even if it somehow were not: stranding `_RENDER_LOCK`
+        # would lock the operator out of every render, batch and verification in the process
+        # until the app was restarted.
+        # The net is wrapped, and the three cleanup calls deliberately stay TOP-LEVEL statements
+        # of this `finally` -- the shape every other mutex-owning handler in this file uses, and
+        # the one `test_the_batch_clears_its_holder_token_and_job_before_releasing` and
+        # `test_only_the_diagnostics_mark_the_holder_and_each_clears_before_release` both read.
+        # Nesting them inside a second `try` protects nothing extra here (`finalise` is already
+        # total) and breaks that documented ordering contract in two suites at once.
+        try:
+            if not finalised:
+                leftover = finalise(cancelled)
+                if leftover:
+                    print(f"[raw-cutter-batch] {leftover}")
+        except Exception:                             # noqa: BLE001 - cleanup must still run
+            pass
+        _clear_cutter_job()
+        _mark_lock_holder('')
+        _RENDER_LOCK.release()
+
+
+def _on_cut_batch_cancel() -> str:
+    """Signal the running batch. Writes only the batch status line.
+
+    The same cooperative flag and the same one-slot job reference the single-video Cancel uses --
+    only one cutter job can exist at a time, because admission is the one shared mutex. Observed at
+    two safe boundaries: between source videos, and between clips inside the current source. No
+    child is killed, nothing already written is removed, and no output folder is deleted.
+    """
+    with _CUTTER_JOB_LOCK:
+        job = _cutter_job
+    if job is None:
+        return CUT_BATCH_NOTHING_RUNNING_TEXT
+    job.cancel()
+    return CUT_BATCH_CANCEL_REQUESTED_TEXT
+
+
 def _on_sample_invalidate(request: gr.Request = None) -> str:
     """Clear the sample report when the video file or the seek position changes.
 
@@ -5676,9 +6070,21 @@ def create_ui() -> gr.Blocks:
             # a prepared library or change what Create Music Video would produce.
             with gr.Tab(LABEL_TAB_RAW_CUTTER, id='tab-raw-cutter'):
                 gr.Markdown(INFO_TAB_RAW_CUTTER)
+                # [FORK] Digital-Union (Raw Cutter Batch V1): one tab, two modes. NOT a fifth
+                # top-level tab -- batch mode is the same tool pointed at a folder instead of a
+                # file, and the execution settings below are SHARED between the two modes rather
+                # than duplicated, so there is exactly one sensitivity, minimum, maximum and
+                # Remove Audio value on the screen.
+                cut_mode = gr.Radio(
+                    choices=[CUT_MODE_SINGLE, CUT_MODE_BATCH],
+                    value=CUT_MODE_SINGLE,
+                    label=LABEL_CUT_MODE,
+                    info=INFO_CUT_MODE,
+                    elem_id='cut-mode-radio',
+                )
                 with gr.Row():
                     with gr.Column(scale=2):
-                        with gr.Group():
+                        with gr.Group(visible=True) as cut_single_inputs:
                             cut_source = gr.Textbox(
                                 label=LABEL_CUT_SOURCE,
                                 placeholder=PLACEHOLDER_CUT_SOURCE,
@@ -5694,6 +6100,33 @@ def create_ui() -> gr.Blocks:
                                 max_lines=3,
                                 elem_id='cut-source-info-box',
                             )
+                        with gr.Group(visible=False) as cut_batch_inputs:
+                            cut_batch_folder = gr.Textbox(
+                                label=LABEL_CUT_BATCH_FOLDER,
+                                placeholder=PLACEHOLDER_CUT_BATCH_FOLDER,
+                                info=INFO_CUT_BATCH_FOLDER,
+                                elem_id='cut-batch-folder-input',
+                            )
+                            cut_batch_recursive = gr.Checkbox(
+                                value=True,
+                                label=LABEL_CUT_BATCH_RECURSIVE,
+                                info=INFO_CUT_BATCH_RECURSIVE,
+                                elem_id='cut-batch-recursive',
+                            )
+                            cut_batch_count_btn = gr.Button(
+                                LABEL_CUT_BATCH_COUNT, variant='secondary', size='sm',
+                                elem_id='cut-batch-count-button')
+                            cut_batch_discovery = gr.Textbox(
+                                label=LABEL_CUT_BATCH_DISCOVERY,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_BATCH_DISCOVERY,
+                                interactive=False,
+                                lines=3,
+                                max_lines=6,
+                                elem_id='cut-batch-discovery-box',
+                            )
+                        # Shared by both modes: one output root, one set of cutting settings.
+                        with gr.Group():
                             cut_output = gr.Textbox(
                                 label=LABEL_CUT_OUTPUT,
                                 placeholder=PLACEHOLDER_CUT_OUTPUT,
@@ -5731,43 +6164,72 @@ def create_ui() -> gr.Blocks:
                                 info=INFO_CUT_REMOVE_AUDIO,
                                 elem_id='cut-remove-audio',
                             )
-                        with gr.Row():
-                            cut_analyze_btn = gr.Button(
-                                LABEL_CUT_ANALYZE, variant='secondary',
-                                elem_id='cut-analyze-button')
-                            cut_run_btn = gr.Button(
-                                LABEL_CUT_RUN, variant='primary',
-                                elem_id='cut-run-button')
-                        cut_cancel_btn = gr.Button(
-                            LABEL_CUT_CANCEL, variant='stop', size='sm',
-                            elem_id='cut-cancel-button')
-                        gr.Markdown(INFO_CUT_ACTIONS)
+                        with gr.Column(visible=True) as cut_single_actions:
+                            with gr.Row():
+                                cut_analyze_btn = gr.Button(
+                                    LABEL_CUT_ANALYZE, variant='secondary',
+                                    elem_id='cut-analyze-button')
+                                cut_run_btn = gr.Button(
+                                    LABEL_CUT_RUN, variant='primary',
+                                    elem_id='cut-run-button')
+                            cut_cancel_btn = gr.Button(
+                                LABEL_CUT_CANCEL, variant='stop', size='sm',
+                                elem_id='cut-cancel-button')
+                            gr.Markdown(INFO_CUT_ACTIONS)
+                        with gr.Column(visible=False) as cut_batch_actions:
+                            cut_batch_start_btn = gr.Button(
+                                LABEL_CUT_BATCH_START, variant='primary',
+                                elem_id='cut-batch-start-button')
+                            cut_batch_cancel_btn = gr.Button(
+                                LABEL_CUT_BATCH_CANCEL, variant='stop', size='sm',
+                                elem_id='cut-batch-cancel-button')
+                            gr.Markdown(INFO_CUT_BATCH_ACTIONS)
                     with gr.Column(scale=3):
-                        cut_summary = gr.Textbox(
-                            label=LABEL_CUT_PLAN_SUMMARY,
-                            value='',
-                            placeholder=PLACEHOLDER_CUT_PLAN_SUMMARY,
-                            interactive=False,
-                            lines=10,
-                            max_lines=18,
-                            elem_id='cut-plan-summary',
-                        )
-                        cut_table = gr.Dataframe(
-                            headers=list(fork_cutter.PLAN_TABLE_HEADERS),
-                            value=[],
-                            interactive=False,
-                            wrap=True,
-                            elem_id='cut-plan-table',
-                        )
-                        cut_report = gr.Textbox(
-                            label=LABEL_CUT_RUN_REPORT,
-                            value='',
-                            placeholder=PLACEHOLDER_CUT_RUN_REPORT,
-                            interactive=False,
-                            lines=8,
-                            max_lines=20,
-                            elem_id='cut-run-report',
-                        )
+                        with gr.Column(visible=True) as cut_single_readouts:
+                            cut_summary = gr.Textbox(
+                                label=LABEL_CUT_PLAN_SUMMARY,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_PLAN_SUMMARY,
+                                interactive=False,
+                                lines=10,
+                                max_lines=18,
+                                elem_id='cut-plan-summary',
+                            )
+                            cut_table = gr.Dataframe(
+                                headers=list(fork_cutter.PLAN_TABLE_HEADERS),
+                                value=[],
+                                interactive=False,
+                                wrap=True,
+                                elem_id='cut-plan-table',
+                            )
+                            cut_report = gr.Textbox(
+                                label=LABEL_CUT_RUN_REPORT,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_RUN_REPORT,
+                                interactive=False,
+                                lines=8,
+                                max_lines=20,
+                                elem_id='cut-run-report',
+                            )
+                        with gr.Column(visible=False) as cut_batch_readouts:
+                            cut_batch_status = gr.Textbox(
+                                label=LABEL_CUT_BATCH_STATUS,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_BATCH_STATUS,
+                                interactive=False,
+                                lines=10,
+                                max_lines=16,
+                                elem_id='cut-batch-status',
+                            )
+                            cut_batch_summary = gr.Textbox(
+                                label=LABEL_CUT_BATCH_SUMMARY,
+                                value='',
+                                placeholder=PLACEHOLDER_CUT_BATCH_SUMMARY,
+                                interactive=False,
+                                lines=14,
+                                max_lines=34,
+                                elem_id='cut-batch-summary',
+                            )
                 # The plan rides as a plain dict of primitives. Nothing live -- no thread, lock,
                 # handle or lifecycle -- may enter `gr.State`, and a dict is also what lets the
                 # Cut handler recompute the staleness signature and compare it.
@@ -6069,6 +6531,51 @@ def create_ui() -> gr.Blocks:
             fn=_on_cut_cancel,
             inputs=[],
             outputs=[cut_report],
+            concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
+            concurrency_limit=None,
+        )
+
+        # [FORK] Digital-Union (Raw Cutter Batch V1): four more registrations, and the same
+        # isolation story. The mode switch writes four visibilities. Count files writes one
+        # read-only box. Start Batch writes the live status and the final summary. Cancel Batch
+        # writes the status. NONE of them writes `status_output`, `video_output`, `process_btn`,
+        # `source_state`, any element of `source_outputs` or `prep_outputs`, any creative widget or
+        # any render state -- and none writes a shared EXECUTION setting, so switching mode or
+        # counting files cannot change what either workflow would do.
+        #
+        # Start Batch and Count files keep `concurrency_limit=None` and join no shared lane, for
+        # the measured S2-A R3 reason: on the pinned gradio 6.19.0 a full concurrency group leaves
+        # the event QUEUED rather than delivering it, so the handler is never entered and the
+        # mutex that was meant to refuse it is never reached.
+        #
+        # Cancel Batch shares `CUTTER_CANCEL_CONCURRENCY_ID` with the single-video Cancel, which is
+        # correct rather than convenient: both target the SAME one-slot `_cutter_job`, because
+        # admission is the one shared mutex and only one cutter job can exist at a time.
+        cut_mode.change(
+            fn=_on_cut_mode_change,
+            inputs=[cut_mode],
+            outputs=[cut_single_inputs, cut_batch_inputs,
+                     cut_single_actions, cut_batch_actions,
+                     cut_single_readouts, cut_batch_readouts],
+            concurrency_limit=None,
+        )
+        cut_batch_count_btn.click(
+            fn=_on_cut_batch_count,
+            inputs=[cut_batch_folder, cut_batch_recursive],
+            outputs=[cut_batch_discovery],
+            concurrency_limit=None,
+        )
+        cut_batch_start_btn.click(
+            fn=_on_cut_batch_run,
+            inputs=[cut_batch_folder, cut_batch_recursive, cut_output, cut_sensitivity,
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio],
+            outputs=[cut_batch_status, cut_batch_summary],
+            concurrency_limit=None,
+        )
+        cut_batch_cancel_btn.click(
+            fn=_on_cut_batch_cancel,
+            inputs=[],
+            outputs=[cut_batch_status],
             concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
             concurrency_limit=None,
         )
