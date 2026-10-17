@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 
 import pytest
 
@@ -350,11 +351,168 @@ def test_a_source_without_audio_is_exported_without_audio_either_way(export_tree
     assert "-y" not in stripped
 
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (frame-boundary P5-S1): the export's geometry guard.
+#
+# The original form of the guard below searched the RENDERED SOURCE of `build_segment_command`
+# for six forbidden substrings. That shape has two defects, and P5 hit both:
+#
+#   1. It could not tell a banned operation from prose naming the ban. P5's docstring explains
+#      "`trim`/`setpts` change no geometry: no `-s`, no `-r`, no `scale`, no `setsar`/`setdar`"
+#      -- so FOUR of the six tokens now appear in the function purely as rationale. Dropping only
+#      "'-vf'" from the tuple, which is what the P5 report proposed, would still have failed on
+#      `setsar`. This file already carries `_code_only` for exactly that hazard; this test did not
+#      use it.
+#   2. A substring ban over source text is bypassable by spelling. `-filter:v scale=...` applies
+#      a scaler while containing neither "'-vf'" nor... well, it contains "scale=", but
+#      `-filter:v $(cat chain)` or a renamed local would not. A ban you can evade without changing
+#      behaviour is not a guard.
+#
+# So the guard is now SEMANTIC: it executes the real command builder and inspects the argv it
+# produces, across both encoders and both audio states, and it is supplemented by an AST pass over
+# EXECUTABLE CODE ONLY so that a conditionally-added option cannot hide behind an untested branch.
+#
+# What is permitted is narrow and exact: the one `trim`/`setpts` chain P5 measured, bounded at the
+# planned duration. Resolution, aspect ratio and frame rate are still preserved by saying nothing
+# about them, which is what this guard has always been for.
+# ---------------------------------------------------------------------------------------------
+
+#: The ONLY video filter chain this export may carry. `trim` selects frames by their own
+#: presentation timestamp and `setpts` rebases the clip's timeline to zero; neither resizes,
+#: re-rates, re-samples nor touches the sample aspect ratio.
+_ALLOWED_VIDEO_FILTER = re.compile(r"^trim=end=(\d+(?:\.\d+)?),setpts=PTS-STARTPTS$")
+
+#: The audio bound has to describe the same interval, or the two streams disagree.
+_ALLOWED_AUDIO_FILTER = re.compile(r"^atrim=end=(\d+(?:\.\d+)?),asetpts=PTS-STARTPTS$")
+
+#: Every spelling FFmpeg accepts for "apply a filter graph". Only `-vf` (and `-af` for the audio
+#: bound) may appear, exactly once each -- so a second chain, a replacement chain, or the same
+#: chain under another name is a failure rather than a silent addition.
+_FILTER_OPTION = re.compile(
+    r"^-(?:vf|af|lavfi|filter|filter_complex|filter_script|filter_complex_script)(?::.*)?$")
+
+#: Options that change output geometry or rate without a filter at all.
+_GEOMETRY_OPTIONS = (
+    "-s", "-s:v", "-video_size", "-aspect", "-r", "-r:v", "-fpsmax", "-vsync", "-fps_mode",
+    "-sws_flags", "-vf:v",
+)
+
+#: Filter names that would resize, re-rate or re-interpret the picture. Checked as written
+#: tokens in executable code, so a chain assembled in pieces is still caught.
+_GEOMETRY_FILTERS = (
+    "scale=", "scale2ref", "scale_cuda", "scale_npp", "crop=", "pad=", "zoompan",
+    "setsar", "setdar", "fps=", "framerate=", "minterpolate", "tinterlace", "yadif",
+)
+
+_EXPORT_PATHS = (
+    ("libx264, audio removed", True, "libx264", False),
+    ("libx264, audio removed, source has audio", True, "libx264", True),
+    ("libx264, audio kept", False, "libx264", True),
+    ("libx264, source has no audio", False, "libx264", False),
+    ("h264_nvenc, audio removed", True, "h264_nvenc", True),
+    ("h264_nvenc, audio kept", False, "h264_nvenc", True),
+)
+
+
+def _export_builder(export_tree):
+    """`build_segment_command` AST-extracted and executed against a namespace holding nothing but
+    the single constant it is allowed to name."""
+    namespace = {"FFMPEG_PATH": "ffmpeg.exe"}
+    exec(ast.unparse(_func(export_tree, "build_segment_command")), namespace)
+    return namespace["build_segment_command"]
+
+
+def _string_constants(node):
+    """Every string literal in EXECUTABLE code, including the literal parts of f-strings.
+
+    Docstrings are removed first: prose is allowed to name the operations the machinery bans.
+    """
+    out = []
+    for inner in ast.walk(_strip_docstrings(node)):
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            out.append(inner.value)
+    return out
+
+
 def test_no_scaling_or_frame_rate_argument_is_ever_added(export_tree):
-    """Aspect ratio and frame rate are preserved by saying nothing about them."""
-    rendered = ast.unparse(_func(export_tree, "build_segment_command"))
-    for forbidden in ("'-vf'", "'-s'", "'-r'", "scale=", "setsar", "setdar"):
-        assert forbidden not in rendered, forbidden
+    """Aspect ratio and frame rate are preserved by saying nothing about them.
+
+    Measured on the produced argv rather than on source text, so neither rationale prose nor an
+    alternate option spelling can change the answer.
+    """
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        argv = build("in.mkv", "out.mp4", 10.022, 5.011, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+        for option in _GEOMETRY_OPTIONS:
+            assert option not in argv, (label, option)
+        chain = argv[argv.index("-vf") + 1] if "-vf" in argv else ""
+        for name in _GEOMETRY_FILTERS:
+            assert name not in chain, (label, name, chain)
+
+    # And the same bans over executable code, so a branch these six paths do not reach cannot
+    # introduce one unseen. `_strip_docstrings` is what makes this immune to the rationale text.
+    literals = _string_constants(_func(export_tree, "build_segment_command"))
+    for option in _GEOMETRY_OPTIONS:
+        assert option not in literals, option
+    for name in _GEOMETRY_FILTERS:
+        assert not any(name in text for text in literals), name
+
+
+def test_the_only_video_filter_is_the_validated_trim_chain(export_tree):
+    """[FORK] P5-S1. Exactly one video filter option, exactly one approved chain, right order.
+
+    The chain is what makes the clip's frame membership the half-open interval the planner means;
+    anything else in it, or a second chain anywhere, is a change this guard exists to notice.
+    """
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        duration = 5.011
+        argv = build("in.mkv", "out.mp4", 10.022, duration, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+
+        video_filters = [a for a in argv if a == "-vf"]
+        assert len(video_filters) == 1, (label, "exactly one -vf expected", argv)
+
+        other = [a for a in argv
+                 if _FILTER_OPTION.match(a) and a not in ("-vf", "-af")]
+        assert other == [], (
+            label, "a filter graph was applied under another option spelling", other)
+
+        chain = argv[argv.index("-vf") + 1]
+        match = _ALLOWED_VIDEO_FILTER.match(chain)
+        assert match, (label, "unapproved video filter chain", chain)
+        assert abs(float(match.group(1)) - duration) < 5e-7, (
+            label, "the trim bound is not the planned duration", chain, duration)
+
+        elements = chain.split(",")
+        assert len(elements) == 2, (label, "extra filter in the chain", elements)
+        assert elements[0].startswith("trim=end="), (label, elements)
+        assert elements[1] == "setpts=PTS-STARTPTS", (label, elements)
+        assert chain.index("trim=") < chain.index("setpts="), (
+            label, "setpts must follow trim, or the bound is measured on rebased timestamps")
+
+
+def test_the_audio_bound_matches_the_video_bound_exactly(export_tree):
+    """[FORK] P5-S1. Audio is bounded by `atrim` on the same interval, or not at all."""
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        duration = 7.967
+        argv = build("in.mkv", "out.mp4", 6.066, duration, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+        keeps_audio = not remove_audio and has_audio
+        if not keeps_audio:
+            assert "-af" not in argv, (label, "audio was filtered on a path with no audio")
+            assert "-an" in argv, (label, "audio must be dropped, not merely silenced")
+            continue
+        assert len([a for a in argv if a == "-af"]) == 1, (label, argv)
+        chain = argv[argv.index("-af") + 1]
+        match = _ALLOWED_AUDIO_FILTER.match(chain)
+        assert match, (label, "unapproved audio filter chain", chain)
+        assert abs(float(match.group(1)) - duration) < 5e-7, (label, chain, duration)
+        video = _ALLOWED_VIDEO_FILTER.match(argv[argv.index("-vf") + 1])
+        assert video and match.group(1) == video.group(1), (
+            label, "the audio and video bounds describe different intervals")
 
 
 def test_the_video_stream_is_pinned_explicitly(export_tree):

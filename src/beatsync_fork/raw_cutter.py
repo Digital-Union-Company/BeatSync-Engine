@@ -29,15 +29,34 @@ So the policy is inverted:
 * A plan with **zero** usable clips is a legitimate analysis result. It is not an error, and the
   Cut button refuses it rather than writing something unusable.
 
+Conservative trimming at scene changes (P6)
+-------------------------------------------
+The same product judgement, pushed one step further by the owner: **prefer simple, predictable,
+conservative trimming over expensive per-cut boundary refinement.** A detected scene change is an
+*estimate*, and the only way to be sure a clip holds no frame of its neighbour without knowing
+exactly where the cut fell is to stand back from it. So every detected scene change gets a
+:data:`SCENE_GUARD_SECONDS` margin on **both** sides, and the footage in between is deliberately
+discarded.
+
+The margin is applied at detected scene changes and nowhere else — not at the start of the source,
+not at its end, and not at a time split inside one continuous shot, because none of those is an
+estimate. A 30-second uninterrupted shot cut into three 10-second clips loses nothing at 10 s and
+20 s; a shot change detected at 10 s costs 0.4 s around it.
+
 The invariants that replace "complete coverage":
 
-1. **No exported segment ever spans a confirmed scene change.** Structural: segments are built
-   inside one shot and never across two.
+1. **No exported segment comes within the guard of a detected scene change.** Structural: segments
+   are built inside one guarded shot and never across two, and :func:`_assert_invariants` measures
+   it on every plan. This strictly subsumes the older "never spans a cut" guarantee.
 2. **Every exported segment satisfies both bounds** — at least the minimum, at most the maximum.
    There is no "flagged short" escape hatch any more; material that cannot satisfy them is skipped.
 3. **Segments stay inside the source, are ordered, and never overlap.** Gaps between them are
    allowed and expected.
 4. **Deterministic** — identical inputs and settings give an identical plan, every time.
+
+What this module does **not** claim: that every source frame reaches an output clip. It never did
+(a short shot is skipped whole), and under the guard policy it is further from true by design. The
+report says how much went where instead of implying nothing was lost.
 """
 
 from __future__ import annotations
@@ -74,6 +93,43 @@ THRESHOLD_FLOOR = 0.01
 MIN_CLIP_SECONDS_DEFAULT = 5.0
 MAX_CLIP_SECONDS_DEFAULT = 300.0
 
+#: [FORK] Digital-Union (frame-boundary P6): the CONSERVATIVE GUARD around a detected scene change,
+#: each side, in seconds. Footage inside the guard is intentionally discarded.
+#:
+#: **Why a margin at all.** The coarse detector resamples to 8 fps before scoring, so the time it
+#: reports is a LABEL on the 1/8 s grid rather than the position of the frames that were compared.
+#: P3 measured where the real cut can actually sit relative to that label -- by decoding the `fps=8`
+#: output and reading each output frame's own source-frame index back out at 23.976/25/29.97/30/60
+#: fps -- and found the resampler carries a frame LATER than its own grid time by a quarter to a
+#: half of an analysis period. That places the real cut inside
+#:
+#:     [reported - 0.100 s, reported + 0.063 s]
+#:
+#: i.e. at worst one analysis period before the label and half a period after it.
+#:
+#: **Why 0.20.** It clears that measured worst case by 100 ms on the early side and 137 ms on the
+#: late side. The margin is the entire mechanism: the guard has to absorb the detector's error
+#: *without being told what it was*, so the surplus over the measured bound is what the policy
+#: buys, not waste to be optimised away.
+#:
+#: **Why this succeeds where per-cut refinement could not.** Refinement had to IDENTIFY the cut
+#: frame, so a cut whose own inter-frame difference never clears the operator's sensitivity is
+#: invisible to it however the candidates are ranked. P5-S1 measured exactly that: a pan->solid cut
+#: at 5.066667 reported at 5.125, where the only super-threshold frame in the bracket was
+#: pan-internal, so every selection rule returned 5.000 and the exported clip opened with two
+#: frames of the outgoing shot. The guard needs only the BOUND, which still held -- 5.066667 lies
+#: inside [5.025, 5.188] -- so it puts the clip edges 141 ms and 258 ms clear of a cut it never
+#: located. Not knowing where the cut is, is the design.
+#:
+#: **Why not smaller.** 0.15 s is arithmetically defensible (50 ms / 87 ms of margin) and 0.125 s
+#: (one analysis period) leaves 25 ms on the early side -- under one frame interval at 30 fps, and
+#: below the measured bound's own uncertainty. Neither is recommended, and the guard must not be
+#: reduced to improve frame retention: retention is explicitly not what this policy optimises.
+#:
+#: Applied at detected scene changes ONLY -- never at the start of the source, never at its end,
+#: and never at a time split inside one continuous shot. See :func:`plan_segments`.
+SCENE_GUARD_SECONDS = 0.20
+
 #: Segment arithmetic is rounded to whole milliseconds before the invariants are checked. Without
 #: it, binary float accumulation makes "no overlap" a statement about 1e-16 rather than about video.
 TIME_QUANTUM = 0.001
@@ -94,6 +150,94 @@ def _finite(value: Any) -> float | None:
 
 def _quantize(value: float) -> float:
     return round(round(value / TIME_QUANTUM) * TIME_QUANTUM, 3)
+
+
+def _quantize_floor(value: float) -> float:
+    """[FORK] Digital-Union (frame-boundary P1): quantize a SCENE CUT **downwards**, never up.
+
+    A scene cut is the presentation time of the first frame of the NEXT shot, and it is used as
+    the exclusive end of the previous clip. :func:`_quantize` rounds to the nearest millisecond,
+    so a cut at 3.066667 s became 3.067 s -- one millisecond *past* the frame it is supposed to
+    stop before. Export bounds the clip with ``-t``, which keeps every frame whose timestamp is
+    below the end, so that one millisecond is enough to decode the first frame of the next scene
+    into the end of the clip. On a 30 fps source the operator sees a single-frame flash of the
+    following shot; at 60 fps, two.
+
+    Flooring is both safe and lossless here, and the margin is not a guess:
+
+    * the last frame that genuinely belongs to this shot sits a whole frame earlier, at
+      ``cut - 1/fps``. Flooring moves the boundary by less than one millisecond, so that frame is
+      still comfortably inside for any source below 1000 fps -- no footage is discarded;
+    * the next shot still starts on its true first frame, because export seeks with ``-ss`` and
+      keeps frames at or after the boundary: a boundary up to a millisecond early still lands on
+      the same frame.
+
+    So the floor removes the overshoot without moving either clip's real content.
+
+    [FORK] P3 (FIX D): the division needs a representation tolerance. ``value / TIME_QUANTUM`` is
+    binary floating point, and for an input that is already an exact number of milliseconds the
+    quotient can land just *below* the integer it should be -- ``3.002 / 0.001`` evaluates to
+    ``3001.9999999999995`` -- so a plain floor drops a whole millisecond that was never overshoot.
+    Measured, that hit 13.34 % of exact-millisecond values between 0 and 600 s.
+
+    On its own that error is harmless: it moves the boundary EARLIER, which is the safe direction,
+    and a millisecond is nothing against frame intervals of 8 to 42 ms -- zero leaks and zero lost
+    frames across 18,000 real frame timestamps at six frame rates. What it did cost was honesty
+    about duration: a shot whose true length is exactly the operator's minimum measured one
+    millisecond short and was silently skipped instead of exported.
+
+    ``1e-9`` of a millisecond -- a picosecond of video -- is far below any real timestamp's
+    resolution, so it cannot pull a boundary past a frame that genuinely sits after it, but it is
+    many orders of magnitude above the ~1e-13 relative error of the division itself. Note the
+    tolerance belongs on the QUOTIENT, not the value: adding it to ``value`` would scale with the
+    magnitude of the timestamp, while the representation error being corrected does not.
+
+    Deliberately not `Decimal`: ``Decimal(3.002)`` is the float's exact binary value,
+    ``3.00199999999999999733...``, which floors to 3.001 just the same -- measured *worse* than the
+    plain float route (29,757 of 60,001 exact values wrong against 7,932). Decimal would only help
+    applied to the timestamp's decimal *string* before it ever became a float.
+    """
+    return round(math.floor(value / TIME_QUANTUM + 1e-9) * TIME_QUANTUM, 3)
+
+
+def _quantize_ceil(value: float) -> float:
+    """[FORK] Digital-Union (frame-boundary P6): quantize a GUARDED START **upwards**, never down.
+
+    The mirror of :func:`_quantize_floor`, for the mirrored reason. A guarded start is
+    ``cut + SCENE_GUARD_SECONDS`` and means *no earlier than this*; rounding it to the nearest
+    millisecond could move it half a millisecond back TOWARDS the cut, which is the one direction
+    the guard exists to forbid. Rounding up keeps ``start - cut >= guard`` true as arithmetic
+    rather than as a tolerance, which is what lets :func:`_assert_invariants` state the guard as a
+    hard property.
+
+    It carries the same representation tolerance :func:`_quantize_floor` does, applied in the
+    opposite direction. ``value / TIME_QUANTUM`` is binary floating point, so an input that is
+    already an exact number of milliseconds can land a hair *above* the integer it should be, and
+    a plain ceiling would then add a whole millisecond that was never needed. Nudging the quotient
+    down by ``1e-9`` -- a picosecond of video, far below any real timestamp's resolution and many
+    orders of magnitude above the division's own ~1e-13 relative error -- removes that without
+    being able to pull the boundary back onto an earlier frame.
+    """
+    return round(math.ceil(value / TIME_QUANTUM - 1e-9) * TIME_QUANTUM, 3)
+
+
+def _resolve_guard(value: Any) -> float:
+    """The conservative scene guard to apply, in seconds. ``None`` means the shipped policy value.
+
+    **Not an operator control**, and deliberately absent from :func:`plan_signature`: it is a fixed
+    product decision, and the parameter exists so a test can measure the policy at other values --
+    not so the GUI can offer one. Junk reads as the policy value rather than raising, like every
+    other absorbed input here.
+
+    A negative reads as zero. A guard that EXTENDED a clip towards a cut would invert the whole
+    point of the policy, so it is refused by clamping rather than honoured.
+    """
+    if value is None:
+        return SCENE_GUARD_SECONDS
+    number = _finite(value)
+    if number is None:
+        return SCENE_GUARD_SECONDS
+    return max(0.0, _quantize(number))
 
 
 def normalize_sensitivity(value: Any) -> int:
@@ -217,10 +361,17 @@ class SourceInfo:
 
 @dataclass(frozen=True)
 class Shot:
-    """One continuous interval between two confirmed scene changes.
+    """One continuous interval between two confirmed scene changes, **after the guard**.
 
     The unit of the whole policy. A shot is either exported (possibly as several pieces, all from
     inside it) or skipped whole — it is never partially merged into a neighbour.
+
+    [FORK] P6: ``start``/``end`` are the **usable** interval, i.e. the detected shot with
+    :data:`SCENE_GUARD_SECONDS` removed at each end that is a detected cut. That is deliberate and
+    it is what makes the record self-consistent: ``duration`` is the length actually judged against
+    the operator's minimum, so a row saying *"3.9s — skip, shorter than the minimum"* is a true
+    statement about the number beside it. The **detected** shot is still recoverable exactly, as
+    ``(start - guard_before, end + guard_after)``.
     """
 
     index: int
@@ -229,10 +380,25 @@ class Shot:
     exported: bool = False
     skip_reason: str = ""
     piece_count: int = 0
+    #: [FORK] P6: seconds the guard removed from this shot's own start and end. Zero at a boundary
+    #: that is the start or the end of the SOURCE, because neither is an estimate. When the two
+    #: guards meet (a detected shot shorter than the bands around it) the shot collapses to a
+    #: point and these two carry its whole detected length between them — the honest reading, since
+    #: the guards really did consume all of it.
+    #:
+    #: New fields are APPENDED: `gui.py` serialises a `Shot` as a fixed six-element list and
+    #: rebuilds it by keyword, so the first six must keep their order.
+    guard_before: float = 0.0
+    guard_after: float = 0.0
 
     @property
     def duration(self) -> float:
         return round(self.end - self.start, 3)
+
+    @property
+    def detected_duration(self) -> float:
+        """The length of the shot as DETECTED, before the guard took anything off it."""
+        return round(self.guard_before + self.duration + self.guard_after, 3)
 
 
 @dataclass(frozen=True)
@@ -263,6 +429,12 @@ class SegmentPlan:
     max_seconds: float = MAX_CLIP_SECONDS_DEFAULT
     detected_scene_count: int = 0
     notes: tuple[str, ...] = ()
+    #: [FORK] P6: the guard actually applied (each side of every detected cut), and the total
+    #: footage it intentionally removed. `guard_discarded` is the measure of the discarded regions
+    #: and cannot double-count: each shot contributes only the two slivers inside its own detected
+    #: interval, and a shot the guards consumed entirely contributes exactly its own length.
+    guard_seconds: float = 0.0
+    guard_discarded: float = 0.0
 
     @property
     def count(self) -> int:
@@ -295,19 +467,46 @@ class SegmentPlan:
         """
         return round(max(0.0, self.source_duration - self.exported_duration), 3)
 
+    @property
+    def skipped_shot_duration(self) -> float:
+        """Usable footage inside shots that were skipped whole — the QUALITY-FIRST loss.
+
+        [FORK] P6. Guard bands are **excluded**: this counts only what survived the guard and was
+        then still too short to export. Reporting the two together would let a guard-band number
+        hide inside a skip number, which is exactly the conflation the owner asked to avoid.
+        """
+        return round(sum(s.duration for s in self.shots if not s.exported), 3)
+
+    @property
+    def dropped_tail_duration(self) -> float:
+        """What is left over once the guard and the skipped shots are accounted for.
+
+        Derived by subtraction from :attr:`skipped_duration` rather than accumulated separately,
+        so the three categories are guaranteed to sum to the total unexported footage instead of
+        being three numbers that merely ought to agree.
+        """
+        return round(max(0.0, self.skipped_duration - self.guard_discarded
+                         - self.skipped_shot_duration), 3)
+
 
 # ---------------------------------------------------------------------------------------------
 # The planner
 # ---------------------------------------------------------------------------------------------
 
 def _usable_scene_times(scene_times: Iterable[Any], duration: float) -> list[float]:
-    """Sorted, de-duplicated interior cut points. Anything outside ``(0, duration)`` is dropped."""
+    """Sorted, de-duplicated interior cut points. Anything outside ``(0, duration)`` is dropped.
+
+    [FORK] Digital-Union (frame-boundary P1): cut points are quantized **downwards**. A cut is
+    the first frame of the next shot and doubles as the exclusive end of this one, so rounding it
+    up by half a millisecond is what let that frame be decoded into the end of the previous clip.
+    See :func:`_quantize_floor`.
+    """
     collected: set[float] = set()
     for value in scene_times or ():
         number = _finite(value)
         if number is None:
             continue
-        moment = _quantize(number)
+        moment = _quantize_floor(number)
         if 0.0 < moment < duration:
             collected.add(moment)
     return sorted(collected)
@@ -353,13 +552,38 @@ def _divide_shot(start: float, end: float, min_seconds: float,
 def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
                   min_seconds: Any = MIN_CLIP_SECONDS_DEFAULT,
                   max_seconds: Any = MAX_CLIP_SECONDS_DEFAULT,
-                  sensitivity: Any = SENSITIVITY_DEFAULT) -> SegmentPlan:
+                  sensitivity: Any = SENSITIVITY_DEFAULT,
+                  guard_seconds: Any = None) -> SegmentPlan:
     """Select the usable shots from a duration plus its detected scene changes.
 
     Shot by shot, with no cross-boundary arithmetic anywhere: each interval between confirmed
     scene changes is judged on its own and is either divided into exportable pieces or skipped
     whole. That is what makes "no exported clip spans a scene change" structural rather than
     checked afterwards.
+
+    **[FORK] Digital-Union (frame-boundary P6): the conservative guard, and exactly where it is
+    not applied.** Each detected scene change is treated as an estimate with a known error bound
+    (see :data:`SCENE_GUARD_SECONDS`), so the shot before it ends ``guard`` seconds early and the
+    shot after it starts ``guard`` seconds late. The footage between those two is discarded on
+    purpose and nothing is ever merged across the cut to recover it.
+
+    Three boundaries deliberately get **no** guard, because none of them is an estimate:
+
+    * the **start of the source** — position 0 opens at 0.0 exactly;
+    * the **end of the source** — the final shot closes at ``total`` exactly;
+    * a **time split inside one shot** — :func:`_divide_shot` divides the already-guarded interval,
+      and its pieces tile it with no gap. A 30 s uninterrupted shot cut into three 10 s clips
+      loses no frame at 10 s or 20 s, because there is no scene change there to be wrong about.
+
+    The quantizers carry the direction: a guarded start rounds **up** and a guarded end rounds
+    **down**, so millisecond rounding can only ever move a boundary further from the cut.
+
+    When two detected cuts are closer together than twice the guard their bands meet, and the shot
+    between them has nothing left. That is handled by collapsing it to a point and recording it as
+    skipped — never as a negative duration, an overlap, or an invented frame — and never by
+    merging its neighbours across either cut.
+
+    ``guard_seconds`` exists for measurement, not for the operator; see :func:`_resolve_guard`.
 
     Raises :class:`RawCutterError` for an unusable duration or contradictory bounds. Everything
     else is absorbed: unusable scene times are ignored rather than fatal, because the detector is
@@ -374,19 +598,43 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
     total = _quantize(total)
     low, high = normalize_durations(min_seconds, max_seconds)
     level = normalize_sensitivity(sensitivity)
+    guard = _resolve_guard(guard_seconds)
 
     usable = _usable_scene_times(scene_times, total)
     boundaries = [0.0] + usable + [total]
+    final = len(boundaries) - 2
 
     shots: list[Shot] = []
     segments: list[Segment] = []
     dropped_tails = 0.0
+    guard_discarded = 0.0
 
     for position in range(len(boundaries) - 1):
-        start, end = boundaries[position], boundaries[position + 1]
-        if end - start <= 0:
+        detected_start, detected_end = boundaries[position], boundaries[position + 1]
+        if detected_end - detected_start <= 0:
             continue
+
+        # The guard applies at DETECTED CUTS and nowhere else. Position 0 opens at the start of the
+        # source and the last shot closes at its end; neither is a detection, so neither pays.
+        start = (_quantize_ceil(detected_start + guard) if position > 0 else detected_start)
+        end = (_quantize_floor(detected_end - guard) if position < final else detected_end)
+
+        if end <= start:
+            # The bands around the two cuts meet or overlap: this detected shot is shorter than the
+            # guards that bracket it, so no part of it can be exported. Collapse it to the midpoint
+            # of the DETECTED interval -- deterministic, inside the source, never negative -- and
+            # still record it, so the report names a skipped shot rather than quietly losing one.
+            middle = min(max(_quantize((detected_start + detected_end) / 2.0), detected_start),
+                         detected_end)
+            start = end = middle
+
+        before = round(start - detected_start, 3)
+        after = round(detected_end - end, 3)
+        guard_discarded += before + after
+
         shot_index = len(shots) + 1
+        # A collapsed shot has zero length, so this returns no pieces: the minimum is positive by
+        # construction (`normalize_durations`), which is why the degenerate case needs no branch.
         pieces, dropped = _divide_shot(start, end, low, high)
 
         if not pieces:
@@ -395,14 +643,16 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
             # twice -- once truthfully as a skipped shot, and once as "leftover tail dropped from
             # the end of long shots", which it never was.
             shots.append(Shot(index=shot_index, start=start, end=end, exported=False,
-                              skip_reason=SKIP_TOO_SHORT))
+                              skip_reason=SKIP_TOO_SHORT,
+                              guard_before=before, guard_after=after))
             continue
 
         dropped_tails += dropped
 
         shots.append(Shot(index=shot_index, start=start, end=end, exported=True,
                           piece_count=len(pieces),
-                          skip_reason=SKIP_REMAINDER if dropped > 0 else ""))
+                          skip_reason=SKIP_REMAINDER if dropped > 0 else "",
+                          guard_before=before, guard_after=after))
         for piece_start, piece_end in pieces:
             at_shot_end = abs(piece_end - end) <= TIME_QUANTUM
             kind = SOURCE_END if (at_shot_end and abs(end - total) <= TIME_QUANTUM) else (
@@ -410,8 +660,10 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
             segments.append(Segment(index=len(segments) + 1, start=piece_start, end=piece_end,
                                     shot_index=shot_index, boundary_kind=kind))
 
-    notes = _build_notes(shots, segments, low, high, usable, dropped_tails)
-    _assert_invariants(segments, shots, total, low, high, usable)
+    guard_discarded = round(guard_discarded, 3)
+    notes = _build_notes(shots, segments, low, high, usable, dropped_tails, guard,
+                         guard_discarded)
+    _assert_invariants(segments, shots, total, low, high, usable, guard)
 
     return SegmentPlan(
         segments=tuple(segments),
@@ -423,15 +675,29 @@ def plan_segments(duration: Any, scene_times: Iterable[Any] = (),
         max_seconds=high,
         detected_scene_count=len(usable),
         notes=tuple(notes),
+        guard_seconds=guard,
+        guard_discarded=guard_discarded,
     )
 
 
 def _build_notes(shots: Sequence[Shot], segments: Sequence[Segment], low: float, high: float,
-                 usable: Sequence[float], dropped_tails: float) -> list[str]:
+                 usable: Sequence[float], dropped_tails: float, guard: float,
+                 guard_discarded: float) -> list[str]:
     notes: list[str] = []
     if not usable:
         notes.append("No scene changes were detected, so the whole source was treated as one "
                      "continuous shot.")
+    elif guard > 0:
+        # [FORK] P6: stated as a deliberate cost with its reason, not buried in the skip total.
+        notes.append(f"{format_timecode(guard_discarded)} was trimmed away in {guard:g}s safety "
+                     f"margins either side of {len(usable)} detected scene change(s). The "
+                     f"detected time is an estimate, so standing back from it is what keeps "
+                     f"frames of the neighbouring shot out of a clip. Splits inside a continuous "
+                     f"shot, and the start and end of the source, lose nothing.")
+    collapsed = [s for s in shots if not s.exported and s.duration <= 0]
+    if collapsed:
+        notes.append(f"{len(collapsed)} shot(s) were shorter than the safety margins around the "
+                     f"cuts that define them, so nothing of them remained to export.")
     skipped = [s for s in shots if not s.exported]
     if skipped:
         notes.append(f"{len(skipped)} shot(s) were skipped for being shorter than the {low:g}s "
@@ -448,12 +714,17 @@ def _build_notes(shots: Sequence[Shot], segments: Sequence[Segment], low: float,
 
 
 def _assert_invariants(segments: Sequence[Segment], shots: Sequence[Shot], duration: float,
-                       low: float, high: float, scene_times: Sequence[float]) -> None:
+                       low: float, high: float, scene_times: Sequence[float],
+                       guard: float = 0.0) -> None:
     """The four guarantees, checked on every plan rather than trusted.
 
     Cheap, and it runs in production rather than only under test: a selection bug that exported a
     clip across a scene change would otherwise be discovered as a ruined source clip an hour of
     encoding later. Note what is NOT asserted any more -- complete coverage. Gaps are the point.
+
+    [FORK] P6: the scene-change check is now a GUARD BAND check. A segment may not intersect
+    ``(cut - guard, cut + guard)`` at all, which is strictly stronger than the old "must not
+    contain the cut" and reduces to exactly that old test when ``guard`` is zero.
     """
     cuts = set(scene_times)
     for previous, following in zip(segments, segments[1:]):
@@ -479,6 +750,12 @@ def _assert_invariants(segments: Sequence[Segment], shots: Sequence[Shot], durat
                 raise RawCutterError(
                     f"Segment {segment.index} ({segment.start}..{segment.end}) spans the scene "
                     f"change at {cut}.")
+            if (segment.start < cut + guard - TIME_QUANTUM
+                    and segment.end > cut - guard + TIME_QUANTUM):
+                raise RawCutterError(
+                    f"Segment {segment.index} ({segment.start}..{segment.end}) reaches inside the "
+                    f"{guard:g}s safety margin around the scene change at {cut}, so it could "
+                    f"carry a frame of the neighbouring shot.")
     for shot in shots:
         if shot.exported and shot.piece_count <= 0:
             raise RawCutterError(f"Shot {shot.index} is marked exported but produced no clip.")
@@ -652,13 +929,23 @@ def plan_summary_text(plan: SegmentPlan, source: SourceInfo) -> str:
         f"SKIP     {len(skipped)} shot(s), "
         f"{format_timecode(plan.skipped_duration)} of footage not exported",
         "",
+        # [FORK] P6: the unexported total, broken into its three causes. One number for "not
+        # exported" lets a safety margin and a short shot hide in each other; the owner asked for
+        # them to be distinguishable, and a plan that cannot say which is which cannot be audited.
+        f"  of which {format_timecode(plan.guard_discarded)} is safety margin around "
+        f"{plan.detected_scene_count} detected cut(s) at {plan.guard_seconds:g}s each side",
+        f"  of which {format_timecode(plan.skipped_shot_duration)} is shots too short to keep",
+        f"  of which {format_timecode(plan.dropped_tail_duration)} is leftover tail",
+        "",
         f"Detection: sensitivity {plan.sensitivity}, scene threshold {plan.threshold:g}, "
         f"{plan.detected_scene_count} scene change(s) found.",
         f"Lengths: {plan.min_seconds:g}s minimum, {plan.max_seconds:g}s maximum.",
     ]
     lines.append("")
     lines.append("Skipped footage is intentional — the Raw Cutter keeps clean continuous shots "
-                 "and leaves the rest. It is not trying to preserve every frame.")
+                 "and leaves the rest. It is not trying to preserve every frame, and around a "
+                 "detected cut it deliberately trims back rather than risk a frame of the "
+                 "neighbouring shot.")
     lines.extend(f"Note: {note}" for note in plan.notes)
     lines.append("")
     if plan.has_work:
@@ -674,6 +961,7 @@ __all__ = [
     "PLAN_TABLE_HEADERS",
     "RawCutterError",
     "SCENE_CUT",
+    "SCENE_GUARD_SECONDS",
     "SENSITIVITY_DEFAULT",
     "SENSITIVITY_MAX",
     "SENSITIVITY_MIN",

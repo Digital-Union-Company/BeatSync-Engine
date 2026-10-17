@@ -12,7 +12,6 @@ Cutting raw footage is not a render and must not acquire a render's machinery.
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import threading
 import time
@@ -43,6 +42,11 @@ EXPORT_TIMEOUT_SECONDS = 1800
 
 #: Matches `detect_video_scene_changes`'s own analysis geometry, so the Raw Cutter and Stage 5 see
 #: the same cuts for the same threshold rather than two slightly different estimates.
+#:
+#: [FORK] Digital-Union (frame-boundary P6): this is the ONLY scene analysis the Raw Cutter runs.
+#: The per-cut native-frame refinement pass that P1-P5 built on top of it is gone -- see
+#: `detect_scenes`, and `beatsync_fork.raw_cutter.SCENE_GUARD_SECONDS` for what replaced it.
+#: Nothing about this pass changed: same rate, same width, same threshold, same cuts.
 ANALYSIS_FPS = 8.0
 ANALYSIS_WIDTH = 384
 
@@ -205,7 +209,25 @@ class SceneResult:
 
 
 def detect_scenes(path: str, threshold: float, job: CutterJob | None = None) -> SceneResult:
-    """Run one CPU scene-score pass and report whether it actually ran."""
+    """Run one CPU scene-score pass and report whether it actually ran.
+
+    **[FORK] Digital-Union (frame-boundary P6): exactly one FFmpeg child, whatever the source.**
+    P1-P5 followed this pass with a second native-frame refinement decode *per detected cut*, to
+    turn each 1/8 s grid label into the real frame time. That machinery is gone. The cost was
+    structural -- one extra subprocess per cut, so a source with 200 cuts paid 200 of them -- and
+    the benefit was never reliable: refinement has to IDENTIFY the cut frame, and a cut whose own
+    inter-frame difference does not clear the operator's sensitivity cannot be identified at all,
+    however the candidates in the bracket are ranked.
+
+    The owner's policy replaces it with a conservative margin: the planner stands back
+    `SCENE_GUARD_SECONDS` from every reported cut and throws the footage in between away. That
+    needs only the detector's measured error BOUND, not the cut's position, so it holds on exactly
+    the sources refinement could not help. See `beatsync_fork.raw_cutter.SCENE_GUARD_SECONDS` for
+    the bound and the arithmetic.
+
+    So the value returned here is deliberately the **coarse grid estimate**, with no claim to be a
+    frame time. Nothing downstream should treat it as one.
+    """
     command = [
         FFMPEG_PATH, '-nostdin', '-hide_banner',
         '-threads', str(MAX_THREADS),
@@ -234,6 +256,20 @@ def detect_scenes(path: str, threshold: float, job: CutterJob | None = None) -> 
         return SceneResult(succeeded=False, elapsed_seconds=elapsed,
                            error=_short_ffmpeg_error(result.stderr, max_chars=800)
                                  or "Scene detection failed.")
+    # [FORK] Digital-Union (frame-boundary P6): the coarse pass resamples to ANALYSIS_FPS BEFORE
+    # scoring, so every time it reports sits on the 1/8 s grid and is a LABEL rather than a frame
+    # time. That is returned as-is, deliberately.
+    #
+    # The planner is what makes it safe: it stands `SCENE_GUARD_SECONDS` back from each of these
+    # values on both sides and discards the footage in between, which needs the detector's error
+    # bound rather than its exact answer. Nothing here should try to sharpen the value -- that is
+    # what the removed refinement pass did, at one extra FFmpeg child per cut, and it could not
+    # help on precisely the cuts that most needed it.
+    #
+    # Note what this also removes: the container-origin conversion. There is no `-copyts` reading
+    # left to convert, because the coarse pass already reports on the planner's axis. A source
+    # whose timestamps do not start at zero therefore needs no special handling at all, rather
+    # than needing a probe that P1 omitted and P3 had to add.
     return SceneResult(times=tuple(_extract_scene_times(result.stderr)), succeeded=True,
                        elapsed_seconds=elapsed)
 
@@ -257,26 +293,56 @@ def build_segment_command(source_path: str, destination: str, start: float, dura
 
     `-ss` before `-i` is the fast accurate seek: FFmpeg seeks to the preceding keyframe and decodes
     forward, so the output starts on the requested frame while skipping the decode of everything
-    before it. `-t` bounds the piece by duration rather than by an absolute end, which keeps each
-    export independent of the others.
+    before it.
 
-    No `-vf`, no `-s`, no `-r`: the source's own resolution, aspect ratio and frame rate are
-    preserved by saying nothing about them. `-map 0:v:0` pins the video stream explicitly so a
-    multi-stream container cannot silently export a different one than was probed.
+    **[FORK] Digital-Union (frame-boundary P5): the clip's membership is decided by the frames'
+    OWN timestamps, not by an output duration.** A segment means the half-open source interval
+    ``[start, start + duration)``, and `trim` is the only bound measured to deliver exactly that.
+
+    An output-side ``-t`` cannot, and the reason is not a rounding error. Measured: the effective
+    end is ``start + duration`` *except* when the first frame FFmpeg actually decodes sits less
+    than half a frame interval after ``-ss``, where the muxer re-zeroes the clip's own timeline and
+    the whole window slides later by that gap -- 15.667 ms but not 16.667 ms at 30 fps, 19.0 but
+    not 20.0 at 25 fps, 7.667 but not 8.333 at 60 fps, i.e. ``0.5/fps``. The gap between ``-ss``
+    and the first decoded frame is under a millisecond for a floored scene cut but spans most of a
+    frame interval for a maximum-duration time split, so NO single duration is right for both: P3's
+    "one millisecond less" leaked the next shot's first frame at a split that ended on a cut
+    (measured on 47 % of start alignments) and dropped a real frame at ordinary interior splits.
+    Over the same 69 boundaries -- five frame rates, four time bases, four timestamp origins, MP4
+    and Matroska, VFR, long-GOP B-frames -- the measured membership failures were: stock ``-t D``
+    18, P3 ``-t D-1ms`` 10, container-absolute ``-to`` with an output offset 4, and **`trim` 0**.
+
+    So: ``-t`` moves BEFORE ``-i``, where it bounds the READ rather than the content (one second
+    past the segment is ample -- the seek gap is under one frame), and `trim` bounds the content on
+    the frames' own presentation times. Without ``-copyts`` those times are seek-relative, measured
+    identical at timestamp origins of 0, 5, 7.25 and 30 seconds, so the bound needs no knowledge of
+    the container's origin and no extra probe. ``setpts=PTS-STARTPTS`` puts the clip's own timeline
+    back at zero, which a container-absolute ``-to`` does not.
+
+    `trim`/`setpts` change no geometry: no `-s`, no `-r`, no `scale`, no `setsar`/`setdar`, so the
+    source's resolution, aspect ratio and frame rate are still preserved by saying nothing about
+    them. `-map 0:v:0` pins the video stream explicitly so a multi-stream container cannot silently
+    export a different one than was probed. The function stays pure argument assembly and
+    deliberately names no module constant but `FFMPEG_PATH`, which is what lets the seam suite
+    extract and execute it on its own -- the read guard is written inline for that reason.
     """
     command = [
         FFMPEG_PATH, '-nostdin', '-hide_banner', '-v', 'error',
         '-ss', f"{start:.3f}",
+        # INPUT-side: bounds what the demuxer READS. `trim` below bounds what the clip CONTAINS.
+        '-t', f"{duration + 1.0:.3f}",
         '-i', source_path,
-        '-t', f"{duration:.3f}",
         '-map', '0:v:0',
+        '-vf', f"trim=end={duration:.6f},setpts=PTS-STARTPTS",
     ]
     if remove_audio or not has_audio:
         # `-an` drops the stream itself, not merely its level: the output container ends up with
         # no audio stream at all, which is what "Remove Audio" has to mean to be worth having.
         command.append('-an')
     else:
-        command.extend(['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '192k'])
+        command.extend(['-map', '0:a:0?',
+                        '-af', f"atrim=end={duration:.6f},asetpts=PTS-STARTPTS",
+                        '-c:a', 'aac', '-b:a', '192k'])
 
     if encoder == 'h264_nvenc':
         command.extend(['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '21', '-pix_fmt', 'yuv420p'])
@@ -377,6 +443,23 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
         if on_progress is not None:
             on_progress(segment.index, total, name)
 
+        # [FORK] Digital-Union (frame-boundary P5): the PLANNED duration is what gets exported.
+        #
+        # P3 passed one millisecond less than planned, to compensate for an output-side `-t`
+        # sliding later by the gap between `-ss` and the first frame actually decoded. That
+        # compensation was right only for the one case it was measured on. A floored scene-cut
+        # start sits under a millisecond below its frame, so one millisecond covered it -- but a
+        # maximum-duration time split starts at a plain quantized time, where the gap spans most of
+        # a frame interval, and the same window slid straight past a scene cut at the segment's
+        # end. Measured end-to-end: a three-way split whose last piece ended on a hard cut exported
+        # the next shot's first frame (and duplicated it into the following clip) at 30 and 25 fps,
+        # on both encoders. The same unconditional millisecond also DROPPED real frames at ordinary
+        # interior splits -- two inside one continuous 29.97 fps shot -- where stock and P1 kept
+        # every frame.
+        #
+        # So the compensation is gone rather than enlarged, and `build_segment_command` bounds the
+        # clip on the frames' own timestamps instead. See its docstring for the five shapes that
+        # were measured over the same 69 boundaries and why `trim` is the only one that holds.
         command = build_segment_command(source.path, staging, segment.start, segment.duration,
                                         remove_audio, encoder, source.has_audio)
         failure = ""

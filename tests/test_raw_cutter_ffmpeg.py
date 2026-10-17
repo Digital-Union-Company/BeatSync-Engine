@@ -16,6 +16,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -144,6 +145,10 @@ def adapter():
               "_parse_rate", "probe_source", "detect_scenes", "build_segment_command",
               "_validate_output", "export_segments", "_discard_staging",
               "prepare_run_directory",
+              # [FORK] frame-boundary P6: `detect_scenes` is one coarse pass again. The per-cut
+              # native refinement helpers P1-P5 needed here are gone, because the machinery they
+              # supported is gone -- the planner now stands a fixed margin back from every
+              # reported cut instead. See `beatsync_fork.raw_cutter.SCENE_GUARD_SECONDS`.
               "SCENE_TIMEOUT_SECONDS", "PROBE_TIMEOUT_SECONDS", "EXPORT_TIMEOUT_SECONDS",
               "ANALYSIS_FPS", "ANALYSIS_WIDTH", "SUPPORTED_SOURCE_SUFFIXES")
     nodes = [n for n in tree.body
@@ -378,7 +383,17 @@ def test_the_exported_segments_preserve_the_source_geometry(adapter, tmp_path):
         assert info.stdout.strip().startswith("320,180"), info.stdout
 
 
-def test_the_exported_segments_tile_the_source_duration(adapter, tmp_path):
+def test_the_exported_segments_account_for_the_source_duration(adapter, tmp_path):
+    """[FORK] P6. The old form of this test asserted the clips TILE the source to within 0.6 s.
+
+    Under the owner's conservative-trim policy that is no longer true and must not be asserted:
+    four shots mean three detected cuts, and each costs two guards. Measured, this fixture
+    exports 6.8 s of its 8.0 s -- and the missing 1.2 s is exactly `3 x 2 x 0.2`.
+
+    So the expectation is replaced rather than loosened: the exported total plus what the plan
+    SAYS it discarded must equal the source. A tolerance wide enough to absorb the guard would
+    have hidden a real coverage bug of the same size, which is the failure mode this avoids.
+    """
     path = _make_video(tmp_path / "cover.mp4", [2, 2, 2, 2])
     source, plan = _plan_for(adapter, path)
     run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "coverout"), path, "t5")
@@ -386,7 +401,13 @@ def test_the_exported_segments_tile_the_source_duration(adapter, tmp_path):
                                          remove_audio=True, encoder='libx264')
     assert all(r.ok for r in results)
     total = sum(_duration(r.path) for r in results)
-    assert total == pytest.approx(source.duration, abs=0.6)
+
+    assert plan.guard_discarded == pytest.approx(
+        2 * plan.detected_scene_count * rc.SCENE_GUARD_SECONDS, abs=1e-9)
+    assert total + plan.skipped_duration == pytest.approx(source.duration, abs=0.6)
+    # And the discarded footage is guard, not quietly dropped material.
+    assert plan.skipped_shot_duration == 0.0 and plan.dropped_tail_duration == 0.0, (
+        plan.skipped_shot_duration, plan.dropped_tail_duration)
 
 
 # =============================================================================================
@@ -632,3 +653,684 @@ def test_cancellation_reports_the_files_that_were_actually_written(adapter, tmp_
     assert sorted(os.path.basename(r.path) for r in kept) == written
     for name in written:
         assert _duration(os.path.join(run_dir, name)) > 0
+
+# =============================================================================================
+# [FORK] Digital-Union (frame-boundary P6): the CONSERVATIVE GUARD, measured on decoded pixels.
+#
+# The property the owner cares about is unchanged and is still the first thing asserted here: no
+# exported clip may contain a frame of a neighbouring shot. What changed is how it is delivered.
+# P1-P5 tried to find the cut's exact frame with a second native-frame FFmpeg pass per cut; P6
+# stands a fixed `SCENE_GUARD_SECONDS` margin back from the coarse estimate on both sides and
+# discards the footage in between.
+#
+# So the frame-conservation expectations in this section are deliberately gone: frames around a
+# detected cut ARE now intentionally lost, and the replacement assertions say exactly which ones
+# and prove that nothing outside those bands went missing. A clip that merely has about the right
+# duration still proves nothing; every test below decodes real pixels.
+# =============================================================================================
+
+_SIZE = "320x240"
+_W, _H = 320, 240
+
+
+def _make_frame_exact_cut(path, rate, frames_a, frames_b,
+                          colour_a="black", colour_b="white"):
+    """Exactly `frames_a` frames of one colour, a hard cut, then `frames_b` of another.
+
+    `trim=end_frame=` counts FRAMES, so the cut lands on a known frame index rather than on a
+    duration that the muxer may round.
+    """
+    result = _run([
+        FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+        '-f', 'lavfi', '-i', f"color={colour_a}:s={_SIZE}:r={rate}",
+        '-f', 'lavfi', '-i', f"color={colour_b}:s={_SIZE}:r={rate}",
+        '-filter_complex',
+        f"[0:v]trim=end_frame={frames_a},setpts=PTS-STARTPTS[a];"
+        f"[1:v]trim=end_frame={frames_b},setpts=PTS-STARTPTS[b];"
+        f"[a][b]concat=n=2:v=1:a=0[v]",
+        '-map', '[v]', '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '0',
+        '-pix_fmt', 'yuv420p', '-g', '30', '-r', str(rate), str(path)])
+    assert result.returncode == 0, result.stderr[-2000:]
+    return str(path)
+
+
+def _frame_labels(path):
+    """Every DECODED frame as 'A' (dark) or 'B' (bright), in presentation order.
+
+    Raw gray output, so this is the frame's own pixels -- not a container duration, not a
+    keyframe index, and not something a seek could fabricate.
+
+    `-fps_mode passthrough` is load-bearing on a variable-rate clip: without it FFmpeg resamples
+    the rawvideo output to the container's nominal `r_frame_rate`, and a 60 fps passage counts as
+    half its real length. Measured on the VFR fixture: 317 frames instead of 270. That would be
+    indistinguishable from the exporter losing frames.
+    """
+    result = subprocess.run(
+        [FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', '-i', str(path),
+         '-map', '0:v:0', '-fps_mode', 'passthrough',
+         '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+        capture_output=True, timeout=180)
+    assert result.returncode == 0, result.stderr[-2000:]
+    raw, size, out = result.stdout, _W * _H, []
+    for offset in range(0, len(raw) - size + 1, size):
+        mean = sum(raw[offset:offset + size]) / size
+        out.append("A" if mean <= 40 else ("B" if mean >= 215 else "?"))
+    return "".join(out)
+
+
+def _cut_and_label(adapter, path, tmp_path, name, minimum=1.0, maximum=300.0,
+                   encoder='libx264', remove_audio=True):
+    source, plan = _plan_for(adapter, path, minimum=minimum, maximum=maximum)
+    run_dir, error = adapter["prepare_run_directory"](str(tmp_path / name), path, name)
+    assert not error, error
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=remove_audio, encoder=encoder)
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    return plan, [(_frame_labels(r.path), r) for r in results]
+
+
+def _source_frame_times(path):
+    """Every source frame's presentation time, on the PLANNER axis (first frame = 0.0).
+
+    FFprobe answers on the CONTAINER axis, which begins at the stream's own `start_time` and
+    need not be zero. The plan is expressed in planner time. Comparing the two directly is what
+    makes a correct non-zero-origin export look as if it had lost 150 frames when it lost 12.
+    """
+    result = _run([FFPROBE, '-v', 'error', '-select_streams', 'v:0',
+                   '-show_entries', 'frame=pts_time', '-of', 'csv=p=0', str(path)], timeout=600)
+    values = sorted(float(v) for v in re.findall(r"([0-9]+\.?[0-9]*)", result.stdout or ""))
+    return [round(v - values[0], 6) for v in values] if values else []
+
+
+def _guard_audit(adapter, path, plan, labelled):
+    """Attribute every source frame that reached no clip to exactly one declared cause.
+
+    Returns ``(by_cause, unexplained)``. "Not exported" is not a defect under this policy; being
+    unable to say WHY is. `unexplained` is the number that has to be zero.
+    """
+    guard = plan.guard_seconds
+    cuts = rc._usable_scene_times(
+        [c for c in _detected(adapter, path)], plan.source_duration)
+    bands = [(c - guard, c + guard) for c in cuts]
+    kept = [(s.start, s.end) for s in plan.segments]
+    skipped = [(s.start, s.end) for s in plan.shots if not s.exported]
+    exported = [(s.start, s.end) for s in plan.shots if s.exported]
+
+    by_cause = {"guard_band": 0, "skipped_shot": 0, "dropped_tail": 0}
+    unexplained = []
+    for moment in _source_frame_times(path):
+        if any(a - 1e-9 <= moment < b - 1e-9 for a, b in kept):
+            continue
+        if any(a - 1e-9 <= moment <= b + 1e-9 for a, b in bands):
+            by_cause["guard_band"] += 1
+        elif any(a - 1e-9 <= moment < b + 1e-9 for a, b in skipped):
+            by_cause["skipped_shot"] += 1
+        elif any(a - 1e-9 <= moment < b + 1e-9 for a, b in exported):
+            by_cause["dropped_tail"] += 1
+        else:
+            unexplained.append(moment)
+    return by_cause, unexplained
+
+
+_DETECTED_CACHE = {}
+
+
+def _detected(adapter, path):
+    if path not in _DETECTED_CACHE:
+        scenes = adapter["detect_scenes"](path, 0.27)
+        assert scenes.succeeded, scenes.error
+        _DETECTED_CACHE[path] = list(scenes.times)
+    return _DETECTED_CACHE[path]
+
+
+# ------------------------------------------------------------------ fixture builders carried
+# forward from the P3/P5 sections, unchanged in behaviour: the fixtures were never the problem.
+
+def _make_offset_cut(path, rate, frames_a, frames_b, offset,
+                     colour_a="black", colour_b="white"):
+    """A frame-exact hard cut in a container whose timestamps START AT `offset` seconds.
+
+    `-output_ts_offset` on a stream copy moves the stream's `start_time` without touching a single
+    frame, so the cut is still at frame `frames_a` of the file and still at `frames_a / rate` on
+    the planner's axis -- only the container's own numbering changes.
+    """
+    plain = _make_frame_exact_cut(path.parent / (path.name + ".plain.mp4"), rate,
+                                  frames_a, frames_b, colour_a, colour_b)
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+                   '-i', plain, '-map', '0:v:0', '-c:v', 'copy',
+                   '-output_ts_offset', str(offset), str(path)])
+    assert result.returncode == 0, result.stderr[-2000:]
+    return str(path)
+
+
+def _make_edit_list_cut(path, rate, frames_a, frames_b, delay=0.5):
+    """The same cut in an MP4 that delays presentation with an EDIT LIST rather than a pts shift.
+
+    A different mechanism from `_make_offset_cut` and worth covering separately: an edit list
+    leaves `start_time` alone and is applied by the demuxer, so a reader that only consults
+    `start_time` sees a zero-based file that does not behave like one.
+    """
+    plain = _make_frame_exact_cut(path.parent / (path.name + ".plain.mp4"), rate,
+                                  frames_a, frames_b)
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+                   '-itsoffset', str(delay), '-i', plain, '-map', '0:v:0', '-c:v', 'copy',
+                   '-movflags', '+faststart', str(path)])
+    assert result.returncode == 0, result.stderr[-2000:]
+    return str(path)
+
+
+def _make_three_shots(path, counts, rate=30):
+    """Frame-exact hard cuts between N DISTINCT solid shots."""
+    inputs = []
+    chains = []
+    for index, count in enumerate(counts):
+        inputs.extend(['-f', 'lavfi', '-i',
+                       "color=%s:s=%s:r=%s" % (_COLOURS[index % len(_COLOURS)], _SIZE, rate)])
+        chains.append("[%d:v]trim=end_frame=%d,setpts=PTS-STARTPTS[s%d];" % (index, count, index))
+    joins = "".join("[s%d]" % i for i in range(len(counts)))
+    result = _run([
+        FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', *inputs,
+        '-filter_complex',
+        "".join(chains) + "%sconcat=n=%d:v=1:a=0[v]" % (joins, len(counts)),
+        '-map', '[v]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '0',
+        '-pix_fmt', 'yuv420p', '-g', '30', '-r', str(rate), str(path)])
+    assert result.returncode == 0, result.stderr[-2000:]
+    return str(path)
+
+
+def _make_vfr_source(path, counts, rates):
+    """One file whose shots were genuinely authored at DIFFERENT frame rates.
+
+    Built by concatenating separately-encoded parts with `-c copy` and `-fps_mode passthrough`,
+    so the result really carries three different inter-frame intervals rather than one nominal
+    rate with duplicated frames. Verified by the caller through the decoded timestamps.
+    """
+    parts = []
+    for index, (count, rate) in enumerate(zip(counts, rates)):
+        part = path.parent / ("_vfr_%d.mp4" % index)
+        result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+                       '-f', 'lavfi', '-i',
+                       "color=%s:s=%s:r=%s" % (_COLOURS[index % len(_COLOURS)], _SIZE, rate),
+                       '-frames:v', str(count), '-c:v', 'libx264', '-preset', 'veryfast',
+                       '-crf', '0', '-pix_fmt', 'yuv420p', '-g', '30', str(part)])
+        assert result.returncode == 0, result.stderr[-2000:]
+        parts.append(part)
+    listing = path.parent / (path.name + ".txt")
+    with open(listing, "w", encoding="utf-8") as handle:
+        for part in parts:
+            handle.write("file '%s'\n" % str(part).replace("\\", "/"))
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error',
+                   '-f', 'concat', '-safe', '0', '-i', str(listing),
+                   '-map', '0:v:0', '-c:v', 'copy', '-fps_mode', 'passthrough', str(path)])
+    assert result.returncode == 0, result.stderr[-2000:]
+    return str(path)
+
+
+def _coarse_native(adapter, path, threshold=0.27):
+    """Every ADJACENT-frame transition above the threshold, whole file, no `fps` filter.
+
+    Used by fixtures to prove they contain the transitions they claim to -- so a test that passes
+    because its fixture was inert is distinguishable from one that passes because the code is
+    right.
+    """
+    result = _run([
+        FFMPEG, '-nostdin', '-hide_banner', '-threads', '2', '-i', path,
+        '-vf', "scale=%s:-2:flags=fast_bilinear,select='gt(scene,%s)',showinfo"
+               % (adapter["ANALYSIS_WIDTH"], threshold),
+        '-an', '-sn', '-dn', '-f', 'null', '-'], timeout=600)
+    return [float(m) for m in re.findall(r"pts_time:([0-9]+\.?[0-9]*)", result.stderr or "")]
+
+
+# ------------------------------------------------------------------ N-way frame provenance
+#
+# `_frame_labels` answers A/B, which is enough for a two-shot fixture. Three or more shots need
+# the frame attributed to WHICH shot, and the shot's appearance is measured from the source
+# itself rather than assumed from the colour name -- a fixture that drifted would otherwise look
+# like a leak.
+
+def _frame_means(path):
+    """Mean luminance of every DECODED frame, in presentation order. See `_frame_labels` on
+    why `-fps_mode passthrough` is required."""
+    result = subprocess.run(
+        [FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', '-i', str(path),
+         '-map', '0:v:0', '-fps_mode', 'passthrough',
+         '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+        capture_output=True, timeout=180)
+    assert result.returncode == 0, result.stderr[-2000:]
+    raw, size, out = result.stdout, _W * _H, []
+    for offset in range(0, len(raw) - size + 1, size):
+        out.append(sum(raw[offset:offset + size]) / size)
+    return out
+
+
+def _shot_profile(source, counts):
+    """Each shot's own mean luminance, measured from the SOURCE at its known frame range."""
+    means = _frame_means(source)
+    assert len(means) == sum(counts), (
+        "the fixture decoded %d frames, not the %d it was authored with" % (len(means),
+                                                                            sum(counts)))
+    profile, at = [], 0
+    for count in counts:
+        block = means[at:at + count]
+        profile.append(sum(block) / len(block))
+        at += count
+    # The shots must be distinguishable, or a leak could not be seen.
+    for i in range(len(profile)):
+        for j in range(i + 1, len(profile)):
+            assert abs(profile[i] - profile[j]) > 12.0, (
+                "shots %d and %d look alike (%.1f vs %.1f), so this fixture cannot detect a leak"
+                % (i, j, profile[i], profile[j]))
+    return profile, counts
+
+
+def _classify(values, profile, tolerance=6.0):
+    """Map each frame mean onto the index of the shot it came from, or -1 if it matches none."""
+    out = []
+    for value in values:
+        best = min(range(len(profile)), key=lambda i: abs(value - profile[i]))
+        out.append(best if abs(value - profile[best]) <= tolerance else -1)
+    return out
+
+
+def _rate_value(rate):
+    """`"30000/1001"` -> 29.97. A fixture literal, parsed rather than evaluated."""
+    text = str(rate)
+    if "/" in text:
+        num, den = text.split("/", 1)
+        return float(num) / float(den)
+    return float(text)
+
+
+# ------------------------------------------------------------------ the core provenance tests
+
+@pytest.mark.parametrize("rate,frames_a,frames_b", [
+    ("30", 92, 98),
+    ("60", 184, 190),
+    ("25", 77, 80),
+    ("24000/1001", 74, 80),
+    ("30000/1001", 92, 95),
+])
+def test_no_frame_of_the_next_scene_is_decoded_into_the_clip_before_it(
+        adapter, tmp_path, rate, frames_a, frames_b):
+    """THE regression, and the one assertion the whole policy exists to keep true."""
+    path = _make_frame_exact_cut(tmp_path / "cut.mp4", rate, frames_a, frames_b)
+    plan, labelled = _cut_and_label(adapter, path, tmp_path, "boundary")
+    assert len(labelled) == 2, [s.boundary_kind for s in plan.segments]
+
+    first, second = labelled[0][0], labelled[1][0]
+    assert "B" not in first, (
+        f"{first.count('B')} frame(s) of the following scene were decoded into the end of the "
+        f"first clip: {first[-12:]}")
+    assert "A" not in second, (
+        f"{second.count('A')} frame(s) of the previous scene leaked into the second clip: "
+        f"{second[:12]}")
+    assert "?" not in first + second, "a frame was neither scene A nor scene B"
+
+
+@pytest.mark.parametrize("rate,frames_a,frames_b", [
+    ("30", 92, 98),
+    ("60", 184, 190),
+    ("25", 77, 80),
+])
+def test_every_frame_the_two_clips_do_not_carry_lies_inside_a_guard_band(
+        adapter, tmp_path, rate, frames_a, frames_b):
+    """[FORK] P6 **replaces** `test_the_two_clips_account_for_every_source_frame`.
+
+    That test asserted the two clips tile the source exactly. Under the owner's policy that is no
+    longer the contract and asserting it would be asserting the old product: frames around a
+    detected cut are now discarded on purpose.
+
+    What replaces it is strictly more informative. Every source frame that reached no clip is
+    attributed to a declared cause, and the only cause available here is the guard band -- there
+    is no short shot and no dropped tail in this fixture. A frame lost anywhere else would be an
+    unintended omission, which is still a defect, and it is counted rather than tolerated.
+    """
+    path = _make_frame_exact_cut(tmp_path / "tile.mp4", rate, frames_a, frames_b)
+    plan, labelled = _cut_and_label(adapter, path, tmp_path, "tiling")
+    by_cause, unexplained = _guard_audit(adapter, path, plan, labelled)
+
+    assert not unexplained, (
+        f"{len(unexplained)} source frame(s) reached no clip and lie in no declared guard band, "
+        f"skipped shot or dropped tail: {unexplained[:8]}")
+    assert by_cause["skipped_shot"] == 0 and by_cause["dropped_tail"] == 0, by_cause
+
+    exported = sum(len(text) for text, _r in labelled)
+    total = frames_a + frames_b
+    assert exported + by_cause["guard_band"] == total, (
+        f"{exported} exported + {by_cause['guard_band']} guarded != {total} source frames")
+
+    # The guard is two margins wide, so the loss is bounded by what the policy declares -- it may
+    # not quietly grow. One frame of slack each side for where the grid falls.
+    nominal = 2 * plan.guard_seconds
+    rate_value = _rate_value(rate)
+    assert by_cause["guard_band"] <= round(nominal * rate_value) + 2, (
+        by_cause["guard_band"], nominal, rate_value)
+
+
+def test_no_clip_ever_contains_frames_of_two_different_shots(adapter, tmp_path):
+    """Three distinct shots, so a leak in either direction is visible as a label change."""
+    path = _make_three_shots(tmp_path / "interior.mp4", [182, 239, 179])
+    source, plan = _plan_for(adapter, path, minimum=1.0)
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "three"), path, "t3")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+
+    profile, counts = _shot_profile(path, [182, 239, 179])
+    for position, result in enumerate(results, start=1):
+        shots_seen = {s for s in _classify(_frame_means(result.path), profile) if s >= 0}
+        assert len(shots_seen) == 1, (
+            f"clip {position} carries frames of shots {sorted(shots_seen)}; a clip must come "
+            f"from exactly one shot")
+
+
+def test_the_detected_cut_is_the_coarse_estimate_and_the_guard_covers_its_error(adapter,
+                                                                                 tmp_path):
+    """[FORK] P6 **replaces** `test_the_detected_cut_is_the_real_frame_time_not_the_analysis_grid`.
+
+    That test asserted the reported cut is the real frame time, which was the refinement pass's
+    whole job. It is deliberately false now: `detect_scenes` returns the coarse grid label and
+    claims nothing more.
+
+    The property that replaces it is the one the policy actually depends on -- the label's error
+    is inside the guard. Measured here rather than assumed, on a cut whose true frame time is
+    known exactly by construction.
+    """
+    path = _make_frame_exact_cut(tmp_path / "grid.mp4", "30", 92, 98)
+    reported = _detected(adapter, path)
+    assert reported, "the detector found nothing"
+
+    true_cut = 92 / 30.0
+    nearest = min(reported, key=lambda t: abs(t - true_cut))
+    grid = 1.0 / adapter["ANALYSIS_FPS"]
+
+    # It IS the grid label -- that is the point, and it is what makes the pass cheap.
+    assert abs(nearest / grid - round(nearest / grid)) < 1e-6, (
+        f"{nearest} is not on the {grid}s analysis grid; something is still refining it")
+    # And the error is comfortably inside the guard, which is what makes the label safe to use.
+    assert abs(nearest - true_cut) < rc.SCENE_GUARD_SECONDS, (
+        f"the coarse estimate {nearest} is {abs(nearest - true_cut) * 1000:.1f} ms from the real "
+        f"cut {true_cut}, outside the {rc.SCENE_GUARD_SECONDS}s guard")
+
+
+def test_the_guard_handles_the_detection_error_that_defeated_refinement(adapter, tmp_path):
+    """[FORK] P6. **The case P5-S1 flagged for review, and why the guard is not just cheaper.**
+
+    P5-S1 measured a hard cut at 5.066667 that the coarse pass reported at 5.125, and could not
+    fix it: refinement has to IDENTIFY the cut frame, and in that fixture the real cut's own
+    inter-frame difference did not clear the sensitivity while an unrelated intra-shot frame did,
+    so every candidate-selection rule returned the wrong frame and the exported clip opened with
+    two frames of the outgoing shot.
+
+    This fixture reproduces the DETECTION ERROR exactly -- true cut 5.066667, coarse report
+    5.125, the same 58.3 ms -- and asserts the guard absorbs it. It does **not** reproduce the
+    low-contrast detector failure that produced that error in P5-S1; the cut here scores 1.0
+    natively. That distinction is deliberate and is stated rather than glossed: the guard's
+    correctness does not depend on why the estimate was wrong, only on its error being bounded,
+    which is precisely why it covers a case candidate selection could not.
+    """
+    path = _make_frame_exact_cut(tmp_path / "p5s1shape.mp4", "30", 152, 150)
+    true_cut = 152 / 30.0
+    reported = _detected(adapter, path)
+    nearest = min(reported, key=lambda t: abs(t - true_cut))
+
+    # Positive control: the estimate must really be LATE, or the fixture proves nothing.
+    assert nearest > true_cut + 1e-6, (
+        f"the coarse estimate {nearest} is not late of the real cut {true_cut}")
+
+    plan, labelled = _cut_and_label(adapter, path, tmp_path, "p5s1shape")
+    assert len(labelled) == 2, [s.boundary_kind for s in plan.segments]
+    first, second = labelled[0][0], labelled[1][0]
+    assert "B" not in first, f"clip 1 ends on {first.count('B')} frame(s) of the next shot"
+    assert "A" not in second, (
+        f"clip 2 opens with {second.count('A')} frame(s) of the previous shot -- the exact "
+        f"symptom P5-S1 measured and could not remove")
+
+    # And the margin really is a margin, not a near miss.
+    assert true_cut - plan.segments[0].end >= 0.1, plan.segments[0].end
+    assert plan.segments[1].start - true_cut >= 0.1, plan.segments[1].start
+
+
+# ------------------------------------------------------------------ time splits lose nothing
+
+def test_a_continuous_shot_split_only_by_the_maximum_loses_no_frame_at_all(adapter, tmp_path):
+    """The owner's worked example, end to end on decoded pixels.
+
+    No scene change anywhere, so no guard anywhere: the pieces must tile the source exactly. This
+    is the half of the policy that is easy to get wrong by applying the margin uniformly.
+    """
+    path = _make_three_shots(tmp_path / "onelong.mp4", [900])
+    source, plan = _plan_for(adapter, path, minimum=5.0, maximum=7.0)
+    assert plan.detected_scene_count == 0, plan.detected_scene_count
+    assert plan.guard_discarded == 0.0, "a time split is not a scene change"
+    assert all(s.boundary_kind in ("time", "source-end") for s in plan.segments)
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "onelong_out"), path, "ol")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    counts = [len(_frame_labels(r.path)) for r in results]
+    assert sum(counts) == 900, (
+        f"the pieces exported {counts} = {sum(counts)} frames instead of tiling the source's "
+        f"900 -- a frame was lost or duplicated at a time split")
+
+
+def test_several_interior_time_splits_tile_the_shot_they_divide(adapter, tmp_path):
+    """[FORK] P5's frame-conservation test, kept but re-scoped to the GUARDED shot.
+
+    The shot's own end is a scene cut, so it legitimately loses a guard there. Everything inside
+    it must still tile exactly: an interior time boundary is arithmetic, not an estimate, and a
+    frame lost at one would be an unintended omission.
+    """
+    path = _make_three_shots(tmp_path / "tiles.mp4", [620, 300], rate="30000/1001")
+    source, plan = _plan_for(adapter, path, minimum=5.0, maximum=6.0)
+    pieces = [s for s in plan.segments if s.shot_index == 1]
+    assert len(pieces) >= 3, [s.boundary_kind for s in plan.segments]
+    # Positive control: the interior boundaries must really be time splits.
+    assert [p.boundary_kind for p in pieces[:-1]] == ["time"] * (len(pieces) - 1)
+    for first, second in zip(pieces, pieces[1:]):
+        assert second.start == first.end, "an interior time split opened a gap"
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "tiles_out"), path, "tl")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    own = [len(_frame_labels(r.path)) for r in results[:len(pieces)]]
+
+    shot_one = plan.shots[0]
+    expected = sum(1 for t in _source_frame_times(path)
+                   if shot_one.start - 1e-9 <= t < shot_one.end - 1e-9)
+    assert sum(own) == expected, (
+        f"the {len(pieces)} pieces exported {own} = {sum(own)} frames, but the guarded shot "
+        f"[{shot_one.start}, {shot_one.end}) holds {expected}")
+
+
+def test_a_maximum_duration_split_that_ends_on_a_cut_keeps_the_next_shot_out(adapter, tmp_path):
+    """[FORK] P5, closing P4-2, re-measured under the guard.
+
+    A clip whose START is a time split and whose END is a scene cut was the shape that leaked the
+    next shot's first frame. The guard now puts 200 ms between them, but the assertion stays
+    pixel-level rather than being assumed safe by arithmetic.
+    """
+    path = _make_three_shots(tmp_path / "split.mp4", [451, 300])
+    _source, plan = _plan_for(adapter, path, minimum=5.0, maximum=7.0)
+    kinds = [s.boundary_kind for s in plan.segments]
+    assert kinds[:2] == ["time", "time"], kinds
+
+    _plan2, labelled = _cut_and_label(adapter, path, tmp_path, "split",
+                                      minimum=5.0, maximum=7.0)
+    profile, _counts = _shot_profile(path, [451, 300])
+    for position, (_text, result) in enumerate(labelled, start=1):
+        shots_seen = {s for s in _classify(_frame_means(result.path), profile) if s >= 0}
+        assert len(shots_seen) == 1, (
+            f"clip {position} holds frames of shots {sorted(shots_seen)}")
+
+
+# ------------------------------------------------------------------ container edge cases
+
+@pytest.mark.parametrize("offset", [5.0, 12.5, 30.0])
+def test_a_source_whose_timestamps_do_not_start_at_zero_needs_no_special_handling(
+        adapter, tmp_path, offset):
+    """[FORK] P6 **replaces** the FIX A tests, and records why they are gone.
+
+    P3's FIX A existed because refinement read candidates under `-copyts` (container time) and
+    compared them against a window in planner time, so at a 5-second origin every refinement
+    silently found nothing. Removing refinement removes the mixed axis: the coarse pass already
+    reports planner time, and there is no second reading to convert.
+
+    The property to assert is therefore no longer "the origin probe ran" but "the origin does not
+    matter". Measured against the zero-origin result on the same content: identical, frame for
+    frame.
+    """
+    plain = _make_frame_exact_cut(tmp_path / "zero.mp4", "30", 92, 98)
+    shifted = _make_offset_cut(tmp_path / f"origin_{offset}.mp4", "30", 92, 98, offset)
+
+    _p1, base = _cut_and_label(adapter, plain, tmp_path, f"base_{offset}")
+    _p2, moved = _cut_and_label(adapter, shifted, tmp_path, f"moved_{offset}")
+
+    assert [t for t, _r in moved] == [t for t, _r in base], (
+        f"a {offset}s timestamp origin changed the exported frames: "
+        f"{[len(t) for t, _r in moved]} against {[len(t) for t, _r in base]}")
+    first, second = moved[0][0], moved[1][0]
+    assert "B" not in first and "A" not in second
+
+
+def test_an_mp4_edit_list_does_not_move_the_guard(adapter, tmp_path):
+    """An edit list delays presentation without changing the samples, so the clips must match the
+    plain file's exactly -- the same control as the timestamp-origin test, a different mechanism."""
+    plain = _make_frame_exact_cut(tmp_path / "plain_el.mp4", "30", 92, 98)
+    delayed = _make_edit_list_cut(tmp_path / "editlist.mp4", "30", 92, 98, 0.5)
+
+    _p1, base = _cut_and_label(adapter, plain, tmp_path, "el_base")
+    _p2, shifted = _cut_and_label(adapter, delayed, tmp_path, "el_shifted")
+    assert [t for t, _r in shifted] == [t for t, _r in base], (
+        f"an edit list changed the exported frames: {[len(t) for t, _r in shifted]} against "
+        f"{[len(t) for t, _r in base]}")
+
+
+def test_a_genuinely_variable_frame_rate_source_still_keeps_its_shots_apart(adapter, tmp_path):
+    """Three shots authored at 30, 15 and 60 fps in one file.
+
+    The provenance property holds. What this test deliberately does NOT assert is frame
+    conservation on the 60 fps passage: the export re-encodes a VFR source at the container's
+    nominal rate, which is pre-existing behaviour -- measured identical on stock main, on the
+    P5-S1 candidate and here -- and is recorded as a known limitation rather than pinned as if
+    it were intended.
+    """
+    path = _make_vfr_source(tmp_path / "vfr.mp4", [90, 90, 90], [30, 15, 60])
+    source, plan = _plan_for(adapter, path, minimum=1.0)
+    assert plan.detected_scene_count == 2, plan.detected_scene_count
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "vfr_out"), path, "vfr")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+
+    profile, _counts = _shot_profile(path, [90, 90, 90])
+    for position, result in enumerate(results, start=1):
+        shots_seen = {s for s in _classify(_frame_means(result.path), profile) if s >= 0}
+        assert len(shots_seen) == 1, (
+            f"VFR clip {position} carries frames of shots {sorted(shots_seen)}")
+
+
+def test_two_hard_cuts_closer_than_two_guards_are_handled_without_a_bad_clip(adapter, tmp_path):
+    """A five-frame shot between two real cuts: the guards consume it entirely.
+
+    It must be skipped, its neighbours must not be merged across either cut, and both exported
+    clips must still come from exactly one shot.
+    """
+    path = _make_three_shots(tmp_path / "near.mp4", [48, 5, 187])
+    source, plan = _plan_for(adapter, path, minimum=1.0)
+    assert plan.detected_scene_count == 2, (
+        f"the coarse pass reported {plan.detected_scene_count} cut(s), so this fixture cannot "
+        f"exercise overlapping guards")
+    middle = plan.shots[1]
+    assert not middle.exported and middle.duration == 0.0, middle
+
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / "near_out"), path, "nr")
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=True, encoder='libx264')
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+    profile, _counts = _shot_profile(path, [48, 5, 187])
+    for position, result in enumerate(results, start=1):
+        shots_seen = {s for s in _classify(_frame_means(result.path), profile) if s >= 0}
+        assert len(shots_seen) == 1, (
+            f"clip {position} carries frames of shots {sorted(shots_seen)}")
+
+
+# ------------------------------------------------------------------ encoder and audio paths
+
+@pytest.mark.parametrize("encoder", ["libx264", "h264_nvenc"])
+@pytest.mark.parametrize("remove_audio", [True, False])
+def test_the_guard_is_identical_on_both_encoders_and_both_audio_settings(
+        adapter, tmp_path, encoder, remove_audio):
+    """The boundary is a planning decision, so neither the encoder nor Remove Audio may move it.
+
+    NVENC is skipped rather than failed where no capable GPU is present -- its absence is an
+    environment fact, not a defect in the plan.
+    """
+    path = _make_video(tmp_path / "av.mp4", [4, 4], with_audio=True, fps=30, size=_SIZE)
+    name = f"av_{encoder}_{int(remove_audio)}"
+    source, plan = _plan_for(adapter, path, minimum=1.0)
+    run_dir, _ = adapter["prepare_run_directory"](str(tmp_path / name), path, name)
+    results = adapter["export_segments"](source=source, plan=plan, run_directory=run_dir,
+                                         remove_audio=remove_audio, encoder=encoder)
+    if encoder == 'h264_nvenc' and not all(r.ok for r in results):
+        pytest.skip("no usable NVENC encoder on this machine")
+    assert all(r.ok for r in results), [r.error for r in results if not r.ok]
+
+    by_index = {s.index: s for s in plan.segments}
+    for result in results:
+        kinds = [s.get('codec_type') for s in _streams(result.path)]
+        if remove_audio:
+            assert 'audio' not in kinds, "`-an` must drop the stream itself, not just the signal"
+        else:
+            assert 'audio' in kinds, "the audio stream was requested and is missing"
+        # The boundary is a PLANNING decision: whatever the encoder and whatever happens to the
+        # audio, the clip must still be the planned length. Recorded per combination so the four
+        # runs can be compared against each other in the evidence.
+        planned = by_index[result.index].duration
+        assert abs(_duration(result.path) - planned) < 0.25, (
+            f"{encoder}/remove_audio={remove_audio}: clip {result.index} is "
+            f"{_duration(result.path):.3f}s against a planned {planned:.3f}s")
+
+    # And the guard really was applied at the one detected cut, on every combination.
+    assert plan.detected_scene_count == 1, plan.detected_scene_count
+    assert plan.guard_discarded == pytest.approx(2 * rc.SCENE_GUARD_SECONDS, abs=1e-9)
+
+
+# ------------------------------------------------------------------ cost
+
+def test_scene_detection_runs_one_ffmpeg_child_whatever_the_cut_count(adapter, tmp_path):
+    """[FORK] P6 **replaces** the two FIX C tests, which bounded the per-cut refinement decode.
+
+    There is no per-cut decode to bound now, so the thing to measure is that there is none. Two
+    sources, one with a single cut and one with eleven, must cost the same number of children.
+    Measured by counting real subprocess launches, not by timing.
+    """
+    launches = []
+    original = adapter["_run_media_command"]
+
+    def counting(cmd, timeout, lifecycle=None):
+        launches.append(list(cmd))
+        return original(cmd, timeout)
+
+    counts = {}
+    for name, shots in (("one", [60, 60]), ("many", [30] * 12)):
+        path = _make_three_shots(tmp_path / f"cost_{name}.mp4", shots)
+        launches.clear()
+        adapter["_run_media_command"] = counting
+        try:
+            scenes = adapter["detect_scenes"](path, 0.27)
+        finally:
+            adapter["_run_media_command"] = original
+        assert scenes.succeeded, scenes.error
+        counts[name] = (len(launches), len(scenes.times))
+
+    assert counts["many"][1] > counts["one"][1], (
+        f"the twelve-shot fixture reported {counts['many'][1]} cuts against "
+        f"{counts['one'][1]}, so this cannot measure cost against cut count")
+    assert counts["one"][0] == counts["many"][0] == 1, (
+        f"scene detection launched {counts['one'][0]} child(ren) for "
+        f"{counts['one'][1]} cut(s) and {counts['many'][0]} for {counts['many'][1]} -- the cost "
+        f"must not scale with the number of cuts")
