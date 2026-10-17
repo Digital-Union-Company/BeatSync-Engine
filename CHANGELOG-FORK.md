@@ -20,6 +20,56 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-17 (Raw Cutter Batch V1: a whole folder, one press)
+
+A second input mode inside the existing **✂️ Raw Cutter** tab — not a fifth tab. **Single Video**
+keeps the V1 workflow unchanged (Analyze / Preview, then Cut Video, with the staleness gate);
+**Folder Batch** processes an entire directory automatically, with no per-file preview and no
+confirmation step. One Start Batch press does the whole folder.
+
+The product decision behind it: process many sources into usable clips with minimal operator
+interaction — *detect what we can, cut what we can, skip short unusable shots, and keep going*. A
+missed gradual transition is an accepted limitation, not a reason to block the batch.
+
+It adds **no second planner and no new detection**. `probe_source`, `detect_scenes`,
+`plan_segments` and `export_segments` are the V1 functions, called unchanged once per source;
+sensitivity mapping, the quality-first shot policy, the skip rules, NVENC/CPU selection, Remove
+Audio and the staged no-replace publication are all untouched. What is new is bookkeeping.
+
+- `src/beatsync_fork/raw_cutter_batch.py` — new, pure, stdlib-only: the nine-outcome vocabulary,
+  the collision-safe output layout, the totals, the manifest payload and every line of report text.
+  Reads no clock, touches no file, starts no process.
+- `src/raw_cutter_export.py` — batch discovery (reusing `input_manager.scan_folder` with
+  `detect_duplicates=False`, so a folder of multi-gigabyte footage pays no fingerprinting cost),
+  junction-resolving root containment, the batch and per-source directory creation, and the
+  manifest write.
+- `src/gui.py` — the mode selector, the batch controls, the sequential loop, phase-level progress
+  and the batch Cancel. The execution settings are **shared** with Single Video mode, so there is
+  one sensitivity, minimum, maximum, Remove Audio and output folder on the screen, not two.
+
+Safety properties, each tested:
+
+- **One mutex acquisition for the whole batch.** It reuses the existing process-global
+  `_RENDER_LOCK` as a sixth call site, so a batch and a music-video render can never run together.
+  Acquiring per source would deadlock on the second file — the lock is non-reentrant on purpose.
+- **One broken source never ends the batch.** Unreadable, detection-failed, planning-refused and
+  no-usable-shots sources are recorded and the next source starts. A partially exported source is
+  reported as PARTIAL and never as complete.
+- **Nothing is ever overwritten.** One `RawCutter_Batch_<timestamp>` folder per run with
+  `exist_ok=False`, a separate folder per source mirroring the input structure, and uniqueness
+  decided across the whole frozen input list — so `cameraA/video01.mp4` and `cameraB/video01.mp4`
+  cannot collide even though their clips share filenames.
+- **An output root inside the source tree is refused**, with both roots resolved through junctions
+  first, so a batch cannot re-ingest the clips it just wrote.
+- **Cancel stops at the next safe boundary**, starts no further source, keeps every finished clip,
+  deletes no output folder, and reports which sources were completed, partial and never attempted.
+- **`batch_manifest.json`** carries one record per *discovered* source — including the ones a
+  cancellation meant were never opened — and is written from the `finally`, so it survives a
+  failure or a stop.
+
+Source files are opened read-only and never modified. No render, Qwen, Stage-5 cache or
+output-promotion behaviour changes.
+
 ### Added — 2026-10-16 (Raw Cutter V1: pull the usable shots out of one long video)
 
 A fourth top-level tab, **✂️ Raw Cutter**, between Creative Studio and Advanced Tools. It takes one

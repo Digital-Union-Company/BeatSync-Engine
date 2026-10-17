@@ -32,7 +32,25 @@ so. Anything in this roadmap that appears to conflict with that principle is wro
 
 ---
 
-### R1 — Raw Cutter V1 · **IMPLEMENTED IN PR #68**
+### Current priority (product-owner decision)
+
+Automatic dissolve detection is **no longer the next feature**. The R2-A research measured the
+candidate signals on real labelled footage and neither was reliable enough to ship; the findings are
+preserved under R2 below and must not be read as a detector that exists.
+
+The priority is now **processing many source videos into usable clips with minimal operator
+interaction** — R4's batch processing, promoted from "when feedback justifies it" to the active
+piece of work. A missed gradual transition is an accepted limitation: the operator cleans up
+afterwards if needed.
+
+> **Detect what we can, cut what we can, skip short unusable shots, and keep going.**
+
+A **Review Assistant Cutter** — any workflow requiring per-cut manual confirmation — was considered
+and **rejected by the product owner**. Do not reintroduce one.
+
+---
+
+### R1 — Raw Cutter V1 · **DONE (merged in PR #68)**
 
 Mechanical, deterministic, quality-first shot selection. No AI involved anywhere.
 
@@ -54,15 +72,37 @@ Mechanical, deterministic, quality-first shot selection. No AI involved anywhere
   file the run does not own.
 - **Cancellation between clips**, keeping everything already completed.
 
-**Not in the frozen Playtest.** `D:\BeatSync-Playtest-dd059fb1\` was built from `dd059fb1`, which
-predates this work. The Raw Cutter is not in that package and will not be until a later Playtest
-build is made from a commit that contains it.
+**Playtest coverage.** `D:\BeatSync-Playtest-dd059fb1\` was built from `dd059fb1`, which predates
+this work, so the Raw Cutter is **not** in that package. `D:\BeatSync-Playtest-77b854a1\` was built
+from `77b854a1` and **does** contain Raw Cutter V1. Neither contains batch mode, which is still an
+open pull request.
 
 ---
 
-### R2 — Transition Detection + Edge Cleaner · **PLANNED, NOT IMPLEMENTED**
+### R2 — Transition Detection + Edge Cleaner · **DEFERRED, NOT IMPLEMENTED · non-blocking**
 
-The next priority, and the one that most affects real footage.
+**Deferred by the product owner.** It was the next priority; the R2-A research then established
+that the signals tested are not reliable enough on real footage, so nothing is built and nothing
+is scheduled. This does **not** block R4 batch processing, which ships without it.
+
+What the research established, kept because a negative result is the expensive part:
+
+- A frozen **contrast-dip** rule found 3 of 5 gradual transitions on a freshly labelled real video
+  — **60 % recall against an 80 % target** — at 0.48 false positives per minute. Ordinary footage in
+  that same video produced *deeper* contrast dips than the two transitions it missed, so no
+  threshold separates them. Not a calibration shortfall.
+- A complementary **blend-linearity** signal scored 6/6 with zero false positives on synthetic
+  fixtures and then produced **zero events** on both real videos. On real footage ordinary content
+  fits the linear-blend model *better* than a true cross-dissolve does — the ordering is inverted,
+  and the synthetic fixtures had encoded the model's own assumption.
+- Both signals fail on the **same** class, dissolves between visually similar shots, for unrelated
+  reasons. They are therefore not complementary where it matters.
+
+**No transition detector exists anywhere in the product**, and no speculative scaffolding for one
+was left in the code. Reviving R2 needs more independently labelled footage, with the candidate rule
+frozen before it is measured.
+
+The earlier edge-only measurement that started all this is still accurate and still worth reading.
 
 Ordinary hard-cut detection misses **gradual** transitions. A cross-dissolve, a fade, or any blend
 between two shots leaves *mixed frames* — frames containing part of the outgoing shot and part of
@@ -133,7 +173,7 @@ that produced it, and any report that implies it does is wrong.
 
 ---
 
-### R3 — AI Director Cutter · **PLANNED, NOT IMPLEMENTED**
+### R3 — AI Director Cutter · **PLANNED for future consideration, NOT IMPLEMENTED**
 
 A future **smart mode of the existing Raw Cutter tab** — not a separate top-level tool, and not a
 replacement for the mechanical cutter.
@@ -200,18 +240,46 @@ modified.
 
 ---
 
-### R4 — Raw Cutter usability and scale · **PLANNED, NOT IMPLEMENTED**
+### R4 — Raw Cutter usability and scale · **ACTIVE DEVELOPMENT PRIORITY**
 
-Secondary improvements, kept deliberately separate from R2 (transition quality) and R3 (AI-assisted
-selection). These are worth doing when Playtest feedback justifies them, not before.
+Promoted from "worth doing when Playtest feedback justifies it" by the product-owner decision above.
+Batch processing is the active piece; the rest of R4 stays unscheduled.
 
-- **Real per-clip progress updates** during a cut run. Progress is currently captured but not
-  streamed, so a long job shows one line until it finishes.
+#### R4-A — Automatic folder batch mode · **IN REVIEW — open pull request, NOT merged**
+
+A second input mode inside the existing ✂️ Raw Cutter tab — not a fifth tab — that processes a whole
+folder with one press and no per-file preview or confirmation.
+
+- **Single Video** mode is unchanged: Analyze / Preview, then Cut Video, with the staleness gate.
+- **Folder Batch** mode takes an input folder, an *Include subfolders* toggle (default on), and the
+  **same** sensitivity, minimum, maximum, Remove Audio and output-folder controls — one value per
+  execution setting, shared between the modes rather than duplicated.
+- **Start Batch** enumerates the supported videos, freezes that list in a deterministic order, and
+  processes them one at a time: probe → scene detection → quality-first plan → export → next.
+- **The V1 planner and detector are reused unchanged.** No new detection of any kind.
+- **One broken or empty source never ends the batch.** Each source is classified — completed, no
+  usable shots, unreadable, detection failed, planning refused, partial, export failed, cancelled or
+  not attempted — and the next one starts. A partially exported source is never reported as
+  complete.
+- **One batch output folder** (`RawCutter_Batch_<timestamp>`) containing a separate folder per
+  source, mirroring the input structure, so identical filenames in different input subfolders can
+  never collide. An output root inside the source tree is refused, resolved through junctions, so a
+  batch cannot re-ingest its own clips.
+- **A `batch_manifest.json`** with one record per discovered source, written even after a failure or
+  a cancellation.
+- **Cancel Batch** stops at the next safe boundary, starts no further source, and keeps every
+  finished clip.
+- **One mutex acquisition for the whole batch**, sharing the existing process-global render lock, so
+  a batch and a music-video render can never run at once.
+
+#### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
+
+- **Real per-clip progress updates** during a single-video cut run. Batch mode reports per file and
+  per phase; inside one clip there is still no progress.
 - **Cancellation during an active FFmpeg segment**, rather than only between clips.
 - **A native local file/folder picker**, without copying large videos into Gradio's upload folder.
 - **Optional fast stream-copy mode**, with measured keyframe-drift reporting — only worth shipping
   if the report can honestly say which clips moved and by how much.
-- **Batch processing** of multiple source files in one run.
 
 ---
 
@@ -219,10 +287,11 @@ selection). These are worth doing when Playtest feedback justifies them, not bef
 
 | Item | Status |
 |---|---|
-| **R1** — Raw Cutter V1, mechanical quality-first selection | **IMPLEMENTED IN PR #68** |
-| **R2** — Transition Detection + Edge Cleaner | **PLANNED** — the measurement is done, the detector is not built |
-| **R3** — AI Director Cutter (Qwen-guided selection) | **PLANNED** — no Qwen in the Raw Cutter today |
-| **R4** — Raw Cutter usability and scale | **PLANNED** |
+| **R1** — Raw Cutter V1, mechanical quality-first selection | **DONE** — merged in PR #68 |
+| **R4-A** — Automatic folder batch mode | **IN REVIEW** — open pull request, not merged, not released |
+| **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
+| **R3** — AI Director Cutter (Qwen-guided selection) | **PLANNED** for future consideration — no Qwen in the Raw Cutter today |
+| **R4** — remaining usability and scale ideas | **PLANNED** |
 
 ---
 

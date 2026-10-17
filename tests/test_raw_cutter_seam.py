@@ -111,7 +111,9 @@ _FORBIDDEN = (
 )
 
 
-@pytest.mark.parametrize("handler", ["_on_cut_analyze", "_on_cut_run", "_on_cut_cancel"])
+@pytest.mark.parametrize("handler", ["_on_cut_analyze", "_on_cut_run", "_on_cut_cancel",
+                                     "_on_cut_mode_change", "_on_cut_batch_count",
+                                     "_on_cut_batch_run", "_on_cut_batch_cancel"])
 def test_no_cutter_handler_can_reach_the_render_pipeline(gui_tree, handler):
     rendered = _code_only(_func(gui_tree, handler))
     for forbidden in _FORBIDDEN:
@@ -147,6 +149,11 @@ _CUTTER_WIDGETS = (
     "cut_source", "cut_source_info", "cut_output", "cut_sensitivity", "cut_min_seconds",
     "cut_max_seconds", "cut_remove_audio", "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn",
     "cut_summary", "cut_table", "cut_report", "cut_plan_state",
+    # Batch V1 additions. Same contract: a cutter widget wired into a render handler would make
+    # footage curation part of the render request.
+    "cut_mode", "cut_batch_folder", "cut_batch_recursive", "cut_batch_count_btn",
+    "cut_batch_discovery", "cut_batch_start_btn", "cut_batch_cancel_btn", "cut_batch_status",
+    "cut_batch_summary",
 )
 
 

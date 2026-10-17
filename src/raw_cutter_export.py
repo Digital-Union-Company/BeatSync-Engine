@@ -428,6 +428,210 @@ def _discard_staging(path: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------------------------
+# Batch V1: discovery and the batch output layout
+#
+# [FORK] Digital-Union (Raw Cutter Batch V1). Everything below is the filesystem half of batch
+# mode; the decisions are `beatsync_fork.raw_cutter_batch`. Nothing here re-implements V1 --
+# `probe_source`, `detect_scenes` and `export_segments` above are called unchanged, once per
+# source, by the loop in `gui.py`.
+# ---------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """The frozen input list for one batch. Order is deterministic and fixed before any work."""
+
+    root: str = ""
+    recursive: bool = True
+    paths: tuple[str, ...] = ()
+    rejected_count: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+def discover_batch_sources(folder: str, recursive: bool) -> DiscoveryResult:
+    """Enumerate the videos a batch will process, in a deterministic frozen order.
+
+    **Reuses `input_manager.scan_folder` rather than walking the tree again.** That function already
+    owns the two properties this needs and would be wrong to re-derive: traversal is
+    all-or-nothing, so a directory that cannot be listed raises instead of quietly yielding a
+    smaller library, and the result is ordered by the project's existing case-insensitive
+    `order_key` with a total-order tie-break, so two scans of the same tree agree exactly. A frozen
+    deterministic list is what makes a batch's manifest reproducible.
+
+    `detect_duplicates=False` is deliberate and is the one deviation from the render path's call:
+    duplicate grouping fingerprints files (size plus SHA-256 of the first and last 1 MiB), and a
+    folder of multi-gigabyte footage would pay that cost before a single clip was cut. Batch mode
+    cuts whatever it is pointed at; it does not de-duplicate, so the read would buy nothing.
+
+    The extension set is Raw Cutter's own `SUPPORTED_SOURCE_SUFFIXES`, not the render pipeline's
+    narrower `.mp4`/`.mkv` default -- the cutter accepts MOV, M4V, AVI and WebM too, and a batch
+    must accept exactly what Single Video mode accepts.
+    """
+    from beatsync_fork import input_manager
+
+    if not isinstance(folder, str) or not folder.strip():
+        return DiscoveryResult(error="Enter the folder that holds your source videos.")
+    root = os.path.abspath(os.path.expandvars(os.path.expanduser(folder.strip().strip('"'))))
+    if not os.path.exists(root):
+        return DiscoveryResult(root=root, error=f"Folder not found:\n{root}")
+    if not os.path.isdir(root):
+        return DiscoveryResult(root=root, error=f"Not a folder:\n{root}")
+
+    try:
+        found = input_manager.scan_folder(
+            root, recursive=bool(recursive),
+            extensions=SUPPORTED_SOURCE_SUFFIXES,
+            detect_duplicates=False)
+    except input_manager.InputScanError as exc:
+        return DiscoveryResult(root=root, recursive=bool(recursive), error=str(exc))
+    except OSError as exc:
+        return DiscoveryResult(root=root, recursive=bool(recursive),
+                               error=f"Could not read the folder: {exc}")
+
+    return DiscoveryResult(
+        root=found.root,
+        recursive=bool(recursive),
+        paths=tuple(item.path for item in found.files),
+        rejected_count=len(found.rejected),
+    )
+
+
+def resolve_batch_roots(input_folder: str, output_folder: str) -> tuple[str, str, str]:
+    """Fully resolve both roots and refuse a nesting loop. Returns ``(input, output, error)``.
+
+    `realpath` runs on BOTH before the comparison, which is the whole point: the containment
+    decision has to see through a junction or a symlink, because an output path that merely *looks*
+    separate may resolve inside the footage tree, and then the next scan re-ingests this run's own
+    clips. The same resolution pattern the delivery share file uses, and for the same reason --
+    a reparse point is resolved and then judged on where it actually lands, never refused on sight.
+
+    The output folder does not have to exist yet; its nearest existing ancestor is resolved instead,
+    so a brand-new destination is judged on where it will really be.
+    """
+    if not isinstance(output_folder, str) or not output_folder.strip():
+        return "", "", "Choose an output folder for the finished clips."
+
+    source = os.path.abspath(os.path.expandvars(os.path.expanduser(str(input_folder).strip()
+                                                                   .strip('"'))))
+    target = os.path.abspath(os.path.expandvars(os.path.expanduser(output_folder.strip()
+                                                                   .strip('"'))))
+    if os.path.exists(target) and not os.path.isdir(target):
+        return "", "", f"The output path is not a folder:\n{target}"
+
+    try:
+        resolved_source = os.path.realpath(source)
+    except OSError:
+        resolved_source = source
+
+    # Resolve the deepest ancestor that exists, then re-attach the rest: `realpath` on a path whose
+    # parents do not exist yet returns it unchanged on Windows, which would skip the junction.
+    probe, tail = target, []
+    while probe and not os.path.exists(probe):
+        probe, piece = os.path.split(probe)
+        if not piece:
+            break
+        tail.append(piece)
+    try:
+        resolved_target = os.path.join(os.path.realpath(probe), *reversed(tail)) if probe else target
+    except OSError:
+        resolved_target = target
+
+    from beatsync_fork import raw_cutter_batch as fork_batch
+    conflict = fork_batch.output_root_conflict(resolved_source, resolved_target)
+    if conflict:
+        return "", "", conflict
+    return resolved_source, resolved_target, ""
+
+
+def prepare_batch_directory(output_root: str, timestamp: str) -> tuple[str, str]:
+    """Create the one new ``RawCutter_Batch_<timestamp>`` folder. Returns ``(path, error)``.
+
+    `exist_ok=False` on the batch folder itself, exactly as `prepare_run_directory` does for a
+    single run: the creation IS the test, so a batch can never adopt a directory that already holds
+    somebody else's clips. Intermediate parents are created normally -- an output root the operator
+    typed but has not made yet is a convenience, not a collision risk.
+    """
+    from beatsync_fork import raw_cutter_batch as fork_batch
+
+    if not isinstance(output_root, str) or not output_root.strip():
+        return "", "Choose an output folder."
+    root = os.path.abspath(output_root.strip())
+    destination = os.path.join(root, fork_batch.batch_directory_name(timestamp))
+    if os.path.exists(destination):
+        return "", f"This batch folder already exists; refusing to reuse it:\n{destination}"
+    try:
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(destination, exist_ok=False)
+    except OSError as exc:
+        return "", f"Could not create the batch folder:\n{destination}\n{exc}"
+    return destination, ""
+
+
+def prepare_item_directory(batch_directory: str,
+                           relative_parts: Sequence[str]) -> tuple[str, str]:
+    """Create one source's own folder inside the batch folder. Returns ``(path, error)``.
+
+    The leaf is created with `exist_ok=False` so two sources can never share a folder even if the
+    uniqueness planning upstream were ever wrong; the intermediate directories are shared by
+    design, because preserving the input structure means several sources legitimately sit under the
+    same parent.
+
+    Containment is **measured** with `commonpath`, not assumed from the string the caller passed:
+    a prefix test would accept ``output-evil`` for ``output``, and these components are derived from
+    operator-supplied folder names.
+    """
+    root = os.path.abspath(batch_directory)
+    if not relative_parts:
+        return "", "No output location was planned for this source."
+    destination = os.path.abspath(os.path.join(root, *relative_parts))
+    try:
+        if os.path.commonpath([root, destination]) != root:
+            return "", "Refused an unsafe output path for this source."
+    except ValueError:
+        return "", "Refused an unsafe output path for this source."
+    parent = os.path.dirname(destination)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        os.makedirs(destination, exist_ok=False)
+    except OSError as exc:
+        return "", f"Could not create the clip folder:\n{destination}\n{exc}"
+    return destination, ""
+
+
+def write_batch_manifest(batch_directory: str, payload: dict) -> str:
+    """Write the per-source record into the batch folder. Returns ``''`` or an error string.
+
+    Written **once**, from the caller's `finally`, so it exists after a failure or a cancellation
+    too -- a manifest that only appeared on the happy path would be worthless exactly when it is
+    needed. Unique temp then a no-replace `os.rename`, same-directory, so a partial file never
+    appears under the real name and an existing manifest is never destroyed.
+
+    It never raises: a batch that wrote clips successfully must not be reported as failed because
+    its bookkeeping file could not be saved.
+    """
+    import json
+
+    from beatsync_fork import raw_cutter_batch as fork_batch
+
+    root = os.path.abspath(batch_directory)
+    destination = os.path.join(root, fork_batch.MANIFEST_FILENAME)
+    staging = os.path.join(root, f".{fork_batch.MANIFEST_FILENAME}.{uuid.uuid4().hex[:12]}.part")
+    try:
+        with open(staging, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(staging, destination)
+        return ""
+    except (OSError, TypeError, ValueError) as exc:
+        _discard_staging(staging)
+        return f"Could not write {fork_batch.MANIFEST_FILENAME}: {exc}"
+
+
 def prepare_run_directory(output_root: str, source_path: str, timestamp: str) -> tuple[str, str]:
     """Create the fresh per-run subfolder. Returns ``(path, error)``.
 
