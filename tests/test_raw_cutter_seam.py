@@ -150,6 +150,8 @@ _CUTTER_WIDGETS = (
     "cut_source", "cut_source_info", "cut_output", "cut_sensitivity", "cut_min_seconds",
     "cut_max_seconds", "cut_remove_audio", "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn",
     "cut_summary", "cut_table", "cut_report", "cut_plan_state",
+    # [FORK] R4-C. Same contract: output naming is footage curation, never a render input.
+    "cut_rename_output",
     # Batch V1 additions. Same contract: a cutter widget wired into a render handler would make
     # footage curation part of the render request.
     "cut_mode", "cut_batch_folder", "cut_batch_recursive", "cut_batch_count_btn",

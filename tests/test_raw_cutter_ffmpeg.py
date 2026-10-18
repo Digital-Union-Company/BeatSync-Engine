@@ -1548,15 +1548,22 @@ def _p8_one_segment_plan(probe_source, start, duration):
 
 
 def _p8_export_one(adapter, path, tmp_path, name, start, duration,
-                   encoder='libx264', remove_audio=True):
-    """Export exactly one interval through the REAL adapter and return its clip path."""
+                   encoder='libx264', remove_audio=True, naming=None):
+    """Export exactly one interval through the REAL adapter and return its clip path.
+
+    [FORK] R4-C: `naming` is threaded into BOTH the run-directory preparation and the export, so
+    a caller measuring the synthetic mode measures the whole shipped path -- the folder name, the
+    staging name and the published name -- rather than only the last of the three.
+    """
     probe = adapter["probe_source"](path)
     assert probe.ok, probe.error
     plan = _p8_one_segment_plan(probe.source, start, duration)
-    run_dir, error = adapter["prepare_run_directory"](str(tmp_path / name), path, name)
+    run_dir, error = adapter["prepare_run_directory"](str(tmp_path / name), path, name,
+                                                      naming=naming)
     assert not error, error
     results = adapter["export_segments"](source=probe.source, plan=plan, run_directory=run_dir,
-                                         remove_audio=remove_audio, encoder=encoder)
+                                         remove_audio=remove_audio, encoder=encoder,
+                                         naming=naming)
     if encoder == 'h264_nvenc' and not all(r.ok for r in results):
         pytest.skip("no usable NVENC encoder on this machine")
     assert all(r.ok for r in results), [r.error for r in results if not r.ok]
@@ -1889,3 +1896,211 @@ def test_the_encoder_time_base_alone_happens_to_be_enough_which_is_why_both_are_
         f"recorded asymmetry no longer holds and the docstring in raw_cutter_export.py should be "
         f"corrected.")
     assert len(set(actual)) == len(actual), "auto collapsed timestamps"
+
+
+# =============================================================================================
+# [FORK] Digital-Union (Raw Cutter R4-C): synthetic output naming, measured against the binary
+#
+# The naming mode must change the output PATH and nothing else. The pure and seam tiers can show
+# that the argv differs only in its last element; only the real binary can show that the frames,
+# their presentation times, the geometry and the stream layout come out identical -- and that no
+# second encode or extra pass was added to achieve it.
+#
+# Every test below is a PAIRED comparison: the same interval of the same fixture exported twice,
+# once in each mode, with the legacy export as the control. An absolute assertion about the
+# synthetic clip alone could be satisfied by an export that was wrong in both modes.
+# =============================================================================================
+
+#: 18 October 2026, matching the owner's worked examples. Fixed rather than read from a clock, so
+#: the expected spelling is a constant and not something the test recomputes the way the code did.
+_R4C_NAMING = rc.OutputNaming(synthetic=True, source_index=1, job_date="18102026")
+
+
+def _r4c_geometry(path):
+    """Resolution, sample aspect ratio, display aspect ratio, pixel format and codec."""
+    result = _run([FFPROBE, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                   'stream=codec_name,width,height,sample_aspect_ratio,display_aspect_ratio,'
+                   'pix_fmt', '-of', 'json', str(path)])
+    assert result.returncode == 0, result.stderr[-1000:]
+    streams = json.loads(result.stdout)['streams']
+    assert len(streams) == 1, streams
+    return streams[0]
+
+
+def _r4c_decodes_cleanly(path):
+    """Decode the whole clip and count the frames. A clip FFmpeg cannot read is not a clip."""
+    result = _run([FFMPEG, '-nostdin', '-hide_banner', '-v', 'error', '-i', str(path),
+                   '-f', 'null', '-'], timeout=300)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert not result.stderr.strip(), f"decoding emitted errors: {result.stderr[-800:]}"
+    return len(_p8_frame_pts(path))
+
+
+def _r4c_pair(adapter, path, tmp_path, label, start, duration, **kw):
+    """Export the SAME interval twice -- legacy naming, then synthetic. Returns both clip paths."""
+    legacy = _p8_export_one(adapter, path, tmp_path, label + "_legacy", start, duration, **kw)
+    synthetic = _p8_export_one(adapter, path, tmp_path, label + "_synthetic", start, duration,
+                               naming=_R4C_NAMING, **kw)
+    return legacy, synthetic
+
+
+@needs_ffmpeg
+def test_a_synthetic_clip_is_named_as_specified_and_leaks_no_basename(adapter, tmp_path):
+    """The real filesystem, through the real adapter: folder, clip name, and nothing left behind.
+
+    The source is deliberately given a distinctive basename, so a leak anywhere in the tree -- a
+    stray staging artifact included -- fails here rather than being argued about.
+    """
+    source = _make_three_shots(tmp_path / "private_wedding_footage.mp4", [90, 90, 90])
+    clip = _p8_export_one(adapter, source, tmp_path, "named", 0.5, 1.0, naming=_R4C_NAMING)
+
+    run_dir = os.path.dirname(clip)
+    assert os.path.basename(run_dir) == "RawCutter_Single_named"
+    assert os.path.basename(clip) == "File001_18102026_001.mp4"
+    listing = os.listdir(run_dir)
+    assert listing == ["File001_18102026_001.mp4"], listing
+    for name in [os.path.basename(run_dir)] + listing:
+        assert "wedding" not in name.casefold(), name
+        assert "private" not in name.casefold(), name
+        assert "footage" not in name.casefold(), name
+
+
+@needs_ffmpeg
+def test_the_legacy_name_is_still_exactly_what_it_always_was(adapter, tmp_path):
+    """The compatibility control, measured on the real filesystem rather than only as a string."""
+    source = _make_three_shots(tmp_path / "private_wedding_footage.mp4", [90, 90, 90])
+    clip = _p8_export_one(adapter, source, tmp_path, "unnamed", 0.5, 1.0)
+    assert os.path.basename(os.path.dirname(clip)) == \
+        "private_wedding_footage_raw_parts_unnamed"
+    assert os.path.basename(clip) == "private_wedding_footage_part_001.mp4"
+
+
+@needs_ffmpeg
+def test_a_synthetic_clip_decodes_cleanly_and_keeps_the_sources_geometry(adapter, tmp_path):
+    """Resolution, SAR, DAR, pixel format and codec, against the legacy export of the same
+    interval. `trim`/`setpts` say nothing about geometry and the naming mode says nothing at all,
+    so the two clips must agree exactly."""
+    source = _make_three_shots(tmp_path / "cfr.mp4", [90, 90, 90])
+    legacy, synthetic = _r4c_pair(adapter, source, tmp_path, "geom", 0.5, 2.0)
+
+    assert _r4c_geometry(synthetic) == _r4c_geometry(legacy)
+    # And both agree with the SOURCE on every geometry field, which is the real claim: the clip
+    # preserves the footage's shape. `codec_name` is excluded only because it is not geometry.
+    origin = _r4c_geometry(source)
+    for field in ('width', 'height', 'sample_aspect_ratio', 'display_aspect_ratio', 'pix_fmt'):
+        assert _r4c_geometry(synthetic).get(field) == origin.get(field), field
+    assert _r4c_decodes_cleanly(synthetic) == _r4c_decodes_cleanly(legacy) > 0
+
+
+@needs_ffmpeg
+def test_a_constant_rate_export_keeps_identical_frame_timing_in_both_modes(adapter, tmp_path):
+    """CFR. Same frame count, same presentation times, to the container's own quantum."""
+    source = _make_three_shots(tmp_path / "cfr_timing.mp4", [90, 90, 90])
+    legacy, synthetic = _r4c_pair(adapter, source, tmp_path, "cfr", 0.5, 2.0)
+
+    reference = _p8_planner_pts(legacy)
+    assert len(reference) > 1, reference
+    _p8_assert_preserved(synthetic, reference, "CFR under synthetic naming",
+                         _p8_quantum(synthetic))
+    assert sorted({round(b - a, 5) for a, b in zip(reference, reference[1:])}) == \
+        sorted({round(b - a, 5) for a, b in zip(_p8_planner_pts(synthetic),
+                                                _p8_planner_pts(synthetic)[1:])})
+
+
+@needs_ffmpeg
+def test_a_variable_rate_export_keeps_identical_frame_timing_in_both_modes(adapter, tmp_path):
+    """VFR, on the P8 fixture that caught the original re-timing defect.
+
+    This is the one that would actually break if the mode had reached the command: the P8
+    `-fps_mode:v passthrough -enc_time_base:v demux` pair is what preserves these 78 frames, and
+    an export that lost them would lose them here too.
+    """
+    source = _make_vfr_exact(tmp_path / "vfr_named.mp4", _P8_VFR_BLOCKS)
+    expected = _p8_expected(_p8_planner_pts(source), _P8_VFR_START, _P8_VFR_DURATION)
+    assert len(expected) == 78, len(expected)
+
+    legacy, synthetic = _r4c_pair(adapter, source, tmp_path, "vfr",
+                                  _P8_VFR_START, _P8_VFR_DURATION)
+    _p8_assert_preserved(legacy, expected, "VFR control", _p8_quantum(legacy))
+    _p8_assert_preserved(synthetic, expected, "VFR under synthetic naming",
+                         _p8_quantum(synthetic))
+    assert _p8_planner_pts(synthetic) == _p8_planner_pts(legacy)
+    assert sorted({round(b - a, 5) for a, b in zip(_p8_planner_pts(synthetic),
+                                                   _p8_planner_pts(synthetic)[1:])}) == \
+        [round(1 / 60, 5)]
+
+
+@needs_ffmpeg
+def test_keeping_the_audio_works_identically_under_synthetic_naming(adapter, tmp_path):
+    """The audio path is untouched by the mode, so both clips must carry the same streams and the
+    same two lengths."""
+    source = _make_vfr_exact(tmp_path / "vfr_named_av.mp4", _P8_VFR_BLOCKS, with_audio=True)
+    legacy, synthetic = _r4c_pair(adapter, source, tmp_path, "vfr_av",
+                                  _P8_VFR_START, _P8_VFR_DURATION, remove_audio=False)
+
+    def lengths(path):
+        result = _run([FFPROBE, '-v', 'error', '-show_entries', 'stream=codec_type,duration',
+                       '-of', 'json', str(path)])
+        assert result.returncode == 0, result.stderr[-1000:]
+        return {s['codec_type']: round(float(s['duration']), 3)
+                for s in json.loads(result.stdout)['streams'] if s.get('duration')}
+
+    assert set(lengths(synthetic)) == {'video', 'audio'}
+    assert lengths(synthetic) == lengths(legacy)
+
+
+@needs_ffmpeg
+def test_removing_the_audio_still_removes_the_stream_under_synthetic_naming(adapter, tmp_path):
+    source = _make_video(tmp_path / "with_audio.mp4", [3, 3, 3], with_audio=True)
+    clip = _p8_export_one(adapter, source, tmp_path, "an", 0.5, 1.0, naming=_R4C_NAMING)
+    assert os.path.basename(clip) == "File001_18102026_001.mp4"
+    kinds = [s.get('codec_type') for s in _streams(clip)]
+    assert 'video' in kinds
+    assert 'audio' not in kinds, kinds
+
+
+@needs_ffmpeg
+def test_the_naming_mode_adds_no_transcode_and_no_extra_ffmpeg_pass(adapter, tmp_path,
+                                                                    monkeypatch):
+    """Counted at the seam the adapter actually runs its children through.
+
+    Three independent measurements, because any one of them alone could be satisfied by a wrong
+    implementation: the same number of child processes, the same number of ENCODE commands, and
+    argv that differs only in the file being written.
+    """
+    source = _make_three_shots(tmp_path / "passes.mp4", [90, 90, 90])
+    recorded = []
+    real = adapter["_run_media_command"]
+
+    def counting(cmd, timeout, lifecycle=None):
+        recorded.append(list(cmd))
+        return real(cmd, timeout)
+
+    monkeypatch.setitem(adapter, "_run_media_command", counting)
+
+    _p8_export_one(adapter, source, tmp_path, "pass_legacy", 0.5, 1.0)
+    legacy = list(recorded)
+    recorded.clear()
+    _p8_export_one(adapter, source, tmp_path, "pass_synthetic", 0.5, 1.0, naming=_R4C_NAMING)
+    synthetic = list(recorded)
+
+    assert len(legacy) == len(synthetic), (len(legacy), len(synthetic))
+    legacy_encodes = [c for c in legacy if os.path.basename(c[0]).startswith("ffmpeg")]
+    synthetic_encodes = [c for c in synthetic if os.path.basename(c[0]).startswith("ffmpeg")]
+    assert len(legacy_encodes) == len(synthetic_encodes) == 1, \
+        "one encode per clip, either way -- the mode must not add a pass"
+    assert legacy_encodes[0][:-1] == synthetic_encodes[0][:-1], \
+        "the mode changed an encoding argument"
+    assert legacy_encodes[0][-1] != synthetic_encodes[0][-1]
+    # And nothing renames a finished file afterwards: the ONE encode wrote the synthetic staging
+    # name directly, so no source-revealing name ever existed on disk.
+    assert "File001_18102026_001" in synthetic_encodes[0][-1]
+    assert "passes" not in os.path.basename(synthetic_encodes[0][-1])
+
+
+@needs_ffmpeg
+def test_a_synthetic_export_leaves_the_source_file_byte_identical(adapter, tmp_path):
+    source = _make_three_shots(tmp_path / "untouched.mp4", [90, 90, 90])
+    before = (_sha256(source), os.path.getsize(source))
+    _p8_export_one(adapter, source, tmp_path, "untouched_out", 0.5, 1.0, naming=_R4C_NAMING)
+    assert (_sha256(source), os.path.getsize(source)) == before
