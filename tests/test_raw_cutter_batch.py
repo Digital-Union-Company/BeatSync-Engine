@@ -582,7 +582,13 @@ def test_every_terminal_path_finalises_through_one_shared_helper(gui_tree):
 def test_start_batch_is_one_click_with_no_confirmation_step(gui_tree, gui_source):
     assert gui_source.count("cut_batch_start_btn.click(") == 1
     kwargs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))
-    assert ast.unparse(kwargs["fn"]) == "_on_cut_batch_run"
+    # [FORK] Raw Cutter progress P1: the click now enters the presentation wrapper, which adds the
+    # progress panel and the button states and delegates to the reviewed `_on_cut_batch_run`
+    # below. The guarantee this test exists for is untouched -- ONE click, no `.then(...)` chain,
+    # no confirmation step -- and the wrapper is asserted to call the real batch exactly once.
+    assert ast.unparse(kwargs["fn"]) == "_on_cut_batch_run_ui"
+    wrapper = _code_only(_func(gui_tree, "_on_cut_batch_run_ui"))
+    assert wrapper.count("_on_cut_batch_run(") == 1, "the wrapper must run the batch exactly once"
     # No `.then(...)` chain: one press does the whole folder.
     start = gui_source.index("cut_batch_start_btn.click(")
     end = gui_source.index("cut_batch_cancel_btn.click(")
@@ -604,14 +610,29 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
     assert gui_source.count("cut_run_btn.click(") == 1
     analyze = _kwargs(_click(gui_tree, "cut_analyze_btn"))
     assert ast.unparse(analyze["fn"]) == "_on_cut_analyze"
-    assert _names(analyze["outputs"]) == ["cut_summary", "cut_table", "cut_plan_state",
-                                          "cut_source_info"]
     run = _kwargs(_click(gui_tree, "cut_run_btn"))
     assert ast.unparse(run["fn"]) == "_on_cut_run"
     assert _names(run["inputs"]) == ["cut_plan_state", "cut_source", "cut_output",
                                      "cut_sensitivity", "cut_min_seconds", "cut_max_seconds",
                                      "cut_remove_audio"]
-    assert _names(run["outputs"]) == ["cut_report"]
+    # [FORK] Raw Cutter progress P1: this test's purpose is that BATCH work did not disturb the
+    # single-video workflow, so it pins the original widgets as a PREFIX that is still written in
+    # the original order -- nothing removed, nothing reordered. The progress panel and the three
+    # button states are the deliberate P1 additions, and they are listed explicitly rather than
+    # waved through, so an accidental fourth addition would still fail here.
+    assert _names(analyze["outputs"]) == ["cut_summary", "cut_table", "cut_plan_state",
+                                          "cut_source_info",
+                                          "cut_progress", "cut_analyze_btn", "cut_run_btn",
+                                          "cut_cancel_btn"]
+    assert _names(run["outputs"]) == ["cut_report",
+                                      "cut_progress", "cut_analyze_btn", "cut_run_btn",
+                                      "cut_cancel_btn"]
+    # And neither handler may reach outside the Raw Cutter: no render, source-confirmation,
+    # Media Preparation or Qwen widget may appear in either list.
+    forbidden = {"status_output", "video_output", "process_btn", "source_state", "source_report",
+                 "confirm_btn", "confirm_status", "prep_status", "prep_report", "verify_report"}
+    for kwargs in (analyze, run):
+        assert not (set(_names(kwargs["outputs"])) & forbidden), _names(kwargs["outputs"])
 
 
 def test_the_batch_reuses_the_shared_execution_settings_rather_than_duplicating_them(gui_tree):
@@ -658,27 +679,54 @@ def test_the_mode_switch_writes_only_visibilities(gui_tree):
 
 def test_every_batch_click_input_matches_its_handler_signature(gui_tree):
     """Gradio passes handler arguments positionally."""
-    for widget, handler in (("cut_batch_start_btn", "_on_cut_batch_run"),
+    for widget, handler in (("cut_batch_start_btn", "_on_cut_batch_run_ui"),
                             ("cut_batch_count_btn", "_on_cut_batch_count"),
                             ("cut_batch_cancel_btn", "_on_cut_batch_cancel")):
         inputs = _kwargs(_click(gui_tree, widget))["inputs"]
         names = [ast.unparse(e) for e in inputs.elts]
-        parameters = [a.arg for a in _func(gui_tree, handler).args.args]
-        assert len(names) == len(parameters), (widget, names, parameters)
+        args = _func(gui_tree, handler).args
+        # [FORK] Raw Cutter progress P1: Gradio supplies only the positional inputs, so compare
+        # against the parameters that have NO default. `_on_cut_batch_run` gained an optional
+        # output-only `sink=None`, which Gradio neither knows about nor supplies.
+        required = [a.arg for a in args.args[:len(args.args) - len(args.defaults)]]
+        assert len(names) == len(required), (widget, names, required)
+    # The wrapper and the batch it delegates to must still agree on the positional arguments.
+    ui = _func(gui_tree, "_on_cut_batch_run_ui").args
+    core = _func(gui_tree, "_on_cut_batch_run").args
+    ui_required = [a.arg for a in ui.args[:len(ui.args) - len(ui.defaults)]]
+    core_required = [a.arg for a in core.args[:len(core.args) - len(core.defaults)]]
+    assert ui_required == core_required, (ui_required, core_required)
 
 
 def test_the_batch_generator_always_yields_both_of_its_two_outputs(gui_tree):
-    """`outputs=[cut_batch_status, cut_batch_summary]`, so every yield must be a 2-tuple or Gradio
-    writes the wrong widget. This is the defect class that shipped a 3-tuple against 4 outputs in
-    V1's analyze handler."""
-    outputs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))["outputs"]
-    assert _names(outputs) == ["cut_batch_status", "cut_batch_summary"]
-    handler = _func(gui_tree, "_on_cut_batch_run")
-    yields = [n for n in ast.walk(handler) if isinstance(n, ast.Yield)]
-    assert yields, "the batch must stream progress"
-    for node in yields:
+    """Every yield must be exactly as wide as the outputs it writes, or Gradio writes the wrong
+    widget. This is the defect class that shipped a 3-tuple against 4 outputs in V1's analyze
+    handler.
+
+    [FORK] Raw Cutter progress P1: there are now TWO arities to pin, and both still matter.
+    `_on_cut_batch_run` -- the reviewed batch -- keeps yielding exactly 2-tuples, which is what
+    makes it safe to delegate to. The wrapper that Gradio actually calls writes 6 widgets, and
+    every one of its yields must be 6 wide.
+    """
+    core = _func(gui_tree, "_on_cut_batch_run")
+    core_yields = [n for n in ast.walk(core) if isinstance(n, ast.Yield)]
+    assert core_yields, "the batch must stream progress"
+    for node in core_yields:
         assert isinstance(node.value, ast.Tuple), ast.unparse(node)
         assert len(node.value.elts) == 2, ast.unparse(node)
+
+    outputs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))["outputs"]
+    assert _names(outputs) == ["cut_batch_status", "cut_batch_summary", "cut_batch_progress",
+                               "cut_batch_count_btn", "cut_batch_start_btn",
+                               "cut_batch_cancel_btn"]
+    wrapper = _func(gui_tree, "_on_cut_batch_run_ui")
+    wrapper_yields = [n for n in ast.walk(wrapper) if isinstance(n, ast.Yield)]
+    assert wrapper_yields, "the wrapper must stream progress"
+    for node in wrapper_yields:
+        # `(status, summary, panel) + <three button updates>` == 6.
+        assert isinstance(node.value, ast.BinOp), ast.unparse(node)
+        assert len(node.value.left.elts) == 3, ast.unparse(node)
+        assert len(outputs.elts) == 6
 
 
 def test_the_count_button_is_read_only_and_takes_no_mutex(gui_tree):
@@ -707,7 +755,10 @@ def test_cancel_batch_shares_the_cutter_cancel_lane_and_the_one_job_slot(gui_tre
     assert ast.unparse(kwargs["concurrency_id"]) == "CUTTER_CANCEL_CONCURRENCY_ID"
     assert ast.unparse(kwargs["concurrency_limit"]) == "None"
     assert ast.unparse(kwargs["inputs"]) == "[]"
-    assert ast.unparse(kwargs["outputs"]) == "[cut_batch_status]"
+    # [FORK] Raw Cutter progress P1: Cancel Batch also writes the progress panel so it can say
+    # "cancellation requested". Its status box stays FIRST and it still writes nothing outside
+    # the batch's own two read-only widgets.
+    assert _names(kwargs["outputs"]) == ["cut_batch_status", "cut_batch_progress"]
     body = _code_only(_func(gui_tree, "_on_cut_batch_cancel"))
     assert "_CUTTER_JOB_LOCK" in body and "_cutter_job" in body
     assert "job.cancel()" in body

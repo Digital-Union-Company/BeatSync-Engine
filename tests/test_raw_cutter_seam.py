@@ -182,11 +182,22 @@ def test_the_cut_takes_the_shared_mutex_exactly_once(gui_tree):
 
 
 def test_the_cut_clears_its_holder_token_before_releasing(gui_tree):
-    """Same ordering every other holder obeys: if the mutex is free, the token is empty."""
+    """Same ordering every other holder obeys: if the mutex is free, the token is empty.
+
+    [FORK] Raw Cutter progress P1: select the `finally` that actually RELEASES the mutex rather
+    than whichever happens to be last. `_on_cut_run` now also contains the export worker's own
+    `try/finally`, and `finallies[-1]` silently picked that one -- the assertion then tested a
+    block it was never about. Selecting by content makes the test say what it means, and makes it
+    strictly harder to satisfy: a handler that released the mutex somewhere with no holder clear
+    would now fail here instead of being skipped.
+    """
     finallies = [n for n in ast.walk(_func(gui_tree, "_on_cut_run"))
                  if isinstance(n, ast.Try) and n.finalbody]
     assert finallies
-    final = [ast.unparse(s) for s in finallies[-1].finalbody]
+    releasing = [n for n in finallies
+                 if any("_RENDER_LOCK.release()" in ast.unparse(s) for s in n.finalbody)]
+    assert len(releasing) == 1, "exactly one finally may release the cutter's mutex"
+    final = [ast.unparse(s) for s in releasing[0].finalbody]
     clear_at = next(i for i, s in enumerate(final) if "_mark_lock_holder('')" in s)
     release_at = next(i for i, s in enumerate(final) if "_RENDER_LOCK.release()" in s)
     assert clear_at < release_at, final
@@ -230,7 +241,11 @@ def test_the_cutter_cancel_has_its_own_lane(gui_tree):
     assert ast.unparse(kwargs["concurrency_id"]) == "CUTTER_CANCEL_CONCURRENCY_ID"
     assert ast.unparse(kwargs["concurrency_limit"]) == "None"
     assert ast.unparse(kwargs["inputs"]) == "[]"
-    assert ast.unparse(kwargs["outputs"]) == "[cut_report]"
+    # [FORK] Raw Cutter progress P1: Cancel now also writes the live progress panel so it can say
+    # "cancellation requested". The guarantee this test exists for is unchanged and still exact:
+    # the cutter's report box stays FIRST, and Cancel writes nothing beyond the cutter's own two
+    # read-only widgets -- no render, source-confirmation or Media Preparation widget.
+    assert _names(kwargs["outputs"]) == ["cut_report", "cut_progress"]
 
 
 def test_the_cancel_lane_is_not_the_render_cancel_lane(gui_source):
@@ -975,13 +990,92 @@ def test_the_cut_inputs_match_the_handler_signature(gui_tree):
         assert len(names) == len(parameters), (widget, names, parameters)
 
 
-def test_the_analyze_outputs_match_what_the_handler_returns(gui_tree):
-    outputs = _kwargs(_click(gui_tree, "cut_analyze_btn"))["outputs"]
-    assert len(outputs.elts) == 4
-    handler = _func(gui_tree, "_on_cut_analyze")
+#: The three button updates `_cut_buttons` / `_cut_batch_buttons` return as one set.
+_BUTTON_SET_WIDTH = {"_cut_buttons": 3, "_cut_batch_buttons": 3}
+
+
+def _emitted_arity(node, locals_=None):
+    """How many Gradio outputs one `yield`/`return` expression supplies.
+
+    [FORK] Raw Cutter progress P1. A handler emits `(payload values) + _cut_buttons(...)`, and
+    some paths emit through a small local helper (`fail(...)`, `refuse(...)`). Counting only the
+    literal tuple would under-count and let a genuinely wrong arity pass, so this resolves both
+    the button-set helpers and any helper defined INSIDE the handler, by following that helper's
+    own return. Anything it cannot resolve returns 0 and fails loudly rather than silently.
+    """
+    locals_ = locals_ or {}
+    if isinstance(node, ast.Tuple):
+        return len(node.elts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _emitted_arity(node.left, locals_) + _emitted_arity(node.right, locals_)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        name = node.func.id
+        if name in _BUTTON_SET_WIDTH:
+            return _BUTTON_SET_WIDTH[name]
+        return locals_.get(name, 0)
+    if isinstance(node, ast.IfExp):
+        # `idle_plan if keep_plan else idle_no_plan` -- both branches must be the same width, or
+        # one code path would write a different number of widgets than the other.
+        left, right = _emitted_arity(node.body, locals_), _emitted_arity(node.orelse, locals_)
+        assert left == right, f"branches of {ast.unparse(node)} emit {left} vs {right}"
+        return left
+    if isinstance(node, ast.Name):
+        # `busy` / `idle_plan` / `idle_no_plan` are bound to a `_cut_buttons(...)` set.
+        return 3
+    return 0
+
+
+def _handler_arities(handler):
+    """Arity of every helper defined inside `handler`, resolved from its own return."""
+    widths = {}
     for node in ast.walk(handler):
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
-            assert len(node.value.elts) == 4, ast.unparse(node)
+        if isinstance(node, ast.FunctionDef) and node is not handler:
+            for ret in ast.walk(node):
+                if isinstance(ret, ast.Return) and ret.value is not None:
+                    width = _emitted_arity(ret.value, widths)
+                    if width:
+                        widths[node.name] = width
+    return widths
+
+
+def test_the_analyze_outputs_match_what_the_handler_returns(gui_tree):
+    """Every emitted tuple must be exactly as wide as the declared outputs.
+
+    This is the defect class that shipped a 3-tuple against 4 outputs in V1: Gradio writes the
+    wrong widget rather than failing, so the arity has to be pinned somewhere. P1 widened both
+    sides together -- four payload widgets plus the progress panel, plus the three button states.
+    """
+    outputs = _kwargs(_click(gui_tree, "cut_analyze_btn"))["outputs"]
+    assert _names(outputs) == ["cut_summary", "cut_table", "cut_plan_state", "cut_source_info",
+                               "cut_progress", "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn"]
+    declared = len(outputs.elts)
+    assert declared == 8
+    handler = _func(gui_tree, "_on_cut_analyze")
+    helpers = _handler_arities(handler)
+    emitted = [n for n in ast.walk(handler)
+               if isinstance(n, ast.Yield) and n.value is not None]
+    assert emitted, "Analyze must emit something"
+    for node in emitted:
+        assert _emitted_arity(node.value, helpers) == declared, ast.unparse(node)
+
+
+def test_the_cut_outputs_match_what_the_handler_yields(gui_tree):
+    """[FORK] Raw Cutter progress P1: the same arity guarantee for Cut Video.
+
+    Cut Video gained the progress panel and the three button states, and it emits from several
+    terminal paths (success, cancellation, failure, and four separate refusals). Every one of
+    them must be exactly as wide as the declared outputs.
+    """
+    outputs = _kwargs(_click(gui_tree, "cut_run_btn"))["outputs"]
+    assert _names(outputs) == ["cut_report", "cut_progress",
+                               "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn"]
+    declared = len(outputs.elts)
+    handler = _func(gui_tree, "_on_cut_run")
+    helpers = _handler_arities(handler)
+    emitted = [n for n in ast.walk(handler) if isinstance(n, ast.Yield) and n.value is not None]
+    assert emitted, "Cut Video must emit something"
+    for node in emitted:
+        assert _emitted_arity(node.value, helpers) == declared, ast.unparse(node)
 
 
 def test_the_four_way_busy_table_names_every_holder(gui_tree):
