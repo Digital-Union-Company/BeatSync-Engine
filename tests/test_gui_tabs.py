@@ -135,7 +135,8 @@ def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: a
     block = source[cutter:advanced]
     assert "gr.Accordion" not in block, "the Raw Cutter must not hide its controls in an accordion"
     for widget in ("cut_source", "cut_output", "cut_sensitivity", "cut_min_seconds",
-                   "cut_max_seconds", "cut_remove_audio", "cut_analyze_btn", "cut_run_btn",
+                   "cut_max_seconds", "cut_remove_audio", "cut_rename_output",
+                   "cut_analyze_btn", "cut_run_btn",
                    "cut_cancel_btn", "cut_summary", "cut_table", "cut_report"):
         assert f"{widget} = gr." in block, f"{widget} is not in the Raw Cutter tab"
 

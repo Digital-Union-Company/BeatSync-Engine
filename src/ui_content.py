@@ -695,6 +695,17 @@ INFO_CUT_REMOVE_AUDIO = (
     "A source with no audio works either way."
 )
 
+# [FORK] Digital-Union (Raw Cutter R4-C): synthetic output naming, opt-in and off by default.
+# Shared between Single Video and Folder Batch, like every other execution setting in this tab.
+LABEL_CUT_RENAME_OUTPUT = "🏷️ Rename output clips"
+INFO_CUT_RENAME_OUTPUT = (
+    "Off by default. Turn it on to name the clips File001_DDMMYYYY_001.mp4 and so on, with no "
+    "part of your original filenames or folder names in any name the cutter creates. The date is "
+    "the day the job started, fixed once, so a long run crossing midnight stays consistent. In "
+    "Folder Batch the per-source folders become File001, File002, … and batch_manifest.json "
+    "still records which original video each one came from."
+)
+
 LABEL_CUT_ANALYZE = "🔎 Analyze / Preview"
 LABEL_CUT_RUN = "✂️ Cut Video"
 LABEL_CUT_CANCEL = "⏹️ Cancel cutting"

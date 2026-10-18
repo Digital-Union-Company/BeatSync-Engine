@@ -53,9 +53,10 @@ and **rejected by the product owner**. Do not reintroduce one.
 chooses to run. Cutting itself stays uninterrupted and uninteractive. A design that put clip
 approval *inside* the cut loop would be the rejected idea wearing a new name.
 
-With batch processing now shipped and deployed (R4-A), the active work has moved to **making a long
-run legible while it happens** (R4-B), **naming its output** (R4-C), and **triaging the result**
-(R5). The ordering is in the status summary at the end of this document.
+With batch processing shipped and deployed (R4-A) and live progress now merged and deployed (R4-B),
+the active work is **naming the output** (R4-C — open draft PR #72, not merged) and
+**triaging the result** (R5, the next feature to build). The ordering is in the status summary at the
+end of this document.
 
 ---
 
@@ -83,8 +84,9 @@ Mechanical, deterministic, quality-first shot selection. No AI involved anywhere
 
 **Playtest coverage.** `D:\BeatSync-Playtest-dd059fb1\` was built from `dd059fb1`, which predates
 this work, so the Raw Cutter is **not** in that package. `D:\BeatSync-Playtest-77b854a1\` was built
-from `77b854a1` and **does** contain Raw Cutter V1. Neither contains batch mode, which is still an
-open pull request.
+from `77b854a1` and **does** contain Raw Cutter V1 but not batch mode. Batch mode is in the later
+packages, built from `dd2e08e4` (PR #69) and `894814aa` (scene guards and VFR-safe exports).
+**No Playtest package contains R4-C**, which is still an open pull request.
 
 ---
 
@@ -281,11 +283,10 @@ folder with one press and no per-file preview or confirmation.
 - **One mutex acquisition for the whole batch**, sharing the existing process-global render lock, so
   a batch and a music-video render can never run at once.
 
-#### R4-B — Live progress and active controls · **IN REVIEW — open draft PR, NOT merged, NOT deployed**
+#### R4-B — Live progress and active controls · **DONE — merged in PR #71, deployed to production**
 
-A truthful progress surface for both Raw Cutter modes. Implemented and validated on a feature
-branch and published as **draft pull request #71**; it has **not been merged, and production does
-not have it.**
+A truthful progress surface for both Raw Cutter modes. Reviewed, remediated, **merged in PR #71**
+(`main` at `2044f360`) and **deployed to production at `2044f360`**.
 
 - **Analyze** names each real phase — reading the source, detecting scene changes, planning — before
   the blocking call it describes, with an **indeterminate** bar. One FFmpeg scene pass reports
@@ -302,35 +303,73 @@ not have it.**
 - Button states are a courtesy only: `plan_signature` and the shared render mutex remain the sole
   authorities and still refuse a caller that never saw the UI.
 
-Measured locally: full suite **6 924 passed, 8 skipped, 0 failed**; a real-browser run observed the
-bar advancing 0 → 11 → 22 → 33 → 44 → 56 → 67 → 78 → 89 → 100 % with counters 0/9 → 9/9 and each
-clip named as it encoded.
+Measured before the merge: full suite **6 953 passed, 8 skipped, 0 failed**; a real-browser run
+observed the bar advancing 0 → 11 → 22 → 33 → 44 → 56 → 67 → 78 → 89 → 100 % with counters
+0/9 → 9/9 and each clip named as it encoded. Two independent reviews (P19-R3, P19-R5) and the
+remediation of both their MAJOR findings are recorded in the pull request.
 
-#### R4-C — Synthetic output naming · **PLANNED, NOT IMPLEMENTED — high priority**
+#### R4-C — Synthetic output naming · **OPEN DRAFT PR #72 — NOT merged, NOT deployed**
 
-An **opt-in** checkbox, **Rename output clips**, default **OFF**. With it off, naming is exactly
-what it is today — this adds a mode, it does not change one.
+Implemented on `feat/raw-cutter-synthetic-output-naming`, independently reviewed, and published as
+**open draft pull request #72**. It is **not on `main`** and **production does not have it** —
+production remains at `2044f360`. The independent review returned a QUALIFIED verdict with two
+non-blocking MINOR findings; the source-index ordering one has since been corrected by product-owner
+decision (see the counter bullet below), which is a further local change on top of the published
+commit and is itself awaiting independent delta review.
+
+An **opt-in** checkbox, **Rename output clips**, default **OFF**, shared by both modes. With it off,
+naming is exactly what it is today — this adds a mode, it does not change one.
 
 With it on, exported clips get synthetic, source-independent names:
 
 ```
-File001_18102026_001.mp4
-File002_18102026_002.mp4
-File003_18102026_003.mp4
+RawCutter_Single_20261018_153000\        RawCutter_Batch_20261018_153000\
+  File001_18102026_001.mp4                 File001\File001_18102026_001.mp4
+  File001_18102026_002.mp4                 File001\File001_18102026_002.mp4
+  File001_18102026_003.mp4                 File002\File002_18102026_001.mp4
+                                           batch_manifest.json
 ```
 
-- The date is the **local job-start date**, `DDMMYYYY`, fixed once per run so a batch crossing
-  midnight does not change naming halfway through.
-- Counters are **deterministic within a run and unique across its whole discovered source set** —
-  the file counter identifies the source, the trailing counter the clip within it.
-- **No exported name and no automatically created output subfolder may leak the original basename**
-  while this mode is on. That is the point of the feature, and it includes the per-source folders
-  Folder Batch creates today.
-- **Provenance is retained but kept separate**: the batch manifest keeps the real mapping for audit,
-  and the exported filenames do not.
+- `File<SSS>` is the source's position in the **frozen** input list (always `001` for Single
+  Video), `DDMMYYYY` the job-start date, `<CCC>` the clip's index within that source.
+- The date is the **local job-start date**, captured **once** per job from the same clock reading
+  the output folder is named after, so a batch crossing midnight does not change naming halfway
+  through. Neither pure module reads a clock at all, which is what makes that structural.
+- Indexes are **never renumbered** when an earlier source is skipped, unreadable or fails.
+- Counters are at least three digits and **widen** rather than wrap. Both are padded to the
+  **total** they count towards: the clip counter to that source's real clip count, and the source
+  counter to the job's **complete frozen source count**, decided once at submission. So a
+  1 200-source batch is `File0001`…`File1200` throughout rather than three digits up to 999 and four
+  after it, and an ordinary filename sort is the discovery order **at every scale**. A batch of 999
+  or fewer sources is unaffected — still exactly `File001`…`File999`.
+  <br>This corrects the one ordering limitation the independent review of PR #72 recorded, by
+  product-owner decision. The superseded spelling padded the source field from each index on its
+  own, so `File1000` sorted before `File101`; identity, uniqueness and index retention were never
+  affected, only the browsing order. The width is held in the one frozen naming record the batch
+  layout and the exporter both read, so the per-source folders and the clips inside them cannot be
+  padded differently.
+- **No exported name and no automatically created output subfolder leaks the original basename**
+  while this mode is on — including the **staging** file, which would otherwise leak for the whole
+  length of an encode. In Folder Batch the mirrored input structure is **dropped** rather than
+  sanitised, because sanitising a folder name still reproduces it.
+- The operator-selected **output root is never renamed**; nor is `RawCutter_Batch_<timestamp>`,
+  which is the run's identity rather than the source's.
+- **Provenance is retained but kept separate**: `batch_manifest.json` keeps the real
+  source → `File<SSS>` mapping and the clips each source produced, and the exported filenames do
+  not. The schema name is unchanged and the only addition is
+  `settings.rename_output_clips`.
 - Applies to **both** Single Video and Folder Batch.
-- No-overwrite publication, atomic staging, source preservation and manifest completeness are
-  unchanged and remain mandatory.
+- No-overwrite publication, atomic staging, source preservation, cancellation, the 0.20 s scene
+  guard, the shared render mutex, CFR/VFR frame timing and manifest completeness are **unchanged**.
+  Measured against the real binary: the mode changes the output path and nothing else about the
+  FFmpeg command, and adds no transcode and no extra pass.
+
+Measured locally: full suite **7 182 passed, 8 skipped, 0 failed** (PR #72 as published is
+7 094 / 8 / 0, and the accepted `main` baseline is 6 953 / 8 / 0), including a new
+`tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide source width at totals of
+1, 2, 9, 10, 99, 100, 999, 1 000, 1 001, 1 200 and 10 000 — including an end-to-end 1 000-source
+batch through the real handler and an executable negative control in which the superseded
+per-index rule fails the ordering requirement.
 
 #### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
 
@@ -377,8 +416,8 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 | **R1** — Raw Cutter V1, mechanical quality-first selection | **DONE** — merged in PR #68, **deployed** |
 | **R4-A** — Automatic folder batch mode | **DONE** — merged in PR #69, **deployed** |
 | **Scene guards + VFR-safe exports** — conservative 0.20 s guard at detected cuts, `-fps_mode:v passthrough -enc_time_base:v demux` | **DONE** — merged in PR #70, **deployed** |
-| **R4-B** — Live progress and active controls | **IN REVIEW** — open **draft PR #71**; not merged, not deployed |
-| **R4-C** — Synthetic output naming (opt-in, default off) | **PLANNED** — specified here, not implemented |
+| **R4-B** — Live progress and active controls | **DONE** — merged in PR #71, **deployed** at `2044f360` |
+| **R4-C** — Synthetic output naming (opt-in, default off) | **OPEN DRAFT PR #72** on `feat/raw-cutter-synthetic-output-naming`; **not merged, not deployed**. One reviewed MINOR (source-index sort order above 999) has been corrected locally on top of the published commit and awaits independent delta review |
 | **R5** — Clips Preview Selector (post-cut triage tab) | **PLANNED** — specified in `docs/claude/clips-preview-selector-v1.md`, not implemented |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
@@ -386,11 +425,15 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 
 ### Current priority order (product-owner decision)
 
-1. **Finish R4-B** live progress and get it reviewed.
-2. **R4-C** synthetic output naming.
-3. **R5** Clips Preview Selector — the interactive gallery first, safe file movement second.
-4. **R3 / Smart Passages** only once the post-cut review workflow exists. It stays opt-in, and it
-   must not be mixed with Stage-5 cache identity or the existing Qwen worker.
+1. ~~**Finish R4-B** live progress and get it reviewed.~~ **Done** — merged in PR #71 and deployed.
+2. **R4-C** synthetic output naming — **open draft PR #72**. Independently reviewed (QUALIFIED); the
+   source-index ordering MINOR has been corrected locally since, so the next step is an independent
+   delta review of that correction. Nothing about it is merged or deployed.
+3. **R5** Clips Preview Selector — the next high-priority feature to build, and the reserved fifth
+   top-level tab. The interactive gallery first, safe file movement second. The accepted
+   specification in `docs/claude/clips-preview-selector-v1.md` is unchanged.
+4. **R3 / Smart Passages** only once the post-cut review workflow exists. It stays **opt-in** by
+   design, and it must not be mixed with Stage-5 cache identity or the existing Qwen worker.
 
 ---
 

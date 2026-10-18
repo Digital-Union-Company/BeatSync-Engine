@@ -439,7 +439,8 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
                     run_directory: str, remove_audio: bool, encoder: str,
                     job: CutterJob | None = None,
                     on_progress: Callable[[int, int, str], None] | None = None,
-                    on_complete: Callable[["SegmentResult"], None] | None = None
+                    on_complete: Callable[["SegmentResult"], None] | None = None,
+                    *, naming: "fork_cutter.OutputNaming | None" = None
                     ) -> list[SegmentResult]:
     """Export every planned segment into ``run_directory``.
 
@@ -472,6 +473,17 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
       never be lost from the caller's accounting because a later metadata read failed. See the
       comment at the measurement itself for the reproduction this came from.
     * Completed segments are never touched by a later failure or by cancellation.
+
+    **[FORK] R4-C: ``naming`` is the job's frozen output-naming request, keyword-only and
+    defaulting to ``None``** -- which is the legacy mode, so every pre-R4-C call site behaves
+    identically. When it asks for synthetic names, this is the ONLY place the decision takes
+    effect, and it takes effect BEFORE FFmpeg is invoked: the destination, the staging file and
+    the name handed to ``on_progress`` all come from the same two pure builders, so the operator
+    sees the name the clip is actually written under. Nothing is renamed afterwards -- a
+    post-export rename would put a source-revealing name on disk for the length of an encode and
+    add a fallible step between publication and ``on_complete``, which the R4 contract forbids.
+    Nothing else changes: same argv, same VFR options, same audio handling, same encoder, same
+    staged no-replace publication, same containment check.
     """
     results: list[SegmentResult] = []
     total = plan.count
@@ -485,7 +497,7 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
     for segment in plan.segments:
         if job is not None and job.cancelled:
             raise CutterCancelled()
-        name = fork_cutter.segment_filename(source.path, segment.index, total)
+        name = fork_cutter.segment_filename(source.path, segment.index, total, naming=naming)
         destination = os.path.abspath(os.path.join(root, name))
         if os.path.commonpath([root, destination]) != root:
             record(SegmentResult(index=segment.index, error="Refused an unsafe path."))
@@ -499,7 +511,7 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
 
         token = uuid.uuid4().hex[:12]
         staging = os.path.join(root, fork_cutter.staging_filename(
-            source.path, segment.index, total, token))
+            source.path, segment.index, total, token, naming=naming))
 
         if on_progress is not None:
             on_progress(segment.index, total, name)
@@ -808,18 +820,23 @@ def write_batch_manifest(batch_directory: str, payload: dict) -> str:
         return f"Could not write {fork_batch.MANIFEST_FILENAME}: {exc}"
 
 
-def prepare_run_directory(output_root: str, source_path: str, timestamp: str) -> tuple[str, str]:
+def prepare_run_directory(output_root: str, source_path: str, timestamp: str, *,
+                          naming: "fork_cutter.OutputNaming | None" = None) -> tuple[str, str]:
     """Create the fresh per-run subfolder. Returns ``(path, error)``.
 
     `os.makedirs(..., exist_ok=False)` is the test and the creation in one step, so a run can never
     adopt a directory that already held someone else's clips.
+
+    [FORK] R4-C: `naming` only changes the NAME `run_directory_name` proposes -- the refusal, the
+    containment of the folder inside the operator's own output root, and the one-step create-is-
+    the-test rule are all unchanged. A synthetic run never adopts or overwrites a previous one.
     """
     if not isinstance(output_root, str) or not output_root.strip():
         return "", "Choose an output folder."
     root = os.path.abspath(os.path.expandvars(os.path.expanduser(output_root.strip().strip('"'))))
     if os.path.exists(root) and not os.path.isdir(root):
         return "", f"The output path is not a folder:\n{root}"
-    name = fork_cutter.run_directory_name(source_path, timestamp)
+    name = fork_cutter.run_directory_name(source_path, timestamp, naming=naming)
     destination = os.path.join(root, name)
     if os.path.exists(destination):
         return "", f"This run folder already exists; refusing to reuse it:\n{destination}"

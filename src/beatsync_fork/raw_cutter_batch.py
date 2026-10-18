@@ -210,14 +210,25 @@ def _relative_parts(source_path: str, scan_root: str) -> tuple[str, ...]:
     return tuple(safe_component(piece) for piece in chain) + (stem,)
 
 
+def _naming_is_synthetic(naming: Any) -> bool:
+    """[FORK] R4-C: only a real :class:`raw_cutter.OutputNaming` asking for it switches the mode.
+
+    Delegated to the one predicate in `raw_cutter`, so the batch layout and the filenames can
+    never disagree about which mode a job is in -- a divergence there would produce a `File003`
+    clip inside a `video01` folder, which leaks the basename anyway and makes the manifest's
+    mapping harder to read rather than easier.
+    """
+    return isinstance(naming, cutter.OutputNaming) and bool(naming.synthetic)
+
+
 def _token(source_path: Any) -> str:
     """A short deterministic tag for one source path. Stable across runs, never random."""
     normalised = os.path.normcase(os.path.abspath(str(source_path or "")))
     return hashlib.sha1(normalised.encode("utf-8", "replace")).hexdigest()[:8]
 
 
-def plan_item_directories(source_paths: Sequence[str],
-                          scan_root: str) -> tuple[tuple[str, ...], ...]:
+def plan_item_directories(source_paths: Sequence[str], scan_root: str, *,
+                          naming: Any = None) -> tuple[tuple[str, ...], ...]:
     """Assign every source a UNIQUE relative output directory, deterministically.
 
     Uniqueness is decided across the whole frozen input list at once, which is the only way to get
@@ -228,7 +239,30 @@ def plan_item_directories(source_paths: Sequence[str],
     navigate. On collision the colliding entry gains a deterministic tag derived from its own full
     path -- never a counter alone, which would depend on enumeration order, and never randomness.
     A numeric suffix is the last-resort tie-break for the astronomically unlikely tag collision.
+
+    **[FORK] R4-C: with synthetic naming on, the layout is one flat ``File<SSS>`` folder per
+    source and the input structure is deliberately NOT mirrored.** Mirroring is what the default
+    mode is for, and it reproduces the source's own folder names -- ``cameraA/sub/video01`` --
+    every one of which is exactly what this mode exists to keep out of the output. The relative
+    chain is therefore dropped rather than sanitised, because sanitising a leak still leaks it.
+
+    Uniqueness in that mode is structural rather than negotiated: the component is the source's
+    1-based position in the frozen list, so two entries cannot collide and no tag, counter or
+    hash is needed. Note the index deliberately comes from the position here and not from
+    ``naming.source_index`` -- this function is answering for the whole list at once, so a
+    job-level record aimed at one source would be the wrong input to read.
+
+    **How wide that position is padded is read from the record, not recomputed here.**
+    ``naming.for_source(position)`` returns the same single-source record the exporter will build
+    its filenames from, so the folder and the clips inside it are padded by one shared number that
+    only the caller's frozen job record supplies. Working the width out locally from
+    ``len(source_paths)`` would be a second rule over the same data, and the day the two disagreed
+    the result would be ``File0007`` clips sitting in a ``File007`` folder.
     """
+    if _naming_is_synthetic(naming):
+        return tuple((naming.for_source(position).source_tag,)
+                     for position in range(1, len(source_paths) + 1))
+
     assigned: dict[tuple[str, ...], str] = {}
     layout: list[tuple[str, ...]] = []
 
@@ -303,11 +337,25 @@ class BatchSettings:
     remove_audio: bool = True
     encoder: str = ""
     recursive: bool = True
+    #: [FORK] R4-C: APPENDED with a default, so every existing construction and every existing
+    #: reader keeps working unchanged. Recorded here because it belongs in the manifest's
+    #: `settings` block -- it is an execution setting the operator chose -- but note it is NOT
+    #: how the naming reaches the exporter: that is `raw_cutter.OutputNaming`, built once at
+    #: submission. Two representations of the same choice, each at the layer that needs it, and
+    #: `gui.py` derives both from the one widget value.
+    rename_output_clips: bool = False
 
     def describe(self) -> str:
-        return (f"sensitivity {self.sensitivity} (threshold {self.threshold:g}), "
+        # [FORK] R4-C: the renaming clause is appended ONLY when the mode is on, so a default
+        # batch's settings line -- which the report, the panel and several assertions read -- is
+        # byte-for-byte what it was before this feature existed.
+        text = (f"sensitivity {self.sensitivity} (threshold {self.threshold:g}), "
                 f"{self.min_seconds:g}s-{self.max_seconds:g}s clips, audio "
-                f"{'removed' if self.remove_audio else 'kept'}, encoder {self.encoder or 'unknown'}")
+                f"{'removed' if self.remove_audio else 'kept'}, encoder "
+                f"{self.encoder or 'unknown'}")
+        if self.rename_output_clips:
+            text += ", output clips renamed"
+        return text
 
 
 @dataclass(frozen=True)
@@ -528,6 +576,15 @@ def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: Batc
     both name and meaning, so an existing reader keeps working and keeps being right. The new
     field is what lets a reader tell `cancelled=False because it finished` from `cancelled=False
     because it crashed` -- which before R2 looked identical in the record.
+
+    [FORK] R4-C: `settings.rename_output_clips` is ADDED and nothing is removed or redefined, so
+    the schema name is unchanged and an existing reader is unaffected. **The provenance mapping
+    this feature needs already existed and is deliberately not duplicated:** every source row
+    carries its real `source` path beside the `relative_output` / `output_directory` the clips
+    actually went to, which in synthetic mode is that source's `File<SSS>` folder. So the record
+    maps original identity to synthetic identity without the exported names carrying it, which is
+    the whole requirement -- and the new flag tells a reader which mode produced the row rather
+    than leaving them to infer it from the shape of a folder name.
     """
     totals = summarise(items, discovered)
     return {
@@ -548,6 +605,7 @@ def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: Batc
             "max_seconds": float(settings.max_seconds),
             "remove_audio": bool(settings.remove_audio),
             "encoder": str(settings.encoder),
+            "rename_output_clips": bool(settings.rename_output_clips),
         },
         "totals": {
             "discovered": totals.discovered,

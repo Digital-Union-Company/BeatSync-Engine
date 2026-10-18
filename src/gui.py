@@ -5025,7 +5025,7 @@ def _restore_plan(state):
 
 
 def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds, max_seconds,
-                remove_audio):
+                remove_audio, rename_output):
     """Cut Video. A generator, so clip X / total is visible while FFmpeg works.
 
     The staleness gate is the first real step and it is deliberately strict: the plan is refused
@@ -5034,6 +5034,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     sensitivity makes it fiction. `Remove Audio` is intentionally absent from the signature -- it
     changes how a segment is exported, never where it begins or ends, so it would refuse a plan
     that is still perfectly valid.
+
+    [FORK] Digital-Union (Raw Cutter R4-C): `rename_output` joins it on exactly the same footing,
+    and for the same reason -- it decides what a clip is CALLED. It is resolved into one frozen
+    `OutputNaming` here, at submission, and that record is what the directory and every filename
+    are built from. Toggling the checkbox in another browser session therefore cannot re-name the
+    clips of a job already running: this frame read the value once and holds its own copy.
     """
     import raw_cutter_export as cutter_export
 
@@ -5082,7 +5088,19 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     job = cutter_export.CutterJob()
     _install_cutter_job(job)
 
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    # [FORK] R4-C: ONE clock reading for the whole run, and both naming fields derive from it.
+    # The run timestamp and the job date must describe the same instant, and nothing further down
+    # may read the time again -- that is what keeps a job that crosses midnight consistent.
+    started_at = datetime.datetime.now()
+    timestamp = started_at.strftime('%Y%m%d_%H%M%S')
+    naming = fork_cutter.OutputNaming(
+        synthetic=bool(rename_output),
+        # Single Video is always source 001: there is one source in this job's frozen list, which
+        # is also why the job-wide source width is the three-digit minimum here. Stated rather
+        # than defaulted, so both handlers visibly freeze the same two facts.
+        source_index=1,
+        job_date=started_at.strftime('%d%m%Y'),
+        source_total=1)
     results = []
     # [FORK] Digital-Union (Raw Cutter R1): the completed list is accumulated through a callback,
     # NOT read from the return value. `export_segments` raises `CutterCancelled` on a stop, and an
@@ -5094,7 +5112,7 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     worker = None
     try:
         run_directory, error = cutter_export.prepare_run_directory(
-            output_folder, source.path, timestamp)
+            output_folder, source.path, timestamp, naming=naming)
         if error:
             yield refuse(f"❌ {error}")
             return
@@ -5131,7 +5149,7 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 outcome['results'] = cutter_export.export_segments(
                     source=source, plan=plan, run_directory=run_directory,
                     remove_audio=bool(remove_audio), encoder=encoder, job=job,
-                    on_progress=started, on_complete=finished)
+                    on_progress=started, on_complete=finished, naming=naming)
             except BaseException as exc:   # noqa: BLE001 - re-raised on the generator's thread
                 outcome['error'] = exc
             finally:
@@ -5321,7 +5339,7 @@ def _on_cut_batch_count(input_folder, recursive) -> str:
 
 
 def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                      max_seconds, remove_audio, sink=None):
+                      max_seconds, remove_audio, rename_output, sink=None):
     """Start Batch. A generator, so the current file and phase stay visible for a long job.
 
     Yields `(live_status, final_summary)`. The summary stays empty until the end, so the operator
@@ -5337,6 +5355,14 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     test harness that exec's this body against a synthesised parent package -- keeps working with
     the original seven arguments and no new module-level name to resolve. Nothing in the batch's
     behaviour reads it; it is written, never consulted.
+
+    [FORK] Digital-Union (Raw Cutter R4-C): `rename_output` is the shared checkbox, read once and
+    resolved into one frozen `OutputNaming` for the WHOLE batch -- including a single `job_date`
+    taken from the same `started_at` the output folder is named after. A batch that runs past
+    midnight therefore keeps the date it started with, and each source's naming is derived from
+    that one record with `for_source(position)` rather than from a counter this loop mutates. The
+    frozen input list is what a source index means, so a source that is skipped, unreadable or
+    fails never renumbers the ones after it.
     """
     import raw_cutter_export as cutter_export
 
@@ -5367,7 +5393,6 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     # The input list is frozen here, before anything is written: the manifest, the output layout
     # and the progress counter all refer to this exact ordered tuple.
     sources = found.paths
-    layout = fork_cutter_batch.plan_item_directories(sources, found.root)
     total = len(sources)
 
     if not _RENDER_LOCK.acquire(blocking=False):
@@ -5379,10 +5404,28 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
 
     clock_started = time.perf_counter()
     started_at = datetime.datetime.now()
+    # [FORK] Digital-Union (Raw Cutter R4-C): ONE naming record for the whole batch, resolved
+    # here and never recomputed. `job_date` comes from the SAME `started_at` the batch folder is
+    # named after, so the two cannot describe different days, and no clip export reads a clock of
+    # its own -- which is what keeps a run that crosses midnight on one scheme.
+    #
+    # `source_total` is the frozen count of the list above, and it is the only place the source
+    # field's width is decided: the layout below and every filename the exporter builds both read
+    # it back out of this record, so a 1200-source batch is `File0001`..`File1200` throughout
+    # instead of three digits up to 999 and four after it. It is taken from `total` rather than
+    # recounted, so it cannot describe a different list than the manifest and the progress counter.
+    naming = fork_cutter.OutputNaming(synthetic=bool(rename_output),
+                                      job_date=started_at.strftime('%d%m%Y'),
+                                      source_total=total)
+    # The output layout is decided from the frozen list and the naming mode together, still
+    # before anything is written: mirrored input structure by default, one flat `File<SSS>`
+    # folder per source when renaming is on.
+    layout = fork_cutter_batch.plan_item_directories(sources, found.root, naming=naming)
     encoder = 'h264_nvenc' if NVENC_AVAILABLE else 'libx264'
     settings = fork_cutter_batch.BatchSettings(
         sensitivity=level, threshold=threshold, min_seconds=low, max_seconds=high,
-        remove_audio=bool(remove_audio), encoder=encoder, recursive=bool(recursive))
+        remove_audio=bool(remove_audio), encoder=encoder, recursive=bool(recursive),
+        rename_output_clips=bool(rename_output))
 
     items: List[Any] = []
     batch_directory = ''
@@ -5588,7 +5631,11 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     cutter_export.export_segments(
                         source=source, plan=plan, run_directory=item_directory,
                         remove_audio=bool(remove_audio), encoder=encoder, job=job,
-                        on_complete=written.append)
+                        on_complete=written.append,
+                        # [FORK] R4-C: the job's naming aimed at THIS source's frozen position.
+                        # `for_source` returns a new frozen record, so the batch-level one is
+                        # never mutated and the index cannot drift between sources.
+                        naming=naming.for_source(position))
                 except cutter_export.CutterCancelled:
                     # `written` is the truth on this path: the exception discards
                     # `export_segments`' return value, so the callback's list is the only record
@@ -5714,7 +5761,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
 
 
 def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                         max_seconds, remove_audio):
+                         max_seconds, remove_audio, rename_output):
     """[FORK] Digital-Union (Raw Cutter progress P1): the batch, with a visible bar and controls.
 
     A thin presentation wrapper, on purpose. `_on_cut_batch_run` above keeps every reviewed
@@ -5733,7 +5780,7 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     status, summary = '', ''
     for status, summary in _on_cut_batch_run(
             input_folder, recursive, output_folder, sensitivity, min_seconds,
-            max_seconds, remove_audio, sink=sink):
+            max_seconds, remove_audio, rename_output, sink=sink):
         total = sink.get('total')
         detail = (f"Source {sink.get('position')} of {total}: "
                   f"{sink.get('name', '')} — {sink.get('phase', '')}") if total else ''
@@ -6627,6 +6674,27 @@ def create_ui() -> gr.Blocks:
                                 info=INFO_CUT_REMOVE_AUDIO,
                                 elem_id='cut-remove-audio',
                             )
+                            # [FORK] Digital-Union (Raw Cutter R4-C): ONE shared checkbox, in the
+                            # same shared settings group as sensitivity, the two lengths and
+                            # Remove Audio -- so there is exactly one value per execution setting
+                            # on the screen and both modes read the same one.
+                            #
+                            # Default OFF, and that is a product decision rather than a
+                            # convenience: with it off every generated name is byte-for-byte what
+                            # it has always been, so an existing workflow cannot be changed by
+                            # this feature shipping.
+                            #
+                            # Deliberately NOT a planning input: it changes what a clip is CALLED,
+                            # never where it begins or ends, so it is absent from
+                            # `plan_signature` and from the staleness listeners below for exactly
+                            # the reason Remove Audio is. Refusing a valid plan over a filename
+                            # would force a needless re-analysis of a long video.
+                            cut_rename_output = gr.Checkbox(
+                                value=False,
+                                label=LABEL_CUT_RENAME_OUTPUT,
+                                info=INFO_CUT_RENAME_OUTPUT,
+                                elem_id='cut-rename-output',
+                            )
                         with gr.Column(visible=True) as cut_single_actions:
                             with gr.Row():
                                 cut_analyze_btn = gr.Button(
@@ -7007,7 +7075,7 @@ def create_ui() -> gr.Blocks:
         cut_run_btn.click(
             fn=_on_cut_run,
             inputs=[cut_plan_state, cut_source, cut_output, cut_sensitivity,
-                    cut_min_seconds, cut_max_seconds, cut_remove_audio],
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output],
             outputs=[cut_report, cut_progress,
                      cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
@@ -7067,7 +7135,7 @@ def create_ui() -> gr.Blocks:
         cut_batch_start_btn.click(
             fn=_on_cut_batch_run_ui,
             inputs=[cut_batch_folder, cut_batch_recursive, cut_output, cut_sensitivity,
-                    cut_min_seconds, cut_max_seconds, cut_remove_audio],
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output],
             outputs=[cut_batch_status, cut_batch_summary, cut_batch_progress,
                      cut_batch_count_btn, cut_batch_start_btn, cut_batch_cancel_btn],
             concurrency_limit=None,

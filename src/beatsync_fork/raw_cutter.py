@@ -776,18 +776,185 @@ def safe_stem(name: Any, fallback: str = "source") -> str:
     return (text or fallback)[:60]
 
 
-def run_directory_name(source_path: Any, timestamp: Any) -> str:
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (Raw Cutter R4-C): synthetic, source-independent output naming
+# ---------------------------------------------------------------------------------------------
+# An OPT-IN mode, default off. With it off every name below is byte-for-byte what it has always
+# been; with it on, no generated filename and no automatically generated directory component may
+# carry the original source's basename or its parent folder's name. That is the entire point of
+# the feature, so it is a property of the NAME BUILDER rather than a post-hoc rename: there is no
+# window in which a source-revealing name exists on disk, not even a staging one.
+#
+# The mode and the date travel together in one frozen record, built ONCE at job submission and
+# passed down. Deliberately not a module-level flag: two browser sessions share this process, so
+# a mutable global would let a checkbox toggled in one re-name the clips of a job already running
+# in the other.
+
+#: The fixed prefix of a synthetic source identity: ``File001``, ``File002``, ...
+SYNTHETIC_PREFIX = "File"
+
+#: The fresh per-run folder Single Video mode creates when synthetic naming is on. Source-
+#: independent by construction, unlike the ``<stem>_raw_parts_`` default.
+SINGLE_DIRECTORY_PREFIX = "RawCutter_Single_"
+
+#: Minimum width of either synthetic counter. Both counters widen from the TOTAL they are counting
+#: towards -- the job's frozen source count for the source field, that source's real clip count for
+#: the clip field -- so one job's names all share a width and ordinary lexical order matches
+#: discovery order at any scale. `f"{1000:03d}"` is `"1000"` anyway, so a counter is also never
+#: truncated and never wraps even if a total is understated.
+SYNTHETIC_INDEX_DIGITS = 3
+
+#: What a `job_date` that is not eight digits reads as. Absorbed rather than fatal, like every
+#: other malformed input here, but deliberately CONSPICUOUS: a name carrying `00000000` says the
+#: caller never supplied a date, instead of hiding it behind today's.
+JOB_DATE_FALLBACK = "0" * 8
+
+_DIGITS_ONLY = re.compile(r"\D+")
+
+
+def normalize_job_date(value: Any) -> str:
+    """``DDMMYYYY`` as eight digits, or :data:`JOB_DATE_FALLBACK`.
+
+    The date is an ARGUMENT for exactly the reason the run timestamp is one: this module reads no
+    clock. The caller captures it **once** for the whole job, which is what stops a batch that
+    crosses midnight from changing its naming scheme halfway through -- and why no clip export
+    may ever re-read the time for itself.
+    """
+    text = _DIGITS_ONLY.sub("", str(value or ""))
+    return text if len(text) == 8 else JOB_DATE_FALLBACK
+
+
+def _coerce_position(value: Any) -> int:
+    """Any junk index as a usable 1-based position. Absorbed, never fatal."""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def source_index_width(source_total: Any, position: Any = 1) -> int:
+    """How many digits EVERY source field in one job uses.
+
+    Derived from the job's complete frozen source count, and deliberately not from the individual
+    index: a width that came from each value would pad source 100 of 1200 to three digits and
+    source 1000 to four, so an ordinary filename sort would read ``...100, 1000, 1001, 101...``.
+    One width for the whole job is what makes plain lexical order agree with discovery order at
+    every scale, which is what an operator browsing the output folder actually sorts by.
+
+    ``position`` is a no-truncation floor only. A correctly built job never needs it, because the
+    total is by definition at least as large as any position in the list; it exists so that an
+    understated total still cannot truncate or wrap an index. Because it can only ever widen a
+    single name, the uniform-width guarantee is a property of the TOTAL being right -- which is
+    why the caller freezes it once, at submission, from the list it is about to process.
+    """
+    total = _coerce_position(source_total)
+    return max(SYNTHETIC_INDEX_DIGITS, len(str(total)), len(str(_coerce_position(position))))
+
+
+def synthetic_source_tag(source_index: Any, source_total: Any = 1) -> str:
+    """``File001`` — one source's whole synthetic identity, filename and folder alike.
+
+    The SAME string names the clip prefix and (in batch mode) that source's output folder, so the
+    two can never drift apart. It is derived from the source's position in the frozen input list,
+    the job's frozen source count, and nothing else -- which is what makes it independent of the
+    file it stands for.
+
+    ``source_total`` defaults to 1, which reproduces exactly the minimum-three-digit spelling a
+    caller got before the job-wide width existed. Batch callers pass the frozen count instead; see
+    :func:`source_index_width`.
+    """
+    position = _coerce_position(source_index)
+    return f"{SYNTHETIC_PREFIX}{position:0{source_index_width(source_total, position)}d}"
+
+
+@dataclass(frozen=True)
+class OutputNaming:
+    """[FORK] R4-C: the job-scoped naming request. Frozen at submission, never mutated.
+
+    ``synthetic`` is the operator's checkbox, resolved once. ``job_date`` is the local calendar
+    date the job started, as ``DDMMYYYY``, captured once by the caller. ``source_index`` is the
+    1-based position of one source in the frozen input list -- always 1 for Single Video, and the
+    discovery position for Folder Batch, which is why :meth:`for_source` exists rather than a
+    setter.
+
+    Indexes are **never renumbered** for a source that is skipped, unreadable or fails: the index
+    is the position in the frozen list, so source 3 is ``File003`` whatever happened to sources 1
+    and 2. That is what keeps the manifest's mapping readable after a partial run.
+
+    ``source_total`` is how many sources the job froze, and it is the SOLE authority for how wide
+    every source field in that job is -- the clip filenames and the per-source batch folders both
+    read it from this one record, so the two cannot disagree and no layer recomputes it from data
+    of its own. It has to live here rather than be worked out where it is used, because the export
+    layer only ever sees :meth:`for_source`'s single-source record and could not otherwise know
+    how large the batch was. Preserved across :meth:`for_source` for exactly that reason.
+
+    The default instance is the legacy mode, so a caller that supplies nothing gets exactly the
+    naming it got before this feature existed -- including the default ``source_total`` of 1, which
+    reproduces the original minimum-three-digit spelling for every index.
+    """
+
+    synthetic: bool = False
+    source_index: int = 1
+    job_date: str = ""
+    source_total: int = 1
+
+    def for_source(self, source_index: Any) -> "OutputNaming":
+        """The same job naming, aimed at one source. Returns a NEW record; nothing is mutated.
+
+        ``source_total`` rides along unchanged: it describes the JOB, not the source, and dropping
+        it here is precisely how a batch would end up with one width in its folder names and
+        another in its filenames.
+        """
+        return OutputNaming(synthetic=self.synthetic,
+                            source_index=_coerce_position(source_index),
+                            job_date=self.job_date, source_total=self.source_total)
+
+    @property
+    def source_tag(self) -> str:
+        return synthetic_source_tag(self.source_index, self.source_total)
+
+    @property
+    def date_field(self) -> str:
+        return normalize_job_date(self.job_date)
+
+
+def _is_synthetic(naming: Any) -> bool:
+    """Only a real :class:`OutputNaming` asking for it switches the mode. Junk reads as legacy.
+
+    `isinstance` rather than duck typing on purpose: a name-building decision this consequential
+    must not be flipped by an unrelated object that happens to carry a `synthetic` attribute.
+    """
+    return isinstance(naming, OutputNaming) and bool(naming.synthetic)
+
+
+def run_directory_name(source_path: Any, timestamp: Any, *,
+                       naming: Any = None) -> str:
     """``<stem>_raw_parts_<timestamp>`` — the fresh per-run folder.
 
     The timestamp is an ARGUMENT, not read from a clock here: this module stays pure, and the
     caller already knows when the run started. Uniqueness is the caller's to enforce by refusing
     an occupied directory; this only proposes a name.
+
+    [FORK] R4-C: with synthetic naming on it is ``RawCutter_Single_<timestamp>`` instead, because
+    the default spelling leads with the source's own stem and would leak it in the one place the
+    operator cannot avoid looking. The timestamp is kept -- it is the run's identity, not the
+    source's -- and so is the caller's refuse-if-it-exists rule.
     """
-    return f"{safe_stem(source_path)}_raw_parts_{str(timestamp).strip() or 'run'}"
+    stamp = str(timestamp).strip() or 'run'
+    if _is_synthetic(naming):
+        return f"{SINGLE_DIRECTORY_PREFIX}{stamp}"
+    return f"{safe_stem(source_path)}_raw_parts_{stamp}"
 
 
-def segment_filename(source_path: Any, index: Any, total: Any, extension: str = ".mp4") -> str:
-    """``<stem>_part_001.mp4``, zero-padded to the real total so files sort correctly."""
+def segment_filename(source_path: Any, index: Any, total: Any, extension: str = ".mp4", *,
+                     naming: Any = None) -> str:
+    """``<stem>_part_001.mp4``, zero-padded to the real total so files sort correctly.
+
+    [FORK] R4-C: with synthetic naming on it is ``File<SSS>_<DDMMYYYY>_<CCC>.mp4`` -- the source's
+    frozen index, the job's own start date, and the clip's index within that source. The source
+    path is still accepted and still ignored in that mode, which is deliberate: the signature
+    stays one shape for both modes, so no call site has to branch.
+    """
     try:
         count = max(1, int(total))
     except (TypeError, ValueError):
@@ -796,12 +963,15 @@ def segment_filename(source_path: Any, index: Any, total: Any, extension: str = 
         position = max(1, int(index))
     except (TypeError, ValueError):
         position = 1
-    width = max(3, len(str(count)))
+    width = max(SYNTHETIC_INDEX_DIGITS, len(str(count)))
+    if _is_synthetic(naming):
+        return (f"{naming.source_tag}_{naming.date_field}_"
+                f"{position:0{width}d}{extension}")
     return f"{safe_stem(source_path)}_part_{position:0{width}d}{extension}"
 
 
 def staging_filename(source_path: Any, index: Any, total: Any, token: Any,
-                     extension: str = ".mp4") -> str:
+                     extension: str = ".mp4", *, naming: Any = None) -> str:
     """The task-owned staging name a clip is written to before it is published.
 
     Carries a per-attempt token so two runs -- or a retry of the same run -- can never collide on
@@ -814,9 +984,14 @@ def staging_filename(source_path: Any, index: Any, total: Any, token: Any,
     makes it fail with "Unable to find a suitable output format" before a single frame is written.
     The marker therefore sits *before* the extension: ``.clip_part_001.a1b2c3.part.mp4``. The
     leading dot keeps it out of the way in a file listing.
+
+    [FORK] R4-C: the base comes from :func:`segment_filename`, so in synthetic mode the STAGING
+    name is source-independent too -- ``.File001_18102026_001.a1b2c3.part.mp4``. A staging file
+    that leaked the basename would defeat the feature for as long as the encode lasted, which on
+    a five-minute clip is the whole visible window. The per-attempt token is unchanged.
     """
     safe_token = _UNSAFE.sub("", str(token or ""))[:24] or "run"
-    base = segment_filename(source_path, index, total, extension="")
+    base = segment_filename(source_path, index, total, extension="", naming=naming)
     return f".{base}.{safe_token}.part{extension}"
 
 
@@ -956,18 +1131,23 @@ def plan_summary_text(plan: SegmentPlan, source: SourceInfo) -> str:
 
 
 __all__ = [
+    "JOB_DATE_FALLBACK",
     "MAX_CLIP_SECONDS_DEFAULT",
     "MIN_CLIP_SECONDS_DEFAULT",
     "PLAN_TABLE_HEADERS",
+    "OutputNaming",
     "RawCutterError",
     "SCENE_CUT",
     "SCENE_GUARD_SECONDS",
     "SENSITIVITY_DEFAULT",
     "SENSITIVITY_MAX",
     "SENSITIVITY_MIN",
+    "SINGLE_DIRECTORY_PREFIX",
     "SKIP_REMAINDER",
     "SKIP_TOO_SHORT",
     "SOURCE_END",
+    "SYNTHETIC_INDEX_DIGITS",
+    "SYNTHETIC_PREFIX",
     "Segment",
     "SegmentPlan",
     "Shot",
@@ -976,6 +1156,7 @@ __all__ = [
     "format_size",
     "format_timecode",
     "normalize_durations",
+    "normalize_job_date",
     "normalize_sensitivity",
     "plan_segments",
     "plan_signature",
@@ -985,5 +1166,7 @@ __all__ = [
     "safe_stem",
     "segment_filename",
     "sensitivity_to_threshold",
+    "source_index_width",
     "staging_filename",
+    "synthetic_source_tag",
 ]

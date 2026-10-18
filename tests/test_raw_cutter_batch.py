@@ -612,9 +612,13 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
     assert ast.unparse(analyze["fn"]) == "_on_cut_analyze"
     run = _kwargs(_click(gui_tree, "cut_run_btn"))
     assert ast.unparse(run["fn"]) == "_on_cut_run"
+    # [FORK] R4-C: the shared Rename output clips checkbox is APPENDED. The original seven are
+    # pinned as a prefix in their original order -- nothing removed, nothing reordered -- and the
+    # one addition is listed explicitly rather than waved through, so an accidental second
+    # addition would still fail here.
     assert _names(run["inputs"]) == ["cut_plan_state", "cut_source", "cut_output",
                                      "cut_sensitivity", "cut_min_seconds", "cut_max_seconds",
-                                     "cut_remove_audio"]
+                                     "cut_remove_audio", "cut_rename_output"]
     # [FORK] Raw Cutter progress P1: this test's purpose is that BATCH work did not disturb the
     # single-video workflow, so it pins the original widgets as a PREFIX that is still written in
     # the original order -- nothing removed, nothing reordered. The progress panel and the three
@@ -637,9 +641,15 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
 
 def test_the_batch_reuses_the_shared_execution_settings_rather_than_duplicating_them(gui_tree):
     """The requirement: avoid maintaining duplicated values for the same execution setting. The
-    sensitivity, minimum, maximum, Remove Audio and output-folder widgets feed BOTH modes."""
+    sensitivity, minimum, maximum, Remove Audio, Rename output clips and output-folder widgets
+    feed BOTH modes.
+
+    [FORK] R4-C: `cut_rename_output` is in this set rather than beside it. The requirement says
+    "exactly one shared setting, consistent with the existing sensitivity, clip-length and Remove
+    Audio controls" -- so it has to be in both input lists AND declared exactly once on screen,
+    which is what the second half of this test measures."""
     shared = {"cut_sensitivity", "cut_min_seconds", "cut_max_seconds", "cut_remove_audio",
-              "cut_output"}
+              "cut_rename_output", "cut_output"}
     batch_inputs = set(_names(_kwargs(_click(gui_tree, "cut_batch_start_btn"))["inputs"]))
     single_inputs = set(_names(_kwargs(_click(gui_tree, "cut_run_btn"))["inputs"]))
     assert shared <= batch_inputs, shared - batch_inputs
@@ -1074,7 +1084,7 @@ class _BatchRun:
 
 def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
                probe_fault=None, export_hook=None, manifest_error="", manifest_raises=False,
-               prelock=False, batch_dir_error="", ui=False):
+               prelock=False, batch_dir_error="", ui=False, rename_output=False):
     """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem.
 
     [FORK] P19-R4: with ``ui=True`` the run is driven through the real `_on_cut_batch_run_ui`
@@ -1082,6 +1092,11 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     what makes a progress assertion an assertion about shipped code rather than about a
     reimplementation of it -- the whole point of findings F-1 and F-2, both of which lived in the
     seam between the batch and its panel and so were invisible to either half alone.
+
+    [FORK] R4-C: ``rename_output`` is the shared Rename output clips checkbox, passed positionally
+    exactly as Gradio passes it. It defaults to ``False`` so every pre-R4-C case below drives the
+    legacy naming mode unchanged -- which is what makes them the negative control for the
+    synthetic-naming cases rather than merely other tests.
     """
     gui = _tree(_GUI)
     wanted = ["_on_cut_batch_run"]
@@ -1143,12 +1158,17 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         return _Res(succeeded=True, times=[10.0, 20.0, 30.0, 40.0], error="")
 
     def export_segments(source=None, plan=None, run_directory=None, remove_audio=True,
-                        encoder="", job=None, on_complete=None):
+                        encoder="", job=None, on_complete=None, naming=None):
         events.append("export:" + os.path.basename(source.path))
         if export_hook:
-            return export_hook(source, plan, run_directory, job, on_complete)
+            return export_hook(source, plan, run_directory, job, on_complete, naming)
         for segment in plan.segments:
-            target = os.path.join(run_directory, "clip_%03d.mp4" % segment.index)
+            # [FORK] R4-C: the REAL name builder, so what lands on disk here is what the shipped
+            # adapter would write -- including the synthetic spelling when the batch asked for it.
+            # Inventing a `clip_%03d.mp4` name in both modes would make every naming assertion
+            # below a statement about this stub instead of about `segment_filename`.
+            target = os.path.join(run_directory, cutter.segment_filename(
+                source.path, segment.index, plan.count, naming=naming))
             with open(target, "wb") as handle:
                 handle.write(b"\0" * 1024)
             on_complete(_Res(index=segment.index, ok=True, size_bytes=1024, error=""))
@@ -1209,7 +1229,8 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     yields = []
     try:
         for value in namespace[entry](
-                str(src_root), False, str(out_root), 50, 1.0, 8.0, True):
+                str(src_root), False, str(out_root), 50, 1.0, 8.0, True,
+                bool(rename_output)):
             yields.append(value)
     except BaseException as exc:                              # noqa: BLE001 - must be observable
         yields.append(("__ESCAPED__", type(exc).__name__ + ": " + str(exc)))
@@ -1301,7 +1322,7 @@ def test_an_unexpected_failure_is_never_reported_as_a_cancellation(tmp_path, mon
 
 def test_the_four_terminal_classifications_are_distinguishable(tmp_path, monkeypatch):
     """Normal, cancellation and fatal must not collapse into each other."""
-    def cancel_after_first(source, plan, run_directory, job, on_complete):
+    def cancel_after_first(source, plan, run_directory, job, on_complete, naming=None):
         for segment in plan.segments:
             with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
                 handle.write(b"\0")
@@ -1329,7 +1350,7 @@ def test_the_four_terminal_classifications_are_distinguishable(tmp_path, monkeyp
 def test_clips_published_before_a_fatal_export_fault_stay_counted(tmp_path, monkeypatch):
     """R1 measured 2 real files on disk reported as `Clips exported 0`, with the source absent
     from every artifact."""
-    def publish_two_then_raise(source, plan, run_directory, job, on_complete):
+    def publish_two_then_raise(source, plan, run_directory, job, on_complete, naming=None):
         for segment in plan.segments[:2]:
             with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
                 handle.write(b"\0" * 64)
@@ -1348,7 +1369,7 @@ def test_clips_published_before_a_fatal_export_fault_stay_counted(tmp_path, monk
 
 
 def test_a_fault_after_the_final_clip_loses_no_clip_accounting(tmp_path, monkeypatch):
-    def publish_all_then_raise(source, plan, run_directory, job, on_complete):
+    def publish_all_then_raise(source, plan, run_directory, job, on_complete, naming=None):
         for segment in plan.segments:
             with open(os.path.join(run_directory, "c%d.mp4" % segment.index), "wb") as handle:
                 handle.write(b"\0" * 64)
@@ -1505,7 +1526,7 @@ def test_progress_never_runs_ahead_of_the_outcomes_actually_recorded(tmp_path, m
 def test_a_cancelled_batch_counts_only_what_it_attempted(tmp_path, monkeypatch):
     """Cancellation must keep the truthful attempted/discovered pair -- never inflate to 100 %,
     and never count the not_attempted backfill as work."""
-    def stop_after_first(source, plan, run_directory, job, on_complete):
+    def stop_after_first(source, plan, run_directory, job, on_complete, naming=None):
         job.cancel()
         raise _FakeCancelled()
 
@@ -1592,12 +1613,16 @@ def test_a_pre_admission_refusal_is_also_never_shown_as_success(tmp_path, monkey
 # --- adjacent terminal classes: none of them may read as an unqualified success ---------------
 
 def _failing_export(fail_on):
-    def hook(source, plan, run_directory, job, on_complete):
+    def hook(source, plan, run_directory, job, on_complete, naming=None):
         if os.path.basename(source.path) == fail_on:
             on_complete(_Res(index=1, ok=False, size_bytes=0, error="injected encoder failure"))
             return None
         for segment in plan.segments:
-            target = os.path.join(run_directory, "clip_%03d.mp4" % segment.index)
+            # [FORK] R4-C: the REAL name builder, honouring whatever naming the batch passed, so
+            # a case that mixes a failed source with healthy ones is still an assertion about the
+            # product's naming rather than about this stub's invented spelling.
+            target = os.path.join(run_directory, cutter.segment_filename(
+                source.path, segment.index, plan.count, naming=naming))
             with open(target, "wb") as handle:
                 handle.write(b"\0" * 1024)
             on_complete(_Res(index=segment.index, ok=True, size_bytes=1024, error=""))
@@ -1665,3 +1690,324 @@ def test_a_clean_batch_is_still_shown_as_a_clean_success(tmp_path, monkeypatch):
     assert panel["state"] == "done", panel
     assert panel["title"] == _UI["CUT_BATCH_DONE_TITLE"], panel
     assert panel["pct"] == 100
+
+
+# =============================================================================================
+# 12. [FORK] Digital-Union (Raw Cutter R4-C): synthetic output naming, end to end
+#
+# `_run_batch` drives the REAL `_on_cut_batch_run` (and, with `ui=True`, the real presentation
+# wrapper) against a real temporary filesystem, with the adapter synthesised. The stub exporter
+# builds its clip names with the real `raw_cutter.segment_filename`, so what lands on disk here
+# is the spelling the shipped builder produces -- these are assertions about the product's naming
+# and its bookkeeping, not about a reimplementation of either.
+#
+# Every case in sections 1-11 above runs with `rename_output=False`, which is the standing
+# negative control for the no-leak claims here; two of them are restated explicitly below as
+# paired comparisons, because a no-leak assertion that would also pass over an empty folder
+# proves nothing on its own.
+# =============================================================================================
+
+def _job_date(run):
+    """The DDMMYYYY the run's own names must carry, derived from the record it wrote.
+
+    Read out of the manifest rather than predicted: the harness freezes no clock, so the only
+    honest expectation is the one the run itself recorded. A test that called `datetime.now()`
+    would also pass against an implementation that re-read the clock per clip, which is exactly
+    the defect the one-date-per-job rule exists to prevent.
+    """
+    date = run.manifest["started_at"].split("T")[0].split("-")
+    return date[2] + date[1] + date[0]
+
+
+def _relative_clips(run):
+    """Every exported clip as a path relative to the batch folder, with `/` separators."""
+    return sorted(os.path.relpath(clip, run.batch_dir).replace(os.sep, "/")
+                  for clip in run.clips)
+
+
+def _published_export(source, plan, run_directory, job, on_complete, naming=None):
+    """The ordinary success path, written with the REAL name builder. Shared by the hooks below."""
+    for segment in plan.segments:
+        target = os.path.join(run_directory, cutter.segment_filename(
+            source.path, segment.index, plan.count, naming=naming))
+        with open(target, "wb") as handle:
+            handle.write(b"\0" * 32)
+        on_complete(_Res(index=segment.index, ok=True, size_bytes=32, error=""))
+    return None
+
+
+def test_renamed_batch_clips_and_folders_use_the_synthetic_scheme(tmp_path, monkeypatch):
+    """The headline. Three sources, each planned into clips, and the whole output tree is
+    `File<SSS>/File<SSS>_<DDMMYYYY>_<CCC>.mp4`."""
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True)
+    _assert_complete_manifest(run, 3)
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] * 3
+    date = _job_date(run)
+
+    relative = _relative_clips(run)
+    assert relative, "nothing was exported"
+    for path in relative:
+        folder, name = path.split("/")
+        assert folder.startswith("File") and folder[4:].isdigit(), path
+        assert name.startswith(folder + "_" + date + "_"), path
+        assert name.endswith(".mp4"), path
+    assert {p.split("/")[0] for p in relative} == {"File001", "File002", "File003"}
+    # One date for the whole batch, not one per source.
+    assert len({p.split("/")[1].split("_")[1] for p in relative}) == 1
+
+
+def test_a_renamed_batch_leaks_no_source_basename_anywhere_under_the_batch_folder(
+        tmp_path, monkeypatch):
+    """Measured by walking the real tree, which is the only check that would also catch a stray
+    staging artifact, a sidecar or a folder nobody thought about.
+
+    `batch_manifest.json` is excluded by name and not by accident: the record is *supposed* to
+    carry the real paths. That is the separation the owner asked for -- provenance retained, and
+    kept out of the names.
+    """
+    sources = ("holiday_video.mp4", "wedding_speech.mp4", "private_recording.mp4")
+    run = _run_batch(tmp_path, monkeypatch, sources=sources, rename_output=True)
+    stems = ("holiday", "wedding", "speech", "private", "recording", "video")
+
+    produced = []
+    for _base, dirs, files in os.walk(run.batch_dir):
+        produced.extend(dirs)
+        produced.extend(files)
+    assert produced, "the batch folder is empty"
+    for name in produced:
+        if name == batch.MANIFEST_FILENAME:
+            continue
+        for stem in stems:
+            assert stem not in name.casefold(), (name, stem)
+
+
+def test_the_default_batch_layout_really_does_carry_those_basenames(tmp_path, monkeypatch):
+    """The negative control for the test above. Without it, a batch that exported nothing at all
+    would satisfy the no-leak assertion."""
+    sources = ("holiday_video.mp4", "wedding_speech.mp4", "private_recording.mp4")
+    run = _run_batch(tmp_path, monkeypatch, sources=sources)
+    produced = []
+    for _base, dirs, files in os.walk(run.batch_dir):
+        produced.extend(dirs)
+        produced.extend(files)
+    joined = " ".join(produced).casefold()
+    for stem in ("holiday", "wedding", "private"):
+        assert stem in joined, stem
+
+
+def test_the_batch_folder_and_the_operators_output_root_are_unchanged_by_renaming(
+        tmp_path, monkeypatch):
+    """`RawCutter_Batch_<timestamp>` is the RUN's identity, not the source's, so it stays. The
+    operator-chosen output root is likewise never renamed -- the feature does not touch parent
+    directories the operator selected."""
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True)
+    assert os.path.basename(run.batch_dir).startswith(batch.BATCH_DIRECTORY_PREFIX)
+    assert os.path.basename(os.path.dirname(run.batch_dir)) == "out"
+    assert run.manifest["output_directory"] == run.batch_dir
+
+
+def test_the_renamed_manifest_maps_every_original_source_to_its_synthetic_folder(
+        tmp_path, monkeypatch):
+    """Provenance retained but kept separate: the names carry nothing, the record carries the
+    whole mapping -- including the clips each source actually produced."""
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True)
+    rows = run.manifest["sources"]
+    assert [os.path.basename(r["source"]) for r in rows] == ["a.mp4", "b.mp4", "c.mp4"]
+    assert [r["relative_output"] for r in rows] == ["File001", "File002", "File003"]
+    assert run.manifest["settings"]["rename_output_clips"] is True
+
+    for row in rows:
+        assert row["clips_written"] > 0
+        assert os.path.isdir(row["output_directory"])
+        on_disk = [n for n in os.listdir(row["output_directory"]) if n.endswith(".mp4")]
+        assert len(on_disk) == row["clips_written"], row
+        assert all(n.startswith(row["relative_output"] + "_") for n in on_disk), on_disk
+    # And the mapping is a bijection over the whole discovered set.
+    assert len({r["source"] for r in rows}) == 3
+    assert len({r["relative_output"] for r in rows}) == 3
+
+
+def test_the_record_still_says_the_mode_was_off_when_it_was(tmp_path, monkeypatch):
+    run = _run_batch(tmp_path, monkeypatch)
+    assert run.manifest["settings"]["rename_output_clips"] is False
+    assert [r["relative_output"] for r in run.manifest["sources"]] == ["a", "b", "c"]
+
+
+def test_a_failed_source_before_a_valid_one_does_not_shift_the_later_indexes(
+        tmp_path, monkeypatch):
+    """The requirement, measured: source 1 fails, and sources 2 and 3 are still `File002` and
+    `File003`. Renumbering would make the record's mapping wrong for every later source."""
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True,
+                     export_hook=_failing_export("a.mp4"))
+    rows = run.manifest["sources"]
+    assert rows[0]["outcome"] == batch.OUTCOME_EXPORT_FAILED
+    assert [r["relative_output"] for r in rows] == ["File001", "File002", "File003"]
+    for row in rows[1:]:
+        assert row["outcome"] == batch.OUTCOME_COMPLETED
+        assert os.path.basename(row["output_directory"]) == row["relative_output"]
+    relative = _relative_clips(run)
+    assert {p.split("/")[0] for p in relative} == {"File002", "File003"}
+    # The surviving clips carry their own source's index, not a renumbered one.
+    for path in relative:
+        folder, name = path.split("/")
+        assert name.startswith(folder + "_" + _job_date(run) + "_"), path
+
+
+def test_a_source_that_publishes_no_clip_keeps_its_index_and_leaves_an_empty_folder(
+        tmp_path, monkeypatch):
+    """A source whose export produces nothing must not consume or shift an index, and the two
+    healthy sources either side of it must still land on their own positions."""
+    def nothing_for_b(source, plan, run_directory, job, on_complete, naming=None):
+        if os.path.basename(source.path) == "b.mp4":
+            return None
+        return _published_export(source, plan, run_directory, job, on_complete, naming)
+
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True, export_hook=nothing_for_b)
+    rows = run.manifest["sources"]
+    assert [r["relative_output"] for r in rows] == ["File001", "File002", "File003"]
+    assert rows[1]["clips_written"] == 0
+    assert rows[1]["outcome"] == batch.OUTCOME_EXPORT_FAILED
+    assert os.listdir(os.path.join(run.batch_dir, "File002")) == []
+    assert {p.split("/")[0] for p in _relative_clips(run)} == {"File001", "File003"}
+
+
+def test_a_renamed_batch_cancelled_part_way_keeps_its_finished_clips_under_their_real_names(
+        tmp_path, monkeypatch):
+    def cancel_after_first(source, plan, run_directory, job, on_complete, naming=None):
+        _published_export(source, plan, run_directory, job, on_complete, naming)
+        if os.path.basename(source.path) == "a.mp4":
+            job.cancel()
+        return None
+
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True,
+                     export_hook=cancel_after_first, ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_CANCELLED
+    assert run.manifest["cancelled"] is True
+    kept = _relative_clips(run)
+    assert kept, "a cancelled batch must keep the clips it had already finished"
+    prefix = "File001/File001_" + _job_date(run) + "_"
+    assert all(p.startswith(prefix) for p in kept), kept
+    assert run.manifest["totals"]["clips_written"] == len(kept)
+    assert run.panel["pct"] < 100, "a cancelled batch must never claim complete processing"
+
+
+def test_a_renamed_batch_with_a_partial_failure_is_classified_exactly_as_before(
+        tmp_path, monkeypatch):
+    """Renaming must not be able to change what the batch says HAPPENED to a source."""
+    plain = _run_batch(tmp_path / "plain", monkeypatch,
+                       export_hook=_failing_export("b.mp4"), ui=True)
+    renamed = _run_batch(tmp_path / "renamed", monkeypatch, rename_output=True,
+                         export_hook=_failing_export("b.mp4"), ui=True)
+    assert renamed.outcomes == plain.outcomes
+    assert renamed.manifest["terminal_status"] == plain.manifest["terminal_status"]
+    assert renamed.manifest["terminal_status"] == batch.TERMINAL_COMPLETED_WITH_FAILURES
+    assert renamed.manifest["totals"] == plain.manifest["totals"]
+    assert renamed.panel["state"] == plain.panel["state"] != "done"
+
+
+def test_a_renamed_batch_whose_manifest_cannot_be_written_still_keeps_its_clips(
+        tmp_path, monkeypatch):
+    """A lost record is a warning about the record, never a verdict on the clips -- and in this
+    mode the record is the only place the original mapping survives, so the warning matters more
+    rather than less."""
+    run = _run_batch(tmp_path, monkeypatch, rename_output=True,
+                     manifest_error="disk is full", ui=True)
+    assert run.manifest is None, "the fixture must leave no manifest on disk"
+    assert len(run.clips) > 0, "the clips themselves were still produced"
+    assert "could NOT be saved" in run.summary
+    assert "disk is full" in run.summary
+    assert run.panel["state"] != "done"
+    assert all(os.path.basename(clip).startswith("File") for clip in run.clips)
+
+
+def test_two_renamed_runs_into_different_output_roots_produce_identical_relative_names(
+        tmp_path, monkeypatch):
+    """Repeated runs. The scheme is deterministic, each run gets its own fresh
+    `RawCutter_Batch_<timestamp>`, and nothing is ever replaced."""
+    first = _run_batch(tmp_path / "one", monkeypatch, rename_output=True)
+    second = _run_batch(tmp_path / "two", monkeypatch, rename_output=True)
+    assert _relative_clips(first) == _relative_clips(second)
+    assert first.batch_dir != second.batch_dir
+    assert len(first.clips) == len(second.clips) > 0
+    for clip in first.clips + second.clips:
+        assert os.path.getsize(clip) > 0
+
+
+def test_renaming_changes_neither_the_outcome_vocabulary_nor_the_totals_of_a_clean_run(
+        tmp_path, monkeypatch):
+    """The compatibility control for the whole section: a clean batch is classified, counted and
+    presented identically in both modes. Only the names differ."""
+    plain = _run_batch(tmp_path / "plain", monkeypatch, ui=True)
+    renamed = _run_batch(tmp_path / "renamed", monkeypatch, rename_output=True, ui=True)
+    assert renamed.outcomes == plain.outcomes == [batch.OUTCOME_COMPLETED] * 3
+    assert renamed.manifest["totals"] == plain.manifest["totals"]
+    assert renamed.manifest["terminal_status"] == plain.manifest["terminal_status"]
+    assert renamed.panel["state"] == plain.panel["state"] == "done"
+    assert renamed.panel["pct"] == plain.panel["pct"] == 100
+    assert renamed.released == plain.released == 1
+    assert _relative_clips(renamed) != _relative_clips(plain), "the negative control"
+
+
+def test_more_than_999_sources_widen_the_folder_index_without_wrapping():
+    """Planned rather than executed -- 1200 synthetic videos is not a unit test -- but it is the
+    same pure function the batch calls, given the shape of input the batch freezes.
+
+    [FORK] R4-C correction: the width comes from the job's frozen source TOTAL, so a 1200-source
+    batch is four digits from its first folder, not three up to 999 and four afterwards.
+    """
+    root = os.path.join("J:", os.sep, "in")
+    paths = [os.path.join(root, "v%04d.mp4" % i) for i in range(1, 1201)]
+    naming = cutter.OutputNaming(synthetic=True, job_date="18102026", source_total=len(paths))
+    layout = batch.plan_item_directories(paths, root, naming=naming)
+    assert layout[0] == ("File0001",)
+    assert layout[998] == ("File0999",)
+    assert layout[999] == ("File1000",)
+    assert layout[1199] == ("File1200",)
+    assert len({parts[0] for parts in layout}) == 1200
+    # One width for the whole job, so an ordinary filename sort is also the discovery order.
+    assert len({len(parts[0]) for parts in layout}) == 1
+    assert [parts[0] for parts in layout] == sorted(parts[0] for parts in layout)
+
+
+def test_a_thousand_source_batch_runs_end_to_end_on_one_uniform_source_width(
+        tmp_path, monkeypatch):
+    """The real `_on_cut_batch_run` over 1,000 sources, not just the pure layout function.
+
+    Deliberately 1,000 tiny real files and a stubbed encoder: the claim under test is the naming
+    contract at that scale, and transcoding a thousand videos to prove a filename would be an
+    unnecessary benchmark rather than stronger evidence.
+    """
+    names = tuple("v%04d.mp4" % i for i in range(1, 1001))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, rename_output=True)
+    rows = run.manifest["sources"]
+    assert len(rows) == 1000
+    expected = ["File%04d" % i for i in range(1, 1001)]
+    assert [r["relative_output"] for r in rows] == expected
+    assert {len(r["relative_output"]) for r in rows} == {len("File0001")}
+    # Every clip sits in its own source's folder and repeats that exact folder tag.
+    relative = _relative_clips(run)
+    assert len({p.split("/")[0] for p in relative}) == 1000
+    for path in relative:
+        folder, name = path.split("/")
+        assert name.startswith(folder + "_" + _job_date(run) + "_"), path
+    # Lexical order over the generated directories is the frozen discovery order.
+    assert sorted(expected) == expected
+
+
+def test_a_failed_first_source_in_a_thousand_source_batch_keeps_source_two_as_file0002(
+        tmp_path, monkeypatch):
+    """The requirement, measured at the scale where the width actually changes: source 1 fails and
+    source 2 is still `File0002`. An index derived from how many exports SUCCEEDED would slide it
+    to `File0001` and make every later row of the record wrong."""
+    names = tuple("v%04d.mp4" % i for i in range(1, 1001))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, rename_output=True,
+                     export_hook=_failing_export("v0001.mp4"))
+    rows = run.manifest["sources"]
+    assert rows[0]["outcome"] == batch.OUTCOME_EXPORT_FAILED
+    assert rows[0]["relative_output"] == "File0001"
+    assert rows[1]["relative_output"] == "File0002"
+    assert rows[1]["outcome"] == batch.OUTCOME_COMPLETED
+    assert rows[999]["relative_output"] == "File1000"
+    # The failed source published nothing, and no later source adopted its index.
+    assert {p.split("/")[0] for p in _relative_clips(run)} == \
+        {"File%04d" % i for i in range(2, 1001)}
