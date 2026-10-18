@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 
 import pytest
 
@@ -350,11 +351,407 @@ def test_a_source_without_audio_is_exported_without_audio_either_way(export_tree
     assert "-y" not in stripped
 
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (frame-boundary P5-S1): the export's geometry guard.
+#
+# The original form of the guard below searched the RENDERED SOURCE of `build_segment_command`
+# for six forbidden substrings. That shape has two defects, and P5 hit both:
+#
+#   1. It could not tell a banned operation from prose naming the ban. P5's docstring explains
+#      "`trim`/`setpts` change no geometry: no `-s`, no `-r`, no `scale`, no `setsar`/`setdar`"
+#      -- so FOUR of the six tokens now appear in the function purely as rationale. Dropping only
+#      "'-vf'" from the tuple, which is what the P5 report proposed, would still have failed on
+#      `setsar`. This file already carries `_code_only` for exactly that hazard; this test did not
+#      use it.
+#   2. A substring ban over source text is bypassable by spelling. `-filter:v scale=...` applies
+#      a scaler while containing neither "'-vf'" nor... well, it contains "scale=", but
+#      `-filter:v $(cat chain)` or a renamed local would not. A ban you can evade without changing
+#      behaviour is not a guard.
+#
+# So the guard is now SEMANTIC: it executes the real command builder and inspects the argv it
+# produces, across both encoders and both audio states, and it is supplemented by an AST pass over
+# EXECUTABLE CODE ONLY so that a conditionally-added option cannot hide behind an untested branch.
+#
+# What is permitted is narrow and exact: the one `trim`/`setpts` chain P5 measured, bounded at the
+# planned duration. Resolution, aspect ratio and frame rate are still preserved by saying nothing
+# about them, which is what this guard has always been for.
+# ---------------------------------------------------------------------------------------------
+
+#: The ONLY video filter chain this export may carry. `trim` selects frames by their own
+#: presentation timestamp and `setpts` rebases the clip's timeline to zero; neither resizes,
+#: re-rates, re-samples nor touches the sample aspect ratio.
+_ALLOWED_VIDEO_FILTER = re.compile(r"^trim=end=(\d+(?:\.\d+)?),setpts=PTS-STARTPTS$")
+
+#: The audio bound has to describe the same interval, or the two streams disagree.
+_ALLOWED_AUDIO_FILTER = re.compile(r"^atrim=end=(\d+(?:\.\d+)?),asetpts=PTS-STARTPTS$")
+
+#: Every spelling FFmpeg accepts for "apply a filter graph". Only `-vf` (and `-af` for the audio
+#: bound) may appear, exactly once each -- so a second chain, a replacement chain, or the same
+#: chain under another name is a failure rather than a silent addition.
+_FILTER_OPTION = re.compile(
+    r"^-(?:vf|af|lavfi|filter|filter_complex|filter_script|filter_complex_script)(?::.*)?$")
+
+#: Options that change output geometry without a filter at all.
+_GEOMETRY_OPTIONS = (
+    "-s", "-s:v", "-video_size", "-aspect", "-sws_flags", "-vf:v",
+)
+
+#: Every spelling that would IMPOSE an output frame rate. Matched by PATTERN rather than kept as an
+#: exact list, because `-r:v` is the same instruction as `-r` and a ban you can evade by adding a
+#: stream specifier is not a ban -- the same lesson as the substring ban this guard replaced.
+#:
+#: [FORK] Digital-Union (frame-boundary P8): `-fps_mode` is deliberately NOT in here any more, and
+#: that is a TIGHTENING rather than a relaxation. It belonged here while the export said nothing
+#: about timing at all -- but "say nothing" was measured to mean "let `-fps_mode auto` re-time a
+#: variable-rate source to its nominal `r_frame_rate` and discard 38 of the 78 frames in the
+#: requested interval". So the option is now required, in exactly one form with exactly one value,
+#: which `_SYNC_CONTRACT` pins: an unreviewed value for it fails, and so does its absence.
+#: `-vsync` stays banned -- it is the deprecated alias of `-fps_mode`, so admitting it would give
+#: the same instruction a second, unpinned spelling.
+_RATE_OPTION = re.compile(r"^-(?:r|fpsmax|framerate|vsync)(?::.*)?$")
+
+#: [FORK] P8. The ONLY synchronisation options this export may carry, and their only permitted
+#: values. Measured on the pinned FFmpeg 8.1.2 against a 270-frame source authored at 30, then 15,
+#: then 60 fps, exporting the 78-frame 60 fps passage:
+#:
+#:   * neither option            -> 40 frames, 38 lost, output re-timed to 1/30
+#:   * `passthrough` alone       -> 78 frames, but 38 of their timestamps collapse onto the
+#:                                  preceding frame's, and video runs 1.333 s against audio 1.300 s
+#:   * `demux` alone             -> correct HERE, but only because `-fps_mode auto` happened to
+#:                                  stop converting once the time base was pinned; that is a
+#:                                  heuristic's current behaviour, not a contract
+#:   * both, as written below    -> the exact 78 frames, exact 1/60 spacing, no duplicate
+#:                                  timestamp, video and audio both 1.300 s
+#:
+#: `demux` means "the source's own time base", which is why it is right in principle and not just
+#: on this fixture: a source's timestamps are by definition exactly representable in its own time
+#: base, so passthrough cannot collapse two of them. The older `-1` spelling measured identical on
+#: every field, but FFmpeg 8.1.2 answers it with "-enc_time_base -1 is deprecated, use
+#: -enc_time_base demux", so the non-deprecated name is the one pinned here.
+_SYNC_CONTRACT = {
+    "-fps_mode": "passthrough",
+    "-enc_time_base": "demux",
+}
+
+#: Matches either synchronisation option in ANY stream-specifier spelling, so the value check
+#: cannot be bypassed by writing `-fps_mode:v:0` or by dropping the specifier.
+_SYNC_OPTION = re.compile(r"^-(fps_mode|enc_time_base)(?::.*)?$")
+
+#: Filter names that would resize, re-rate or re-interpret the picture. Checked as written
+#: tokens in executable code, so a chain assembled in pieces is still caught.
+_GEOMETRY_FILTERS = (
+    "scale=", "scale2ref", "scale_cuda", "scale_npp", "crop=", "pad=", "zoompan",
+    "setsar", "setdar", "fps=", "framerate=", "minterpolate", "tinterlace", "yadif",
+)
+
+_EXPORT_PATHS = (
+    ("libx264, audio removed", True, "libx264", False),
+    ("libx264, audio removed, source has audio", True, "libx264", True),
+    ("libx264, audio kept", False, "libx264", True),
+    ("libx264, source has no audio", False, "libx264", False),
+    ("h264_nvenc, audio removed", True, "h264_nvenc", True),
+    ("h264_nvenc, audio kept", False, "h264_nvenc", True),
+)
+
+
+def _export_builder(export_tree):
+    """`build_segment_command` AST-extracted and executed against a namespace holding nothing but
+    the single constant it is allowed to name."""
+    namespace = {"FFMPEG_PATH": "ffmpeg.exe"}
+    exec(ast.unparse(_func(export_tree, "build_segment_command")), namespace)
+    return namespace["build_segment_command"]
+
+
+def _string_constants(node):
+    """Every string literal in EXECUTABLE code, including the literal parts of f-strings.
+
+    Docstrings are removed first: prose is allowed to name the operations the machinery bans.
+    """
+    out = []
+    for inner in ast.walk(_strip_docstrings(node)):
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            out.append(inner.value)
+    return out
+
+
 def test_no_scaling_or_frame_rate_argument_is_ever_added(export_tree):
-    """Aspect ratio and frame rate are preserved by saying nothing about them."""
-    rendered = ast.unparse(_func(export_tree, "build_segment_command"))
-    for forbidden in ("'-vf'", "'-s'", "'-r'", "scale=", "setsar", "setdar"):
-        assert forbidden not in rendered, forbidden
+    """Aspect ratio is preserved by saying nothing about it; the frame rate is never IMPOSED.
+
+    Measured on the produced argv rather than on source text, so neither rationale prose nor an
+    alternate option spelling can change the answer.
+
+    [FORK] P8: the distinction this test now draws is between *imposing* a rate and *preserving*
+    one. `-r`, `-fpsmax` and `-vsync` tell the output what its timing should be and stay banned in
+    every specifier spelling; the reviewed `-fps_mode`/`-enc_time_base` pair tells FFmpeg to keep
+    the timing the source already has, and is pinned separately by
+    `test_the_only_synchronisation_options_are_the_reviewed_pair`.
+    """
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        argv = build("in.mkv", "out.mp4", 10.022, 5.011, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+        for option in _GEOMETRY_OPTIONS:
+            assert option not in argv, (label, option)
+        imposed = [a for a in argv if _RATE_OPTION.match(a)]
+        assert imposed == [], (label, "an output frame rate was imposed", imposed, argv)
+        chain = argv[argv.index("-vf") + 1] if "-vf" in argv else ""
+        for name in _GEOMETRY_FILTERS:
+            assert name not in chain, (label, name, chain)
+
+    # And the same bans over executable code, so a branch these six paths do not reach cannot
+    # introduce one unseen. `_strip_docstrings` is what makes this immune to the rationale text.
+    literals = _string_constants(_func(export_tree, "build_segment_command"))
+    for option in _GEOMETRY_OPTIONS:
+        assert option not in literals, option
+    assert [text for text in literals if _RATE_OPTION.match(text)] == [], literals
+    for name in _GEOMETRY_FILTERS:
+        assert not any(name in text for text in literals), name
+
+
+def test_the_only_video_filter_is_the_validated_trim_chain(export_tree):
+    """[FORK] P5-S1. Exactly one video filter option, exactly one approved chain, right order.
+
+    The chain is what makes the clip's frame membership the half-open interval the planner means;
+    anything else in it, or a second chain anywhere, is a change this guard exists to notice.
+    """
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        duration = 5.011
+        argv = build("in.mkv", "out.mp4", 10.022, duration, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+
+        video_filters = [a for a in argv if a == "-vf"]
+        assert len(video_filters) == 1, (label, "exactly one -vf expected", argv)
+
+        other = [a for a in argv
+                 if _FILTER_OPTION.match(a) and a not in ("-vf", "-af")]
+        assert other == [], (
+            label, "a filter graph was applied under another option spelling", other)
+
+        chain = argv[argv.index("-vf") + 1]
+        match = _ALLOWED_VIDEO_FILTER.match(chain)
+        assert match, (label, "unapproved video filter chain", chain)
+        assert abs(float(match.group(1)) - duration) < 5e-7, (
+            label, "the trim bound is not the planned duration", chain, duration)
+
+        elements = chain.split(",")
+        assert len(elements) == 2, (label, "extra filter in the chain", elements)
+        assert elements[0].startswith("trim=end="), (label, elements)
+        assert elements[1] == "setpts=PTS-STARTPTS", (label, elements)
+        assert chain.index("trim=") < chain.index("setpts="), (
+            label, "setpts must follow trim, or the bound is measured on rebased timestamps")
+
+
+def test_the_audio_bound_matches_the_video_bound_exactly(export_tree):
+    """[FORK] P5-S1. Audio is bounded by `atrim` on the same interval, or not at all."""
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        duration = 7.967
+        argv = build("in.mkv", "out.mp4", 6.066, duration, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+        keeps_audio = not remove_audio and has_audio
+        if not keeps_audio:
+            assert "-af" not in argv, (label, "audio was filtered on a path with no audio")
+            assert "-an" in argv, (label, "audio must be dropped, not merely silenced")
+            continue
+        assert len([a for a in argv if a == "-af"]) == 1, (label, argv)
+        chain = argv[argv.index("-af") + 1]
+        match = _ALLOWED_AUDIO_FILTER.match(chain)
+        assert match, (label, "unapproved audio filter chain", chain)
+        assert abs(float(match.group(1)) - duration) < 5e-7, (label, chain, duration)
+        video = _ALLOWED_VIDEO_FILTER.match(argv[argv.index("-vf") + 1])
+        assert video and match.group(1) == video.group(1), (
+            label, "the audio and video bounds describe different intervals")
+
+
+def test_the_only_synchronisation_options_are_the_reviewed_pair(export_tree):
+    """[FORK] P8. Exactly one `-fps_mode` and one `-enc_time_base`, each with its reviewed value.
+
+    This is what replaced the blanket `-fps_mode` ban, and it is strictly tighter than the ban was:
+    the ban matched one exact token, so `-fps_mode:v` walked straight past it, and it could say
+    nothing at all about the VALUE -- `-fps_mode cfr` would have satisfied it while reintroducing
+    the frame loss. This matches either option in any specifier spelling, requires both to be
+    present exactly once, and admits exactly one value for each.
+
+    Both options must also sit on the OUTPUT side. Before `-i` they are input options with a
+    different meaning entirely, and an export that quietly became an input-side instruction would
+    read as correct here while doing nothing.
+    """
+    build = _export_builder(export_tree)
+    for label, remove_audio, encoder, has_audio in _EXPORT_PATHS:
+        argv = build("in.mkv", "out.mp4", 10.022, 5.011, remove_audio=remove_audio,
+                     encoder=encoder, has_audio=has_audio)
+        input_at = argv.index("-i")
+        seen = {}
+        for position, token in enumerate(argv):
+            match = _SYNC_OPTION.match(token)
+            if match is None:
+                continue
+            option = "-" + match.group(1)
+            assert option not in seen, (label, f"{option} appears more than once", argv)
+            assert position + 1 < len(argv), (label, f"{token} carries no value", argv)
+            assert position > input_at, (
+                label, f"{token} is an input option here, not an output one", argv)
+            seen[option] = (token, argv[position + 1])
+
+        assert set(seen) == set(_SYNC_CONTRACT), (
+            label, "the reviewed synchronisation pair is not exactly what gets passed", seen)
+        for option, (token, value) in sorted(seen.items()):
+            assert value == _SYNC_CONTRACT[option], (
+                label, f"{token} carries an unreviewed value", value)
+            assert token in (option, f"{option}:v"), (
+                label, "unexpected option spelling", token)
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (frame-boundary P8): negative controls for the export guards.
+#
+# A guard nobody has watched fail is a guard nobody knows works. Each control below mutates the
+# REAL adapter source in memory, re-parses it, and hands the mutated tree to the SHIPPED assertion
+# that is supposed to notice -- so what is proved is that this file's own guard catches the defect,
+# not that some test somewhere fails. The shipped file is never written to.
+#
+# `_mutated_tree` insists the target text is uniquely present. A mutation that silently matched
+# nothing would make its control pass for the wrong reason, which is precisely the failure mode
+# these exist to exclude.
+# ---------------------------------------------------------------------------------------------
+
+_FPS_MODE_LINE = "        '-fps_mode:v', 'passthrough',\n"
+_ENC_TB_LINE = "        '-enc_time_base:v', 'demux',\n"
+_VIDEO_CHAIN = 'f"trim=end={duration:.6f},setpts=PTS-STARTPTS"'
+_AUDIO_CHAIN = 'f"atrim=end={duration:.6f},asetpts=PTS-STARTPTS"'
+
+
+def _mutated_tree(*replacements: tuple[str, str]) -> ast.Module:
+    with open(_EXPORT, encoding="utf-8") as handle:
+        source = handle.read()
+    mutated = source
+    for old, new in replacements:
+        assert mutated.count(old) == 1, f"mutation target is not uniquely present: {old!r}"
+        mutated = mutated.replace(old, new)
+    assert mutated != source, "mutation did not change the source"
+    return ast.parse(mutated, filename=_EXPORT)
+
+
+def test_negative_control_removing_passthrough_mode_is_caught():
+    """Mutation: drop `-fps_mode:v passthrough`, which is how the frame loss was shipped."""
+    tree = _mutated_tree((_FPS_MODE_LINE, ""))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+@pytest.mark.parametrize("mode", ["cfr", "vfr", "auto", "drop"])
+def test_negative_control_a_frame_dropping_sync_mode_is_caught(mode):
+    """Mutation: keep the option, change the value to one that may drop or duplicate frames.
+
+    The old blanket ban could not have caught any of these -- it banned the option, so it had
+    nothing to say once the option was legitimately present. `auto` is included because it is the
+    default that caused the defect, and `vfr` because it silently DROPS a frame whose timestamp
+    collides instead of keeping it.
+    """
+    tree = _mutated_tree((_FPS_MODE_LINE, f"        '-fps_mode:v', '{mode}',\n"))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+def test_negative_control_removing_the_encoder_time_base_is_caught():
+    """Mutation: keep passthrough, drop the time base -- the measured collapsed-timestamp case.
+
+    This is the control for "78 frames, 38 of them sharing a timestamp with their predecessor":
+    a frame count alone would have called that a fix.
+    """
+    tree = _mutated_tree((_ENC_TB_LINE, ""))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+@pytest.mark.parametrize("value", ["0", "1:90000", "1:1000", "-1", "filter"])
+def test_negative_control_changing_the_encoder_time_base_is_caught(value):
+    """Mutation: a different time base. `0` is the nominal-rate base that collapses timestamps;
+    the fixed ratios impose a grid unrelated to the source; `-1` is the deprecated spelling and
+    `filter` the sibling named value -- both of which happen to work on the measured fixture, which
+    is exactly why the guard pins the reviewed one rather than accepting anything that passes."""
+    tree = _mutated_tree((_ENC_TB_LINE, f"        '-enc_time_base:v', '{value}',\n"))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+@pytest.mark.parametrize("option,value", [("-r", "30"), ("-r:v", "25"), ("-fpsmax", "30"),
+                                          ("-vsync", "1"), ("-framerate", "30")])
+def test_negative_control_an_imposed_output_frame_rate_is_caught(option, value):
+    """Mutation: add an option that tells the output what its rate must be, in each spelling.
+
+    `-vsync` is the one that matters most here: it is the deprecated alias of `-fps_mode`, so
+    admitting it would give the reviewed instruction a second unpinned spelling.
+    """
+    tree = _mutated_tree((_FPS_MODE_LINE,
+                          _FPS_MODE_LINE + f"        '{option}', '{value}',\n"))
+    with pytest.raises(AssertionError):
+        test_no_scaling_or_frame_rate_argument_is_ever_added(tree)
+
+
+def test_negative_control_a_second_sync_option_spelling_is_caught():
+    """Mutation: pass the reviewed value twice, once bare and once specified.
+
+    Two spellings of one instruction is how a later edit changes behaviour while leaving the
+    reviewed line visibly intact.
+    """
+    tree = _mutated_tree((_FPS_MODE_LINE,
+                          _FPS_MODE_LINE + "        '-fps_mode', 'passthrough',\n"))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+def test_negative_control_an_input_side_sync_option_is_caught():
+    """Mutation: move the pair before `-i`, where they are input options and preserve nothing.
+
+    Both replacements are required for the control to mean anything: removing the output-side pair
+    without re-adding it anywhere would be caught by the "both present" clause instead, and would
+    prove nothing about position.
+    """
+    tree = _mutated_tree(
+        (_FPS_MODE_LINE + _ENC_TB_LINE, ""),
+        ("        '-i', source_path,\n",
+         _FPS_MODE_LINE + _ENC_TB_LINE + "        '-i', source_path,\n"))
+    with pytest.raises(AssertionError):
+        test_the_only_synchronisation_options_are_the_reviewed_pair(tree)
+
+
+@pytest.mark.parametrize("filter_name", ["fps=25", "framerate=30", "minterpolate"])
+def test_negative_control_a_rate_conversion_filter_is_caught(filter_name):
+    """Mutation: do the conversion in the filter graph instead, where no option ban would see it."""
+    tree = _mutated_tree(
+        (_VIDEO_CHAIN,
+         'f"trim=end={duration:.6f},setpts=PTS-STARTPTS,%s"' % filter_name))
+    with pytest.raises(AssertionError):
+        test_no_scaling_or_frame_rate_argument_is_ever_added(tree)
+    with pytest.raises(AssertionError):
+        test_the_only_video_filter_is_the_validated_trim_chain(tree)
+
+
+def test_negative_control_breaking_the_audio_video_alignment_is_caught():
+    """Mutation: trim the audio to a different interval than the video.
+
+    The A/V skew the P8 measurement exposed (1.333 s of video against 1.300 s of audio) came from
+    the video side, but the reverse mistake is equally available and must not pass.
+    """
+    tree = _mutated_tree(
+        (_AUDIO_CHAIN,
+         'f"atrim=end={duration - 0.05:.6f},asetpts=PTS-STARTPTS"'))
+    with pytest.raises(AssertionError):
+        test_the_audio_bound_matches_the_video_bound_exactly(tree)
+
+
+def test_the_negative_controls_are_measuring_a_guard_that_currently_passes(export_tree):
+    """The control on the controls: unmutated, every assertion the mutants trip must hold.
+
+    Without this, a guard that was broken outright would make every `pytest.raises` above succeed
+    and the whole block would read as green.
+    """
+    test_the_only_synchronisation_options_are_the_reviewed_pair(export_tree)
+    test_no_scaling_or_frame_rate_argument_is_ever_added(export_tree)
+    test_the_only_video_filter_is_the_validated_trim_chain(export_tree)
+    test_the_audio_bound_matches_the_video_bound_exactly(export_tree)
 
 
 def test_the_video_stream_is_pinned_explicitly(export_tree):
