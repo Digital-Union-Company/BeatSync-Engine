@@ -281,10 +281,11 @@ folder with one press and no per-file preview or confirmation.
 - **One mutex acquisition for the whole batch**, sharing the existing process-global render lock, so
   a batch and a music-video render can never run at once.
 
-#### R4-B — Live progress and active controls · **LOCAL CANDIDATE — validated, NOT merged, NOT deployed**
+#### R4-B — Live progress and active controls · **IN REVIEW — open draft PR, NOT merged, NOT deployed**
 
-A truthful progress surface for both Raw Cutter modes. Implemented and validated locally on a
-feature branch; **no pull request exists and production does not have it.**
+A truthful progress surface for both Raw Cutter modes. Implemented and validated on a feature
+branch and published as **draft pull request #71**; it has **not been merged, and production does
+not have it.**
 
 - **Analyze** names each real phase — reading the source, detecting scene changes, planning — before
   the blocking call it describes, with an **indeterminate** bar. One FFmpeg scene pass reports
@@ -376,7 +377,7 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 | **R1** — Raw Cutter V1, mechanical quality-first selection | **DONE** — merged in PR #68, **deployed** |
 | **R4-A** — Automatic folder batch mode | **DONE** — merged in PR #69, **deployed** |
 | **Scene guards + VFR-safe exports** — conservative 0.20 s guard at detected cuts, `-fps_mode:v passthrough -enc_time_base:v demux` | **DONE** — merged in PR #70, **deployed** |
-| **R4-B** — Live progress and active controls | **LOCAL CANDIDATE** — implemented and validated on a branch; **no PR, not merged, not deployed** |
+| **R4-B** — Live progress and active controls | **IN REVIEW** — open **draft PR #71**; not merged, not deployed |
 | **R4-C** — Synthetic output naming (opt-in, default off) | **PLANNED** — specified here, not implemented |
 | **R5** — Clips Preview Selector (post-cut triage tab) | **PLANNED** — specified in `docs/claude/clips-preview-selector-v1.md`, not implemented |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |

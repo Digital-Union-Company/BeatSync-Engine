@@ -849,6 +849,14 @@ CUT_BATCH_RUNNING_TITLE = "Batch running"
 CUT_BATCH_DONE_TITLE = "Batch finished"
 CUT_BATCH_FAILED_TITLE = "Batch stopped"
 CUT_BATCH_CANCELLED_TITLE = "Batch cancelled"
+#: [FORK] Digital-Union (P19-R4): the batch ran to the end of its list, but some sources failed.
+#: `raw_cutter_batch.terminal_status` has always distinguished this from a clean run; the panel
+#: used to flatten both into the same green "Batch finished", which is the one reading an operator
+#: must not be given — the per-source failures are in the summary and the manifest either way.
+CUT_BATCH_PARTIAL_TITLE = "Batch finished with failures"
+#: [FORK] Digital-Union (P19-R4): every source succeeded, but the machine-readable record did not
+#: reach disk, so the run cannot be audited afterwards. The clips are real; the evidence is not.
+CUT_BATCH_RECORD_LOST_TITLE = "Batch finished — record NOT saved"
 #: A batch that was refused before it ever reached finalisation has no terminal class, and the
 #: panel says exactly that rather than inventing one.
 CUT_BATCH_NOT_RUN_TITLE = "Batch did not run"

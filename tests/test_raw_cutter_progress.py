@@ -283,3 +283,125 @@ def test_the_progress_panel_never_writes_outside_the_raw_cutter(gui_tree):
                    "cut_batch_start_btn", "cut_batch_cancel_btn"):
         written = set(_names(_kwargs(_click(gui_tree, widget))["outputs"]))
         assert written <= allowed, (widget, written - allowed)
+
+
+# --------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (P19-R4): the Cancel controls must actually be RED.
+#
+# The independent P19-R3 review measured `variant='stop'` rendering as a neutral grey gradient in
+# the pinned Gradio 6.19.0 + Ocean theme, in BOTH states -- so the only difference between an
+# armed emergency control and a dead one was opacity. These assertions pin the shipped stylesheet
+# against the DOM that was actually measured; the computed-style proof is browser evidence, which
+# a bare-interpreter suite cannot produce and must not pretend to.
+# --------------------------------------------------------------------------------------------
+
+def _cut_cancel_css(gui_source: str) -> str:
+    start = gui_source.index("CUT_CANCEL_CSS = ")
+    return gui_source[start:gui_source.index('"""', gui_source.index('"""', start) + 3) + 3]
+
+
+def test_the_cancel_controls_are_styled_red_by_id(gui_source):
+    """Both controls, selected by id. `variant='stop'` is not a promise of red and was measured
+    not to be one."""
+    css = _cut_cancel_css(gui_source)
+    for marker in ("button#cut-cancel-button", "button#cut-batch-cancel-button"):
+        assert marker in css, marker
+    # The theme paints with a gradient over a transparent background-color, so overriding only
+    # the colour would be invisible. This is the measured fact the rule depends on.
+    assert "background-image:" in css
+    assert css.count("background-image:") >= 2, "the enabled and disabled states both need one"
+
+
+def test_the_cancel_styling_is_scoped_to_the_cutter_and_cannot_reach_quick_render(gui_source):
+    """Quick Render's `Cancel Active Render` carries the SAME `stop` class and has no `elem_id`.
+    A class-based selector would have restyled a render control this change must not touch.
+
+    Checked by parsing the selectors rather than by banning substrings: `button {` occurs inside
+    `button#cut-batch-cancel-button {`, so a substring ban here asserts the wrong thing and fails
+    for the wrong reason.
+    """
+    css = _cut_cancel_css(gui_source)
+    body = css[css.index('"""') + 3:css.rindex('"""')]
+    selectors = []
+    for block in body.split("}"):
+        head = block.split("{")[0].strip()
+        if head:
+            selectors.extend(part.strip() for part in head.split(",") if part.strip())
+    assert selectors, "no selectors found"
+    for selector in selectors:
+        assert selector.startswith("button#"), f"not id-scoped: {selector!r}"
+        assert ("#cut-cancel-button" in selector
+                or "#cut-batch-cancel-button" in selector), selector
+    # Exactly the two cutter controls, and nothing else in the application.
+    targeted = {s.split(":")[0] for s in selectors}
+    assert targeted == {"button#cut-cancel-button", "button#cut-batch-cancel-button"}, targeted
+
+
+def test_the_disabled_cancel_is_subdued_and_the_enabled_one_is_not(gui_source):
+    """Idle must not look armed. The disabled rule drops the gradient and goes translucent, on
+    top of the opacity and grayscale the theme already applies."""
+    css = _cut_cancel_css(gui_source)
+    assert ":disabled" in css
+    disabled = css[css.index(":disabled"):]
+    assert "background-image: none" in disabled
+    assert "cursor: not-allowed" in disabled
+
+
+def test_the_cancel_controls_keep_a_visible_hover_and_focus_affordance(gui_source):
+    """Colour is never the only indicator, and the control must stay keyboard-reachable."""
+    css = _cut_cancel_css(gui_source)
+    assert ":not(:disabled):hover" in css, "hover must not light up a disabled control"
+    assert ":focus-visible" in css
+    assert "outline:" in css
+
+
+def test_the_cancel_styling_is_actually_applied_to_the_app(gui_source):
+    """A stylesheet nobody passes to `gr.Blocks` is decoration in a source file."""
+    assert "css=STATUS_BOX_CSS + CUT_CANCEL_CSS" in gui_source
+    # And the pre-existing status-box rules are still there rather than replaced.
+    assert "STATUS_BOX_CSS = " in gui_source and "#status-output-box" in gui_source
+
+
+# --------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (P19-R4): the batch terminal class is the batch module's own vocabulary.
+# --------------------------------------------------------------------------------------------
+
+def test_the_batch_terminal_class_comes_from_the_pure_classifier(gui_tree):
+    """F-1/F-2 both came from the presentation inventing its own verdict. The wrapper now renders
+    `terminal_status`, and the batch publishes it -- one classifier, two renderings."""
+    core = _code_only(_func(gui_tree, "_on_cut_batch_run"))
+    assert "fork_cutter_batch.terminal_status(" in core, \
+        "the batch must publish the pure classifier's answer, not its own expression"
+    wrapper = _code_only(_func(gui_tree, "_on_cut_batch_run_ui"))
+    for member in ("TERMINAL_COMPLETED", "TERMINAL_COMPLETED_WITH_FAILURES",
+                   "TERMINAL_CANCELLED", "TERMINAL_FAILED"):
+        assert f"fork_cutter_batch.{member}" in wrapper, member
+    # Still never parsed from prose.
+    for forbidden in ("startswith", "endswith", "in status", "status =="):
+        assert forbidden not in wrapper, forbidden
+
+
+def test_the_batch_progress_count_is_folded_from_recorded_outcomes(gui_tree):
+    """The F-1 root cause, pinned: the count must come from the same fold the manifest uses, and
+    must no longer be read off the raw `items` length inside the progress callback."""
+    core = _code_only(_func(gui_tree, "_on_cut_batch_run"))
+    assert "fork_cutter_batch.summarise(items, total)" in core
+    assert "finished=totals.attempted" in core
+    assert "finished=len(items)" not in core, "the stale snapshot is back"
+
+
+def test_the_batch_publishes_its_count_when_an_outcome_is_recorded(gui_tree):
+    """Counting only at `progress(...)` is what dropped the final source. `record(...)` must
+    publish too, because the last source has no further progress call."""
+    core = _func(gui_tree, "_on_cut_batch_run")
+    record = _func(core, "record")
+    assert "publish()" in _code_only(record), \
+        "the recording boundary must update the progress sink"
+
+
+def test_a_batch_that_never_started_publishes_no_terminal_class(gui_tree):
+    """F-2: absence of a class is the structural statement "there was no terminal state", and it
+    is what routes both refusal shapes to the same honest panel."""
+    core = _code_only(_func(gui_tree, "_on_cut_batch_run"))
+    assert "started = bool(batch_directory)" in core
+    assert "sink.pop('terminal', None)" in core

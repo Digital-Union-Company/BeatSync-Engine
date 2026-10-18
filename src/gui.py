@@ -385,6 +385,57 @@ STATUS_BOX_CSS = """
 }
 """
 
+# [FORK] Digital-Union (P19-R4): make the two Raw Cutter Cancel controls actually RED.
+#
+# `variant='stop'` is NOT a guarantee of red. Measured in the pinned Gradio 6.19.0 + Ocean theme:
+# the stop variant paints `background-image: linear-gradient(120deg, #52525b ...)` over a
+# `background-color` of `rgba(0,0,0,0)` — a neutral grey. An emergency control that looks like
+# every other button is one an operator does not reach for, which is why this is written against
+# the measured DOM rather than against the variant's name.
+#
+# Three measured facts this depends on, each of which would have been wrong if guessed:
+#   * `elem_id` lands on the `<button>` ITSELF here, not on a wrapper — so `button#id`, never
+#     `#id button`.
+#   * the theme paints with `background-image`, so overriding `background-color` alone would be
+#     invisible underneath the gradient.
+#   * Quick Render's "Cancel Active Render" carries the SAME `stop` class and has no `elem_id`.
+#     Scoping by id is therefore what keeps this off every other button in the app; a `.stop`
+#     selector would have restyled a render control this task has no business touching.
+#
+# Colour is never the only state indicator: the label text and Gradio's own `disabled` attribute
+# both remain, and the disabled rule below keeps the subdued treatment the theme already applies.
+CUT_CANCEL_CSS = """
+button#cut-cancel-button,
+button#cut-batch-cancel-button {
+    background-image: linear-gradient(120deg, #a32015 0%, #c5362c 60%, #a32015 100%) !important;
+    background-color: #c5362c !important;
+    border-color: #ff8a80 !important;
+    color: #ffffff !important;
+    font-weight: 600 !important;
+}
+
+button#cut-cancel-button:not(:disabled):hover,
+button#cut-batch-cancel-button:not(:disabled):hover {
+    background-image: linear-gradient(120deg, #b8291d 0%, #d4423a 60%, #b8291d 100%) !important;
+    border-color: #ffb3ab !important;
+}
+
+button#cut-cancel-button:focus-visible,
+button#cut-batch-cancel-button:focus-visible {
+    outline: 3px solid #ffd5d5 !important;
+    outline-offset: 2px !important;
+}
+
+button#cut-cancel-button:disabled,
+button#cut-batch-cancel-button:disabled {
+    background-image: none !important;
+    background-color: rgba(163, 32, 21, 0.20) !important;
+    border-color: rgba(163, 32, 21, 0.45) !important;
+    color: rgba(255, 255, 255, 0.55) !important;
+    cursor: not-allowed !important;
+}
+"""
+
 
 def _stage_status(stage_number: int) -> str:
     return f"Stage {stage_number} is processing. Please wait."
@@ -5338,6 +5389,22 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     cancelled = False
     finalised = False
 
+    def publish(**extra):
+        """[FORK] Digital-Union (P19-R4, finding F-1): write the sink from RECORDED outcomes.
+
+        The count is `summarise(items, total).attempted` -- the same fold the manifest's own
+        totals use. Two consequences, both deliberate: the bar and the record cannot disagree
+        about how much of the batch is done, and the `not_attempted` backfill is excluded by
+        construction rather than by a second rule that could drift away from the first.
+
+        Called wherever `items` changes AND at finalisation. The previous version wrote the count
+        only from `progress(phase)`, which runs BEFORE each source's `record(...)`, so the final
+        source was missing from every terminal panel and a fully successful batch reported
+        `n - 1` of `n` -- measured at 50 %, 67 % and 80 % for two, three and five sources.
+        """
+        totals = fork_cutter_batch.summarise(items, total)
+        sink.update(finished=totals.attempted, completed=totals.completed, **extra)
+
     def finalise(is_cancelled, fatal=''):
         """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
 
@@ -5363,7 +5430,33 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         # it. The presentation wrapper reads this instead of inspecting the status text -- the
         # project forbids deriving an outcome class from a status or error string, and rightly:
         # prose is not a contract, and a reworded message would silently change the UI's verdict.
-        sink['terminal'] = 'failed' if fatal else ('cancelled' if is_cancelled else 'done')
+        #
+        # [FORK] Digital-Union (P19-R4, finding F-2): the class is now the PURE classifier the
+        # manifest itself uses, so the panel and the record can never disagree, and
+        # `completed_with_failures` -- a class the classifier has always produced -- stops being
+        # flattened into the same green success a clean run gets.
+        #
+        # A run that never obtained an output directory never started, and is published with NO
+        # terminal class at all. That is the structural way to say "there was no terminal state",
+        # and it lands on the same honest "Batch did not run" panel the pre-admission refusal
+        # already uses -- one presentation for both refusal shapes, and no third vocabulary to
+        # keep in step. The old expression could only answer done/cancelled/failed, so the one
+        # early `return` inside the `try` below -- a refused `prepare_batch_directory` -- reached
+        # this net with neither a cancellation nor a fatal error and was published as `done`: a
+        # green "Batch finished" over a run that created nothing.
+        #
+        # Published BEFORE the backfill, and provably equivalent to publishing after it:
+        # `not_attempted` is in neither `_FAILED` nor `attempted`, so appending those rows moves
+        # neither `terminal_status` nor the count. Doing it first means no fault inside the `try`
+        # can leave the operator looking at a stale panel.
+        started = bool(batch_directory)
+        if started:
+            sink['terminal'] = fork_cutter_batch.terminal_status(
+                items, total, is_cancelled, fatal_error=fatal)
+            publish(total=total)
+        else:
+            sink.pop('terminal', None)
+            publish()
         try:
             # Only sources never opened at all become `not_attempted`; anything the loop touched
             # has already recorded itself, including on the fatal path.
@@ -5374,17 +5467,24 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     outcome=fork_cutter_batch.OUTCOME_NOT_ATTEMPTED))
             if not batch_directory:
                 return ''
-            return cutter_export.write_batch_manifest(
+            # [FORK] P19-R4: the write's RESULT is recorded in the sink as well as returned, so
+            # the panel can say that the authoritative record did not reach disk. The summary has
+            # always disclosed it; the panel used to show a run whose manifest was lost with the
+            # same green headline as one whose manifest was saved.
+            sink['manifest_error'] = cutter_export.write_batch_manifest(
                 batch_directory,
                 fork_cutter_batch.manifest_payload(
                     items, total, settings, batch_directory, found.root,
                     started_at.isoformat(timespec='seconds'),
                     datetime.datetime.now().isoformat(timespec='seconds'),
                     time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal))
+            return sink['manifest_error']
         except Exception as exc:                      # noqa: BLE001 - see the docstring
             import traceback
             traceback.print_exc()
-            return f"the batch record could not be built: {type(exc).__name__}: {exc}"
+            sink['manifest_error'] = (
+                f"the batch record could not be built: {type(exc).__name__}: {exc}")
+            return sink['manifest_error']
 
     try:
         batch_directory, error = cutter_export.prepare_batch_directory(
@@ -5410,13 +5510,12 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                 # [FORK] Digital-Union (Raw Cutter progress P1): the text is unchanged; the sink
                 # is a side-channel of the SAME facts this line already had in scope, so the
                 # visual bar and the status text can never disagree about where the batch is.
-                # `items` holds one record per source whose outcome has been classified, which is
-                # why it is the honest denominator-free count of "finished".
-                sink.update(
-                    position=position, total=total, name=basename, phase=phase,
-                    finished=len(items),
-                    completed=sum(1 for i in items
-                                  if getattr(i, 'outcome', '') == 'completed'))
+                #
+                # [FORK] P19-R4 (F-1): this line owns the position, the name and the phase, and
+                # carries only those. The COUNT comes from `publish`, which folds the recorded
+                # outcomes -- deriving it here was the off-by-one, because this callback runs
+                # before the current source has been recorded.
+                publish(position=position, total=total, name=basename, phase=phase)
                 return fork_cutter_batch.progress_text(position, total, basename, phase, items,
                                                 batch_directory)
 
@@ -5426,6 +5525,10 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     index=position, source_path=source_path, relative_parts=parts,
                     outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
                 recorded = True
+                # [FORK] P19-R4 (F-1): the count moves when an outcome is RECORDED, because that
+                # is the moment a source is genuinely finished -- including the last one, which
+                # has no further `progress(...)` call to carry it.
+                publish()
 
             # [FORK] R2 (F-3): a source the loop has OPENED always leaves a record, even when the
             # fault is one nothing here anticipated. Without this the record was simply never
@@ -5643,14 +5746,27 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     #
     # The class comes from `sink['terminal']`, which the batch's single finalisation helper set
     # structurally. It is NOT inferred from the status text: this project forbids deriving an
-    # outcome class from a status or error string, and a refusal that never reached finalisation
-    # legitimately has no terminal class at all -- which is why the default below is neutral
-    # rather than a cheerful "done".
+    # outcome class from a status or error string.
+    #
+    # [FORK] Digital-Union (P19-R4): the four values are now the batch module's own
+    # `TERMINAL_*` vocabulary, so this table is a rendering of the pure classifier rather than a
+    # parallel one that can drift from it. `completed_with_failures` gets its own qualified
+    # headline and a non-green tone -- the single-video cut already uses the `failed` tone when
+    # some clips failed, and a batch with a failed source is the same statement about the run.
+    #
+    # The neutral default covers BOTH refusal shapes: a batch refused before admission never
+    # reaches finalisation at all, and one refused before it got an output directory is
+    # deliberately published with no terminal class. Neither ran, so neither gets a verdict.
     tone, title = {
-        'failed': ('failed', CUT_BATCH_FAILED_TITLE),
-        'cancelled': ('stopping', CUT_BATCH_CANCELLED_TITLE),
-        'done': ('done', CUT_BATCH_DONE_TITLE),
+        fork_cutter_batch.TERMINAL_FAILED: ('failed', CUT_BATCH_FAILED_TITLE),
+        fork_cutter_batch.TERMINAL_CANCELLED: ('stopping', CUT_BATCH_CANCELLED_TITLE),
+        fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: ('failed', CUT_BATCH_PARTIAL_TITLE),
+        fork_cutter_batch.TERMINAL_COMPLETED: ('done', CUT_BATCH_DONE_TITLE),
     }.get(sink.get('terminal'), ('stopping', CUT_BATCH_NOT_RUN_TITLE))
+    # A run whose every source succeeded but whose authoritative record never reached disk is not
+    # a clean success. The summary has always said so; the panel now agrees with it.
+    if sink.get('manifest_error') and tone == 'done':
+        tone, title = 'failed', CUT_BATCH_RECORD_LOST_TITLE
     yield (status, summary,
            _cut_progress_html(title, '', done=sink.get('finished'),
                               total=sink.get('total'), tone=tone)) + idle
@@ -5763,7 +5879,8 @@ def create_ui() -> gr.Blocks:
         cuda_status = "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
-    app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
+    app = gr.Blocks(title='BeatSync Engine', theme='ocean',
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
