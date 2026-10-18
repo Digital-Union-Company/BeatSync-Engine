@@ -1915,6 +1915,12 @@ def test_the_encoder_time_base_alone_happens_to_be_enough_which_is_why_both_are_
 #: the expected spelling is a constant and not something the test recomputes the way the code did.
 _R4C_NAMING = rc.OutputNaming(synthetic=True, source_index=1, job_date="18102026")
 
+#: [FORK] R4-C correction: source 7 of a frozen 1,200-source batch. This is the record shape the
+#: job-wide width actually changes -- `File0007`, not `File007` -- and it is exercised against the
+#: real binary because the width is decided in the name builder that feeds FFmpeg's output path.
+_R4C_WIDE_NAMING = rc.OutputNaming(synthetic=True, source_index=7, job_date="18102026",
+                                   source_total=1200)
+
 
 def _r4c_geometry(path):
     """Resolution, sample aspect ratio, display aspect ratio, pixel format and codec."""
@@ -1973,6 +1979,79 @@ def test_the_legacy_name_is_still_exactly_what_it_always_was(adapter, tmp_path):
     assert os.path.basename(os.path.dirname(clip)) == \
         "private_wedding_footage_raw_parts_unnamed"
     assert os.path.basename(clip) == "private_wedding_footage_part_001.mp4"
+
+
+@needs_ffmpeg
+def test_a_wide_batch_clip_is_named_for_the_frozen_total_and_is_otherwise_identical(
+        adapter, tmp_path):
+    """[FORK] R4-C correction, against the binary: source 7 of 1,200 is `File0007`.
+
+    The width change happens in the builder that produces FFmpeg's output path, so this is the one
+    assertion that the corrected name is what the encoder actually wrote -- staging file included
+    -- rather than something computed beside it. Paired with the three-digit record so the only
+    difference measured is the padding.
+    """
+    source = _make_three_shots(tmp_path / "private_wedding_footage.mp4", [90, 90, 90])
+    before = (_sha256(source), os.path.getsize(source))
+    narrow = _p8_export_one(adapter, source, tmp_path, "narrow", 0.5, 1.5,
+                            naming=_R4C_NAMING)
+    wide = _p8_export_one(adapter, source, tmp_path, "wide", 0.5, 1.5,
+                          naming=_R4C_WIDE_NAMING)
+
+    assert os.path.basename(narrow) == "File001_18102026_001.mp4"
+    assert os.path.basename(wide) == "File0007_18102026_001.mp4"
+    # The one encode wrote that name directly: nothing else survives in the run directory, so no
+    # staging artifact and no post-publication rename of a differently padded name occurred.
+    wide_dir = os.path.dirname(wide)
+    assert os.listdir(wide_dir) == ["File0007_18102026_001.mp4"]
+    for name in [os.path.basename(wide_dir)] + os.listdir(wide_dir):
+        for token in ("wedding", "private", "footage"):
+            assert token not in name.casefold(), name
+
+    # Padding is the ONLY difference: same geometry, same frames, same presentation times.
+    assert _r4c_geometry(wide) == _r4c_geometry(narrow)
+    assert _p8_frame_pts(wide) == _p8_frame_pts(narrow)
+    assert _r4c_decodes_cleanly(wide) == _r4c_decodes_cleanly(narrow) > 0
+    # And neither export touched the source.
+    assert (_sha256(source), os.path.getsize(source)) == before
+
+
+@needs_ffmpeg
+def test_a_wide_batch_clip_adds_no_second_encode_or_extra_pass(adapter, tmp_path):
+    """The cost claim for the corrected path: one encode command, whose argv differs from the
+    three-digit export's in nothing but the output path.
+
+    Taken from the shipped `build_segment_command` with the two staging names the shipped builder
+    produces, so this compares what the exporter would really run rather than a reconstruction.
+    """
+    source = _make_three_shots(tmp_path / "cfr.mp4", [90, 90, 90])
+    names = [rc.staging_filename(source, 1, 1, "tok12345", naming=naming)
+             for naming in (_R4C_NAMING, _R4C_WIDE_NAMING)]
+    assert names[0] == ".File001_18102026_001.tok12345.part.mp4"
+    assert names[1] == ".File0007_18102026_001.tok12345.part.mp4"
+
+    argvs = [adapter["build_segment_command"](str(source), os.path.join(str(tmp_path), name),
+                                              0.5, 1.0, True, 'libx264', False)
+             for name in names]
+    assert argvs[0][:-1] == argvs[1][:-1], "only the output path may differ"
+    assert argvs[0].count('-i') == argvs[1].count('-i') == 1, "one input, one pass"
+    assert os.path.basename(argvs[1][-1]) == names[1]
+    # The corrected padding really is in the command the encoder is handed.
+    assert "File0007" in argvs[1][-1] and "File0007" not in argvs[0][-1]
+
+
+@needs_ffmpeg
+def test_a_wide_batch_clip_keeps_variable_rate_timing_exactly(adapter, tmp_path):
+    """The VFR guarantee has to survive the correction too: the P8 fixture's 78-frame interval,
+    at the source's own times, identical between the two record widths."""
+    source = _make_vfr_exact(tmp_path / "vfr_wide.mp4", _P8_VFR_BLOCKS)
+    narrow = _p8_export_one(adapter, source, tmp_path, "vfr_narrow",
+                            _P8_VFR_START, _P8_VFR_DURATION, naming=_R4C_NAMING)
+    wide = _p8_export_one(adapter, source, tmp_path, "vfr_wide_out",
+                          _P8_VFR_START, _P8_VFR_DURATION, naming=_R4C_WIDE_NAMING)
+    assert os.path.basename(wide) == "File0007_18102026_001.mp4"
+    assert _p8_planner_pts(wide) == _p8_planner_pts(narrow)
+    assert len(_p8_frame_pts(wide)) == 78
 
 
 @needs_ffmpeg

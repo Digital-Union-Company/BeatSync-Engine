@@ -328,22 +328,200 @@ def test_the_clip_counter_is_padded_to_the_total_so_one_sources_clips_always_sor
     assert names[-1] == "File001_18102026_1200.mp4"
 
 
-def test_the_source_field_widens_from_its_own_index_which_costs_sort_order_above_999():
-    """Measured and recorded rather than hidden, because it is a real consequence.
+# =============================================================================================
+# 3b. The job-wide source width (R4-C correction of the published Q-1 limitation)
+#
+# The source field is padded to the width of the job's COMPLETE frozen source count, decided once
+# at submission. The superseded spelling derived the width from each index, which left a >999
+# batch mixing three- and four-digit folders so that an ordinary filename sort read
+# `...File100, File1000, File1001, File101...`. Identity and uniqueness were never affected; the
+# browsing order was, and the owner chose to correct it.
+# =============================================================================================
 
-    The requirement specifies the source field as "minimum three digits" and "wider when an INDEX
-    exceeds 999", so the width is driven by the index itself -- not by how many sources the job
-    discovered. `File1000` therefore sorts before `File100_` (`'0'` < `'_'`), which affects a job
-    with more than 999 sources and nothing else. The alternative -- padding every source to the
-    discovered total, so source 10 of 1200 became `File0010` -- would keep the order but stop
-    reproducing the owner's own `File010` example, so it was not adopted.
+#: Every total the width contract is asserted at, including both sides of all three boundaries.
+_WIDTH_TOTALS = (1, 2, 9, 10, 99, 100, 999, 1000, 1001, 1200, 10000)
 
-    Below the boundary, which is every realistic batch, the order is exact.
+
+def _job(total, date=DATE):
+    """One job record exactly as a batch of ``total`` sources freezes it at submission."""
+    return rc.OutputNaming(synthetic=True, job_date=date, source_total=total)
+
+
+def _expected_width(total):
+    """The contract, written independently of the implementation: `max(3, len(str(total)))`."""
+    return max(3, len(str(total)))
+
+
+@pytest.mark.parametrize("total", _WIDTH_TOTALS)
+def test_every_source_in_one_job_shares_the_width_of_the_frozen_total(total):
+    """The load-bearing property: ONE width per job, derived from the total and nothing else.
+
+    Asserted across the whole frozen list rather than at a sample, because a mixed width is
+    exactly what the superseded spelling produced and a sampled test could step over it.
     """
-    small = [rc.synthetic_source_tag(i) for i in range(1, 1000)]
-    assert small == sorted(small), "sort order must be exact for up to 999 sources"
-    assert rc.synthetic_source_tag(1000) == "File1000"
-    assert sorted(["File100_x", "File1000_x"]) == ["File1000_x", "File100_x"]
+    width = _expected_width(total)
+    tags = [_job(total).for_source(position).source_tag
+            for position in range(1, total + 1)]
+    assert len(tags) == total
+    assert {len(tag) for tag in tags} == {len(rc.SYNTHETIC_PREFIX) + width}, \
+        "one job must not mix source-index widths"
+    assert tags[0] == f"{rc.SYNTHETIC_PREFIX}{1:0{width}d}"
+    assert tags[-1] == f"{rc.SYNTHETIC_PREFIX}{total:0{width}d}"
+    assert rc.source_index_width(total) == width
+
+
+@pytest.mark.parametrize("total", _WIDTH_TOTALS)
+def test_the_source_field_sorts_lexically_and_numerically_at_every_scale(total):
+    """The requirement the correction exists for: plain lexical order IS discovery order."""
+    tags = [_job(total).for_source(position).source_tag
+            for position in range(1, total + 1)]
+    assert tags == sorted(tags), "ordinary filename sorting must follow the source order"
+    assert len(set(tags)) == total, "and the tags must still be unique"
+
+
+@pytest.mark.parametrize("total", _WIDTH_TOTALS)
+def test_no_source_index_is_truncated_or_wrapped_at_any_total(total):
+    """Every tag must read back as its own position -- no lost leading digit, no modulo."""
+    prefix = len(rc.SYNTHETIC_PREFIX)
+    for position in (1, total // 2 or 1, total):
+        tag = _job(total).for_source(position).source_tag
+        assert tag.startswith(rc.SYNTHETIC_PREFIX)
+        digits = tag[prefix:]
+        assert digits.isdigit() and int(digits) == position, tag
+
+
+@pytest.mark.parametrize("total,position,expected", [
+    (1, 1, "File001"),                                    # one-source Single Video job
+    (10, 1, "File001"), (10, 2, "File002"), (10, 10, "File010"),
+    (999, 1, "File001"), (999, 999, "File999"),
+    (1000, 1, "File0001"), (1000, 2, "File0002"),
+    (1000, 999, "File0999"), (1000, 1000, "File1000"),
+    (1001, 1, "File0001"), (1001, 1001, "File1001"),
+    (10000, 1, "File00001"), (10000, 10000, "File10000"),
+])
+def test_the_owners_worked_examples_are_reproduced_exactly(total, position, expected):
+    """The owner's own examples, as literal strings, for both the tag and the whole filename."""
+    naming = _job(total).for_source(position)
+    assert naming.source_tag == expected
+    assert rc.segment_filename("anything.mp4", 1, 1, naming=naming) == \
+        f"{expected}_{DATE}_001.mp4"
+
+
+@pytest.mark.parametrize("total", [1, 2, 9, 10, 99, 100, 999])
+def test_a_batch_of_999_or_fewer_is_byte_for_byte_what_pr_72_published(total):
+    """The correction is confined to what it had to change. At or below 999 sources -- every
+    realistic batch -- the published names are reproduced exactly, three digits throughout."""
+    for position in (1, total):
+        published = f"{rc.SYNTHETIC_PREFIX}{position:03d}"
+        assert _job(total).for_source(position).source_tag == published
+        # And identical to what a caller that supplies no total at all still gets.
+        assert rc.synthetic_source_tag(position) == published
+
+
+@pytest.mark.parametrize("total", _WIDTH_TOTALS)
+def test_the_folder_tag_and_the_filename_prefix_agree_at_every_scale(total):
+    """One record feeds both builders, so a `File0007` clip can never land in a `File007` folder.
+
+    This is the seam the single-authority design protects: the batch layout and the exporter read
+    the width from the same frozen record instead of each working it out locally.
+    """
+    naming = _job(total)
+    probe = sorted({min(max(1, p), total)
+                    for p in (1, 2, total // 2, total - 1, total)})
+    paths = [rf"{_ROOT}\source_{i}.mp4" for i in range(1, total + 1)]
+    layout = batch.plan_item_directories(paths, _ROOT, naming=naming)
+    assert len(layout) == total
+    for position in probe:
+        folder, = layout[position - 1]
+        filename = rc.segment_filename(paths[position - 1], 1, 1,
+                                       naming=naming.for_source(position))
+        staging = rc.staging_filename(paths[position - 1], 1, 1, "tok12345",
+                                      naming=naming.for_source(position))
+        assert filename.startswith(folder + "_"), (folder, filename)
+        assert staging == f".{filename[:-len('.mp4')]}.tok12345.part.mp4"
+    assert len({len(parts[0]) for parts in layout}) == 1
+
+
+def test_for_source_preserves_the_frozen_total():
+    """The invariance the whole design rests on. `for_source` describes a SOURCE; the total
+    describes the JOB, and dropping it is precisely how the folders and the filenames would end up
+    with two different widths."""
+    job = _job(1200)
+    assert job.source_total == 1200
+    aimed = job.for_source(7)
+    assert aimed.source_total == 1200
+    assert aimed.source_tag == "File0007"
+    # Chained, and the job record is still untouched.
+    assert aimed.for_source(42).source_total == 1200
+    assert aimed.for_source(42).source_tag == "File0042"
+    assert job.source_index == 1 and job.source_total == 1200
+
+
+def test_the_frozen_total_is_immutable_like_the_rest_of_the_record():
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        _job(1200).source_total = 3                           # type: ignore[misc]
+
+
+def test_an_early_source_is_padded_for_the_whole_batch_not_for_itself():
+    """Source 1 of a 1,000-source job is `File0001`, not `File001`. This is the single assertion
+    that the width is a property of the job rather than of the value being formatted."""
+    assert _job(1).for_source(1).source_tag == "File001"
+    assert _job(999).for_source(1).source_tag == "File001"
+    assert _job(1000).for_source(1).source_tag == "File0001"
+    assert _job(10000).for_source(1).source_tag == "File00001"
+
+
+@pytest.mark.parametrize("junk", [None, 0, -5, "", "abc", 1.9, [1], {}])
+def test_a_nonsense_total_is_absorbed_and_still_never_truncates(junk):
+    """Malformed input is absorbed here exactly as everywhere else in this module -- and the
+    no-truncation floor means even a nonsense total cannot damage an index."""
+    naming = rc.OutputNaming(synthetic=True, job_date=DATE, source_total=junk)
+    assert naming.for_source(1).source_tag == "File001"
+    assert naming.for_source(1000).source_tag == "File1000"
+    assert int(naming.for_source(1234).source_tag[len(rc.SYNTHETIC_PREFIX):]) == 1234
+
+
+def test_an_understated_total_widens_rather_than_losing_a_digit():
+    """Defensive, and deliberately NOT how the product calls it: the floor exists so a wrong total
+    can only ever make one name wider, never truncate or wrap it."""
+    assert rc.source_index_width(10, 1000) == 4
+    assert rc.OutputNaming(synthetic=True, job_date=DATE,
+                           source_total=10).for_source(1000).source_tag == "File1000"
+
+
+def test_the_superseded_per_index_width_fails_the_sort_order_requirement():
+    """Executable negative control. The old rule is reimplemented here and shown to FAIL the
+    requirement the correction was authorized for, while the shipped rule passes it -- so this
+    test would still fail if the implementation quietly reverted."""
+    def superseded(position):                                 # the published PR #72 spelling
+        return f"{rc.SYNTHETIC_PREFIX}{position:0{max(3, len(str(position)))}d}"
+
+    old = [superseded(i) for i in range(1, 1002)]
+    new = [_job(1001).for_source(i).source_tag for i in range(1, 1002)]
+
+    assert old != sorted(old), "the superseded rule must genuinely mis-sort, or this proves nothing"
+    assert old[99:101] == ["File100", "File101"] and old[999] == "File1000"
+    assert sorted(old).index("File1000") < sorted(old).index("File101"), \
+        "File1000 sorting before File101 is the defect"
+    # The shipped rule: uniform width, so lexical order is the source order.
+    assert new == sorted(new)
+    assert new[99:101] == ["File0100", "File0101"] and new[999] == "File1000"
+    assert len({len(tag) for tag in new}) == 1
+    assert len({len(tag) for tag in old}) == 2, "the control really did mix widths"
+
+
+def test_the_batch_layout_reads_the_width_from_the_record_rather_than_recomputing_it():
+    """Structural, and it is the anti-drift guarantee: if this function worked the width out from
+    `len(source_paths)` there would be two rules over the same fact, and the day they disagreed the
+    folders and the clips inside them would be padded differently."""
+    layout = _code_only(_func(_tree(os.path.join(_REPO_ROOT, "src", "beatsync_fork",
+                                                 "raw_cutter_batch.py")),
+                              "plan_item_directories"))
+    assert "naming.for_source(position).source_tag" in layout, \
+        "the layout must take its tag from the frozen job record"
+    assert "source_index_width" not in layout, "the width is not recomputed in this layer"
+    assert "synthetic_source_tag(" not in layout, \
+        "going straight to the builder would bypass the record's frozen total"
 
 
 def test_a_counter_is_never_renumbered_by_a_skipped_or_failed_source():
@@ -586,13 +764,88 @@ def test_every_hard_naming_case_still_produces_one_flat_unique_safe_component(pa
 
 def test_the_synthetic_layout_is_unique_across_the_whole_frozen_source_set():
     """Uniqueness here is structural rather than negotiated -- the component is the position -- so
-    the assertion is over a set large enough to cross the three-digit boundary."""
+    the assertion is over a set large enough to cross the three-digit boundary.
+
+    [FORK] R4-C correction: the record carries the frozen total, so all 1,500 components are four
+    digits and the directory listing sorts in discovery order.
+    """
     paths = [rf"{_ROOT}\same_name.mp4"] * 1500
-    layout = batch.plan_item_directories(paths, _ROOT, naming=ON)
+    layout = batch.plan_item_directories(paths, _ROOT, naming=_job(len(paths)))
     assert len(layout) == 1500
     assert len({parts[0] for parts in layout}) == 1500
-    assert layout[0] == ("File001",) and layout[999] == ("File1000",)
+    assert layout[0] == ("File0001",) and layout[999] == ("File1000",)
     assert layout[1499] == ("File1500",)
+    assert [parts[0] for parts in layout] == sorted(parts[0] for parts in layout)
+
+
+def test_a_wide_batch_still_leaks_no_source_basename_or_folder_name():
+    """The privacy claim has to survive the correction: the components are still derived from the
+    position, the frozen total and nothing taken from the paths."""
+    paths = ([rf"{_ROOT}\cameraA\secret_wedding.mp4"] * 500
+             + [rf"{_ROOT}\nested\deeper\secret_wedding.mkv"] * 500
+             + [rf"{_ROOT}\CON.mp4"] * 200)
+    naming = _job(len(paths))
+    layout = batch.plan_item_directories(paths, _ROOT, naming=naming)
+    flattened = "/".join("/".join(parts) for parts in layout).casefold()
+    for token in ("secret_wedding", "cameraa", "nested", "deeper", "con.mp4"):
+        assert token not in flattened, token
+    assert all(len(parts) == 1 and parts[0].isascii() for parts in layout)
+    # And the filenames built from the same record are equally clean.
+    for position in (1, 500, 501, 1200):
+        name = rc.segment_filename(paths[position - 1], 1, 1,
+                                   naming=naming.for_source(position))
+        assert "secret" not in name.casefold() and "con" not in name.casefold()
+        assert name.startswith(f"File{position:04d}_")
+
+
+def test_a_wide_batch_that_crosses_midnight_still_carries_one_date_and_one_width():
+    """Both frozen facts together: the correction added a second job-scoped field, and neither it
+    nor the date may vary across the sources of one job."""
+    naming = _job(1200)
+    names = [rc.segment_filename("x.mp4", clip, 3, naming=naming.for_source(source))
+             for source in (1, 2, 999, 1000, 1200) for clip in (1, 3)]
+    assert {name.split("_")[1] for name in names} == {DATE}
+    assert {len(name.split("_")[0]) for name in names} == {len("File0001")}
+
+
+def test_a_single_video_job_is_one_source_wide_with_as_many_clips_as_it_needs():
+    """Single Video freezes a one-source list, so the source field is the three-digit minimum
+    however many clips the plan produces -- the clip field is what widens there."""
+    naming = _job(1).for_source(1)
+    assert rc.run_directory_name("x.mp4", "20261018_153000", naming=naming) == \
+        "RawCutter_Single_20261018_153000"
+    assert rc.segment_filename("x.mp4", 1, 1, naming=naming) == f"File001_{DATE}_001.mp4"
+    assert rc.segment_filename("x.mp4", 7, 12, naming=naming) == f"File001_{DATE}_007.mp4"
+    assert rc.segment_filename("x.mp4", 7, 1200, naming=naming) == f"File001_{DATE}_0007.mp4"
+    assert rc.staging_filename("x.mp4", 2, 4, "tok1", naming=naming) == \
+        f".File001_{DATE}_002.tok1.part.mp4"
+
+
+def test_both_gui_handlers_freeze_a_source_total_on_their_one_naming_record():
+    """The GUI seam, and it is load-bearing: the record is the sole authority for the width, so a
+    handler that built one without a total would reintroduce the mixed-width defect no matter how
+    correct the pure module is. `gui.py` cannot be imported here, so this is asserted against its
+    real source."""
+    gui = _tree(_GUI)
+    batch_body = _code_only(_func(gui, "_on_cut_batch_run"))
+    assert batch_body.count("fork_cutter.OutputNaming(") == 1, "still one record for the batch"
+    assert "source_total=total" in batch_body, \
+        "the batch must freeze the width from its own frozen source count"
+    # `total` is the length of the frozen list the manifest and the progress counter also use.
+    assert "total = len(sources)" in batch_body
+
+    single_body = _code_only(_func(gui, "_on_cut_run"))
+    assert single_body.count("fork_cutter.OutputNaming(") == 1
+    assert "source_total=1" in single_body, "Single Video freezes a one-source job"
+
+
+def test_no_layer_outside_the_record_decides_the_source_width():
+    """`source_index_width` is called in exactly one place -- the tag builder -- so there is one
+    rule over one frozen number, which is what stops the folders and the filenames from drifting."""
+    for relative in ("src/gui.py", "src/raw_cutter_export.py",
+                     "src/beatsync_fork/raw_cutter_batch.py"):
+        rendered = _code_only(_tree(os.path.join(_REPO_ROOT, *relative.split("/"))))
+        assert "source_index_width" not in rendered, relative
 
 
 def test_the_synthetic_layout_needs_no_hash_tag_or_counter_tie_break():

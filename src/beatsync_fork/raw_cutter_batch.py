@@ -251,9 +251,16 @@ def plan_item_directories(source_paths: Sequence[str], scan_root: str, *,
     hash is needed. Note the index deliberately comes from the position here and not from
     ``naming.source_index`` -- this function is answering for the whole list at once, so a
     job-level record aimed at one source would be the wrong input to read.
+
+    **How wide that position is padded is read from the record, not recomputed here.**
+    ``naming.for_source(position)`` returns the same single-source record the exporter will build
+    its filenames from, so the folder and the clips inside it are padded by one shared number that
+    only the caller's frozen job record supplies. Working the width out locally from
+    ``len(source_paths)`` would be a second rule over the same data, and the day the two disagreed
+    the result would be ``File0007`` clips sitting in a ``File007`` folder.
     """
     if _naming_is_synthetic(naming):
-        return tuple((cutter.synthetic_source_tag(position),)
+        return tuple((naming.for_source(position).source_tag,)
                      for position in range(1, len(source_paths) + 1))
 
     assigned: dict[tuple[str, ...], str] = {}

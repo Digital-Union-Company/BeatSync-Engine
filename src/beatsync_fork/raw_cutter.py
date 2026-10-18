@@ -797,8 +797,11 @@ SYNTHETIC_PREFIX = "File"
 #: independent by construction, unlike the ``<stem>_raw_parts_`` default.
 SINGLE_DIRECTORY_PREFIX = "RawCutter_Single_"
 
-#: Minimum width of either synthetic counter. Wider is used when the index itself needs it --
-#: `f"{1000:03d}"` is `"1000"`, so a counter is never truncated and never wraps.
+#: Minimum width of either synthetic counter. Both counters widen from the TOTAL they are counting
+#: towards -- the job's frozen source count for the source field, that source's real clip count for
+#: the clip field -- so one job's names all share a width and ordinary lexical order matches
+#: discovery order at any scale. `f"{1000:03d}"` is `"1000"` anyway, so a counter is also never
+#: truncated and never wraps even if a total is understated.
 SYNTHETIC_INDEX_DIGITS = 3
 
 #: What a `job_date` that is not eight digits reads as. Absorbed rather than fatal, like every
@@ -821,23 +824,47 @@ def normalize_job_date(value: Any) -> str:
     return text if len(text) == 8 else JOB_DATE_FALLBACK
 
 
-def _index_field(value: Any) -> str:
-    """One synthetic counter: at least :data:`SYNTHETIC_INDEX_DIGITS` digits, never truncated."""
+def _coerce_position(value: Any) -> int:
+    """Any junk index as a usable 1-based position. Absorbed, never fatal."""
     try:
-        position = max(1, int(value))
+        return max(1, int(value))
     except (TypeError, ValueError):
-        position = 1
-    return f"{position:0{max(SYNTHETIC_INDEX_DIGITS, len(str(position)))}d}"
+        return 1
 
 
-def synthetic_source_tag(source_index: Any) -> str:
+def source_index_width(source_total: Any, position: Any = 1) -> int:
+    """How many digits EVERY source field in one job uses.
+
+    Derived from the job's complete frozen source count, and deliberately not from the individual
+    index: a width that came from each value would pad source 100 of 1200 to three digits and
+    source 1000 to four, so an ordinary filename sort would read ``...100, 1000, 1001, 101...``.
+    One width for the whole job is what makes plain lexical order agree with discovery order at
+    every scale, which is what an operator browsing the output folder actually sorts by.
+
+    ``position`` is a no-truncation floor only. A correctly built job never needs it, because the
+    total is by definition at least as large as any position in the list; it exists so that an
+    understated total still cannot truncate or wrap an index. Because it can only ever widen a
+    single name, the uniform-width guarantee is a property of the TOTAL being right -- which is
+    why the caller freezes it once, at submission, from the list it is about to process.
+    """
+    total = _coerce_position(source_total)
+    return max(SYNTHETIC_INDEX_DIGITS, len(str(total)), len(str(_coerce_position(position))))
+
+
+def synthetic_source_tag(source_index: Any, source_total: Any = 1) -> str:
     """``File001`` — one source's whole synthetic identity, filename and folder alike.
 
     The SAME string names the clip prefix and (in batch mode) that source's output folder, so the
-    two can never drift apart. It is derived from the source's position in the frozen input list
-    and from nothing else, which is what makes it independent of the file it stands for.
+    two can never drift apart. It is derived from the source's position in the frozen input list,
+    the job's frozen source count, and nothing else -- which is what makes it independent of the
+    file it stands for.
+
+    ``source_total`` defaults to 1, which reproduces exactly the minimum-three-digit spelling a
+    caller got before the job-wide width existed. Batch callers pass the frozen count instead; see
+    :func:`source_index_width`.
     """
-    return f"{SYNTHETIC_PREFIX}{_index_field(source_index)}"
+    position = _coerce_position(source_index)
+    return f"{SYNTHETIC_PREFIX}{position:0{source_index_width(source_total, position)}d}"
 
 
 @dataclass(frozen=True)
@@ -854,26 +881,37 @@ class OutputNaming:
     is the position in the frozen list, so source 3 is ``File003`` whatever happened to sources 1
     and 2. That is what keeps the manifest's mapping readable after a partial run.
 
+    ``source_total`` is how many sources the job froze, and it is the SOLE authority for how wide
+    every source field in that job is -- the clip filenames and the per-source batch folders both
+    read it from this one record, so the two cannot disagree and no layer recomputes it from data
+    of its own. It has to live here rather than be worked out where it is used, because the export
+    layer only ever sees :meth:`for_source`'s single-source record and could not otherwise know
+    how large the batch was. Preserved across :meth:`for_source` for exactly that reason.
+
     The default instance is the legacy mode, so a caller that supplies nothing gets exactly the
-    naming it got before this feature existed.
+    naming it got before this feature existed -- including the default ``source_total`` of 1, which
+    reproduces the original minimum-three-digit spelling for every index.
     """
 
     synthetic: bool = False
     source_index: int = 1
     job_date: str = ""
+    source_total: int = 1
 
     def for_source(self, source_index: Any) -> "OutputNaming":
-        """The same job naming, aimed at one source. Returns a NEW record; nothing is mutated."""
-        try:
-            position = max(1, int(source_index))
-        except (TypeError, ValueError):
-            position = 1
-        return OutputNaming(synthetic=self.synthetic, source_index=position,
-                            job_date=self.job_date)
+        """The same job naming, aimed at one source. Returns a NEW record; nothing is mutated.
+
+        ``source_total`` rides along unchanged: it describes the JOB, not the source, and dropping
+        it here is precisely how a batch would end up with one width in its folder names and
+        another in its filenames.
+        """
+        return OutputNaming(synthetic=self.synthetic,
+                            source_index=_coerce_position(source_index),
+                            job_date=self.job_date, source_total=self.source_total)
 
     @property
     def source_tag(self) -> str:
-        return synthetic_source_tag(self.source_index)
+        return synthetic_source_tag(self.source_index, self.source_total)
 
     @property
     def date_field(self) -> str:
@@ -1128,6 +1166,7 @@ __all__ = [
     "safe_stem",
     "segment_filename",
     "sensitivity_to_threshold",
+    "source_index_width",
     "staging_filename",
     "synthetic_source_tag",
 ]

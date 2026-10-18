@@ -5095,9 +5095,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     timestamp = started_at.strftime('%Y%m%d_%H%M%S')
     naming = fork_cutter.OutputNaming(
         synthetic=bool(rename_output),
-        # Single Video is always source 001: there is one source in this job's frozen list.
+        # Single Video is always source 001: there is one source in this job's frozen list, which
+        # is also why the job-wide source width is the three-digit minimum here. Stated rather
+        # than defaulted, so both handlers visibly freeze the same two facts.
         source_index=1,
-        job_date=started_at.strftime('%d%m%Y'))
+        job_date=started_at.strftime('%d%m%Y'),
+        source_total=1)
     results = []
     # [FORK] Digital-Union (Raw Cutter R1): the completed list is accumulated through a callback,
     # NOT read from the return value. `export_segments` raises `CutterCancelled` on a stop, and an
@@ -5405,8 +5408,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     # here and never recomputed. `job_date` comes from the SAME `started_at` the batch folder is
     # named after, so the two cannot describe different days, and no clip export reads a clock of
     # its own -- which is what keeps a run that crosses midnight on one scheme.
+    #
+    # `source_total` is the frozen count of the list above, and it is the only place the source
+    # field's width is decided: the layout below and every filename the exporter builds both read
+    # it back out of this record, so a 1200-source batch is `File0001`..`File1200` throughout
+    # instead of three digits up to 999 and four after it. It is taken from `total` rather than
+    # recounted, so it cannot describe a different list than the manifest and the progress counter.
     naming = fork_cutter.OutputNaming(synthetic=bool(rename_output),
-                                      job_date=started_at.strftime('%d%m%Y'))
+                                      job_date=started_at.strftime('%d%m%Y'),
+                                      source_total=total)
     # The output layout is decided from the frozen list and the naming mode together, still
     # before anything is written: mirrored input structure by default, one flat `File<SSS>`
     # folder per source when renaming is on.

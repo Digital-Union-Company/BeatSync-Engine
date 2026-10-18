@@ -1950,13 +1950,64 @@ def test_renaming_changes_neither_the_outcome_vocabulary_nor_the_totals_of_a_cle
 
 def test_more_than_999_sources_widen_the_folder_index_without_wrapping():
     """Planned rather than executed -- 1200 synthetic videos is not a unit test -- but it is the
-    same pure function the batch calls, given the shape of input the batch freezes."""
+    same pure function the batch calls, given the shape of input the batch freezes.
+
+    [FORK] R4-C correction: the width comes from the job's frozen source TOTAL, so a 1200-source
+    batch is four digits from its first folder, not three up to 999 and four afterwards.
+    """
     root = os.path.join("J:", os.sep, "in")
     paths = [os.path.join(root, "v%04d.mp4" % i) for i in range(1, 1201)]
-    naming = cutter.OutputNaming(synthetic=True, job_date="18102026")
+    naming = cutter.OutputNaming(synthetic=True, job_date="18102026", source_total=len(paths))
     layout = batch.plan_item_directories(paths, root, naming=naming)
-    assert layout[0] == ("File001",)
-    assert layout[998] == ("File999",)
+    assert layout[0] == ("File0001",)
+    assert layout[998] == ("File0999",)
     assert layout[999] == ("File1000",)
     assert layout[1199] == ("File1200",)
     assert len({parts[0] for parts in layout}) == 1200
+    # One width for the whole job, so an ordinary filename sort is also the discovery order.
+    assert len({len(parts[0]) for parts in layout}) == 1
+    assert [parts[0] for parts in layout] == sorted(parts[0] for parts in layout)
+
+
+def test_a_thousand_source_batch_runs_end_to_end_on_one_uniform_source_width(
+        tmp_path, monkeypatch):
+    """The real `_on_cut_batch_run` over 1,000 sources, not just the pure layout function.
+
+    Deliberately 1,000 tiny real files and a stubbed encoder: the claim under test is the naming
+    contract at that scale, and transcoding a thousand videos to prove a filename would be an
+    unnecessary benchmark rather than stronger evidence.
+    """
+    names = tuple("v%04d.mp4" % i for i in range(1, 1001))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, rename_output=True)
+    rows = run.manifest["sources"]
+    assert len(rows) == 1000
+    expected = ["File%04d" % i for i in range(1, 1001)]
+    assert [r["relative_output"] for r in rows] == expected
+    assert {len(r["relative_output"]) for r in rows} == {len("File0001")}
+    # Every clip sits in its own source's folder and repeats that exact folder tag.
+    relative = _relative_clips(run)
+    assert len({p.split("/")[0] for p in relative}) == 1000
+    for path in relative:
+        folder, name = path.split("/")
+        assert name.startswith(folder + "_" + _job_date(run) + "_"), path
+    # Lexical order over the generated directories is the frozen discovery order.
+    assert sorted(expected) == expected
+
+
+def test_a_failed_first_source_in_a_thousand_source_batch_keeps_source_two_as_file0002(
+        tmp_path, monkeypatch):
+    """The requirement, measured at the scale where the width actually changes: source 1 fails and
+    source 2 is still `File0002`. An index derived from how many exports SUCCEEDED would slide it
+    to `File0001` and make every later row of the record wrong."""
+    names = tuple("v%04d.mp4" % i for i in range(1, 1001))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, rename_output=True,
+                     export_hook=_failing_export("v0001.mp4"))
+    rows = run.manifest["sources"]
+    assert rows[0]["outcome"] == batch.OUTCOME_EXPORT_FAILED
+    assert rows[0]["relative_output"] == "File0001"
+    assert rows[1]["relative_output"] == "File0002"
+    assert rows[1]["outcome"] == batch.OUTCOME_COMPLETED
+    assert rows[999]["relative_output"] == "File1000"
+    # The failed source published nothing, and no later source adopted its index.
+    assert {p.split("/")[0] for p in _relative_clips(run)} == \
+        {"File%04d" % i for i in range(2, 1001)}
