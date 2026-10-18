@@ -582,7 +582,13 @@ def test_every_terminal_path_finalises_through_one_shared_helper(gui_tree):
 def test_start_batch_is_one_click_with_no_confirmation_step(gui_tree, gui_source):
     assert gui_source.count("cut_batch_start_btn.click(") == 1
     kwargs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))
-    assert ast.unparse(kwargs["fn"]) == "_on_cut_batch_run"
+    # [FORK] Raw Cutter progress P1: the click now enters the presentation wrapper, which adds the
+    # progress panel and the button states and delegates to the reviewed `_on_cut_batch_run`
+    # below. The guarantee this test exists for is untouched -- ONE click, no `.then(...)` chain,
+    # no confirmation step -- and the wrapper is asserted to call the real batch exactly once.
+    assert ast.unparse(kwargs["fn"]) == "_on_cut_batch_run_ui"
+    wrapper = _code_only(_func(gui_tree, "_on_cut_batch_run_ui"))
+    assert wrapper.count("_on_cut_batch_run(") == 1, "the wrapper must run the batch exactly once"
     # No `.then(...)` chain: one press does the whole folder.
     start = gui_source.index("cut_batch_start_btn.click(")
     end = gui_source.index("cut_batch_cancel_btn.click(")
@@ -604,14 +610,29 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
     assert gui_source.count("cut_run_btn.click(") == 1
     analyze = _kwargs(_click(gui_tree, "cut_analyze_btn"))
     assert ast.unparse(analyze["fn"]) == "_on_cut_analyze"
-    assert _names(analyze["outputs"]) == ["cut_summary", "cut_table", "cut_plan_state",
-                                          "cut_source_info"]
     run = _kwargs(_click(gui_tree, "cut_run_btn"))
     assert ast.unparse(run["fn"]) == "_on_cut_run"
     assert _names(run["inputs"]) == ["cut_plan_state", "cut_source", "cut_output",
                                      "cut_sensitivity", "cut_min_seconds", "cut_max_seconds",
                                      "cut_remove_audio"]
-    assert _names(run["outputs"]) == ["cut_report"]
+    # [FORK] Raw Cutter progress P1: this test's purpose is that BATCH work did not disturb the
+    # single-video workflow, so it pins the original widgets as a PREFIX that is still written in
+    # the original order -- nothing removed, nothing reordered. The progress panel and the three
+    # button states are the deliberate P1 additions, and they are listed explicitly rather than
+    # waved through, so an accidental fourth addition would still fail here.
+    assert _names(analyze["outputs"]) == ["cut_summary", "cut_table", "cut_plan_state",
+                                          "cut_source_info",
+                                          "cut_progress", "cut_analyze_btn", "cut_run_btn",
+                                          "cut_cancel_btn"]
+    assert _names(run["outputs"]) == ["cut_report",
+                                      "cut_progress", "cut_analyze_btn", "cut_run_btn",
+                                      "cut_cancel_btn"]
+    # And neither handler may reach outside the Raw Cutter: no render, source-confirmation,
+    # Media Preparation or Qwen widget may appear in either list.
+    forbidden = {"status_output", "video_output", "process_btn", "source_state", "source_report",
+                 "confirm_btn", "confirm_status", "prep_status", "prep_report", "verify_report"}
+    for kwargs in (analyze, run):
+        assert not (set(_names(kwargs["outputs"])) & forbidden), _names(kwargs["outputs"])
 
 
 def test_the_batch_reuses_the_shared_execution_settings_rather_than_duplicating_them(gui_tree):
@@ -658,27 +679,54 @@ def test_the_mode_switch_writes_only_visibilities(gui_tree):
 
 def test_every_batch_click_input_matches_its_handler_signature(gui_tree):
     """Gradio passes handler arguments positionally."""
-    for widget, handler in (("cut_batch_start_btn", "_on_cut_batch_run"),
+    for widget, handler in (("cut_batch_start_btn", "_on_cut_batch_run_ui"),
                             ("cut_batch_count_btn", "_on_cut_batch_count"),
                             ("cut_batch_cancel_btn", "_on_cut_batch_cancel")):
         inputs = _kwargs(_click(gui_tree, widget))["inputs"]
         names = [ast.unparse(e) for e in inputs.elts]
-        parameters = [a.arg for a in _func(gui_tree, handler).args.args]
-        assert len(names) == len(parameters), (widget, names, parameters)
+        args = _func(gui_tree, handler).args
+        # [FORK] Raw Cutter progress P1: Gradio supplies only the positional inputs, so compare
+        # against the parameters that have NO default. `_on_cut_batch_run` gained an optional
+        # output-only `sink=None`, which Gradio neither knows about nor supplies.
+        required = [a.arg for a in args.args[:len(args.args) - len(args.defaults)]]
+        assert len(names) == len(required), (widget, names, required)
+    # The wrapper and the batch it delegates to must still agree on the positional arguments.
+    ui = _func(gui_tree, "_on_cut_batch_run_ui").args
+    core = _func(gui_tree, "_on_cut_batch_run").args
+    ui_required = [a.arg for a in ui.args[:len(ui.args) - len(ui.defaults)]]
+    core_required = [a.arg for a in core.args[:len(core.args) - len(core.defaults)]]
+    assert ui_required == core_required, (ui_required, core_required)
 
 
 def test_the_batch_generator_always_yields_both_of_its_two_outputs(gui_tree):
-    """`outputs=[cut_batch_status, cut_batch_summary]`, so every yield must be a 2-tuple or Gradio
-    writes the wrong widget. This is the defect class that shipped a 3-tuple against 4 outputs in
-    V1's analyze handler."""
-    outputs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))["outputs"]
-    assert _names(outputs) == ["cut_batch_status", "cut_batch_summary"]
-    handler = _func(gui_tree, "_on_cut_batch_run")
-    yields = [n for n in ast.walk(handler) if isinstance(n, ast.Yield)]
-    assert yields, "the batch must stream progress"
-    for node in yields:
+    """Every yield must be exactly as wide as the outputs it writes, or Gradio writes the wrong
+    widget. This is the defect class that shipped a 3-tuple against 4 outputs in V1's analyze
+    handler.
+
+    [FORK] Raw Cutter progress P1: there are now TWO arities to pin, and both still matter.
+    `_on_cut_batch_run` -- the reviewed batch -- keeps yielding exactly 2-tuples, which is what
+    makes it safe to delegate to. The wrapper that Gradio actually calls writes 6 widgets, and
+    every one of its yields must be 6 wide.
+    """
+    core = _func(gui_tree, "_on_cut_batch_run")
+    core_yields = [n for n in ast.walk(core) if isinstance(n, ast.Yield)]
+    assert core_yields, "the batch must stream progress"
+    for node in core_yields:
         assert isinstance(node.value, ast.Tuple), ast.unparse(node)
         assert len(node.value.elts) == 2, ast.unparse(node)
+
+    outputs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))["outputs"]
+    assert _names(outputs) == ["cut_batch_status", "cut_batch_summary", "cut_batch_progress",
+                               "cut_batch_count_btn", "cut_batch_start_btn",
+                               "cut_batch_cancel_btn"]
+    wrapper = _func(gui_tree, "_on_cut_batch_run_ui")
+    wrapper_yields = [n for n in ast.walk(wrapper) if isinstance(n, ast.Yield)]
+    assert wrapper_yields, "the wrapper must stream progress"
+    for node in wrapper_yields:
+        # `(status, summary, panel) + <three button updates>` == 6.
+        assert isinstance(node.value, ast.BinOp), ast.unparse(node)
+        assert len(node.value.left.elts) == 3, ast.unparse(node)
+        assert len(outputs.elts) == 6
 
 
 def test_the_count_button_is_read_only_and_takes_no_mutex(gui_tree):
@@ -707,7 +755,10 @@ def test_cancel_batch_shares_the_cutter_cancel_lane_and_the_one_job_slot(gui_tre
     assert ast.unparse(kwargs["concurrency_id"]) == "CUTTER_CANCEL_CONCURRENCY_ID"
     assert ast.unparse(kwargs["concurrency_limit"]) == "None"
     assert ast.unparse(kwargs["inputs"]) == "[]"
-    assert ast.unparse(kwargs["outputs"]) == "[cut_batch_status]"
+    # [FORK] Raw Cutter progress P1: Cancel Batch also writes the progress panel so it can say
+    # "cancellation requested". Its status box stays FIRST and it still writes nothing outside
+    # the batch's own two read-only widgets.
+    assert _names(kwargs["outputs"]) == ["cut_batch_status", "cut_batch_progress"]
     body = _code_only(_func(gui_tree, "_on_cut_batch_cancel"))
     assert "_CUTTER_JOB_LOCK" in body and "_cutter_job" in body
     assert "job.cancel()" in body
@@ -901,6 +952,64 @@ import time as _time
 import types as _types
 
 
+def _ui_strings():
+    """Every `CUT_*` / `LABEL_CUT*` constant, read from the real `src/ui_content.py`.
+
+    [FORK] P19-R4. Stdlib-only module-level string assignments, evaluated directly, so the wrapper
+    under test renders the headlines the application actually ships.
+    """
+    path = os.path.join(_REPO_ROOT, "src", "ui_content.py")
+    with open(path, encoding="utf-8") as handle:
+        source = ast.parse(handle.read(), filename=path)
+    out: dict = {}
+    for node in source.body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)):
+            continue
+        name = node.targets[0].id
+        if not name.startswith(("CUT_", "LABEL_CUT")):
+            continue
+        try:
+            out[name] = ast.literal_eval(node.value)
+        except ValueError:
+            continue                                   # an f-string or a concat: not needed here
+    return out
+
+
+#: The operator-facing titles, read once from the real `src/ui_content.py`. Tests compare against
+#: these rather than against literals, so a reworded headline cannot make an assertion describe a
+#: screen the application does not ship.
+_UI = _ui_strings()
+
+
+def _panel_data(html):
+    """Parse the `data-*` contract out of one rendered progress panel.
+
+    [FORK] P19-R4. `_cut_progress_html` publishes `data-state`, `data-pct`, `data-done`,
+    `data-total` and `data-determinate` precisely so a test never has to read presentation. The
+    title is read too, because "which headline did the operator see" is the question F-2 is about.
+    """
+    if not isinstance(html, str) or "cut-progress-panel" not in html:
+        return {}
+
+    def attr(name):
+        marker = name + '="'
+        if marker not in html:
+            return ""
+        return html.split(marker, 1)[1].split('"', 1)[0]
+
+    title = ""
+    if 'id="cut-progress-title"' in html:
+        title = html.split('id="cut-progress-title"', 1)[1].split(">", 1)[1].split("<", 1)[0]
+    return {
+        "state": attr("data-state"),
+        "pct": int(attr("data-pct") or -1),
+        "done": attr("data-done"),
+        "total": attr("data-total"),
+        "determinate": attr("data-determinate") == "1",
+        "title": title,
+    }
+
+
 class _FakeCancelled(Exception):
     """Stands in for `raw_cutter_export.CutterCancelled` -- an ordinary Exception, as there."""
 
@@ -925,6 +1034,23 @@ class _BatchRun:
         self.yields, self.batch_dir, self.manifest = yields, batch_dir, manifest
         self.clips, self.events, self.lock, self.released = clips, events, lock, released
 
+    # --- [FORK] P19-R4: the presentation panel, when the run was driven through the wrapper ---
+    #
+    # These read the `data-*` contract `_cut_progress_html` publishes, which is deliberately the
+    # stable surface a test is meant to assert against -- never the presentation styling.
+
+    @property
+    def panel(self):
+        """The FINAL progress panel's `data-*` contract, as a dict. `{}` when there is none."""
+        if not self.yields or len(self.yields[-1]) < 3:
+            return {}
+        return _panel_data(self.yields[-1][2])
+
+    @property
+    def panels(self):
+        """Every progress panel the wrapper emitted, in order."""
+        return [_panel_data(y[2]) for y in self.yields if len(y) >= 3]
+
     @property
     def status(self):
         return self.yields[-1][0] if self.yields else ""
@@ -948,10 +1074,27 @@ class _BatchRun:
 
 def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
                probe_fault=None, export_hook=None, manifest_error="", manifest_raises=False,
-               prelock=False):
-    """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem."""
-    handler_node = _strip_docstrings(_func(_tree(_GUI), "_on_cut_batch_run"))
-    module = ast.fix_missing_locations(ast.Module(body=[handler_node], type_ignores=[]))
+               prelock=False, batch_dir_error="", ui=False):
+    """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem.
+
+    [FORK] P19-R4: with ``ui=True`` the run is driven through the real `_on_cut_batch_run_ui`
+    presentation wrapper instead, and the REAL `_cut_progress_html` renders the panels. That is
+    what makes a progress assertion an assertion about shipped code rather than about a
+    reimplementation of it -- the whole point of findings F-1 and F-2, both of which lived in the
+    seam between the batch and its panel and so were invisible to either half alone.
+    """
+    gui = _tree(_GUI)
+    wanted = ["_on_cut_batch_run"]
+    if ui:
+        # Three exec'd pieces plus the module-level tone table must land in ONE namespace, or the
+        # wrapper cannot resolve the renderer it calls.
+        wanted += ["_cut_progress_html", "_cut_batch_buttons", "_on_cut_batch_run_ui"]
+    body = [_strip_docstrings(_func(gui, name)) for name in wanted]
+    if ui:
+        body = [node for node in gui.body
+                if isinstance(node, ast.Assign)
+                and getattr(node.targets[0], "id", "") == "_CUT_TONES"] + body
+    module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
     namespace: dict = {}
     exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
 
@@ -975,6 +1118,11 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         return str(src_root), str(out_root), ""
 
     def prepare_batch_directory(root, stamp):
+        if batch_dir_error:
+            # [FORK] P19-R4 (F-2): the real refusal shape -- a read-only or full output volume.
+            # It returns from INSIDE the handler's `try`, which is what makes it reach the
+            # cleanup net rather than one of the reviewed terminal paths.
+            return "", batch_dir_error
         target = os.path.join(root, "RawCutter_Batch_" + str(stamp))
         os.makedirs(target, exist_ok=False)
         return target, ""
@@ -1040,7 +1188,7 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
             lock.release()
 
     namespace.update(
-        os=os, time=_time, datetime=_datetime, List=list, Any=object,
+        os=os, time=_time, datetime=_datetime, List=list, Any=object, Dict=dict,
         fork_cutter=cutter, fork_cutter_batch=batch, _RENDER_LOCK=_Lock(),
         _mark_lock_holder=lambda token: events.append("holder:" + (token or "cleared")),
         _LOCK_HOLDER_CUTTER="cutter",
@@ -1049,9 +1197,18 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         _cut_busy_message=lambda: "BUSY", NVENC_AVAILABLE=False,
         CUT_BATCH_DONE_STATUS="DONE", CUT_BATCH_CANCELLED_STATUS="CANCELLED")
 
+    if ui:
+        # The wrapper needs `gr.update` and the real operator-facing titles. The titles are read
+        # from the real `ui_content.py` rather than invented, so a reworded headline cannot make a
+        # passing test describe a screen nobody ships.
+        namespace["gr"] = _types.SimpleNamespace(update=lambda **kw: dict(kw))
+        namespace.update(_ui_strings())
+        namespace.setdefault("html_lib", __import__("html"))
+
+    entry = "_on_cut_batch_run_ui" if ui else "_on_cut_batch_run"
     yields = []
     try:
-        for value in namespace["_on_cut_batch_run"](
+        for value in namespace[entry](
                 str(src_root), False, str(out_root), 50, 1.0, 8.0, True):
             yields.append(value)
     except BaseException as exc:                              # noqa: BLE001 - must be observable
@@ -1261,3 +1418,250 @@ def test_a_refused_batch_releases_nothing_and_creates_nothing(tmp_path, monkeypa
     assert run.batch_dir == ""
     assert run.released == 0, "a refused batch released a lock it never acquired"
     assert "probe:a.mp4" not in run.events
+
+
+# ==============================================================================================
+# [FORK] Digital-Union (P19-R4): the batch PROGRESS PANEL, executed end to end.
+#
+# The independent P19-R3 review found two defects that lived in the seam between the reviewed
+# batch core and its presentation wrapper -- a place neither half's own tests looked at:
+#
+#   F-1  every successful batch under-reported. The panel's count came from a snapshot taken
+#        inside progress(phase), which runs BEFORE each source's record(...), so the last source
+#        was always missing. Measured 2 -> 50 %, 3 -> 67 %, 5 -> 80 %. A complete batch could
+#        never reach 100 %.
+#   F-2  a batch refused AFTER admission, because its output directory could not be created,
+#        reached the cleanup net, which finalised with cancelled=False and no fatal error and so
+#        published a terminal class of "done" -- a green "Batch finished" for a run that wrote
+#        nothing.
+#
+# Both are asserted here through the REAL wrapper and the REAL renderer, because an assertion
+# about either half alone is exactly what let them ship.
+# ==============================================================================================
+
+# --- F-1: a completed batch reaches 100 %, at every size --------------------------------------
+
+@pytest.mark.parametrize("count", [1, 2, 3, 5])
+def test_a_fully_successful_batch_reports_every_source_and_reaches_one_hundred(
+        tmp_path, monkeypatch, count):
+    """The defect in one line: n - 1 of n, forever.
+
+    Parameterised over sizes because the original fault was an off-by-one that survives any
+    single-size check which happens to agree with it.
+    """
+    names = tuple("s%d.mp4" % i for i in range(1, count + 1))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, ui=True)
+
+    assert run.outcomes == [batch.OUTCOME_COMPLETED] * count
+    panel = run.panel
+    assert panel, "the wrapper emitted no progress panel at all"
+    assert panel["determinate"], "a finished batch of known size must show a measured fraction"
+    assert panel["done"] == str(count), panel
+    assert panel["total"] == str(count), panel
+    assert panel["pct"] == 100, panel
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 5])
+def test_the_terminal_panel_count_equals_the_manifest_attempted_count(
+        tmp_path, monkeypatch, count):
+    """Panel and manifest must agree -- they are two renderings of one set of recorded outcomes.
+
+    This is the property F-1 actually violated: the panel read a stale snapshot while the
+    manifest read the live records, so the two artifacts described different runs.
+    """
+    names = tuple("s%d.mp4" % i for i in range(1, count + 1))
+    run = _run_batch(tmp_path, monkeypatch, sources=names, ui=True)
+    _assert_complete_manifest(run, count)
+    assert run.panel["done"] == str(run.manifest["totals"]["attempted"])
+    assert run.panel["total"] == str(run.manifest["totals"]["discovered"])
+
+
+def test_the_final_source_outcome_is_recorded_before_the_terminal_panel_is_rendered(
+        tmp_path, monkeypatch):
+    """The ordering the fix depends on, measured rather than assumed."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    # The last source really did reach record(...) -- it is in the manifest as completed ...
+    assert run.manifest["sources"][-1]["outcome"] == batch.OUTCOME_COMPLETED
+    # ... and the panel the operator was left looking at counts it.
+    assert run.panel["done"] == "3" and run.panel["pct"] == 100
+
+
+def test_progress_never_runs_ahead_of_the_outcomes_actually_recorded(tmp_path, monkeypatch):
+    """The opposite failure to F-1, and the one the original snapshot was protecting against.
+
+    A source must not be counted the moment it STARTS. Every intermediate panel must report a
+    count no greater than the number of sources already finished at that point, and the sequence
+    must never decrease.
+    """
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    counts = [int(p["done"]) for p in run.panels if p.get("determinate")]
+    assert counts, "no determinate panel was rendered"
+    assert counts == sorted(counts), "the batch counter went backwards: %r" % (counts,)
+    assert counts[-1] == 3
+    assert counts[0] == 0, "the first source was counted before it had finished"
+    assert max(counts) <= 3
+
+
+def test_a_cancelled_batch_counts_only_what_it_attempted(tmp_path, monkeypatch):
+    """Cancellation must keep the truthful attempted/discovered pair -- never inflate to 100 %,
+    and never count the not_attempted backfill as work."""
+    def stop_after_first(source, plan, run_directory, job, on_complete):
+        job.cancel()
+        raise _FakeCancelled()
+
+    run = _run_batch(tmp_path, monkeypatch, export_hook=stop_after_first, ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_CANCELLED
+    attempted = run.manifest["totals"]["attempted"]
+    assert run.manifest["totals"]["not_attempted"] > 0, "this fixture must leave a backfill"
+    assert run.panel["done"] == str(attempted)
+    assert run.panel["total"] == "3"
+    assert run.panel["pct"] < 100, "a cancelled batch must never claim complete processing"
+    assert run.panel["state"] == "stopping"
+
+
+def test_the_backfill_changes_neither_the_count_nor_the_class(tmp_path, monkeypatch):
+    """The property that makes it safe to publish both at finalisation.
+
+    not_attempted is in neither _FAILED nor attempted, so appending backfill rows moves neither
+    summarise(...).attempted nor terminal_status(...). Asserted directly against the pure
+    classifier so a future change to either set fails here rather than silently skewing the panel.
+    """
+    items = [batch.BatchItem(index=1, source_path="a", relative_parts=("a",),
+                             outcome=batch.OUTCOME_COMPLETED)]
+    backfilled = items + [
+        batch.BatchItem(index=i, source_path="x", relative_parts=("x",),
+                        outcome=batch.OUTCOME_NOT_ATTEMPTED) for i in (2, 3)]
+    assert batch.summarise(items, 3).attempted == batch.summarise(backfilled, 3).attempted == 1
+    assert (batch.terminal_status(items, 3, False, "")
+            == batch.terminal_status(backfilled, 3, False, "")
+            == batch.TERMINAL_COMPLETED)
+
+
+# --- F-2: a refused batch is never a successful one -------------------------------------------
+
+_BATCH_REFUSAL = "Could not create the batch folder:\n[WinError 5] Access is denied"
+
+
+def test_an_output_directory_refusal_after_admission_is_never_shown_as_success(
+        tmp_path, monkeypatch):
+    """F-2 exactly: the one early return inside the handler's try.
+
+    It reaches the cleanup net, which finalises with no cancellation and no fatal error. Before
+    the fix that published "done" and the panel read a green "Batch finished" over a run that
+    created nothing.
+    """
+    run = _run_batch(tmp_path, monkeypatch, batch_dir_error=_BATCH_REFUSAL, ui=True)
+
+    panel = run.panel
+    assert panel, "no panel was rendered"
+    assert panel["state"] != "done", "a refused batch was presented as a success"
+    assert panel["title"] != _UI["CUT_BATCH_DONE_TITLE"], panel
+    assert panel["title"] == _UI["CUT_BATCH_NOT_RUN_TITLE"], panel
+    assert not panel["determinate"], "a batch that never ran must not show a percentage"
+    assert panel["pct"] == -1, panel
+    # The refusal itself stays on screen, and nothing was fabricated.
+    assert "Could not create the batch folder" in run.status
+    assert run.batch_dir == "", "a refused batch created an output directory"
+    assert run.manifest is None, "a refused batch claimed a manifest"
+    assert run.clips == []
+
+
+def test_an_output_directory_refusal_still_cleans_up_exactly_once(tmp_path, monkeypatch):
+    """The admission contract is unchanged by the presentation fix: the mutex WAS taken here, so
+    it must be released exactly once, with the job slot and holder token cleared first."""
+    run = _run_batch(tmp_path, monkeypatch, batch_dir_error=_BATCH_REFUSAL, ui=True)
+    assert run.released == 1
+    assert not run.lock.locked()
+    assert "job:cleared" in run.events
+    assert run.events[-1] == "holder:cleared"
+    assert "probe:a.mp4" not in run.events, "a refused batch opened a source"
+
+
+def test_a_pre_admission_refusal_is_also_never_shown_as_success(tmp_path, monkeypatch):
+    """The other refusal shape -- the mutex was busy, so the batch never started at all. It was
+    already correct, and must stay correct: both refusals land on the same honest panel."""
+    run = _run_batch(tmp_path, monkeypatch, prelock=True, ui=True)
+    panel = run.panel
+    assert panel["state"] != "done"
+    assert panel["title"] == _UI["CUT_BATCH_NOT_RUN_TITLE"], panel
+    assert not panel["determinate"]
+    assert run.released == 0, "a refused batch released a lock it never acquired"
+    assert run.batch_dir == ""
+
+
+# --- adjacent terminal classes: none of them may read as an unqualified success ---------------
+
+def _failing_export(fail_on):
+    def hook(source, plan, run_directory, job, on_complete):
+        if os.path.basename(source.path) == fail_on:
+            on_complete(_Res(index=1, ok=False, size_bytes=0, error="injected encoder failure"))
+            return None
+        for segment in plan.segments:
+            target = os.path.join(run_directory, "clip_%03d.mp4" % segment.index)
+            with open(target, "wb") as handle:
+                handle.write(b"\0" * 1024)
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=1024, error=""))
+        return None
+    return hook
+
+
+def test_a_batch_with_a_failed_source_is_not_an_unqualified_green_success(tmp_path, monkeypatch):
+    """completed_with_failures is a distinct class the pure classifier already produces. The
+    panel must not flatten it into the same green "Batch finished" a clean run gets."""
+    run = _run_batch(tmp_path, monkeypatch, export_hook=_failing_export("b.mp4"), ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED_WITH_FAILURES
+    panel = run.panel
+    assert panel["state"] != "done", "a batch with a failed source was shown as a clean success"
+    assert panel["title"] != _UI["CUT_BATCH_DONE_TITLE"]
+    # Every source was still attempted, so the fraction is honest and complete.
+    assert panel["done"] == "3" and panel["total"] == "3"
+
+
+def test_a_fatal_batch_error_is_shown_as_failed_and_never_as_cancelled_or_done(
+        tmp_path, monkeypatch):
+    def boom(path):
+        if os.path.basename(path) == "b.mp4":
+            raise RuntimeError("injected: second source")
+
+    run = _run_batch(tmp_path, monkeypatch, probe_fault=boom, ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_FAILED
+    panel = run.panel
+    assert panel["state"] == "failed", panel
+    assert panel["title"] == _UI["CUT_BATCH_FAILED_TITLE"], panel
+    assert panel["title"] != _UI["CUT_BATCH_CANCELLED_TITLE"]
+
+
+def test_a_manifest_write_failure_is_not_presented_as_a_clean_success(tmp_path, monkeypatch):
+    """Every source succeeded, but the authoritative record did not reach disk. The summary has
+    always disclosed that; the panel used to show the same green "Batch finished" as a run whose
+    manifest was saved."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_error="disk full", ui=True)
+    # This fixture refuses the WRITE, so there is deliberately no manifest file to read back --
+    # that absence is the condition under test, not an accident of the harness.
+    assert run.manifest is None, "the fixture must leave no manifest on disk"
+    assert len(run.clips) > 0, "the clips themselves were still produced"
+    assert "could NOT be saved" in run.summary
+    panel = run.panel
+    assert panel["state"] != "done", "a lost manifest was presented as a clean success"
+    assert panel["title"] == _UI["CUT_BATCH_RECORD_LOST_TITLE"], panel
+    assert panel["done"] == "3" and panel["total"] == "3", "the per-source work still completed"
+
+
+def test_a_finalisation_fault_is_not_presented_as_a_clean_success(tmp_path, monkeypatch):
+    """The finaliser itself broke. Cleanup still runs (asserted elsewhere); the panel must not
+    claim the run ended cleanly."""
+    run = _run_batch(tmp_path, monkeypatch, manifest_raises=True, ui=True)
+    assert not run.escaped
+    assert run.released == 1
+    assert run.panel["state"] != "done"
+
+
+def test_a_clean_batch_is_still_shown_as_a_clean_success(tmp_path, monkeypatch):
+    """The control arm for all five tests above. Without it they could be satisfied by a panel
+    that never says "done" at all, which would be a different lie."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED
+    panel = run.panel
+    assert panel["state"] == "done", panel
+    assert panel["title"] == _UI["CUT_BATCH_DONE_TITLE"], panel
+    assert panel["pct"] == 100

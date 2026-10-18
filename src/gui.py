@@ -82,6 +82,7 @@ import errno
 # [FORK] Digital-Union (Deliverable Export V1-B-S1): the subordinate share publication verifies its
 # staged copy by re-reading it, so it needs a digest. Stdlib only, like everything else here.
 import hashlib
+import html as html_lib
 import multiprocessing
 import queue
 import re
@@ -381,6 +382,57 @@ STATUS_BOX_CSS = """
     max-height: 186px !important;
     overflow-y: auto !important;
     resize: none !important;
+}
+"""
+
+# [FORK] Digital-Union (P19-R4): make the two Raw Cutter Cancel controls actually RED.
+#
+# `variant='stop'` is NOT a guarantee of red. Measured in the pinned Gradio 6.19.0 + Ocean theme:
+# the stop variant paints `background-image: linear-gradient(120deg, #52525b ...)` over a
+# `background-color` of `rgba(0,0,0,0)` — a neutral grey. An emergency control that looks like
+# every other button is one an operator does not reach for, which is why this is written against
+# the measured DOM rather than against the variant's name.
+#
+# Three measured facts this depends on, each of which would have been wrong if guessed:
+#   * `elem_id` lands on the `<button>` ITSELF here, not on a wrapper — so `button#id`, never
+#     `#id button`.
+#   * the theme paints with `background-image`, so overriding `background-color` alone would be
+#     invisible underneath the gradient.
+#   * Quick Render's "Cancel Active Render" carries the SAME `stop` class and has no `elem_id`.
+#     Scoping by id is therefore what keeps this off every other button in the app; a `.stop`
+#     selector would have restyled a render control this task has no business touching.
+#
+# Colour is never the only state indicator: the label text and Gradio's own `disabled` attribute
+# both remain, and the disabled rule below keeps the subdued treatment the theme already applies.
+CUT_CANCEL_CSS = """
+button#cut-cancel-button,
+button#cut-batch-cancel-button {
+    background-image: linear-gradient(120deg, #a32015 0%, #c5362c 60%, #a32015 100%) !important;
+    background-color: #c5362c !important;
+    border-color: #ff8a80 !important;
+    color: #ffffff !important;
+    font-weight: 600 !important;
+}
+
+button#cut-cancel-button:not(:disabled):hover,
+button#cut-batch-cancel-button:not(:disabled):hover {
+    background-image: linear-gradient(120deg, #b8291d 0%, #d4423a 60%, #b8291d 100%) !important;
+    border-color: #ffb3ab !important;
+}
+
+button#cut-cancel-button:focus-visible,
+button#cut-batch-cancel-button:focus-visible {
+    outline: 3px solid #ffd5d5 !important;
+    outline-offset: 2px !important;
+}
+
+button#cut-cancel-button:disabled,
+button#cut-batch-cancel-button:disabled {
+    background-image: none !important;
+    background-color: rgba(163, 32, 21, 0.20) !important;
+    border-color: rgba(163, 32, 21, 0.45) !important;
+    color: rgba(255, 255, 255, 0.55) !important;
+    cursor: not-allowed !important;
 }
 """
 
@@ -4715,6 +4767,128 @@ def _cut_busy_message() -> str:
     return MEDIA_BUSY_UNKNOWN_TEXT
 
 
+# ============================================================================================
+# [FORK] Digital-Union (Raw Cutter progress P1): a visible, TRUTHFUL progress surface.
+#
+# The problem this solves: `Analyze` and `Cut Video` both do long FFmpeg work, and before this
+# the screen said nothing while they did it. An operator could not tell a slow cut from a hung
+# one, and nothing stopped a second click landing on top of the first.
+#
+# The rule the whole surface obeys: **a number is only shown when it was measured.** The cutter
+# measures exactly one thing it can turn into a percentage -- clips actually published over clips
+# planned -- so that is the only determinate bar. Scene detection is one opaque FFmpeg pass, so it
+# gets a named phase and an indeterminate bar. There is no ETA anywhere, and none is derivable:
+# segment lengths vary, the encoder is not linear in wall-clock, and a guessed time would be a
+# lie told with a straight face.
+# ============================================================================================
+
+#: Tones carry meaning, not decoration: an operator reads colour before text.
+_CUT_TONES = {
+    'active': ('#2f81f7', '#1f6feb'),     # work is genuinely running
+    'done': ('#2ea043', '#238636'),       # a terminal success
+    'stopping': ('#d29922', '#bb8009'),   # cancellation requested, not yet complete
+    'failed': ('#f85149', '#da3633'),     # a terminal failure or refusal
+}
+
+
+def _cut_progress_html(title: str, detail: str = '', *, done=None, total=None,
+                       note: str = '', tone: str = 'active') -> str:
+    """One progress panel for the Raw Cutter. Returns HTML; never invents a number.
+
+    Passing `done` and `total` produces a DETERMINATE bar whose percentage is exactly
+    ``done / total``. They are only ever given counts the cutter has already recorded -- a clip
+    is counted when `on_complete` fired for it, a source when its outcome was classified -- so
+    the bar can stand still for a long time and still be honest.
+
+    Omitting them produces an INDETERMINATE bar: a phase that is really running but whose
+    internal progress FFmpeg does not report. That is shown as motion without a number, which is
+    the truthful rendering of "working, amount unknown".
+
+    `data-*` attributes are deliberate: they are the stable contract the browser tests read, so a
+    test never has to parse presentation.
+    """
+    bar, fill = _CUT_TONES.get(tone, _CUT_TONES['active'])
+    determinate = isinstance(done, int) and isinstance(total, int) and total > 0
+    if determinate:
+        done = max(0, min(int(done), int(total)))
+        pct = int(round((done * 100.0) / total))
+        width = f'{pct}%'
+        counter = f'{done} / {total}'
+        anim = ''
+    else:
+        pct = -1                      # -1 == "not measurable", never 0, which would read as stalled
+        width = '100%'
+        counter = ''
+        # A slow sweep, so an indeterminate phase still looks alive rather than frozen.
+        anim = ('background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,'
+                'rgba(255,255,255,.45) 50%,rgba(255,255,255,0) 100%);'
+                'background-size:40% 100%;background-repeat:no-repeat;'
+                'animation:bsweep 1.4s linear infinite;')
+    rows = [
+        '<style>@keyframes bsweep{0%{background-position:-40% 0}100%{background-position:140% 0}}</style>',
+        f'<div id="cut-progress-panel" data-state="{tone}" data-pct="{pct}" '
+        f'data-done="{done if determinate else ""}" data-total="{total if determinate else ""}" '
+        f'data-determinate="{"1" if determinate else "0"}" '
+        'style="padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.12);">',
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;">',
+        f'<strong id="cut-progress-title" style="color:{bar};">{html_lib.escape(title)}</strong>',
+        f'<span id="cut-progress-counter" style="opacity:.85;font-variant-numeric:tabular-nums;">'
+        f'{html_lib.escape(counter)}</span>',
+        '</div>',
+        f'<div style="margin:8px 0 6px;height:10px;border-radius:999px;'
+        f'background:rgba(255,255,255,.10);overflow:hidden;">'
+        f'<div id="cut-progress-bar" style="height:100%;width:{width};border-radius:999px;'
+        f'background:{fill};{anim}"></div></div>',
+    ]
+    if detail:
+        rows.append(f'<div id="cut-progress-detail" style="opacity:.9;">'
+                    f'{html_lib.escape(detail)}</div>')
+    if note:
+        rows.append(f'<div id="cut-progress-note" style="opacity:.65;font-size:.85em;'
+                    f'margin-top:4px;">{html_lib.escape(note)}</div>')
+    rows.append('</div>')
+    return ''.join(rows)
+
+
+def _cut_progress_clear() -> str:
+    """The idle panel: empty, so nothing claims work is happening when none is."""
+    return ''
+
+
+def _cut_buttons(*, analyze: bool, run: bool, cancel: bool):
+    """The three single-video controls, as one honest set.
+
+    Returned together on every path on purpose. Setting them one at a time is how a surface ends
+    up with Cancel still glowing after a job finished, or Cut Video enabled against a plan that no
+    longer exists. These are a CONVENIENCE for the operator, never a safety gate -- admission is
+    `_RENDER_LOCK` and plan validity is `plan_signature`, both unchanged and both still enforced
+    server-side for a caller that never saw this UI.
+    """
+    return (gr.update(interactive=analyze),
+            gr.update(interactive=run),
+            gr.update(interactive=cancel, variant='stop'))
+
+
+def _cut_batch_buttons(*, count: bool, start: bool, cancel: bool):
+    """The batch controls. Same reasoning as `_cut_buttons`."""
+    return (gr.update(interactive=count),
+            gr.update(interactive=start),
+            gr.update(interactive=cancel, variant='stop'))
+
+
+def _on_cut_planning_input_change():
+    """A planning setting moved, so the plan on screen no longer describes this source.
+
+    Disables Cut Video and says why. This is presentation only: `_on_cut_run` still recomputes
+    `plan_signature` against the LIVE widgets and the LIVE file and still refuses a stale plan on
+    its own, which is what protects an API caller, a second browser tab and anyone who bypasses
+    this handler entirely. Nothing is queued and no state is cleared -- the plan itself is left
+    alone so a user who reverts the setting can still cut it.
+    """
+    return (gr.update(interactive=False),
+            _cut_progress_html(CUT_PLAN_STALE_TITLE, CUT_SETTINGS_CHANGED_TEXT, tone='stopping'))
+
+
 def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
     """Analyze / Preview. Probes, detects scene changes, plans — and writes NOTHING.
 
@@ -4726,32 +4900,69 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
     answers `[]` for both "no cuts" and "the detector did not run", which is fine for Stage 5 but
     would be a lie here: it would present one giant time-split clip as the footage's own structure.
     `raw_cutter_export.detect_scenes` keeps the two apart and this refuses on the failure.
+
+    [FORK] Digital-Union (Raw Cutter progress P1): now a GENERATOR, so the named phase on screen
+    is the phase actually executing. The three phases are the three real steps -- probe, detect,
+    plan -- and each is announced *before* its blocking call, which is what makes the label true
+    while the call runs rather than after it.
+
+    The bar is indeterminate throughout. Detection is one FFmpeg pass that reports nothing
+    usable, so any percentage here would be fabricated.
+
+    Analyze has **no cancellable job**, by design and unchanged: it writes nothing, holds no
+    mutex and installs no `CutterJob`. Cancel cutting is therefore left DISABLED for the whole of
+    analysis -- presenting it as able to stop this would be a lie, and pressing it would
+    truthfully answer "no cut job is running".
     """
     import raw_cutter_export as cutter_export
 
+    busy = _cut_buttons(analyze=False, run=False, cancel=False)
+    idle_no_plan = _cut_buttons(analyze=True, run=False, cancel=False)
+
+    def fail(summary, details_text):
+        return (summary, [], None, details_text,
+                _cut_progress_html(CUT_ANALYZE_FAILED_TITLE, summary.lstrip('❌ ').split('\n')[0],
+                                   tone='failed')) + idle_no_plan
+
+    yield ('', [], gr.update(), gr.update(),
+           _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_PROBE_TEXT,
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
+
     probe = cutter_export.probe_source(source_path)
     if not probe.ok:
-        return f"❌ {probe.error}", [], None, ""
+        yield fail(f"❌ {probe.error}", "")
+        return
     source = probe.source
     details = source.describe()
 
     try:
         low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
     except fork_cutter.RawCutterError as exc:
-        return f"❌ {exc}", [], None, details
+        yield fail(f"❌ {exc}", details)
+        return
 
     level = fork_cutter.normalize_sensitivity(sensitivity)
     threshold = fork_cutter.sensitivity_to_threshold(level)
 
+    yield ('', [], gr.update(), details,
+           _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_DETECT_TEXT,
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
+
     scenes = cutter_export.detect_scenes(source.path, threshold)
     if not scenes.succeeded:
-        return (f"❌ Scene detection failed, so no plan was made.\n{scenes.error}\n\n"
-                f"Nothing was written and your source file was not touched."), [], None, details
+        yield fail((f"❌ Scene detection failed, so no plan was made.\n{scenes.error}\n\n"
+                    f"Nothing was written and your source file was not touched."), details)
+        return
+
+    yield ('', [], gr.update(), details,
+           _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_PLAN_TEXT,
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
 
     try:
         plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high, level)
     except fork_cutter.RawCutterError as exc:
-        return f"❌ {exc}", [], None, details
+        yield fail(f"❌ {exc}", details)
+        return
 
     summary = fork_cutter.plan_summary_text(plan, source)
     summary = (f"{summary}\n\nScene detection took {scenes.elapsed_seconds:g}s.")
@@ -4769,7 +4980,20 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
         'sensitivity': level, 'min_seconds': low, 'max_seconds': high,
         'threshold': plan.threshold, 'detected': plan.detected_scene_count,
     }
-    return summary, fork_cutter.plan_table_rows(plan), state, details
+    # [FORK] P1: Cut Video becomes available ONLY for a plan that actually exports something.
+    # `plan.has_work` is the same predicate `_on_cut_run` refuses on, so the button and the
+    # server-side guard cannot disagree -- the button is just the earlier, friendlier half.
+    if plan.has_work:
+        panel = _cut_progress_html(
+            CUT_PHASE_ANALYZING_TITLE + ' — done',
+            f'{plan.count} clip(s) planned. Press Cut Video to export them.',
+            done=plan.count, total=plan.count, tone='done')
+        buttons = _cut_buttons(analyze=True, run=True, cancel=False)
+    else:
+        panel = _cut_progress_html(CUT_PLAN_STALE_TITLE, CUT_ANALYZE_DONE_NO_WORK_TEXT,
+                                   tone='stopping')
+        buttons = _cut_buttons(analyze=True, run=False, cancel=False)
+    yield (summary, fork_cutter.plan_table_rows(plan), state, details, panel) + buttons
 
 
 def _restore_plan(state):
@@ -4813,35 +5037,46 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     """
     import raw_cutter_export as cutter_export
 
+    busy = _cut_buttons(analyze=False, run=False, cancel=True)
+    idle_plan = _cut_buttons(analyze=True, run=True, cancel=False)
+    idle_no_plan = _cut_buttons(analyze=True, run=False, cancel=False)
+
+    def refuse(text, *, keep_plan=True):
+        """A refusal performs no work, so the controls go straight back to idle."""
+        return (text, _cut_progress_html(CUT_CUT_REFUSED_TITLE, text.split('\n')[0],
+                                         tone='failed')) + (idle_plan if keep_plan else idle_no_plan)
+
     source, plan = _restore_plan(plan_state)
     if source is None:
-        yield CUT_NO_PLAN_TEXT
+        yield refuse(CUT_NO_PLAN_TEXT, keep_plan=False)
         return
     if not plan.has_work:
         # [FORK] Digital-Union (Raw Cutter R1): a zero-clip plan is a legitimate ANALYSIS result --
         # the source genuinely has nothing long enough to export -- but it is not something to
         # execute. Refused clearly here rather than creating an empty run folder.
-        yield CUT_NOTHING_TO_EXPORT_TEXT
+        yield refuse(CUT_NOTHING_TO_EXPORT_TEXT, keep_plan=False)
         return
 
     probe = cutter_export.probe_source(source_path)
     if not probe.ok:
-        yield f"❌ {probe.error}"
+        yield refuse(f"❌ {probe.error}")
         return
     try:
         low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
     except fork_cutter.RawCutterError as exc:
-        yield f"❌ {exc}"
+        yield refuse(f"❌ {exc}")
         return
     live_signature = fork_cutter.plan_signature(probe.source, sensitivity, low, high)
     if live_signature != plan_state.get('signature'):
-        yield CUT_STALE_PLAN_TEXT
+        # The backend staleness gate, unchanged and still the ONLY authority. A disabled button
+        # is a courtesy; this is the guarantee, and it refuses an API caller just the same.
+        yield refuse(CUT_STALE_PLAN_TEXT, keep_plan=False)
         return
 
     if not _RENDER_LOCK.acquire(blocking=False):
         # Names the real holder, exactly as the three sibling guards do. A refused click performs
         # no work, creates no directory and leaves no state.
-        yield _cut_busy_message()
+        yield refuse(_cut_busy_message())
         return
     _mark_lock_holder(_LOCK_HOLDER_CUTTER)
     job = cutter_export.CutterJob()
@@ -4856,24 +5091,86 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     # the handler below can read it on every terminal path.
     completed: List[Any] = []
     run_directory = ''
+    worker = None
     try:
         run_directory, error = cutter_export.prepare_run_directory(
             output_folder, source.path, timestamp)
         if error:
-            yield f"❌ {error}"
+            yield refuse(f"❌ {error}")
             return
 
         encoder = 'h264_nvenc' if NVENC_AVAILABLE else 'libx264'
-        yield (f"✂️ Cutting {plan.count} clip(s) into:\n{run_directory}\n\n"
-               f"Encoder: {encoder}. Audio: "
-               f"{'removed' if remove_audio else 'kept'}.")
+        header = (f"✂️ Cutting {plan.count} clip(s) into:\n{run_directory}\n\n"
+                  f"Encoder: {encoder}. Audio: "
+                  f"{'removed' if remove_audio else 'kept'}.")
+        yield (header, _cut_progress_html(
+            CUT_PHASE_CUTTING_TITLE, 'Starting…', done=0, total=plan.count,
+            note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+
+        # [FORK] P1: `export_segments` is a BLOCKING call, so running it in this frame is exactly
+        # why the screen used to freeze from the first clip to the last. It now runs on a worker
+        # and reports through a queue, which is what lets this generator keep yielding WHILE
+        # FFmpeg works instead of only after it returns.
+        #
+        # The two callbacks are the existing, documented ones -- `raw_cutter_export` is not
+        # modified. `on_progress` announces the clip that is STARTING (so the detail line is true
+        # during the encode); `on_complete` is what moves the bar, because it is the only signal
+        # that a clip was really published. Both meanings are preserved exactly.
+        events: "queue.Queue" = queue.Queue()
+        outcome: Dict[str, Any] = {}
+
+        def started(index, total, name):
+            events.put(('start', index, total, name))
 
         def finished(result):
-            completed.append(result)
+            completed.append(result)       # the R4 contract: the only reliable evidence on a stop
+            events.put(('done', result))
 
-        results = cutter_export.export_segments(
-            source=source, plan=plan, run_directory=run_directory,
-            remove_audio=bool(remove_audio), encoder=encoder, job=job, on_complete=finished)
+        def run_export():
+            try:
+                outcome['results'] = cutter_export.export_segments(
+                    source=source, plan=plan, run_directory=run_directory,
+                    remove_audio=bool(remove_audio), encoder=encoder, job=job,
+                    on_progress=started, on_complete=finished)
+            except BaseException as exc:   # noqa: BLE001 - re-raised on the generator's thread
+                outcome['error'] = exc
+            finally:
+                events.put(('eof', None))
+
+        worker = threading.Thread(target=run_export, name='raw-cutter-export', daemon=True)
+        worker.start()
+
+        published, current = 0, ''
+        while True:
+            try:
+                event = events.get(timeout=0.4)
+            except queue.Empty:
+                # A heartbeat. The percentage deliberately does NOT move -- nothing finished --
+                # but the panel keeps rendering, so a two-minute clip looks busy rather than hung.
+                yield (header, _cut_progress_html(
+                    CUT_PHASE_CUTTING_TITLE, current or 'Encoding…',
+                    done=published, total=plan.count,
+                    note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+                continue
+            kind = event[0]
+            if kind == 'eof':
+                break
+            if kind == 'start':
+                current = f'Encoding clip {event[1]} of {event[2]}: {event[3]}'
+            else:
+                published = sum(1 for r in completed if r.ok)
+                current = f'Published {os.path.basename(event[1].path)}' if event[1].ok \
+                          else f'Clip failed: {event[1].error}'
+            yield (header, _cut_progress_html(
+                CUT_PHASE_CUTTING_TITLE, current, done=published, total=plan.count,
+                note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+
+        worker.join()
+        if 'error' in outcome:
+            # Re-raised here so the existing, reviewed handlers below keep owning every terminal
+            # path. Nothing about cancellation or failure classification changes.
+            raise outcome['error']
+        results = outcome.get('results', [])
 
         done = [r for r in results if r.ok]
         failed = [r for r in results if not r.ok]
@@ -4894,7 +5191,12 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 lines.append(f"  ... and {len(failed) - 20} more")
         lines.append("")
         lines.append("Your source file was not modified.")
-        yield "\n".join(lines)
+        yield ("\n".join(lines), _cut_progress_html(
+            CUT_CUT_DONE_TITLE,
+            f'{len(done)} of {plan.count} clip(s) written'
+            + (f'; {len(failed)} failed' if failed else '.'),
+            done=len(done), total=plan.count,
+            tone='failed' if failed else 'done')) + idle_plan
 
     except cutter_export.CutterCancelled:
         # `completed` is the truth here, never `results`: the exception propagated out of
@@ -4914,32 +5216,53 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             lines.append(f"{len(failed_before_stop)} clip(s) had already failed before the stop.")
         lines.append("")
         lines.append("Your source file was not modified.")
-        yield "\n".join(lines)
+        yield ("\n".join(lines), _cut_progress_html(
+            CUT_CANCELLED_TEXT.split('.')[0], f'{len(written)} of {plan.count} clip(s) kept.',
+            done=len(written), total=plan.count, tone='stopping')) + idle_plan
     except Exception as exc:
         # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
         import traceback
         traceback.print_exc()
-        yield (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
-               f"Your source file was not modified.")
+        text = (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
+                f"Your source file was not modified.")
+        yield (text, _cut_progress_html(CUT_CUT_FAILED_TITLE,
+                                        f'{type(exc).__name__}: {exc}', tone='failed')) + idle_plan
     finally:
+        # [FORK] P1: the export now lives on a worker, so admission must not be handed back while
+        # that worker is still writing. If this frame unwinds early -- an abandoned Gradio stream
+        # closing the generator under `GeneratorExit` -- the job is cancelled COOPERATIVELY and
+        # reaped before the mutex is released. Releasing first would let a second cut start while
+        # FFmpeg from the first was still running, which is precisely what `_RENDER_LOCK` exists
+        # to prevent. On every ordinary path the worker has already been joined above and this
+        # costs nothing.
+        if worker is not None and worker.is_alive():
+            job.cancel()
+            worker.join()
         _clear_cutter_job()
         _mark_lock_holder('')
         _RENDER_LOCK.release()
 
 
-def _on_cut_cancel() -> str:
-    """Signal the running cut job. Writes only the cutter's own report line.
+def _on_cut_cancel() -> Tuple[str, str]:
+    """Signal the running cut job. Writes the cutter's report line and the progress panel.
 
     Cooperative, exactly like the render Cancel: the flag is observed between segments, so the
     clip currently encoding finishes or is discarded cleanly rather than being torn up mid-write.
     Completed clips are always kept.
+
+    [FORK] Digital-Union (Raw Cutter progress P1): also writes the progress panel, and is careful
+    about the word it uses. Pressing Cancel reports **requested**, never "cancelled" -- the job
+    stops at the next cooperative checkpoint, and the running generator is what announces the real
+    terminal state once the work has actually stopped. Claiming completion here would be the exact
+    lie this panel exists to avoid.
     """
     with _CUTTER_JOB_LOCK:
         job = _cutter_job
     if job is None:
-        return CUT_NOTHING_RUNNING_TEXT
+        return CUT_NOTHING_RUNNING_TEXT, _cut_progress_clear()
     job.cancel()
-    return CUT_CANCEL_REQUESTED_TEXT
+    return CUT_CANCEL_REQUESTED_TEXT, _cut_progress_html(
+        CUT_CANCEL_REQUESTED_TITLE, CUT_CANCEL_REQUESTED_TEXT, tone='stopping')
 
 
 # ============================================================================================
@@ -4998,7 +5321,7 @@ def _on_cut_batch_count(input_folder, recursive) -> str:
 
 
 def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                      max_seconds, remove_audio):
+                      max_seconds, remove_audio, sink=None):
     """Start Batch. A generator, so the current file and phase stay visible for a long job.
 
     Yields `(live_status, final_summary)`. The summary stays empty until the end, so the operator
@@ -5008,8 +5331,16 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     batch creates no directory and holds nothing: the length bounds once for the whole run, then
     the two roots resolved and checked for nesting, then discovery. Only then is admission
     attempted.
+
+    [FORK] Digital-Union (Raw Cutter progress P1): `sink` is an OPTIONAL output-only dict for the
+    presentation wrapper. It defaults to a throwaway, so every existing caller -- including the
+    test harness that exec's this body against a synthesised parent package -- keeps working with
+    the original seven arguments and no new module-level name to resolve. Nothing in the batch's
+    behaviour reads it; it is written, never consulted.
     """
     import raw_cutter_export as cutter_export
+
+    sink = {} if sink is None else sink
 
     try:
         low, high = fork_cutter.normalize_durations(min_seconds, max_seconds)
@@ -5058,6 +5389,22 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     cancelled = False
     finalised = False
 
+    def publish(**extra):
+        """[FORK] Digital-Union (P19-R4, finding F-1): write the sink from RECORDED outcomes.
+
+        The count is `summarise(items, total).attempted` -- the same fold the manifest's own
+        totals use. Two consequences, both deliberate: the bar and the record cannot disagree
+        about how much of the batch is done, and the `not_attempted` backfill is excluded by
+        construction rather than by a second rule that could drift away from the first.
+
+        Called wherever `items` changes AND at finalisation. The previous version wrote the count
+        only from `progress(phase)`, which runs BEFORE each source's `record(...)`, so the final
+        source was missing from every terminal panel and a fully successful batch reported
+        `n - 1` of `n` -- measured at 50 %, 67 % and 80 % for two, three and five sources.
+        """
+        totals = fork_cutter_batch.summarise(items, total)
+        sink.update(finished=totals.attempted, completed=totals.completed, **extra)
+
     def finalise(is_cancelled, fatal=''):
         """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
 
@@ -5079,6 +5426,37 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         """
         nonlocal finalised
         finalised = True
+        # [FORK] P1: record the terminal CLASS structurally, at the one place that already knows
+        # it. The presentation wrapper reads this instead of inspecting the status text -- the
+        # project forbids deriving an outcome class from a status or error string, and rightly:
+        # prose is not a contract, and a reworded message would silently change the UI's verdict.
+        #
+        # [FORK] Digital-Union (P19-R4, finding F-2): the class is now the PURE classifier the
+        # manifest itself uses, so the panel and the record can never disagree, and
+        # `completed_with_failures` -- a class the classifier has always produced -- stops being
+        # flattened into the same green success a clean run gets.
+        #
+        # A run that never obtained an output directory never started, and is published with NO
+        # terminal class at all. That is the structural way to say "there was no terminal state",
+        # and it lands on the same honest "Batch did not run" panel the pre-admission refusal
+        # already uses -- one presentation for both refusal shapes, and no third vocabulary to
+        # keep in step. The old expression could only answer done/cancelled/failed, so the one
+        # early `return` inside the `try` below -- a refused `prepare_batch_directory` -- reached
+        # this net with neither a cancellation nor a fatal error and was published as `done`: a
+        # green "Batch finished" over a run that created nothing.
+        #
+        # Published BEFORE the backfill, and provably equivalent to publishing after it:
+        # `not_attempted` is in neither `_FAILED` nor `attempted`, so appending those rows moves
+        # neither `terminal_status` nor the count. Doing it first means no fault inside the `try`
+        # can leave the operator looking at a stale panel.
+        started = bool(batch_directory)
+        if started:
+            sink['terminal'] = fork_cutter_batch.terminal_status(
+                items, total, is_cancelled, fatal_error=fatal)
+            publish(total=total)
+        else:
+            sink.pop('terminal', None)
+            publish()
         try:
             # Only sources never opened at all become `not_attempted`; anything the loop touched
             # has already recorded itself, including on the fatal path.
@@ -5089,17 +5467,24 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     outcome=fork_cutter_batch.OUTCOME_NOT_ATTEMPTED))
             if not batch_directory:
                 return ''
-            return cutter_export.write_batch_manifest(
+            # [FORK] P19-R4: the write's RESULT is recorded in the sink as well as returned, so
+            # the panel can say that the authoritative record did not reach disk. The summary has
+            # always disclosed it; the panel used to show a run whose manifest was lost with the
+            # same green headline as one whose manifest was saved.
+            sink['manifest_error'] = cutter_export.write_batch_manifest(
                 batch_directory,
                 fork_cutter_batch.manifest_payload(
                     items, total, settings, batch_directory, found.root,
                     started_at.isoformat(timespec='seconds'),
                     datetime.datetime.now().isoformat(timespec='seconds'),
                     time.perf_counter() - clock_started, is_cancelled, fatal_error=fatal))
+            return sink['manifest_error']
         except Exception as exc:                      # noqa: BLE001 - see the docstring
             import traceback
             traceback.print_exc()
-            return f"the batch record could not be built: {type(exc).__name__}: {exc}"
+            sink['manifest_error'] = (
+                f"the batch record could not be built: {type(exc).__name__}: {exc}")
+            return sink['manifest_error']
 
     try:
         batch_directory, error = cutter_export.prepare_batch_directory(
@@ -5122,6 +5507,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
             recorded = False
 
             def progress(phase):
+                # [FORK] Digital-Union (Raw Cutter progress P1): the text is unchanged; the sink
+                # is a side-channel of the SAME facts this line already had in scope, so the
+                # visual bar and the status text can never disagree about where the batch is.
+                #
+                # [FORK] P19-R4 (F-1): this line owns the position, the name and the phase, and
+                # carries only those. The COUNT comes from `publish`, which folds the recorded
+                # outcomes -- deriving it here was the off-by-one, because this callback runs
+                # before the current source has been recorded.
+                publish(position=position, total=total, name=basename, phase=phase)
                 return fork_cutter_batch.progress_text(position, total, basename, phase, items,
                                                 batch_directory)
 
@@ -5131,6 +5525,10 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                     index=position, source_path=source_path, relative_parts=parts,
                     outcome=outcome, seconds=round(time.perf_counter() - file_clock, 3), **extra))
                 recorded = True
+                # [FORK] P19-R4 (F-1): the count moves when an outcome is RECORDED, because that
+                # is the moment a source is genuinely finished -- including the last one, which
+                # has no further `progress(...)` call to carry it.
+                publish()
 
             # [FORK] R2 (F-3): a source the loop has OPENED always leaves a record, even when the
             # fault is one nothing here anticipated. Without this the record was simply never
@@ -5315,20 +5713,84 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         _RENDER_LOCK.release()
 
 
-def _on_cut_batch_cancel() -> str:
+def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
+                         max_seconds, remove_audio):
+    """[FORK] Digital-Union (Raw Cutter progress P1): the batch, with a visible bar and controls.
+
+    A thin presentation wrapper, on purpose. `_on_cut_batch_run` above keeps every reviewed
+    terminal path -- the R2 single finalisation, the manifest, the outcome classification, the
+    cancellation and abandoned-stream handling -- with its original name, signature and body, so
+    the assertions that guard those invariants keep guarding exactly the same code. This function
+    adds nothing but the progress panel and the three button states.
+
+    The bar counts **sources whose outcome has been recorded** (`items`), never sources started,
+    so it cannot run ahead of what the manifest will say.
+    """
+    sink: Dict[str, Any] = {}
+    busy = _cut_batch_buttons(count=False, start=False, cancel=True)
+    idle = _cut_batch_buttons(count=True, start=True, cancel=False)
+
+    status, summary = '', ''
+    for status, summary in _on_cut_batch_run(
+            input_folder, recursive, output_folder, sensitivity, min_seconds,
+            max_seconds, remove_audio, sink=sink):
+        total = sink.get('total')
+        detail = (f"Source {sink.get('position')} of {total}: "
+                  f"{sink.get('name', '')} — {sink.get('phase', '')}") if total else ''
+        yield (status, summary,
+               _cut_progress_html(CUT_BATCH_RUNNING_TITLE, detail,
+                                  done=sink.get('finished'), total=total,
+                                  note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+
+    # One final frame: the controls come back and the panel states the terminal outcome.
+    #
+    # The class comes from `sink['terminal']`, which the batch's single finalisation helper set
+    # structurally. It is NOT inferred from the status text: this project forbids deriving an
+    # outcome class from a status or error string.
+    #
+    # [FORK] Digital-Union (P19-R4): the four values are now the batch module's own
+    # `TERMINAL_*` vocabulary, so this table is a rendering of the pure classifier rather than a
+    # parallel one that can drift from it. `completed_with_failures` gets its own qualified
+    # headline and a non-green tone -- the single-video cut already uses the `failed` tone when
+    # some clips failed, and a batch with a failed source is the same statement about the run.
+    #
+    # The neutral default covers BOTH refusal shapes: a batch refused before admission never
+    # reaches finalisation at all, and one refused before it got an output directory is
+    # deliberately published with no terminal class. Neither ran, so neither gets a verdict.
+    tone, title = {
+        fork_cutter_batch.TERMINAL_FAILED: ('failed', CUT_BATCH_FAILED_TITLE),
+        fork_cutter_batch.TERMINAL_CANCELLED: ('stopping', CUT_BATCH_CANCELLED_TITLE),
+        fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: ('failed', CUT_BATCH_PARTIAL_TITLE),
+        fork_cutter_batch.TERMINAL_COMPLETED: ('done', CUT_BATCH_DONE_TITLE),
+    }.get(sink.get('terminal'), ('stopping', CUT_BATCH_NOT_RUN_TITLE))
+    # A run whose every source succeeded but whose authoritative record never reached disk is not
+    # a clean success. The summary has always said so; the panel now agrees with it.
+    if sink.get('manifest_error') and tone == 'done':
+        tone, title = 'failed', CUT_BATCH_RECORD_LOST_TITLE
+    yield (status, summary,
+           _cut_progress_html(title, '', done=sink.get('finished'),
+                              total=sink.get('total'), tone=tone)) + idle
+
+
+def _on_cut_batch_cancel() -> Tuple[str, str]:
     """Signal the running batch. Writes only the batch status line.
 
     The same cooperative flag and the same one-slot job reference the single-video Cancel uses --
     only one cutter job can exist at a time, because admission is the one shared mutex. Observed at
     two safe boundaries: between source videos, and between clips inside the current source. No
     child is killed, nothing already written is removed, and no output folder is deleted.
+
+    [FORK] Digital-Union (Raw Cutter progress P1): also writes the progress panel, and like the
+    single-video Cancel it reports **requested**, never "cancelled". The running batch generator
+    announces the real terminal state once the work has actually stopped.
     """
     with _CUTTER_JOB_LOCK:
         job = _cutter_job
     if job is None:
-        return CUT_BATCH_NOTHING_RUNNING_TEXT
+        return CUT_BATCH_NOTHING_RUNNING_TEXT, _cut_progress_clear()
     job.cancel()
-    return CUT_BATCH_CANCEL_REQUESTED_TEXT
+    return CUT_BATCH_CANCEL_REQUESTED_TEXT, _cut_progress_html(
+        CUT_CANCEL_REQUESTED_TITLE, CUT_BATCH_CANCEL_REQUESTED_TEXT, tone='stopping')
 
 
 def _on_sample_invalidate(request: gr.Request = None) -> str:
@@ -5417,7 +5879,8 @@ def create_ui() -> gr.Blocks:
         cuda_status = "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
-    app = gr.Blocks(title='BeatSync Engine', theme='ocean', css=STATUS_BOX_CSS)
+    app = gr.Blocks(title='BeatSync Engine', theme='ocean',
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -6169,11 +6632,18 @@ def create_ui() -> gr.Blocks:
                                 cut_analyze_btn = gr.Button(
                                     LABEL_CUT_ANALYZE, variant='secondary',
                                     elem_id='cut-analyze-button')
+                                # [FORK] P1: starts UNAVAILABLE. There is no plan at load, so an
+                                # enabled Cut Video would only ever earn the "press Analyze first"
+                                # refusal. The server-side plan check is unchanged and still the
+                                # authority -- this just stops the pointless click.
                                 cut_run_btn = gr.Button(
-                                    LABEL_CUT_RUN, variant='primary',
+                                    LABEL_CUT_RUN, variant='primary', interactive=False,
                                     elem_id='cut-run-button')
+                            # [FORK] P1: starts INACTIVE. A permanently red emergency control that
+                            # does nothing teaches an operator to distrust it; it lights up only
+                            # while a job it can really stop is running.
                             cut_cancel_btn = gr.Button(
-                                LABEL_CUT_CANCEL, variant='stop', size='sm',
+                                LABEL_CUT_CANCEL, variant='stop', size='sm', interactive=False,
                                 elem_id='cut-cancel-button')
                             gr.Markdown(INFO_CUT_ACTIONS)
                         with gr.Column(visible=False) as cut_batch_actions:
@@ -6182,10 +6652,16 @@ def create_ui() -> gr.Blocks:
                                 elem_id='cut-batch-start-button')
                             cut_batch_cancel_btn = gr.Button(
                                 LABEL_CUT_BATCH_CANCEL, variant='stop', size='sm',
+                                interactive=False,
                                 elem_id='cut-batch-cancel-button')
                             gr.Markdown(INFO_CUT_BATCH_ACTIONS)
                     with gr.Column(scale=3):
                         with gr.Column(visible=True) as cut_single_readouts:
+                            # [FORK] Digital-Union (Raw Cutter progress P1): FIRST in the column,
+                            # because it is the thing an operator looks at while waiting. Empty at
+                            # idle so it never claims work that is not happening.
+                            cut_progress = gr.HTML(
+                                value='', elem_id='cut-progress', label=LABEL_CUT_PROGRESS)
                             cut_summary = gr.Textbox(
                                 label=LABEL_CUT_PLAN_SUMMARY,
                                 value='',
@@ -6212,6 +6688,8 @@ def create_ui() -> gr.Blocks:
                                 elem_id='cut-run-report',
                             )
                         with gr.Column(visible=False) as cut_batch_readouts:
+                            cut_batch_progress = gr.HTML(
+                                value='', elem_id='cut-batch-progress', label=LABEL_CUT_PROGRESS)
                             cut_batch_status = gr.Textbox(
                                 label=LABEL_CUT_BATCH_STATUS,
                                 value='',
@@ -6514,26 +6992,47 @@ def create_ui() -> gr.Blocks:
         #
         # Cancel gets its own lane for the same reason the render Cancel does: queuing a stop
         # behind the job it is meant to stop makes it useless.
+        #
+        # [FORK] Digital-Union (Raw Cutter progress P1): each of the three now also writes the
+        # progress panel and the three button states, so there is exactly ONE writer of the
+        # cutter's control surface per event and the states cannot be left inconsistent by a
+        # handler that forgot one of them.
         cut_analyze_btn.click(
             fn=_on_cut_analyze,
             inputs=[cut_source, cut_sensitivity, cut_min_seconds, cut_max_seconds],
-            outputs=[cut_summary, cut_table, cut_plan_state, cut_source_info],
+            outputs=[cut_summary, cut_table, cut_plan_state, cut_source_info, cut_progress,
+                     cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
         )
         cut_run_btn.click(
             fn=_on_cut_run,
             inputs=[cut_plan_state, cut_source, cut_output, cut_sensitivity,
                     cut_min_seconds, cut_max_seconds, cut_remove_audio],
-            outputs=[cut_report],
+            outputs=[cut_report, cut_progress,
+                     cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
         )
         cut_cancel_btn.click(
             fn=_on_cut_cancel,
             inputs=[],
-            outputs=[cut_report],
+            outputs=[cut_report, cut_progress],
             concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
             concurrency_limit=None,
         )
+
+        # [FORK] P1: a planning setting moved, so the plan on screen is no longer about this
+        # source. Cut Video goes unavailable and says why. Presentation only -- `_on_cut_run`
+        # still recomputes `plan_signature` and still refuses a stale plan by itself, which is
+        # what protects an API caller and a second browser tab that never fired these events.
+        # Nothing is queued here and the plan state is deliberately NOT cleared, so reverting the
+        # setting and pressing Analyze again is cheap.
+        for _planning_input in (cut_source, cut_sensitivity, cut_min_seconds, cut_max_seconds):
+            _planning_input.change(
+                fn=_on_cut_planning_input_change,
+                inputs=[],
+                outputs=[cut_run_btn, cut_progress],
+                concurrency_limit=None,
+            )
 
         # [FORK] Digital-Union (Raw Cutter Batch V1): four more registrations, and the same
         # isolation story. The mode switch writes four visibilities. Count files writes one
@@ -6566,16 +7065,17 @@ def create_ui() -> gr.Blocks:
             concurrency_limit=None,
         )
         cut_batch_start_btn.click(
-            fn=_on_cut_batch_run,
+            fn=_on_cut_batch_run_ui,
             inputs=[cut_batch_folder, cut_batch_recursive, cut_output, cut_sensitivity,
                     cut_min_seconds, cut_max_seconds, cut_remove_audio],
-            outputs=[cut_batch_status, cut_batch_summary],
+            outputs=[cut_batch_status, cut_batch_summary, cut_batch_progress,
+                     cut_batch_count_btn, cut_batch_start_btn, cut_batch_cancel_btn],
             concurrency_limit=None,
         )
         cut_batch_cancel_btn.click(
             fn=_on_cut_batch_cancel,
             inputs=[],
-            outputs=[cut_batch_status],
+            outputs=[cut_batch_status, cut_batch_progress],
             concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
             concurrency_limit=None,
         )

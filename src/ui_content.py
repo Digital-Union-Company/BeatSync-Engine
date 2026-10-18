@@ -811,6 +811,60 @@ CUT_BATCH_CANCEL_REQUESTED_TEXT = (
 CUT_BATCH_DONE_STATUS = "Batch finished. See the summary below."
 CUT_BATCH_CANCELLED_STATUS = "Batch cancelled. Finished clips were kept — see the summary below."
 
+# [FORK] Digital-Union (Raw Cutter progress P1): the live progress panel.
+#
+# Every string here describes work that is ACTUALLY happening or a count that was ACTUALLY
+# recorded. There is deliberately no ETA and no synthetic percentage: the only determinate
+# fraction the Raw Cutter can honestly report is published clips over planned clips, because that
+# is the only quantity it measures. Scene detection is one opaque FFmpeg pass, so it is shown as a
+# named phase with an indeterminate bar rather than a number that would be invented.
+LABEL_CUT_PROGRESS = "Live progress"
+
+CUT_PHASE_PROBE_TEXT = "Reading the source file…"
+CUT_PHASE_DETECT_TEXT = "Detecting scene changes…"
+CUT_PHASE_PLAN_TEXT = "Planning the shots…"
+CUT_PHASE_ANALYZING_TITLE = "Analyzing"
+CUT_PHASE_CUTTING_TITLE = "Cutting"
+CUT_PHASE_STOPPING_TITLE = "Stopping"
+
+#: Shown while an indeterminate phase runs, so an operator can tell "slow" from "stuck".
+CUT_PROGRESS_INDETERMINATE_NOTE = "No percentage is shown because this step cannot be measured."
+
+#: Shown while a single clip is encoding and the published count has not moved yet.
+CUT_PROGRESS_ENCODING_NOTE = (
+    "A long clip can hold the percentage still — the bar only moves when a clip is actually "
+    "finished and written."
+)
+
+CUT_ANALYZE_DONE_NO_WORK_TEXT = (
+    "Analysis finished, but this plan exports nothing, so Cut Video stays unavailable."
+)
+CUT_ANALYZE_FAILED_TITLE = "Analysis failed"
+CUT_PLAN_STALE_TITLE = "Plan needs refreshing"
+CUT_CUT_DONE_TITLE = "Cutting finished"
+CUT_CUT_FAILED_TITLE = "Cutting failed"
+CUT_CUT_REFUSED_TITLE = "Nothing was cut"
+CUT_CANCEL_REQUESTED_TITLE = "Cancellation requested"
+CUT_BATCH_RUNNING_TITLE = "Batch running"
+CUT_BATCH_DONE_TITLE = "Batch finished"
+CUT_BATCH_FAILED_TITLE = "Batch stopped"
+CUT_BATCH_CANCELLED_TITLE = "Batch cancelled"
+#: [FORK] Digital-Union (P19-R4): the batch ran to the end of its list, but some sources failed.
+#: `raw_cutter_batch.terminal_status` has always distinguished this from a clean run; the panel
+#: used to flatten both into the same green "Batch finished", which is the one reading an operator
+#: must not be given — the per-source failures are in the summary and the manifest either way.
+CUT_BATCH_PARTIAL_TITLE = "Batch finished with failures"
+#: [FORK] Digital-Union (P19-R4): every source succeeded, but the machine-readable record did not
+#: reach disk, so the run cannot be audited afterwards. The clips are real; the evidence is not.
+CUT_BATCH_RECORD_LOST_TITLE = "Batch finished — record NOT saved"
+#: A batch that was refused before it ever reached finalisation has no terminal class, and the
+#: panel says exactly that rather than inventing one.
+CUT_BATCH_NOT_RUN_TITLE = "Batch did not run"
+CUT_SETTINGS_CHANGED_TEXT = (
+    "A planning setting changed, so the previous plan no longer describes this source. "
+    "Press Analyze / Preview again before cutting."
+)
+
 INFO_TAB_CREATIVE_STUDIO = (
     "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
     "alone is exactly the render Quick Render describes. The Creative Preset lives on Quick "

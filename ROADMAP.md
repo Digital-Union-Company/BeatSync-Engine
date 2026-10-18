@@ -48,6 +48,15 @@ afterwards if needed.
 A **Review Assistant Cutter** — any workflow requiring per-cut manual confirmation — was considered
 and **rejected by the product owner**. Do not reintroduce one.
 
+**R5's Clips Preview Selector is not that, and the distinction is load-bearing.** It reviews clips
+**after** the Raw Cutter has already produced them, in its own tab, as a separate pass the operator
+chooses to run. Cutting itself stays uninterrupted and uninteractive. A design that put clip
+approval *inside* the cut loop would be the rejected idea wearing a new name.
+
+With batch processing now shipped and deployed (R4-A), the active work has moved to **making a long
+run legible while it happens** (R4-B), **naming its output** (R4-C), and **triaging the result**
+(R5). The ordering is in the status summary at the end of this document.
+
 ---
 
 ### R1 — Raw Cutter V1 · **DONE (merged in PR #68)**
@@ -245,7 +254,7 @@ modified.
 Promoted from "worth doing when Playtest feedback justifies it" by the product-owner decision above.
 Batch processing is the active piece; the rest of R4 stays unscheduled.
 
-#### R4-A — Automatic folder batch mode · **IN REVIEW — open pull request, NOT merged**
+#### R4-A — Automatic folder batch mode · **DONE — merged in PR #69, deployed to production**
 
 A second input mode inside the existing ✂️ Raw Cutter tab — not a fifth tab — that processes a whole
 folder with one press and no per-file preview or confirmation.
@@ -272,10 +281,59 @@ folder with one press and no per-file preview or confirmation.
 - **One mutex acquisition for the whole batch**, sharing the existing process-global render lock, so
   a batch and a music-video render can never run at once.
 
+#### R4-B — Live progress and active controls · **IN REVIEW — open draft PR, NOT merged, NOT deployed**
+
+A truthful progress surface for both Raw Cutter modes. Implemented and validated on a feature
+branch and published as **draft pull request #71**; it has **not been merged, and production does
+not have it.**
+
+- **Analyze** names each real phase — reading the source, detecting scene changes, planning — before
+  the blocking call it describes, with an **indeterminate** bar. One FFmpeg scene pass reports
+  nothing measurable, so no percentage is shown rather than one being invented.
+- **Cut Video** shows a determinate bar that advances **only when a clip is actually published**,
+  with `done / total` counts and the name of the clip currently encoding. A long clip holds the
+  percentage still and says so.
+- **There is no ETA, and none is derivable** — segment lengths vary and the encoder is not linear in
+  wall-clock.
+- **Cancel** is inactive at idle, red and live only while a job it can really stop is running, and
+  reports *cancellation requested* rather than claiming completion.
+- **Folder Batch** gets the equivalent surface: source *N of M*, the current phase, and a bar that
+  counts sources whose outcome has been recorded.
+- Button states are a courtesy only: `plan_signature` and the shared render mutex remain the sole
+  authorities and still refuse a caller that never saw the UI.
+
+Measured locally: full suite **6 924 passed, 8 skipped, 0 failed**; a real-browser run observed the
+bar advancing 0 → 11 → 22 → 33 → 44 → 56 → 67 → 78 → 89 → 100 % with counters 0/9 → 9/9 and each
+clip named as it encoded.
+
+#### R4-C — Synthetic output naming · **PLANNED, NOT IMPLEMENTED — high priority**
+
+An **opt-in** checkbox, **Rename output clips**, default **OFF**. With it off, naming is exactly
+what it is today — this adds a mode, it does not change one.
+
+With it on, exported clips get synthetic, source-independent names:
+
+```
+File001_18102026_001.mp4
+File002_18102026_002.mp4
+File003_18102026_003.mp4
+```
+
+- The date is the **local job-start date**, `DDMMYYYY`, fixed once per run so a batch crossing
+  midnight does not change naming halfway through.
+- Counters are **deterministic within a run and unique across its whole discovered source set** —
+  the file counter identifies the source, the trailing counter the clip within it.
+- **No exported name and no automatically created output subfolder may leak the original basename**
+  while this mode is on. That is the point of the feature, and it includes the per-source folders
+  Folder Batch creates today.
+- **Provenance is retained but kept separate**: the batch manifest keeps the real mapping for audit,
+  and the exported filenames do not.
+- Applies to **both** Single Video and Folder Batch.
+- No-overwrite publication, atomic staging, source preservation and manifest completeness are
+  unchanged and remain mandatory.
+
 #### Remaining R4 ideas · **PLANNED, NOT IMPLEMENTED**
 
-- **Real per-clip progress updates** during a single-video cut run. Batch mode reports per file and
-  per phase; inside one clip there is still no progress.
 - **Cancellation during an active FFmpeg segment**, rather than only between clips.
 - **A native local file/folder picker**, without copying large videos into Gradio's upload folder.
 - **Optional fast stream-copy mode**, with measured keyframe-drift reporting — only worth shipping
@@ -283,15 +341,56 @@ folder with one press and no per-file preview or confirmation.
 
 ---
 
+### R5 — Clips Preview Selector · **PLANNED, NOT IMPLEMENTED — next high-priority workflow**
+
+A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
+post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
+Folder Batch exists precisely so that cutting needs no interaction.
+
+- A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
+- **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to
+  PENDING and a keyboard-accessible alternative for every action.
+- **Hover plays muted inline**, leaving pauses, with optional bounded wheel scrubbing.
+- **Confirm stays disabled until every clip in the batch is decided.** Selected clips move to a
+  Media Library folder, rejected ones to a **quarantine** folder — rejection is *not* deletion, and
+  V1 has no expiry and no permanent delete.
+- Colour is never the decision record: server-side clip IDs and durable per-file outcomes are.
+- Transfers are verified — atomic no-replace moves on one volume, staged verified copies across
+  volumes — with per-file intent recorded so a partial failure is recoverable rather than silent.
+
+Full specification: [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md).
+
+**The 100-clip page size is a product target, not a measured performance claim.** It needs
+benchmarking at 25 / 50 / 100 items in the pinned Windows + Gradio environment before anyone
+promises it.
+
+---
+
 ## Status summary
+
+Three different things are distinguished deliberately below, because conflating them is how a
+roadmap starts lying: **deployed** (running in production), **merged** (on `main`, not necessarily
+deployed), and **local candidate** (exists on a branch, validated, but neither merged nor shipped).
 
 | Item | Status |
 |---|---|
-| **R1** — Raw Cutter V1, mechanical quality-first selection | **DONE** — merged in PR #68 |
-| **R4-A** — Automatic folder batch mode | **IN REVIEW** — open pull request, not merged, not released |
+| **R1** — Raw Cutter V1, mechanical quality-first selection | **DONE** — merged in PR #68, **deployed** |
+| **R4-A** — Automatic folder batch mode | **DONE** — merged in PR #69, **deployed** |
+| **Scene guards + VFR-safe exports** — conservative 0.20 s guard at detected cuts, `-fps_mode:v passthrough -enc_time_base:v demux` | **DONE** — merged in PR #70, **deployed** |
+| **R4-B** — Live progress and active controls | **IN REVIEW** — open **draft PR #71**; not merged, not deployed |
+| **R4-C** — Synthetic output naming (opt-in, default off) | **PLANNED** — specified here, not implemented |
+| **R5** — Clips Preview Selector (post-cut triage tab) | **PLANNED** — specified in `docs/claude/clips-preview-selector-v1.md`, not implemented |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
-| **R3** — AI Director Cutter (Qwen-guided selection) | **PLANNED** for future consideration — no Qwen in the Raw Cutter today |
+| **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
+
+### Current priority order (product-owner decision)
+
+1. **Finish R4-B** live progress and get it reviewed.
+2. **R4-C** synthetic output naming.
+3. **R5** Clips Preview Selector — the interactive gallery first, safe file movement second.
+4. **R3 / Smart Passages** only once the post-cut review workflow exists. It stays opt-in, and it
+   must not be mixed with Stage-5 cache identity or the existing Qwen worker.
 
 ---
 
@@ -301,5 +400,6 @@ folder with one press and no per-file preview or confirmation.
 |---|---|
 | [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) | What changed and when — the AGPL-3.0 §5(a) modification record |
 | [`docs/claude/raw-cutter-edge-cleaner.md`](docs/claude/raw-cutter-edge-cleaner.md) | The R2 feasibility measurement, and why the obvious signal does not work |
+| [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md) | The R5 Clips Preview Selector specification — gallery, classification and safe file movement |
 | [`docs/claude/README.md`](docs/claude/README.md) | Map of the engineering rules and reference material |
 | [`README.md`](README.md) | What the application is and how to run it |
