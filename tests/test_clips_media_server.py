@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 
 import pytest
 
@@ -600,6 +601,113 @@ def test_an_unverifiable_journal_tail_returns_503_and_records_nothing(world, mon
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"},
                            body=b'{"to":"SELECTED","rev":0}')
+    assert status == 200 and json.loads(body)["rev"] == 1
+
+
+#: [R5-P7 / N6] The Windows codes CPython maps onto `FileNotFoundError`. Five of them mean "the
+#: pathname did not resolve", not "the file is absent", and the R5-P5 carve-out read all six as
+#: proof of a terminated tail -- so this endpoint answered **200** for a decision that recovered
+#: as PENDING. The store-level matrix lives in `test_clips_review.py`; this is the boundary.
+_FILE_NOT_FOUND_WINERRORS = (2, 3, 15, 53, 67, 161)
+
+
+def _decide_once(world, revision=0):
+    return call(world["app"], decide_url(world), method="POST",
+                headers={"Content-Type": "application/json"},
+                body=b'{"to":"SELECTED","rev":%d}' % revision)
+
+
+def _mentions(haystack, needle):
+    """Backslash-insensitive containment, for proving a path is NOT in a response body.
+
+    `str(OSError)` reprs `filename`/`filename2`, doubling every backslash, and JSON encoding
+    doubles them again -- so the obvious `path in text` test passes against a body that really
+    does carry the path. Stripping the separators is immune to the layers of escaping.
+    """
+    return needle.replace("\\", "").replace("/", "") in \
+        haystack.replace("\\", "").replace("/", "")
+
+
+def _no_paths_in(body, world, journal):
+    """Nothing in a 503 body may name the journal, the state directory or any source media."""
+    text = body.decode("utf-8", "replace")
+    assert not _mentions(text, journal), f"the journal path reached the client: {text}"
+    assert not _mentions(text, os.path.dirname(journal))
+    assert "review-journal" not in text and ".jsonl" not in text
+    assert not _mentions(text, world["review"]) and not _mentions(text, world["secret"])
+    assert ".mp4" not in text
+    assert SENTINEL_TEXT not in body
+    return text
+
+
+@pytest.mark.parametrize("winerror", _FILE_NOT_FOUND_WINERRORS)
+def test_a_file_not_found_journal_tail_returns_503_not_200(world, monkeypatch, winerror):
+    """[R5-P7 / N6] Each code, through the shipped middleware, with a genuinely damaged tail.
+
+    The injection delegates by path for the same reason as the test above: patching
+    `os.path.getsize` for everything makes the descriptor-identity probe fail first and the
+    handler refuses 409 before the journal is reached, which would make this pass vacuously.
+    """
+    store = world["store"]
+    journal = store.journal_path
+    with open(journal, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+    with open(journal, "rb") as handle:
+        before = handle.read()
+    assert not before.endswith(b"\n"), "the tail really is unterminated"
+
+    real_getsize = os.path.getsize
+    target = os.path.normcase(os.path.abspath(journal))
+
+    def blind(path):
+        if os.path.normcase(os.path.abspath(path)) == target:
+            raise OSError(0, "simulated path-resolution failure", None, winerror)
+        return real_getsize(path)
+
+    monkeypatch.setattr(cr.os.path, "getsize", blind)
+    status, _, body = _decide_once(world)
+    monkeypatch.undo()
+
+    assert status == 503, f"winerror {winerror} answered {status}, never 200"
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "errno" in payload["detail"], "the condition stays diagnosable"
+    _no_paths_in(body, world, journal)
+
+    with open(journal, "rb") as handle:
+        assert handle.read() == before, "a refused decision appends nothing"
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    assert store.get(identity) == (cr.PENDING, 0), "no revision moved"
+    assert store.journal_tails_repaired == 0
+
+    # The refusal consumed nothing, so the operator's original expected revision still applies.
+    status, _, body = _decide_once(world)
+    assert status == 200 and json.loads(body)["rev"] == 1
+
+
+def test_the_503_body_never_discloses_the_journal_path_when_it_cannot_be_opened(world):
+    """[R5-P7] The pre-existing disclosure R5-P6 confirmed, pinned at the boundary it reaches.
+
+    No fault injection: a read-only ACL on the journal is enough to make `os.open` fail with the
+    filename attached, which is how the absolute path used to land in this body. An ACL change or
+    a backup tool can do exactly this, so the condition is ordinary rather than contrived.
+    """
+    journal = world["store"].journal_path
+    os.chmod(journal, stat.S_IREAD)
+    try:
+        status, _, body = _decide_once(world)
+    finally:
+        os.chmod(journal, stat.S_IREAD | stat.S_IWRITE)
+
+    assert status == 503
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    text = _no_paths_in(body, world, journal)
+    assert "Permission denied" not in text, "no raw OSError text"
+    assert "errno 13" in text, "the condition stays diagnosable"
+
+    # Writable again: the same decision is accepted, so the refusal left nothing wedged.
+    status, _, body = _decide_once(world)
     assert status == 200 and json.loads(body)["rev"] == 1
 
 

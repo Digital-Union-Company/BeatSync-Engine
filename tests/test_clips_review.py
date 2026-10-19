@@ -1459,7 +1459,9 @@ def test_the_refusal_message_does_not_disclose_the_journal_path(tmp_path, monkey
         store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
     monkeypatch.undo()
     message = str(failure.value)
-    assert store.journal_path not in message
+    # [R5-P7] `_mentions` rather than `in`: `str(OSError)` reprs its filenames, so a literal
+    # substring test passes against a message that really is disclosing the path.
+    assert not _mentions(message, store.journal_path)
     assert "review-journal" not in message and ".jsonl" not in message
     assert os.path.basename(directory) not in message
     assert "errno 5" in message, "the condition stays diagnosable without the path"
@@ -1550,6 +1552,296 @@ def test_an_unverifiable_tail_also_refuses_begin_scan_rather_than_half_recording
     monkeypatch.undo()
     assert _journal_bytes(store.journal_path) == before
     assert store.current_scan("owner-a") == "scan-1", "the scan pointer did not move"
+
+
+# ---- N6: `FileNotFoundError` is not proof that the journal is empty -------------------------
+#
+# R5-P5 carved `FileNotFoundError` out of the refusal above and justified it with "`_append`
+# opens with O_CREAT before calling this, so the production path never sees it". The independent
+# R5-P6 review measured both halves of that and both were wrong:
+#
+#   * `FileNotFoundError` is the class CPython maps SIX Windows codes onto, and five of them say
+#     "the pathname did not resolve", not "the file is not there". A share that stopped answering
+#     or a volume that went away raises them while the journal is still on disk with a torn tail,
+#     so the carve-out reinstated the original false success for every one of them -- through all
+#     three of the probe's I/O steps, not just the size check.
+#   * The one code it was designed for, ERROR_FILE_NOT_FOUND, is the one that cannot occur there:
+#     with the append descriptor open Windows refuses to unlink or rename the file at all, and if
+#     the name had already gone, O_CREAT would recreate it and `getsize` would answer 0 honestly.
+#
+# So the carve-out is conditioned on the open descriptor, and these tests pin that. `os.path.
+# exists`/`lexists` are deliberately NOT the discriminator: they answer "no" for an unresolvable
+# path just as readily, which is the confusion being removed.
+
+#: Asserted by construction in `_winerror`, so this table cannot drift from the interpreter.
+_FILE_NOT_FOUND_WINERRORS = (
+    (2, "ERROR_FILE_NOT_FOUND"),
+    (3, "ERROR_PATH_NOT_FOUND"),
+    (15, "ERROR_INVALID_DRIVE"),
+    (53, "ERROR_BAD_NETPATH"),
+    (67, "ERROR_BAD_NET_NAME"),
+    (161, "ERROR_BAD_PATHNAME"),
+)
+
+
+def _winerror(code, name):
+    """An `OSError` carrying a Windows native code, classified as the interpreter classifies it."""
+    failure = OSError(0, f"simulated {name}", None, code)
+    assert isinstance(failure, FileNotFoundError), (
+        f"winerror {code} ({name}) is expected to map to FileNotFoundError; if the interpreter "
+        f"stops doing that, this table -- not the implementation -- is what needs revisiting")
+    return failure
+
+
+def _blind_tail(monkeypatch, journal, step, failure):
+    """Fail exactly one of the tail probe's three I/O steps, for exactly one file.
+
+    Narrow by DELEGATION, not by scope. `cr.os.path` **is** `os.path`, so patching `getsize`
+    through it is a process-global patch; what keeps everything else working is that each
+    replacement delegates for any path that is not this test's own disposable journal. Without
+    that, the descriptor-identity probe fails first and the endpoint refuses with 409 before the
+    journal is ever reached -- the trap already recorded in `test_clips_media_server.py`.
+    """
+    real_getsize = os.path.getsize
+    real_open = open
+
+    class _Blinded:
+        """A reader whose `read` fails; `seek` still works, so the failure is in the last step."""
+
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._handle.close()
+            return False
+
+        def seek(self, *args, **kwargs):
+            return self._handle.seek(*args, **kwargs)
+
+        def read(self, *args, **kwargs):
+            raise failure
+
+    def getsize(path):
+        if step == "size" and _same_file(path, journal):
+            raise failure
+        return real_getsize(path)
+
+    def opener(file, *args, **kwargs):
+        if _same_file(file, journal):
+            if step == "open":
+                raise failure
+            if step == "read":
+                return _Blinded(real_open(file, *args, **kwargs))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os.path, "getsize", getsize)
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+
+
+@pytest.mark.parametrize("step", ["size", "open", "read"])
+@pytest.mark.parametrize("code,name", _FILE_NOT_FOUND_WINERRORS)
+def test_a_file_not_found_during_tail_inspection_refuses_the_decision(tmp_path, monkeypatch,
+                                                                      step, code, name):
+    """N6. Every `FileNotFoundError`-classified code, in every I/O step, must fail closed.
+
+    Against the original implementation each of these eighteen cases returned ('REJECTED', 1),
+    merged ~112 bytes into the damaged line and recovered as PENDING after a restart.
+    """
+    directory, store = _store_with_a_committed_record(tmp_path)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+    before = _journal_bytes(store.journal_path)
+    assert not before.endswith(b"\n"), "the tail really is unterminated"
+
+    _blind_tail(monkeypatch, store.journal_path, step, _winerror(code, name))
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert "could not verify the review journal tail" in str(failure.value)
+    assert _journal_bytes(store.journal_path) == before, "not one byte may be appended"
+    assert store.journal_tails_repaired == 0, "no repair against an unverifiable file"
+    assert store.get("later") == (cr.PENDING, 0), "no in-memory decision or revision"
+
+    reloaded = cr.ReviewStore(directory)
+    assert reloaded.get("later") == (cr.PENDING, 0), "nothing reported, nothing recovered"
+    assert reloaded.get("committed") == (cr.SELECTED, 1), "committed records are preserved"
+    assert reloaded.get("torn") == (cr.PENDING, 0), "the torn record never claimed success"
+
+
+def test_the_open_append_descriptor_is_what_forbids_the_missing_journal_answer(tmp_path,
+                                                                              monkeypatch):
+    """The discriminator is the descriptor, not the error class and not an existence check.
+
+    Same store, same absent journal, same `FileNotFoundError`: without a handle it is a definite
+    answer, with one it is a refusal. This is the whole of the N6 fix, stated once.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    assert not os.path.exists(store.journal_path)
+
+    assert store._journal_tail_is_terminated() is True, (        # noqa: SLF001 - white box
+        "a direct read-only probe on an absent journal has no tail to terminate")
+
+    handle = os.open(str(tmp_path / "stand-in"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(cr.PersistenceError) as failure:
+            store._journal_tail_is_terminated(handle)           # noqa: SLF001 - white box
+    finally:
+        os.close(handle)
+    assert "could not verify the review journal tail" in str(failure.value)
+
+
+def test_a_healthy_retry_after_a_file_not_found_refusal_keeps_the_original_revision(tmp_path,
+                                                                                    monkeypatch):
+    """Failing closed must not wedge the store or consume the operator's expected revision."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+
+    _blind_tail(monkeypatch, store.journal_path, "size", _winerror(53, "ERROR_BAD_NETPATH"))
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0) == (cr.REJECTED, 1), (
+        "the refused attempt advanced no revision, so 0 is still the expected one")
+    assert store.journal_tails_repaired == 1, "the genuine damage is repaired by the retry"
+
+    reloaded = cr.ReviewStore(directory)
+    assert reloaded.get("later") == (cr.REJECTED, 1), "a reported success must be recoverable"
+    assert reloaded.get("committed") == (cr.SELECTED, 1)
+    assert reloaded.corrupt_records_discarded == 1, "exactly one line was damaged"
+
+
+# ---- The 503 body carries numbers, never a filesystem path ----------------------------------
+#
+# Independently confirmed by R5-P6 and pre-existing: `_append`'s open-failure message
+# interpolated `{exc}`, and `str(OSError)` appends `filename` (and `filename2`) whenever the
+# failing call was made by pathname -- so an authorized operator's decision request could receive
+# the journal's absolute path in the 503 body. Reproduced there with no fault injection at all,
+# via a read-only ACL and via another process holding the file with no sharing.
+
+def _path_bearing(errno_, winerror, journal):
+    """An `OSError` shaped the way a real pathname call raises one: filenames attached."""
+    return OSError(errno_, "simulated failure", journal, winerror, journal + ".second")
+
+
+def _mentions(haystack, needle):
+    """Backslash-insensitive containment, for proving a path is NOT being disclosed.
+
+    `str(OSError)` runs `repr()` over `filename` and `filename2`, which doubles every backslash,
+    and a JSON body doubles them again. So the obvious `path in message` test passes against a
+    message that really does carry the path -- measured, and it is why this helper exists rather
+    than a plain `in`. Comparing with the separators stripped is immune to however many layers of
+    escaping sit in between.
+    """
+    return needle.replace("\\", "").replace("/", "") in \
+        haystack.replace("\\", "").replace("/", "")
+
+
+def test_the_io_detail_helper_reports_numbers_and_never_the_exception_text():
+    """The single formatter every client-visible persistence message goes through."""
+    journal = r"C:\app\state\clips-review\review-journal.jsonl"
+    detail = cr._io_detail(_path_bearing(13, 5, journal))       # noqa: SLF001 - white box
+    assert detail == "errno 13, winerror 5"
+    assert not _mentions(detail, journal)
+    assert "review-journal" not in detail and ".jsonl" not in detail
+    assert "simulated failure" not in detail, "not the exception's own text either"
+
+    # errno alone when there is no native code, and an honest word when there is no errno.
+    assert cr._io_detail(OSError(28, "no space")) == "errno 28"  # noqa: SLF001
+    assert cr._io_detail(Exception("not an OSError")) == "errno unknown"  # noqa: SLF001
+
+
+@pytest.mark.parametrize("failing", ["open", "write", "fsync", "tail"])
+def test_no_persistence_failure_discloses_the_journal_path(tmp_path, monkeypatch, failing):
+    """Every `PersistenceError` `_append` can raise reaches the browser. None may carry a path.
+
+    `winerror 53` is used for the tail case so this also covers the N6 refusal, whose message is
+    new in this change.
+    """
+    directory, store = _store_with_a_committed_record(tmp_path)
+    journal = store.journal_path
+    state_directory = os.path.dirname(journal)
+
+    if failing == "tail":
+        _blind_tail(monkeypatch, journal, "size", _winerror(53, "ERROR_BAD_NETPATH"))
+    else:
+        real_open, real_write, real_fsync = os.open, os.write, os.fsync
+
+        def opener(path, flags, mode=0o777):
+            if failing == "open" and _same_file(path, journal):
+                raise _path_bearing(13, 5, journal)
+            return real_open(path, flags, mode)
+
+        def writer(descriptor, payload):
+            if failing == "write":
+                raise _path_bearing(28, 39, journal)
+            return real_write(descriptor, payload)
+
+        def flusher(descriptor):
+            if failing == "fsync":
+                raise _path_bearing(5, 1117, journal)
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(cr.os, "open", opener)
+        monkeypatch.setattr(cr.os, "write", writer)
+        monkeypatch.setattr(cr.os, "fsync", flusher)
+
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    message = str(failure.value)
+    assert not _mentions(message, journal), f"the journal path reached the client: {message}"
+    assert not _mentions(message, journal + ".second"), "nor may filename2"
+    assert not _mentions(message, state_directory)
+    assert "review-journal" not in message and ".jsonl" not in message
+    assert os.path.basename(directory) not in message
+    assert "simulated failure" not in message, "no raw OSError text"
+    assert "errno " in message, "the condition stays diagnosable"
+
+
+def test_the_byte_count_survives_the_redaction(tmp_path, monkeypatch):
+    """Redacting the path must not cost the one diagnostic that identifies a torn write."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    real_write = os.write
+    calls = {"n": 0}
+
+    def stuttering(descriptor, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_write(descriptor, payload[:20])
+        raise _path_bearing(28, 39, store.journal_path)
+
+    monkeypatch.setattr(cr.os, "write", stuttering)
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert "after 20 byte(s)" in str(failure.value), "the byte count belongs in the message"
+    assert not _mentions(str(failure.value), store.journal_path)
+    assert ".jsonl" not in str(failure.value)
+
+
+def test_the_refusal_message_names_the_native_code_when_errno_is_ambiguous(tmp_path,
+                                                                           monkeypatch):
+    """Windows collapses distinct conditions onto one errno, so the native code is the useful one.
+
+    `ERROR_BAD_NETPATH` and a genuinely missing file are both `errno 2`. Without the `winerror`
+    the operator cannot tell "the share went away" from "there is no journal".
+    """
+    directory, store = _store_with_a_committed_record(tmp_path)
+    _blind_tail(monkeypatch, store.journal_path, "size", _winerror(53, "ERROR_BAD_NETPATH"))
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+    assert "errno 2" in str(failure.value)
+    assert "winerror 53" in str(failure.value)
 
 
 def test_concurrent_decisions_keep_revisions_unique_and_contiguous(tmp_path):

@@ -1275,6 +1275,31 @@ class StaleWrite(Exception):
         self.revision = int(revision)
 
 
+def _io_detail(exc: BaseException) -> str:
+    """[R5-P7] A numbers-only description of an I/O failure, safe to show a client.
+
+    Every :class:`PersistenceError` raised by :class:`ReviewStore` reaches the browser: the
+    middleware answers 503 with ``{"detail": str(exc)[:200]}``. ``str(OSError)`` appends
+    ``filename`` -- and ``filename2`` -- whenever the failing call was made **by pathname**, so
+    interpolating the exception text put the journal's absolute path in that body. An independent
+    review reproduced it twice without fault injection: a read-only ACL on the journal, and
+    another process holding it with no sharing, both of which make ``os.open`` fail with the path
+    attached. The descriptor-based calls (``os.write``, ``os.fsync``) normally carry no filename,
+    but they are formatted the same way here rather than relying on that.
+
+    ``winerror`` is included when present because Windows collapses distinct conditions onto one
+    errno -- a genuinely missing file and ``ERROR_BAD_NETPATH`` are both ``errno 2`` -- so the
+    native code is the diagnosable one. The full exception, path included, stays reachable
+    internally through ``raise ... from exc``.
+    """
+    number = getattr(exc, "errno", None)
+    detail = f"errno {number}" if number is not None else "errno unknown"
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        detail += f", winerror {winerror}"
+    return detail
+
+
 @dataclass(slots=True)
 class Record:
     identity: str
@@ -1366,6 +1391,9 @@ class ReviewStore:
         value, with no exception. The original code discarded that return value, so a positive
         short write left a truncated record on disk while the API reported the decision recorded
         -- the one thing the durability contract says must never happen.
+
+        [R5-P7] The byte count stays in the message -- it is the diagnostically useful part --
+        but the exception's own text does not; see :func:`_io_detail`.
         """
         written = 0
         while written < len(payload):
@@ -1373,8 +1401,8 @@ class ReviewStore:
                 count = os.write(handle, payload[written:])
             except OSError as exc:
                 raise PersistenceError(
-                    f"could not durably write the decision after {written} byte(s): {exc}"
-                ) from exc
+                    f"could not durably write the decision after {written} byte(s) "
+                    f"({_io_detail(exc)})") from exc
             if count is None or count <= 0:
                 # A zero-byte write is not progress; looping on it would spin forever.
                 raise PersistenceError(
@@ -1382,10 +1410,15 @@ class ReviewStore:
             written += count
         return written
 
-    def _journal_tail_is_terminated(self) -> bool:
+    def _journal_tail_is_terminated(self, open_handle: int | None = None) -> bool:
         """Whether the journal is empty or ends in a newline. Raises if it cannot be determined.
 
-        [R5-P5 / N2] An ``OSError`` here is **not an answer**, and the earlier code read it as
+        Pass ``open_handle`` when an append is in flight. It is the descriptor :meth:`_append`
+        already holds, and it is **evidence, not a flag**: a caller that owns an open journal
+        cannot truthfully claim the journal is absent, so there is nothing for a caller to get
+        wrong by mistake. It is not read through -- the inspection below is still by pathname.
+
+        [R5-P5 / N2] An ``OSError`` here is **not an answer**, and the original code read it as
         one: it returned ``True`` -- "already terminated" -- so :meth:`_terminate_damaged_tail`
         skipped the repair and the append landed directly against a possibly damaged tail. That
         reinstated the exact F4 defect the repair exists to prevent: the two lines merged into one
@@ -1400,18 +1433,32 @@ class ReviewStore:
 
         So this fails **closed**. If the tail cannot be inspected, the journal's state is unknown,
         and an unknown journal state is not a licence to append -- nor to assume damage and write
-        a repair newline into a file whose condition could not be read. The caller reports the
-        decision as not durably recorded, which is true, and a later healthy retry repairs a
-        genuinely unterminated tail normally.
+        a repair newline into a file whose condition could not be read.
 
-        A *missing* journal is the one exception, and it is not a weakening: "the file does not
-        exist" is a definite answer, not a failure to read one. There is no tail to terminate and
-        nothing a later append could merge with. ``_append`` opens with ``O_CREAT`` before calling
-        this, so the production path never sees it; a direct caller on a fresh store does.
+        [R5-P7 / N6] **A missing journal is only an answer when no append is in flight, and
+        ``FileNotFoundError`` does not mean "missing".** R5-P5 carved out ``FileNotFoundError``
+        and justified it with "``_append`` opens with ``O_CREAT`` before calling this, so the
+        production path never sees it". That reasoning was wrong in both directions, and an
+        independent review measured both halves:
 
-        The message carries the errno rather than the exception text, because the exception text
-        contains the journal's filesystem path and this message reaches the HTTP client in the
-        503 body.
+        * ``FileNotFoundError`` is the class Python maps **six** Windows codes onto --
+          ``ERROR_FILE_NOT_FOUND`` (2), ``ERROR_PATH_NOT_FOUND`` (3), ``ERROR_INVALID_DRIVE``
+          (15), ``ERROR_BAD_NETPATH`` (53), ``ERROR_BAD_NET_NAME`` (67) and
+          ``ERROR_BAD_PATHNAME`` (161). Five of those say "the pathname did not resolve", not
+          "the file is not there": a share that stopped answering or a volume that went away
+          produces them while the journal is still sitting on disk with a torn tail. The
+          carve-out read all six as proof of a terminated tail, so the false success came back
+          for every one of them, through all three I/O steps below.
+        * The one code it was *designed* for is the one that cannot occur here. With the append
+          descriptor open, Windows refuses to unlink or rename the file at all (sharing
+          violation), and if the name had already gone, ``O_CREAT`` would have recreated it and
+          ``getsize`` would answer 0 honestly.
+
+        So the carve-out is now conditioned on the descriptor rather than on the error class.
+        ``os.path.exists``/``lexists`` deliberately play no part: they answer "no" for an
+        unresolvable path just as readily, which is the very confusion being removed.
+
+        The messages carry numbers only -- see :func:`_io_detail`.
         """
         try:
             if os.path.getsize(self.journal_path) == 0:
@@ -1419,12 +1466,13 @@ class ReviewStore:
             with open(self.journal_path, "rb") as probe:
                 probe.seek(-1, os.SEEK_END)
                 return probe.read(1) == b"\n"
-        except FileNotFoundError:
-            return True
         except OSError as exc:
+            if open_handle is None and isinstance(exc, FileNotFoundError):
+                # No append in flight, and nothing on disk: there is no tail to terminate and
+                # nothing a later append could merge with. A definite answer, not a failed read.
+                return True
             raise PersistenceError(
-                "could not verify the review journal tail "
-                f"(errno {getattr(exc, 'errno', 'unknown')})") from exc
+                f"could not verify the review journal tail ({_io_detail(exc)})") from exc
 
     def _terminate_damaged_tail(self, handle: int) -> bool:
         """[R5-P3 / F4] Close off a newline-less tail before appending after it.
@@ -1442,8 +1490,12 @@ class ReviewStore:
 
         [R5-P5 / N2] Raises :class:`PersistenceError` when the tail cannot be inspected at all --
         the repair is only safe to skip when the tail is *known* to be terminated.
+
+        [R5-P7 / N6] ``handle`` is forwarded to the probe, which is what tells it an append is in
+        flight. Every reader of this method holds an open journal, so no inspection failure
+        reaching it -- ``FileNotFoundError`` included -- may be read as "terminated".
         """
-        if self._journal_tail_is_terminated():
+        if self._journal_tail_is_terminated(handle):
             return False
         self._write_all(handle, b"\n")
         self.journal_tails_repaired += 1
@@ -1460,20 +1512,27 @@ class ReviewStore:
         raises before any byte is written, so no record is appended, the in-memory state is not
         advanced -- :meth:`decide` updates it only after this returns -- and the open handle is
         still closed by the ``finally`` below.
+
+        [R5-P7 / N6] The descriptor opened here is passed down to the tail probe, and that is the
+        whole guarantee: **once this function holds the journal open, no inspection failure of any
+        class may be read as "the tail is terminated".** There is no remaining error for which the
+        append proceeds against an unverified tail.
         """
         payload = (json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
         try:
             handle = os.open(self.journal_path, flags, 0o600)
         except OSError as exc:
-            raise PersistenceError(f"could not open the review journal: {exc}") from exc
+            raise PersistenceError(
+                f"could not open the review journal ({_io_detail(exc)})") from exc
         try:
             self._terminate_damaged_tail(handle)
             self._write_all(handle, payload)
             try:
                 os.fsync(handle)
             except OSError as exc:
-                raise PersistenceError(f"could not flush the review journal: {exc}") from exc
+                raise PersistenceError(
+                    f"could not flush the review journal ({_io_detail(exc)})") from exc
         finally:
             os.close(handle)
         self.journal_records += 1
