@@ -1344,6 +1344,214 @@ def test_compaction_recovers_after_a_damaged_tail(tmp_path):
     assert after.decide("owner-a", "fresh", cr.SELECTED, "scan-2", 0) == (cr.SELECTED, 1)
 
 
+# ---- N2: the journal tail probe fails CLOSED ------------------------------------------------
+#
+# The independent R5-P4 review found that `_journal_tail_is_terminated` answered `True` on an
+# `OSError` -- "already terminated" -- so `_terminate_damaged_tail` skipped the repair and the
+# append landed against a possibly damaged tail. Measured: `decide()` returned ('REJECTED', 1),
+# 112 bytes were appended into the damaged line, and the decision recovered as PENDING after a
+# restart. That is the F4 defect reinstated whenever the probe hits an I/O fault.
+#
+# Fault injection below is deliberately NARROW. It is scoped to the module under test -- its own
+# `os.path.getsize` and its own `open` name, which Python resolves from module globals before
+# builtins -- and every injected callable DELEGATES for any path that is not this test's own
+# disposable journal. A global patch would break the descriptor-identity probe and make the
+# handler refuse with 409 before the journal was ever reached, which is the trap recorded in
+# `test_clips_media_server.py::test_a_decision_that_cannot_be_persisted_returns_503_not_200`.
+
+def _journal_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _blind_getsize(journal, errno_=5):
+    """`os.path.getsize` that raises for exactly one file and delegates for every other."""
+    real = os.path.getsize
+
+    def getsize(path):
+        if _same_file(path, journal):
+            raise OSError(errno_, "simulated I/O error reading the journal size")
+        return real(path)
+    return getsize
+
+
+def _blind_tail_read(journal, errno_=5):
+    """`open` that returns a reader whose `read` raises, for exactly one file."""
+    real = open
+
+    class _Unreadable:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._handle.close()
+            return False
+
+        def seek(self, *args, **kwargs):
+            return self._handle.seek(*args, **kwargs)
+
+        def read(self, *args, **kwargs):
+            raise OSError(errno_, "simulated I/O error reading the journal tail")
+
+    def opener(file, *args, **kwargs):
+        if _same_file(file, journal):
+            return _Unreadable(real(file, *args, **kwargs))
+        return real(file, *args, **kwargs)
+    return opener
+
+
+def _store_with_a_committed_record(tmp_path):
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "committed", cr.SELECTED, "scan-1", 0)
+    return directory, store
+
+
+def test_a_journal_tail_that_cannot_be_sized_refuses_the_decision(tmp_path, monkeypatch):
+    """N2, case A. An `OSError` from `os.path.getsize` is not an answer about the tail."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    before = _journal_bytes(store.journal_path)
+
+    monkeypatch.setattr(cr.os.path, "getsize", _blind_getsize(store.journal_path))
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert "could not verify the review journal tail" in str(failure.value)
+    assert _journal_bytes(store.journal_path) == before, "not one byte may be appended"
+    assert store.get("later") == (cr.PENDING, 0), "no in-memory decision or revision"
+    reloaded = cr.ReviewStore(directory)
+    assert reloaded.get("later") == (cr.PENDING, 0), "nothing was reported, nothing recovered"
+    assert reloaded.get("committed") == (cr.SELECTED, 1), "committed records are preserved"
+
+
+def test_a_journal_tail_that_cannot_be_read_refuses_the_decision(tmp_path, monkeypatch):
+    """N2, case B. The same fail-closed outcome when the failure is in the tail READ rather than
+    in the size check -- the probe has two I/O steps and both must fail closed."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    before = _journal_bytes(store.journal_path)
+
+    monkeypatch.setattr(cr, "open", _blind_tail_read(store.journal_path), raising=False)
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert "could not verify the review journal tail" in str(failure.value)
+    assert _journal_bytes(store.journal_path) == before
+    assert store.get("later") == (cr.PENDING, 0)
+    assert cr.ReviewStore(directory).get("later") == (cr.PENDING, 0)
+
+
+def test_the_refusal_message_does_not_disclose_the_journal_path(tmp_path, monkeypatch):
+    """This message reaches the HTTP client in the 503 body, so it carries the errno rather than
+    the exception text -- an `OSError` from `getsize` stringifies with the filename in it."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    monkeypatch.setattr(cr.os.path, "getsize", _blind_getsize(store.journal_path))
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+    message = str(failure.value)
+    assert store.journal_path not in message
+    assert "review-journal" not in message and ".jsonl" not in message
+    assert os.path.basename(directory) not in message
+    assert "errno 5" in message, "the condition stays diagnosable without the path"
+
+
+def test_a_damaged_tail_plus_an_inspection_error_is_refused_not_committed(tmp_path, monkeypatch):
+    """N2, case C -- the exact R5-P4 reproduction.
+
+    A genuine unterminated record, then the inspection error. Before the fix this returned
+    ('REJECTED', 1) and recovered as PENDING: a success reported for a record that does not exist.
+    """
+    directory, store = _store_with_a_committed_record(tmp_path)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+    before = _journal_bytes(store.journal_path)
+    assert not before.endswith(b"\n"), "the tail really is unterminated"
+
+    monkeypatch.setattr(cr.os.path, "getsize", _blind_getsize(store.journal_path))
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert _journal_bytes(store.journal_path) == before, (
+        "the append must not land against the damaged tail")
+    assert store.journal_tails_repaired == 0, "no repair may be written to an unverifiable file"
+    recovered = cr.ReviewStore(directory)
+    assert recovered.get("later") == (cr.PENDING, 0)
+    assert recovered.get("committed") == (cr.SELECTED, 1)
+
+
+def test_a_healthy_retry_after_the_refusal_repairs_the_tail_and_persists(tmp_path, monkeypatch):
+    """N2, case D. Failing closed must not leave the store wedged: once the I/O fault clears, the
+    same decision succeeds, the genuinely damaged tail is repaired, and the record survives a
+    restart. The revision is 1, not 2 -- the refused attempt consumed nothing."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+
+    monkeypatch.setattr(cr.os.path, "getsize", _blind_getsize(store.journal_path))
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0)
+    monkeypatch.undo()
+
+    assert store.decide("owner-a", "later", cr.REJECTED, "scan-1", 0) == (cr.REJECTED, 1), (
+        "the refused attempt advanced no revision, so 0 is still the expected one")
+    assert store.journal_tails_repaired == 1, "the genuine damage is repaired by the retry"
+
+    recovered = cr.ReviewStore(directory)
+    assert recovered.get("later") == (cr.REJECTED, 1), "a reported success must be recoverable"
+    assert recovered.get("committed") == (cr.SELECTED, 1)
+    assert recovered.get("torn") == (cr.PENDING, 0), "the torn record never reported success"
+    assert recovered.corrupt_records_discarded == 1, "exactly one line was damaged"
+
+
+def test_the_tail_probe_still_answers_normally_when_the_file_is_readable(tmp_path):
+    """N2, case F. Failing closed must not make the probe pessimistic: an empty journal and a
+    newline-terminated one are both 'terminated', and only a genuine unterminated tail repairs."""
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    assert not os.path.exists(store.journal_path), "nothing has been journalled yet"
+    assert store._journal_tail_is_terminated() is True, (
+        "a journal that does not exist has no tail to terminate -- that is a definite answer, "
+        "not a failure to read one, and it is the ONLY OSError carved out of the refusal")
+
+    store.begin_scan("owner-a", "scan-1")
+    assert store._journal_tail_is_terminated() is True, "a normal append leaves a newline"
+    assert store.decide("owner-a", "a", cr.SELECTED, "scan-1", 0) == (cr.SELECTED, 1)
+    assert store._journal_tail_is_terminated() is True
+    assert store.journal_tails_repaired == 0, "nothing to repair on the happy path"
+
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn"')
+    assert store._journal_tail_is_terminated() is False
+    assert store.decide("owner-a", "b", cr.REJECTED, "scan-1", 0) == (cr.REJECTED, 1)
+    assert store.journal_tails_repaired == 1
+    assert cr.ReviewStore(directory).get("b") == (cr.REJECTED, 1)
+
+
+def test_an_unverifiable_tail_also_refuses_begin_scan_rather_than_half_recording_it(tmp_path,
+                                                                                    monkeypatch):
+    """`begin_scan` journals too, so it must fail closed the same way. The GUI already turns a
+    `PersistenceError` from the scan into an honest empty state rather than a half-live page."""
+    directory, store = _store_with_a_committed_record(tmp_path)
+    before = _journal_bytes(store.journal_path)
+    monkeypatch.setattr(cr.os.path, "getsize", _blind_getsize(store.journal_path))
+    with pytest.raises(cr.PersistenceError):
+        store.begin_scan("owner-a", "scan-2")
+    monkeypatch.undo()
+    assert _journal_bytes(store.journal_path) == before
+    assert store.current_scan("owner-a") == "scan-1", "the scan pointer did not move"
+
+
 def test_concurrent_decisions_keep_revisions_unique_and_contiguous(tmp_path):
     store = cr.ReviewStore(str(tmp_path / "state"))
     store.begin_scan("owner-a", "scan-1")

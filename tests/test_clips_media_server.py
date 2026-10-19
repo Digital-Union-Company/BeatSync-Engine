@@ -553,6 +553,56 @@ def test_a_decision_that_cannot_be_persisted_returns_503_not_200(world, monkeypa
     assert status == 503 and json.loads(body)["code"] == "not_durably_recorded"
 
 
+def test_an_unverifiable_journal_tail_returns_503_and_records_nothing(world, monkeypatch):
+    """[R5-P5 / N2] The same truthful 503, for the condition the independent review found.
+
+    The journal tail probe used to answer "already terminated" on an `OSError`, so the append
+    went ahead against an unverified -- possibly damaged -- tail and this endpoint answered
+    **200** for a decision that recovered as PENDING. It must answer 503.
+
+    The injection is scoped to one file. Patching `os.path.getsize` for everything would make the
+    descriptor-identity probe fail first and the endpoint would refuse 409 before the journal was
+    ever reached -- the same trap the test above records about `os.open`.
+    """
+    store = world["store"]
+    journal = store.journal_path
+    real_getsize = os.path.getsize
+
+    def blind(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(journal)):
+            raise OSError(5, "simulated I/O error reading the journal size")
+        return real_getsize(path)
+
+    with open(journal, "rb") as handle:
+        before = handle.read()
+
+    monkeypatch.setattr(cr.os.path, "getsize", blind)
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"SELECTED","rev":0}')
+    monkeypatch.undo()
+
+    assert status == 503, "never 200 for a decision that is not on disk"
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    with open(journal, "rb") as handle:
+        assert handle.read() == before, "a refused decision appends nothing"
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    assert store.get(identity) == (cr.PENDING, 0), "no revision moved"
+
+    # The 503 body is operator-facing. It must not disclose media or journal paths.
+    text = body.decode("utf-8", "replace")
+    assert world["review"] not in text and world["secret"] not in text
+    assert ".mp4" not in text and journal not in text
+    assert SENTINEL_TEXT not in body
+
+    # And the endpoint recovers: with the fault cleared the same decision is accepted.
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"SELECTED","rev":0}')
+    assert status == 200 and json.loads(body)["rev"] == 1
+
+
 # =============================================================================================
 # 8. State
 # =============================================================================================

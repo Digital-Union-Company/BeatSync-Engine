@@ -1383,15 +1383,48 @@ class ReviewStore:
         return written
 
     def _journal_tail_is_terminated(self) -> bool:
-        """Whether the journal is empty or ends in a newline."""
+        """Whether the journal is empty or ends in a newline. Raises if it cannot be determined.
+
+        [R5-P5 / N2] An ``OSError`` here is **not an answer**, and the earlier code read it as
+        one: it returned ``True`` -- "already terminated" -- so :meth:`_terminate_damaged_tail`
+        skipped the repair and the append landed directly against a possibly damaged tail. That
+        reinstated the exact F4 defect the repair exists to prevent: the two lines merged into one
+        unparsable record, the API reported the decision recorded, and it recovered as ``PENDING``
+        after a restart.
+
+        The comment that justified it -- "``_load`` already treats that as corruption" -- was
+        reasoning about the wrong moment. ``_load``'s tolerance is for *start-up recovery*, where
+        discarding an unreadable record is the only sensible option and nothing is being promised
+        to anyone. Here the consequence is a *false success at append time*, which the durability
+        contract forbids outright.
+
+        So this fails **closed**. If the tail cannot be inspected, the journal's state is unknown,
+        and an unknown journal state is not a licence to append -- nor to assume damage and write
+        a repair newline into a file whose condition could not be read. The caller reports the
+        decision as not durably recorded, which is true, and a later healthy retry repairs a
+        genuinely unterminated tail normally.
+
+        A *missing* journal is the one exception, and it is not a weakening: "the file does not
+        exist" is a definite answer, not a failure to read one. There is no tail to terminate and
+        nothing a later append could merge with. ``_append`` opens with ``O_CREAT`` before calling
+        this, so the production path never sees it; a direct caller on a fresh store does.
+
+        The message carries the errno rather than the exception text, because the exception text
+        contains the journal's filesystem path and this message reaches the HTTP client in the
+        503 body.
+        """
         try:
             if os.path.getsize(self.journal_path) == 0:
                 return True
             with open(self.journal_path, "rb") as probe:
                 probe.seek(-1, os.SEEK_END)
                 return probe.read(1) == b"\n"
-        except OSError:
-            return True              # unreadable: _load already treats that as corruption
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise PersistenceError(
+                "could not verify the review journal tail "
+                f"(errno {getattr(exc, 'errno', 'unknown')})") from exc
 
     def _terminate_damaged_tail(self, handle: int) -> bool:
         """[R5-P3 / F4] Close off a newline-less tail before appending after it.
@@ -1406,6 +1439,9 @@ class ReviewStore:
         Writing one newline first makes the damaged record a self-contained line that ``_load``
         discards, and leaves every fully committed record before it intact. Returns whether a
         repair was performed.
+
+        [R5-P5 / N2] Raises :class:`PersistenceError` when the tail cannot be inspected at all --
+        the repair is only safe to skip when the tail is *known* to be terminated.
         """
         if self._journal_tail_is_terminated():
             return False
@@ -1419,6 +1455,11 @@ class ReviewStore:
         A failure here is raised, never swallowed: the caller must report that the decision was
         not durably recorded rather than show the operator a tick. A reported success means the
         complete record is on disk and recoverable.
+
+        [R5-P5 / N2] That now includes not being able to *inspect* the journal: an unreadable tail
+        raises before any byte is written, so no record is appended, the in-memory state is not
+        advanced -- :meth:`decide` updates it only after this returns -- and the open handle is
+        still closed by the ``finally`` below.
         """
         payload = (json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
