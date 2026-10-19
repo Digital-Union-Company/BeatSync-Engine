@@ -1146,6 +1146,154 @@ def test_a_non_integer_generation_can_never_publish():
     assert coordinator.publish("owner-a", generation, {"session": "ok", "entries": []}) is True
 
 
+# ---- [R5-P9 / N4] an active view must never describe a revoked session ---------------------
+#
+# `begin` makes a new scan the newest *before* that scan revokes the previous session and
+# publishes its own page. For the whole interval in between -- which contains the poster pass, so
+# seconds, not microseconds -- the stored view named a session the registry had already revoked.
+# Every reader of `view()` (the handler, Refresh, and the `/r5state` read) therefore described a
+# dead page as current.
+
+def _published(coordinator, owner, session):
+    generation = coordinator.begin(owner)
+    assert coordinator.publish(owner, generation, {"session": session, "entries": []})
+    return generation
+
+
+def test_a_view_stops_being_current_the_moment_a_newer_scan_begins():
+    coordinator = cr.ScanCoordinator()
+    _published(coordinator, "owner-a", "session-1")
+    assert coordinator.view("owner-a")["session"] == "session-1"
+
+    coordinator.begin("owner-a")             # the newer scan has started, not yet published
+    assert coordinator.view("owner-a") == {}, (
+        "between `begin` and `publish` the previous session is already revoked, so the stored "
+        "view must not be served as the current page")
+
+
+def test_the_newer_scans_page_becomes_current_once_it_publishes():
+    coordinator = cr.ScanCoordinator()
+    _published(coordinator, "owner-a", "session-1")
+    second = coordinator.begin("owner-a")
+    assert coordinator.view("owner-a") == {}
+    assert coordinator.publish("owner-a", second, {"session": "session-2", "entries": []})
+    assert coordinator.view("owner-a")["session"] == "session-2"
+
+
+def test_a_scan_that_never_took_a_generation_cannot_blank_a_valid_view():
+    """A refused folder or an empty enumeration returns before `begin`, so it changes nothing.
+
+    This is the property that keeps the fail-closed read above from being destructive: only a
+    scan that is really going to change authoritative state supersedes the current page.
+    """
+    coordinator = cr.ScanCoordinator()
+    _published(coordinator, "owner-a", "session-1")
+    for _ in range(3):
+        assert coordinator.view("owner-a")["session"] == "session-1"
+    assert coordinator.newest("owner-a") == 1
+
+
+def test_a_failed_newest_scan_never_resurrects_the_older_page():
+    """Both with and without the handler's `discard`, which must not be the only line of defence."""
+    coordinator = cr.ScanCoordinator()
+    _published(coordinator, "owner-a", "session-1")
+    failed = coordinator.begin("owner-a")
+    coordinator.discard("owner-a", failed)
+    assert coordinator.view("owner-a") == {}
+
+    other = cr.ScanCoordinator()
+    _published(other, "owner-a", "session-1")
+    other.begin("owner-a")                   # fails without ever calling discard
+    assert other.view("owner-a") == {}, "the older page must not reappear as current"
+
+
+def test_one_owners_transition_does_not_disturb_another_owner():
+    coordinator = cr.ScanCoordinator()
+    _published(coordinator, "owner-a", "a-session")
+    _published(coordinator, "owner-b", "b-session")
+    coordinator.begin("owner-b")             # B is mid-scan
+    assert coordinator.view("owner-b") == {}
+    assert coordinator.view("owner-a")["session"] == "a-session", "owners are isolated"
+
+
+# ---- [R5-P9 / N5] a failed compaction must not cost a committed decision --------------------
+#
+# Compaction is an optimisation over the journal, never the record. These pin the two failure
+# points separately, because they fail at opposite ends of the operation.
+
+def _store_with_decisions(tmp_path, count=4):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    for index in range(count):
+        store.decide("owner-a", f"clip-{index}", cr.SELECTED, "scan-1")
+    return store
+
+
+def test_a_snapshot_publication_failure_loses_no_committed_decision(tmp_path, monkeypatch):
+    """The snapshot never lands. The journal must still hold everything."""
+    store = _store_with_decisions(tmp_path)
+    real_replace = os.replace
+
+    def refuse(src, dst, *args, **kwargs):
+        if str(dst) == store.snapshot_path:
+            raise OSError(13, "snapshot refused", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "replace", refuse)
+    with pytest.raises(OSError):
+        store.compact()
+    monkeypatch.undo()
+
+    assert os.path.getsize(store.journal_path) > 0, "the journal must not have been truncated"
+    reloaded = cr.ReviewStore(str(tmp_path / "state"))
+    for index in range(4):
+        assert reloaded.get(f"clip-{index}") == (cr.SELECTED, 1)
+
+
+def test_a_journal_truncation_failure_after_the_snapshot_landed_loses_no_decision(
+        tmp_path, monkeypatch):
+    """The snapshot *has* landed and then the truncation fails -- the crash-safe direction.
+
+    Both copies briefly hold the same records, which is why the replay is idempotent per identity.
+    Nothing may be lost, and nothing may be double-counted.
+    """
+    store = _store_with_decisions(tmp_path)
+    real_open = open
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if str(file) == store.journal_path and "w" in str(mode):
+            raise OSError(13, "truncation refused", str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+    with pytest.raises(OSError):
+        store.compact()
+    monkeypatch.undo()
+
+    assert os.path.exists(store.snapshot_path), "the snapshot did land"
+    reloaded = cr.ReviewStore(str(tmp_path / "state"))
+    for index in range(4):
+        assert reloaded.get(f"clip-{index}") == (cr.SELECTED, 1), "no record lost or doubled"
+    assert reloaded.get("clip-0")[1] == 1, "a replayed record must not advance a revision"
+
+
+def test_the_public_io_detail_is_the_same_numbers_only_formatter():
+    """[R5-P9] `gui.py` formats its operator-visible I/O failures with this, so it is public.
+
+    One rule, one implementation: a second copy in the view layer is how the two drift apart.
+    """
+    failure = OSError(13, "denied", r"C:\state\review-journal.jsonl", 5,
+                      r"C:\state\review-snapshot.json")
+    detail = cr.io_detail(failure)
+    assert detail == "errno 13, winerror 5"
+    assert "io_detail" in cr.__all__
+    assert cr.io_detail(OSError(28, "no space")) == "errno 28"
+    assert cr.io_detail(Exception("not an OSError")) == "errno unknown"
+    stripped = lambda text: text.replace("\\", "").replace("/", "")      # noqa: E731
+    assert stripped("C:statereview-journal.jsonl") not in stripped(detail)
+
+
 # ---- F2: the strict mandatory expected revision --------------------------------------------
 
 @pytest.mark.parametrize("payload,code", [

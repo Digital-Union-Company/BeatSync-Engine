@@ -42,9 +42,9 @@ _UI_CONTENT = os.path.join(_SRC, "ui_content.py")
 
 #: The handlers this suite drives, in dependency order within one namespace.
 _HANDLERS = ("_clips_store", "_clips_owner", "_clips_remember", "_clips_view",
-             "_clips_poster_exists", "_clips_poster_resolver", "_clips_identities",
-             "_on_clips_check", "_clips_render_current", "_on_clips_scan", "_clips_decide",
-             "_clips_state", "_on_clips_refresh", "_on_clips_confirm")
+             "_clips_failure_text", "_clips_poster_exists", "_clips_poster_resolver",
+             "_clips_identities", "_on_clips_check", "_clips_render_current", "_on_clips_scan",
+             "_clips_decide", "_clips_state", "_on_clips_refresh", "_on_clips_confirm")
 
 
 class _Update(dict):
@@ -624,3 +624,419 @@ def test_no_source_filename_reaches_the_browser(world):
 def test_a_superseded_scan_report_names_no_path(world):
     assert "\\" not in world["ui"]["CLIPS_SCAN_SUPERSEDED_TEXT"]
     assert "superseded" in world["ui"]["CLIPS_SCAN_SUPERSEDED_TEXT"].lower()
+
+
+# =============================================================================================
+# [R5-P9 / N5] A failed optional compaction must not destroy a scan that already succeeded
+# =============================================================================================
+
+class _StoreGate:
+    """The real store, with `maybe_compact` made to pause or misbehave on demand."""
+
+    def __init__(self, real, error=None, gate=None):
+        self._real = real
+        self._error = error
+        self._gate = gate
+        self.calls = 0
+
+    def __getattr__(self, item):
+        return getattr(self._real, item)
+
+    def maybe_compact(self):
+        self.calls += 1
+        if self._gate is not None:
+            self._gate()
+        if self._error is not None:
+            raise self._error
+        return self._real.maybe_compact()
+
+
+def _prime_for_real_compaction(namespace):
+    """Make the next `maybe_compact()` actually compact, so a real failure point is reached."""
+    store = namespace["_clips_store"]()
+    store.journal_records = cr.COMPACT_AFTER_RECORDS
+    return store
+
+
+def _assert_served(result, world, owner):
+    """The scan was served: a real grid, live credentials, and Confirm derived from the record."""
+    report, grid, counts, confirm = result
+    session, page = _session_of(grid)
+    assert session and page, f"no grid was served: {report[:160]!r}"
+    view = world["ns"]["_clips_view"](owner)
+    assert view.get("session") == session, "the served grid is not the authoritative page"
+    entries = world["ns"]["_CLIPS_REGISTRY"].page_entries(session, page)
+    assert entries, "the served page's credentials must be live"
+    return report, grid, counts, confirm
+
+
+@pytest.mark.parametrize("where", ["snapshot", "truncation"])
+def test_a_failed_compaction_still_serves_the_scan_that_already_succeeded(
+        world, monkeypatch, where):
+    """Both compaction failure points, through the real handler.
+
+    Compaction runs *after* the scan has published a page and minted live credentials, and it was
+    outside the handler's `try`. An `OSError` from it therefore threw away a scan that had
+    entirely succeeded -- the operator lost a gallery they were already entitled to, for a failure
+    that costs nothing. `snapshot` fails before the snapshot lands; `truncation` fails after it
+    has landed, which is the opposite end of the same operation.
+    """
+    owner = "browser-compaction"
+    store = _prime_for_real_compaction(world["ns"])
+    real_replace, real_open = os.replace, open
+
+    def refuse_replace(src, dst, *args, **kwargs):
+        if str(dst) == store.snapshot_path:
+            raise OSError(13, "snapshot refused", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    def refuse_truncate(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if str(file) == store.journal_path and "w" in str(mode):
+            raise OSError(13, "truncation refused", str(file))
+        return real_open(file, *args, **kwargs)
+
+    if where == "snapshot":
+        monkeypatch.setattr(cr.os, "replace", refuse_replace)
+    else:
+        monkeypatch.setattr(cr, "open", refuse_truncate, raising=False)
+
+    result = _scan(world, owner)
+    monkeypatch.undo()
+
+    report, grid, _, _ = _assert_served(result, world, owner)
+
+    # The operator is told, honestly, and without a path.
+    assert "compaction" in report.lower(), f"the failure must be reported: {report!r}"
+    assert "errno 13" in report, "the diagnosable numbers must survive"
+    stripped = lambda text: text.replace("\\", "").replace("/", "")      # noqa: E731
+    for secret in (store.journal_path, store.snapshot_path, os.path.dirname(store.journal_path)):
+        assert stripped(secret) not in stripped(report), \
+            f"a filesystem path reached the operator: {report!r}"
+
+
+def test_a_failed_compaction_leaves_every_committed_decision_recoverable(world, monkeypatch):
+    """The journal stays authoritative, which is the whole reason the failure is survivable."""
+    owner = "browser-compaction-2"
+    first = _scan(world, owner)
+    session, page = _session_of(first[1])
+    entries = world["ns"]["_CLIPS_REGISTRY"].page_entries(session, page)
+    store = world["ns"]["_clips_store"]()
+    decided = world["ns"]["_clips_decide"](
+        owner, session, page, entries[0], {"to": cr.SELECTED, "rev": 0})
+    assert decided["ok"], decided
+
+    _prime_for_real_compaction(world["ns"])
+    real_replace = os.replace
+
+    def refuse(src, dst, *args, **kwargs):
+        if str(dst) == store.snapshot_path:
+            raise OSError(13, "snapshot refused", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "replace", refuse)
+    second = _scan(world, owner)
+    monkeypatch.undo()
+    _assert_served(second, world, owner)
+
+    identity = cr.decision_identity(entries[0].path, entries[0].size, entries[0].mtime_ns)
+    reloaded = cr.ReviewStore(store.dir)
+    assert reloaded.get(identity) == (cr.SELECTED, 1), \
+        "a committed decision must survive the failed compaction and a restart"
+
+
+def test_a_compaction_failure_before_the_scan_transaction_is_still_fail_closed(world):
+    """Containment is scoped to the *optional* compaction, not to the scan's own durability.
+
+    `begin_scan` appends to the journal inside the authority block. If that cannot be recorded the
+    scan has not happened, and the handler must still report an honest empty state.
+    """
+    owner = "browser-fail-closed"
+    store = world["ns"]["_clips_store"]()
+    original = store.begin_scan
+
+    def refuse(*args, **kwargs):
+        raise cr.PersistenceError("could not verify the review journal tail (errno 13)")
+
+    store.begin_scan = refuse
+    try:
+        report, grid, counts, confirm = _scan(world, owner)
+    finally:
+        store.begin_scan = original
+
+    assert grid == world["ui"]["CLIPS_GALLERY_INITIAL_HTML"], "nothing may be loaded"
+    assert "failed" in report.lower()
+    assert confirm == {"interactive": False}
+    assert world["ns"]["_clips_view"](owner) == {}, "no page may be left looking current"
+
+
+def test_a_programming_error_in_compaction_is_not_swallowed(world):
+    """Only the two I/O classes are contained. A `TypeError` is a bug and must still surface."""
+    owner = "browser-bug"
+    real = world["ns"]["_clips_store"]()
+    world["ns"]["_CLIPS_STORE"] = _StoreGate(real, error=TypeError("a real bug"))
+    with pytest.raises(TypeError):
+        _scan(world, owner)
+
+
+# =============================================================================================
+# [R5-P9 / N4] No reader may describe a revoked session as current, mid-transition
+# =============================================================================================
+
+def test_no_reader_describes_a_revoked_session_as_current_during_a_scan(tmp_path, ui):
+    """The mandatory deterministic test.
+
+    Scan B is paused *after* the authority block -- so `new_session` has already revoked A's
+    session -- and *before* it publishes its own view. While it is paused, a different thread
+    drives the real Refresh and `/r5state` handlers. Neither may describe A's dead page as
+    current. Then B is released and its page must be served and classifiable.
+    """
+    media = _tree_of_clips(tmp_path)
+    reached, release = threading.Event(), threading.Event()
+
+    def hook(entries):
+        if threading.current_thread().name == "scan-B":
+            reached.set()
+            assert release.wait(30), "the test's own gate timed out"
+
+    namespace = _build(str(tmp_path / "state"), ui, poster_hook=hook)
+    owner = "browser-session-N4"
+    request = _Gr.Request(session_hash=owner)
+
+    first = namespace["_on_clips_scan"](
+        media, True, str(tmp_path / "lib"), str(tmp_path / "rej"), 100, request)
+    a_session, a_page = _session_of(first[1])
+    assert a_session, "the first scan must have produced a real page"
+
+    box = {}
+
+    def run_b():
+        box["B"] = namespace["_on_clips_scan"](
+            media, True, str(tmp_path / "lib"), str(tmp_path / "rej"), 100, request)
+
+    thread = threading.Thread(target=run_b, name="scan-B")
+    thread.start()
+    try:
+        assert reached.wait(30), "scan B never reached the poster pass"
+
+        # A's credentials really are dead by now -- that is what makes serving them a defect.
+        with pytest.raises(cr.Refusal):
+            namespace["_CLIPS_REGISTRY"].page_entries(a_session, a_page)
+
+        assert namespace["_clips_view"](owner) == {}, \
+            "the authoritative view still named A's revoked session"
+
+        grid, counts, confirm = namespace["_on_clips_refresh"](request)
+        assert _session_of(grid) == (None, None), "Refresh repainted a revoked page"
+        assert grid == ui["CLIPS_GALLERY_INITIAL_HTML"]
+        assert confirm == {"interactive": False}
+
+        state = namespace["_clips_state"](owner, a_session, a_page)
+        assert state == {"ok": False, "code": "not_the_active_page"}, \
+            "/r5state answered for a revoked page"
+    finally:
+        release.set()
+        thread.join(30)
+
+    # Released: B's page is now the current one, and it is usable.
+    b_session, b_page = _session_of(box["B"][1])
+    assert b_session and b_session != a_session
+    assert namespace["_clips_view"](owner)["session"] == b_session
+    entries = namespace["_CLIPS_REGISTRY"].page_entries(b_session, b_page)
+    decided = namespace["_clips_decide"](
+        owner, b_session, b_page, entries[0], {"to": cr.SELECTED, "rev": 0})
+    assert decided["ok"], f"the newest page must be classifiable: {decided}"
+
+
+def test_a_failed_newest_scan_leaves_nothing_looking_current(world):
+    """A scan that takes a generation and then fails must not leave the older page on screen."""
+    owner = "browser-N4-failed"
+    first = _scan(world, owner)
+    assert _session_of(first[1])[0]
+
+    store = world["ns"]["_clips_store"]()
+    original = store.begin_scan
+    store.begin_scan = lambda *a, **k: (_ for _ in ()).throw(
+        cr.PersistenceError("could not open the review journal (errno 13)"))
+    try:
+        failed = _scan(world, owner)
+    finally:
+        store.begin_scan = original
+
+    assert failed[1] == world["ui"]["CLIPS_GALLERY_INITIAL_HTML"]
+    assert world["ns"]["_clips_view"](owner) == {}
+    assert _session_of(world["ns"]["_on_clips_refresh"](world["request"](
+        session_hash=owner))[0]) == (None, None)
+
+    # And the operator recovers simply by scanning again.
+    again = _scan(world, owner)
+    assert _session_of(again[1])[0], "a later healthy scan must restore a usable gallery"
+
+
+def test_a_refused_folder_does_not_invalidate_a_valid_current_page(world):
+    """A validation refusal returns before `begin`, so it must change nothing at all."""
+    owner = "browser-N4-refused"
+    first = _scan(world, owner)
+    session, page = _session_of(first[1])
+
+    refused = _scan(world, owner, folder=str(world["tmp"] / "does-not-exist"))
+    assert "❌" in refused[0]
+
+    assert world["ns"]["_clips_view"](owner).get("session") == session, \
+        "a refused scan blanked a page it never superseded"
+    assert world["ns"]["_CLIPS_REGISTRY"].page_entries(session, page)
+    assert _session_of(world["ns"]["_on_clips_refresh"](
+        world["request"](session_hash=owner))[0]) == (session, page)
+
+
+# =============================================================================================
+# [R5-P9 / N1] A late scan response must render the authoritative page, not its own locals
+# =============================================================================================
+
+def _paused_after_publication(world, owner):
+    """Start a scan and stop it between `publish` and the response it renders."""
+    paused, release, armed = threading.Event(), threading.Event(), {"on": True}
+
+    def gate():
+        if armed["on"] and threading.current_thread().name == "scan-A":
+            armed["on"] = False
+            paused.set()
+            assert release.wait(30), "the test's own gate timed out"
+
+    world["ns"]["_CLIPS_STORE"] = _StoreGate(world["ns"]["_clips_store"](), gate=gate)
+    box = {}
+
+    def run():
+        box["A"] = _scan(world, owner)
+
+    thread = threading.Thread(target=run, name="scan-A")
+    thread.start()
+    assert paused.wait(30), "scan A never reached the post-publication pause"
+    return thread, release, box
+
+
+def test_a_scan_superseded_after_publishing_returns_the_newest_page(world):
+    """Interleaving 1 and 2: A publishes, B publishes, then A assembles its response.
+
+    A's own `entries`/`session_id`/`page_token` are revoked by now. Rendering from them is the F1
+    symptom returning by a later route, so the response is rendered from the authoritative view.
+    """
+    owner = "browser-N1"
+    thread, release, box = _paused_after_publication(world, owner)
+    a_session = world["ns"]["_clips_view"](owner)["session"]
+
+    b_report, b_grid, _, _ = _scan(world, owner)         # B overtakes and completes
+    b_session, b_page = _session_of(b_grid)
+    assert b_session and b_session != a_session
+
+    release.set()
+    thread.join(30)
+    a_report, a_grid, a_counts, a_confirm = box["A"]
+
+    assert _session_of(a_grid) == (b_session, b_page), \
+        "the superseded response handed the browser its own revoked credentials"
+    assert world["ns"]["_CLIPS_REGISTRY"].page_entries(b_session, b_page), \
+        "whatever A returned must carry live credentials"
+    assert a_report == world["ui"]["CLIPS_SCAN_SUPERSEDED_TEXT"], \
+        "the report must describe the page actually being shown"
+    assert world["ns"]["_clips_view"](owner)["session"] == b_session
+
+
+def test_the_superseded_response_counts_and_confirm_describe_the_page_it_shows(world):
+    """Interleaving 3: A's response arrives last. Everything in it must describe B's page."""
+    owner = "browser-N1-consistent"
+    thread, release, box = _paused_after_publication(world, owner)
+    b = _scan(world, owner)
+    b_session, b_page = _session_of(b[1])
+    release.set()
+    thread.join(30)
+    a_report, a_grid, a_counts, a_confirm = box["A"]
+
+    entries = world["ns"]["_CLIPS_REGISTRY"].page_entries(b_session, b_page)
+    store = world["ns"]["_clips_store"]()
+    identities = [cr.decision_identity(e.path, e.size, e.mtime_ns) for e in entries]
+    expected = cr.counts_text(store.counts(identities))
+    assert a_counts == expected, "the counters describe a different page from the grid"
+    assert a_confirm == {"interactive": store.counts(identities)[cr.PENDING] == 0}
+    # Arriving last is therefore safe: the grid, the counters and Confirm all describe B's page.
+    assert _session_of(a_grid) == (b_session, b_page) == _session_of(b[1])
+
+
+def test_a_scan_superseded_by_one_that_then_fails_shows_an_honest_empty_state(world):
+    """Interleaving 4: B supersedes A and then fails. Neither page may look current."""
+    owner = "browser-N1-bfails"
+    thread, release, box = _paused_after_publication(world, owner)
+    a_session = world["ns"]["_clips_view"](owner)["session"]
+
+    store = world["ns"]["_CLIPS_STORE"]
+    original = store._real.begin_scan
+    store._real.begin_scan = lambda *a, **k: (_ for _ in ()).throw(
+        cr.PersistenceError("could not open the review journal (errno 13)"))
+    try:
+        failed = _scan(world, owner)
+    finally:
+        store._real.begin_scan = original
+    assert failed[1] == world["ui"]["CLIPS_GALLERY_INITIAL_HTML"]
+
+    release.set()
+    thread.join(30)
+    a_report, a_grid, _, a_confirm = box["A"]
+
+    assert _session_of(a_grid) == (None, None), \
+        "A resurrected its own page after a newer scan had already revoked it"
+    assert a_grid == world["ui"]["CLIPS_GALLERY_INITIAL_HTML"]
+    assert a_confirm == {"interactive": False}
+    assert world["ns"]["_clips_view"](owner) == {}
+    assert a_session, "A really had published before being superseded"
+
+    # Not a permanently dead gallery: the next scan restores one.
+    assert _session_of(_scan(world, owner)[1])[0]
+
+
+def test_two_owners_do_not_supersede_each_other_after_publication(world):
+    """Interleaving 5: A and B belong to different browsers and must not interact."""
+    owner_a, owner_b = "browser-N1-a", "browser-N1-b"
+    thread, release, box = _paused_after_publication(world, owner_a)
+    a_session = world["ns"]["_clips_view"](owner_a)["session"]
+
+    other = _scan(world, owner_b)
+    b_session, _ = _session_of(other[1])
+
+    release.set()
+    thread.join(30)
+    a_grid = box["A"][1]
+
+    assert _session_of(a_grid)[0] == a_session, \
+        "another owner's scan superseded this one"
+    assert b_session != a_session
+    assert world["ns"]["_clips_view"](owner_a)["session"] == a_session
+    assert world["ns"]["_clips_view"](owner_b)["session"] == b_session
+
+
+def test_the_scan_handler_renders_from_the_authoritative_view(world):
+    """Structural: the grid is built from the published view, not from the scan's own locals.
+
+    A behavioural test can only catch the interleavings it schedules; this catches a future edit
+    that quietly goes back to the locals, whatever the timing.
+    """
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    handler = next(node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "_on_clips_scan")
+
+    assignments = [ast.unparse(node) for node in ast.walk(handler)
+                   if isinstance(node, ast.Assign)]
+    assert "current = _clips_view(owner)" in assignments, \
+        "the handler must re-read the authoritative view before rendering"
+
+    calls = [node for node in ast.walk(handler) if isinstance(node, ast.Call)
+             and ast.unparse(node.func) == "fork_clips.gallery_html"]
+    assert len(calls) == 1, f"expected exactly one gallery_html call, found {len(calls)}"
+    args = [ast.unparse(argument) for argument in calls[0].args]
+    assert args[0] == "current['entries']"
+    assert args[2] == "current['identity']"
+    assert args[3] == "current['session']"
+    assert args[4] == "current['page']"
+    for stale in ("entries", "identity", "session_id", "page_token"):
+        assert stale not in args, (
+            f"the grid is still built from the scan's local {stale!r}; a scan superseded after "
+            "publishing would hand the browser revoked credentials")

@@ -695,12 +695,49 @@ AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
 )
 
 
+#: Gradio's event-registration methods. Calling one of these is how a component attaches
+#: behaviour -- including client-side script -- to the app. Any *other* call is ordinary Python
+#: and is none of this guard's business, which is what keeps the fail-closed rule below from
+#: rejecting unrelated code.
+GRADIO_EVENT_METHODS = frozenset({
+    "blur", "change", "clear", "click", "collapse", "download", "edit", "end", "expand",
+    "focus", "input", "key_up", "like", "load", "pause", "play", "release", "retry",
+    "select", "stop", "stream", "submit", "success", "then", "tick", "undo", "upload",
+})
+
+#: What :func:`_javascript_registrations` reports for an event registration whose keywords cannot
+#: be read statically. Deliberately not a script name, so it can never match the allowlist.
+OPAQUE_REGISTRATION = "**<keywords not statically readable>"
+
+
 def _javascript_registrations(tree):
-    """Every call in `gui.py` carrying `js=` or `_js=`, as (callee, argument) pairs."""
+    """Every call in `gui.py` that can carry client-side JavaScript, as (callee, argument) pairs.
+
+    [R5-P9 / N3] **Fails closed on keyword unpacking.** `ast` represents `**mapping` as a
+    `keyword` whose `arg` is `None`, so the old loop -- which only ever compared `keyword.arg`
+    against the two names -- skipped it silently. An event registered through a dynamic keyword
+    dictionary therefore produced *no* pair at all, the exact-equality check below compared the
+    allowlist against a set that simply did not contain it, and the guard passed something it had
+    never looked at. That is the worst failure mode a guard can have: not a wrong answer, but a
+    confident answer about code it did not read.
+
+    The rule is structural, not textual: if a **Gradio event method** is called with keywords that
+    cannot be resolved statically, the registration is reported as :data:`OPAQUE_REGISTRATION`,
+    which is on no allowlist and so fails the comparison. The guard does not try to prove what is
+    inside the mapping -- it cannot, in general -- it refuses to certify what it cannot read.
+
+    Scoping to :data:`GRADIO_EVENT_METHODS` is what keeps this honest in the other direction.
+    `gui.py` legitimately calls `sink.update(**payload)` and `fork_cutter_batch.BatchItem(**fields)`;
+    neither can attach script to the app, and neither is rejected. A positive control for the one
+    approved registration, and negative controls for both evasion shapes, are below.
+    """
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        if (getattr(node.func, "attr", None) in GRADIO_EVENT_METHODS
+                and any(keyword.arg is None for keyword in node.keywords)):
+            found.append((ast.unparse(node.func), OPAQUE_REGISTRATION))
         for keyword in node.keywords:
             if keyword.arg in ("js", "_js"):
                 found.append((ast.unparse(node.func), ast.unparse(keyword.value)))
@@ -746,6 +783,88 @@ def test_the_allowlist_itself_rejects_a_planted_registration():
     assert ("open_output_folder_btn.click", "ANY_SCRIPT") not in \
         AUTHORIZED_JAVASCRIPT_REGISTRATIONS, (
         "the protected button must never be allowlisted for JavaScript")
+
+
+# ---------------------------------------------------------------------------------------------
+# [R5-P9 / N3] The allowlist must not be evadable by keyword unpacking.
+#
+# The fixtures below are parsed from source built at run time, and the keyword name is assembled
+# rather than written out. Two reasons, in order of importance. First, these tests must fail
+# because of the *shape* of the registration in the AST, never because some literal happens to
+# appear in this file -- a guard that trips on its own explanatory text proves nothing about the
+# behaviour it claims to pin. Second, this repository carries raw-source substring guards, and
+# planting a forbidden literal where one of them might read it has produced false failures before.
+# ---------------------------------------------------------------------------------------------
+
+_JS_KEYWORD = "j" + "s"
+
+
+def _registration_fixture(source):
+    """Parse a one-line fixture and return what the guard makes of it."""
+    return _javascript_registrations(ast.parse(source))
+
+
+def test_a_registration_hidden_behind_keyword_unpacking_cannot_evade_the_allowlist():
+    """The N3 bypass, as an assertion.
+
+    `ast` reports `keyword.arg is None` for `**mapping`, so before this fix the guard returned an
+    empty list for the registration below and the exact-equality check passed it without ever
+    reading it. Now the call is reported as opaque, which is on no allowlist.
+    """
+    hidden = "{'" + _JS_KEYWORD + "': EVIL_SCRIPT}"
+    source = f"protected_btn.click(fn=None, inputs=None, outputs=None, **{hidden})"
+
+    # The fixture really is the shape under test: an event call with an unreadable keyword.
+    call = ast.parse(source).body[0].value
+    assert isinstance(call, ast.Call) and call.func.attr in GRADIO_EVENT_METHODS
+    assert any(keyword.arg is None for keyword in call.keywords), \
+        "the fixture must use keyword unpacking, or it is not testing N3"
+
+    found = _registration_fixture(source)
+    assert found == [("protected_btn.click", OPAQUE_REGISTRATION)], (
+        "an event registration whose keywords cannot be read statically must be reported, "
+        f"not silently skipped: {found!r}")
+    assert found != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS), \
+        "the opaque registration must not compare equal to the allowlist"
+
+
+def test_an_unauthorized_named_javascript_keyword_on_another_event_is_still_reported():
+    """The ordinary, non-unpacked evasion. This never regressed; it must not start to."""
+    source = f"process_btn.click(fn=None, {_JS_KEYWORD}=EVIL_SCRIPT)"
+    found = _registration_fixture(source)
+    assert found == [("process_btn.click", "EVIL_SCRIPT")]
+    assert found != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+
+
+def test_the_approved_installer_still_reads_as_the_only_registration():
+    """The positive control: the fix must not reject the one legitimate case.
+
+    Read from the shipped `gui.py`, so this fails if the real registration ever stops matching.
+    """
+    assert _javascript_registrations(_tree(_GUI)) == sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+
+
+def test_ordinary_keyword_unpacking_is_not_mistaken_for_an_event_registration():
+    """Fail-closed on event registrations, not on `**kwargs` as such.
+
+    Grounded in the real source rather than a hypothetical: `gui.py` genuinely contains calls that
+    unpack a mapping, and none of them is a Gradio event method. If a future change made the guard
+    reject plain `**kwargs`, the suite would start failing on unrelated, legitimate code -- so this
+    asserts both that such calls exist and that they are ignored.
+    """
+    for source in ("sink.update(**payload)",
+                   "fork_cutter_batch.BatchItem(**fields)",
+                   "helper(**options)"):
+        assert _registration_fixture(source) == [], f"{source} must not be reported"
+
+    unpacking_calls = [
+        node for node in ast.walk(_tree(_GUI))
+        if isinstance(node, ast.Call) and any(k.arg is None for k in node.keywords)]
+    assert unpacking_calls, "expected gui.py to contain at least one **kwargs call"
+    assert all(getattr(node.func, "attr", None) not in GRADIO_EVENT_METHODS
+               for node in unpacking_calls), (
+        "gui.py now unpacks keywords into a Gradio event registration; that is exactly what the "
+        "N3 guard refuses to certify, and it needs a deliberate decision rather than a test edit")
 
 
 def test_no_progress_stage_was_invented_for_the_folder_button():

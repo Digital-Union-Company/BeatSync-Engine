@@ -631,16 +631,42 @@ class ScanCoordinator:
             return True
 
     def view(self, owner: Any) -> dict:
-        """The owner's current page, or ``{}``. Never raises for an unknown owner."""
+        """The owner's current page, or ``{}``. Never raises for an unknown owner.
+
+        [R5-P9 / N4] **A stored view is current only while its own generation is still the
+        newest.** The window this closes is structural rather than incidental: :meth:`begin`
+        makes a new scan the newest *before* that scan enters :meth:`authority` and calls
+        ``new_session``, which revokes the owner's previous session -- and the poster pass between
+        that revocation and :meth:`publish` takes seconds. For that whole interval the stored view
+        named a session the registry had already revoked, so every caller of this method
+        (``_clips_view``, Refresh, and the ``/r5state`` read) described a dead page as current and
+        every tile in the repainted grid answered ``403 unknown_session``.
+
+        A transition therefore reads as **empty**, which is the honest answer: there is no current
+        page until the newest scan publishes one. That is deliberately the same shape as "no scan
+        yet" -- an empty gallery is a state the operator can act on, whereas a page of revoked
+        credentials is not.
+
+        Two properties this must not break, and does not:
+
+        * a scan refused *before* :meth:`begin` takes a generation never moves ``_newest``, so a
+          bad folder or an empty enumeration cannot blank an otherwise valid current view;
+        * a newest scan that fails still calls :meth:`discard`, and this check additionally means
+          an older page cannot look current even if that discard were ever missed.
+        """
         try:
             key = _require_owner(owner)
         except Refusal:
             return {}
         with self._lock:
             view = self._views.get(key)
-            if view is not None:
-                self._views.move_to_end(key)
-            return view or {}
+            if view is None:
+                return {}
+            if view.get("generation") != self._newest.get(key):
+                # Superseded by a scan that has started and has not published yet.
+                return {}
+            self._views.move_to_end(key)
+            return view
 
     def discard(self, owner: Any, generation: Any) -> bool:
         """Clear the owner's view if ``generation`` is still the newest.
@@ -1300,6 +1326,21 @@ def _io_detail(exc: BaseException) -> str:
     return detail
 
 
+def io_detail(exc: BaseException) -> str:
+    """[R5-P9] The public spelling of :func:`_io_detail`, for callers outside this module.
+
+    ``gui.py`` reports a failed scan and a failed optional compaction in the operator's status
+    box. Those messages interpolated the exception, and a bare ``OSError`` stringifies with
+    ``filename`` -- and ``filename2`` -- attached, so the journal or snapshot path reached the
+    screen by exactly the route the 503 body was corrected for. The rule is one rule, so it has
+    one implementation rather than a second copy in the view layer.
+
+    ``PersistenceError`` and :class:`Refusal` are *not* passed through here: their own messages
+    are already path-free by construction and say more than a number does.
+    """
+    return _io_detail(exc)
+
+
 @dataclass(slots=True)
 class Record:
     identity: str
@@ -1698,6 +1739,7 @@ __all__ = [
     "discover_clips",
     "freeze_page",
     "identify_root",
+    "io_detail",
     "parse_range",
     "protected_destinations",
     "validate_roots",

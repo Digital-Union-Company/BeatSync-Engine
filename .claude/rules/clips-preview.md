@@ -144,13 +144,32 @@ per-owner view, in one object, because the two must be consulted together:
    generation **while holding the owner's lock** and raises `SupersededScan` otherwise;
 4. the poster pass runs **outside** that lock — and takes no render lock and joins no concurrency
    group;
-5. `publish()` installs the view only if the generation is still newest.
+5. `publish()` installs the view only if the generation is still newest;
+6. [R5-P9 / N1] the handler then renders its response **from the authoritative view**, re-read
+   after publication — never from the locals it built. Publishing successfully is not the end of
+   the race: the poster pass and the journal compaction both take real time, and a second scan can
+   supersede this one afterwards, after which `entries`, `session_id` and `page_token` name a
+   session `new_session` has already revoked. A structural test pins the `gallery_html` arguments
+   to the re-read view, because a behavioural test can only catch the interleavings it schedules.
 
-Two consequences that are requirements, not side effects. A **superseded** scan repaints the
+Three consequences that are requirements, not side effects. A **superseded** scan repaints the
 *authoritative* page rather than the one it built — handing the browser its own grid would display
-a revoked session as current, since whichever response arrives last is what the operator sees. And
-a **newest scan that fails** calls `discard()`, so the operator is left with an honest empty state
-rather than an older revoked page silently resurrected.
+a revoked session as current, since whichever response arrives last is what the operator sees. A
+**newest scan that fails** calls `discard()`, so the operator is left with an honest empty state
+rather than an older revoked page silently resurrected. And [R5-P9 / N4] **a stored view is
+current only while its own generation is still the newest**: `begin()` makes a new scan the newest
+*before* that scan revokes the previous session, so for the whole interval up to its `publish()`
+the stored view named an already-revoked session. `ScanCoordinator.view()` therefore answers `{}`
+during a transition, and every reader — the handler, Refresh and the `/r5state` read — sees the
+same honest "no current page" rather than a grid whose every tile answers `403 unknown_session`.
+An empty gallery is a state the operator can act on; a page of dead credentials is not.
+
+**What this does *not* promise.** A server-side generation check cannot order HTTP responses. If a
+superseded scan's response is assembled before the newer scan publishes, it paints the empty state
+and can still arrive *after* the newer scan's grid, leaving the browser momentarily empty while a
+live page exists. That is recovered by Refresh, which repaints from the authoritative view, and by
+the client's resync on an untrustworthy page — never by a permanently dead gallery. Do not claim
+response ordering that is not proved at the client boundary.
 
 The locks are per owner, so two operators never block each other. A narrow
 `concurrency_limit=1` on the scan event would be acceptable as defence in depth, but Gradio queue
@@ -223,8 +242,68 @@ raises `PersistenceError` and the endpoint answers 503** — the operator must n
 a decision that is not on disk. Do not swallow it, and do not reintroduce a single unchecked
 `os.write`.
 
-**A write that fails raises `PersistenceError` and the endpoint answers 503.** The operator must
-never see a tick for a decision that is not on disk. Do not swallow it.
+[R5-P5 / N2 · R5-P7 / N6] **Failing to *inspect* the journal is not an answer either.** The tail
+probe raises `PersistenceError` when it cannot determine whether the tail is terminated: an
+unknown journal state is not a licence to append, nor to assume damage and write a repair newline
+into a file whose condition could not be read. `_load`'s tolerance of an unreadable journal is
+about start-up recovery and says nothing about whether an append may proceed.
+
+> **Open, deliberately not fixed here (R5-P8 / N7).** That tolerance is itself asymmetric: the
+> *write* path now refuses when it cannot inspect the journal, while the *read* path still answers
+> "empty". A journal that is transiently unreadable at construction — an exclusive share lock from
+> a backup or indexer is enough — makes every previously decided clip come back as `PENDING`, with
+> no exception and nothing said to the operator. No decision is lost and a later readable start
+> recovers all of them, so this is transient under-reporting rather than data loss. Do **not**
+> silently change `_load` to "fix" it; it is an owner decision with its own scope.
+
+**The carve-out for a missing journal is conditioned on the open descriptor, never on the error
+class.** "The file is not there" is a definite answer only when no append is in flight.
+`FileNotFoundError` does **not** mean "missing": Python maps six Windows codes onto it —
+`ERROR_FILE_NOT_FOUND` (2), `ERROR_PATH_NOT_FOUND` (3), `ERROR_INVALID_DRIVE` (15),
+`ERROR_BAD_NETPATH` (53), `ERROR_BAD_NET_NAME` (67) and `ERROR_BAD_PATHNAME` (161) — and five of
+those say *the pathname did not resolve* while the journal still sits on disk with a torn tail.
+Reading all six as proof of a terminated tail reinstated the exact false success the repair exists
+to prevent, through all three of the probe's I/O steps. So `_append` passes the descriptor it
+already holds down to the probe, and **once that descriptor is held no inspection failure of any
+class may be read as "terminated"**. Do not substitute `os.path.exists` or `os.path.lexists`: they
+answer "no" for an unresolvable path exactly as readily as for an absent one, which is the
+confusion being removed.
+
+Stated precisely, because the distinction matters to anyone editing it: the descriptor parameter
+is **not** dereferenced or validated by the probe — its only use is `open_handle is None`. What
+guarantees the production caller supplies a genuinely open handle is the **closed call graph**:
+`_journal_tail_is_terminated` has exactly one caller, `_terminate_damaged_tail`, which has exactly
+one caller, `_append`, which opens the journal first. Keep that call graph closed; a future caller
+passing `None` while an append is in flight would reopen the hole, and only the structure prevents
+it.
+
+**Every client-visible persistence error carries numbers only.** `PersistenceError` reaches the
+browser in the 503 body, and `str(OSError)` appends `filename` — and `filename2` — whenever the
+failing call was made by pathname, so interpolating the exception put the journal's absolute path
+in that body. It was reachable with no fault injection at all: a read-only ACL on the journal, or
+another process holding it with no sharing. All four messages go through `_io_detail`, which emits
+`errno`, plus `winerror` **when CPython supplies one**, plus the short-write byte count. `winerror`
+is not guaranteed: it is present from `os.path.getsize`, and absent from `builtins.open`,
+`os.open`, `os.write` and `os.fsync`, which set `errno` only — so do not build a diagnosis that
+requires it. Keep `raise … from exc` everywhere, so the full exception, path included, stays
+reachable internally through the traceback. The same rule applies to the operator-visible status
+box, not just the 503 body: `gui.py` formats a bare `OSError` through `io_detail` and leaves
+`PersistenceError` and `Refusal` messages as-is, because those are already path-free.
+
+**Testing for an absent path must be separator-insensitive.** `str(OSError)` runs `repr()` over
+its filenames, which doubles every backslash, and a JSON body doubles them again — so
+`assert path not in message` passes against a message that *does* leak the path. Compare with the
+separators stripped from both sides, and prove the assertion is live against the vulnerable
+version before trusting it.
+
+[R5-P9 / N5] **Compaction is an optimisation over the journal, never the record, and its failure
+must not cost a scan.** `maybe_compact()` runs after the scan has already published a page and
+minted live credentials; letting an `OSError` from it escape the handler destroyed a scan that had
+entirely succeeded. Contain it, report it honestly in the status box, and serve the page — the
+journal remains authoritative and every committed decision is still recoverable. Contain the two
+I/O classes only: a `TypeError` from a programming mistake must still surface. Both failure points
+are covered by regression tests, because they fail at opposite ends of the operation — before the
+snapshot lands, and after it has landed but before the journal is truncated.
 
 Location is load-bearing: **never** beside the source media, and **never** under
 `input/gradio_uploads` — `cleanup_on_startup` deletes everything under `input/` except `audio`,

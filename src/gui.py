@@ -6322,6 +6322,21 @@ def _clips_view(owner: str) -> dict:
     return _CLIPS_SCANS.view(owner)
 
 
+def _clips_failure_text(failure) -> str:
+    """Operator-visible text for a failed clips operation, carrying no filesystem path.
+
+    [R5-P9] `PersistenceError` and `Refusal` already carry a deliberately path-free message --
+    that is the R5-P7 contract the HTTP 503 body depends on, and it says more than a number does,
+    so it is used as-is. A bare `OSError` is the opposite: it stringifies with `filename` (and
+    `filename2`) attached whenever the failing call was made by pathname, so interpolating one put
+    the journal's or the snapshot's absolute path into the status box the operator is looking at.
+    Those are reported as numbers, by the same formatter the 503 body uses.
+    """
+    if isinstance(failure, OSError):
+        return fork_clips.io_detail(failure)
+    return str(failure)
+
+
 def _clips_poster_exists(entry) -> bool:
     try:
         return os.path.getsize(fork_clips.poster_path_for(CLIPS_POSTER_DIR, entry)) > 0
@@ -6392,7 +6407,11 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     3. the authority-changing calls (`begin_scan`, `new_session`, `publish_page`) run inside
        `authority(...)`, which re-checks the generation **while holding the owner's lock**;
     4. the slow poster pass runs **outside** that lock, and takes no render lock;
-    5. `publish()` installs the view only if this generation is still the newest.
+    5. `publish()` installs the view only if this generation is still the newest;
+    6. [R5-P9 / N1] the response itself is then rendered from the **authoritative view**, not from
+       this scan's locals, so a scan superseded after it published repaints what is current
+       instead of returning markup whose session has already been revoked;
+    7. [R5-P9 / N5] the optional journal compaction cannot destroy a scan that has succeeded.
 
     A superseded scan therefore changes nothing and repaints the authoritative page; a newest scan
     that *fails* discards the view rather than leaving an older revoked page looking current.
@@ -6455,15 +6474,41 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
         # A failed NEWEST scan must leave an honest empty state. Resurrecting the previous page
         # would present a revoked session as current.
         _CLIPS_SCANS.discard(owner, generation)
-        return (f"❌ The scan failed and nothing is loaded: {failure}",
+        return (f"❌ The scan failed and nothing is loaded: {_clips_failure_text(failure)}",
                 empty[0], empty[1], gr.update(interactive=False))
 
-    store.maybe_compact()
+    # [R5-P9 / N5] Compaction is an optimisation over the journal, never the record itself, and
+    # it runs *after* this scan has already published a valid page and minted live credentials.
+    # Letting its failure escape therefore destroyed a scan that had entirely succeeded: the
+    # operator lost the gallery they were already entitled to, for a failure that costs nothing.
+    # The journal stays authoritative and every committed decision remains recoverable, so the
+    # page is served and the failure is reported honestly instead. Only the two I/O classes are
+    # contained -- a `TypeError` from a programming mistake in `compact()` must still surface.
+    compaction_notice = ''
+    try:
+        store.maybe_compact()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        compaction_notice = (
+            "\n⚠️  Journal housekeeping (compaction) failed and was skipped "
+            f"({_clips_failure_text(failure)}). Your decisions are safe: the journal is the "
+            "record, and every decision already made is still in it.")
 
-    identities = _clips_identities(view)
+    # [R5-P9 / N1] Render from the authoritative view, never from this scan's own locals.
+    # Publication succeeded above, but the poster pass and the compaction below both take real
+    # time, and a second scan can supersede this one in between -- after which `entries`,
+    # `identity`, `session_id` and `page_token` name a session `new_session` has already revoked.
+    # Handing that markup to the browser is the F1 symptom returning by a later route: every tile
+    # answers 403. Deriving the response from `_clips_view` means a superseded scan repaints
+    # whatever is current instead, so whichever response the browser receives last is live.
+    current = _clips_view(owner)
+    if current.get('generation') != generation:
+        return _clips_render_current(owner, CLIPS_SCAN_SUPERSEDED_TEXT)
+
+    identities = _clips_identities(current)
     counts = store.counts(identities)
-    grid = fork_clips.gallery_html(entries, store.snapshot_of(identities), identity,
-                                   session_id, page_token, _clips_poster_exists)
+    grid = fork_clips.gallery_html(current['entries'], store.snapshot_of(identities),
+                                   current['identity'], current['session'], current['page'],
+                                   _clips_poster_exists)
     report = (
         f"Enumerated {len(found.files)} clip(s) under:\n{found.root}\n"
         f"Subfolders: {'included' if recursive else 'excluded'}\n"
@@ -6473,7 +6518,7 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
         f"(cached {posters.hits}, made {posters.generated}, "
         f"no frame {posters.failures}, {posters.workers} worker(s))\n"
         "Read-only: metadata and one poster frame per clip. No file was moved, renamed or deleted."
-    )
+    ) + compaction_notice
     return (report, grid, fork_clips.counts_text(counts),
             gr.update(interactive=counts[fork_clips.PENDING] == 0))
 
