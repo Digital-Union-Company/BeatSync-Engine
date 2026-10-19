@@ -24,8 +24,9 @@ is streamed in bounded chunks, so peak memory does not scale with clip size.
 Four routes are claimed. Everything else is passed through to Gradio unchanged:
 
     GET|HEAD  /r5clip/{session}/{page}/{clip}     video bytes, byte-range capable
-    GET|HEAD  /r5poster/{session}/{page}/{clip}   poster JPEG, same authorization
-    POST      /r5decide/{session}/{page}/{clip}   one classification
+    GET|HEAD  /r5poster/{session}/{page}/{clip}   poster JPEG, same authorization *and* the same
+                                                  live-source descriptor identity gate
+    POST      /r5decide/{session}/{page}/{clip}   one classification, mandatory expected revision
     GET       /r5state/{session}/{page}           the server's authoritative record
 """
 
@@ -145,6 +146,16 @@ class ClipMediaMiddleware:
 
         if prefix == POSTER_PREFIX:
             entry = self.registry.resolve(session_id, page_token, clip_id)
+            # [R5-P3 / F5] The poster route revalidates the LIVE SOURCE on its opened descriptor,
+            # exactly as the clip route does. Authorizing page membership and then serving a
+            # cached JPEG was an asymmetry, not a design: a replaced or truncated source made the
+            # clip route answer 409 while the poster route kept serving a thumbnail of a file
+            # that no longer exists in that form, so the operator was shown a frame they could
+            # not play and could not classify. `open_entry` is the same one implementation, so
+            # the two routes cannot drift into checking different things, and it raises the same
+            # 409/410/403 refusals. The fd is closed immediately: it is a gate, not the body.
+            source_fd, entry = self.registry.open_entry(entry)
+            os.close(source_fd)
             poster = self.poster_resolver(entry) if self.poster_resolver else None
             if not poster or not os.path.isfile(poster):
                 raise core.Refusal(404, "poster_unavailable")

@@ -706,6 +706,21 @@ CLIPS_GALLERY_INITIAL_HTML = (
 CLIPS_CONFIRM_DISABLED_TEXT = (
     "Confirm is disabled until every clip on the page is decided. Undecided is not a decision."
 )
+# [R5-P3 / F8] Classifying posts straight to the server rather than through a Gradio event, which
+# is deliberate -- but it means a decision cannot re-enable the Confirm button by itself. Without
+# this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
+# It is display text: it enables nothing, and only Refresh moves the button, from the durable
+# record.
+CLIPS_REFRESH_TO_ENABLE_HINT = (
+    'All clips decided — press "Re-read the server\'s record" to enable Confirm.'
+)
+# [R5-P3 / F1] A scan that was overtaken by a newer scan of the same browser session. It changed
+# nothing, and the gallery it is replacing shows the newest page rather than its own, whose
+# session the newer scan already revoked.
+CLIPS_SCAN_SUPERSEDED_TEXT = (
+    "This scan was superseded by a newer one and was discarded.\n"
+    "Nothing was changed. The gallery below shows the newest scan's page."
+)
 CLIPS_CONFIRM_READY_TEXT = (
     "Every clip on this page is decided.\n\n"
     "**Moving files is NOT enabled in this phase.** Nothing has been moved, renamed or deleted. "

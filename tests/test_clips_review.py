@@ -822,12 +822,26 @@ def test_the_store_directory_is_not_under_gradio_uploads():
 # 9. Posters
 # =============================================================================================
 
+#: [R5-P3 / F6] A COMPLETE minimal JPEG: start-of-image, a little payload, end-of-image.
+#:
+#: The fixtures below used to write the three SOI bytes only. `ensure_posters` now distinguishes a
+#: finished poster from a truncated one by the end-of-image marker -- because a size check cannot,
+#: which is how a poster truncated by a killed FFmpeg used to count as a permanent cache hit. So a
+#: fixture writing SOI alone was standing in for exactly the corruption the check must reject.
+#: Every assertion in this section is unchanged; only the fixture became realistic.
+_JPEG = b"\xff\xd8\xff\xdb" + b"\x00" * 48 + b"\xff\xd9"
+
+
 def test_the_poster_argv_is_built_in_one_place_and_seeks_before_decoding():
     argv = cr.build_poster_command("ffmpeg.exe", "in.mp4", "out.jpg", 1.0)
     assert argv[0] == "ffmpeg.exe"
     assert argv.index("-ss") < argv.index("-i"), "seeking after -i would decode the whole clip"
     assert "-frames:v" in argv and argv[-1] == "out.jpg"
     assert f"scale={cr.POSTER_WIDTH}:-2" in argv
+    # [R5-P3 / F6] The destination is an attempt file now, so the format must be stated rather
+    # than inferred from the output filename's extension.
+    assert argv[argv.index("-f") + 1] == "image2"
+    assert argv[argv.index("-c:v") + 1] == "mjpeg"
 
 
 def test_poster_keys_change_when_the_clip_changes(tmp_path):
@@ -847,7 +861,7 @@ def test_posters_are_generated_once_then_cached(tmp_path, clips_tree):
     def runner(argv, timeout):
         calls.append(argv)
         with open(argv[-1], "wb") as handle:
-            handle.write(b"\xff\xd8\xff")
+            handle.write(_JPEG)
         return 0
 
     cache = str(tmp_path / "posters")
@@ -894,7 +908,7 @@ def test_poster_concurrency_is_bounded_to_four(tmp_path, clips_tree):
 
     def runner(argv, timeout):
         with open(argv[-1], "wb") as handle:
-            handle.write(b"\xff\xd8\xff")
+            handle.write(_JPEG)
         return 0
 
     outcome = cr.ensure_posters(entries, str(tmp_path / "posters"), "ffmpeg", runner, workers=99)
@@ -905,7 +919,7 @@ def test_the_poster_cache_is_pruned_to_a_bound(tmp_path):
     cache = tmp_path / "posters"
     cache.mkdir()
     for index in range(12):
-        _make(str(cache / f"{index:032x}.jpg"), b"\xff\xd8\xff")
+        _make(str(cache / f"{index:032x}.jpg"), _JPEG)
     removed = cr.prune_poster_cache(str(cache), limit=5)
     assert removed == 7
     assert len(os.listdir(cache)) == 5
@@ -1006,3 +1020,617 @@ def test_the_core_is_importable_on_a_bare_interpreter():
                             timeout=120)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[]", result.stdout
+
+
+# =============================================================================================
+# 13. [R5-P3] Independent-review remediation: F1, F2, F4, F6
+#
+# Every test below pins a defect that was independently reproduced on the reviewed commit
+# 2829800b and corrected in this one. They are regression tests in the strict sense: each one
+# fails on the pre-remediation source.
+# =============================================================================================
+
+import threading                                                            # noqa: E402
+import time                                                                 # noqa: E402
+
+
+# ---- F1: the same-owner scan generation protocol -------------------------------------------
+
+def test_scan_generations_are_monotonic_and_per_owner():
+    coordinator = cr.ScanCoordinator()
+    a1 = coordinator.begin("owner-a")
+    b1 = coordinator.begin("owner-b")
+    a2 = coordinator.begin("owner-a")
+    assert a2 > a1 and b1 > a1, "generations must increase"
+    assert coordinator.newest("owner-a") == a2
+    assert coordinator.newest("owner-b") == b1, "one owner's scan must not move another's"
+    assert coordinator.is_current("owner-a", a2) and not coordinator.is_current("owner-a", a1)
+
+
+def test_an_older_generation_cannot_enter_the_authority_section():
+    """The whole point of F1: the generation check and the authority-changing calls must happen
+    together. A check followed by an unprotected new_session is what the defect was."""
+    coordinator = cr.ScanCoordinator()
+    old = coordinator.begin("owner-a")
+    new = coordinator.begin("owner-a")
+    with pytest.raises(cr.SupersededScan) as refused:
+        with coordinator.authority("owner-a", old):
+            pytest.fail("the superseded scan entered its authority section")
+    assert refused.value.generation == old and refused.value.newest == new
+    with coordinator.authority("owner-a", new):
+        pass                                        # the newest one enters
+
+
+def test_an_older_generation_cannot_publish_a_view():
+    coordinator = cr.ScanCoordinator()
+    old = coordinator.begin("owner-a")
+    new = coordinator.begin("owner-a")
+    assert coordinator.publish("owner-a", new, {"session": "new", "entries": []}) is True
+    assert coordinator.publish("owner-a", old, {"session": "old", "entries": []}) is False
+    assert coordinator.view("owner-a")["session"] == "new"
+    assert coordinator.stats()["superseded_scans"] == 1
+
+
+def test_the_authority_section_serialises_concurrent_same_owner_scans():
+    """Two threads racing the authority section: exactly one must get through, and it must be
+    the newer generation."""
+    coordinator = cr.ScanCoordinator()
+    started = threading.Barrier(2)
+    results = []
+
+    def attempt(generation):
+        started.wait(10)
+        try:
+            with coordinator.authority("owner-a", generation):
+                time.sleep(0.01)
+                results.append(("entered", generation))
+        except cr.SupersededScan:
+            results.append(("refused", generation))
+
+    old = coordinator.begin("owner-a")
+    new = coordinator.begin("owner-a")
+    threads = [threading.Thread(target=attempt, args=(g,)) for g in (old, new)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    assert ("entered", new) in results
+    assert ("refused", old) in results
+    assert [r for r in results if r[0] == "entered"] == [("entered", new)]
+
+
+def test_a_failed_newest_scan_discards_rather_than_resurrecting_an_older_page():
+    coordinator = cr.ScanCoordinator()
+    first = coordinator.begin("owner-a")
+    coordinator.publish("owner-a", first, {"session": "first", "entries": [1]})
+    second = coordinator.begin("owner-a")
+    assert coordinator.discard("owner-a", second) is True
+    assert coordinator.view("owner-a") == {}, (
+        "a failed newest scan must leave an honest empty state, not the previous page")
+
+
+def test_an_older_generation_cannot_discard_the_newest_view():
+    coordinator = cr.ScanCoordinator()
+    old = coordinator.begin("owner-a")
+    new = coordinator.begin("owner-a")
+    coordinator.publish("owner-a", new, {"session": "new", "entries": [1]})
+    assert coordinator.discard("owner-a", old) is False
+    assert coordinator.view("owner-a")["session"] == "new"
+
+
+def test_the_coordinator_is_bounded_and_forgets_owners():
+    coordinator = cr.ScanCoordinator(max_owners=3)
+    for index in range(6):
+        owner = f"owner-{index}"
+        coordinator.publish(owner, coordinator.begin(owner), {"session": owner, "entries": []})
+    assert coordinator.stats()["owners"] <= 3
+    assert coordinator.view("owner-0") == {}, "the oldest owner was evicted"
+    assert coordinator.view("owner-5")["session"] == "owner-5"
+    coordinator.forget("owner-5")
+    assert coordinator.view("owner-5") == {}
+
+
+def test_coordinator_identity_fails_closed():
+    coordinator = cr.ScanCoordinator()
+    for bad in (None, "", "   ", 7, "a" * 200, "has space", "has/slash"):
+        with pytest.raises(cr.Refusal):
+            coordinator.begin(bad)
+    assert coordinator.view(None) == {}, "view must not raise for an unusable owner"
+
+
+def test_a_non_integer_generation_can_never_publish():
+    coordinator = cr.ScanCoordinator()
+    generation = coordinator.begin("owner-a")
+    for bad in (None, "1", "abc", 1.5, [], {}):
+        assert coordinator.publish("owner-a", bad, {"session": "x", "entries": []}) is False
+    assert coordinator.publish("owner-a", generation, {"session": "ok", "entries": []}) is True
+
+
+# ---- F2: the strict mandatory expected revision --------------------------------------------
+
+@pytest.mark.parametrize("payload,code", [
+    ({}, cr.REVISION_REQUIRED),
+    ({"to": "SELECTED"}, cr.REVISION_REQUIRED),
+    ({"rev": None}, cr.REVISION_REQUIRED),
+    ({"rev": "0"}, cr.MALFORMED_REVISION),
+    ({"rev": "1"}, cr.MALFORMED_REVISION),
+    ({"rev": "1abc"}, cr.MALFORMED_REVISION),
+    ({"rev": "abc"}, cr.MALFORMED_REVISION),
+    ({"rev": True}, cr.MALFORMED_REVISION),
+    ({"rev": False}, cr.MALFORMED_REVISION),
+    ({"rev": 0.9}, cr.MALFORMED_REVISION),
+    ({"rev": 1.0}, cr.MALFORMED_REVISION),
+    ({"rev": -1}, cr.MALFORMED_REVISION),
+    ({"rev": []}, cr.MALFORMED_REVISION),
+    ({"rev": {}}, cr.MALFORMED_REVISION),
+    ("not a dict", cr.REVISION_REQUIRED),
+    (None, cr.REVISION_REQUIRED),
+])
+def test_only_a_genuine_nonnegative_json_integer_is_an_expected_revision(payload, code):
+    """F2. Coercing with int() under except (TypeError, ValueError) -> expected = None turned
+    every one of these into "skip the concurrency check" -- a fail-open, and reachable from the
+    shipped client because JSON.stringify of NaN is null."""
+    with pytest.raises(cr.RevisionError) as refused:
+        cr.parse_expected_revision(payload)
+    assert refused.value.code == code
+
+
+@pytest.mark.parametrize("value", [0, 1, 2, 99, 10 ** 9])
+def test_a_valid_revision_parses_to_itself(value):
+    assert cr.parse_expected_revision({"to": "SELECTED", "rev": value}) == value
+
+
+def test_bool_is_rejected_even_though_it_is_an_int_subclass():
+    """isinstance(True, int) is True in Python, so without an explicit guard a JSON true would
+    be read as revision 1."""
+    assert isinstance(True, int)
+    with pytest.raises(cr.RevisionError):
+        cr.parse_expected_revision({"rev": True})
+
+
+def test_the_store_refuses_a_non_integer_expected_revision_rather_than_coercing(tmp_path):
+    """Defence in depth. int(0.9) is 0 and int(True) is 1, so coercion here would quietly
+    compare against the wrong revision."""
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "ident", cr.SELECTED, "scan-1", 0)
+    for bad in (0.9, 1.0, True, "0", [0]):
+        with pytest.raises(cr.StaleWrite) as refused:
+            store.decide("owner-a", "ident", cr.REJECTED, "scan-1", bad)
+        assert refused.value.code == cr.MALFORMED_REVISION
+    assert store.get("ident") == (cr.SELECTED, 1), "none of them may touch the record"
+
+
+def test_expected_revision_none_is_still_available_to_internal_callers(tmp_path):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    assert store.decide("owner-a", "ident", cr.SELECTED, "scan-1", None) == (cr.SELECTED, 1)
+
+
+def test_a_refused_revision_appends_nothing_to_the_journal(tmp_path):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "ident", cr.SELECTED, "scan-1", 0)
+    journal = os.path.join(store.dir, "review-journal.jsonl")
+    with open(journal, "rb") as handle:
+        before = handle.read()
+    for bad in (0, 2, 7):
+        with pytest.raises(cr.StaleWrite):
+            store.decide("owner-a", "ident", cr.REJECTED, "scan-1", bad)
+    with open(journal, "rb") as handle:
+        assert handle.read() == before, "a refused decision must not reach the journal"
+    assert store.get("ident") == (cr.SELECTED, 1)
+
+
+# ---- F4: journal write durability ----------------------------------------------------------
+
+def test_a_positive_short_write_is_completed_rather_than_reported_as_done(tmp_path, monkeypatch):
+    """F4. os.write may accept fewer bytes than offered and say so in its return value with no
+    exception. The original code discarded that value, so the API reported a decision recorded
+    while a truncated record sat on disk."""
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    real_write = os.write
+    calls = []
+
+    def dribble(handle, data):
+        calls.append(len(data))
+        return real_write(handle, data[:9])
+
+    monkeypatch.setattr(os, "write", dribble)
+    assert store.decide("owner-a", "ident", cr.SELECTED, "scan-1", 0) == (cr.SELECTED, 1)
+    monkeypatch.undo()
+    assert len(calls) > 3, "the write really was short"
+    assert cr.ReviewStore(str(tmp_path / "state")).get("ident") == (cr.SELECTED, 1), (
+        "a reported success must mean a complete, recoverable record")
+
+
+def test_a_short_write_then_an_oserror_is_a_persistence_error(tmp_path, monkeypatch):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    real_write = os.write
+    state = {"n": 0}
+
+    def short_then_fail(handle, data):
+        state["n"] += 1
+        if state["n"] == 1:
+            return real_write(handle, data[:20])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "write", short_then_fail)
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "ident", cr.SELECTED, "scan-1", 0)
+    monkeypatch.undo()
+    assert "after 20 byte(s)" in str(failure.value), "the byte count belongs in the message"
+    assert store.get("ident") == (cr.PENDING, 0), "no visible decision"
+    assert cr.ReviewStore(str(tmp_path / "state")).get("ident") == (cr.PENDING, 0)
+
+
+def test_a_zero_byte_write_raises_instead_of_looping_forever(tmp_path, monkeypatch):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    monkeypatch.setattr(os, "write", lambda handle, data: 0)
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.decide("owner-a", "ident", cr.SELECTED, "scan-1", 0)
+    monkeypatch.undo()
+    assert "accepted no bytes" in str(failure.value)
+    assert cr.ReviewStore(str(tmp_path / "state")).get("ident") == (cr.PENDING, 0)
+
+
+def test_an_unterminated_tail_cannot_swallow_the_next_record(tmp_path):
+    """F4, the sharper half. The journal is O_APPEND and a record is one line, so an append
+    landing after a newline-less tail used to merge with it into a single unparsable line --
+    destroying a *later, fully successful* decision. The docstring claimed a torn write could
+    only damage the last line; it could damage the next one too."""
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "committed", cr.SELECTED, "scan-1", 0)
+    journal = os.path.join(store.dir, "review-journal.jsonl")
+
+    # what a power loss mid-write leaves behind
+    with open(journal, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+
+    restarted = cr.ReviewStore(directory)
+    restarted.begin_scan("owner-a", "scan-1")
+    assert restarted.decide("owner-a", "later", cr.REJECTED, "scan-1", 0) == (cr.REJECTED, 1)
+    assert restarted.journal_tails_repaired >= 1
+
+    recovered = cr.ReviewStore(directory)
+    assert recovered.get("later") == (cr.REJECTED, 1), (
+        "the later decision reported success, so it must survive")
+    assert recovered.get("committed") == (cr.SELECTED, 1), "committed records are preserved"
+    assert recovered.get("torn") == (cr.PENDING, 0), "the torn record never reported success"
+    assert recovered.corrupt_records_discarded == 1, "exactly one line was damaged"
+
+
+def test_every_journal_line_stays_independently_parseable_after_a_repair(tmp_path):
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    with open(os.path.join(store.dir, "review-journal.jsonl"), "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn"')
+    store.decide("owner-a", "a", cr.SELECTED, "scan-1", 0)
+    store.decide("owner-a", "b", cr.REJECTED, "scan-1", 0)
+    with open(os.path.join(store.dir, "review-journal.jsonl"), "rb") as handle:
+        lines = [line for line in handle.read().splitlines() if line.strip()]
+    parsed = 0
+    for line in lines:
+        try:
+            json.loads(line)
+            parsed += 1
+        except ValueError:
+            pass
+    assert parsed == len(lines) - 1, "only the one damaged line is unparseable"
+
+
+def test_compaction_recovers_after_a_damaged_tail(tmp_path):
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "kept", cr.SELECTED, "scan-1", 0)
+    with open(os.path.join(store.dir, "review-journal.jsonl"), "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn"')
+    store.decide("owner-a", "also", cr.REJECTED, "scan-1", 0)
+    store.compact()
+    with open(os.path.join(store.dir, "review-journal.jsonl"), "rb") as handle:
+        assert handle.read() == b"", "compaction truncates the journal"
+    after = cr.ReviewStore(directory)
+    assert after.get("kept") == (cr.SELECTED, 1)
+    assert after.get("also") == (cr.REJECTED, 1)
+    assert after.get("torn") == (cr.PENDING, 0)
+    after.begin_scan("owner-a", "scan-2")
+    assert after.decide("owner-a", "fresh", cr.SELECTED, "scan-2", 0) == (cr.SELECTED, 1)
+
+
+def test_concurrent_decisions_keep_revisions_unique_and_contiguous(tmp_path):
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    store.begin_scan("owner-a", "scan-1")
+    accepted, failures = [], []
+
+    def hammer():
+        for _ in range(10):
+            while True:
+                _, revision = store.get("shared")
+                try:
+                    accepted.append(
+                        store.decide("owner-a", "shared", cr.SELECTED, "scan-1", revision)[1])
+                    break
+                except cr.StaleWrite:
+                    continue                    # lost the race, re-read -- the designed flow
+                except Exception as error:      # noqa: BLE001
+                    failures.append(error)
+                    return
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert not failures, failures[:2]
+    assert sorted(accepted) == list(range(1, 41)), "revisions are unique and contiguous"
+    assert store.get("shared")[1] == 40
+    assert cr.ReviewStore(str(tmp_path / "state")).get("shared") == (cr.SELECTED, 40)
+
+
+# ---- F6: atomic poster publication ---------------------------------------------------------
+
+@pytest.mark.parametrize("payload,complete", [
+    (b"", False),
+    (b"\xff", False),
+    (b"\xff\xd8", False),
+    (b"\xff\xd8\xff", False),                      # start-of-image only: a truncated poster
+    (b"hello world" * 8, False),
+    (b"\xff\xd9", False),                          # end marker without a start
+    # The REALISTIC truncation: a killed FFmpeg has written several KB of a valid JPEG and then
+    # died, so the header is right, the file is far past any length threshold, and only the
+    # end-of-image marker is missing. A mutation control found that the cases above all failed
+    # for other reasons (too short, or a bad header), so none of them actually exercised the EOI
+    # check -- this one does, and it is the shape the defect took in production.
+    (b"\xff\xd8\xff\xdb" + b"\x7f" * 4096, False),
+    (b"\xff\xd8\xff\xdb" + b"\x7f" * 4096 + b"\xff\xd9", True),
+    # A bad header WITH a valid end marker. Nothing above exercised the header clause on its own,
+    # so removing it went undetected until a mutation control said so.
+    (b"this is not a jpeg at all" + b"\xff\xd9", False),
+    # Four bytes in which the start and end markers OVERLAP. Without the length floor this reads
+    # as a complete JPEG, because `seek(-2, END)` lands inside the header.
+    (b"\xff\xd8\xff\xd9", False),
+    (_JPEG, True),
+])
+def test_is_complete_jpeg_distinguishes_finished_from_truncated(tmp_path, payload, complete):
+    """F6. The old cache test was getsize(destination) > 0, which cannot tell a finished poster
+    from one a killed FFmpeg stopped half way -- so a truncated poster counted as a permanent
+    hit and that clip showed a broken image forever."""
+    path = _make(str(tmp_path / "candidate.jpg"), payload)
+    assert cr.is_complete_jpeg(path) is complete
+
+
+def test_is_complete_jpeg_is_false_for_a_missing_file(tmp_path):
+    assert cr.is_complete_jpeg(str(tmp_path / "nope.jpg")) is False
+
+
+def test_a_truncated_published_poster_is_a_miss_and_is_regenerated(tmp_path, clips_tree):
+    registry = cr.ClipRegistry()
+    files = cr.discover_clips(clips_tree, True).files
+    _, _, entries = _page(registry, "owner-a", files)
+    cache = str(tmp_path / "posters")
+    os.makedirs(cache, exist_ok=True)
+    entry = entries[0]
+    destination = cr.poster_path_for(cache, entry)
+    _make(destination, b"\xff\xd8\xff")            # what a killed FFmpeg leaves behind
+
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append(argv)
+        with open(argv[-1], "wb") as handle:
+            handle.write(_JPEG)
+        return 0
+
+    outcome = cr.ensure_posters([entry], cache, "ffmpeg", runner, workers=1)
+    assert (outcome.hits, outcome.generated) == (0, 1), "a truncated poster is not a cache hit"
+    assert cr.is_complete_jpeg(destination), "it healed"
+    assert cr.ensure_posters([entry], cache, "ffmpeg", runner, workers=1).hits == 1
+
+
+def test_ffmpeg_never_writes_the_published_poster_filename(tmp_path, clips_tree):
+    registry = cr.ClipRegistry()
+    files = cr.discover_clips(clips_tree, True).files
+    _, _, entries = _page(registry, "owner-a", files)
+    cache = str(tmp_path / "posters")
+    entry = entries[0]
+    destinations = []
+
+    def runner(argv, timeout):
+        destinations.append(argv[-1])
+        with open(argv[-1], "wb") as handle:
+            handle.write(_JPEG)
+        return 0
+
+    cr.ensure_posters([entry], cache, "ffmpeg", runner, workers=1)
+    published = cr.poster_path_for(cache, entry)
+    assert destinations and destinations[0] != published, (
+        "a killed process must not be able to leave a partial file at the cache path")
+    assert destinations[0].endswith(".part.jpg")
+    assert cr.is_complete_jpeg(published)
+
+
+def test_a_truncated_attempt_is_never_published(tmp_path, clips_tree):
+    registry = cr.ClipRegistry()
+    files = cr.discover_clips(clips_tree, True).files
+    _, _, entries = _page(registry, "owner-a", files)
+    cache = str(tmp_path / "posters")
+    entry = entries[0]
+
+    def killed(argv, timeout):
+        with open(argv[-1], "wb") as handle:
+            handle.write(b"\xff\xd8\xff")          # half a JPEG
+        return 0                                   # and claims success anyway
+
+    outcome = cr.ensure_posters([entry], cache, "ffmpeg", killed, workers=1)
+    assert (outcome.generated, outcome.failures) == (0, 1)
+    assert not os.path.exists(cr.poster_path_for(cache, entry))
+    assert not [n for n in os.listdir(cache) if ".part." in n], "no attempt file is left behind"
+
+
+def test_a_failing_attempt_cannot_delete_a_valid_published_poster(tmp_path, clips_tree):
+    """The previous implementation ran os.unlink(destination) on failure, which could destroy a
+    perfectly good published poster."""
+    registry = cr.ClipRegistry()
+    files = cr.discover_clips(clips_tree, True).files
+    _, _, entries = _page(registry, "owner-a", files)
+    cache = str(tmp_path / "posters")
+    os.makedirs(cache, exist_ok=True)
+    entry = entries[0]
+    destination = cr.poster_path_for(cache, entry)
+    _make(destination, b"\xff\xd8\xff")            # incomplete, so the pass will attempt it
+
+    cr.ensure_posters([entry], cache, "ffmpeg", lambda argv, timeout: 1, workers=1)
+    assert os.path.exists(destination), "a failing attempt must not unlink the cache path"
+    with open(destination, "rb") as handle:
+        assert handle.read() == b"\xff\xd8\xff", "and must not alter it either"
+
+
+def test_concurrent_attempts_for_one_key_each_own_a_unique_temporary(tmp_path, clips_tree):
+    registry = cr.ClipRegistry()
+    files = cr.discover_clips(clips_tree, True).files
+    _, _, entries = _page(registry, "owner-a", files)
+    cache = str(tmp_path / "posters")
+    entry = entries[0]
+    seen, lock = [], threading.Lock()
+
+    def slow(argv, timeout):
+        with lock:
+            seen.append(argv[-1])
+        time.sleep(0.03)
+        with open(argv[-1], "wb") as handle:
+            handle.write(_JPEG)
+        return 0
+
+    threads = [threading.Thread(target=cr.ensure_posters,
+                                args=([entry], cache, "ffmpeg", slow), kwargs={"workers": 1})
+               for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert len(seen) >= 2 and len(set(seen)) == len(seen), "every attempt had its own name"
+    assert cr.is_complete_jpeg(cr.poster_path_for(cache, entry))
+    assert not [n for n in os.listdir(cache) if ".part." in n]
+
+
+def test_poster_attempt_paths_are_exclusively_created_and_distinct(tmp_path):
+    cache = str(tmp_path / "posters")
+    os.makedirs(cache)
+    destination = os.path.join(cache, "a" * 32 + ".jpg")
+    first = cr.poster_attempt_path(cache, destination)
+    second = cr.poster_attempt_path(cache, destination)
+    assert first != second
+    assert os.path.exists(first) and os.path.exists(second)
+    assert os.path.dirname(first) == cache, "same directory, so os.replace is atomic"
+
+
+def test_pruning_leaves_in_flight_attempt_files_alone(tmp_path):
+    cache = tmp_path / "posters"
+    cache.mkdir()
+    for index in range(6):
+        _make(str(cache / f"{index:032x}.jpg"), _JPEG)
+    attempt = cr.poster_attempt_path(str(cache), str(cache / ("b" * 32 + ".jpg")))
+    removed = cr.prune_poster_cache(str(cache), limit=0)
+    assert removed == 6, "all six published posters were candidates"
+    assert os.path.exists(attempt), "an attempt belongs to the attempt that created it"
+
+
+# =============================================================================================
+# [R5-P3] The composed gallery script must be VALID JavaScript
+#
+# This section exists because of a defect R5-P3 introduced and the real browser caught: the
+# Confirm hint is operator text from `ui_content.py`, it contains an apostrophe ("the server's
+# record"), and it was substituted *bare* into a single-quoted JS literal. The apostrophe closed
+# the literal, Gradio's `new AsyncFunction` threw `SyntaxError: Unexpected identifier 's'`, and
+# the ENTIRE gallery script failed to compile -- no hover, no clicks, no decisions, and no visible
+# error anywhere in the Python layer.
+#
+# Asserting "the placeholder is present" was not enough, and neither was the full suite. What was
+# missing is a check on the *composed* result, which is what these tests add.
+# =============================================================================================
+
+def _compose_gallery_js():
+    """Build CLIPS_GALLERY_JS exactly as `gui.py` does, without importing gui.py."""
+    import json as _json
+
+    gui_source = open(os.path.join(_SRC, "gui.py"), encoding="utf-8").read()
+    ui_source = open(os.path.join(_SRC, "ui_content.py"), encoding="utf-8").read()
+
+    namespace = {"json": _json}
+    for node in ast.parse(ui_source).body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id.startswith("CLIPS_"):
+            try:
+                namespace[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+
+    assign = next(node for node in ast.parse(gui_source).body
+                  if isinstance(node, ast.Assign)
+                  and getattr(node.targets[0], "id", "") == "CLIPS_GALLERY_JS")
+    return eval(                                        # noqa: S307 - the expression under test
+        compile(ast.Expression(assign.value), "<gallery-js>", "eval"), namespace)
+
+
+def test_operator_text_enters_the_gallery_script_as_a_json_literal():
+    """The substitution must emit a complete, escaped literal -- not raw text inside quotes."""
+    gui_source = open(os.path.join(_SRC, "gui.py"), encoding="utf-8").read()
+    assert ".replace('__REFRESH_HINT__', json.dumps(CLIPS_REFRESH_TO_ENABLE_HINT))" in gui_source
+    assert "'__REFRESH_HINT__'" not in gui_source.split("CLIPS_GALLERY_JS = r\"\"\"")[1] \
+        .split('""".replace(')[0], (
+        "the placeholder must NOT be wrapped in JS quotes: json.dumps supplies them, and quoting "
+        "it again is what let an apostrophe in the wording close the literal")
+
+
+def test_the_composed_gallery_script_is_syntactically_valid_javascript():
+    """Parsed by a real JavaScript engine when one is available, and structurally otherwise.
+
+    Node is not a dependency of this project, so its absence is a skip rather than a failure --
+    but the structural half below runs everywhere and would have caught the actual defect.
+    """
+    import shutil
+    import subprocess
+
+    composed = _compose_gallery_js()
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed; the structural assertions below still apply")
+    probe = f"const f = {composed};\nif (typeof f !== 'function') throw new Error('not a fn');\n"
+    result = subprocess.run([node, "--input-type=module", "-e", probe],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, (
+        f"the composed gallery script is not valid JavaScript:\n{result.stderr[:800]}")
+
+
+def test_no_substituted_operator_text_can_close_a_javascript_literal():
+    """Structural, engine-free: every interpolated constant must survive quote characters.
+
+    Checks the composed script rather than the template, because the template is correct by
+    construction and the composed result is where the damage appeared.
+    """
+    composed = _compose_gallery_js()
+    ui_source = open(os.path.join(_SRC, "ui_content.py"), encoding="utf-8").read()
+    hint = next(ast.literal_eval(node.value) for node in ast.parse(ui_source).body
+                if isinstance(node, ast.Assign)
+                and getattr(node.targets[0], "id", "") == "CLIPS_REFRESH_TO_ENABLE_HINT")
+    assert "'" in hint, (
+        "this test is only meaningful while the wording contains an apostrophe; if the wording "
+        "changed, keep a quote in it or this guard silently stops guarding anything")
+    assert hint not in composed, (
+        "the raw text appears verbatim in the script, so it was interpolated rather than encoded")
+    import json as _json
+    assert _json.dumps(hint) in composed, "the encoded form must be what lands in the script"
+
+
+def test_the_gallery_script_is_installed_through_app_load_unchanged():
+    """The composed value is what Gradio compiles, so the registration must pass the constant
+    itself rather than rebuild it at the call site."""
+    gui_source = open(os.path.join(_SRC, "gui.py"), encoding="utf-8").read()
+    assert "app.load(fn=None, inputs=None, outputs=None, js=CLIPS_GALLERY_JS)" in gui_source

@@ -15,6 +15,25 @@ Read this status before anything else, because the document describes a V1 that 
 | §7 local file serving security | **IMPLEMENTED** |
 | §8 completion contract | **NOT IMPLEMENTED** |
 
+**Independently reviewed, and remediated.** R5-P2 was an independent adversarial code and security
+review of the implementation. It returned `CHANGES_REQUIRED` on two MAJOR defects and recorded
+seven further findings; R5-P3 corrected all nine. What that review established, which this
+document previously stated inaccurately:
+
+* The Gradio browser session hash that scopes a review session is **client-originated** and minted
+  with `Math.random()`. It is a scoping key, **not** an authenticated operator identity. The HTTP
+  media layer does not depend on it — it authorizes on server-minted opaque identifiers and
+  recovers the owner server-side. The app stays localhost-only and claims no multi-user
+  authentication.
+* The expected revision on a decision is now **mandatory and strictly typed**; it was previously
+  bypassable by omitting or corrupting it.
+* Two same-owner scans are now ordered by an explicit generation protocol; previously a slow older
+  scan could republish its own revoked session and leave the tab unusable.
+* The poster route now revalidates the live source on its descriptor, like the clip route.
+* Poster publication is atomic; the journal writes every byte and cannot lose a later record.
+* **Four poster workers against a drive a render is reading remains unmeasured** and is a
+  disclosed operational limitation, not a safety claim — see `.claude/rules/clips-preview.md`.
+
 **R5-P1 moves no file.** Browsing, playing and classifying are read-only, the decisions are
 durable, and the Confirm control reports readiness rather than acting. There is no transfer code
 in the repository — not disabled, not feature-flagged, not dead; §6 and §8 remain a design that
@@ -179,9 +198,15 @@ resolution, not clip length (73.6 ms for a 15 s 1080p clip versus 73.7 ms for a 
 
 **Four workers is a ceiling, not a tuning knob.** D0 traced clip-extraction timeouts to four
 concurrent FFmpeg-class readers on one mechanical drive, so the pool clamps there and a test pins
-the clamp. The table above was measured on an SSD; the contention risk D0 found is
-drive-dependent, so a slow spinning media drive may behave differently and raising the ceiling
-would need its own measurement.
+the clamp.
+
+**And four workers is a performance figure, not a safety result.** The table above was measured on
+an **SSD with no render running**. Four concurrent readers is the same shape as the D0 contention
+condition, the gallery takes **no** render lock, and the case of a scan running while a render
+reads the same mechanical drive is **unmeasured**. It stands as a disclosed operational
+limitation; raising the ceiling would need its own measurement, and lowering it is the cheap
+mitigation if the case ever bites. Do not read this table as evidence that a concurrent scan is
+safe on a spinning disk.
 
 If a page size ever fails to hold, **the page size is what gives — not the safety rules.**
 

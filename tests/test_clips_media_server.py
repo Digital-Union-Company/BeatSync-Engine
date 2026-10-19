@@ -122,13 +122,22 @@ def world(tmp_path):
         ident = view["identity"].get(entry.clip_id)
         if ident is None:
             return {"ok": False, "code": "clip_not_on_page"}
-        if not registry.live_identity_ok(entry):
-            return {"ok": False, "code": "identity_changed"}
-        try:
-            expected = int(payload["rev"]) if payload.get("rev") is not None else None
-        except (TypeError, ValueError):
-            expected = None
         idents = list(view["identity"].values())
+        # [R5-P3 / F2] Mirrors the real `gui._clips_decide`: the expected revision is MANDATORY
+        # and strictly typed, validated BEFORE anything is written. This double used to replicate
+        # the `int(...)` coercion that turned every malformed revision into "no concurrency check
+        # requested" -- keeping that here would have left the endpoint's decision tests blind to
+        # the defect.
+        try:
+            expected = cr.parse_expected_revision(payload)
+        except cr.RevisionError as bad:
+            current, revision = store.get(ident)
+            return {"ok": False, "code": bad.code, "clip": entry.clip_id,
+                    "decision": current, "rev": revision, "counts": store.counts(idents)}
+        if not registry.live_identity_ok(entry):
+            current, revision = store.get(ident)
+            return {"ok": False, "code": "identity_changed", "clip": entry.clip_id,
+                    "decision": current, "rev": revision, "counts": store.counts(idents)}
         try:
             decision, revision = store.decide(owner_in, ident, target, view["scan_id"], expected)
         except cr.StaleWrite as stale:
@@ -410,7 +419,7 @@ def test_a_foreign_origin_cannot_drive_a_review_session(world, origin):
                           f"{world['entries'][0].clip_id}", "POST")):
         status, _, body = call(world["app"], path, method=method,
                                headers={"Origin": origin, "Content-Type": "application/json"},
-                               body=b'{"to":"SELECTED"}')
+                               body=b'{"to":"SELECTED","rev":0}')
         assert status == 403 and body == b"foreign_origin_refused"
 
 
@@ -437,7 +446,7 @@ def decide_url(world, index=0):
 def test_an_authorized_decision_is_recorded(world):
     status, headers, body = call(world["app"], decide_url(world), method="POST",
                                  headers={"Content-Type": "application/json"},
-                                 body=b'{"to":"SELECTED"}')
+                                 body=b'{"to":"SELECTED","rev":0}')
     assert status == 200
     payload = json.loads(body)
     assert payload["ok"] and payload["decision"] == "SELECTED" and payload["rev"] == 1
@@ -447,9 +456,11 @@ def test_an_authorized_decision_is_recorded(world):
 
 @pytest.mark.parametrize("to", ["SELECTED", "REJECTED", "PENDING"])
 def test_every_legal_transition_is_accepted(world, to):
+    # [R5-P3 / F2] `rev` is now mandatory, so the correct current revision (0, nothing recorded
+    # yet) travels with the transition. The assertion itself is unchanged.
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"},
-                           body=json.dumps({"to": to}).encode())
+                           body=json.dumps({"to": to, "rev": 0}).encode())
     assert status == 200 and json.loads(body)["decision"] == to
 
 
@@ -488,14 +499,14 @@ def test_a_path_in_the_decision_body_is_ignored(world):
     authority, and must not become one."""
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"},
-                           body=json.dumps({"to": "SELECTED",
+                           body=json.dumps({"to": "SELECTED", "rev": 0,
                                             "path": r"C:\Windows\win.ini"}).encode())
     assert status == 200 and json.loads(body)["ok"]
 
 
 def test_a_forged_revision_cannot_force_a_write(world):
     call(world["app"], decide_url(world), method="POST",
-         headers={"Content-Type": "application/json"}, body=b'{"to":"SELECTED"}')
+         headers={"Content-Type": "application/json"}, body=b'{"to":"SELECTED","rev":0}')
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"},
                            body=b'{"to":"REJECTED","rev":999}')
@@ -509,7 +520,7 @@ def test_a_decision_on_a_changed_clip_is_refused(world):
         handle.write(b"CHANGED")
     status, _, body = call(world["app"], decide_url(world, 1), method="POST",
                            headers={"Content-Type": "application/json"},
-                           body=b'{"to":"SELECTED"}')
+                           body=b'{"to":"SELECTED","rev":0}')
     assert status == 409 and json.loads(body)["code"] == "identity_changed"
 
 
@@ -517,7 +528,7 @@ def test_a_decision_on_a_guessed_clip_is_refused(world):
     status, _, body = call(world["app"],
                            f"/r5decide/{world['session']}/{world['page']}/AAAAAAAAAAAAAAAAAAAAAA",
                            method="POST", headers={"Content-Type": "application/json"},
-                           body=b'{"to":"SELECTED"}')
+                           body=b'{"to":"SELECTED","rev":0}')
     assert status == 403 and body == b"clip_not_in_page"
 
 
@@ -538,7 +549,7 @@ def test_a_decision_that_cannot_be_persisted_returns_503_not_200(world, monkeypa
     monkeypatch.setattr(cr.ReviewStore, "_append", refuse)
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"},
-                           body=b'{"to":"SELECTED"}')
+                           body=b'{"to":"SELECTED","rev":0}')
     assert status == 503 and json.loads(body)["code"] == "not_durably_recorded"
 
 
@@ -548,7 +559,7 @@ def test_a_decision_that_cannot_be_persisted_returns_503_not_200(world, monkeypa
 
 def test_the_state_endpoint_reports_the_servers_record(world):
     call(world["app"], decide_url(world), method="POST",
-         headers={"Content-Type": "application/json"}, body=b'{"to":"REJECTED"}')
+         headers={"Content-Type": "application/json"}, body=b'{"to":"REJECTED","rev":0}')
     status, _, body = call(world["app"], f"/r5state/{world['session']}/{world['page']}")
     assert status == 200
     payload = json.loads(body)
@@ -600,7 +611,7 @@ def test_serving_and_deciding_never_touches_the_reviewed_files(world):
     call(world["app"], f"/r5poster/{world['session']}/{world['page']}/"
                        f"{world['entries'][0].clip_id}")
     call(world["app"], decide_url(world), method="POST",
-         headers={"Content-Type": "application/json"}, body=b'{"to":"SELECTED"}')
+         headers={"Content-Type": "application/json"}, body=b'{"to":"SELECTED","rev":0}')
     call(world["app"], f"/r5state/{world['session']}/{world['page']}")
     for entry in world["entries"]:
         with open(entry.path, "rb") as handle:
@@ -618,3 +629,185 @@ def test_the_media_layer_contains_no_mutating_filesystem_call():
                       "shutil.copy", "shutil.rmtree", "os.rmdir", "os.makedirs", "O_WRONLY",
                       "O_CREAT", "MoveFileEx"):
         assert forbidden not in source, f"the media layer can {forbidden}"
+
+
+# =============================================================================================
+# [R5-P3] Independent-review remediation at the HTTP boundary: F5 and F2
+# =============================================================================================
+
+#: A COMPLETE minimal JPEG. The poster route does not parse JPEG structure -- publication is
+#: atomic, so a published poster is always whole -- but using a realistic value keeps these
+#: fixtures honest about what the cache holds.
+_JPEG = b"\xff\xd8\xff\xdb" + b"\x00" * 48 + b"\xff\xd9"
+
+
+def _poster_url(world, index=0):
+    return f"/r5poster/{world['session']}/{world['page']}/{world['entries'][index].clip_id}"
+
+
+def _clip_url(world, index=0):
+    return f"/r5clip/{world['session']}/{world['page']}/{world['entries'][index].clip_id}"
+
+
+# ---- F5: the poster route validates the live source ----------------------------------------
+
+def test_a_valid_clip_and_poster_are_served(world):
+    status, headers, body = call(world["app"], _poster_url(world))
+    assert status == 200
+    assert headers["content-type"] == "image/jpeg"
+    assert body.startswith(b"\xff\xd8\xff")
+
+
+def test_a_poster_is_refused_once_the_source_inode_changes(world, tmp_path):
+    """F5. The poster route used to authorize page membership and then open the cached JPEG with
+    no live-source check, so this request kept returning a thumbnail of a file that no longer
+    existed in that form -- while /r5clip correctly answered 409. The operator was shown a frame
+    they could neither play nor classify."""
+    import time as _time
+    entry = world["entries"][0]
+    before = call(world["app"], _poster_url(world))
+    assert before[0] == 200, "the poster is there to begin with"
+
+    _time.sleep(0.02)
+    replacement = _write(str(tmp_path / "replacement.bin"), b"B" * entry.size)
+    os.replace(replacement, entry.path)           # same size, different inode
+
+    clip_status, _, clip_body = call(world["app"], _clip_url(world))
+    poster_status, _, poster_body = call(world["app"], _poster_url(world))
+    assert clip_status == 409 and clip_body == b"identity_changed"
+    assert poster_status == 409 and poster_body == b"identity_changed", (
+        "both media routes must reach the same verdict about the same source")
+    assert before[2] not in poster_body, "the stale poster bytes must not be served"
+
+
+def test_a_poster_is_refused_once_the_source_size_changes(world):
+    entry = world["entries"][0]
+    with open(entry.path, "ab") as handle:
+        handle.write(b"X" * 32)
+    assert call(world["app"], _poster_url(world))[:2][0] == 409
+    assert call(world["app"], _clip_url(world))[0] == 409
+
+
+def test_a_poster_is_refused_once_the_source_mtime_changes(world):
+    entry = world["entries"][0]
+    info = os.stat(entry.path)
+    os.utime(entry.path, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+    status, _, body = call(world["app"], _poster_url(world))
+    assert status == 409 and body == b"identity_changed"
+
+
+def test_a_poster_is_refused_once_the_source_is_deleted(world):
+    os.unlink(world["entries"][0].path)
+    status, _, body = call(world["app"], _poster_url(world))
+    assert status == 410 and body == b"source_unavailable"
+    assert call(world["app"], _clip_url(world))[0] == 410
+
+
+def test_an_unchanged_source_with_no_poster_falls_back_normally(world):
+    """The second clip deliberately has no poster. An unplayable or un-postered clip must stay
+    classifiable, so this is a plain 404 rather than an identity refusal."""
+    status, _, body = call(world["app"], _poster_url(world, 1))
+    assert status == 404 and body == b"poster_unavailable"
+
+
+def test_poster_authorization_still_precedes_identity(world):
+    """A foreign credential must be refused without the source ever being opened."""
+    entry = world["entries"][0]
+    os.unlink(entry.path)                          # would be 410 if identity were checked first
+    bad_session = f"/r5poster/nosuchsession00000/{world['page']}/{entry.clip_id}"
+    status, _, body = call(world["app"], bad_session)
+    assert status == 403 and body == b"unknown_session"
+
+
+def test_a_poster_refusal_discloses_no_path_or_filename(world, tmp_path):
+    entry = world["entries"][0]
+    os.unlink(entry.path)
+    bodies = [call(world["app"], _poster_url(world))[2],
+              call(world["app"], _poster_url(world, 1))[2]]
+    for body in bodies:
+        assert str(tmp_path).encode() not in body
+        assert b"clip0001" not in body and b".mp4" not in body and b".jpg" not in body
+
+
+def test_the_poster_route_uses_the_same_open_entry_as_the_clip_route():
+    """Structural: one implementation, so the two routes cannot drift into checking different
+    things. A pathname stat would reintroduce the time-of-check/time-of-use gap."""
+    import ast
+    source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "src", "clips_media_server.py"), encoding="utf-8").read()
+    serve = source[source.index("async def _serve"):source.index("async def _decide")]
+    poster_branch = serve[serve.index("if prefix == POSTER_PREFIX:"):serve.index("else:")]
+    assert "open_entry" in poster_branch, "the poster branch must revalidate the live source"
+    assert "os.stat(" not in poster_branch, "a pathname stat is not a descriptor check"
+    tree = ast.parse(source)
+    assert "os.path.join" not in source, "the HTTP layer still builds no paths"
+    assert tree is not None
+
+
+# ---- F2: the mandatory expected revision, through the real endpoint ------------------------
+
+@pytest.mark.parametrize("body,code", [
+    (b'{"to":"REJECTED"}', "revision_required"),
+    (b'{"to":"REJECTED","rev":null}', "revision_required"),
+    (b'{"to":"REJECTED","rev":"1"}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":"abc"}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":"1abc"}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":true}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":false}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":0.9}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":1.0}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":-1}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":[]}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":{}}', "malformed_revision"),
+    (b'{"to":"REJECTED","rev":0}', "revision_conflict"),
+    (b'{"to":"REJECTED","rev":99}', "revision_conflict"),
+])
+def test_no_malformed_or_stale_revision_can_overwrite_a_decision(world, body, code):
+    """F2, at the boundary that matters. Every one of these used to be accepted except the two
+    well-formed integers, because a malformed revision was coerced to None and None means
+    "no concurrency check requested"."""
+    first = call(world["app"], decide_url(world), method="POST",
+                 headers={"Content-Type": "application/json"},
+                 body=b'{"to":"SELECTED","rev":0}')
+    assert first[0] == 200 and json.loads(first[2])["rev"] == 1
+
+    journal = os.path.join(world["store"].dir, "review-journal.jsonl")
+    with open(journal, "rb") as handle:
+        before = handle.read()
+
+    status, _, refused = call(world["app"], decide_url(world), method="POST",
+                              headers={"Content-Type": "application/json"}, body=body)
+    payload = json.loads(refused)
+    assert status == 409, payload
+    assert payload["code"] == code and payload["ok"] is False
+    assert payload["decision"] == "SELECTED" and payload["rev"] == 1, (
+        "a refusal reports the server's current record so a stale tab can resync")
+
+    with open(journal, "rb") as handle:
+        assert handle.read() == before, "a refused decision must not reach the journal"
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    assert world["store"].get(identity) == ("SELECTED", 1), "and must not move the record"
+
+
+def test_only_the_exact_current_revision_is_accepted(world):
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"SELECTED","rev":0}')
+    assert status == 200 and json.loads(body)["rev"] == 1
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":1}')
+    assert status == 200 and json.loads(body)["decision"] == "REJECTED"
+    assert json.loads(body)["rev"] == 2
+
+
+def test_an_illegal_transition_is_refused_before_the_revision_is_considered(world):
+    """Ordering matters for the refusal codes: a body that names no legal decision at all is
+    not a concurrency problem."""
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"DELETE_FOREVER","rev":0}')
+    assert status == 409 and json.loads(body)["code"] == "illegal_transition"
+    status, _, body = call(world["app"], decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"}, body=b'{}')
+    assert status == 409 and json.loads(body)["code"] == "illegal_transition"

@@ -677,6 +677,77 @@ def test_no_browser_side_file_navigation_or_javascript_was_added():
                 f"a file:// URL appears in a string literal: {node.value[:80]!r}"
 
 
+#: [R5-P3 / F9] The ONLY event registrations in `gui.py` permitted to carry client-side
+#: JavaScript, as (callee, argument) pairs read from the AST.
+#:
+#: Why an allowlist and not the old blanket ban. Before R5-P1 this file forbade `js=`/`_js=` on
+#: *any* call in `gui.py`, which was wider than the one-button claim its own docstring makes --
+#: and it had to go when the R5 gallery legitimately needed an interaction layer the accepted
+#: specification mandates. The independent review (F9) recorded the cost of that narrowing: with
+#: the global form gone, any future feature could attach JavaScript anywhere with no test
+#: objecting. This restores the blast radius without re-banning the one legitimate case.
+#:
+#: Structural rather than a substring scan: the pair comes from `ast.unparse` of the call's `func`
+#: and of the keyword's value, so a renamed variable holding the same script, or the same keyword
+#: on a different event, both show up as a new pair rather than slipping through a text match.
+AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
+    ("app.load", "CLIPS_GALLERY_JS"),
+)
+
+
+def _javascript_registrations(tree):
+    """Every call in `gui.py` carrying `js=` or `_js=`, as (callee, argument) pairs."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg in ("js", "_js"):
+                found.append((ast.unparse(node.func), ast.unparse(keyword.value)))
+    return sorted(found)
+
+
+def test_only_the_authorized_registration_carries_client_side_javascript():
+    """Application-wide, and deliberately exact.
+
+    Adding a `js=` anywhere in `gui.py` fails this test until the pair is added to the allowlist
+    above -- which is a decision someone has to make on purpose, with a reviewer looking at it.
+    """
+    registrations = _javascript_registrations(_tree(_GUI))
+    assert registrations == sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS), (
+        "an unauthorized client-side JavaScript registration appeared in gui.py: "
+        f"{registrations!r} != {sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)!r}")
+
+
+def test_the_authorized_registration_is_the_gallery_installer_and_nothing_else():
+    """The one permitted entry is pinned to what it actually is: a listener installer that
+    registers no server call (`fn=None`), not a hidden channel for decisions."""
+    tree = _tree(_GUI)
+    loads = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and ast.unparse(node.func) == "app.load"
+             and any(keyword.arg == "js" for keyword in node.keywords)]
+    assert len(loads) == 1, f"expected exactly one JavaScript app.load, found {len(loads)}"
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in loads[0].keywords}
+    assert keywords.get("js") == "CLIPS_GALLERY_JS"
+    assert keywords.get("fn") == "None", "the installer must register no server call"
+    assert keywords.get("inputs") == "None" and keywords.get("outputs") == "None"
+
+
+def test_the_allowlist_itself_rejects_a_planted_registration():
+    """An executable negative control for the allowlist's own comparison.
+
+    The mutation controls in the task report plant a real `js=` in `gui.py` and show this suite
+    failing. This checks the comparison that makes that happen, without editing the source: a
+    pair that is not on the list must not compare equal.
+    """
+    planted = sorted(list(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+                     + [("process_btn.click", "SOME_OTHER_SCRIPT")])
+    assert planted != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+    assert ("open_output_folder_btn.click", "ANY_SCRIPT") not in \
+        AUTHORIZED_JAVASCRIPT_REGISTRATIONS, (
+        "the protected button must never be allowlisted for JavaScript")
+
+
 def test_no_progress_stage_was_invented_for_the_folder_button():
     """M4 stays DEFERRED_BY_PRODUCT_OWNER, and this button is not a reason to reopen it."""
     body = ast.unparse(_func(_GUI, HANDLER))

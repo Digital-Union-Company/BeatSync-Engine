@@ -83,6 +83,10 @@ import errno
 # staged copy by re-reading it, so it needs a digest. Stdlib only, like everything else here.
 import hashlib
 import html as html_lib
+# [FORK] Digital-Union (R5-P3): used to emit operator text into the gallery script as a properly
+# escaped JS string literal. Interpolating it bare is how an apostrophe in the wording broke the
+# whole script's compilation.
+import json
 import multiprocessing
 import queue
 import re
@@ -551,11 +555,37 @@ CLIPS_GALLERY_JS = r"""
     }
   }
 
+  function countsBox() {
+    return document.querySelector('#clips-counts-box textarea, #clips-counts-box input');
+  }
+
   function paintCounts(counts) {
-    const box = document.querySelector('#clips-counts-box textarea, #clips-counts-box input');
+    const box = countsBox();
     if (!box || !counts) { return; }
-    box.value = 'Kept ' + counts.SELECTED + '   ·   Discarded ' + counts.REJECTED +
-                '   ·   Undecided ' + counts.PENDING + '   ·   Total ' + counts.TOTAL;
+    let text = 'Kept ' + counts.SELECTED + '   ·   Discarded ' + counts.REJECTED +
+               '   ·   Undecided ' + counts.PENDING + '   ·   Total ' + counts.TOTAL;
+    // [R5-P3 / F8] Decisions do not travel through a Gradio event, so this response cannot
+    // change the Confirm button's enabled state -- only Refresh can, and it derives that state
+    // from the durable record. Rather than leave the operator looking at "Undecided 0" beside a
+    // greyed-out Confirm with no explanation, say what is needed. This is display text only: it
+    // never enables anything, and the authority stays on the server.
+    if (counts.TOTAL > 0 && counts.PENDING === 0) { text += '\n' + __REFRESH_HINT__; }
+    box.value = text;
+  }
+
+  function sayProblem(message) {
+    const box = countsBox();
+    if (box) { box.value = message; }
+  }
+
+  // [R5-P3 / F2] The WHOLE attribute must be a non-negative integer. `parseInt` is not usable
+  // here: it accepts a numeric prefix ("3abc" -> 3) and returns NaN for anything else, and
+  // `JSON.stringify` turns NaN into `null`, which the server used to read as "no concurrency
+  // check requested". So a tampered `data-rev` disabled the very guarantee it was meant to feed.
+  function validRevision(text) {
+    if (typeof text !== 'string' || !/^(0|[1-9][0-9]*)$/.test(text)) { return null; }
+    const value = Number(text);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
   }
 
   async function send(clip, to, rev) {
@@ -579,9 +609,21 @@ CLIPS_GALLERY_JS = r"""
     if (body && body.decision) { paint(clip, body.decision, body.rev); }
   }
 
-  function decide(tile, to) {
+  async function decide(tile, to) {
     if (!tile) { return; }
-    send(tile.dataset.clip, to, parseInt(tile.dataset.rev || '0', 10));
+    const rev = validRevision(tile.dataset.rev);
+    if (rev === null) {
+      // The DOM revision is not trustworthy. Send NOTHING, re-read the server's record, and
+      // repaint from it. If even that fails, say so rather than leaving a silent dead click.
+      window.__r5Last = {ok: false, code: 'local_revision_invalid'};
+      const body = await window.__r5Resync();
+      if (!body || !body.ok) {
+        sayProblem('Could not read the decision record from the server. ' +
+                   'Press "Re-read the server\'s record" before deciding again.');
+      }
+      return;
+    }
+    send(tile.dataset.clip, to, rev);
   }
 
   // Lazy media: no <video> exists until hover, and exactly one exists at a time.
@@ -677,9 +719,16 @@ CLIPS_GALLERY_JS = r"""
   window.__r5Resync = async () => {
     const g = grid();
     if (!g) { return {ok: false, code: 'no_grid'}; }
-    const res = await fetch('/r5state/' + g.dataset.session + '/' + g.dataset.page);
-    const body = await res.json();
-    if (!body || !body.ok) { return body; }
+    // [R5-P3 / F2] Never throws: `decide` depends on this answering so that an untrustworthy DOM
+    // revision results in a resync or a visible failure, not an unhandled rejection.
+    let body;
+    try {
+      const res = await fetch('/r5state/' + g.dataset.session + '/' + g.dataset.page);
+      body = await res.json();
+    } catch (err) {
+      return {ok: false, code: 'network_error'};
+    }
+    if (!body || !body.ok) { return body || {ok: false, code: 'no_body'}; }
     Object.keys(body.clips).forEach((clip) => {
       paint(clip, body.clips[clip].decision, body.clips[clip].rev);
     });
@@ -700,7 +749,17 @@ CLIPS_GALLERY_JS = r"""
     }).observe(host, {childList: true, subtree: true});
   }
 }
-"""
+""".replace('__REFRESH_HINT__', json.dumps(CLIPS_REFRESH_TO_ENABLE_HINT))
+# [R5-P3 / F8] Operator-facing wording stays in `ui_content.py` like every other string in this
+# app; the gallery layer is a raw JS literal, so it is substituted in rather than interpolated.
+#
+# The substitution emits a COMPLETE JS string literal via `json.dumps`, and the placeholder above
+# is deliberately NOT wrapped in quotes in the JS. Dropping raw text inside `'...'` was wrong and
+# the real browser caught it: this hint contains an apostrophe ("the server's record"), which
+# closed the literal and made the whole gallery script fail to compile --
+# `SyntaxError: Unexpected identifier 's'` out of Gradio's `new AsyncFunction`, which silently
+# costs every listener on the page. JSON encoding is the only safe way to move operator text into
+# a script; never interpolate it bare, and never assume a constant has no quote in it.
 
 
 def _stage_status(stage_number: int) -> str:
@@ -6205,11 +6264,12 @@ _CLIPS_REGISTRY = fork_clips.ClipRegistry()
 _CLIPS_STORE_LOCK = threading.Lock()
 _CLIPS_STORE = None
 
-#: Per-owner view of the current page: owner -> {session, page, entries, identity, ...}. Keyed by
-#: the Gradio session hash, bounded, so a long-lived process holds at most a handful of pages.
-_CLIPS_PAGES: "OrderedDict[str, dict]" = OrderedDict()
-_CLIPS_PAGES_LOCK = threading.Lock()
+#: [R5-P3 / F1] Per-owner scan generations AND the authoritative per-owner view, in one object so
+#: that "is my scan still the newest?" and "change the authoritative state" cannot drift apart.
+#: Replaces the bare `_CLIPS_PAGES` dict, whose unconditional writes let a slow older scan
+#: republish its own revoked session after a newer scan had already superseded it.
 CLIPS_MAX_TRACKED_SESSIONS = 32
+_CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
 
 
 def _clips_store():
@@ -6222,12 +6282,25 @@ def _clips_store():
 
 
 def _clips_owner(request) -> str:
-    """The owner of a review session is the **server-injected** Gradio session hash.
+    """The owner key for a review session is the Gradio browser session hash.
 
-    `gr.Request` is injected per request and is not a widget, so nothing the browser sends can
-    forge it. Absent or unusable identity **fails closed**: there is deliberately no shared
-    anonymous registry to fall back into, because that is exactly how one operator's rescan would
-    be able to revoke another's authorization.
+    [R5-P3 / F3] Stated accurately, because the earlier wording here was wrong. `gr.Request`
+    *injects* this value into the handler -- it is a real parameter, never listed in a click's
+    `inputs`, so it is not a widget the browser can set directly. But the **value itself
+    originates in the Gradio client**: `gradio/route_utils.py` reads it from the request body, and
+    the browser mints it with `Math.random().toString(36).substring(2)`, which is not a
+    cryptographically secure generator. So this is **not** an authenticated operator identity, and
+    a non-conforming local client can choose any owner key it likes.
+
+    What that does and does not cost. It scopes one browser session's pages and rescans against
+    another's, which is its whole job. It is **not** what protects the media: the HTTP layer
+    authorizes on server-minted `secrets.token_urlsafe` session/page/clip ids and asks the
+    registry who owns them, so no owner identity is ever read from a request. The app stays
+    localhost-only and claims no multi-user authentication.
+
+    Absent or unusable identity **fails closed**: there is deliberately no shared anonymous
+    registry to fall back into, because that is exactly how one browser's rescan would be able to
+    revoke another's authorization.
     """
     session_hash = getattr(request, 'session_hash', None) if request is not None else None
     if not session_hash:
@@ -6235,20 +6308,18 @@ def _clips_owner(request) -> str:
     return str(session_hash)
 
 
-def _clips_remember(owner: str, view: dict) -> None:
-    with _CLIPS_PAGES_LOCK:
-        _CLIPS_PAGES[owner] = view
-        _CLIPS_PAGES.move_to_end(owner)
-        while len(_CLIPS_PAGES) > CLIPS_MAX_TRACKED_SESSIONS:
-            _CLIPS_PAGES.popitem(last=False)
+def _clips_remember(owner: str, generation, view: dict) -> bool:
+    """Publish `view` as the owner's current page, but only if `generation` is still the newest.
+
+    [R5-P3 / F1] The unconditional last-write-wins version of this function is what let an older
+    scan reinstate its own revoked session. Publication is now conditional and the decision is
+    made inside the coordinator's lock.
+    """
+    return _CLIPS_SCANS.publish(owner, generation, view)
 
 
 def _clips_view(owner: str) -> dict:
-    with _CLIPS_PAGES_LOCK:
-        view = _CLIPS_PAGES.get(owner)
-        if view is not None:
-            _CLIPS_PAGES.move_to_end(owner)
-        return view or {}
+    return _CLIPS_SCANS.view(owner)
 
 
 def _clips_poster_exists(entry) -> bool:
@@ -6281,12 +6352,50 @@ def _on_clips_check(input_folder, library_folder, rejected_folder):
     return "\n".join(lines)
 
 
+def _clips_render_current(owner: str, report: str):
+    """Render whatever the server currently holds for `owner`, with `report` as the message.
+
+    [R5-P3 / F1] Used by Refresh *and* by a superseded scan. A superseded scan must not hand the
+    browser the grid it built -- that page's session was revoked the moment the newer scan opened
+    its own, so every tile in it would answer 403. Repainting the authoritative page instead means
+    that whichever response the browser receives last, what it displays is current.
+    """
+    view = _clips_view(owner)
+    if not view.get('entries'):
+        return (report, CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
+                gr.update(interactive=False))
+    store = _clips_store()
+    identities = _clips_identities(view)
+    counts = store.counts(identities)
+    grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
+                                   view['identity'], view['session'], view['page'],
+                                   _clips_poster_exists)
+    return (report, grid, fork_clips.counts_text(counts),
+            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+
+
 def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, page_size,
                    request: gr.Request = None):
     """Validate, enumerate, freeze one page, mint opaque ids and build the grid.
 
-    Order matters: the roots are refused **before** anything is read, so a destination that
-    overlaps the input never reaches the filesystem.
+    Order matters twice over.
+
+    The roots are refused **before** anything is read, so a destination that overlaps the input
+    never reaches the filesystem.
+
+    And [R5-P3 / F1] the scan now runs under an explicit per-owner generation:
+
+    1. refusals that change nothing happen first, so a scan rejected for a bad folder or an empty
+       enumeration never takes a generation and therefore cannot supersede a running scan;
+    2. `begin()` takes the generation -- from here on this scan is visible as "the newest", even
+       though it has not finished;
+    3. the authority-changing calls (`begin_scan`, `new_session`, `publish_page`) run inside
+       `authority(...)`, which re-checks the generation **while holding the owner's lock**;
+    4. the slow poster pass runs **outside** that lock, and takes no render lock;
+    5. `publish()` installs the view only if this generation is still the newest.
+
+    A superseded scan therefore changes nothing and repaints the authoritative page; a newest scan
+    that *fails* discards the view rather than leaving an older revoked page looking current.
     """
     empty = (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT)
     try:
@@ -6316,25 +6425,39 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
 
     store = _clips_store()
     scan_id = secrets.token_urlsafe(12)
-    store.begin_scan(owner, scan_id)
-    session_id = _CLIPS_REGISTRY.new_session(owner, scan_id)
-    page_token, entries = _CLIPS_REGISTRY.publish_page(
-        owner, session_id, 1, fork_clips.freeze_page(found.files, 0, size))
+    generation = _CLIPS_SCANS.begin(owner)
+    try:
+        # Outside the lock: one stat per file, and it touches no authoritative state.
+        frozen = fork_clips.freeze_page(found.files, 0, size)
+        with _CLIPS_SCANS.authority(owner, generation):
+            store.begin_scan(owner, scan_id)
+            session_id = _CLIPS_REGISTRY.new_session(owner, scan_id)
+            page_token, entries = _CLIPS_REGISTRY.publish_page(owner, session_id, 1, frozen)
 
-    from ffmpeg_processing import FFMPEG_PATH          # local: no module-level import is added
-    # The runner lives in the fork core, not here: two suites pin this module's
-    # `subprocess.run` site count at exactly two (the delivery preview and the Director), and
-    # that invariant keeps process launching out of the view layer.
-    posters = fork_clips.ensure_posters(entries, CLIPS_POSTER_DIR, FFMPEG_PATH,
-                                        fork_clips.run_poster_command)
+        from ffmpeg_processing import FFMPEG_PATH      # local: no module-level import is added
+        # The runner lives in the fork core, not here: two suites pin this module's
+        # `subprocess.run` site count at exactly two (the delivery preview and the Director), and
+        # that invariant keeps process launching out of the view layer.
+        posters = fork_clips.ensure_posters(entries, CLIPS_POSTER_DIR, FFMPEG_PATH,
+                                            fork_clips.run_poster_command)
 
-    identity = {entry.clip_id: fork_clips.decision_identity(entry.path, entry.size,
-                                                            entry.mtime_ns)
-                for entry in entries}
-    view = {'session': session_id, 'page': page_token, 'scan_id': scan_id, 'entries': entries,
-            'identity': identity, 'total': len(found.files), 'root': found.root,
-            'page_size': size}
-    _clips_remember(owner, view)
+        identity = {entry.clip_id: fork_clips.decision_identity(entry.path, entry.size,
+                                                                entry.mtime_ns)
+                    for entry in entries}
+        view = {'session': session_id, 'page': page_token, 'scan_id': scan_id,
+                'entries': entries, 'identity': identity, 'total': len(found.files),
+                'root': found.root, 'page_size': size}
+        if not _clips_remember(owner, generation, view):
+            raise fork_clips.SupersededScan(generation, _CLIPS_SCANS.newest(owner))
+    except fork_clips.SupersededScan:
+        return _clips_render_current(owner, CLIPS_SCAN_SUPERSEDED_TEXT)
+    except (fork_clips.Refusal, fork_clips.PersistenceError, OSError) as failure:
+        # A failed NEWEST scan must leave an honest empty state. Resurrecting the previous page
+        # would present a revoked session as current.
+        _CLIPS_SCANS.discard(owner, generation)
+        return (f"❌ The scan failed and nothing is loaded: {failure}",
+                empty[0], empty[1], gr.update(interactive=False))
+
     store.maybe_compact()
 
     identities = _clips_identities(view)
@@ -6370,16 +6493,34 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
     identity = view['identity'].get(entry.clip_id)
     if identity is None:
         return {'ok': False, 'code': 'clip_not_on_page'}
+
+    store = _clips_store()
+    identities = _clips_identities(view)
+
+    def refuse(code):
+        """A refusal that discloses the server's current record to the already-authorized page.
+
+        Nothing is appended and no revision moves: this returns before `store.decide` is reached.
+        """
+        current, revision = store.get(identity)
+        return {'ok': False, 'code': code, 'clip': entry.clip_id, 'decision': current,
+                'rev': revision, 'counts': store.counts(identities)}
+
+    # [R5-P3 / F2] The expected revision is MANDATORY and strictly typed. The previous code did
+    # `int(payload.get('rev'))` inside a try/except that assigned `None`, so a missing, null,
+    # string, bool, float, list or dict revision all became "no concurrency check requested" --
+    # a fail-open, and one reachable from the shipped client, because `parseInt` of a tampered
+    # non-numeric `data-rev` is `NaN` and `JSON.stringify(NaN)` is `null`. Validation now happens
+    # before anything is written, and a bad revision is refused with its own stable code.
+    try:
+        expected = fork_clips.parse_expected_revision(payload)
+    except fork_clips.RevisionError as bad:
+        return refuse(bad.code)
+
     # Identity is revalidated on the OPENED DESCRIPTOR, so a path repointed between enumeration
     # and now is caught rather than inherited.
     if not _CLIPS_REGISTRY.live_identity_ok(entry):
-        return {'ok': False, 'code': 'identity_changed'}
-    try:
-        expected = int(payload.get('rev')) if payload.get('rev') is not None else None
-    except (TypeError, ValueError):
-        expected = None
-    store = _clips_store()
-    identities = _clips_identities(view)
+        return refuse('identity_changed')
     try:
         decision, revision = store.decide(owner, identity, target, view['scan_id'], expected)
     except fork_clips.StaleWrite as stale:
@@ -6410,24 +6551,18 @@ def _clips_state(owner, session_id, page_token):
 
 def _on_clips_refresh(request: gr.Request = None):
     """Re-render the grid from the server's record. This is the proof that the DOM is not the
-    decision: whatever the page currently shows, this repaints it to what the server holds."""
+    decision: whatever the page currently shows, this repaints it to what the server holds.
+
+    [R5-P3 / F8] This is also the only thing that moves the Confirm button, and it derives that
+    state solely from `store.counts()` -- the durable record. So a clip put back to PENDING
+    disables Confirm again on the next Refresh, and no amount of DOM editing can enable it.
+    """
     try:
         owner = _clips_owner(request)
     except fork_clips.Refusal:
         return (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
                 gr.update(interactive=False))
-    view = _clips_view(owner)
-    if not view.get('entries'):
-        return (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
-                gr.update(interactive=False))
-    store = _clips_store()
-    identities = _clips_identities(view)
-    counts = store.counts(identities)
-    grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
-                                   view['identity'], view['session'], view['page'],
-                                   _clips_poster_exists)
-    return (grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+    return _clips_render_current(owner, '')[1:]
 
 
 def _on_clips_confirm(request: gr.Request = None):

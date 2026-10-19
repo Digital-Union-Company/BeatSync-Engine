@@ -21,6 +21,21 @@ restores the original mtime and inode -- deliberate tampering, not an accident -
 Hashing every clip on every request would re-read gigabytes per page, which is why it is not done;
 the guarantee is stated here rather than overclaimed. Nothing in R5-P1 mutates a file, so the
 consequence of the residual case is a stale preview, never a wrong move.
+
+Who an "owner" is, stated accurately
+------------------------------------
+[R5-P3 / F3] An owner key is the Gradio browser session hash. ``gr.Request`` *injects* it into the
+handler -- it is not a widget and is not listed in any click's ``inputs`` -- but the **value
+originates in the Gradio client**: ``gradio/route_utils.py`` reads it from the request body, and
+the browser mints it with ``Math.random().toString(36).substring(2)``, which is not a CSPRNG. It
+is therefore **not** a cryptographically authenticated operator identity, and a non-conforming
+local client can choose any owner key it likes.
+
+What does *not* depend on it: the HTTP media layer authorizes on server-minted
+``secrets.token_urlsafe`` session, page and clip identifiers and recovers the owner server-side
+via :meth:`ClipRegistry.owner_of`, so no owner identity is ever read from an HTTP request. The
+owner key scopes one browser's review session against another's; it is not an authentication
+boundary. The application remains localhost-only and claims no multi-user authentication.
 """
 
 from __future__ import annotations
@@ -75,6 +90,74 @@ class Refusal(Exception):
 
 class PersistenceError(Exception):
     """A decision could not be durably recorded. The caller must report, never pretend success."""
+
+
+class SupersededScan(Exception):
+    """[R5-P3 / F1] A newer scan for this owner has already started.
+
+    Raised by :class:`ScanCoordinator` when an older generation tries to change authoritative
+    state. The older scan must abandon its result -- it must **not** fall back to publishing it,
+    and it must not hand the browser markup for the page it built, because that page's session was
+    revoked the moment the newer scan opened its own.
+    """
+
+    def __init__(self, generation: int, newest: int):
+        super().__init__(f"scan generation {generation} superseded by {newest}")
+        self.generation = int(generation)
+        self.newest = int(newest)
+
+
+#: [R5-P3 / F2] Stable refusal codes for the mandatory expected-revision contract.
+REVISION_REQUIRED = "revision_required"
+MALFORMED_REVISION = "malformed_revision"
+REVISION_CONFLICT = "revision_conflict"
+
+
+class RevisionError(Exception):
+    """[R5-P3 / F2] The client's expected revision is absent or not a usable integer.
+
+    Separate from :class:`StaleWrite` on purpose: a *conflict* means the client's view is merely
+    out of date, while this means the client did not state a view at all. Collapsing the two is
+    exactly the defect this type exists to prevent -- the original code coerced every malformed
+    revision to ``None``, which the store reads as "no concurrency check requested".
+    """
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = str(code)
+
+
+def parse_expected_revision(payload: Any) -> int:
+    """[R5-P3 / F2] The strict, mandatory expected revision. **Fails closed.**
+
+    A decision must state which revision it believes it is replacing. Accepted: a genuine,
+    non-negative JSON integer, and nothing else.
+
+    Rejected, each with a stable code rather than a silent downgrade to "no check":
+
+    * a missing ``rev`` key, and ``None``                      -> ``revision_required``
+    * a string, including a numeric one like ``"3"``           -> ``malformed_revision``
+    * a bool -- ``True`` is an ``int`` subclass in Python, so it is excluded explicitly, or
+      ``{"rev": true}`` would be read as revision 1
+    * a float, including an integral one like ``3.0``, because JSON cannot distinguish an intended
+      integer from a truncation artefact; ``0.9`` previously became ``0``
+    * a list, dict or any other type
+    * a negative integer
+
+    The failure direction is the whole point. ``int(payload.get('rev'))`` inside a
+    ``try/except (TypeError, ValueError)`` that assigns ``None`` turns every malformed value into
+    an explicit request to skip the concurrency check, which is a fail-*open*.
+    """
+    if not isinstance(payload, dict) or "rev" not in payload:
+        raise RevisionError(REVISION_REQUIRED)
+    raw = payload["rev"]
+    if raw is None:
+        raise RevisionError(REVISION_REQUIRED)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise RevisionError(MALFORMED_REVISION)
+    if raw < 0:
+        raise RevisionError(MALFORMED_REVISION)
+    return int(raw)
 
 
 # --------------------------------------------------------------------------------------------
@@ -383,6 +466,213 @@ class ClipRegistry:
 
 
 # --------------------------------------------------------------------------------------------
+# Scan lifecycle  [R5-P3 / F1]
+# --------------------------------------------------------------------------------------------
+
+class _ScanAuthority:
+    """The critical section in which one scan may change authoritative state.
+
+    Entering re-checks the generation **while holding the owner's lock** and raises
+    :class:`SupersededScan` if a newer scan has started. That ordering is the fix: the original
+    code had no critical section at all, so "am I still newest?" and "revoke the previous session"
+    were two separate moments with a window between them.
+    """
+
+    def __init__(self, coordinator: "ScanCoordinator", owner: str, generation: int):
+        self._coordinator = coordinator
+        self._owner = owner
+        self._generation = int(generation)
+        self._lock = None
+
+    def __enter__(self) -> int:
+        self._lock = self._coordinator._owner_lock(self._owner)
+        self._lock.acquire()
+        try:
+            newest = self._coordinator.newest(self._owner)
+            if newest != self._generation:
+                raise SupersededScan(self._generation, newest)
+        except BaseException:
+            self._lock.release()
+            self._lock = None
+            raise
+        return self._generation
+
+    def __exit__(self, *exc_info) -> bool:
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
+        return False
+
+
+class ScanCoordinator:
+    """Per-owner monotonic scan generations plus the authoritative per-owner view.
+
+    The defect this replaces (independent review F1): ``_on_clips_scan`` ran
+    ``begin_scan -> new_session -> publish_page -> ensure_posters -> remember`` with no lock
+    spanning it and no notion of which scan was newest. ``new_session`` revokes the owner's
+    previous sessions, and the poster pass takes seconds, so an older scan finishing last
+    republished its own already-revoked view -- leaving every tile answering ``403
+    unknown_session`` until the operator scanned again. Reachable with a double-click, because
+    the Gradio event carries ``concurrency_limit=None`` (no limit).
+
+    Two things are needed and neither alone is sufficient:
+
+    * a **generation** taken before any authoritative state changes, so "newest" is knowable
+      even while the newest scan is still running -- comparing against the last *completed* view
+      would not see a scan that has started and not yet finished;
+    * a **critical section** (:meth:`authority`) in which the generation check and the
+      authority-changing calls happen together.
+
+    Publication is then conditional: :meth:`publish` stores a view only if its generation is
+    still the newest, so a late result is discarded rather than installed.
+
+    The owner's lock is held only across the fast authoritative calls. The poster pass runs
+    outside it, and no render lock or concurrency group is involved -- a read-only gallery is not
+    a render.
+    """
+
+    def __init__(self, max_owners: int = MAX_OWNERS) -> None:
+        self._lock = threading.RLock()
+        self._max_owners = max(1, int(max_owners))
+        self._counter = 0
+        self._newest: "OrderedDict[str, int]" = OrderedDict()
+        self._views: "OrderedDict[str, dict]" = OrderedDict()
+        self._locks: dict[str, threading.RLock] = {}
+        self.superseded_scans = 0
+
+    # ---- generations -----------------------------------------------------------------
+
+    def begin(self, owner: Any) -> int:
+        """Take the next generation for ``owner`` and record it as the newest started scan.
+
+        Call this only once a scan is actually going to change state: a scan refused for a bad
+        folder or an empty enumeration never takes a generation, so it cannot supersede a running
+        one.
+        """
+        key = _require_owner(owner)
+        with self._lock:
+            self._counter += 1
+            generation = self._counter
+            self._newest[key] = generation
+            self._newest.move_to_end(key)
+            self._prune()
+            return generation
+
+    def newest(self, owner: Any) -> int:
+        key = _require_owner(owner)
+        with self._lock:
+            return self._newest.get(key, 0)
+
+    @staticmethod
+    def _strict_generation(generation: Any) -> int | None:
+        """A generation must be a genuine ``int``, never something coerced into one.
+
+        Same reasoning as :func:`parse_expected_revision`, and for the same reason: ``int("1")``
+        is 1 and ``int(True)`` is 1, so a coercing comparison would let a value that is not a
+        generation at all match the newest one. Generations are minted internally, so this is
+        defence in depth rather than input validation -- but a coercion here would be the exact
+        shape of the defect this class exists to close.
+        """
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            return None
+        return int(generation)
+
+    def is_current(self, owner: Any, generation: Any) -> bool:
+        wanted = self._strict_generation(generation)
+        if wanted is None:
+            return False
+        try:
+            return self.newest(owner) == wanted
+        except Refusal:
+            return False
+
+    def authority(self, owner: Any, generation: Any) -> _ScanAuthority:
+        """Critical section for the authority-changing part of a scan. See :class:`_ScanAuthority`."""
+        wanted = self._strict_generation(generation)
+        if wanted is None:
+            raise SupersededScan(-1, self.newest(owner))
+        return _ScanAuthority(self, _require_owner(owner), wanted)
+
+    def _owner_lock(self, key: str) -> threading.RLock:
+        """One lock per owner, so two operators never block each other."""
+        with self._lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = self._locks[key] = threading.RLock()
+            return lock
+
+    def _prune(self) -> None:
+        while len(self._newest) > self._max_owners:
+            dropped, _ = self._newest.popitem(last=False)
+            self._views.pop(dropped, None)
+            self._locks.pop(dropped, None)
+
+    # ---- the authoritative view ------------------------------------------------------
+
+    def publish(self, owner: Any, generation: Any, view: dict) -> bool:
+        """Install ``view`` as the owner's current page, **only if** still the newest generation.
+
+        Returns ``False`` for a superseded scan, whose result is then discarded entirely.
+        """
+        key = _require_owner(owner)
+        wanted = self._strict_generation(generation)
+        if wanted is None:
+            return False
+        with self._lock:
+            if self._newest.get(key) != wanted:
+                self.superseded_scans += 1
+                return False
+            stored = dict(view)
+            stored["generation"] = wanted
+            self._views[key] = stored
+            self._views.move_to_end(key)
+            while len(self._views) > self._max_owners:
+                self._views.popitem(last=False)
+            return True
+
+    def view(self, owner: Any) -> dict:
+        """The owner's current page, or ``{}``. Never raises for an unknown owner."""
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return {}
+        with self._lock:
+            view = self._views.get(key)
+            if view is not None:
+                self._views.move_to_end(key)
+            return view or {}
+
+    def discard(self, owner: Any, generation: Any) -> bool:
+        """Clear the owner's view if ``generation`` is still the newest.
+
+        For a newest scan that **failed**: the operator must be left with an honest empty state,
+        never with an older page silently resurrected as though it were current.
+        """
+        key = _require_owner(owner)
+        wanted = self._strict_generation(generation)
+        if wanted is None:
+            return False
+        with self._lock:
+            if self._newest.get(key) != wanted:
+                return False
+            self._views.pop(key, None)
+            return True
+
+    def forget(self, owner: Any) -> None:
+        key = _require_owner(owner)
+        with self._lock:
+            self._newest.pop(key, None)
+            self._views.pop(key, None)
+            self._locks.pop(key, None)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"owners": len(self._newest), "views": len(self._views),
+                    "generations_issued": self._counter,
+                    "superseded_scans": self.superseded_scans}
+
+
+# --------------------------------------------------------------------------------------------
 # Range parsing
 # --------------------------------------------------------------------------------------------
 
@@ -541,12 +831,71 @@ def poster_path_for(cache_dir: str, entry: ClipEntry) -> str:
     return os.path.join(cache_dir, poster_key(entry.path, entry.size, entry.mtime_ns) + ".jpg")
 
 
+#: [R5-P3 / F6] A *published* poster is exactly ``<32 hex>.jpg``. Generation attempts write
+#: ``<32 hex>.<16 hex>.part.jpg`` in the same directory, so the two are never confused: a prune
+#: pass will not delete somebody's in-flight attempt, and an abandoned attempt can never be
+#: mistaken for a cache hit.
+_PUBLISHED_POSTER_RE = re.compile(r"\A[0-9a-f]{32}\.jpg\Z")
+
+#: Markers a complete JPEG must carry. Truncation is the realistic failure (a killed or
+#: timed-out FFmpeg), and truncation removes the trailing marker, so checking both ends is what
+#: distinguishes "finished" from "stopped half way".
+_JPEG_SOI = b"\xff\xd8\xff"
+_JPEG_EOI = b"\xff\xd9"
+
+
+def poster_attempt_path(cache_dir: str, destination: str) -> str:
+    """A unique, exclusively created attempt file beside ``destination``.
+
+    Same directory, so publication is an ``os.replace`` on one filesystem and therefore atomic.
+    ``O_EXCL`` means two concurrent attempts for the same cache key cannot pick the same name.
+    """
+    base = os.path.basename(destination)
+    key = base[:-4] if base.endswith(".jpg") else base
+    for _ in range(8):
+        candidate = os.path.join(cache_dir, f"{key}.{secrets.token_hex(8)}.part.jpg")
+        try:
+            handle = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(handle)
+        return candidate
+    raise OSError("could not create a unique poster attempt file")
+
+
+def is_complete_jpeg(path: str) -> bool:
+    """[R5-P3 / F6] Whether ``path`` holds a *complete* JPEG, not merely a non-empty file.
+
+    The original cache test was ``os.path.getsize(destination) > 0``, so a truncated poster left
+    behind by a killed FFmpeg counted as a permanent hit and that clip showed a broken image
+    forever. A size check cannot distinguish the two; the end-of-image marker can.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(len(_JPEG_SOI))
+            if head != _JPEG_SOI:
+                return False
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() < len(_JPEG_SOI) + len(_JPEG_EOI):
+                return False
+            handle.seek(-len(_JPEG_EOI), os.SEEK_END)
+            return handle.read(len(_JPEG_EOI)) == _JPEG_EOI
+    except OSError:
+        return False
+
+
 def build_poster_command(ffmpeg: str, source: str, destination: str,
                          at_seconds: float = POSTER_SEEK_SECONDS) -> list[str]:
-    """The one poster argv. Built here so the GUI never becomes a command-construction site."""
+    """The one poster argv. Built here so the GUI never becomes a command-construction site.
+
+    ``-f image2`` and ``-c:v mjpeg`` are explicit rather than inferred from the extension: the
+    destination is an attempt file now, and a poster writer must never depend on filename guessing
+    for what format it produces.
+    """
     return [str(ffmpeg), "-v", "error", "-nostdin", "-y",
             "-ss", f"{float(at_seconds):.2f}", "-i", str(source),
             "-frames:v", "1", "-vf", f"scale={POSTER_WIDTH}:-2", "-q:v", "6",
+            "-c:v", "mjpeg", "-f", "image2",
             str(destination)]
 
 
@@ -600,12 +949,11 @@ def ensure_posters(entries: Iterable[ClipEntry], cache_dir: str, ffmpeg: str, ru
     outcome = PosterOutcome(workers=max(1, min(int(workers), POSTER_MAX_WORKERS)))
     for entry in entries:
         destination = poster_path_for(cache_dir, entry)
-        try:
-            if os.path.getsize(destination) > 0:
-                outcome.hits += 1
-                continue
-        except OSError:
-            pass
+        # [R5-P3 / F6] A *complete* JPEG is a hit. An incomplete one is a miss and is
+        # regenerated, which is how a poster truncated by an earlier killed FFmpeg heals.
+        if is_complete_jpeg(destination):
+            outcome.hits += 1
+            continue
         pending.append((entry, destination))
 
     if not pending:
@@ -614,23 +962,37 @@ def ensure_posters(entries: Iterable[ClipEntry], cache_dir: str, ffmpeg: str, ru
     started = time.perf_counter()
 
     def one(job: tuple[ClipEntry, str]) -> bool:
+        """Generate into an attempt file, validate it, then publish atomically.
+
+        [R5-P3 / F6] FFmpeg never writes the published name. Three consequences, each of which
+        was a defect before: a killed process cannot leave a partial file at the cache path; a
+        reader can never observe a half-written poster; and a failing attempt cannot delete a
+        *valid* published poster, which the previous ``os.unlink(destination)`` did.
+        """
         entry, destination = job
-        argv = build_poster_command(ffmpeg, entry.path, destination, at_seconds)
         try:
-            code = runner(argv, POSTER_TIMEOUT_SECONDS)
-        except Exception:                                  # noqa: BLE001 - a poster is optional
-            code = -1
-        if code == 0:
+            attempt = poster_attempt_path(cache_dir, destination)
+        except OSError:
+            return False
+        try:
+            argv = build_poster_command(ffmpeg, entry.path, attempt, at_seconds)
             try:
-                if os.path.getsize(destination) > 0:
-                    return True
+                code = runner(argv, POSTER_TIMEOUT_SECONDS)
+            except Exception:                              # noqa: BLE001 - a poster is optional
+                code = -1
+            if code != 0 or not is_complete_jpeg(attempt):
+                return False
+            try:
+                os.replace(attempt, destination)
+            except OSError:
+                return False
+            return True
+        finally:
+            # Only ever this attempt's own file. Another attempt's temporary belongs to it.
+            try:
+                os.unlink(attempt)
             except OSError:
                 pass
-        try:
-            os.unlink(destination)
-        except OSError:
-            pass
-        return False
 
     if outcome.workers == 1:
         results = [one(job) for job in pending]
@@ -646,9 +1008,13 @@ def ensure_posters(entries: Iterable[ClipEntry], cache_dir: str, ffmpeg: str, ru
 
 
 def prune_poster_cache(cache_dir: str, limit: int = POSTER_CACHE_MAX_FILES) -> int:
-    """Keep the cache bounded, oldest first. Returns how many files were removed."""
+    """Keep the cache bounded, oldest first. Returns how many files were removed.
+
+    [R5-P3 / F6] Only *published* posters are candidates. An in-flight attempt file is owned by
+    the attempt that created it, so pruning must not touch one.
+    """
     try:
-        names = [n for n in os.listdir(cache_dir) if n.endswith(".jpg")]
+        names = [n for n in os.listdir(cache_dir) if _PUBLISHED_POSTER_RE.match(n)]
     except OSError:
         return 0
     if len(names) <= limit:
@@ -937,6 +1303,8 @@ class ReviewStore:
         self._scans: dict[str, str] = {}               # owner -> current scan id
         self.corrupt_records_discarded = 0
         self.journal_records = 0
+        #: [R5-P3 / F4] How many times an unterminated tail was closed off before appending.
+        self.journal_tails_repaired = 0
         self._load()
 
     # ---- durability ------------------------------------------------------------------
@@ -964,8 +1332,11 @@ class ReviewStore:
                     try:
                         event = json.loads(line)
                     except ValueError:
-                        # A crash during the final write can only truncate the LAST line. An
-                        # unparsable record is discarded rather than guessed at.
+                        # [R5-P3 / F4] An unparsable record is discarded rather than guessed at.
+                        # A damaged line can only ever be a *single* line, because `_append`
+                        # terminates an unterminated tail before writing after it -- so a later
+                        # healthy record can no longer be swallowed by a partial one. Every
+                        # fully committed record before the damage is preserved.
                         self.corrupt_records_discarded += 1
                         continue
                     self._apply(event)
@@ -988,23 +1359,80 @@ class ReviewStore:
                                              str(event.get("scan_id", "")),
                                              float(event.get("at", 0.0)))
 
+    def _write_all(self, handle: int, payload: bytes) -> int:
+        """[R5-P3 / F4] Write every byte, or raise. Returns the number of bytes written.
+
+        ``os.write`` is permitted to accept fewer bytes than offered and say so in its return
+        value, with no exception. The original code discarded that return value, so a positive
+        short write left a truncated record on disk while the API reported the decision recorded
+        -- the one thing the durability contract says must never happen.
+        """
+        written = 0
+        while written < len(payload):
+            try:
+                count = os.write(handle, payload[written:])
+            except OSError as exc:
+                raise PersistenceError(
+                    f"could not durably write the decision after {written} byte(s): {exc}"
+                ) from exc
+            if count is None or count <= 0:
+                # A zero-byte write is not progress; looping on it would spin forever.
+                raise PersistenceError(
+                    f"the review journal accepted no bytes after {written} of {len(payload)}")
+            written += count
+        return written
+
+    def _journal_tail_is_terminated(self) -> bool:
+        """Whether the journal is empty or ends in a newline."""
+        try:
+            if os.path.getsize(self.journal_path) == 0:
+                return True
+            with open(self.journal_path, "rb") as probe:
+                probe.seek(-1, os.SEEK_END)
+                return probe.read(1) == b"\n"
+        except OSError:
+            return True              # unreadable: _load already treats that as corruption
+
+    def _terminate_damaged_tail(self, handle: int) -> bool:
+        """[R5-P3 / F4] Close off a newline-less tail before appending after it.
+
+        A newline-less final line means a previous append died part way through its record --
+        either a short write that then failed, or the process dying mid-write. The original
+        docstring claimed "a torn write can only damage the last line"; it does not. Because the
+        journal is opened ``O_APPEND`` and a record is one line, the next append lands directly
+        against the damaged bytes and the two become a single unparsable line, so a *later,
+        fully successful* decision is silently destroyed too.
+
+        Writing one newline first makes the damaged record a self-contained line that ``_load``
+        discards, and leaves every fully committed record before it intact. Returns whether a
+        repair was performed.
+        """
+        if self._journal_tail_is_terminated():
+            return False
+        self._write_all(handle, b"\n")
+        self.journal_tails_repaired += 1
+        return True
+
     def _append(self, event: dict) -> None:
-        """One record, one write, then flush and fsync. A torn write can only damage this line.
+        """One record, fully written, then fsync'd.
 
         A failure here is raised, never swallowed: the caller must report that the decision was
-        not durably recorded rather than show the operator a tick.
+        not durably recorded rather than show the operator a tick. A reported success means the
+        complete record is on disk and recoverable.
         """
-        payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+        payload = (json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
         try:
             handle = os.open(self.journal_path, flags, 0o600)
         except OSError as exc:
             raise PersistenceError(f"could not open the review journal: {exc}") from exc
         try:
-            os.write(handle, payload.encode("utf-8"))
-            os.fsync(handle)
-        except OSError as exc:
-            raise PersistenceError(f"could not durably write the decision: {exc}") from exc
+            self._terminate_damaged_tail(handle)
+            self._write_all(handle, payload)
+            try:
+                os.fsync(handle)
+            except OSError as exc:
+                raise PersistenceError(f"could not flush the review journal: {exc}") from exc
         finally:
             os.close(handle)
         self.journal_records += 1
@@ -1076,10 +1504,19 @@ class ReviewStore:
         an old revision and is refused with the current value rather than silently overwriting it.
         The journal append happens *before* the in-memory update, so a reported success always
         means the record is on disk.
+
+        [R5-P3 / F2] ``None`` still means "no check" for internal callers, but it may no longer be
+        *arrived at* by coercion. A non-integer ``expected_revision`` is now refused outright
+        rather than passed through ``int()``, which used to turn ``0.9`` into ``0`` and would turn
+        ``True`` into ``1``. The HTTP path never passes ``None`` derived from client input: it
+        validates with :func:`parse_expected_revision` first and refuses before reaching here.
         """
         key = _require_owner(owner)
         if decision not in DECISIONS:
             raise StaleWrite("invalid_decision", *self.get(identity))
+        if expected_revision is not None and (isinstance(expected_revision, bool)
+                                              or not isinstance(expected_revision, int)):
+            raise StaleWrite(MALFORMED_REVISION, *self.get(identity))
         with self._lock:
             if str(scan_id) != self._scans.get(key, ""):
                 record = self._records.get(identity)
@@ -1089,7 +1526,7 @@ class ReviewStore:
             current = record.decision if record else PENDING
             revision = record.revision if record else 0
             if expected_revision is not None and int(expected_revision) != revision:
-                raise StaleWrite("revision_conflict", current, revision)
+                raise StaleWrite(REVISION_CONFLICT, current, revision)
             revision += 1
             event = {"k": "decide", "identity": identity, "decision": decision,
                      "revision": revision, "scan_id": str(scan_id), "at": time.time()}
@@ -1121,6 +1558,20 @@ class ReviewStore:
 __all__ = [
     "COMPACT_AFTER_RECORDS",
     "DECISIONS",
+    "MALFORMED_REVISION",
+    "REVISION_CONFLICT",
+    "REVISION_REQUIRED",
+    "RevisionError",
+    "ScanCoordinator",
+    "SupersededScan",
+    "build_poster_command",
+    "ensure_posters",
+    "is_complete_jpeg",
+    "parse_expected_revision",
+    "poster_attempt_path",
+    "poster_key",
+    "poster_path_for",
+    "prune_poster_cache",
     "Discovery",
     "MAX_CLIPS_PER_PAGE",
     "MAX_OWNERS",
