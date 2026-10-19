@@ -969,3 +969,220 @@ def test_an_illegal_transition_is_refused_before_the_revision_is_considered(worl
     status, _, body = call(world["app"], decide_url(world), method="POST",
                            headers={"Content-Type": "application/json"}, body=b'{}')
     assert status == 409 and json.loads(body)["code"] == "illegal_transition"
+
+
+# =============================================================================================
+# [R5-P11 / N7] An unreadable durable record answers 503, never a successful classification
+#
+# The fixture above captures an already-constructed `ReviewStore` in its handler closures, so it
+# cannot reach the condition this section is about: `gui._clips_store()` creates the store on
+# **first use**, which means the constructor's refusal is raised inside the request. These tests
+# therefore build a middleware whose handlers obtain the store lazily, the way the shipped ones
+# do, and then make the recovery fail.
+#
+# The answer must be the existing persistence contract -- 503 `not_durably_recorded` with a
+# path-free body -- rather than a 200 reporting every clip as `PENDING`, or a 409 that would make
+# an unreadable record look like an ordinary refusal. Nothing in the middleware changes for this:
+# it already maps the persistence failure to that response, and raising the right class from the
+# store is the whole of the fix at this boundary.
+
+def _deny_reads(monkeypatch, path):
+    """`open` that refuses READ opens of exactly one file and delegates for every other.
+
+    Narrow by the convention `test_clips_review.py` records: a global patch breaks the
+    descriptor-identity probe, and the endpoint then refuses 409 before the record is reached --
+    which is the trap `test_a_decision_that_cannot_be_persisted_returns_503_not_200` exists to
+    remember.
+    """
+    real = open
+    target = os.path.normcase(os.path.abspath(path))
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            raise PermissionError(13, "access denied", str(file), 32)
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+
+
+def _lazily_served(world, state_dir):
+    """A middleware whose decision and state handlers create the store on first use."""
+    cache = {}
+    view = world["view"]
+    identities = list(view["identity"].values())
+
+    def store():
+        if "store" not in cache:
+            cache["store"] = cr.ReviewStore(state_dir)   # may raise PersistenceError
+        return cache["store"]
+
+    def decide(owner_in, session_in, page_in, entry, payload):
+        if session_in != view["session"] or page_in != view["page"]:
+            return {"ok": False, "code": "not_the_active_page"}
+        current = store()
+        identity = view["identity"][entry.clip_id]
+        expected = cr.parse_expected_revision(payload)
+        decision, revision = current.decide(owner_in, identity, payload["to"],
+                                            current.current_scan(owner_in), expected)
+        return {"ok": True, "clip": entry.clip_id, "decision": decision, "rev": revision,
+                "counts": current.counts(identities)}
+
+    def state(owner_in, session_in, page_in):
+        if session_in != view["session"] or page_in != view["page"]:
+            return {"ok": False, "code": "not_the_active_page"}
+        current = store()
+        snapshot = current.snapshot_of(identities)
+        return {"ok": True, "counts": current.counts(identities),
+                "clips": {e.clip_id: {"decision": snapshot[view["identity"][e.clip_id]][0],
+                                      "rev": snapshot[view["identity"][e.clip_id]][1]}
+                          for e in view["entries"]}}
+
+    app = server.ClipMediaMiddleware(
+        Downstream(), registry=world["registry"],
+        poster_resolver=lambda entry: cr.poster_path_for(world["posters"], entry),
+        decide_handler=decide, state_handler=state)
+    return app, cache
+
+
+def _seed(state_dir, owner):
+    store = cr.ReviewStore(state_dir)
+    store.begin_scan(owner, "scan-1")
+    return store
+
+
+def _durable_bytes(store):
+    out = {}
+    for name, path in (("snapshot", store.snapshot_path), ("journal", store.journal_path)):
+        try:
+            with open(path, "rb") as handle:
+                out[name] = handle.read()
+        except FileNotFoundError:
+            out[name] = None
+    return out
+
+
+def _leaks(text, secret):
+    """Separator-stripped containment: `str(OSError)` reprs its filenames and JSON escapes them
+    again, so a plain `in` passes against a body that really is disclosing the path (R5-P7)."""
+    strip = lambda value: value.replace("\\", "").replace("/", "")       # noqa: E731
+    return strip(secret) in strip(text)
+
+
+def test_n7_case18_a_decision_whose_record_cannot_be_read_answers_503(world, tmp_path,
+                                                                      monkeypatch):
+    """Case 18, the write half. A classification against an unreadable record is not a refusal
+    the client can act on by resyncing -- it is a durability failure, and 503 is the one answer
+    that does not claim anything about the decision."""
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    app, cache = _lazily_served(world, state_dir)
+
+    # Control: the same request, with the record readable. The baseline is taken AFTER it, so the
+    # comparison below is against a journal that already holds a committed decision.
+    status, _, body = call(app, decide_url(world), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"SELECTED","rev":0}')
+    assert status == 200 and json.loads(body)["ok"] is True, body
+    cache.clear()                               # the lazy store has not been created yet
+    before = _durable_bytes(seeded)
+
+    _deny_reads(monkeypatch, seeded.journal_path)
+    status, headers, body = call(app, decide_url(world, 1), method="POST",
+                                 headers={"Content-Type": "application/json"},
+                                 body=b'{"to":"REJECTED","rev":0}')
+    monkeypatch.undo()
+
+    assert status == 503, "never 200, and never a 409 the client would try to resync away"
+    payload = json.loads(body)
+    assert payload == {"ok": False, "code": "not_durably_recorded",
+                       "detail": payload["detail"]}, payload
+    assert "could not read the review journal" in payload["detail"]
+    assert headers["content-type"] == "application/json"
+    assert headers["cache-control"] == "no-store"
+    assert _durable_bytes(seeded) == before, "a refused decision writes nothing"
+    assert "store" not in cache, "a refusal must not be cached"
+
+    # And the retry succeeds, on the same already-authorized page.
+    status, _, body = call(app, decide_url(world, 1), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":0}')
+    assert status == 200 and json.loads(body)["decision"] == "REJECTED", body
+
+
+def test_n7_case18_the_state_route_also_answers_503_rather_than_an_empty_record(world, tmp_path,
+                                                                                monkeypatch):
+    """Case 18, the read half -- and the more dangerous one.
+
+    `/r5state` exists to be believed: the client repaints the whole page from it. A 200 whose
+    `clips` map reported every decision as `PENDING` would make the browser *show* a reviewed
+    folder as untouched, with `ok: true` attached.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    app, cache = _lazily_served(world, state_dir)
+
+    url = f"/r5state/{world['session']}/{world['page']}"
+    status, _, body = call(app, url)
+    assert status == 200
+    assert json.loads(body)["clips"][world["entries"][0].clip_id]["decision"] == "SELECTED"
+    cache.clear()
+
+    _deny_reads(monkeypatch, seeded.journal_path)
+    status, _, body = call(app, url)
+    monkeypatch.undo()
+
+    assert status == 503, body
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload, (
+        "no partial record may be reported alongside the failure")
+
+    status, _, body = call(app, url)
+    assert status == 200
+    assert json.loads(body)["clips"][world["entries"][0].clip_id]["decision"] == "SELECTED", (
+        "the record was never in danger; only the reading of it failed")
+
+
+@pytest.mark.parametrize("route", ["decide", "state"])
+def test_n7_the_503_body_never_discloses_a_filesystem_path(world, tmp_path, monkeypatch, route):
+    """Both routes' bodies reach an authorized but untrusted client. Neither may carry a path.
+
+    The failure is injected with the filenames attached, which is how a real pathname call raises
+    one -- `str(OSError)` would otherwise put the journal's absolute path in the JSON body.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    app, _ = _lazily_served(world, state_dir)
+    journal = seeded.journal_path
+
+    real = open
+    target = os.path.normcase(os.path.abspath(journal))
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            raise OSError(13, "simulated failure", journal, 5, journal + ".second")
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+    if route == "decide":
+        status, _, body = call(app, decide_url(world), method="POST",
+                               headers={"Content-Type": "application/json"},
+                               body=b'{"to":"SELECTED","rev":0}')
+    else:
+        status, _, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+    monkeypatch.undo()
+
+    assert status == 503
+    text = body.decode("utf-8")
+    for secret in (journal, journal + ".second", os.path.dirname(journal),
+                   os.path.basename(os.path.dirname(journal))):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+    assert "simulated failure" not in text, "nor the raw OSError text"
+    assert "errno 13, winerror 5" in text, "the condition stays diagnosable"

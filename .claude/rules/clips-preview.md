@@ -167,9 +167,26 @@ An empty gallery is a state the operator can act on; a page of dead credentials 
 **What this does *not* promise.** A server-side generation check cannot order HTTP responses. If a
 superseded scan's response is assembled before the newer scan publishes, it paints the empty state
 and can still arrive *after* the newer scan's grid, leaving the browser momentarily empty while a
-live page exists. That is recovered by Refresh, which repaints from the authoritative view, and by
-the client's resync on an untrustworthy page — never by a permanently dead gallery. Do not claim
-response ordering that is not proved at the client boundary.
+live page exists. Do not claim response ordering that is not proved at the client boundary.
+
+[R5-P10 / N1 — disposition, do not widen] **Authority is safe in that residual schedule;
+presentation can be stale.** A late response cannot regain media or decision authority: its
+credentials are revoked, so `open_authorized` answers `unknown_session` and `_clips_state` answers
+`not_the_active_page`. What it can do is paint a dead grid.
+
+The recovery claim must be stated narrowly, because the earlier wording here was too broad and an
+independent review measured why. **Manual Refresh is a possible recovery route** — the server-side
+handler renders the authoritative view, and a real browser Refresh click after three overlapping
+physical Scan clicks was observed to work. **Automatic recovery from an expired page is not fully
+implemented and not independently established.** The shipped `MutationObserver` calls
+`__r5Resync` on a new grid nonce, but `__r5Resync` only paints an *authorized* page: it does not
+request a fresh gallery when a stale page receives a refusal, and the observer ignores the
+returned failure. A probe that injected earlier grid markup into the Gradio host left the old grid
+in place and produced no recovery message — though it manipulated Gradio-managed DOM directly, so
+it does **not** prove that a genuinely reordered Gradio response defeats Refresh either. A
+network-level reordered-response browser test is the open evidence gap. So: do not write that
+client resync recovers an untrustworthy page, and do not write that the stale-presentation window
+is closed. R5-P11 made no N1 change.
 
 The locks are per owner, so two operators never block each other. A narrow
 `concurrency_limit=1` on the scan event would be acceptable as defence in depth, but Gradio queue
@@ -190,6 +207,19 @@ Two things that look like details and are not:
 * **The grid markup carries a nonce.** A `gr.HTML` update whose markup is byte-identical to the
   previous value is **not delivered**, which made "re-read the server's record" look like a no-op.
   Do not remove the nonce.
+
+[R5-P10 / N3 — disposition, do not overclaim] One `app.load(fn=None, inputs=None, outputs=None,
+js=CLIPS_GALLERY_JS)` is the single approved JavaScript registration, and an AST guard in
+`tests/test_open_output_folder.py` reports any other event registration that carries `js=`/`_js=`
+or opaque `**kwargs`. **It is a review guard, not an authentication boundary, and its coverage is
+bounded.** It catches an explicit named `js=` on any of its maintained event names, dictionary or
+opaque unpacking on those names, and `.then`/`.success` unpacking. It does **not** cover every
+JS-capable event on pinned Gradio 6.19.0 — runtime inspection also lists `double_click`, `copy`,
+`delete`, `example_select`, `option_select`, `pause_recording`, `preview_open`/`preview_close`,
+`start_recording` and `stop_recording` — nor an aliased `register = button.click; register(...)`,
+nor `getattr(button, 'click')(...)`. Those are **hypothetical future edits**, not bypasses present
+in the source; no current production bypass was found. Do not describe the guard as covering every
+possible alias or dynamically constructed registration. R5-P11 made no N3 change.
 
 ### Optimistic concurrency is MANDATORY, and strictly typed
 
@@ -245,16 +275,91 @@ a decision that is not on disk. Do not swallow it, and do not reintroduce a sing
 [R5-P5 / N2 · R5-P7 / N6] **Failing to *inspect* the journal is not an answer either.** The tail
 probe raises `PersistenceError` when it cannot determine whether the tail is terminated: an
 unknown journal state is not a licence to append, nor to assume damage and write a repair newline
-into a file whose condition could not be read. `_load`'s tolerance of an unreadable journal is
-about start-up recovery and says nothing about whether an append may proceed.
+into a file whose condition could not be read.
 
-> **Open, deliberately not fixed here (R5-P8 / N7).** That tolerance is itself asymmetric: the
-> *write* path now refuses when it cannot inspect the journal, while the *read* path still answers
-> "empty". A journal that is transiently unreadable at construction — an exclusive share lock from
-> a backup or indexer is enough — makes every previously decided clip come back as `PENDING`, with
-> no exception and nothing said to the operator. No decision is lost and a later readable start
-> recovers all of them, so this is transient under-reporting rather than data loss. Do **not**
-> silently change `_load` to "fix" it; it is an owner decision with its own scope.
+### Start-up recovery is all-or-nothing, and an incomplete one is never compacted
+
+[R5-P11 / N7] **This closes a confirmed permanent loss of committed decisions.** Earlier reports
+and an earlier version of this rule called it transient under-reporting that "loses no decision
+and self-heals on a later readable start". That was **wrong**, and the correction matters more
+than the wording: an independent review reproduced the loss, and the R5-P11 remediation
+reproduced it again on the frozen baseline four ways — a real Windows exclusive-sharing lock and
+controlled fault injection, each against the snapshot and against the journal, plus the real
+2,000-record automatic threshold.
+
+**The mechanism, exactly.** `_load` caught `OSError` in the same clause as `ValueError`, so an
+unreadable snapshot was recorded as "corruption"; and an `OSError` part way through the journal
+replay was swallowed with whatever had already been applied kept. Either way the constructor
+returned a store that could not be told from a healthy one, holding an **empty or truncated**
+record. That store was fully writable and fully compactable, and `compact()` then wrote that
+memory over the real snapshot and truncated the journal. After that the decisions were gone: the
+bytes that still held them had been replaced from a record that was never authoritative.
+Measured, pre-fix: a 369-byte snapshot replaced by a 146-byte one, a 419-byte journal truncated
+to zero, three committed decisions permanently `PENDING, 0`.
+
+Two consequences that are easy to get wrong:
+
+* **The destructive step needed no new decision at all.** In the journal-denial case the append
+  was correctly refused by the N2/N6 fix and `compact()` destroyed the record anyway. So the guard
+  cannot live only on the write path.
+* **It needed no operator action at all.** `maybe_compact()` fires automatically at
+  `COMPACT_AFTER_RECORDS`, so an ordinary scan was enough.
+
+**The contract now.** Nothing is published until the snapshot and the journal have both been read
+in full: memory is assembled in local dicts and installed in one step, and only then is the store
+marked recovered. A failure propagates out of `__init__` as a `PersistenceError` — which is
+strictly better than a store that looks healthy, because there is then no object to append to and
+nothing to compact from. `_append` and `compact` additionally check the recovery flag, because
+`compact()` neither reads nor needs the files it replaces, so "raise from `_load`" is not by
+itself sufficient. **Nothing in `_load` writes**, so a refused load leaves both copies
+byte-for-byte as they were and a later healthy attempt recovers everything, at the original
+revisions, with the scan state restored and no manual repair.
+
+**Six conditions, kept distinct.** Conflating any two of them is how this defect was reached:
+
+| Condition | Answer |
+|---|---|
+| Both files genuinely absent | a fresh store; ordinary first run |
+| Snapshot content is not usable JSON | discarded, the journal replays (the R5-P3 tolerance) |
+| A torn final journal line | that one line discarded, everything before it preserved |
+| A complete, readable journal | replayed in full |
+| A temporary I/O failure (lock, ACL, device, unresolved pathname) | `PersistenceError`, nothing written |
+| A replay that cannot be shown to be complete | `PersistenceError`, nothing written |
+
+A transient read failure is **not** corruption — that conflation *was* the defect. Corruption
+tolerance is deliberately bounded to statements about *content*: unusable bytes on disk are a
+definite finding, a read that failed is not. And N7 is never "fixed" by discarding a snapshot or
+deleting journal data; the retained bytes are what the retry recovers from.
+
+**Absence is established from the directory listing, not inferred from a failure.** Do **not** use
+`os.path.exists` or `os.path.lexists` as evidence that a state file is safely absent: they answer
+`False` for a path that merely stopped *resolving* — a share that went away, a removed volume, a
+traversal-denied ACL — exactly as readily as for a name that was never there. Measured:
+`os.path.exists(r'\\no-such-host\share\file.txt')` is `False`. `FileNotFoundError` is not
+"missing" either, for the same six Windows codes the N6 fix separated. So `_absence_is_proven`
+requires the error class *and* code that mean an absent leaf, *and* an enumerable directory, *and*
+the basename genuinely not in it; a listing that cannot be read, or that still contains the name,
+fails closed. One measured detail worth keeping: `builtins.open` sets `errno` but **no**
+`winerror` (only `os.path.getsize` supplies one), so on the real read path the decision rests
+entirely on the listing — do not build a diagnosis there that requires the native code.
+
+**The refusal is reportable, and that is part of the contract.** `PersistenceError` is the one
+class both boundaries already handle, so every durability failure from the constructor — including
+a state directory that cannot be created — raises it and nothing else. `gui._clips_store()`
+assigns the module global from a local that only exists once the constructor returned, so a
+refusal is **never cached**: a passing exclusive share must not become a process-lifetime outage,
+and a half-loaded store must never become the one every later caller writes through.
+`_on_clips_scan` obtains the store **before** `ScanCoordinator.begin()`, so a refusal takes no
+generation, supersedes no running scan, blanks no current page, opens no review session and never
+starts the poster pass. Scan, Refresh and Confirm all say plainly that the saved decisions could
+not be read, that nothing was changed or lost, and that the retry is the next step — Refresh's
+outputs are `(gallery, counts, Confirm)` with no status box, so its **gallery** carries the
+message. A grid of `PENDING` tiles, "Undecided 0", or a readiness report derived from a record
+that could not be read are all false statements with the authority of true ones; none of them may
+be produced. `/r5decide` and `/r5state` deliberately do **not** catch it: the middleware already
+answers that class with a path-free `503 not_durably_recorded`, which is the correct answer for a
+classification that cannot be read or written, and catching it would make an unreadable record
+indistinguishable from an ordinary refusal.
 
 **The carve-out for a missing journal is conditioned on the open descriptor, never on the error
 class.** "The file is not there" is a definite answer only when no append is in flight.
@@ -296,14 +401,25 @@ its filenames, which doubles every backslash, and a JSON body doubles them again
 separators stripped from both sides, and prove the assertion is live against the vulnerable
 version before trusting it.
 
-[R5-P9 / N5] **Compaction is an optimisation over the journal, never the record, and its failure
-must not cost a scan.** `maybe_compact()` runs after the scan has already published a page and
-minted live credentials; letting an `OSError` from it escape the handler destroyed a scan that had
-entirely succeeded. Contain it, report it honestly in the status box, and serve the page — the
-journal remains authoritative and every committed decision is still recoverable. Contain the two
-I/O classes only: a `TypeError` from a programming mistake must still surface. Both failure points
-are covered by regression tests, because they fail at opposite ends of the operation — before the
-snapshot lands, and after it has landed but before the journal is truncated.
+[R5-P9 / N5] **Compaction is an optimisation over the record, never the record itself, and its
+failure must not cost a scan.** `maybe_compact()` runs after the scan has already published a page
+and minted live credentials; letting an `OSError` from it escape the handler destroyed a scan that
+had entirely succeeded. Contain it, report it honestly in the status box, and serve the page.
+Contain the two I/O classes only: a `TypeError` from a programming mistake must still surface.
+Both failure points are covered by regression tests, because they fail at opposite ends of the
+operation — before the snapshot lands, and after it has landed but before the journal is
+truncated. A failed compaction also leaves the store **recovered**: it is a failed optimisation,
+the record in memory is still the one that was recovered, and the store stays writable.
+
+**State the reassurance accurately** — [R5-P11] corrected after an independent review, and the
+earlier wording is a good example of a claim that is true of the tested failure points and false
+in general. The status box used to tell the operator that every decision already made "is still in
+the journal". **The journal alone is not the record.** After a successful compaction the journal
+is empty and the snapshot is the authoritative copy, so the promise is recoverability from the
+**snapshot plus the journal**, not residence in either one. Do not restore any wording that names
+a single copy as the record: the shipped message says every decision "stays recoverable from the
+snapshot plus the journal, and a failed compaction discards neither", which is what the storage
+contract guarantees and no more.
 
 Location is load-bearing: **never** beside the source media, and **never** under
 `input/gradio_uploads` — `cleanup_on_startup` deletes everything under `input/` except `audio`,
@@ -428,6 +544,13 @@ condition. State it accurately:
 Do not convert this into a render-lock or a concurrency group without measuring first — and do not
 restate it as safety. Lowering `POSTER_MAX_WORKERS` is the cheap mitigation if the case ever bites;
 raising it needs its own measurement against an active render on a mechanical drive.
+
+[F7 — disposition] **Still UNMEASURED.** Neither the R5-P10 review nor the R5-P11 N7 remediation
+measured it: no benchmark, no Qwen inference, no production render and no owner footage was used
+by either. A representative synthetic 1/2/4-worker HDD contention test with a comparable
+concurrent render on the same mechanical drive is a separate, separately authorized
+pre-deployment gate. Do not record it as closed, mitigated or low-risk until that measurement
+exists.
 
 ## Confirm
 

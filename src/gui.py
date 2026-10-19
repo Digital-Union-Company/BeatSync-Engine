@@ -6273,12 +6273,63 @@ _CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
 
 
 def _clips_store():
-    """The decision store, created on first use so importing `gui` writes nothing."""
+    """The decision store, created on first use so importing `gui` writes nothing.
+
+    [R5-P11 / N7] `ReviewStore` now raises `PersistenceError` rather than returning a store that
+    recovered only part of the durable record, and **that failure must not be cached**. The global
+    is therefore bound from a local that only exists once the constructor has returned: if the
+    snapshot or journal was transiently unreadable -- a backup or indexer holding an exclusive
+    share is enough -- `_CLIPS_STORE` stays `None` and the next call retries the recovery from
+    scratch. Caching a refusal, or a half-loaded store, would turn a passing lock into a
+    process-lifetime outage; caching a half-loaded one would also re-arm the loss path, because
+    every later caller would be writing to a record the disk does not hold.
+    """
     global _CLIPS_STORE
     with _CLIPS_STORE_LOCK:
         if _CLIPS_STORE is None:
-            _CLIPS_STORE = fork_clips.ReviewStore(CLIPS_STATE_DIR)
+            recovered = fork_clips.ReviewStore(CLIPS_STATE_DIR)
+            _CLIPS_STORE = recovered
         return _CLIPS_STORE
+
+
+def _clips_state_unavailable_text(failure) -> str:
+    """[R5-P11 / N7] The operator-facing wording for a durable record that could not be read.
+
+    Three things it must do, because the pre-fix behaviour did none of them. Say plainly that the
+    saved decisions could **not** be read, so a page of `PENDING` tiles is never mistaken for a
+    folder nobody has reviewed. Say that nothing was changed or lost, which is now true by
+    construction -- a refused load writes nothing. And name the retry, because the condition this
+    reports is usually transient.
+
+    It carries no filesystem path: `_clips_failure_text` reduces a bare `OSError` to numbers, and
+    `PersistenceError` is already path-free by the R5-P7 contract.
+    """
+    return ("⚠️  Your saved decisions could NOT be read, so nothing has been loaded.\n"
+            "Nothing was changed, overwritten or lost — the record on disk is untouched.\n"
+            "This is usually temporary (a backup or indexer holding the file). "
+            "Wait a moment and try again.\n"
+            f"({_clips_failure_text(failure)})")
+
+
+def _clips_unavailable_outputs(failure):
+    """[R5-P11 / N7] The four scan outputs for a durable record that could not be read.
+
+    Shaped so that every surface is honest at once, because the surfaces do not all get a status
+    box. Refresh's outputs are `(gallery, counts, Confirm)` -- no report -- so the **gallery**
+    carries the message rather than the "Nothing scanned yet" placeholder, which would read as a
+    folder nobody has reviewed. The counters are replaced rather than recomputed: "Undecided 0"
+    derived from a record that could not be read is precisely the misreading this exists to
+    prevent, and so is a grid of `PENDING` tiles. Confirm is disabled, by the F8 rule -- its state
+    comes only from the durable record, and there isn't one to read.
+    """
+    import html as _html
+
+    message = _clips_state_unavailable_text(failure)
+    grid = ('<div class="r5-empty">'
+            + '<br>'.join(_html.escape(line) for line in message.splitlines())
+            + '</div>')
+    return (message, grid, 'Saved decisions unavailable — nothing was loaded.',
+            gr.update(interactive=False))
 
 
 def _clips_owner(request) -> str:
@@ -6379,7 +6430,14 @@ def _clips_render_current(owner: str, report: str):
     if not view.get('entries'):
         return (report, CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
                 gr.update(interactive=False))
-    store = _clips_store()
+    # [R5-P11 / N7] Refresh is the operator's recovery route, so it must survive the condition it
+    # is recovering from. A store that cannot completely recover now refuses rather than reporting
+    # an empty record, and repainting this page from a record that could not be read would show
+    # every decided clip as undecided -- the exact misreading the refusal exists to replace.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_unavailable_outputs(failure)
     identities = _clips_identities(view)
     counts = store.counts(identities)
     grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
@@ -6442,7 +6500,16 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     except (TypeError, ValueError):
         size = 100
 
-    store = _clips_store()
+    # [R5-P11 / N7] The durable record is obtained BEFORE a generation is taken, and that ordering
+    # is the whole containment. A refused recovery therefore changes nothing at all: no generation
+    # is minted, so no running scan is superseded and no current page is blanked; `begin_scan` and
+    # `new_session` are never reached, so no review session is opened against a record the server
+    # could not read; and the poster pass never starts. The operator is told what happened instead
+    # of being handed a folder that looks entirely undecided.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_unavailable_outputs(failure)
     scan_id = secrets.token_urlsafe(12)
     generation = _CLIPS_SCANS.begin(owner)
     try:
@@ -6488,10 +6555,19 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     try:
         store.maybe_compact()
     except (fork_clips.PersistenceError, OSError) as failure:
+        # [R5-P11] The reassurance here used to say every decision already made "is still in the
+        # journal". That overstates what the storage contract guarantees, and an independent review
+        # found it inaccurate: after a *successful* compaction the snapshot is the authoritative
+        # copy and the journal is empty, so the journal alone is not the record. What is true, and
+        # is what matters to the operator, is that compaction only ever runs against a completely
+        # recovered record and that a failed one destroys neither copy -- either the snapshot has
+        # not been replaced yet, or it has landed and the journal still replays onto it
+        # idempotently. Promise the recoverability, not the location.
         compaction_notice = (
             "\n⚠️  Journal housekeeping (compaction) failed and was skipped "
-            f"({_clips_failure_text(failure)}). Your decisions are safe: the journal is the "
-            "record, and every decision already made is still in it.")
+            f"({_clips_failure_text(failure)}). Your decisions are safe: every decision already "
+            "made stays recoverable from the snapshot plus the journal, and a failed compaction "
+            "discards neither.")
 
     # [R5-P9 / N1] Render from the authoritative view, never from this scan's own locals.
     # Publication succeeded above, but the poster pass and the compaction below both take real
@@ -6539,6 +6615,12 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
     if identity is None:
         return {'ok': False, 'code': 'clip_not_on_page'}
 
+    # [R5-P11 / N7] Deliberately NOT contained here. `_clips_store` raises `PersistenceError` when
+    # the durable record could not be completely recovered, and the middleware already answers that
+    # class with 503 `not_durably_recorded` and a path-free body -- which is the correct answer for
+    # a classification that cannot be read or written. Catching it to return a JSON `ok: False`
+    # would make an unreadable record indistinguishable from an ordinary refusal, and catching it
+    # to return `ok: True` would be the false success the whole durability contract forbids.
     store = _clips_store()
     identities = _clips_identities(view)
 
@@ -6577,7 +6659,12 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
 
 
 def _clips_state(owner, session_id, page_token):
-    """The authoritative record for one page, for GET /r5state."""
+    """The authoritative record for one page, for GET /r5state.
+
+    [R5-P11 / N7] A `PersistenceError` from `_clips_store` is left to propagate for the same
+    reason as in `_clips_decide`: this route's entire purpose is to be believed, so an unreadable
+    record must answer 503 rather than report every clip as `PENDING` with `ok: True`.
+    """
     view = _clips_view(owner)
     if view.get('session') != session_id or view.get('page') != page_token:
         return {'ok': False, 'code': 'not_the_active_page'}
@@ -6624,7 +6711,13 @@ def _on_clips_confirm(request: gr.Request = None):
     view = _clips_view(owner)
     if not view.get('entries'):
         return "Nothing has been scanned on this page."
-    store = _clips_store()
+    # [R5-P11 / N7] A readiness report derived from a record that could not be read would be a
+    # false negative with the authority of a positive statement -- "0 kept, 0 discarded" reads as
+    # a reviewed page rather than an unreadable one. Refuse to report instead.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_state_unavailable_text(failure)
     counts = store.counts(_clips_identities(view))
     if counts[fork_clips.PENDING]:
         return (f"{CLIPS_CONFIRM_DISABLED_TEXT}\n\n"

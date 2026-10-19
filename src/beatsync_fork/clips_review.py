@@ -1326,6 +1326,15 @@ def _io_detail(exc: BaseException) -> str:
     return detail
 
 
+#: [R5-P11 / N7] The one Windows code that genuinely means "that name is not in this directory".
+#: ``FileNotFoundError`` is the class CPython maps **six** codes onto -- enumerated in
+#: :meth:`ReviewStore._journal_tail_is_terminated` -- and five of them say *the pathname did not
+#: resolve*: a share that stopped answering, a volume that went away, a bad UNC name. Reading all
+#: six as "the file is not there" is how a journal still sitting on disk, holding every committed
+#: decision, was recovered as an empty store.
+_ERROR_FILE_NOT_FOUND = 2
+
+
 def io_detail(exc: BaseException) -> str:
     """[R5-P9] The public spelling of :func:`_io_detail`, for callers outside this module.
 
@@ -1361,7 +1370,15 @@ class ReviewStore:
 
     def __init__(self, directory: str) -> None:
         self.dir = os.path.abspath(directory)
-        os.makedirs(self.dir, exist_ok=True)
+        #: [R5-P11 / N7] ``False`` until :meth:`_load` has rebuilt the **whole** record. A store
+        #: that did not completely recover may never append and may never compact. Set before the
+        #: first statement that can fail, so the guard is true even for a half-built object.
+        self._recovered = False
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not open the review state directory ({_io_detail(exc)})") from exc
         self.journal_path = os.path.join(self.dir, "review-journal.jsonl")
         self.snapshot_path = os.path.join(self.dir, "review-snapshot.json")
         self._lock = threading.RLock()
@@ -1375,22 +1392,105 @@ class ReviewStore:
 
     # ---- durability ------------------------------------------------------------------
 
-    def _load(self) -> None:
-        if os.path.exists(self.snapshot_path):
-            try:
-                with open(self.snapshot_path, "r", encoding="utf-8") as handle:
-                    snapshot = json.load(handle)
-                for identity, raw in snapshot.get("records", {}).items():
-                    self._records[identity] = Record(identity, raw["decision"],
-                                                     int(raw["revision"]), raw.get("scan_id", ""),
-                                                     float(raw.get("updated_at", 0.0)))
-                self._scans.update(snapshot.get("scans", {}))
-            except (OSError, ValueError, KeyError, TypeError):
-                self.corrupt_records_discarded += 1     # unusable snapshot; the journal replays
-        if not os.path.exists(self.journal_path):
-            return
+    def _absence_is_proven(self, path: str, exc: OSError) -> bool:
+        """[R5-P11 / N7] Whether ``exc`` *proves* ``path``'s leaf name is not in :attr:`dir`.
+
+        A genuinely fresh store has no snapshot and no journal and must still work, so "the file
+        is not there" has to remain a usable answer. What it must **not** be is a guess, and the
+        two ways of guessing it are exactly the ways this defect was reached:
+
+        * ``os.path.exists`` / ``os.path.lexists`` answer ``False`` for a path that merely failed
+          to *resolve* -- a disconnected share, a removed volume, an ACL that denies traversal --
+          just as readily as for a name that is absent. The same confusion the N6 fix removed from
+          the append path was still load-bearing on the read path.
+        * ``FileNotFoundError`` is not "missing" either. CPython maps six Windows codes onto it
+          and only ``ERROR_FILE_NOT_FOUND`` says the name is not in the directory.
+
+        So absence is established from the **directory listing**, which is positive filesystem
+        evidence rather than an inference from a failure: the error class and code must be the one
+        that means an absent leaf, *and* the directory must be enumerable, *and* the basename must
+        genuinely not be in it. A listing that cannot be read, or that does contain the name, is an
+        unresolved condition and fails closed. Everything else -- a sharing violation, a denied
+        ACL, a device error -- is not an answer at all.
+        """
+        if not isinstance(exc, FileNotFoundError):
+            return False
+        winerror = getattr(exc, "winerror", None)
+        if winerror is not None and winerror != _ERROR_FILE_NOT_FOUND:
+            return False
         try:
-            with open(self.journal_path, "r", encoding="utf-8") as handle:
+            names = os.listdir(self.dir)
+        except OSError:
+            return False
+        return os.path.basename(path) not in names
+
+    def _read_snapshot(self) -> tuple[dict[str, Record], dict[str, str], int]:
+        """The snapshot, into **fresh** dicts. Returns ``(records, scans, discarded)``.
+
+        [R5-P11 / N7] Three outcomes, kept distinct because conflating any two of them is how a
+        committed decision was lost:
+
+        * **genuinely absent** -- an empty contribution, and the journal is the whole record;
+        * **syntactically unusable content** -- discarded so the journal can replay over it, which
+          is the deliberate corruption tolerance R5-P3 established. Nothing is written here, so
+          the unusable bytes stay on disk for inspection;
+        * **unreadable** -- a lock, an ACL, a device error, an unresolved pathname. That is not an
+          answer about what the snapshot holds, so it raises. The original code caught ``OSError``
+          in the same clause as ``ValueError`` and therefore called a transient read failure
+          "corruption", published an empty record set as authoritative, and allowed the next
+          compaction to overwrite the real snapshot with it.
+
+        Records are also materialised **all at once**: the original loop assigned into the live
+        ``self._records`` as it went, so a ``KeyError`` on the third of ten records left the first
+        two installed and the rest silently absent.
+        """
+        try:
+            handle = open(self.snapshot_path, "r", encoding="utf-8")
+        except OSError as exc:
+            if self._absence_is_proven(self.snapshot_path, exc):
+                return {}, {}, 0
+            raise PersistenceError(
+                f"could not read the review snapshot ({_io_detail(exc)})") from exc
+        try:
+            with handle:
+                raw = handle.read()
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not read the review snapshot ({_io_detail(exc)})") from exc
+        try:
+            snapshot = json.loads(raw)
+            records = {identity: Record(identity, entry["decision"], int(entry["revision"]),
+                                        str(entry.get("scan_id", "")),
+                                        float(entry.get("updated_at", 0.0)))
+                       for identity, entry in snapshot["records"].items()}
+            scans = {owner: str(scan) for owner, scan in snapshot.get("scans", {}).items()}
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return {}, {}, 1
+        return records, scans, 0
+
+    def _replay_journal(self, records: dict[str, Record], scans: dict[str, str]
+                        ) -> tuple[int, int]:
+        """Replay the journal onto ``records``/``scans``. Returns ``(applied, discarded)``.
+
+        [R5-P11 / N7] An ``OSError`` part way through the replay **raises**. The original code
+        swallowed it and kept whatever had been applied so far, which published a truncated
+        prefix of the journal as the authoritative record -- and then let the store be written to
+        and compacted, turning a transient read failure into permanent loss.
+
+        A single unparsable *line* is still discarded and the replay continues: that is the F4
+        torn-tail tolerance, and it is a statement about one record's content rather than a failed
+        read of the file.
+        """
+        try:
+            handle = open(self.journal_path, "r", encoding="utf-8")
+        except OSError as exc:
+            if self._absence_is_proven(self.journal_path, exc):
+                return 0, 0
+            raise PersistenceError(
+                f"could not read the review journal ({_io_detail(exc)})") from exc
+        applied = discarded = 0
+        try:
+            with handle:
                 for line in handle:
                     line = line.strip()
                     if not line:
@@ -1403,27 +1503,91 @@ class ReviewStore:
                         # terminates an unterminated tail before writing after it -- so a later
                         # healthy record can no longer be swallowed by a partial one. Every
                         # fully committed record before the damage is preserved.
-                        self.corrupt_records_discarded += 1
+                        discarded += 1
                         continue
-                    self._apply(event)
-                    self.journal_records += 1
-        except OSError:
-            self.corrupt_records_discarded += 1
+                    self._apply(event, records, scans)
+                    applied += 1
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not replay the review journal ({_io_detail(exc)})") from exc
+        return applied, discarded
 
-    def _apply(self, event: dict) -> None:
+    def _load(self) -> None:
+        """Rebuild memory from the snapshot and the journal: **completely, or not at all**.
+
+        [R5-P11 / N7] This is the fix for a confirmed permanent-loss path, not a tidy-up. The
+        original implementation treated every read failure as corruption and returned a store
+        that looked healthy, so:
+
+        1. a transiently unreadable snapshot or journal -- an exclusive share from a backup or an
+           indexer is enough -- loaded as an **empty** record set, with no exception raised and
+           nothing said to the operator;
+        2. that store was fully writable and fully compactable;
+        3. the next ``compact()``, including the automatic one at
+           :data:`COMPACT_AFTER_RECORDS`, wrote that empty set over the real snapshot and
+           truncated the journal.
+
+        After step 3 the decisions were gone for good: the retained bytes that still held them
+        had been replaced by a snapshot built from memory that was never authoritative. Measured
+        on the pre-fix code with a real Windows exclusive-sharing lock *and* with independent
+        fault injection, for the snapshot and for the journal, and through the real 2,000-record
+        automatic threshold.
+
+        So nothing is published until both halves have been read in full. Memory is assembled in
+        local dicts and installed only on the last line, and ``_recovered`` -- the flag
+        :meth:`_require_recovered` gates every mutation on -- is set only after that. A failure
+        here propagates out of ``__init__`` as a :class:`PersistenceError`, which is strictly
+        better than a store that cannot be told from a healthy one: there is no object to append
+        to, so there is nothing to compact from. **Nothing in this method writes**, so a refused
+        load leaves the snapshot and the journal byte-for-byte as they were and a later healthy
+        attempt recovers everything.
+        """
+        records, scans, unusable_snapshot = self._read_snapshot()
+        applied, damaged_lines = self._replay_journal(records, scans)
+        self._records = records
+        self._scans.update(scans)
+        self.corrupt_records_discarded += unusable_snapshot + damaged_lines
+        self.journal_records = applied
+        self._recovered = True
+
+    def _require_recovered(self) -> None:
+        """[R5-P11 / N7] Refuse to mutate a store whose start-up recovery was not complete.
+
+        Defence in depth behind the constructor's refusal, and the reason the fix cannot be
+        reduced to "raise from ``_load``": the destructive step is ``compact()``, which neither
+        reads nor needs the files it is about to replace. Gating the two mutating entry points on
+        the recovery flag means an incompletely recovered store can never become the snapshot,
+        however it came to exist -- a partially constructed object, a subclass, a future reload
+        path that resets state in place.
+        """
+        if not self._recovered:
+            raise PersistenceError(
+                "the review record was not completely recovered, so it is read-only: "
+                "nothing may be appended to it and it may not be compacted")
+
+    def _apply(self, event: dict, records: dict[str, Record] | None = None,
+               scans: dict[str, str] | None = None) -> None:
+        """Fold one journal event into ``records``/``scans``, defaulting to the live state.
+
+        [R5-P11 / N7] The explicit targets are what let :meth:`_load` stage a replay without
+        publishing it: a replay that fails half way through must leave the live record untouched
+        rather than half updated.
+        """
+        records = self._records if records is None else records
+        scans = self._scans if scans is None else scans
         kind = event.get("k")
         if kind == "scan":
             owner = event.get("owner")
             if isinstance(owner, str):
-                self._scans[owner] = str(event.get("scan_id", ""))
+                scans[owner] = str(event.get("scan_id", ""))
         elif kind == "decide":
             identity = event.get("identity")
             if not isinstance(identity, str):
                 return
-            self._records[identity] = Record(identity, str(event.get("decision", PENDING)),
-                                             int(event.get("revision", 0)),
-                                             str(event.get("scan_id", "")),
-                                             float(event.get("at", 0.0)))
+            records[identity] = Record(identity, str(event.get("decision", PENDING)),
+                                       int(event.get("revision", 0)),
+                                       str(event.get("scan_id", "")),
+                                       float(event.get("at", 0.0)))
 
     def _write_all(self, handle: int, payload: bytes) -> int:
         """[R5-P3 / F4] Write every byte, or raise. Returns the number of bytes written.
@@ -1558,7 +1722,12 @@ class ReviewStore:
         whole guarantee: **once this function holds the journal open, no inspection failure of any
         class may be read as "the tail is terminated".** There is no remaining error for which the
         append proceeds against an unverified tail.
+
+        [R5-P11 / N7] It also includes not having *recovered* the journal: a store that could not
+        read its own record in full must not add to it, because the record it would be adding to
+        is not the one on disk.
         """
+        self._require_recovered()
         payload = (json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
         try:
@@ -1584,7 +1753,17 @@ class ReviewStore:
         Crash-safe in either order: the snapshot lands via ``os.replace``, and a journal that
         still holds records simply replays them onto an already-current snapshot, which is
         idempotent per identity.
+
+        [R5-P11 / N7] **Both of those steps destroy the previous copy of the record, so this is
+        the one operation an incompletely recovered store may never perform.** Replacing the
+        snapshot discards the bytes it was built from, and truncating the journal discards the
+        replay that would have corrected an incomplete load. Memory is the only input, so a
+        store that holds less than the disk did overwrites the disk with the loss -- which is
+        precisely what turned a transient read failure into a permanent one. A measured
+        consequence worth stating: the destructive step needed no new decision at all. A journal
+        denied at start-up, then released, was already unrecoverable once this ran.
         """
+        self._require_recovered()
         with self._lock:
             snapshot = {
                 "scans": dict(self._scans),

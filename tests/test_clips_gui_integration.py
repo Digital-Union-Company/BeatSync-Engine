@@ -41,7 +41,8 @@ _GUI = os.path.join(_SRC, "gui.py")
 _UI_CONTENT = os.path.join(_SRC, "ui_content.py")
 
 #: The handlers this suite drives, in dependency order within one namespace.
-_HANDLERS = ("_clips_store", "_clips_owner", "_clips_remember", "_clips_view",
+_HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailable_outputs",
+             "_clips_owner", "_clips_remember", "_clips_view",
              "_clips_failure_text", "_clips_poster_exists", "_clips_poster_resolver",
              "_clips_identities", "_on_clips_check", "_clips_render_current", "_on_clips_scan",
              "_clips_decide", "_clips_state", "_on_clips_refresh", "_on_clips_confirm")
@@ -541,11 +542,17 @@ def test_the_counters_tell_the_operator_that_refresh_enables_confirm(world):
 
 
 def test_only_the_record_can_ever_ENABLE_the_confirm_button():
-    """Three handlers touch the button, and only one of them may ever enable it.
+    """Four handlers touch the button, and only two of them may ever enable it.
 
     `_on_clips_scan` and `_on_clips_refresh` additionally *disable* it on a refusal or a failure,
-    which is the fail-closed direction and must stay. The asymmetry is the point: enabling is
-    derived from `store.counts()` in exactly one place.
+    and [R5-P11 / N7] `_clips_unavailable_outputs` disables it when the durable record could not
+    be read. That is the fail-closed direction and must stay. The asymmetry is the point: enabling
+    is derived from `store.counts()` and nothing else.
+
+    The expected list is deliberately an identity set rather than a count. A new handler that
+    merely *disables* the button is a safe addition and belongs here; one that enables it is the
+    defect this test exists to catch, and it would have to appear in `enablers` -- which is pinned
+    separately, with the derivation of each enabler checked below.
     """
     tree = ast.parse(open(_GUI, encoding="utf-8").read())
     movers, enablers = [], []
@@ -558,10 +565,16 @@ def test_only_the_record_can_ever_ENABLE_the_confirm_button():
             movers.append(node.name)
         if "interactive=True" in body or "interactive=counts" in body:
             enablers.append(node.name)
-    assert sorted(movers) == ["_clips_render_current", "_on_clips_refresh", "_on_clips_scan"], \
-        movers
+    assert sorted(movers) == ["_clips_render_current", "_clips_unavailable_outputs",
+                              "_on_clips_refresh", "_on_clips_scan"], movers
     assert sorted(enablers) == ["_clips_render_current", "_on_clips_scan"], (
         f"only these may enable Confirm, and both from the record: {enablers}")
+    unavailable = next(n for n in tree.body
+                       if isinstance(n, ast.FunctionDef)
+                       and n.name == "_clips_unavailable_outputs")
+    body = ast.unparse(unavailable)
+    assert "interactive=False" in body and "interactive=True" not in body, (
+        "the persistence-unavailable path may only ever DISABLE Confirm")
     for name in enablers:
         node = next(n for n in tree.body
                     if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -1040,3 +1053,302 @@ def test_the_scan_handler_renders_from_the_authoritative_view(world):
         assert stale not in args, (
             f"the grid is still built from the scan's local {stale!r}; a scan superseded after "
             "publishing would hand the browser revoked credentials")
+
+
+# =============================================================================================
+# [R5-P11 / N7] An unreadable durable record must refuse honestly, not look like a clean folder
+#
+# `ReviewStore` now raises `PersistenceError` rather than returning a store that recovered only
+# part of the record. Three things follow for this layer, and each was wrong before:
+#
+# * **Scan** obtains the store *before* `ScanCoordinator.begin()`, so a refused recovery takes no
+#   generation, opens no review session, revokes nothing and never starts the poster pass.
+# * **The refusal is not cached.** `_CLIPS_STORE` is assigned from a local that only exists once
+#   the constructor returned, so a passing exclusive share does not become a process-lifetime
+#   outage -- and a half-loaded store never becomes the one every later caller writes through.
+# * **Nothing reports success.** A grid of PENDING tiles, "Undecided 0", or a readiness report
+#   derived from a record that could not be read are all false statements with the authority of
+#   true ones. Refresh has no status box of its own, so its gallery carries the message.
+#
+# The underlying defect was permanent loss of committed decisions, reproduced on the frozen
+# baseline with a real Windows exclusive-sharing lock and with controlled injection; see
+# `test_clips_review.py`'s N7 section for the storage-level contract.
+
+def _seed_decisions(state_dir, count=3):
+    """Commit `count` decisions into the GUI's own state directory, before any handler runs."""
+    store = cr.ReviewStore(state_dir)
+    store.begin_scan("seed-owner", "seed-scan")
+    expected = {}
+    for index in range(count):
+        identity = f"seeded-{index}"
+        expected[identity] = store.decide("seed-owner", identity, cr.SELECTED, "seed-scan")
+    return store, expected
+
+
+def _deny_journal_reads(monkeypatch, journal):
+    """`open` that refuses READ opens of exactly this journal and delegates for every other.
+
+    Narrow by the convention this suite and `test_clips_review.py` both follow: a global patch
+    would break the poster cache and the descriptor-identity probe, and the handler would then
+    fail for a reason that is not the one under test.
+    """
+    real = open
+    target = os.path.normcase(os.path.abspath(journal))
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            raise PermissionError(13, "access denied", str(file), 32)
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+
+
+def _durable_bytes(store):
+    out = {}
+    for name, path in (("snapshot", store.snapshot_path), ("journal", store.journal_path)):
+        try:
+            with open(path, "rb") as handle:
+                out[name] = handle.read()
+        except FileNotFoundError:
+            out[name] = None
+    return out
+
+
+def _leaks_path(text, secret):
+    """Separator-stripped containment (R5-P7): `str(OSError)` reprs its filenames, so a plain
+    `in` test passes against text that really is disclosing the path."""
+    strip = lambda value: value.replace("\\", "").replace("/", "")       # noqa: E731
+    return strip(secret) in strip(text)
+
+
+def test_n7_case16_scan_refuses_and_mints_nothing_when_the_record_cannot_be_read(
+        world, monkeypatch):
+    """Case 16. Scan must refuse before it changes any authoritative state.
+
+    The ordering is the containment: `_clips_store()` is called before `begin()`, so a refusal
+    cannot supersede a running scan, cannot blank an existing page, cannot open a review session
+    against a record the server could not read, and cannot start the poster pass.
+    """
+    state_dir = str(world["tmp"] / "state")
+    seed, expected = _seed_decisions(state_dir)
+    before = _durable_bytes(seed)
+    namespace = world["ns"]
+    assert namespace["_CLIPS_STORE"] is None, "the store is created lazily"
+
+    _deny_journal_reads(monkeypatch, seed.journal_path)
+    report, grid, counts, confirm = _scan(world, "browser-n7-scan")
+    monkeypatch.undo()
+
+    assert "could NOT be read" in report, report
+    assert "try again" in report.lower(), "the operator is told the retry is the next step"
+    assert confirm == {"interactive": False}
+    assert "r5-tile" not in grid, "not one clip may be painted as undecided"
+    assert "Nothing scanned yet" not in grid, (
+        "the placeholder would read as a folder nobody has reviewed")
+    assert "could NOT be read" in grid, "Refresh has no status box, so the gallery must say it"
+    assert "unavailable" in counts.lower(), f"the counters must not read as decided: {counts!r}"
+
+    # Nothing authoritative moved, and nothing was cached.
+    assert namespace["_CLIPS_STORE"] is None, "a refusal must not be cached"
+    assert namespace["_clips_view"]("browser-n7-scan") == {}
+    assert namespace["_CLIPS_SCANS"].stats()["generations_issued"] == 0, (
+        "no generation may be taken, or a refusal could supersede a healthy running scan")
+    assert namespace["_CLIPS_REGISTRY"].stats()["sessions"] == 0, "no session was opened"
+    assert _durable_bytes(seed) == before, "a refused scan writes nothing"
+
+    # And the healthy retry works, with every seeded decision intact.
+    retried = namespace["_clips_store"]()
+    for identity, value in expected.items():
+        assert retried.get(identity) == value, "the seeded decisions survived the refusal"
+    served = _scan(world, "browser-n7-scan")
+    assert _session_of(served[1])[0], f"the retry must serve a real grid: {served[0][:200]!r}"
+
+
+def test_n7_case17_refresh_and_confirm_refuse_rather_than_report_a_clean_page(world,
+                                                                              monkeypatch):
+    """Case 17. The two read-only surfaces, after a page is already on screen.
+
+    `_CLIPS_STORE` is set back to `None` to model the lazy store not yet existing -- which is the
+    only state in which `_clips_store()` reads the disk, and therefore the only state in which an
+    unreadable record can reach these handlers. The view is untouched, so the page still has
+    entries: without the refusal, Refresh would repaint every decided clip as PENDING and Confirm
+    would report "0 kept, 0 discarded" about a record it could not read.
+    """
+    namespace = world["ns"]
+    owner = "browser-n7-refresh"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    assert view.get("entries"), "the page must be live before the record becomes unreadable"
+    store = namespace["_clips_store"]()
+    for entry in view["entries"]:
+        decided = namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                             {"to": cr.SELECTED, "rev": 0})
+        assert decided["ok"], decided
+
+    # Control: with the record readable, these two surfaces report the decided page.
+    healthy_grid, healthy_counts, healthy_confirm = namespace["_on_clips_refresh"](
+        world["request"](session_hash=owner))
+    assert healthy_confirm == {"interactive": True}, "the control arm must really be positive"
+    assert "Kept 3" in healthy_counts, healthy_counts
+    assert "NOT enabled" in namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+
+    before = _durable_bytes(store)
+    namespace["_CLIPS_STORE"] = None
+    _deny_journal_reads(monkeypatch, store.journal_path)
+
+    grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    monkeypatch.undo()
+
+    assert confirm == {"interactive": False}, "Confirm must fail closed"
+    assert "r5-tile" not in grid, "a decided clip may never be repainted as undecided"
+    assert "could NOT be read" in grid, "Refresh's only surface for this is the gallery"
+    assert "unavailable" in counts.lower(), counts
+    assert "could NOT be read" in confirmation, confirmation
+    for forbidden in ("NOT enabled", "Recorded:", "are still undecided"):
+        assert forbidden not in confirmation, (
+            f"an unreadable record must not produce a readiness claim ({forbidden})")
+    assert namespace["_CLIPS_STORE"] is None, "neither surface cached the refusal"
+    assert _durable_bytes(store) == before
+
+    # The record is still there, and the next Refresh paints the real decisions again.
+    grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
+    assert confirm == {"interactive": True}, "recovery is automatic once the file is readable"
+    assert "Kept 3" in counts, counts
+
+
+def test_n7_the_store_factory_never_caches_a_refusal(world, monkeypatch):
+    """The one site that could turn a passing lock into a process-lifetime outage.
+
+    Caching the exception would wedge the tab until the app restarted; caching a half-loaded
+    store would re-arm the loss path, because every later caller would be appending to a record
+    the disk does not hold.
+    """
+    namespace = world["ns"]
+    state_dir = str(world["tmp"] / "state")
+    seed, expected = _seed_decisions(state_dir)
+
+    _deny_journal_reads(monkeypatch, seed.journal_path)
+    for _ in range(3):
+        with pytest.raises(cr.PersistenceError):
+            namespace["_clips_store"]()
+        assert namespace["_CLIPS_STORE"] is None, "nothing may be cached by a failed attempt"
+    monkeypatch.undo()
+
+    store = namespace["_clips_store"]()
+    assert namespace["_CLIPS_STORE"] is store, "a complete recovery IS cached"
+    assert namespace["_clips_store"]() is store, "and reused"
+    for identity, value in expected.items():
+        assert store.get(identity) == value
+
+
+def test_n7_no_operator_visible_refusal_discloses_a_filesystem_path(world, monkeypatch):
+    """Every surface the refusal reaches: the report, the gallery, the counters and Confirm.
+
+    `_clips_failure_text` reduces a bare `OSError` to `errno`/`winerror`, and `PersistenceError`
+    is path-free by the R5-P7 contract -- but the message is assembled here, so it is checked
+    here, separator-blind.
+    """
+    namespace = world["ns"]
+    state_dir = str(world["tmp"] / "state")
+    seed, _ = _seed_decisions(state_dir)
+    secrets_to_keep = (seed.journal_path, seed.snapshot_path, state_dir,
+                       os.path.basename(state_dir))
+
+    owner = "browser-n7-redaction"
+    _scan(world, owner)
+    namespace["_CLIPS_STORE"] = None
+    _deny_journal_reads(monkeypatch, seed.journal_path)
+    report, grid, counts, confirm = _scan(world, owner)
+    refresh = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    monkeypatch.undo()
+
+    surfaces = [report, grid, counts, confirmation, refresh[0], refresh[1]]
+    for text in surfaces:
+        for secret in secrets_to_keep:
+            assert not _leaks_path(text, secret), f"a path reached the operator: {text[:200]!r}"
+        assert "review-journal" not in text and "review-snapshot" not in text
+        assert ".jsonl" not in text
+    assert "errno 13" in report, "the condition must stay diagnosable without the path"
+    assert confirm == {"interactive": False}
+
+
+def test_n7_the_compaction_notice_no_longer_claims_the_journal_holds_everything(world,
+                                                                                monkeypatch):
+    """[R5-P11] The R5-P9 reassurance was inaccurate and an independent review said so.
+
+    It told the operator every decision already made "is still in the journal". After a
+    successful compaction the journal is empty and the snapshot is the authoritative copy, so that
+    is not universally true -- and the confirmed N7 path could compact incomplete memory into a
+    replacement snapshot, which made it false in the one case where it mattered most. The
+    corrected wording promises recoverability from both copies, which is what the storage contract
+    actually guarantees.
+    """
+    owner = "browser-n7-wording"
+    store = _prime_for_real_compaction(world["ns"])
+    real_replace = os.replace
+
+    def refuse(src, dst, *args, **kwargs):
+        if str(dst) == store.snapshot_path:
+            raise OSError(13, "snapshot refused", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "replace", refuse)
+    report, grid, _, _ = _scan(world, owner)
+    monkeypatch.undo()
+
+    assert "compaction" in report.lower(), report
+    assert "still in it" not in report, "the inaccurate reassurance must be gone"
+    assert "journal is the" not in report, (
+        "and so must the claim that the journal alone is the record")
+    assert "recoverable from the snapshot plus the journal" in report, report
+    assert _session_of(grid)[0], "the scan that succeeded is still served"
+
+
+def test_n7_the_scan_handler_reads_the_store_before_it_takes_a_generation():
+    """Structural, because the ordering is what makes the refusal harmless.
+
+    A behavioural test can only catch the interleavings it schedules. If `_clips_store()` were
+    moved after `begin()`, a refusal would mint a generation -- which, by the N4 rule, makes any
+    existing page stop being current -- and would then never publish one, so an operator with a
+    live gallery would lose it to someone else's unreadable disk.
+    """
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    scan = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_on_clips_scan")
+    body = ast.unparse(scan)
+    assert body.index("_clips_store()") < body.index("_CLIPS_SCANS.begin("), (
+        "the durable record must be obtained BEFORE a scan generation is taken")
+    assert body.index("_clips_store()") < body.index("ensure_posters"), (
+        "and before the poster pass")
+    assert "_clips_unavailable_outputs" in body, "the refusal must be reported, not raised"
+
+
+def test_n7_the_decision_and_state_routes_let_the_503_contract_answer():
+    """Structural. These two answer HTTP, and the middleware already maps the persistence failure
+    to a path-free 503 `not_durably_recorded`. Catching it here to return a JSON body would make
+    an unreadable record indistinguishable from an ordinary refusal -- or, worse, report success.
+
+    Asserted over the **exception handlers in the AST**, not over the unparsed text. The two
+    functions legitimately *explain* in prose why they do not catch it, and a substring test
+    would be tripped by the explanation -- which has now happened six times in this repository.
+    """
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    for name in ("_clips_decide", "_clips_state"):
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        caught = set()
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.ExceptHandler) and inner.type is not None:
+                targets = (inner.type.elts if isinstance(inner.type, ast.Tuple)
+                           else [inner.type])
+                caught.update(ast.unparse(target).rsplit(".", 1)[-1] for target in targets)
+        assert "_clips_store()" in ast.unparse(node), f"{name} must use the lazy store"
+        assert "PersistenceError" not in caught, (
+            f"{name} caught the persistence failure instead of letting 503 answer: {caught}")
+        assert "OSError" not in caught, f"{name} must not contain a bare I/O failure either"
+        assert "_clips_unavailable_outputs" not in ast.unparse(node), (
+            f"{name} returns JSON, not GUI outputs")

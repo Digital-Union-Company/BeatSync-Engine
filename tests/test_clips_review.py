@@ -2282,3 +2282,726 @@ def test_the_gallery_script_is_installed_through_app_load_unchanged():
     itself rather than rebuild it at the call site."""
     gui_source = open(os.path.join(_SRC, "gui.py"), encoding="utf-8").read()
     assert "app.load(fn=None, inputs=None, outputs=None, js=CLIPS_GALLERY_JS)" in gui_source
+
+
+# =============================================================================================
+# [R5-P11 / N7] Start-up recovery is all-or-nothing, and an incomplete one is NEVER compacted
+#
+# The defect these pin was confirmed twice independently and is a **permanent loss of committed
+# decisions**, not the transient under-reporting the earlier reports and rule called it.
+#
+# `_load` treated every read failure as corruption: an unreadable snapshot was caught in the same
+# clause as a syntactically invalid one, and an `OSError` part way through the journal replay was
+# swallowed with whatever had been applied so far kept. Either way the constructor returned a
+# store that could not be told from a healthy one, with an EMPTY or truncated record. That store
+# was fully writable and fully compactable, and `compact()` -- including the automatic one at
+# COMPACT_AFTER_RECORDS -- then wrote that incomplete memory over the real snapshot and truncated
+# the journal. After that the decisions were gone: the bytes that still held them had been
+# replaced by a snapshot assembled from a record that was never authoritative.
+#
+# Measured on the pre-fix code, in the task evidence, four independent ways: a real Windows
+# exclusive-sharing lock and controlled fault injection, each against the snapshot and against the
+# journal, plus the real 2,000-record automatic threshold. In the sharpest of them no new decision
+# was needed at all -- the append was correctly refused by the N2/N6 fix, and `compact()` alone
+# destroyed three committed decisions. The retained state was mutated every time (a 369-byte
+# snapshot replaced by a 146-byte one; a 419-byte journal truncated to 0). After the fix all four
+# leave the snapshot and journal byte-for-byte identical.
+#
+# Fault injection below follows the N2/N6 convention in this file: scoped to the module under
+# test, delegating for every path that is not this test's own disposable state.
+
+def _deny_reads(monkeypatch, path, make_error):
+    """`open` that raises for READ opens of exactly one file, and delegates for every other."""
+    real = open
+    target = os.path.normcase(os.path.abspath(path))
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            raise make_error()
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+
+
+def _fail_part_way_through(monkeypatch, path, after_lines, errno_=5):
+    """`open` whose returned handle yields `after_lines` real lines and then raises.
+
+    The point of injecting at *iteration* rather than at `open` is that it is the only shape that
+    produces a genuinely partial replay: the first records are real, applied records, and the
+    failure arrives with the store half rebuilt.
+    """
+    real = open
+    target = os.path.normcase(os.path.abspath(path))
+
+    class _Partial:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._handle.close()
+            return False
+
+        def __iter__(self):
+            for index, line in enumerate(self._handle):
+                if index >= after_lines:
+                    raise OSError(errno_, "simulated I/O error part way through the replay")
+                yield line
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            return _Partial(real(file, *args, **kwargs))
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+
+
+class _RealExclusiveLock:
+    """A genuine Windows handle opened with **no sharing**: any other open is refused by the OS.
+
+    Not a simulation. This is the condition the defect was reported for -- a backup, an indexer or
+    an antivirus holding the file for a moment -- and it needs no injection at all, which is why
+    one of these is kept in the suite rather than only in the task evidence.
+    """
+
+    def __init__(self, path):
+        import ctypes
+
+        self._ctypes = ctypes
+        self.path = path
+        self._handle = None
+        self._kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+        self._kernel.CreateFileW.restype = ctypes.c_void_p
+        self._kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    def __enter__(self):
+        handle = self._kernel.CreateFileW(self.path, 0x80000000, 0, None, 3, 0, None)
+        if handle == self._ctypes.c_void_p(-1).value:
+            raise OSError(self._ctypes.get_last_error(), "CreateFileW refused")
+        self._handle = handle
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._handle is not None:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
+        return False
+
+
+def _state_bytes(store):
+    """The whole durable footprint, so "not one byte changed" is a single comparison."""
+    out = {}
+    for name, path in (("snapshot", store.snapshot_path), ("journal", store.journal_path)):
+        try:
+            with open(path, "rb") as handle:
+                out[name] = handle.read()
+        except FileNotFoundError:
+            out[name] = None
+    return out
+
+
+def _committed(directory, count=3, compact=False):
+    """`count` distinct decisions, each committed at revision 1. Optionally compacted."""
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    expected = {}
+    for index in range(count):
+        identity = f"clip-{index}"
+        decision = cr.SELECTED if index % 2 else cr.REJECTED
+        expected[identity] = store.decide("owner-a", identity, decision, "scan-1")
+    if compact:
+        store.compact()
+    return store, expected
+
+
+def _assert_fully_recovered(directory, expected, scan="scan-1"):
+    """Every committed identity, decision and revision is back, and so is the scan pointer."""
+    store = cr.ReviewStore(directory)
+    for identity, value in expected.items():
+        assert store.get(identity) == value, f"{identity} did not survive"
+    assert store.current_scan("owner-a") == scan, "the scan state must be restored too"
+    return store
+
+
+# ---- 1-3: the cases that must keep working exactly as they did ------------------------------
+
+def test_n7_case1_a_genuinely_fresh_store_still_works(tmp_path):
+    """Case 1. Both files genuinely absent is the ordinary first run, not a failure.
+
+    This is the property that makes the fix non-trivial: "absent" has to stay a usable answer
+    while every *unresolved* condition fails closed.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    assert not os.path.exists(store.snapshot_path) and not os.path.exists(store.journal_path)
+    assert store._recovered is True                              # noqa: SLF001 - white box
+    store.begin_scan("owner-a", "scan-1")
+    assert store.decide("owner-a", "clip-0", cr.SELECTED, "scan-1") == (cr.SELECTED, 1)
+    store.compact()
+    assert cr.ReviewStore(directory).get("clip-0") == (cr.SELECTED, 1)
+
+
+def test_n7_case2_a_valid_snapshot_with_an_empty_journal_recovers(tmp_path):
+    """Case 2. The post-compaction steady state: the snapshot IS the record."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    assert os.path.getsize(store.journal_path) == 0, "compaction emptied the journal"
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.journal_records == 0
+    assert recovered.corrupt_records_discarded == 0, "a valid snapshot is not corruption"
+
+
+def test_n7_case3_a_valid_snapshot_plus_later_journal_events_recovers(tmp_path):
+    """Case 3. Snapshot and journal together, with the journal winning where they overlap."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    store.begin_scan("owner-a", "scan-2")
+    expected["clip-0"] = store.decide("owner-a", "clip-0", cr.SELECTED, "scan-2")
+    expected["clip-new"] = store.decide("owner-a", "clip-new", cr.REJECTED, "scan-2")
+    assert os.path.getsize(store.journal_path) > 0
+
+    recovered = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert recovered.get("clip-0") == (cr.SELECTED, 2), (
+        "the journal event supersedes the snapshot and keeps its revision")
+    assert recovered.journal_records == 3, "one scan plus two decisions replayed"
+
+
+# ---- 4-8: every unreadable condition fails closed, and changes nothing ----------------------
+
+@pytest.mark.parametrize("which", ["snapshot", "journal"])
+def test_n7_cases4_5_a_temporarily_unreadable_state_file_refuses_the_store(tmp_path, monkeypatch,
+                                                                           which):
+    """Cases 4 and 5. The core reproduction, for each file in turn.
+
+    Pre-fix this returned a store reporting every decision as `PENDING, 0`, with no exception and
+    nothing said to the operator. It must raise instead -- and raise the one class the GUI and the
+    HTTP boundary already handle.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=(which == "snapshot"))
+    target = store.snapshot_path if which == "snapshot" else store.journal_path
+    before = _state_bytes(store)
+
+    _deny_reads(monkeypatch, target, lambda: PermissionError(13, "access denied", target, 5))
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert f"could not read the review {which}" in str(failure.value)
+    assert _state_bytes(store) == before, "a refused load may not touch one byte"
+    _assert_fully_recovered(directory, expected)
+
+
+@pytest.mark.parametrize("which", ["snapshot", "journal"])
+def test_n7_cases6_7_one_readable_file_does_not_excuse_the_other(tmp_path, monkeypatch, which):
+    """Cases 6 and 7. A snapshot and a journal that both hold records, one of them unreadable.
+
+    This is the asymmetric pair: the readable half alone looks like a plausible record, which is
+    exactly why a partial recovery must not be published. The decisions that live only in the
+    unreadable half would be silently absent, and the next compaction would make that permanent.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)        # three decisions in the snapshot
+    store.begin_scan("owner-a", "scan-2")
+    expected["clip-journal-only"] = store.decide("owner-a", "clip-journal-only",
+                                                 cr.SELECTED, "scan-2")
+    assert os.path.getsize(store.snapshot_path) > 0 and os.path.getsize(store.journal_path) > 0
+
+    target = store.snapshot_path if which == "snapshot" else store.journal_path
+    before = _state_bytes(store)
+    _deny_reads(monkeypatch, target, lambda: PermissionError(13, "access denied", target, 5))
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert _state_bytes(store) == before
+    _assert_fully_recovered(directory, expected, scan="scan-2")
+
+
+def test_n7_case8_an_io_failure_part_way_through_the_replay_refuses_the_store(tmp_path,
+                                                                              monkeypatch):
+    """Case 8. The subtlest half of the defect: a replay that genuinely half succeeded.
+
+    The original code's `except OSError` wrapped the whole loop and kept every record applied
+    before the failure, so the store published a *prefix* of the journal as the authoritative
+    record. A prefix is more dangerous than an empty set, because it looks right.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, count=4)
+    before = _state_bytes(store)
+
+    # Two lines in: the scan record and the first decision have been applied for real.
+    _fail_part_way_through(monkeypatch, store.journal_path, after_lines=2)
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert "could not replay the review journal" in str(failure.value)
+    assert _state_bytes(store) == before
+    _assert_fully_recovered(directory, expected)
+
+
+@pytest.mark.parametrize("code,name", _FILE_NOT_FOUND_WINERRORS)
+def test_n7_a_file_not_found_that_is_not_absence_still_refuses(tmp_path, monkeypatch, code, name):
+    """`FileNotFoundError` is not proof of absence on the READ path either.
+
+    The same six Windows codes the N6 fix separated on the append path reach `_load`, and five of
+    them mean *the pathname did not resolve* while the journal sits on disk holding every
+    committed decision. The one code that does mean an absent leaf is the one that cannot be true
+    here, because the directory listing still shows the file -- so all six must refuse, and the
+    assertion is about the *filesystem evidence*, not about the error class.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    before = _state_bytes(store)
+
+    def error():
+        failure = FileNotFoundError(2, f"simulated {name}", store.journal_path)
+        failure.winerror = code
+        return failure
+
+    _deny_reads(monkeypatch, store.journal_path, error)
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert _state_bytes(store) == before
+    _assert_fully_recovered(directory, expected)
+
+
+@pytest.mark.parametrize("which", ["snapshot", "journal"])
+def test_n7_a_path_that_stops_resolving_is_not_absence(tmp_path, monkeypatch, which):
+    """**A bare existence check is not evidence**, and this is the case that proves it.
+
+    `os.path.exists` answers `False` for a path that stopped *resolving* -- a share that went
+    away, a volume that was removed, an ACL that denies traversal -- exactly as readily as for a
+    name that was never there, while the file is still on disk holding every committed decision.
+    Measured directly: `os.path.exists(r'\\\\no-such-host\\share\\file.txt')` is `False`.
+
+    Modelled here by making `exists` and `lexists` answer `False` for this one file while the
+    directory listing still shows it -- which is the evidence the fix reads instead. A disposable
+    mutation control that replaces the classification with `not os.path.exists(path)` passes every
+    other test in this suite and fails only this one, which is why it is a separate case rather
+    than a variant of the one below.
+
+    `winerror` is deliberately not what carries this: measured on this interpreter,
+    `builtins.open` sets `errno` but **no** `winerror` (only `os.path.getsize` supplies one), so
+    on the real read path the decision rests entirely on the listing.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=(which == "snapshot"))
+    target = store.snapshot_path if which == "snapshot" else store.journal_path
+    before = _state_bytes(store)
+    real_exists, real_lexists = os.path.exists, os.path.lexists
+
+    def vanished(path, real=None):
+        if _same_file(path, target):
+            return False                    # the pathname no longer resolves
+        return real(path)
+
+    monkeypatch.setattr(cr.os.path, "exists", lambda path: vanished(path, real_exists))
+    monkeypatch.setattr(cr.os.path, "lexists", lambda path: vanished(path, real_lexists))
+    _deny_reads(monkeypatch, target,
+                lambda: FileNotFoundError(2, "simulated ERROR_BAD_NETPATH", target))
+
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert f"could not read the review {which}" in str(failure.value)
+    assert _state_bytes(store) == before
+    assert os.path.basename(target) in os.listdir(directory), (
+        "the file never went anywhere -- only the pathname stopped resolving")
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7_absence_is_established_from_the_directory_listing_not_from_the_error(tmp_path,
+                                                                                 monkeypatch):
+    """The discriminator, stated once. Same error class, same code, opposite answers.
+
+    With the file genuinely gone from the directory, `ERROR_FILE_NOT_FOUND` is a definite answer.
+    With the file still listed, the identical exception is an unresolved condition. And if the
+    directory itself cannot be enumerated there is no evidence either way, so it fails closed --
+    which is what `os.path.exists` could never express, because it answers "no" for all three.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+
+    def absent():
+        failure = FileNotFoundError(2, "simulated ERROR_FILE_NOT_FOUND", store.journal_path)
+        failure.winerror = 2
+        return failure
+
+    # (a) the journal IS in the listing: not absence, refuse.
+    _deny_reads(monkeypatch, store.journal_path, absent)
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    # (b) the directory cannot be enumerated: no evidence, refuse.
+    _deny_reads(monkeypatch, store.journal_path, absent)
+    monkeypatch.setattr(cr.os, "listdir",
+                        lambda path: (_ for _ in ()).throw(OSError(5, "cannot enumerate")))
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    # (c) genuinely removed, and the listing agrees: an answer, so the snapshot alone recovers.
+    store.compact()
+    os.unlink(store.journal_path)
+    recovered = cr.ReviewStore(directory)
+    for identity, value in expected.items():
+        assert recovered.get(identity) == value, "the snapshot alone is a complete recovery"
+
+
+# ---- 9-10: corruption tolerance is PRESERVED, and kept distinct from a failed read ----------
+
+def test_n7_case9_a_torn_final_record_is_still_a_complete_recovery(tmp_path):
+    """Case 9. A torn tail is a statement about one record's content, not a failed read.
+
+    The distinction is the whole fix: this must stay tolerated and the store must stay writable
+    and compactable, because the damaged bytes were never a committed decision in the first place.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "a", encoding="utf-8") as handle:
+        handle.write('{"k":"decide","identity":"torn","dec')
+
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.corrupt_records_discarded == 1, "exactly the one damaged line"
+    assert recovered.get("torn") == (cr.PENDING, 0), "a torn record never reported success"
+    assert recovered._recovered is True                          # noqa: SLF001 - white box
+
+    recovered.begin_scan("owner-a", "scan-2")
+    assert recovered.decide("owner-a", "after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    recovered.compact()
+    _assert_fully_recovered(directory, expected, scan="scan-2")
+
+
+def test_n7_case10_a_syntactically_invalid_snapshot_still_replays_the_journal(tmp_path):
+    """Case 10. Unusable *content* stays recoverable from the journal, as R5-P3 established.
+
+    Preserved deliberately, and bounded deliberately: it applies when the bytes on disk are not
+    JSON, which is a definite finding about the snapshot. A read that *failed* says nothing about
+    the content and is handled by the cases above. Nothing here is written, so the unusable bytes
+    remain on disk for inspection.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.snapshot_path, "w", encoding="utf-8") as handle:
+        handle.write("{ this is not json")
+
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.corrupt_records_discarded == 1
+    assert recovered._recovered is True                          # noqa: SLF001 - white box
+    with open(store.snapshot_path, encoding="utf-8") as handle:
+        assert handle.read() == "{ this is not json", "a refused snapshot is not rewritten"
+
+
+@pytest.mark.parametrize("payload", [
+    '{"records": "not a mapping"}',
+    '{"records": {"a": "not a record"}}',
+    '{"records": {"a": {"revision": 1}}}',                       # no decision key
+    '{"records": {"a": {"decision": "SELECTED", "revision": "x"}}}',
+    '["not", "an", "object"]',
+    '{"scans": 7, "records": {}}',
+])
+def test_n7_a_structurally_invalid_snapshot_contributes_nothing_rather_than_a_prefix(tmp_path,
+                                                                                     payload):
+    """A snapshot that parses but does not describe records must contribute **nothing**.
+
+    The original loop assigned into the live record as it went, so a `KeyError` on the third of
+    ten entries left the first two installed and the rest silently missing -- a partial
+    publication by a different route. Records are now materialised in one expression.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.snapshot_path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.corrupt_records_discarded == 1
+
+
+# ---- 11-13: the retry, and normal service afterwards ----------------------------------------
+
+def test_n7_cases11_12_13_a_denial_that_clears_recovers_everything_and_resumes(tmp_path,
+                                                                               monkeypatch):
+    """Cases 11, 12 and 13 in one sequence, because they are one operator story.
+
+    A denial, a refusal, the denial clearing, then a healthy retry that recovers every decision at
+    its original revision, restores the scan state, accepts a new decision and compacts normally.
+    No journal was hand-edited and nothing had to be repaired -- which is the test that the fix is
+    a refusal rather than a wedge.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    before = _state_bytes(store)
+
+    _deny_reads(monkeypatch, store.journal_path,
+                lambda: PermissionError(13, "access denied", store.journal_path, 32))
+    for _ in range(3):                      # a repeated failure must stay a failure
+        with pytest.raises(cr.PersistenceError):
+            cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert _state_bytes(store) == before, "three refused attempts changed nothing"
+
+    retried = _assert_fully_recovered(directory, expected)
+    retried.begin_scan("owner-a", "scan-2")
+    assert retried.decide("owner-a", "clip-fresh", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    retried.compact()
+    assert os.path.getsize(retried.journal_path) == 0
+
+    final = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert final.get("clip-fresh") == (cr.SELECTED, 1)
+
+
+# ---- The destructive sequence: compaction after a failed load ------------------------------
+
+@pytest.mark.parametrize("which", ["snapshot", "journal"])
+def test_n7_the_destructive_sequence_cannot_happen(tmp_path, monkeypatch, which):
+    """**The mandatory reproduction.** A failed load, then a real `compact()`.
+
+    Pre-fix, with the snapshot denied: the store loaded empty, accepted a new decision and
+    compacted, and all three originals were gone for good. With the journal denied the append was
+    correctly refused by the N2/N6 fix and `compact()` destroyed them anyway -- which is why the
+    guard is on `compact()` and not only on the write path.
+
+    The corrected behaviour must *prevent* the sequence, not delay it: there is no store to
+    compact, and if one is somehow held, `compact()` itself refuses.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=(which == "snapshot"))
+    target = store.snapshot_path if which == "snapshot" else store.journal_path
+    before = _state_bytes(store)
+
+    _deny_reads(monkeypatch, target, lambda: PermissionError(13, "access denied", target, 5))
+    try:
+        incomplete = cr.ReviewStore(directory)
+    except cr.PersistenceError:
+        incomplete = None
+    if incomplete is not None:
+        # Deliberately NOT a `pytest.raises` around the construction. If the constructor ever
+        # stops refusing, this branch runs the real destructive sequence so the test fails on the
+        # measured loss below -- rather than passing because some other exception arrived first.
+        try:
+            incomplete.begin_scan("owner-a", "scan-2")
+            incomplete.decide("owner-a", "clip-new", cr.SELECTED, "scan-2")
+        except cr.PersistenceError:
+            pass                            # the write path may refuse; compaction is the danger
+        try:
+            incomplete.compact()
+        except (cr.PersistenceError, OSError):
+            pass
+    monkeypatch.undo()
+
+    assert incomplete is None, "an incompletely recovered store must not be constructible"
+    assert _state_bytes(store) == before, "not one byte of either copy may have changed"
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7_a_store_that_did_not_fully_recover_is_read_only(tmp_path):
+    """The guard behind the refusal, exercised directly.
+
+    `compact()` neither reads nor needs the files it replaces, so "raise from `_load`" is not by
+    itself sufficient -- anything holding a store whose recovery was incomplete could still turn
+    memory into the snapshot. Both mutating entry points therefore check the recovery flag.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    before = _state_bytes(store)
+    store._recovered = False                                     # noqa: SLF001 - white box
+
+    with pytest.raises(cr.PersistenceError) as compaction:
+        store.compact()
+    assert "not completely recovered" in str(compaction.value)
+    with pytest.raises(cr.PersistenceError):
+        store.begin_scan("owner-a", "scan-2")
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "clip-new", cr.SELECTED, "scan-1")
+    store.journal_records = cr.COMPACT_AFTER_RECORDS
+    with pytest.raises(cr.PersistenceError):
+        store.maybe_compact()
+
+    assert _state_bytes(store) == before, "a read-only store writes nothing at all"
+    store._recovered = True                                      # noqa: SLF001 - white box
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7_the_real_automatic_compaction_threshold_is_preserved_and_gated(tmp_path):
+    """Case: the REAL `maybe_compact()` threshold, from a real journal of that many records.
+
+    Two halves, because both matter. A completely recovered store must still compact at
+    COMPACT_AFTER_RECORDS -- the fix must not disable the housekeeping. And a store whose recovery
+    was incomplete must refuse at exactly the same point, which is the automatic route by which
+    the loss happened with no operator action at all.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    # Real records in the real format, written in one call rather than 2,000 fsync'd appends.
+    # The counter under test is `journal_records`, and it is derived from the replay.
+    with open(store.journal_path, "a", encoding="utf-8") as handle:
+        for index in range(cr.COMPACT_AFTER_RECORDS):
+            handle.write(json.dumps({"k": "scan", "owner": "owner-a",
+                                     "scan_id": "scan-1", "at": 0.0},
+                                    separators=(",", ":")) + "\n")
+
+    loaded = cr.ReviewStore(directory)
+    assert loaded.journal_records >= cr.COMPACT_AFTER_RECORDS, "the threshold is really reached"
+
+    gated = cr.ReviewStore(directory)
+    gated._recovered = False                                     # noqa: SLF001 - white box
+    before = _state_bytes(gated)
+    with pytest.raises(cr.PersistenceError):
+        gated.maybe_compact()
+    assert _state_bytes(gated) == before, "the automatic route destroys nothing either"
+
+    assert loaded.maybe_compact() is True, "a recovered store still compacts automatically"
+    assert loaded.journal_records == 0
+    _assert_fully_recovered(directory, expected)
+
+
+# ---- A real OS lock, with no injection at all ----------------------------------------------
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows exclusive sharing modes only")
+@pytest.mark.parametrize("which", ["snapshot", "journal"])
+def test_n7_a_real_windows_exclusive_lock_refuses_the_store_and_loses_nothing(tmp_path, which):
+    """The reported condition itself: another process holding the file with no sharing.
+
+    No monkeypatching anywhere. A backup, an indexer or an antivirus is enough to produce this,
+    and pre-fix it was sufficient on its own to lose every committed decision once anything
+    compacted afterwards.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=(which == "snapshot"))
+    target = store.snapshot_path if which == "snapshot" else store.journal_path
+    before = _state_bytes(store)
+
+    with _RealExclusiveLock(target):
+        with pytest.raises(cr.PersistenceError) as failure:
+            cr.ReviewStore(directory)
+        assert f"could not read the review {which}" in str(failure.value)
+
+    assert _state_bytes(store) == before, "the retained bytes are untouched"
+    _assert_fully_recovered(directory, expected)
+
+
+# ---- The refusal is reportable: a typed class, and no path in the message -------------------
+
+def test_n7_the_refusal_is_a_persistence_error_and_discloses_no_path(tmp_path, monkeypatch):
+    """Every one of these messages can reach the browser in the 503 body and the status box.
+
+    `PersistenceError` is the class both boundaries already handle, and `_io_detail` is the one
+    formatter -- so the numbers survive and the journal's absolute path does not. Compared with
+    the separators stripped, because `str(OSError)` reprs its filenames (R5-P7).
+    """
+    directory = str(tmp_path / "state")
+    store, _ = _committed(directory, compact=True)
+
+    for which, target in (("snapshot", store.snapshot_path), ("journal", store.journal_path)):
+        _deny_reads(monkeypatch, target,
+                    lambda target=target: _path_bearing(13, 5, target))
+        with pytest.raises(cr.PersistenceError) as failure:
+            cr.ReviewStore(directory)
+        monkeypatch.undo()
+        message = str(failure.value)
+        assert not _mentions(message, target), f"a path reached the client: {message}"
+        assert not _mentions(message, directory)
+        assert "review-journal" not in message and "review-snapshot" not in message
+        assert ".jsonl" not in message and ".json" not in message
+        assert "simulated failure" not in message, "nor the raw OSError text"
+        assert "errno 13, winerror 5" in message, "and it stays diagnosable"
+        assert f"could not read the review {which}" in message
+
+
+def test_n7_an_unusable_state_directory_is_also_a_persistence_error(tmp_path, monkeypatch):
+    """The constructor's other I/O step. One typed class for every durability failure means the
+    GUI and the 503 boundary need exactly one `except` between them."""
+    def refuse(path, *args, **kwargs):
+        raise PermissionError(13, "cannot create", path, 5)
+
+    monkeypatch.setattr(cr.os, "makedirs", refuse)
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(str(tmp_path / "state"))
+    monkeypatch.undo()
+    assert "could not open the review state directory" in str(failure.value)
+    assert not _mentions(str(failure.value), str(tmp_path))
+
+
+def test_n7_concurrent_decisions_after_a_recovery_keep_revision_order(tmp_path):
+    """Case 15, after a real recovery rather than on a fresh store.
+
+    The staged replay installs a new `_records` dict on the instance, so this pins that the lock
+    and the revision sequence still hold over the record that `_load` published.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    reopened = cr.ReviewStore(directory)
+    reopened.begin_scan("owner-a", "scan-2")
+    accepted, failures = [], []
+
+    def hammer():
+        for _ in range(8):
+            while True:
+                _, revision = reopened.get("clip-0")
+                try:
+                    accepted.append(reopened.decide("owner-a", "clip-0", cr.SELECTED,
+                                                    "scan-2", revision)[1])
+                    break
+                except cr.StaleWrite:
+                    continue
+                except Exception as error:                       # noqa: BLE001
+                    failures.append(error)
+                    return
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert not failures, failures[:2]
+    start = expected["clip-0"][1]
+    assert sorted(accepted) == list(range(start + 1, start + 33)), (
+        "revisions stay unique and contiguous from the recovered revision")
+    assert cr.ReviewStore(directory).get("clip-0") == (cr.SELECTED, start + 32)
+
+
+def test_n7_a_compaction_failure_still_leaves_a_completely_recovered_store(tmp_path,
+                                                                           monkeypatch):
+    """Case 14, from the N7 angle. The two compaction failure points are already covered for
+    loss; what matters here is that neither leaves a store that must be treated as incomplete.
+
+    A failed compaction is a failed *optimisation*. The record in memory is still the one that was
+    recovered, so the store stays writable -- otherwise containing the failure (N5) would have
+    traded one outage for another.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    real_replace = os.replace
+
+    def refuse(src, dst, *args, **kwargs):
+        if str(dst) == store.snapshot_path:
+            raise OSError(13, "snapshot refused", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "replace", refuse)
+    with pytest.raises(OSError):
+        store.compact()
+    monkeypatch.undo()
+
+    assert store._recovered is True                              # noqa: SLF001 - white box
+    store.begin_scan("owner-a", "scan-2")
+    assert store.decide("owner-a", "clip-after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    store.compact()
+    final = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert final.get("clip-after") == (cr.SELECTED, 1)
