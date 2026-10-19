@@ -107,21 +107,27 @@ def _registrations(tree: ast.Module, suffix: str) -> list[ast.Call]:
 #: opens the app specifically to use -- curating footage before any of the render workflow applies
 #: -- so it sits beside the other workflows rather than inside Advanced Tools, which is exactly
 #: the discoverability problem the three-tab refresh existed to fix.
+#:
+#: Amended by R5 P1: a FIFTH top-level tab, the Clips Preview Selector, placed LAST. Last is
+#: deliberate and keeps two existing contracts intact: Advanced Tools stays at index 3, so every
+#: containment assertion below needs no index change, and the new tab's markup stays OUT of the
+#: `source[cutter:advanced]` block that
+#: `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
 _TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-         "LABEL_TAB_ADVANCED")
+         "LABEL_TAB_ADVANCED", "LABEL_TAB_CLIPS_PREVIEW")
 
 
-def test_there_are_exactly_four_tabs(tree: ast.Module):
+def test_there_are_exactly_five_tabs(tree: ast.Module):
     items = [i for i in _with_items(tree) if i.startswith("gr.Tab(")]
-    assert len(items) == 4, f"expected four tabs, found {len(items)}: {items}"
+    assert len(items) == 5, f"expected five tabs, found {len(items)}: {items}"
     assert len([i for i in _with_items(tree) if i.startswith("gr.Tabs(")]) == 1
 
 
-def test_the_tabs_are_the_documented_four_in_order(source: str):
+def test_the_tabs_are_the_documented_five_in_order(source: str):
     positions = [source.index(f"gr.Tab({label}") for label in _TABS]
     assert positions == sorted(positions), (
-        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools — the order is "
-        "load-bearing for several containment assertions in other suites")
+        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools, then Clips "
+        "Preview — the order is load-bearing for several containment assertions in other suites")
 
 
 def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: ast.Module):
@@ -139,6 +145,83 @@ def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: a
                    "cut_analyze_btn", "cut_run_btn",
                    "cut_cancel_btn", "cut_summary", "cut_table", "cut_report"):
         assert f"{widget} = gr." in block, f"{widget} is not in the Raw Cutter tab"
+
+
+def test_the_clips_preview_tab_is_last_and_top_level(source: str, tree: ast.Module):
+    """[FORK] R5 P1. Two separate claims: it is a `gr.Tab` of its own rather than something
+    buried in an accordion, and it is the LAST one.
+
+    Last is not cosmetic. Inserting it between Raw Cutter and Advanced Tools would move Advanced
+    to index 4 -- breaking `test_the_occasional_tools_are_on_the_advanced_tab` and
+    `test_library_prep_is_the_last_block_in_the_advanced_tab` -- and would pull this tab's markup
+    into the span `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for
+    `gr.Accordion`.
+    """
+    assert "gr.Tab(LABEL_TAB_CLIPS_PREVIEW" in source
+    clips = source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")
+    for earlier in _TABS[:-1]:
+        assert source.index(f"gr.Tab({earlier}") < clips, f"{earlier} must come before it"
+    block = source[clips:source.index("source_outputs = [", clips)]
+    assert "gr.Accordion" not in block, "the Clips Preview tab must not hide its controls"
+    for widget in ("clips_input", "clips_recursive", "clips_library", "clips_rejected",
+                   "clips_page_size", "clips_check_btn", "clips_scan_btn", "clips_refresh_btn",
+                   "clips_report", "clips_counts", "clips_gallery", "clips_confirm_btn",
+                   "clips_confirm_out"):
+        assert f"{widget} = gr." in block, f"{widget} is not in the Clips Preview tab"
+
+
+def test_the_clips_preview_tab_uses_no_slider(source: str):
+    """Measured in R5-P0, and the reason page size is a `gr.Number`.
+
+    `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices
+    `source[INFO_PREP_SAMPLE : sample_btn.click(]` and forbids `gr.Slider` in it. That span runs
+    past `source_outputs = [` into the event wiring, so a tab placed last falls inside it -- a
+    slider here would fail a test protecting the approved sample resource policy. The test is
+    right; the widget is a Number.
+    """
+    clips = source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")
+    block = source[clips:source.index("source_outputs = [", clips)]
+    assert "gr.Slider" not in block
+    assert "clips_page_size = gr.Number(" in block
+
+
+def test_the_clips_tab_writes_no_render_or_source_widget(source: str):
+    """Isolation, asserted on the event wiring: reviewing clips must not be able to clear a
+    confirmed source set, change what a render would do, or disturb a cutter job."""
+    start = source.index("clips_check_btn.click(")
+    end = source.index("app.load(", start)
+    block = source[start:end]
+    for forbidden in ("status_output", "video_output", "process_btn", "source_state",
+                      "source_outputs", "prep_outputs", "session_state", "cut_run_btn",
+                      "cut_report", "render_invocation_state", "variation_seed",
+                      "creative_preset", "_RENDER_LOCK", "RENDER_CONCURRENCY_ID"):
+        assert forbidden not in block, f"a Clips Preview event writes or reads {forbidden}"
+    assert block.count(".click(") == 4, "expected exactly four Clips Preview registrations"
+
+
+def test_the_clips_handlers_take_an_injected_request_not_a_widget(tree: ast.Module, source: str):
+    """The owner of a review session is the server-side session hash. It must arrive through
+    `gr.Request` injection -- a real parameter with a default so the handler stays callable --
+    and must never be listed in a click's `inputs`, because a browser-supplied owner would let
+    one session name another's pages.
+
+    Asserted against the parsed signature rather than a formatted string: the earlier version of
+    this test matched source text and broke on a line wrap, which proved nothing about the code.
+    """
+    for name in ("_on_clips_scan", "_on_clips_refresh", "_on_clips_confirm"):
+        func = next((n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == name), None)
+        assert func is not None, f"{name} is missing"
+        args = [a.arg for a in func.args.args]
+        assert args[-1] == "request", f"{name} does not take an injected request last"
+        annotation = ast.unparse(func.args.args[-1].annotation or ast.Constant(None))
+        assert "gr.Request" in annotation, f"{name}'s request is not a gr.Request"
+        assert func.args.defaults, f"{name}'s request has no default, so it is not optional"
+
+    # And no click passes it in.
+    start = source.index("clips_scan_btn.click(")
+    block = source[start:source.index("outputs=", start)]
+    assert "request" not in block, "gr.Request must not be listed in inputs"
 
 
 def test_every_tab_label_is_defined_in_ui_content(source: str):

@@ -1386,9 +1386,41 @@ def test_the_presentation_wrapper_passes_the_setting_straight_through(gui_tree):
     assert "rename_output" in _code_only(_func(gui_tree, "_on_cut_batch_run_ui"))
 
 
-def test_this_feature_added_no_fifth_top_level_tab(gui_source):
-    """The fifth tab is reserved for the R5 Clips Preview Selector."""
-    assert gui_source.count("gr.Tab(") == 4
+def test_this_feature_added_no_fifth_top_level_tab(gui_source, gui_tree):
+    """R4-C adds no tab of its own. The fifth tab belongs to R5 and nothing else.
+
+    Amended for R5-P1, which shipped the reserved fifth tab this assertion was waiting for. The
+    original `count("gr.Tab(") == 4` has been replaced rather than renumbered: a bare count would
+    pass for *any* fifth tab, including one R4-C had added by mistake, which is the thing this
+    test exists to catch. So the tab set is now asserted by **identity** — the four that existed
+    when R4-C shipped, plus the one R5 reserved, and no sixth.
+    """
+    expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
+                "LABEL_TAB_ADVANCED", "LABEL_TAB_CLIPS_PREVIEW")
+    assert gui_source.count("gr.Tab(") == len(expected), (
+        "the top-level tab set changed: it must be exactly the four tabs R4-C shipped against "
+        "plus the R5 Clips Preview Selector")
+    for label in expected:
+        assert f"gr.Tab({label}" in gui_source, f"{label} is not a top-level tab"
+    # The fifth one is R5's, and R4-C still contributes none: no Raw Cutter widget is declared
+    # inside that tab.
+    #
+    # Taken from the `with gr.Tab(...)` node's own body, not from a source slice. A slice from the
+    # tab to `source_outputs = [` was tried and was wrong: the Raw Cutter's event wiring sits
+    # between the two, so the slice legitimately mentions every cutter widget and the assertion
+    # fired on correct code.
+    clips_tab = next(
+        (node for node in ast.walk(gui_tree)
+         if isinstance(node, ast.With)
+         and any("gr.Tab(LABEL_TAB_CLIPS_PREVIEW" in ast.unparse(item.context_expr)
+                 for item in node.items)),
+        None)
+    assert clips_tab is not None, "the Clips Preview tab is not a `with gr.Tab(...)` block"
+    body = "\n".join(ast.unparse(statement) for statement in clips_tab.body)
+    for widget in ("cut_rename_output", "cut_source", "cut_batch_folder", "cut_run_btn"):
+        assert f"{widget} = gr." not in body, (
+            f"{widget} is declared inside the Clips Preview tab; R4-C's widgets belong to "
+            "Raw Cutter")
 
 
 def test_the_feature_touches_no_render_or_gate_widget(gui_tree):

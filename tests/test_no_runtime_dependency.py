@@ -135,6 +135,17 @@ def test_fork_modules_import_only_stdlib():
         "concurrent",
         "dataclasses",
         "enum",
+        # `secrets` arrived with R5-P1: `clips_review` mints the opaque clip, page and session
+        # identifiers the Clips Preview Selector hands the browser. It must be
+        # `secrets.token_urlsafe`, not `random` -- `random` is already on this list and is NOT
+        # cryptographically secure, so using it would make a clip id predictable and the whole
+        # per-file authorization guessable. This is a security requirement rather than a
+        # convenience. Still stdlib, still no runtime dependency.
+        "secrets",
+        # `html` arrived with R5-P1 for the same module: every value interpolated into a gallery
+        # tile goes through `html.escape`, so no filename or label can carry markup or script into
+        # the page. A hand-rolled escaper would be strictly worse than the stdlib one.
+        "html",
         "math",
         "types",
         "typing",

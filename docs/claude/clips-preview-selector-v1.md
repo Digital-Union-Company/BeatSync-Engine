@@ -1,7 +1,28 @@
 # Clips Preview Selector V1 — specification
 
-**Status:** PLANNED · **NOT IMPLEMENTED** · design only.
-No code exists. Every performance figure below is a **target to be measured**, not a result.
+**Status:** **PARTIALLY IMPLEMENTED — R5-P1 (read-only review) is built; transfer is NOT.**
+
+Read this status before anything else, because the document describes a V1 that is not finished:
+
+| Part of this specification | State |
+|---|---|
+| §2 inputs and path-relationship refusal | **IMPLEMENTED** |
+| §3 gallery, states, interactions, keyboard | **IMPLEMENTED** |
+| §4 classification and the counters | **IMPLEMENTED** |
+| §4 *confirm actually moving files* | **NOT IMPLEMENTED** |
+| §5 performance | **MEASURED** — figures below are results, not targets |
+| §6 filesystem integrity / transfer contract | **NOT IMPLEMENTED** — design only |
+| §7 local file serving security | **IMPLEMENTED** |
+| §8 completion contract | **NOT IMPLEMENTED** |
+
+**R5-P1 moves no file.** Browsing, playing and classifying are read-only, the decisions are
+durable, and the Confirm control reports readiness rather than acting. There is no transfer code
+in the repository — not disabled, not feature-flagged, not dead; §6 and §8 remain a design that
+requires its own authorization and its own review before anything is written.
+
+Implementation: `src/beatsync_fork/clips_review.py` (stdlib-only core),
+`src/clips_media_server.py` (ASGI endpoint), the fifth tab in `src/gui.py`. Operative engineering
+contract: `.claude/rules/clips-preview.md`. Feasibility evidence: the R5-P0 report.
 
 A fifth top-level GUI tab for reviewing clips **after** the Raw Cutter has produced them: keep the
 good ones, quarantine the rest, in bulk, quickly.
@@ -122,18 +143,47 @@ evaluate:
 | **Bounded metadata/proxy cache** | LRU, size-capped, keyed by clip identity (path + size + mtime) |
 | **Format fallback** | some containers will not play in Chromium; fall back to the poster plus a clear "preview unavailable" marker rather than an empty box — **an unplayable clip must still be classifiable** |
 
-### Benchmark before promising
+### Benchmarked — these are results
 
-Measure **25, 50 and 100** items in the pinned Windows + Gradio 6.19.0 environment:
+Measured in the pinned Windows + Gradio 6.19.0 environment (real Chrome, production FFmpeg), on
+the live fifth tab. Warm means the poster cache is populated.
 
-- time to first interactive render
-- scroll smoothness at the bottom of the page
-- hover-to-first-frame latency
-- seek latency when scrubbing
-- peak browser memory
+| Page size | First interactive, warm | First interactive, cold | Poster pass, cold |
+|---:|---:|---:|---:|
+| 25 | **508 ms** | 514 ms | 0.331 s (25 made) |
+| 50 | **518 ms** | 1 026 ms | 0.577 s (50 made) |
+| 100 | **522 ms** | 1 533 ms | 1.169 s (100 made) |
 
-**100 items is a product target, not a verified claim.** If it does not hold, the page size is what
-gives — not the safety rules.
+Warm first-interactive is **flat** from 25 to 100 — the grid renders images, so page size barely
+touches it. Cold scales with the poster pass, which is the only per-clip work.
+
+Constant at every page size, by design rather than luck: **zero** video elements mounted at rest,
+**exactly one** mounted and playing while a tile is hovered, 60–61 fps at the bottom of the page,
+hover-to-first-frame 26–27 ms, seek 0–1 ms, and 15 poster requests regardless of page size because
+the grid loads lazily.
+
+### Poster extraction, measured on realistic 1080p sources
+
+24 clips, 271 MiB, using the shipped runner:
+
+| Workers | Wall | Per clip | Projected 100 clips | Speed-up |
+|---:|---:|---:|---:|---:|
+| 1 | 2.057 s | 85.7 ms | 8.57 s | — |
+| 2 | 1.047 s | 43.6 ms | 4.36 s | 1.96× |
+| **4** | **0.616 s** | **25.7 ms** | **2.57 s** | **3.34×** |
+
+A warm second pass over the same 24 clips cost **0.0006 s** (all cache hits).
+
+**Extraction is duration-independent** — `-ss` seeks before decoding, so cost scales with
+resolution, not clip length (73.6 ms for a 15 s 1080p clip versus 73.7 ms for a 30 s one).
+
+**Four workers is a ceiling, not a tuning knob.** D0 traced clip-extraction timeouts to four
+concurrent FFmpeg-class readers on one mechanical drive, so the pool clamps there and a test pins
+the clamp. The table above was measured on an SSD; the contention risk D0 found is
+drive-dependent, so a slow spinning media drive may behave differently and raising the ceiling
+would need its own measurement.
+
+If a page size ever fails to hold, **the page size is what gives — not the safety rules.**
 
 ---
 

@@ -39,6 +39,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `source-verification.md` | `src/beatsync_fork/media_verify.py`, `src/ffmpeg_processing.py` (the FFprobe metadata probe), `tests/test_media_verify.py` |
 | `scale-diagnostics.md` | `src/beatsync_fork/input_report.py`, `src/video_processor.py`, `src/video_analysis.py`, `tests/test_scale_diagnostics.py` |
 | `fork-package.md` | `src/beatsync_fork/**/*.py`, `tests/test_no_runtime_dependency.py`, `tests/test_fork_identity.py` |
+| `clips-preview.md` | `src/beatsync_fork/clips_review.py`, `src/clips_media_server.py`, `tests/test_clips_{review,media_server}.py`, `docs/claude/clips-preview-selector-v1.md` |
 | `gui-integration.md` | `src/gui.py`, `src/ui_content.py` |
 | `test-harness.md` | `tests/**/*.py`, `pytest.ini`, `requirements-dev.txt` |
 | `platform-and-packaging.md` | `install.bat`, `run.bat`, `scripts/install.ps1`, `src/logger.py`, `src/paths.py`, `README.md`, `CHANGELOG-FORK.md` |

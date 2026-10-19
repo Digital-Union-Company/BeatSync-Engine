@@ -606,24 +606,75 @@ def test_gradio_file_serving_permissions_were_not_widened():
         assert kwargs.get("server_name", "'127.0.0.1'") in ("'127.0.0.1'", '"127.0.0.1"'), kwargs
 
 
+#: Browser-side mechanisms Open Output Folder must never acquire. The approved behaviour is a
+#: Windows shell verb on the machine running the backend; anything here would move the action into
+#: the browser.
+#:
+#: Every entry is a precise API name. A bare `"download"` was tried and removed: the handler's own
+#: docstring explains *why* a download control was rejected, so the word appears in prose and the
+#: substring ban fired on the explanation rather than on any mechanism. Download mechanisms are
+#: named exactly below, and `test_nothing_the_product_owner_rejected_was_implemented` keeps
+#: guarding `gr.DownloadButton`, `FileResponse` and `send_file` across the whole module.
+BROWSER_SIDE_FORBIDDEN = ("file://", "window.open", "navigator.", "document.querySelector",
+                          "document.location", "window.location", "showDirectoryPicker",
+                          "showSaveFilePicker", "createObjectURL", "gr.DownloadButton",
+                          "FileResponse", "send_file")
+
+
 def test_no_browser_side_file_navigation_or_javascript_was_added():
     """Section 4: the folder opens on the machine running the backend, by design.
 
-    Structural: no event may carry a `js`/`_js` keyword, and no string literal anywhere may be a
-    `file://` URL or browser API call. A substring scan of the raw source would trip on prose.
-    """
-    tree = _tree(_GUI)
-    for call in ast.walk(tree):
-        if isinstance(call, ast.Call):
-            for banned_kw in ("js", "_js"):
-                assert banned_kw not in [kw.arg for kw in call.keywords], \
-                    f"{banned_kw}= passed to {ast.unparse(call.func)}"
+    Scoped to the Open Output Folder feature -- its handler and its one event registration -- and
+    that scope is the correction R5-P1 required.
 
-    literals = [n.value for n in ast.walk(tree)
-                if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    for text in literals:
-        for forbidden in ("file://", "window.open", "navigator.", "document.querySelector"):
-            assert forbidden not in text, f"{forbidden} in a string literal: {text[:80]!r}"
+    The original version walked the WHOLE of `gui.py`: no `js`/`_js` keyword on any call, and no
+    browser-API substring in any literal anywhere in the module. That was wider than the claim it
+    was written to defend (this test's own docstring names one button), and it made the file an
+    application-wide ban on client-side code. R5's Clips Preview gallery legitimately needs a
+    JavaScript interaction layer -- hover preview, keyboard navigation, one active player at a
+    time -- which the accepted specification mandates, so the global form had to go.
+
+    Nothing this test actually protected is given up. The handler still may not reach a browser
+    API, its registration still may not carry `js`/`_js`, and it still may not acquire a download
+    path. `test_nothing_the_product_owner_rejected_was_implemented` continues to guard the
+    rejected-mechanism list module-wide, and a negative control in the R5-P1 R2 closeout proves a
+    deliberate `window.open` planted in this handler still fails here.
+    """
+    # 1. The handler itself: no browser-side mechanism, in code or in any string it builds.
+    #    Docstrings stripped via this module's existing `_code` helper -- this handler's own prose
+    #    explains which mechanisms were rejected and why, so an un-stripped scan fires on the
+    #    explanation rather than on code. `_code`'s own docstring records that this has happened
+    #    repeatedly here.
+    handler = _code(_func(_GUI, HANDLER))
+    for forbidden in BROWSER_SIDE_FORBIDDEN:
+        assert forbidden not in handler, f"{forbidden} reached {HANDLER}"
+
+    # 2. Its one registration: no JavaScript may be attached to this event.
+    registration = _click(BUTTON)
+    for banned_kw in ("js", "_js"):
+        assert banned_kw not in [kw.arg for kw in registration.keywords], \
+            f"{banned_kw}= passed to {BUTTON}.click"
+
+    # 3. Nothing the handler calls may smuggle one in either. Walked by name through the module,
+    #    so a rename cannot evade it.
+    tree = _tree(_GUI)
+    called = {node.func.id for node in ast.walk(_func(_GUI, HANDLER))
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    for name in sorted(called):
+        helper = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == name), None)
+        if helper is None:
+            continue
+        rendered = _code(helper)
+        for forbidden in BROWSER_SIDE_FORBIDDEN:
+            assert forbidden not in rendered, f"{forbidden} reached {name}, called by {HANDLER}"
+
+    # 4. `file://` is refused module-wide, independently of scope: the app never navigates a
+    #    browser to a local path, and no feature has a reason to build such a URL.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "file://" not in node.value, \
+                f"a file:// URL appears in a string literal: {node.value[:80]!r}"
 
 
 def test_no_progress_stage_was_invented_for_the_folder_button():
