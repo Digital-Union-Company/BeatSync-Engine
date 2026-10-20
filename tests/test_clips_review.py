@@ -3648,3 +3648,486 @@ def test_n7_the_replay_validator_is_never_stricter_than_the_write_path(tmp_path)
     again = cr.ReviewStore(directory)
     assert again.get("") == (cr.SELECTED, 1), "and survives the snapshot too"
     assert again.get("x" * 64) == (cr.PENDING, 1)
+
+
+# =============================================================================================
+# N7-R3: a newline-less tail is not necessarily an unfinished record
+# =============================================================================================
+#
+# R5-P13 stamped a `tail-repaired` marker onto EVERY newline-less final line. An independent
+# review (R5-P14) measured the consequence: a decision that had been reported successful, whose
+# line lost only its terminating newline, was recovered correctly on the next start, turned into
+# "damage this process accounted for" by the marker, and then erased by the following compaction.
+# The parent commit -- which wrote a bare newline -- preserved it, so the marker mechanism was a
+# strict regression for this one shape.
+#
+# The distinction these tests pin: truncating one of this writer's records always leaves JSON
+# that will not parse, so a newline-less line that parses WHOLE was written whole and is
+# completed, not relabelled. Everything about the genuine torn fragment is unchanged, which the
+# frozen interrupted-repair tests above continue to assert.
+
+
+def _drop_final_newline(store):
+    """External loss of exactly one byte: the journal's terminating newline. Nothing else."""
+    with open(store.journal_path, "rb") as handle:
+        data = handle.read()
+    assert data.endswith(b"\n"), "precondition: the journal was properly terminated"
+    with open(store.journal_path, "wb") as handle:
+        handle.write(data[:-1])
+    return data[:-1]
+
+
+def _parsed_journal_events(store):
+    """Every journal line parsed INDEPENDENTLY. Raises if any line is not one whole event."""
+    events = []
+    for line in _journal_lines(store):
+        text = line.decode("utf-8").strip()
+        if text:
+            events.append(json.loads(text))          # no partial parse, no trailing bytes
+    return events
+
+
+def test_n7r3_a_valid_record_missing_only_its_newline_survives_repair_and_compaction(tmp_path):
+    """The mandatory N7-R3 durable-write sequence, end to end.
+
+    This is the regression the whole fix exists for. It fails on the parent commit of this
+    correction -- the decision comes back ``PENDING, 0`` at step 7 -- and the failure is permanent
+    once ``compact()`` has run.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    last = "clip-2"
+    assert expected[last] == (cr.REJECTED, 1), "the last decision was REPORTED SUCCESSFUL"
+
+    # 2. its terminating newline is lost, and nothing else
+    truncated = _drop_final_newline(store)
+    assert truncated.endswith(b"}"), "the record itself is complete"
+    final_line = truncated.rsplit(b"\n", 1)[-1]
+    assert json.loads(final_line.decode("utf-8"))["identity"] == last, (
+        "the final line is still one complete, parseable, valid event")
+
+    # 3. the remaining valid event is recovered after a restart
+    first = _assert_fully_recovered(directory, expected)
+    assert first.corrupt_records_discarded == 0, "a whole record is not corruption"
+
+    # 4. another operation completes the missing newline WITHOUT marking it as damage
+    first.begin_scan("owner-a", "scan-2")
+    assert first.journal_tails_completed == 1, "the newline was supplied"
+    assert first.journal_tails_repaired == 0, "and no repair marker was written"
+    with open(first.journal_path, encoding="utf-8") as handle:
+        assert cr._JOURNAL_TAIL_REPAIRED not in handle.read(), (   # noqa: SLF001 - white box
+            "no marker reached the journal at all")
+
+    # the record keeps its exact original bytes, now simply terminated
+    with open(first.journal_path, "rb") as handle:
+        assert handle.read().startswith(truncated + b"\n")
+
+    # 5. a subsequent valid decision is appended and reported successful
+    assert first.decide("owner-a", "clip-new", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    expected["clip-new"] = (cr.SELECTED, 1)
+
+    # the journal is a sequence of independently parseable events, not a concatenation
+    events = _parsed_journal_events(first)
+    assert [e["identity"] for e in events if e["k"] == "decide"] == [
+        "clip-0", "clip-1", "clip-2", "clip-new"]
+    assert all(e["k"] in cr._JOURNAL_KINDS for e in events)        # noqa: SLF001 - white box
+
+    # 6-7. restart: both decisions present, at their correct revisions
+    second = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert second.corrupt_records_discarded == 0
+
+    # 8-10. compact, restart, everything remains
+    second.compact()
+    third = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert third.corrupt_records_discarded == 0
+
+    # 11-12. a second AUTOMATIC compaction cycle, through the real threshold
+    for _ in range(cr.COMPACT_AFTER_RECORDS):
+        third.begin_scan("owner-a", "scan-2")
+        if third.maybe_compact():
+            break
+    else:                                                          # pragma: no cover
+        pytest.fail("the real automatic threshold never fired")
+    fourth = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert fourth.get(last) == (cr.REJECTED, 1), (
+        "no previously accepted decision may become PENDING or disappear")
+
+
+def test_n7r3_a_short_write_that_lands_the_record_but_not_its_newline_is_not_destroyed(tmp_path):
+    """The writer's OWN near-miss, with reported-FAILURE semantics stated explicitly.
+
+    A positive short write lands the complete JSON object and then fails before the newline, so
+    ``_write_all`` raises and the caller is correctly told the decision was **not** recorded. The
+    bytes are nevertheless on disk and parseable, and the next start reports the decision as
+    present -- so completing the line is the self-consistent answer, and relabelling it as damage
+    (which is what R5-P13 did) makes the store contradict itself across two restarts.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    real_write = os.write
+    calls = {"n": 0}
+
+    def short_then_fail(fd, payload):
+        calls["n"] += 1
+        if calls["n"] == 1 and payload.endswith(b"\n") and len(payload) > 1:
+            real_write(fd, payload[:-1])             # everything except the newline
+            raise OSError(28, "synthetic no space left")
+        return real_write(fd, payload)
+
+    os.write = short_then_fail
+    try:
+        with pytest.raises(cr.PersistenceError):
+            store.decide("owner-a", "clip-short", cr.SELECTED, "scan-1")
+    finally:
+        os.write = real_write
+    assert store.get("clip-short") == (cr.PENDING, 0), "the caller was told it failed"
+
+    # it is nevertheless a complete, parseable record on disk
+    with open(store.journal_path, "rb") as handle:
+        tail = handle.read().rsplit(b"\n", 1)[-1]
+    assert json.loads(tail.decode("utf-8"))["identity"] == "clip-short"
+
+    reloaded = _assert_fully_recovered(directory, expected)
+    assert reloaded.get("clip-short") == (cr.SELECTED, 1), (
+        "a whole record on disk replays; this is the state the repair must not destroy")
+    reloaded.begin_scan("owner-a", "scan-1")
+    assert reloaded.journal_tails_repaired == 0, "no marker onto a complete record"
+    assert reloaded.journal_tails_completed == 1
+
+    final = _assert_fully_recovered(directory, expected)
+    assert final.get("clip-short") == (cr.SELECTED, 1)
+    final.compact()
+    assert _assert_fully_recovered(directory, expected).get("clip-short") == (cr.SELECTED, 1)
+
+
+def test_n7r3_a_genuinely_torn_fragment_still_gets_the_marker_first_repair(tmp_path):
+    """The other half of the distinction: nothing about the F4 torn tail changed.
+
+    Guards the fix against over-reach -- a fragment that does not parse must still be closed off
+    with the marker, before its newline, and must still be discarded on the next start.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+
+    first = _assert_fully_recovered(directory, expected)
+    assert first.get("torn") == (cr.PENDING, 0), "an unfinished record never reported success"
+    first.begin_scan("owner-a", "scan-2")
+    assert first.journal_tails_repaired == 1, "genuine damage is still marker-repaired"
+    assert first.journal_tails_completed == 0, "and is NOT treated as a complete record"
+
+    damaged = next(line for line in _journal_lines(first) if b'"torn"' in line)
+    assert damaged.rstrip().endswith(b"}"), "the marker terminates the fragment"
+    assert cr._TAIL_REPAIR_PREFIX.encode() in damaged              # noqa: SLF001 - white box
+    with pytest.raises(ValueError):
+        json.loads(damaged.decode("utf-8").strip())                # still one unparsable line
+    assert cr.ReviewStore._damage_is_accounted_for(                # noqa: SLF001 - white box
+        damaged.decode("utf-8").strip()) is True
+
+    assert first.decide("owner-a", "after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    expected["after"] = (cr.SELECTED, 1)
+    second = _assert_fully_recovered(directory, expected, scan="scan-2")
+    second.compact()
+    _assert_fully_recovered(directory, expected, scan="scan-2")
+
+
+def test_n7r3_a_complete_but_unaccountable_final_record_fails_closed(tmp_path):
+    """Case C. Parses whole, describes no record this build understands: write nothing.
+
+    Reachable because the store is already constructed and in memory when the file changes
+    underneath it. Completing it would publish an unaccountable record; marking it repaired would
+    destroy the evidence of one. So neither happens.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(json.dumps({"k": "decide", "identity": "x", "decision": "SELECTED",
+                                 "revision": "not-a-number", "scan_id": "scan-1"}).encode())
+    before = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError) as failure:
+        store.begin_scan("owner-a", "scan-2")
+    assert "nothing has been changed" in str(failure.value)
+    assert not _mentions(str(failure.value), store.journal_path), "no path in a client message"
+    assert _state_bytes(store) == before, "not one byte was written"
+    assert store.journal_tails_repaired == 0 and store.journal_tails_completed == 0
+
+    # removing the one bad line recovers everything, at the original revisions
+    _rewrite_journal(store, _journal_lines(store)[:-1])
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r3_a_complete_record_behind_a_partial_marker_is_refused_not_discarded(tmp_path):
+    """The adversarial combined shape: a complete valid event plus a PARTIAL repair marker.
+
+    Only an EARLIER build could have produced this -- the corrected repair writes a lone newline
+    after a record that parses, and a one-byte write has no partial state. It is covered anyway
+    because the two unsafe answers are both reachable from here and both destroy data:
+
+    * stamping a marker over it is N7-R3 with an extra step;
+    * discarding it as marker-accounted damage is N7-R3 reached through the READ path -- and a
+      short write really can land a whole marker and still miss its newline.
+
+    Choosing between "a committed decision" and "a record mid-write" needs provenance the format
+    does not carry, so both paths refuse and every byte is kept. The decision stays recoverable:
+    this proves it by supplying the newline the earlier build should have written.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    truncated = _drop_final_newline(store)
+    partial = json.dumps({"k": cr._JOURNAL_TAIL_REPAIRED,          # noqa: SLF001 - white box
+                          "at": 0.0}, separators=(",", ":"))[:12]
+    with open(store.journal_path, "ab") as handle:
+        handle.write(partial.encode("utf-8"))
+    before = _state_bytes(store)
+
+    # the READ path refuses rather than silently dropping the record in front of the marker
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    assert "unidentifiable partial write" in str(failure.value)
+    assert not _mentions(str(failure.value), store.journal_path)
+    assert _state_bytes(store) == before, "a refused load writes nothing"
+
+    # and so does the APPEND path, reached from a store that was already constructed
+    with open(store.journal_path, "wb") as handle:
+        handle.write(truncated)
+    live = cr.ReviewStore(directory)
+    with open(live.journal_path, "ab") as handle:
+        handle.write(partial.encode("utf-8"))
+    guarded = _state_bytes(live)
+    with pytest.raises(cr.PersistenceError) as second:
+        live.begin_scan("owner-a", "scan-2")
+    assert "unidentifiable partial write" in str(second.value)
+    assert _state_bytes(live) == guarded
+    assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0
+
+    # Nothing was destroyed. Supplying the newline is NOT the repair -- the partial marker is
+    # still sitting behind the record, so the refusal correctly stands:
+    with open(live.journal_path, "ab") as handle:
+        handle.write(b"\n")
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+
+    # Removing the partial marker -- the bytes the earlier build should never have written -- is
+    # what recovers every decision, at its original revision.
+    with open(live.journal_path, "wb") as handle:
+        handle.write(truncated + b"\n")
+    recovered = cr.ReviewStore(directory)
+    for identity, value in expected.items():
+        assert recovered.get(identity) == value
+    assert recovered.corrupt_records_discarded == 0
+
+
+@pytest.mark.parametrize("shape,expected_kind", [
+    ('{"k":"decide","identity":"a","decision":"SELECTED","revision":1,"scan_id":"s","at":1.0}',
+     "complete_event"),
+    ('{"k":"scan","owner":"owner-a","scan_id":"s","at":1.0}', "complete_event"),
+    ('{"k":"tail-repaired","at":1.0}', "complete_event"),
+    ('{"k":"decide","identity":"a","decision":"SELE', "torn_fragment"),
+    ('{"k":"decide","identity":"torn"', "torn_fragment"),
+    ('', "torn_fragment"),
+    ('   ', "torn_fragment"),
+    ('{"k":"decide","identity":"a","decision":"SELECTED","revision":"x","scan_id":"s"}',
+     "invalid_event"),
+    ('{"k":"transfer","identity":"a"}', "invalid_event"),
+    ('{"k":"decide","identity":"a","decision":"SELECTED","revision":1,"scan_id":"s","at":1.0}'
+     '{"k":"tail-rep', "trailing_bytes"),
+    ('{"k":"tail-repaired","at":1.0} { damaged }', "trailing_bytes"),
+])
+def test_n7r3_the_tail_classifier_tells_the_four_shapes_apart(tmp_path, shape, expected_kind):
+    """The classification table, stated as a test so it cannot drift.
+
+    ``_apply`` is handed throwaway dicts, so classifying a tail can never publish it; the
+    assertion on the live record below is what pins that.
+    """
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    before = dict(store._records)                                  # noqa: SLF001 - white box
+    assert store._classify_unterminated_tail(                      # noqa: SLF001 - white box
+        shape.encode("utf-8")) == expected_kind
+    assert store._records == before, (                             # noqa: SLF001 - white box
+        "validating a tail must not mutate the live record")
+
+
+def test_n7r3_a_tail_that_is_not_utf8_is_genuine_damage(tmp_path):
+    """A torn write can stop mid multi-byte sequence. Not text, so not a whole record."""
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    assert store._classify_unterminated_tail(                      # noqa: SLF001 - white box
+        b'{"k":"decide","identity":"\xff\xfe') == "torn_fragment"
+
+
+def test_n7r3_every_event_the_writer_emits_classifies_as_a_complete_record(tmp_path):
+    """Writer/reader symmetry for the new classifier, from the REAL write path.
+
+    A newline-less tail that this writer produced whole must never be read as damage. The events
+    are taken off disk rather than hand-written, so the agreement is measured and not assumed.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "c" * 64, cr.SELECTED, "scan-1")
+    store.decide("owner-a", "", cr.REJECTED, "scan-1")             # the writer permits this
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn"')
+    store.decide("owner-a", "after", cr.PENDING, "scan-1")         # forces a real repair
+    assert store.journal_tails_repaired == 1
+
+    kinds = set()
+    for line in _journal_lines(store):
+        text = line.decode("utf-8").strip()
+        if not text:
+            continue
+        try:
+            kinds.add(json.loads(text)["k"])
+        except ValueError:
+            # The repaired fragment. The marker never exists as a line of its own -- it is always
+            # a suffix of the damage it accounts for -- so the writer's real marker bytes are
+            # taken from where the repair actually put them.
+            cut = text.rfind(cr._TAIL_REPAIR_PREFIX)               # noqa: SLF001 - white box
+            assert cut > 0, "the only unparsable line here is the repaired fragment"
+            marker = text[cut:]
+            kinds.add(json.loads(marker)["k"])
+            assert store._classify_unterminated_tail(              # noqa: SLF001 - white box
+                marker.encode("utf-8")) == "complete_event", (
+                "the writer's own tail-repair event must classify as a whole record")
+            continue
+        assert store._classify_unterminated_tail(                  # noqa: SLF001 - white box
+            text.encode("utf-8")) == "complete_event", (
+            f"the writer emitted {text!r}, which the tail classifier must accept whole")
+    assert kinds == set(cr._JOURNAL_KINDS), (                      # noqa: SLF001 - white box
+        "all three shapes were exercised")
+
+
+def test_n7r3_an_oversized_final_line_is_refused_rather_than_guessed_at(tmp_path):
+    """The bound on tail inspection. An unclassifiable line is a refusal, never a guess.
+
+    Also the proof that classification is bounded at all: without a ceiling, identifying one
+    final record could become a read of a journal holding ``COMPACT_AFTER_RECORDS`` records.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"' + b"x" * (cr.MAX_TAIL_INSPECT_BYTES + 1))
+    before = _state_bytes(store)
+
+    live = cr.ReviewStore(directory)                               # the tail is a torn fragment
+    with pytest.raises(cr.PersistenceError) as failure:
+        live.begin_scan("owner-a", "scan-2")
+    assert "too large to identify" in str(failure.value)
+    assert str(cr.MAX_TAIL_INSPECT_BYTES) in str(failure.value), "the bound is diagnosable"
+    assert not _mentions(str(failure.value), store.journal_path)
+    assert _state_bytes(store) == before, "nothing was written to an unclassifiable journal"
+
+    _rewrite_journal(store, _journal_lines(store)[:-1])
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r3_the_tail_reader_is_bounded_and_finds_the_last_line_across_blocks(tmp_path):
+    """The backwards walk returns exactly the bytes after the last newline, over many blocks."""
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    filler = b'{"k":"scan","owner":"owner-a","scan_id":"' + b"y" * 400 + b'","at":1.0}\n'
+    with open(store.journal_path, "ab") as handle:
+        for _ in range(int(cr._TAIL_CHUNK_BYTES / 100) + 40):      # noqa: SLF001 - white box
+            handle.write(filler)
+        handle.write(b'{"k":"decide","identity":"tail-marker"')
+    assert os.path.getsize(store.journal_path) > cr._TAIL_CHUNK_BYTES * 2    # noqa: SLF001
+    assert store._journal_tail_bytes() == (                        # noqa: SLF001 - white box
+        b'{"k":"decide","identity":"tail-marker"')
+
+    # a journal that is one single unterminated line has no newline to find at all
+    lone = cr.ReviewStore(str(tmp_path / "other"))
+    with open(lone.journal_path, "wb") as handle:
+        handle.write(b'{"k":"decide","identity":"only"')
+    assert lone._journal_tail_bytes() == (                         # noqa: SLF001 - white box
+        b'{"k":"decide","identity":"only"')
+
+
+def test_n7r3_an_uninspectable_tail_writes_nothing(tmp_path, monkeypatch):
+    """Case D. If the tail's CONTENT cannot be read, that is not a licence to append.
+
+    The N2/N6 rule, extended from termination to content. Getting this test to exercise the right
+    guard took a correction worth recording: failing *every* binary open of the journal makes
+    `_journal_tail_is_terminated` raise first, so the assertion passed without
+    `_journal_tail_bytes` ever running -- and the mutation that swallows ITS failure survived. So
+    the termination probe is allowed to succeed and only the content read is refused, which is
+    the one ordering that actually reaches the new guard.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    _drop_final_newline(store)
+    live = cr.ReviewStore(directory)
+    before = _state_bytes(live)
+
+    real_open = open
+    opens = {"n": 0}
+
+    def refuse_the_content_read(path, *args, **kwargs):
+        if os.path.abspath(str(path)) == os.path.abspath(live.journal_path) and (
+                "b" in "".join(str(a) for a in args)):
+            opens["n"] += 1
+            if opens["n"] > 1:            # 1st = the termination probe, which must succeed
+                raise OSError(5, "synthetic device error")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", refuse_the_content_read)
+    with pytest.raises(cr.PersistenceError) as failure:
+        live.begin_scan("owner-a", "scan-2")
+    monkeypatch.undo()
+    assert opens["n"] >= 2, "the termination probe ran and the CONTENT read was the one refused"
+    assert not _mentions(str(failure.value), live.journal_path)
+    assert _state_bytes(live) == before, "an unreadable tail is never written after"
+    assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r3_a_short_read_of_the_tail_writes_nothing(tmp_path, monkeypatch):
+    """A read that returns fewer bytes than asked for is not an answer about the tail either."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    _drop_final_newline(store)
+    live = cr.ReviewStore(directory)
+    before = _state_bytes(live)
+
+    real_open = open
+
+    class ShortReader:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def seek(self, *a):
+            return self.inner.seek(*a)
+
+        def tell(self):
+            return self.inner.tell()
+
+        def read(self, size=-1):
+            data = self.inner.read(size)
+            return data[:-1] if size and size > 1 and data else data
+
+    opens = {"n": 0}
+
+    def short(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if os.path.abspath(str(path)) == os.path.abspath(live.journal_path) and (
+                "b" in "".join(str(a) for a in args)):
+            opens["n"] += 1
+            if opens["n"] > 1:
+                return ShortReader(handle)
+        return handle
+
+    monkeypatch.setattr("builtins.open", short)
+    with pytest.raises(cr.PersistenceError) as failure:
+        live.begin_scan("owner-a", "scan-2")
+    monkeypatch.undo()
+    assert "could not read the end of the review journal" in str(failure.value)
+    assert not _mentions(str(failure.value), live.journal_path)
+    assert _state_bytes(live) == before
+    _assert_fully_recovered(directory, expected)

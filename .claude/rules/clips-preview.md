@@ -263,9 +263,11 @@ count on an `OSError`.
 **The old claim that "a torn write can only damage the last line" was wrong.** Because the journal
 is `O_APPEND` and a record is one line, an append landing after a newline-less tail merges with it
 into a single unparsable line — so a *later, fully successful* decision was silently destroyed
-too. `_append` therefore closes off an unterminated tail before writing after it
-(`journal_tails_repaired` counts it). The damaged record becomes a self-contained discardable
-line, every fully committed record before it is preserved, and the next record is intact.
+too. `_append` therefore closes off an unterminated tail before writing after it. A tail that does
+not parse becomes a self-contained discardable line (`journal_tails_repaired` counts it); a tail
+that parses whole is a record and is simply terminated (`journal_tails_completed` counts it — see
+"A newline-less line is not necessarily an unfinished event"). Either way every fully committed
+record before it is preserved and the next record is intact.
 
 [R5-P13 / N7-R2] **The repair writes durable evidence, appended onto the damaged fragment, and
 the order within that one write is load-bearing.** It appends
@@ -286,6 +288,60 @@ Two reasons, and both were measured rather than reasoned:
 
 Do not move the newline to the front, do not split the repair into two writes, and do not put the
 marker on a line of its own: the evidence must be attached to the damage it accounts for.
+
+#### A newline-less line is not necessarily an unfinished event
+
+[R5-P15 / N7-R3] **R5-P13 stamped that marker onto *every* newline-less tail, and for one shape
+that destroyed data.** An independent review measured it: a decision that had been **reported
+successful**, whose line lost only its terminating newline — one byte, which external truncation is
+enough to do — was recovered correctly on the next start, turned into "damage this process
+accounted for" by the marker, and erased by the following `compact()`. The parent commit, which
+wrote a bare newline, preserved it. The reasoning that licensed this ("an unterminated line is one
+whose decision was never reported successful") is true of **this writer's own interrupted writes**
+and not of the file, which is exactly the gap the N7-R2 half of the same commit exists to close for
+*terminated* damage. **Do not restore unconditional marker-stamping**, and do not reintroduce any
+claim that newline-less implies unfinished.
+
+The discriminator is the strict validator read the other way round: **truncating one of this
+writer's records always leaves JSON that will not parse**, because the closing brace is the last
+byte before the newline. So a newline-less final line that parses *whole* was written whole.
+`_terminate_damaged_tail` therefore classifies before it writes anything —
+`_classify_unterminated_tail`, over a bounded backwards read (`_journal_tail_bytes`, capped by
+`MAX_TAIL_INSPECT_BYTES`; identifying one line must never become a pass over a journal holding
+`COMPACT_AFTER_RECORDS` records):
+
+| Final unterminated line | Answer |
+|---|---|
+| Parses whole **and** satisfies the replay validator | **complete the record**: write the missing newline and nothing else, preserving its exact original bytes. `journal_tails_completed` counts it; no marker is written |
+| Does not parse | the F4 torn fragment: marker-first repair, exactly as above. `journal_tails_repaired` counts it |
+| Parses whole but describes no record this build can account for | `PersistenceError`, nothing written |
+| A complete value followed by unidentifiable bytes | `PersistenceError`, nothing written |
+| Cannot be read, or is larger than the inspection bound | `PersistenceError`, nothing written |
+
+Validation uses the **same** `_apply` the replay path runs, against **throwaway** dicts — a tail is
+never published merely by being classified, and the reader can never refuse a tail the repair
+accepted.
+
+**Crash-order, stated separately for the two repairs, because they are different writes:**
+
+* *Completing a valid record* is a **one-byte** write. `os.write` either accepts that byte or it
+  does not, so there is no partial state to recover from and no evidence marker is needed: the
+  record was already whole, and the only thing in question was its terminator.
+* *Repairing a torn fragment* is the marker-plus-newline write whose internal order is load-bearing,
+  unchanged and still frozen: every prefix of it leaves the fragment unterminated, hence still the
+  trailing damage, so the next append repairs it again. Calculate the real payload length when
+  testing this — the production timestamp makes it **46 bytes**, not the 31 of a synthetic
+  `"at":0.0` fixture, and a fixture's length is not evidence about the writer's.
+
+**The fourth row is the one combined shape worth naming.** A complete record with a *partial* marker
+behind it can only come from an earlier build — the corrected repair never writes a marker after a
+line that parses. Both available answers destroy data: stamping a marker over it is N7-R3 with an
+extra step, and discarding it as marker-accounted damage is N7-R3 reached through the **read** path,
+which is reachable because a short write really can land a whole marker and still miss its newline.
+Telling "a committed decision" from "a record mid-write" needs provenance this format does not
+carry, so `_replay_journal` consults `_tail_hides_a_complete_record` **before** the marker amnesty
+and both paths refuse. Nothing is destroyed: every byte is kept, and removing the stray marker
+recovers every decision at its original revision.
 
 A reported success now means the complete record is on disk and recoverable. **A write that fails
 raises `PersistenceError` and the endpoint answers 503** — the operator must never see a tick for
@@ -381,8 +437,10 @@ nothing is written and removing the damaged snapshot recovers everything from th
 | Both files genuinely absent | a fresh store; ordinary first run |
 | A valid snapshot, with or without later journal events | replayed in full |
 | Snapshot content that cannot be accounted for — bad JSON, bad structure, an unknown decision, a non-integer revision, bad UTF-8 | `PersistenceError`, nothing written |
-| An **unterminated** final journal line | that one line discarded, everything before it preserved (F4) |
+| An **unterminated** final journal line that **parses whole** | replayed as the ordinary event it is — it was written whole, only its terminator is missing (R5-P15 / N7-R3) |
+| An **unterminated** final journal line that does **not** parse | that one line discarded, everything before it preserved (F4) |
 | An unreadable journal line that **is** terminated, anywhere in the file | `PersistenceError`, nothing written |
+| A complete value followed by unidentifiable bytes, anywhere in the file | `PersistenceError`, nothing written — checked **before** the marker amnesty below (R5-P15 / N7-R3) |
 | An unreadable line carrying its own attached `tail-repaired` marker | discarded; the repair already accounted for it |
 | A parsable event with a schema or kind this build cannot account for | `PersistenceError`, nothing written |
 | A journal that is not valid UTF-8 | `PersistenceError`, nothing written |
@@ -409,11 +467,41 @@ A transient read failure is **not** corruption, and corruption is **not** a lice
 empty history. N7 is never "fixed" by discarding a snapshot or deleting journal data: **the
 retained bytes are what the retry recovers from, and a refused load writes nothing at all**, so
 every forensic byte of both copies survives the refusal. The only bytes compaction may ever erase
-are ones that never represented a reported success — an unterminated fragment, or one already
-closed off by its own marker.
+are ones that never represented a reported success — an unterminated fragment **that does not
+parse**, or one already closed off by its own marker. A newline-less line that parses whole is a
+record, not a fragment, and it is kept (R5-P15 / N7-R3).
 
 There is **no migration concern** from this tightening: R5 is unmerged, so no deployed install has
 ever written a `state/clips-review/` journal or snapshot.
+
+#### Two bounded limitations, recorded rather than claimed closed
+
+[R5-P15 / N7-R4 · N7-R5] Both were raised by an independent review, both were classified as
+non-blocking, and **neither is closed by the N7-R3 correction.** They are written down here so that
+no later change can quietly assume they were.
+
+* **N7-R4 — `tail-repaired` is an auditable format convention, not authenticated evidence of its
+  own origin.** Anything that can write to the journal can write a well-formed marker, and
+  `_damage_is_accounted_for` returns `True` for it; a review appended a forged marker to unrelated
+  corrupted content and the discard was accepted. That is **outside** the accidental-corruption
+  model this design targets — random damage does not synthesise a valid marker object — and closing
+  it would need provenance the format does not carry. So: do **not** describe the marker as proof of
+  origin, and do **not** restore the earlier claim that a marker "can only reach a line through that
+  repair" — that was a statement about this writer, not about the file, and N7-R3 falsified its
+  load-bearing half without any forgery at all. What is true is narrower and worth keeping: the
+  repair only fires on an unterminated tail, it never marks a line that parses whole, and the
+  amnesty is reached only after `_tail_hides_a_complete_record` has ruled out a whole record in
+  front of it. No signature, MAC, trust store or journal redesign is authorised for this.
+* **N7-R5 — duplicate JSON keys make readable content ambiguous.** Ordinary JSON parsing keeps the
+  *last* duplicate, so a syntactically valid snapshot whose `records` property appears twice loads
+  as the second one, with `corrupt_records_discarded` at `0`. The legitimate writer cannot produce
+  it (`json.dump` of a `dict` has no duplicate keys) and it is not a plausible shape for random
+  corruption, so it is bounded and non-blocking. No duplicate-key parser redesign is authorised
+  for this.
+
+Recovery is **not** universal: these rules bound what *can* be recovered from external corruption
+and make everything else refuse without writing. Do not restate them as recovery from arbitrary
+damage.
 
 **Absence is established from the directory listing, not inferred from a failure.** Do **not** use
 `os.path.exists` or `os.path.lexists` as evidence that a state file is safely absent: they answer

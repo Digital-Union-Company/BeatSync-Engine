@@ -1355,6 +1355,35 @@ _TAIL_REPAIR_PREFIX = '{"k":"' + _JOURNAL_TAIL_REPAIRED + '"'
 
 _JOURNAL_KINDS = (_JOURNAL_SCAN, _JOURNAL_DECIDE, _JOURNAL_TAIL_REPAIRED)
 
+#: [R5-P15 / N7-R3] How an unterminated final journal line is classified before anything is
+#: written after it. R5-P13 had no such classification -- *every* newline-less tail was treated
+#: as an unfinished write and stamped with a repair marker -- and an independent review measured
+#: where that leads: a committed decision that had been **reported successful**, whose line lost
+#: only its terminating newline, was recovered correctly on the next start, then turned into
+#: "damage this process accounted for" by the marker, then erased by the following ``compact()``.
+#: The parent commit, which wrote a bare newline, preserved it. So the two shapes are now told
+#: apart, and the one that costs nothing to keep is kept.
+_TAIL_COMPLETE_EVENT = "complete_event"      # a whole, schema-valid record; only its newline is
+#                                              missing. Complete it and preserve its exact bytes.
+_TAIL_TORN_FRAGMENT = "torn_fragment"        # genuinely unfinished; the F4 torn tail, repaired
+#                                              with the marker-first write, unchanged.
+_TAIL_INVALID_EVENT = "invalid_event"        # parses whole, but describes no record this build
+#                                              can account for. Fail closed.
+_TAIL_TRAILING_BYTES = "trailing_bytes"      # a complete value followed by something
+#                                              unidentifiable. Fail closed; see
+#                                              :meth:`ReviewStore._classify_unterminated_tail`.
+
+#: Read granularity when walking backwards for the last newline. One block covers any record this
+#: writer produces, so the ordinary case is a single read.
+_TAIL_CHUNK_BYTES = 8192
+
+#: [R5-P15 / N7-R3] The ceiling on that walk. A record is a few hundred bytes -- a 64-character
+#: identity, a short scan token and two numbers -- so this is orders of magnitude above anything
+#: the writer emits, and it is here so that classifying **one** line can never degrade into an
+#: unbounded read of the whole journal. A final line past this bound cannot be classified, and an
+#: unclassifiable line is refused rather than guessed at.
+MAX_TAIL_INSPECT_BYTES = 1 << 20
+
 
 class _EventSchemaError(Exception):
     """[R5-P13 / N7-R2] One journal event does not describe what its kind promises to describe.
@@ -1437,6 +1466,11 @@ class ReviewStore:
         self.journal_records = 0
         #: [R5-P3 / F4] How many times an unterminated tail was closed off before appending.
         self.journal_tails_repaired = 0
+        #: [R5-P15 / N7-R3] How many times a **complete, schema-valid** final record was found
+        #: missing only its terminating newline and simply completed. Counted separately from
+        #: :attr:`journal_tails_repaired` because the two are different events: that one records
+        #: damage being set aside, this one records a committed record being preserved.
+        self.journal_tails_completed = 0
         self._load()
 
     # ---- durability ------------------------------------------------------------------
@@ -1599,11 +1633,18 @@ class ReviewStore:
         So damage is tolerated in exactly two shapes, and both of them are *positive evidence*
         rather than an absence of complaint:
 
-        * **the final line, when it is unterminated** -- a record whose write did not reach its
-          newline. ``_append`` writes a record and its newline in one ``_write_all``, which either
-          writes every byte or raises, so an unterminated line is one whose decision was *never
-          reported successful*; and nothing can follow it, so nothing committed is hiding behind
-          it. This is the F4 torn tail, unchanged. A malformed line that **is** terminated is a
+        * **the final line, when it is unterminated *and does not parse*** -- a record whose write
+          did not reach its newline. ``_append`` writes a record and its newline in one
+          ``_write_all``, which either writes every byte or raises, so a line this *writer* left
+          unterminated is one whose decision was never reported successful; and nothing can follow
+          it, so nothing committed is hiding behind it. This is the F4 torn tail, unchanged.
+
+          [R5-P15 / N7-R3] **But "unterminated" alone was never the right test, and reading it as
+          one destroyed data.** A newline-less final line that parses whole was *written* whole --
+          only its terminator is missing, which external truncation of one byte is enough to do --
+          and such a line is replayed here as the ordinary event it is. The repair path tells the
+          two apart as well; see :meth:`_classify_unterminated_tail`. A malformed line that **is**
+          terminated is a
           different animal: this writer only ever terminates a line it wrote in full, and a full
           record parses -- so terminated damage is external corruption of something that may well
           have been committed, wherever in the file it sits, and it refuses;
@@ -1614,9 +1655,20 @@ class ReviewStore:
           accepted F4 sequence would break on the second restart: once a torn fragment has been
           closed off it is no longer the final line, and a rule that said "only the last line may
           be damaged" would refuse a store whose later decision had already been reported
-          successful. A marker can only reach a line through that repair, and the repair only ever
-          fires on an unterminated tail -- so a damaged line in the middle of the file cannot
-          acquire one.
+          successful.
+
+          [R5-P15 / N7-R4] **The marker is an auditable format convention, not authenticated
+          evidence of its own origin**, and an earlier version of this paragraph claimed more than
+          that: it said a marker "can only reach a line through that repair", which is a statement
+          about this writer and not about the file. An independent review appended a well-formed
+          marker to unrelated corrupted content and the discard was accepted. That is outside the
+          accidental-corruption model this design targets -- random damage does not synthesise a
+          valid marker object -- and closing it would need provenance this format does not carry,
+          so it is a recorded limitation rather than a claim. What *is* true: the repair itself
+          only ever fires on an unterminated tail, it never writes a marker onto a line that
+          parses whole (:meth:`_classify_unterminated_tail`), and the amnesty is reached only
+          after :meth:`_tail_hides_a_complete_record` has ruled out a whole record hiding in
+          front of it.
 
         Anything else -- an unparsable line with a committed event after it -- means the record it
         held cannot be established, so recovery refuses and **nothing is written**. Both copies
@@ -1652,6 +1704,21 @@ class ReviewStore:
                     try:
                         event = json.loads(line)
                     except ValueError as unreadable:
+                        if self._tail_hides_a_complete_record(line):
+                            # [R5-P15 / N7-R3] A complete JSON value with unidentifiable bytes
+                            # after it. Checked BEFORE the marker amnesty, because a short write
+                            # can land a whole marker and still miss its newline -- and then the
+                            # amnesty would discard the complete record in front of it, which is
+                            # the N7-R3 loss reached through the read path instead of the repair.
+                            # This writer never puts a marker behind a complete record, so the
+                            # shape is foreign however it arrived; refusing keeps every byte, and
+                            # the decision is recoverable by hand.
+                            raise PersistenceError(
+                                f"review journal record {applied + damaged + 1} is a complete "
+                                "record followed by an unidentifiable partial write, so whether "
+                                "it was committed cannot be established; nothing has been "
+                                "changed and both copies are exactly as they were"
+                            ) from unreadable
                         if self._damage_is_accounted_for(line):
                             damaged += 1
                             continue
@@ -1683,6 +1750,26 @@ class ReviewStore:
         return applied, damaged + int(torn_tail)
 
     @staticmethod
+    def _tail_hides_a_complete_record(line: str) -> bool:
+        """[R5-P15 / N7-R3] Whether an unparsable ``line`` *begins* with a whole JSON value.
+
+        Only a question about shape -- it says nothing about whether the value is a record this
+        build understands, and deliberately so: a complete JSON object followed by bytes this
+        writer would never put there is unexplained either way, and an unexplained line that may
+        be holding a committed decision is refused rather than discarded.
+
+        It does **not** fire on a repaired fragment. A torn record is unbalanced JSON from its
+        first byte, so ``raw_decode`` fails at offset 0 for every genuine F4 tail and for every
+        prefix of a marker written onto one -- which is what keeps the frozen interrupted-repair
+        guarantee intact.
+        """
+        try:
+            _value, end = json.JSONDecoder().raw_decode(line)
+        except ValueError:
+            return False
+        return bool(line[end:].strip())
+
+    @staticmethod
     def _damage_is_accounted_for(line: str) -> bool:
         """[R5-P13 / N7-R2] Whether an unparsable ``line`` carries this process's repair evidence.
 
@@ -1704,6 +1791,14 @@ class ReviewStore:
 
         The last occurrence is the one examined, because a partly written marker can precede a
         complete one, and it must parse all the way to the end of the line.
+
+        [R5-P15 / N7-R4] These bounds make the marker **unambiguous**, not **authentic**. It is a
+        format convention: anything that can write to the journal can write a well-formed marker,
+        and this returns ``True`` for it. That is outside the accidental-corruption model -- random
+        damage does not produce a valid marker object -- and it is recorded as a limitation rather
+        than described as proof of origin. :meth:`_replay_journal` consults
+        :meth:`_tail_hides_a_complete_record` first, so the amnesty can no longer discard a whole
+        record that is sitting in front of a marker.
         """
         cut = line.rfind(_TAIL_REPAIR_PREFIX)
         if cut < 0:
@@ -1936,11 +2031,137 @@ class ReviewStore:
             raise PersistenceError(
                 f"could not verify the review journal tail ({_io_detail(exc)})") from exc
 
+    def _journal_tail_bytes(self) -> bytes:
+        """[R5-P15 / N7-R3] The bytes after the journal's last newline. Bounded, or raises.
+
+        Walked **backwards** in blocks from end of file, so the ordinary case is one read of one
+        block rather than a pass over the whole journal: classifying one final line must never
+        become an unbounded read, because the journal grows to
+        :data:`COMPACT_AFTER_RECORDS` records between compactions.
+
+        Two conditions are refusals rather than answers, for the same reason every other
+        inspection failure on this path is:
+
+        * an ``OSError`` -- the tail's content is not known, and an unknown tail is not a licence
+          to write anything after it (the R5-P5 / N2 rule, applied to content as it already is to
+          termination);
+        * a final line longer than :data:`MAX_TAIL_INSPECT_BYTES` -- it cannot be classified
+          within the bound, and the task this fix answers is explicit that an unclassifiable line
+          is refused, not guessed at. No record this writer emits comes close to the bound.
+
+        Opened by pathname while the append descriptor is held, exactly as
+        :meth:`_journal_tail_is_terminated` already does; nothing has been written through that
+        descriptor yet, so the bytes are stable.
+        """
+        try:
+            with open(self.journal_path, "rb") as probe:
+                probe.seek(0, os.SEEK_END)
+                remaining = probe.tell()
+                tail = b""
+                while remaining > 0:
+                    step = min(_TAIL_CHUNK_BYTES, remaining)
+                    remaining -= step
+                    probe.seek(remaining)
+                    block = probe.read(step)
+                    if len(block) != step:
+                        raise PersistenceError(
+                            "could not read the end of the review journal, so its final record "
+                            "could not be identified; nothing has been changed")
+                    cut = block.rfind(b"\n")
+                    if cut >= 0:
+                        tail = block[cut + 1:] + tail
+                        break
+                    tail = block + tail
+                    # Bound the accumulation itself, so a journal with no newline at all cannot
+                    # be read into memory whole.
+                    self._require_inspectable_tail(tail)
+        except OSError as exc:
+            raise PersistenceError(
+                f"could not read the review journal tail ({_io_detail(exc)})") from exc
+        # And bound the result. The incremental check above cannot be the only one: the block
+        # that *finds* the newline exits the walk, so a line a little over the ceiling would
+        # otherwise be returned without ever having been measured. Caught by its own test.
+        self._require_inspectable_tail(tail)
+        return tail
+
+    @staticmethod
+    def _require_inspectable_tail(tail: bytes) -> None:
+        if len(tail) > MAX_TAIL_INSPECT_BYTES:
+            raise PersistenceError(
+                "the review journal's final record is too large to identify within "
+                f"{MAX_TAIL_INSPECT_BYTES} bytes, so whether it holds a committed decision "
+                "cannot be established; nothing has been changed")
+
+    def _classify_unterminated_tail(self, raw: bytes) -> str:
+        """[R5-P15 / N7-R3] Which of the four shapes an unterminated final line is.
+
+        The distinction rests on the same fact the strict replay validator rests on, read the
+        other way round: **truncating one of this writer's records always leaves JSON that will
+        not parse**, because the closing brace is the last byte before the newline. So a
+        newline-less final line that *does* parse whole was written whole -- its decision may well
+        have been reported successful -- and the one thing that must not happen to it is being
+        relabelled as damage. R5-P13's docstrings asserted the converse ("an unterminated line is
+        one whose decision was never reported successful"); that holds for this writer's own
+        interrupted writes and not for the file, which is the gap N7-R3 occupied.
+
+        ``_apply`` is called with **throwaway** dicts, never the live record: validating a tail
+        must not publish it. Validation is deliberately the *same* code the replay path runs, so
+        this can never accept a record the reader would later refuse.
+
+        The two fail-closed shapes are worth stating explicitly:
+
+        * :data:`_TAIL_INVALID_EVENT` -- complete JSON, but no record this build can account for.
+          Completing it would publish an unaccountable record; marking it as repaired damage would
+          destroy evidence of one. Neither is safe, so nothing is written.
+        * :data:`_TAIL_TRAILING_BYTES` -- a complete value followed by something unidentifiable.
+          This is the combined shape: a *previous* build's repair could have stamped a partial
+          marker onto a valid record. The complete prefix may be a committed decision, so stamping
+          a marker over it is exactly the N7-R3 loss with an extra step; but recovering it would
+          mean trusting a line that parses only when trailing bytes are ignored, which is the
+          laundering route :meth:`_damage_is_accounted_for` is bounded to prevent. The information
+          to choose safely is not on disk, so this refuses and keeps every byte. **The fixed writer
+          cannot produce this shape** -- it writes a lone newline after a valid record, and a
+          one-byte write is all-or-nothing -- so no store this build wrote can reach it.
+        """
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # A torn write can stop mid multi-byte sequence. Not text, so not a whole record:
+            # genuine damage, repaired like any other.
+            return _TAIL_TORN_FRAGMENT
+        line = text.strip()
+        if not line:
+            return _TAIL_TORN_FRAGMENT
+        try:
+            event = json.loads(line)
+        except ValueError:
+            try:
+                _value, end = json.JSONDecoder().raw_decode(line)
+            except ValueError:
+                return _TAIL_TORN_FRAGMENT          # the ordinary F4 torn tail
+            if line[end:].strip():
+                return _TAIL_TRAILING_BYTES
+            # Unreachable: json.loads tolerates trailing whitespace, so it would have parsed.
+            return _TAIL_TORN_FRAGMENT
+        try:
+            self._apply(event, {}, {})
+        except _EventSchemaError:
+            return _TAIL_INVALID_EVENT
+        return _TAIL_COMPLETE_EVENT
+
     def _terminate_damaged_tail(self, handle: int) -> bool:
         """[R5-P3 / F4] Close off a newline-less tail before appending after it.
 
-        A newline-less final line means a previous append died part way through its record --
-        either a short write that then failed, or the process dying mid-write. The original
+        [R5-P15 / N7-R3] **A newline-less final line does not by itself mean an unfinished
+        record**, and this method's first job is now to say which of the four shapes in
+        :meth:`_classify_unterminated_tail` it is. Only a fragment that does not parse is repaired
+        with the marker; a complete, schema-valid record missing only its terminator is *completed*
+        with the one byte it lacks and keeps its exact original bytes; the two unidentifiable
+        shapes write nothing at all. The paragraphs below describe the torn-fragment path, which
+        is unchanged.
+
+        A newline-less *unparsable* tail means a previous append died part way through its record
+        -- either a short write that then failed, or the process dying mid-write. The original
         docstring claimed "a torn write can only damage the last line"; it does not. Because the
         journal is opened ``O_APPEND`` and a record is one line, the next append lands directly
         against the damaged bytes and the two become a single unparsable line, so a *later,
@@ -1975,6 +2196,26 @@ class ReviewStore:
         """
         if self._journal_tail_is_terminated(handle):
             return False
+        shape = self._classify_unterminated_tail(self._journal_tail_bytes())
+        if shape == _TAIL_COMPLETE_EVENT:
+            # [R5-P15 / N7-R3] A whole record that lost only its newline. Writing the newline and
+            # nothing else keeps its original bytes parseable for ever; stamping a marker onto it
+            # -- which is what R5-P13 did to every newline-less tail -- converted a decision that
+            # had been reported successful into discardable damage, and the next compaction then
+            # erased it. One byte, so there is no partially written state to recover from either.
+            self._write_all(handle, b"\n")
+            self.journal_tails_completed += 1
+            return True
+        if shape == _TAIL_INVALID_EVENT:
+            raise PersistenceError(
+                "the review journal's final record is complete but does not describe a record "
+                "this build can account for, so it can be neither completed nor set aside "
+                "safely; nothing has been changed and both copies are exactly as they were")
+        if shape == _TAIL_TRAILING_BYTES:
+            raise PersistenceError(
+                "the review journal's final record is followed by an unidentifiable partial "
+                "write, so whether it held a committed decision cannot be established; nothing "
+                "has been changed and both copies are exactly as they were")
         marker = json.dumps({"k": _JOURNAL_TAIL_REPAIRED, "at": time.time()},
                             separators=(",", ":"), ensure_ascii=False)
         self._write_all(handle, (marker + "\n").encode("utf-8"))
