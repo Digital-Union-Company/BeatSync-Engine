@@ -4865,17 +4865,54 @@ def test_n7r7_only_repair_markers_may_follow_a_torn_character(text, expected):
     assert cr.ReviewStore._is_repair_evidence_so_far(text) is expected   # noqa: SLF001
 
 
-def test_n7r7_a_fragment_whose_interior_cannot_be_ruled_out_fails_closed(tmp_path):
+def _nested(openings: int) -> str:
+    """A proper object prefix with exactly `openings` *structural* interior object openings.
+
+    `{"a":{"a":{"a":` and so on: every one of them opens a real nested object, none of them closes,
+    so each is a position at which a whole value genuinely has to be ruled out.
+    """
+    return '{"a":' * (openings + 1)
+
+
+@pytest.mark.parametrize("braces", [
+    cr.MAX_HIDDEN_RECORD_PROBES - 1,            # 63
+    cr.MAX_HIDDEN_RECORD_PROBES,                # 64
+    cr.MAX_HIDDEN_RECORD_PROBES + 1,            # 65 -- over the ceiling, and still fine
+    400,                                        # and far over it
+])
+def test_n7r21_braces_inside_a_string_value_never_consume_the_probe_budget(braces):
+    """[R5-P21] Literal braces in a string are content, so they are not candidates at all.
+
+    This is the defect's unit form. The budget exists to bound how many *structural* interior
+    openings are ruled out, and a `{` the writer itself put inside an identity rules nothing in or
+    out. Charging the budget for them made a legitimate value with enough braces in it refusable
+    for no reason, on top of the single-`{}` false refusal that blocked the merge.
+    """
+    assert cr.ReviewStore._is_an_unfinished_record(                # noqa: SLF001 - white box
+        '{"a":"' + "{" * braces), "a string's contents are never a structural candidate"
+
+
+@pytest.mark.parametrize("openings,expected", [
+    (cr.MAX_HIDDEN_RECORD_PROBES - 1, True),    # 63 -- below the ceiling, still answered
+    (cr.MAX_HIDDEN_RECORD_PROBES, True),        # 64 -- exactly the ceiling
+    (cr.MAX_HIDDEN_RECORD_PROBES + 1, False),   # 65 -- exhausted, therefore refused
+])
+def test_n7r7_a_fragment_whose_interior_cannot_be_ruled_out_fails_closed(openings, expected):
     """The probe ceiling is a refusal, not a shortcut.
 
     A record this writer emits has no interior object, so the ceiling is unreachable in practice.
     If it ever is reached, "I ran out of budget before I could rule out a hidden record" has to
     mean the same thing as "there is one".
+
+    [R5-P21] The fixture now uses genuinely structural openings. It used to be `{"a":"` followed by
+    braces inside the open string, which the corrected discriminator does not count -- so the old
+    fixture would have passed for the wrong reason while the real bound went unexercised.
     """
-    fragment = '{"a":"' + "{" * (cr.MAX_HIDDEN_RECORD_PROBES + 1)
-    assert not cr.ReviewStore._is_an_unfinished_record(fragment)   # noqa: SLF001 - white box
-    assert cr.ReviewStore._is_an_unfinished_record(                # noqa: SLF001 - white box
-        '{"a":"' + "{" * (cr.MAX_HIDDEN_RECORD_PROBES - 1)), "below the ceiling it still answers"
+    fragment = _nested(openings)
+    assert cr.ReviewStore._structural_object_openings(              # noqa: SLF001 - white box
+        fragment) == tuple(range(5, 5 * (openings + 1), 5)), "the fixture is what it claims"
+    assert cr.ReviewStore._is_an_unfinished_record(                 # noqa: SLF001 - white box
+        fragment) is expected
 
 
 def test_n7r7_the_writer_and_the_reader_agree_on_every_real_torn_prefix(tmp_path):
@@ -4906,3 +4943,315 @@ def test_n7r7_the_writer_and_the_reader_agree_on_every_real_torn_prefix(tmp_path
             final = _assert_fully_recovered(directory, expected, scan="scan-2")
             assert final.get("after") == (cr.SELECTED, 1), (
                 f"a reported success must survive a tear {keep} byte(s) into {character!r}")
+
+
+# ---- [R5-P21] braces a writer put inside a string are not record boundaries -----------------
+#
+# R5-P19 replaced "torn by elimination" with a positive, writer-derived test, which is what refuses
+# a committed event hidden behind external damage. An independent R5-P20 review then measured the
+# cost of how its interior probe was written: it asked `raw_decode` at EVERY interior `{`, so the
+# real writer's own `identity="clip-{}e-acute"` made the `{}` inside that string look like a whole
+# hidden object, and a GENUINE torn write was refused. Cold recovery and the next append both
+# raised, and decisions committed before the tear became unreachable until someone edited the file.
+#
+# The correction is not "skip braces inside strings". That alone would fix the measured case and
+# open a worse one: an external prefix that merely OPENS a string can hand a committed event to a
+# quote-tracker as though it were somebody's text -- `{"a":"` in front of `{"k":"decide",...}`, where
+# the event's own first `"` closes the string the damage opened. So the whole prefix now has to be
+# grammatical: every character accounted for by the JSON grammar, which leaves no damaged prefix for
+# anything to hide behind, and makes a string's boundaries a fact rather than a guess.
+
+@pytest.mark.parametrize("text,expected", [
+    # --- what the real writer leaves: proper prefixes, cut anywhere -------------------------
+    ('{"k":"decide","identity":"clip-{}', ()),       # **the R5-P20 shape**: braces in a string
+    ('{"k":"decide","identity":"clip-{', ()),
+    ('{"k":"decide","identity":"clip-}', ()),
+    ('{"k":"decide","identity":"{}{}{}', ()),
+    ('{"k":"decide","identity":"{\\"a\\":1}', ()),   # an escaped JSON object, as content
+    ('{"k":"decide","identity":"a\\"b{', ()),        # an escaped quote, then a brace
+    ('{"k":"decide","identity":"a\\\\b{', ()),       # an escaped backslash, then a brace
+    ('{"k":"decide","identity":"a\\', ()),           # cut INSIDE an escape sequence
+    ('{"k":"decide","identity":"a","revision":1', ()),
+    ('{"k":"decide","identity":"a","revision":', ()),
+    ('{', ()),
+    ('{"', ()),                                      # cut inside a key
+    ('{"k"', ()),
+    ('{"k":', ()),
+    ('{"k":"tail-repaired","at":', ()),
+    # --- structural interior openings: real candidates, reported as such --------------------
+    ('{"a":{', (5,)),
+    ('{"a":{"b":{', (5, 10)),
+    ('{"a":[{"b":2},{', (6, 14)),                    # inside an array, which this writer never emits
+    # --- not a proper prefix of one object: refused outright --------------------------------
+    ('', None),
+    ('xx{"k":"decide"', None),                       # unidentifiable bytes in front
+    ('{x{"k":"decide","identity":"a"}', None),        # ... with a plausible first byte
+    ('{"a":"{"k":"decide","identity":"a"}', None),   # **the adversarial shape**: the event's own
+    #                                                  quote closes the string the damage opened
+    ('{"a":1}', None),                               # a WHOLE object is not a proper prefix
+    ('{"a":1} ', None),
+    ('{"a":1}{"b":2', None),                         # a whole object with more behind it
+    ('{"a":,', None),                                # no value where one is required
+    ('{"a" 1', None),                                # no colon
+    ('{"a":1 1', None),                              # no comma
+    ('{"a":1,}', None),                              # a key is required after a comma
+    ('{"a":1,1', None),
+    ('{1:2', None),                                  # a key must be a string
+    ('{"a":tru', ()),                                # a bare word, interrupted
+    ('{"a":trux', None),                             # a bare word that is not one
+    ('[1,2', None),                                  # this writer emits objects, never arrays
+    ('{]', None),
+    ('{"a":[1}', None),                              # containers closed in the wrong order
+])
+def test_n7r21_the_prefix_scanner_validates_the_grammar_and_locates_real_openings(text, expected):
+    """[R5-P21] The scanner, as a table: what it accepts, what it refuses, and what it points at.
+
+    `None` is a refusal -- "this is not a proper prefix of one JSON object" -- and is what keeps an
+    externally damaged prefix from presenting a committed event as string content. A tuple is an
+    acceptance, and its contents are the only positions at which a whole value still has to be
+    ruled out. Note that both of the measured loss shapes and the measured false refusal appear
+    here, told apart by the grammar rather than by what they happen to contain.
+    """
+    assert cr.ReviewStore._structural_object_openings(text) == expected   # noqa: SLF001
+
+
+#: A whole, schema-valid `decide` event. Discarding a line that holds one of these intact is
+#: exactly the N7-R7 permanent loss, whatever the bytes in front of it look like.
+_WHOLE_EVENT = ('{"k":"decide","identity":"keep","decision":"SELECTED","revision":1,'
+                '"scan_id":"s","at":1.0}')
+
+
+@pytest.mark.parametrize("prefix,why", [
+    ('{"a":"', "an opened string: the event's own first quote closes it"),
+    ('{"a":"\\\\"', "an escape, then an opened string"),
+    ('{"a":"x","b":"', "a complete field first, so the scanner is in a plausible state"),
+    ('{"a":[', "an opened array"),
+    ('{"a":', "a nested object, where a value is genuinely expected"),
+    ('{"a":1', "a grammatical fragment with the event simply appended"),
+    ('{"a":1{"k":"tail-repaired","at":1.0}', "... behind real repair evidence as well"),
+    ('{"k":"decide","identity":"x"', "a fragment that looks like a record of this very kind"),
+])
+def test_n7r21_a_quote_aware_scan_cannot_be_talked_into_hiding_a_committed_event(prefix, why):
+    """[R5-P21] The reason the correction is a grammar and not a brace-skipper.
+
+    Each line puts a whole, schema-valid `decide` event behind a prefix that invites a quote-aware
+    scanner to read it as string content, or behind one that is itself perfectly grammatical. None
+    of them may be classified as an unfinished record or as an interrupted write, because
+    discarding one would be discarding the committed decision inside it.
+
+    Three distinct guards are being asserted at once, and each row needs a different one: the
+    grammar refuses the opened-string rows, the structural interior probe refuses the array and
+    nested-object rows, and the repair-evidence check refuses the rows where the event sits where
+    only marker prefixes may sit. A fix that restored any one of those to a brace-skipper would
+    pass some of these rows and lose a committed decision on the others.
+    """
+    text = prefix + _WHOLE_EVENT
+    event, end = json.JSONDecoder().raw_decode(text, len(prefix))
+    assert end == len(text) and event["identity"] == "keep", "the fixture holds a whole event"
+    assert not cr.ReviewStore._is_an_unfinished_record(text)       # noqa: SLF001 - white box
+    assert not cr.ReviewStore._text_is_an_interrupted_write(text)  # noqa: SLF001 - white box
+
+
+#: [R5-P21] Every string construct the task requires, carried by a REAL `decide` identity or a REAL
+#: `begin_scan` scan id, with a multi-byte character after it for the tear to land inside.
+_BRACE_SHAPES = [
+    ("empty-object", "identity", "clip-{}é", "é"),
+    ("open-brace", "identity", "clip-{é", "é"),
+    ("close-brace", "identity", "clip-}é", "é"),
+    ("json-object", "identity", 'clip-{"a":1}é', "é"),
+    ("repeated-empty", "identity", "clip-{}{}{}é", "é"),
+    ("escaped-quotes", "identity", 'clip-{"q"}é', "é"),
+    ("backslashes", "identity", "clip-\\{}\\é", "é"),
+    ("a-whole-record", "identity", 'clip-{"k":"decide","identity":"x"}é', "é"),
+    ("unicode-then-braces", "identity", "clip-é{}€", "€"),
+    ("braces-then-unicode", "identity", "clip-{}€", "€"),
+    ("emoji", "identity", "clip-{}\U0001f600", "\U0001f600"),
+    ("marker-text", "identity", 'clip-{"k":"tail-repaired","at":0.0}é', "é"),
+    ("scan-empty-object", "scan", "scan-{}€", "€"),
+    ("scan-open-brace", "scan", "scan-{€", "€"),
+    ("scan-json-object", "scan", 'scan-{"a":1}é', "é"),
+    ("scan-emoji", "scan", "scan-{}\U0001f600", "\U0001f600"),
+]
+
+_BRACE_ROWS = [(f"{label}-{keep}", field, value, char, keep)
+               for label, field, value, char in _BRACE_SHAPES
+               for keep in range(1, len(char.encode("utf-8")))]
+
+
+@pytest.mark.parametrize("label,field,value,char,keep", _BRACE_ROWS,
+                         ids=[row[0] for row in _BRACE_ROWS])
+def test_n7r21_a_real_write_torn_after_braces_in_a_string_survives_the_whole_lifecycle(
+        tmp_path, label, field, value, char, keep):
+    """[R5-P21] **The blocking gate.** Writer -> replay -> repair -> append -> replay -> compaction.
+
+    Every record here is produced by the real `decide()` or `begin_scan()` and torn by a real short
+    `os.write`, so the fragment on disk is the writer's own bytes and not a hand-built fixture. On
+    the frozen candidate every one of these rows refuses at the first restart, taking the three
+    decisions committed *before* the tear down with it; on its parent they all recovered. Nothing
+    about the fix may be visible here except that they recover again.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    if field == "scan":
+        store.begin_scan("owner-a", value)
+        identity, scan = "torn-identity", value
+    else:
+        identity, scan = value, "scan-1"
+
+    with _TornInside(char.encode("utf-8"), keep) as tear:
+        with pytest.raises(cr.PersistenceError):
+            store.decide("owner-a", identity, cr.SELECTED, scan)
+    assert tear.cut is not None, "the tear has to have fired inside the real payload"
+    assert store.get(identity) == (cr.PENDING, 0), "an interrupted write is never a success"
+
+    fragment = _journal_lines(store)[-1]
+    assert not fragment.endswith(b"\n")
+    readable = cr.ReviewStore._longest_text_prefix(fragment)       # noqa: SLF001 - white box
+    assert set("{}") & set(readable[1:]), "the fixture must really carry an interior brace"
+    assert cr.ReviewStore._structural_object_openings(             # noqa: SLF001 - white box
+        readable) == (), "every brace in it is string content, so nothing has to be ruled out"
+    assert cr.ReviewStore._bytes_are_an_interrupted_write(         # noqa: SLF001 - white box
+        fragment), "the writer's own bytes must be recognised as the writer's"
+
+    # 1. Restart before any repair, and 2. recover every decision committed beforehand.
+    first = _assert_fully_recovered(directory, expected, scan=scan)
+    assert first.get(identity) == (cr.PENDING, 0)
+    assert first.corrupt_records_discarded == 1
+
+    # 3. A subsequent decision, which performs the real repair, and must be durable.
+    assert first.decide("owner-a", "later", cr.SELECTED, scan) == (cr.SELECTED, 1)
+    assert first.journal_tails_repaired == 1, "a torn fragment is repaired, never completed"
+    assert first.journal_tails_completed == 0
+
+    # 4. Restart: every reported-successful decision is still at its own revision.
+    second = _assert_fully_recovered(directory, expected, scan=scan)
+    assert second.get("later") == (cr.SELECTED, 1)
+    assert second.get(identity) == (cr.PENDING, 0)
+
+    # 5. Real compaction, then 6. restart again: the same answers.
+    second.compact()
+    final = _assert_fully_recovered(directory, expected, scan=scan)
+    assert final.get("later") == (cr.SELECTED, 1)
+    assert final.get(identity) == (cr.PENDING, 0)
+
+
+def test_n7r21_braces_in_a_string_plus_an_interrupted_repair_still_recovers(tmp_path):
+    """[R5-P21] The two shapes together, at every prefix of the real repair marker.
+
+    A record torn inside a string that already contains braces, and then the repair itself cut at
+    every byte of its own single write. The stub left behind is where the old 26-character anchor
+    could not find the boundary: `…"clip-{}` followed by `{"k` reads as the string `clip-{}{` and
+    then a bare `k`, so the fragment is only grammatical once the split is *found*. Every prefix
+    has to leave every reported success recoverable.
+    """
+    full = b'{"k":"tail-repaired","at":0.0}\n'
+    for cut in range(len(full) + 1):
+        directory = str(tmp_path / f"state-{cut}")
+        store, expected = _committed(directory)
+        with open(store.journal_path, "ab") as handle:
+            handle.write(b'{"k":"decide","identity":"clip-{}","decision":"SELE')
+            handle.write(full[:cut])             # the interrupted repair write
+
+        recovered = _assert_fully_recovered(directory, expected)
+        recovered.begin_scan("owner-a", "scan-2")
+        assert recovered.decide("owner-a", "after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+        again = _assert_fully_recovered(directory, expected, scan="scan-2")
+        assert again.get("after") == (cr.SELECTED, 1), (
+            f"a reported success must survive a repair interrupted after {cut} byte(s)")
+        again.compact()
+        final = _assert_fully_recovered(directory, expected, scan="scan-2")
+        assert final.get("after") == (cr.SELECTED, 1)
+
+
+@pytest.mark.parametrize("prefix", [b"xx", b"{x", b'{"k":', b'{"a":"'])
+@pytest.mark.parametrize("suffix,why", [
+    (b"", "no evidence at all"),
+    (b'{"k":"tail-repaired","at":1.0}', "a genuine, complete, attached repair marker"),
+])
+def test_n7r21_readable_unaccountable_damage_refuses_the_warm_append_too(
+        tmp_path, prefix, suffix, why):
+    """[R5-P21] The readable twin of the whole N7-R7 sequence, against a **warm healthy** store.
+
+    Three gaps this closes, each found by a mutation that nothing else noticed. The existing
+    coverage reaches the append path only through a freshly constructed store, which refuses at
+    construction -- so `_classify_unterminated_tail` was never asked about *readable* unaccountable
+    damage, and neither was the readable half of the marker amnesty. Both are reachable exactly
+    here: a store that is already healthy in memory, whose journal is then damaged underneath it.
+
+    The marker rows are the point of the second half. A complete, valid, attached marker is
+    present, and it still must not excuse the line -- because the damage is not writer-shaped, and
+    the amnesty would discard the committed event sitting inside it without ever looking.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    assert store.decide("owner-a", "committed", cr.SELECTED, "scan-1") == (cr.SELECTED, 1)
+    expected["committed"] = (cr.SELECTED, 1)
+    original = _journal_lines(store)
+
+    event = _leading(store, prefix, suffix)
+    damaged = _state_bytes(store)
+    assert _is_text(prefix + event + suffix), "this is the READABLE twin; pin that it is readable"
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)                                # cold
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "later", cr.SELECTED, "scan-1")   # warm append
+    assert store.get("later") == (cr.PENDING, 0), "a refused decision is never a success"
+    assert _state_bytes(store) == damaged, "a refusal writes no byte"
+
+    # And the refusal really did preserve something: the record is still there, byte for byte.
+    assert event in damaged["journal"]
+    _rewrite_journal(store, original)
+    _assert_fully_recovered(directory, expected)
+
+
+@pytest.mark.parametrize("stubs,expected", [
+    (cr.MAX_HIDDEN_RECORD_PROBES - 1, True),    # 63 -- the real boundary is still reached
+    (cr.MAX_HIDDEN_RECORD_PROBES, True),        # 64 -- exactly the ceiling
+    (cr.MAX_HIDDEN_RECORD_PROBES + 1, False),   # 65 -- exhausted, therefore refused
+])
+def test_n7r21_the_split_candidate_budget_fails_closed(stubs, expected):
+    """[R5-P21] The second budget: how many places a repair could have begun are tried.
+
+    The fragment is cut after a comma, so a `{` is *not* grammatical where the stubs start and
+    every candidate but the leftmost fails. That makes the walk run its full length, which is the
+    only way to reach the ceiling -- and the ceiling has to mean "could not be ruled out", not
+    "keep looking until something fits". Running past it would eventually accept the line and
+    discard whatever the unexplained bytes were covering.
+    """
+    line = '{"k":"decide","identity":"a",' + "{" * stubs
+    assert cr.ReviewStore._text_is_an_interrupted_write(line) is expected   # noqa: SLF001
+
+
+def test_n7r21_the_real_automatic_compaction_threshold_survives_braced_identities(tmp_path):
+    """[R5-P21] The real `COMPACT_AFTER_RECORDS` route, with braces and a real tear in the history.
+
+    `maybe_compact()` is the path a long-lived store actually takes, and it is the one that made
+    the earlier losses permanent. Every decision reported successful before and after a genuine
+    torn write with braces in its identity has to be at its original revision once it has fired.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    expected = {}
+    fired = 0
+    for index in range(cr.COMPACT_AFTER_RECORDS // 2):
+        identity = f"clip-{{}}-{index}"          # a literal '{}' in every single identity
+        expected[identity] = store.decide("owner-a", identity, cr.SELECTED, "scan-1")
+        fired += store.maybe_compact()
+
+    with _TornInside("é".encode("utf-8"), 1) as tear:
+        with pytest.raises(cr.PersistenceError):
+            store.decide("owner-a", "clip-{}é", cr.SELECTED, "scan-1")
+    assert tear.cut is not None
+
+    live = _assert_fully_recovered(directory, expected)
+    for index in range(cr.COMPACT_AFTER_RECORDS // 2 + 4):
+        identity = f"after-{{}}-{index}"
+        expected[identity] = live.decide("owner-a", identity, cr.SELECTED, "scan-1")
+        fired += live.maybe_compact()
+    assert live.journal_tails_repaired == 1
+    assert fired > 0, "the real automatic threshold must have fired at least once"
+
+    _assert_fully_recovered(directory, expected)
+    assert len(expected) == cr.COMPACT_AFTER_RECORDS + 4, "the fixture really crossed the bound"

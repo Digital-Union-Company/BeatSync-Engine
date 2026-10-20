@@ -1423,6 +1423,22 @@ MAX_TAIL_INSPECT_BYTES = 1 << 20
 #: ruled out is not a fragment that may be discarded.
 MAX_HIDDEN_RECORD_PROBES = 64
 
+#: [R5-P21] Whitespace the JSON grammar allows between tokens. ``json.dumps`` with
+#: ``separators=(",", ":")`` emits none of it, so accepting it costs nothing and keeps
+#: :meth:`ReviewStore._structural_object_openings` a scanner for JSON rather than for one dumper's
+#: exact spelling.
+_JSON_SPACE = " \t\n\r"
+
+#: [R5-P21] Every character a JSON number can be built from. Deliberately **not** a number
+#: validator -- see :meth:`ReviewStore._structural_object_openings` for why leniency *inside* a
+#: token can only ever cause a refusal, and why the strictness that matters is at the token
+#: boundary that follows it.
+_JSON_NUMBER = "-+.eE0123456789"
+
+#: [R5-P21] The three bare words JSON allows where a value is expected. This writer emits none of
+#: them today; recognising them keeps the scanner a JSON scanner.
+_JSON_WORDS = ("true", "false", "null")
+
 
 class _EventSchemaError(Exception):
     """[R5-P13 / N7-R2] One journal event does not describe what its kind promises to describe.
@@ -2098,6 +2114,180 @@ class ReviewStore:
         return all(character in _TAIL_REPAIR_NUMBER for character in number)
 
     @staticmethod
+    def _json_string_end(text: str, start: int) -> "int | None":
+        """[R5-P21] The index just past the closing quote of the string opening at ``text[start]``.
+
+        ``None`` means the string is still open when ``text`` runs out, which is the ordinary shape
+        of a torn record: the tear usually lands inside the identity, so the final field is a
+        string nobody ever closed.
+
+        Only ``\\`` and ``"`` are interpreted, because only they can move the closing quote: an
+        escape consumes the next character whatever it is, so ``\\"`` cannot close the string and
+        ``\\\\"`` can. Nothing else about the contents is judged -- a ``{`` in here is text, a
+        ``\\uXXXX`` body is text, and neither needs validating to find where the string ends.
+        """
+        walk = start + 1
+        size = len(text)
+        while walk < size:
+            character = text[walk]
+            if character == "\\":
+                walk += 2                        # the escaped character, whatever it is
+                continue
+            if character == '"':
+                return walk + 1
+            walk += 1
+        return None
+
+    @staticmethod
+    def _structural_object_openings(text: str) -> "tuple[int, ...] | None":
+        """[R5-P21] Validate ``text`` as a proper prefix of one JSON object, and say where inside
+        it an object *structurally* opens.
+
+        ``None`` means ``text`` is **not** a proper prefix of a single JSON object: either some
+        character is not grammatical where it stands, or the object finishes before the text does.
+        Otherwise the answer is the indices, after index zero, at which a ``{`` opens a nested
+        object -- the only positions at which a whole JSON value could be hiding.
+
+        **Why a grammar and not a brace-skipper.** [R5-P20] The defect this replaces probed every
+        interior ``{``, including one inside a string, so the real writer's own
+        ``identity="clip-{}é"`` made ``{}`` look like a whole hidden object and a genuine torn
+        write was refused. Merely *skipping* braces inside strings would fix that case and open a
+        worse one: an external prefix can put a committed event where a quote-tracker reads it as
+        string content. ``{"a":"`` in front of a whole ``{"k":"decide",...}`` is exactly that --
+        the event's own first ``"`` closes the string the damage opened, and from there a
+        brace-skipper is reading the event's bytes as if they were someone's text.
+
+        Requiring the *whole* prefix to be grammatical closes that off, because there is then no
+        damaged prefix left to hide anything behind: every character is accounted for by the
+        grammar, so a string's boundaries are where the grammar says they are rather than where a
+        heuristic guessed. The ``{"a":"{"k":...`` shape fails at the ``k`` -- a bare word where the
+        grammar demands ``,`` or ``}`` -- and is refused, which is the behaviour R5-P19 bought and
+        this correction must not spend.
+
+        Leniency and strictness are placed deliberately. *Inside* a token this scanner is looser
+        than JSON: ``_JSON_NUMBER`` accepts ``01`` and ``1e``, and a string's contents are not
+        validated. That direction is safe, and safe in one direction only -- the caller has already
+        established that :func:`json.JSONDecoder.raw_decode` could not parse a whole value at
+        offset zero, so a token this scanner accepts but JSON would reject can only make the
+        prefix look *finished* here (an empty stack, hence ``None``, hence a refusal) and never
+        make unexplained bytes look accounted for. At every token *boundary* it is exact: what may
+        follow a value, a key or a comma is the JSON grammar and nothing else.
+
+        Iterative with an explicit container stack, so prefix depth costs no interpreter frames.
+        """
+        if not text.startswith("{"):
+            return None
+        stack: list[str] = []
+        openings: list[int] = []
+        expect = "value"
+        index, size = 0, len(text)
+        while True:
+            while index < size and text[index] in _JSON_SPACE:
+                index += 1
+            if index >= size:
+                # The text ran out. Still inside a container means a *proper* prefix, which is the
+                # question. An empty stack means the value finished, which is not.
+                return tuple(openings) if stack else None
+            character = text[index]
+
+            if expect == "close":
+                # A value just ended; what may follow it belongs to the container holding it.
+                expect = ("object-tail" if stack and stack[-1] == "object"
+                          else "array-tail" if stack else "done")
+                continue
+
+            if expect in ("value", "first-value"):
+                if character == "]" and expect == "first-value":
+                    stack.pop()
+                    index += 1
+                    expect = "close"
+                    continue
+                if character == "{":
+                    if stack:                    # index zero is the record itself, not an interior
+                        openings.append(index)
+                    stack.append("object")
+                    index += 1
+                    expect = "first-key"
+                    continue
+                if character == "[":
+                    stack.append("array")
+                    index += 1
+                    expect = "first-value"
+                    continue
+                if character == '"':
+                    end = ReviewStore._json_string_end(text, index)
+                    if end is None:
+                        return tuple(openings) if stack else None
+                    index = end
+                    expect = "close"
+                    continue
+                if character in "-0123456789":
+                    walk = index
+                    while walk < size and text[walk] in _JSON_NUMBER:
+                        walk += 1
+                    index = walk
+                    expect = "close"
+                    continue
+                word = next((one for one in _JSON_WORDS if one[0] == character), None)
+                if word is None:
+                    return None
+                if text.startswith(word, index):
+                    index += len(word)
+                    expect = "close"
+                    continue
+                if word.startswith(text[index:]):
+                    return tuple(openings) if stack else None   # interrupted inside the word
+                return None
+
+            if expect in ("first-key", "key"):
+                if character == "}" and expect == "first-key":
+                    stack.pop()
+                    index += 1
+                    expect = "close"
+                    continue
+                if character != '"':
+                    return None
+                end = ReviewStore._json_string_end(text, index)
+                if end is None:
+                    return tuple(openings) if stack else None
+                index = end
+                expect = "colon"
+                continue
+
+            if expect == "colon":
+                if character != ":":
+                    return None
+                index += 1
+                expect = "value"
+                continue
+
+            if expect == "object-tail":
+                if character == "}":
+                    stack.pop()
+                    index += 1
+                    expect = "close"
+                    continue
+                if character == ",":
+                    index += 1
+                    expect = "key"
+                    continue
+                return None
+
+            if expect == "array-tail":
+                if character == "]":
+                    stack.pop()
+                    index += 1
+                    expect = "close"
+                    continue
+                if character == ",":
+                    index += 1
+                    expect = "value"
+                    continue
+                return None
+
+            return None                          # "done": a whole value with something after it
+
+    @staticmethod
     def _is_an_unfinished_record(text: str) -> bool:
         """[R5-P19 / N7-R7] Whether ``text`` is a proper prefix of one of this writer's records.
 
@@ -2107,11 +2297,24 @@ class ReviewStore:
           bytes cannot be sitting in front of whatever follows them;
         * it does not parse whole, because a whole value is not an unfinished write and the caller
           refuses on that separately (:meth:`_tail_hides_a_complete_record`);
-        * **no whole JSON value starts anywhere inside it.** This is the requirement the earlier
-          revisions lacked. ``raw_decode`` is asked only at offset zero, so ``{x`` followed by an
-          entire committed decision fails to parse at offset zero and was called torn. A record
-          this writer emits has no interior object, so probing every interior ``{`` costs nothing
-          on a real fragment and refuses the hidden-record shape outright.
+        * **it is grammatical all the way through, and no whole JSON value starts at any position
+          where an object structurally opens inside it.** ``raw_decode`` is asked only at offset
+          zero, so ``{x`` followed by an entire committed decision fails to parse at offset zero
+          and was called torn; probing the interior refuses that outright.
+
+        [R5-P21] The interior positions come from :meth:`_structural_object_openings`, which
+        validates the prefix instead of scanning it for braces. The revision before it probed
+        every interior ``{`` -- including one the writer itself put inside a string, which is how
+        the real ``identity="clip-{}é"`` came to be read as hiding the whole object ``{}`` and a
+        genuine torn write came to be refused. Positions inside a string are not candidates; a
+        prefix that is not grammatical is not a torn record at all. Both halves of that are
+        load-bearing, and the second is the one that keeps an external prefix from presenting a
+        committed event as somebody's string content.
+
+        A record this writer emits is flat, so a real fragment yields **zero** openings and the
+        probe budget is never approached. The budget is a ceiling on *structural* candidates, and
+        exceeding it is a refusal: a fragment whose interior could not be ruled out is not ruled
+        out. Literal braces in a string value are not candidates and so never consume it.
 
         The probe is **not** a search for a record to trust -- the value found is discarded
         unexamined and nothing is ever recovered from it. Finding one is only ever a reason to
@@ -2127,16 +2330,18 @@ class ReviewStore:
             pass
         else:
             return False
+        openings = ReviewStore._structural_object_openings(text)
+        if openings is None:
+            return False                         # not a prefix of one record; nothing to discard
         probes = 0
-        start = text.find("{", 1)
-        while start >= 0:
+        for start in openings:
             probes += 1
             if probes > MAX_HIDDEN_RECORD_PROBES:
                 return False                     # could not be ruled out, so it is not ruled out
             try:
                 decoder.raw_decode(text, start)
             except ValueError:
-                start = text.find("{", start + 1)
+                continue
             else:
                 return False
         return True
@@ -2182,19 +2387,49 @@ class ReviewStore:
     def _text_is_an_interrupted_write(line: str) -> bool:
         """[R5-P19 / N7-R7] Whether a readable, unparsable ``line`` is one this writer left behind.
 
-        The split point is the first repair-marker opening, which is unambiguous: ``"`` is escaped
-        inside a JSON string, so ``'{"k":"tail-repaired","at":'`` cannot occur inside a record's
-        content and only ever marks where a repair began. Everything before it must be an
-        unfinished record; everything from it on must be repair evidence and nothing else.
+        The line splits into "the fragment the writer tore" and "the evidence the writer appended
+        to it". Everything before the split must be an unfinished record; everything from it on
+        must be repair evidence and nothing else.
 
-        A shorter interrupted marker -- one that did not reach the end of that fixed opening --
-        contains no split point, so it stays part of the fragment, which still does not parse. The
-        answer is the same either way.
+        [R5-P21] The split is now found by *trying* the places a repair could have begun, instead
+        of by searching for that one fixed opening. The old anchor was 26 characters long, and a
+        repair interrupted before it got that far leaves a stub -- ``{"k``, ``{"k"``, ``{"k":`` --
+        that the anchor cannot see, so the stub stayed glued to the fragment. That was harmless
+        while the fragment only had to "not parse", and it is not harmless now that the fragment
+        has to be *grammatical*: a record torn inside a string, which is the ordinary tear, has an
+        unterminated string at its end, and the stub's own ``"`` closes it. ``…"decision":"SELE``
+        followed by ``{"k`` then reads as the string ``SELE{`` followed by a bare ``k``, which is
+        no longer a prefix of anything. That is a real, measured shape -- every prefix of the real
+        46-byte marker over a real torn record -- so the boundary has to be found rather than
+        assumed.
+
+        Candidates are walked from the right, and the walk stops at the first suffix that is not
+        repair evidence, which costs nothing: evidence validity is monotone in this direction.
+        Extending a suffix leftwards to an earlier ``{`` keeps every piece the shorter suffix had,
+        so a piece that already disqualified it disqualifies the longer one too.
+
+        Neither half of an accepted split can conceal a committed decision. The evidence half must
+        be nothing but repair-marker prefixes, and a ``decide`` or ``scan`` event is not a prefix
+        of one. The fragment half must satisfy :meth:`_is_an_unfinished_record`, which is
+        grammatical throughout and has no whole value at any structural interior position. The
+        candidate count is bounded by :data:`MAX_HIDDEN_RECORD_PROBES` -- the same ceiling, used
+        for the same reason, since each candidate is one interior ``{`` whose interpretation has
+        to be ruled out -- and exhausting it refuses.
         """
-        cut = line.find(_TAIL_REPAIR_OPENING)
-        fragment, evidence = (line, "") if cut < 0 else (line[:cut], line[cut:])
-        return (ReviewStore._is_an_unfinished_record(fragment)
-                and ReviewStore._is_repair_evidence_so_far(evidence))
+        if ReviewStore._is_an_unfinished_record(line):
+            return True                          # the whole line is the torn record; no repair ran
+        probes = 0
+        cut = line.rfind("{")
+        while cut > 0:
+            if not ReviewStore._is_repair_evidence_so_far(line[cut:]):
+                return False                     # monotone: no earlier '{' can be evidence either
+            probes += 1
+            if probes > MAX_HIDDEN_RECORD_PROBES:
+                return False                     # could not be ruled out, so it is not ruled out
+            if ReviewStore._is_an_unfinished_record(line[:cut]):
+                return True
+            cut = line.rfind("{", 0, cut)
+        return False
 
     @staticmethod
     def _bytes_are_an_interrupted_write(raw: bytes) -> bool:

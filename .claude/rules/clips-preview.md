@@ -458,7 +458,8 @@ Three properties of that template do all the work, and each one refuses a shape 
 destroyed data:
 
 * **the readable part must be an unfinished record** — it opens with `{`, it does not parse whole,
-  and no whole JSON value starts anywhere inside it. An *empty* readable part is not an unfinished
+  it is **grammatical all the way through**, and no whole JSON value starts at any position where
+  an object *structurally* opens inside it. An *empty* readable part is not an unfinished
   record, which is the N7-R7 defect itself; `{x` followed by an entire committed decision is not
   one either, which is the same loss with a plausible-looking first byte.
 * **the undecodable part must be a well-formed partial character** (`_is_truncated_character`),
@@ -492,6 +493,9 @@ Hard constraints, all of them load-bearing:
   object" is safe here and would not be anywhere else. Its budget (`MAX_HIDDEN_RECORD_PROBES`)
   exists so one pathological line cannot make a linear scan quadratic, and **exceeding it is a
   refusal** — a fragment whose interior could not be ruled out is not ruled out.
+* **And do not treat a `{` *character* as identifying one either.** [R5-P21] The probe may only be
+  asked at positions where an object genuinely opens; see the next subsection for why, and for why
+  that is not the same as skipping braces inside strings.
 * **Do not broaden the marker amnesty.** `_damage_is_accounted_for` is still the only validator
   that decides whether a complete marker accounts for damage; `_is_repair_evidence_so_far` only
   bounds what may be *present* in the suffix. **N7-R4 is untouched**: a forged marker on a
@@ -499,15 +503,66 @@ Hard constraints, all of them load-bearing:
 * **The same rule applies to the readable path.** Decodable-but-unidentifiable bytes in front of a
   whole committed event (`xx{…}`) reached the identical loss, because
   `_tail_hides_a_complete_record` also looks only from offset zero.
-  `_text_is_an_interrupted_write` closes it, splitting the line at the first marker opening —
-  unambiguous, because `"` is escaped inside JSON strings, so that literal can only mark where a
-  repair began.
+  `_text_is_an_interrupted_write` closes it, by splitting the line into the fragment the writer
+  tore and the evidence it appended, and requiring both halves to be what the writer can leave.
 
 *Residual, recorded rather than claimed closed:* a non-finite `at` (`NaN`/`Infinity`) is not
 writer-shaped under `_TAIL_REPAIR_NUMBER`, so such a line refuses rather than being repaired.
 `time.time()` cannot produce one, the direction is fail-closed, and the separate question of
 whether the marker *grammar* should exclude them (raised by R5-P18) is an owner decision that this
 correction does not make.
+
+#### A brace the writer put inside a string is not a record boundary
+
+[R5-P21] **The positive test above was right and its interior probe was written wrongly, and an
+independent R5-P20 review measured what that cost.** The probe asked `raw_decode` at *every*
+interior `{`, including one inside a JSON string — so the real writer's own
+`identity="clip-{}é"` made the `{}` in that string look like a whole hidden object, and a
+**genuine** torn write was classified `unaccounted_damage`. Reproduced here on all three of the
+reviewer's mandatory inputs through the public API with a real short `os.write`: the interrupted
+`decide()` raised as it should, and then cold recovery *and* the next warm append both refused, so
+decisions committed before the tear became unreachable until someone edited the file by hand. The
+immediate parent recovered every one of them. A fail-closed availability loss rather than a data
+loss — but it broke the F4/N6 torn-write guarantee for the core API, which R5-P19 had explicitly
+promised to preserve.
+
+**The fix is a grammar, and `_structural_object_openings` is the whole of it.** It validates the
+fragment as a *proper prefix of one JSON object* and returns the positions at which an object
+structurally opens inside it; `None` means "not a prefix of one record", which refuses.
+
+**Skipping braces inside strings would not have been enough, and must not be substituted for
+this.** A quote-tracker can be talked into reading a committed event as somebody's text: `{"a":"`
+in front of a whole `{"k":"decide",…}` opens a string that the *event's own first quote* closes,
+and from there the tracker is scanning the event's bytes as string content. Requiring the whole
+prefix to be grammatical removes the hiding place rather than stepping around it — there is no
+unexplained prefix left for anything to sit behind, so a string's boundaries are where the grammar
+says they are instead of where a heuristic guessed. `{"a":"{"k":…` fails at the bare `k`, exactly
+as `{x{…}` fails at the `x`. Eight such shapes are pinned by test, and they need three *different*
+guards between them: the grammar refuses the opened-string ones, the structural probe refuses the
+nested-object and array ones, and `_is_repair_evidence_so_far` refuses the ones where the event
+sits where only marker prefixes may sit. Any one of the three reverted to a brace-skipper passes
+some of those rows and discards a committed decision on the others.
+
+Consequences worth stating, because each is a thing not to undo:
+
+* **The probe budget counts structural candidates only.** Literal braces in an identity are
+  content and consume none of it, so a legitimate value with 400 of them is still recoverable.
+  `MAX_HIDDEN_RECORD_PROBES` is unchanged, and exceeding it is still a refusal.
+* **Leniency is placed on purpose, and in one direction only.** Inside a token the scanner is
+  looser than JSON — `01` and `1e` pass as numbers, string contents are not validated — because
+  the caller has already established that no whole value parses at offset zero. A token this
+  scanner accepts but JSON would reject can therefore only make the prefix look *finished*, which
+  is a refusal. At every token *boundary* it is exact.
+* **The fragment/evidence split is found, not assumed.** The old 26-character
+  `_TAIL_REPAIR_OPENING` anchor cannot see a repair interrupted before it got that far, and the
+  resulting stub stayed glued to the fragment. That was harmless while the fragment only had to
+  *not parse*; it is not harmless now that it has to be grammatical, because the ordinary tear
+  lands inside a string and the stub's own `"` closes it. Candidates are walked from the right and
+  the walk stops at the first suffix that is not repair evidence — sound because evidence validity
+  is monotone in that direction — bounded by the same probe ceiling, and exhausting it refuses.
+* **Nothing here recovers anything.** No embedded event is ever applied, extracted or trusted; the
+  only outcomes remain "torn, which the caller knows how to repair" and "unaccountable", and the
+  second writes no byte. No lenient decoding, no byte substitution, no new format, no dependency.
 
 ### Start-up recovery is all-or-nothing, and an incomplete one is never compacted
 
