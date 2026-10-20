@@ -164,5 +164,11 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   the D1-era figures and the pre-D2 `int(st_mtime)` identity are recorded in
   `docs/claude/stage5-cache-history.md`. Current identity behaviour is
   `.claude/rules/stage5-cache-identity.md`.
-- **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in
-  `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...`; the runtime cache is read-only for study work.
+- **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in an
+  **exclusively claimed HOT task workspace** —
+  `<HOT>\Projects\BeatSync-Engine-DigitalUnion\Tasks\<TASK_ID>`, where `<HOT>` is this machine's
+  declared `PROJECT_HOT_WORKSPACE_ROOT`, claimed per `.claude/rules/operating-policies.md`
+  (`PCBUS-PF-v2`); if the root is not declared or is unavailable, **stop and ask** rather than
+  choosing a path. Copy any fixture the test needs into that workspace. The real
+  `input/video_analysis_cache/` is **read-only for study work**, is never the mutation target, and is
+  never cleaned as housekeeping.

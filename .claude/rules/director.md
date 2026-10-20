@@ -582,5 +582,8 @@ Measured against the real 4B asset through the **production** `system_prompt()`,
 smoke set (the A1 energy-down sentence → `section_reactivity: steadier/80`; the kinetic sentence →
 `motion_preference: dynamic/100`; the cinematic broad instruction → a coherent three-axis intent),
 3.54–4.00 s per proposal, with the concentrated-library adjustment firing correctly (Source Diversity
-88 → 63). The real-model run belongs in `C:\tmp\BeatSync-Engine-DigitalUnion\tasks\...` against
-read-only assets.
+88 → 63). The real-model run belongs in an **exclusively claimed HOT task workspace** —
+`<HOT>\Projects\BeatSync-Engine-DigitalUnion\Tasks\<TASK_ID>`, where `<HOT>` is this machine's
+declared `PROJECT_HOT_WORKSPACE_ROOT` — against read-only assets. Claim it per
+`.claude/rules/operating-policies.md` (`PCBUS-PF-v2`); if the root is not declared or is
+unavailable, **stop and ask** rather than choosing a path.
