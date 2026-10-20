@@ -159,9 +159,10 @@ These apply in almost every session. Each has a scoped rule with the full contra
 ## Hard safety floor
 
 The full, operative policies are `.claude/rules/operating-policies.md` (unscoped, always active:
-`DU-REPO-WORKFLOW-v1`, `PCBUS-HK-v1`, `PCBUS-WATCHDOG-v1`). Read it before any repository mutation or
-any wait on an external result. The non-negotiables, restated here deliberately because getting one
-wrong is expensive:
+`DU-REPO-WORKFLOW-v1`, `PCBUS-HK-v1`, `PCBUS-WATCHDOG-v1`, `PCBUS-PF-v2`). Read it before any
+repository mutation, any wait on an external result, **and any task that creates files outside this
+repository** — that file carries the operative storage, ownership, retention and quarantine rules.
+The non-negotiables, restated here deliberately because getting one wrong is expensive:
 
 - **Never force-push and never rewrite published history** unless the task explicitly authorizes it.
   Push the branch the task was done on; never push implementation work directly to `main`; never merge
@@ -172,9 +173,18 @@ wrong is expensive:
   the blocker. An explicit READ ONLY / NO COMMIT / NO PUSH instruction overrides this default.
 - **Never `git add .`** — stage explicit authorized paths, and preserve pre-existing uncommitted work
   outside task scope.
-- **Temporary work goes outside the repository**, in `C:\tmp\BeatSync-Engine-DigitalUnion\` (per-task
-  scratch under `tasks\<TASK_NAME>\`, uncertain material under `quarantine\<YYYY-MM-DD>\`). Plan the
-  location before creating the file. Temp storage is a workspace, never an archive.
+- **Temporary work goes outside the repository** — `Storage Policy: PCBUS-PF-v2`. New task work goes
+  in an **exclusively claimed** workspace under this machine's declared `PROJECT_HOT_WORKSPACE_ROOT`
+  (`<HOT>`); retained evidence, reviews, playtests, backups and exports go under its declared
+  `PROJECT_FILES_ROOT` (`<DURABLE>`). Root values come from the machine's own verified configuration
+  and are **not** hardcoded here. **The `C:\tmp\…` convention is retired for new work**; workspaces
+  and evidence already there stay put and are never migrated, rewritten or cleaned as housekeeping.
+  **If this machine's two roots are not declared, or a declared root is unavailable, stop and ask** —
+  never guess a drive letter, never fall back to `C:\tmp` or `%TEMP%`, never create a compatibility
+  junction. Plan the location before creating the file; temp storage is a workspace, never an archive.
+  The operative rules — ownership, nesting, capacity, retention classes, copy-verify-release ordering
+  and quarantine — are in `.claude/rules/operating-policies.md`. Stronger BeatSync-specific retention
+  rules override them, and none of this grants new Git, cleanup, migration or deployment authority.
 - **`input/video_analysis_cache/` and `output/` are preserved by policy**, `.gitignore`
   notwithstanding — the cache is deliberately retained (including the retained Qwen request/response
   JSON) and `output/` holds the user's rendered videos. Never clear either as housekeeping, and never
