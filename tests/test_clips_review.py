@@ -3592,7 +3592,12 @@ def test_n7r2_an_unfinished_record_may_not_be_followed_by_anything(tmp_path, mon
     real = open
 
     class _Handle:
-        """Yields an unterminated record and then keeps going."""
+        """Yields an unterminated record and then keeps going.
+
+        Bytes, because the replay opens the journal in binary and decodes line by line
+        (R5-P17 / N7-R6) -- a text-mode fake would no longer model the handle it replaces, and
+        the guard under test would be reached through a `TypeError` instead of its own logic.
+        """
 
         def __enter__(self):
             return self
@@ -3601,9 +3606,9 @@ def test_n7r2_an_unfinished_record_may_not_be_followed_by_anything(tmp_path, mon
             return False
 
         def __iter__(self):
-            yield '{"k":"decide","identity":"torn"'          # no newline: an unfinished record
-            yield ('{"k":"decide","identity":"after","decision":"SELECTED","revision":1,'
-                   '"scan_id":"scan-1","at":0.0}\n')
+            yield b'{"k":"decide","identity":"torn"'         # no newline: an unfinished record
+            yield (b'{"k":"decide","identity":"after","decision":"SELECTED","revision":1,'
+                   b'"scan_id":"scan-1","at":0.0}\n')
 
     def opener(file, *args, **kwargs):
         mode = args[0] if args else kwargs.get("mode", "r")
@@ -4131,3 +4136,402 @@ def test_n7r3_a_short_read_of_the_tail_writes_nothing(tmp_path, monkeypatch):
     assert not _mentions(str(failure.value), live.journal_path)
     assert _state_bytes(live) == before
     _assert_fully_recovered(directory, expected)
+
+
+# ---- R5-P17 / N7-R6: a write torn INSIDE a character ----------------------------------------
+#
+# The gap an independent review measured on the parent and on R5-P15 alike. `_write_all` stops
+# wherever the OS stopped it, which is a *byte* boundary and not a character boundary, so the real
+# writer can leave a journal line that is not UTF-8 text at all. Two halves were broken:
+#
+# * the append classifier called every undecodable tail torn damage, including a whole committed
+#   record with an invalid byte stuck on the end -- so a further decision was reported successful
+#   against history the reader had already refused;
+# * the reader decoded the whole file strictly in text mode, so one undecodable byte anywhere
+#   aborted the entire replay -- including a fragment the writer had just marked as repaired, and
+#   including the decisions committed before the tear.
+#
+# Together those are a writer that promises what the reader will not honour. The tests below drive
+# the REAL writer through REAL short writes inside two-, three- and four-byte characters, at every
+# proper prefix of each, and follow each one through restart, repair, restart, compaction, restart
+# and a further append.
+
+_VALID_DECIDE = (b'{"k":"decide","identity":"a","decision":"SELECTED","revision":1,'
+                 b'"scan_id":"s","at":1.0}')
+
+
+def _is_text(raw: bytes) -> bool:
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+class _TornInside:
+    """Patch `os.write` so the first payload containing `needle` is cut `keep` bytes into it.
+
+    A genuine *positive* short write followed by a genuine `OSError`, exactly as the F4 tests do
+    it -- so the record really travels through `_write_all` and the caller really is told the
+    decision failed. Injecting at `os.write` rather than at `_write_all` is what makes the
+    all-the-bytes-or-raise contract part of what is being measured rather than part of the mock.
+    """
+
+    def __init__(self, needle: bytes, keep: int):
+        self.needle, self.keep, self.cut = needle, keep, None
+        self._real = os.write
+
+    def __enter__(self):
+        def short_then_fail(fd, payload):
+            if self.cut is None and self.needle in payload:
+                self.cut = payload.index(self.needle) + self.keep
+                self._real(fd, payload[:self.cut])
+                raise OSError(28, "synthetic no space left")
+            return self._real(fd, payload)
+
+        os.write = short_then_fail
+        return self
+
+    def __exit__(self, *exc_info):
+        os.write = self._real
+        return False
+
+
+@pytest.mark.parametrize("char,keep,width", [
+    ("é", 1, 2),                      # e-acute: the shape the independent review reported
+    ("€", 1, 3), ("€", 2, 3),    # euro sign
+    ("\U0001f600", 1, 4), ("\U0001f600", 2, 4), ("\U0001f600", 3, 4),
+    ("A", 0, 1),                           # the ASCII control: the F4 torn tail, unchanged
+])
+def test_n7r6_a_write_torn_inside_a_character_keeps_every_decision_recoverable(
+        tmp_path, char, keep, width):
+    """**The blocking gate.** The full lifecycle, for every proper prefix of every width.
+
+    On the frozen candidate every multi-byte row fails at the very first restart: the store refuses
+    to open at all, so not only is the later reported-successful decision unrecoverable, the three
+    decisions committed *before* the tear are unreachable too. The ASCII row passed there and must
+    keep passing here -- that is what makes this a preservation fix rather than a behaviour change.
+    """
+    assert len(char.encode("utf-8")) == width, "the table describes the encoding, so pin it"
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    identity = f"clip-{char}-torn"
+
+    with _TornInside(char.encode("utf-8"), keep) as tear:
+        with pytest.raises(cr.PersistenceError):
+            store.decide("owner-a", identity, cr.SELECTED, "scan-1")
+    assert tear.cut is not None, "the tear has to have fired inside the real payload"
+    assert store.get(identity) == (cr.PENDING, 0), "an interrupted write is never a success"
+
+    fragment = _journal_lines(store)[-1]
+    assert not fragment.endswith(b"\n"), "an unterminated fragment, in every row"
+    assert _is_text(fragment) == (width == 1), (
+        "every multi-byte row really is undecodable, and the ASCII control really is text")
+
+    # 1. Restart BEFORE any repair. This is where the candidate refused outright.
+    first = _assert_fully_recovered(directory, expected)
+    assert first.get(identity) == (cr.PENDING, 0)
+    assert first.corrupt_records_discarded == 1, "exactly the one unfinished record"
+
+    # 2. A further decision through the public API, which performs the real repair.
+    first.begin_scan("owner-a", "scan-2")
+    assert first.decide("owner-a", "later", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    assert first.journal_tails_repaired == 1, "a fragment is repaired, never completed"
+    assert first.journal_tails_completed == 0
+
+    # 3. Restart again: the reported success must survive, and so must the earlier decisions.
+    second = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert second.get("later") == (cr.SELECTED, 1), "a reported success must survive a restart"
+    assert second.get(identity) == (cr.PENDING, 0)
+    assert second.corrupt_records_discarded == 1
+
+    lines = _journal_lines(second)
+    damaged_at = next(index for index, line in enumerate(lines)
+                      if cr._TAIL_REPAIR_PREFIX_BYTES in line)   # noqa: SLF001 - white box
+    assert damaged_at != len(lines) - 1, "the damage is no longer the final line"
+    assert lines[damaged_at].endswith(b"\n"), "the repair terminated it"
+    assert cr.ReviewStore._bytes_damage_is_accounted_for(        # noqa: SLF001 - white box
+        lines[damaged_at].strip()), "and left evidence the byte-level reader can verify"
+    assert sum(1 for line in lines
+               if cr._TAIL_REPAIR_PREFIX_BYTES in line) == 1, "one repair, once"
+
+    # 4. Real compaction, then restart, then a further append, then restart.
+    second.compact()
+    assert os.path.getsize(second.journal_path) == 0
+    third = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert third.get("later") == (cr.SELECTED, 1), "and must survive compaction too"
+    third.begin_scan("owner-a", "scan-3")
+    assert third.decide("owner-a", "after", cr.SELECTED, "scan-3") == (cr.SELECTED, 1)
+    fourth = _assert_fully_recovered(directory, expected, scan="scan-3")
+    assert fourth.get("after") == (cr.SELECTED, 1)
+    assert fourth.get("later") == (cr.SELECTED, 1), "nothing accepted may go missing"
+
+
+def test_n7r6_a_tear_inside_a_unicode_scan_id_recovers_the_same_way(tmp_path):
+    """The other field the writer permits non-ASCII in, torn in a `scan` event rather than a
+    `decide` one -- so the recovery is not specific to one event kind.
+
+    The owner is deliberately **not** included: `_require_owner` restricts it to
+    ``[A-Za-z0-9_.:-]``, so a Unicode owner never reaches the journal at all. Pinned below rather
+    than asserted in prose.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    scan = "scan-€-2"
+
+    with _TornInside("€".encode("utf-8"), 2) as tear:
+        with pytest.raises(cr.PersistenceError):
+            store.begin_scan("owner-a", scan)
+    assert tear.cut is not None
+    assert not _is_text(_journal_lines(store)[-1])
+
+    first = _assert_fully_recovered(directory, expected)          # the old scan pointer stands
+    assert first.corrupt_records_discarded == 1
+    first.begin_scan("owner-a", scan)
+    assert first.decide("owner-a", "clip-é", cr.SELECTED, scan) == (cr.SELECTED, 1)
+
+    second = _assert_fully_recovered(directory, expected, scan=scan)
+    assert second.get("clip-é") == (cr.SELECTED, 1)
+    second.compact()
+    assert _assert_fully_recovered(directory, expected, scan=scan).get(
+        "clip-é") == (cr.SELECTED, 1)
+
+
+def test_n7r6_a_unicode_owner_is_refused_before_it_can_reach_the_journal(tmp_path):
+    """The boundary of the row above, measured: a non-ASCII owner is a 403, not a journal event."""
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    with pytest.raises(cr.Refusal) as failure:
+        store.begin_scan("owner-é", "scan-1")
+    assert failure.value.reason == "malformed_session_identity"
+    assert _state_bytes(store)["journal"] in (None, b""), "and nothing was written"
+
+
+@pytest.mark.parametrize("suffix", [b"\xff", b"\xc3", b"\x80", b"\xff\xfe"])
+def test_n7r6_a_complete_record_with_an_invalid_byte_after_it_refuses_both_ways(tmp_path, suffix):
+    """The second confirmed route: a WHOLE committed event with unidentifiable bytes appended.
+
+    The fresh-load path already refused this. The gap was the store that is **already open**: its
+    classifier read the undecodable line as torn damage, stamped the committed record with a repair
+    marker and reported the next decision successful -- against a journal no restart could replay.
+    Both entry points must refuse, and neither may write a byte.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    live = cr.ReviewStore(directory)              # initialized while the record was still whole
+    original = _journal_lines(store)
+    assert original[-1].endswith(b"\n")
+    _rewrite_journal(store, original[:-1] + [original[-1].rstrip(b"\n") + suffix])
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, "a fresh construction refuses"
+    assert after == damaged
+    with pytest.raises(cr.PersistenceError) as load_failure:
+        cr.ReviewStore(directory)
+    assert "unidentifiable partial write" in str(load_failure.value)
+    assert not _mentions(str(load_failure.value), store.journal_path)
+    assert "review-journal" not in str(load_failure.value)
+
+    with pytest.raises(cr.PersistenceError) as append_failure:
+        live.decide("owner-a", "clip-new", cr.SELECTED, "scan-1")
+    assert "unidentifiable partial write" in str(append_failure.value)
+    assert not _mentions(str(append_failure.value), store.journal_path)
+    assert _state_bytes(store) == damaged, "a refused append writes nothing"
+    assert live.get("clip-new") == (cr.PENDING, 0), "and advances no revision"
+    assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0
+
+    _rewrite_journal(store, original)             # removing the foreign bytes recovers everything
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.corrupt_records_discarded == 0
+
+
+@pytest.mark.parametrize("raw,expected_kind", [
+    (b'{"k":"decide","identity":"clip-\xc3', "torn_fragment"),
+    (b'{"k":"decide","identity":"clip-\xe2\x82', "torn_fragment"),
+    (b'{"k":"decide","identity":"clip-\xf0\x9f\x98', "torn_fragment"),
+    (b'{"k":"decide","identity":"\xff\xfe', "torn_fragment"),
+    (b"\xff\xfe", "torn_fragment"),
+    (_VALID_DECIDE + b"\xff", "trailing_bytes"),
+    (_VALID_DECIDE + b"\xc3", "trailing_bytes"),
+    (b'{"k":"tail-repaired","at":1.0}\xff', "trailing_bytes"),
+    (b'   \xff', "torn_fragment"),
+])
+def test_n7r6_the_classifier_tells_a_torn_character_from_a_hidden_record(
+        tmp_path, raw, expected_kind):
+    """The byte-level half of the four-shape table. R5-P15 answered `torn_fragment` to all of it.
+
+    The `trailing_bytes` rows are the ones that matter: a complete record is hiding behind bytes
+    nothing can identify, so it may be a committed decision and nothing may be written over it.
+    """
+    store = cr.ReviewStore(str(tmp_path / "state"))
+    before = dict(store._records)                                  # noqa: SLF001 - white box
+    assert store._classify_unterminated_tail(raw) == expected_kind  # noqa: SLF001 - white box
+    assert store._records == before, (                             # noqa: SLF001 - white box
+        "validating a tail must not mutate the live record")
+
+
+@pytest.mark.parametrize("evidence,recoverable", [
+    (b"", False),                                            # no evidence at all
+    (b'{"k":"tail-rep', False),                              # an interrupted marker is not one
+    (b'{"k":"tail-repaired","at":1.0} { damaged }', False),   # nor a marker with content after it
+    (b'{"k":"tail-repaired"}', False),                       # nor one missing its required field
+    (b'{"k":"tail-repaired","at":1.0}', True),               # this, and only this
+])
+def test_n7r6_a_terminated_undecodable_record_needs_valid_evidence(
+        tmp_path, evidence, recoverable):
+    """N7-R2's rule, now enforced on a line that is not text: terminated damage mid-file is
+    tolerated only where this process's own repair accounts for it, and refused otherwise.
+
+    The positive row is what keeps the repaired fragment readable once a later decision has been
+    written behind it; the negative rows are what stops a changed *reader* laundering external
+    corruption into tolerated damage.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, b'{"k":"decide","identity":"clip-\xe2\x82' + evidence + b"\n")
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    if recoverable:
+        recovered = _assert_fully_recovered(directory, expected)
+        assert recovered.corrupt_records_discarded == 1
+        assert _state_bytes(store) == damaged, "tolerating it changes nothing on disk"
+        return
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None and after == damaged
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    message = str(failure.value)
+    assert not _mentions(message, store.journal_path)
+    assert "review-journal" not in message and ".jsonl" not in message
+    if not evidence:
+        assert "UTF-8" in message and "byte offset" in message, (
+            "the N7-R2 diagnosability contract, kept on the byte path")
+
+
+def test_n7r6_a_partly_written_marker_on_a_torn_character_is_repaired_again(tmp_path):
+    """The crash-order guarantee, for the undecodable fragment. Marker-first, still.
+
+    Any proper prefix of the marker leaves the fragment unterminated, hence still the trailing
+    damage, so the next append repairs it again -- and no accepted decision is lost on the way.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    partial = cr._TAIL_REPAIR_PREFIX_BYTES[:12]                    # noqa: SLF001 - white box
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"clip-\xe2\x82' + partial)
+
+    live = _assert_fully_recovered(directory, expected)
+    assert live.corrupt_records_discarded == 1, "still the trailing damage, not history"
+    live.begin_scan("owner-a", "scan-2")
+    assert live.decide("owner-a", "later", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    assert live.journal_tails_repaired == 1
+
+    again = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert again.get("later") == (cr.SELECTED, 1)
+    assert again.corrupt_records_discarded == 1
+    again.compact()
+    assert _assert_fully_recovered(directory, expected, scan="scan-2").get(
+        "later") == (cr.SELECTED, 1)
+
+
+def test_n7r6_the_byte_and_text_marker_validators_are_one_validator(tmp_path):
+    """Writer/reader agreement, measured on a REAL repair of a REAL torn character.
+
+    The marker bytes are read back off disk rather than written by hand, and both entry points are
+    asked about the same line. One byte short of its closing brace is not evidence either way,
+    which is what stops the amnesty widening into "contains something marker-shaped".
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with _TornInside("\U0001f600".encode("utf-8"), 2):
+        with pytest.raises(cr.PersistenceError):
+            store.decide("owner-a", "clip-\U0001f600", cr.SELECTED, "scan-1")
+
+    live = _assert_fully_recovered(directory, expected)
+    live.begin_scan("owner-a", "scan-2")
+    live.decide("owner-a", "later", cr.SELECTED, "scan-2")
+
+    damaged = next(line.strip() for line in _journal_lines(live)
+                   if cr._TAIL_REPAIR_PREFIX_BYTES in line)        # noqa: SLF001 - white box
+    assert not _is_text(damaged), "the fragment it accounts for is genuinely not text"
+    assert cr.ReviewStore._bytes_damage_is_accounted_for(damaged)   # noqa: SLF001 - white box
+    marker = damaged[damaged.rfind(cr._TAIL_REPAIR_PREFIX_BYTES):]  # noqa: SLF001 - white box
+    assert cr.ReviewStore._damage_is_accounted_for(                 # noqa: SLF001 - white box
+        marker.decode("utf-8")), "the text validator agrees about the same bytes"
+    assert not cr.ReviewStore._bytes_damage_is_accounted_for(       # noqa: SLF001 - white box
+        damaged[:-1]), "one byte short of the closing brace is not evidence"
+
+
+@pytest.mark.parametrize("raw,text", [
+    (b"", ""),
+    (b"abc", "abc"),
+    (b"abc\xc3", "abc"),
+    (b"abc\xc3\xa9", "abcé"),
+    (b"abc\xc3{", "abc"),
+    (b"\xff\xfeabc", ""),
+    (b"a\xe2\x82\xacb\xf0\x9f", "a€b"),
+])
+def test_n7r6_the_text_prefix_is_strict_and_never_substitutes_a_byte(raw, text):
+    """What `_longest_text_prefix` is allowed to be: a byte-exact prefix, decoded strictly.
+
+    It exists to answer one question whose only positive answer is a refusal, so reading less than
+    is there can cost a reason to refuse and can never manufacture a reason to accept. What it must
+    never do is invent a character -- a substitution would turn an unreadable record into a
+    readable-looking one, which is the whole failure mode this commit removes.
+    """
+    found = cr.ReviewStore._longest_text_prefix(raw)               # noqa: SLF001 - white box
+    assert found == text
+    assert raw.startswith(found.encode("utf-8")), "byte-exact prefix, not a repair of the input"
+    assert "�" not in found, "no replacement character was manufactured"
+
+
+def test_n7r6_no_decode_on_the_persistence_path_may_substitute_or_drop_a_byte():
+    """The structural guard, read off the syntax tree rather than out of the text.
+
+    A substring scan would match this module's own prose about the rule, which is exactly how such
+    a guard gets "fixed" by deleting the rule. So the call sites are inspected instead: no call in
+    the module may pass a decoding error handler, positionally or by keyword.
+    """
+    source = open(os.path.join(_SRC, "beatsync_fork", "clips_review.py"),
+                  encoding="utf-8").read()
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        if any(keyword.arg == "errors" for keyword in node.keywords):
+            offenders.append(("error handler by keyword", node.lineno))
+        func = node.func
+        if (isinstance(func, ast.Attribute) and func.attr in {"decode", "encode"}
+                and len(node.args) > 1):
+            offenders.append((f"positional handler on .{func.attr}()", node.lineno))
+    assert offenders == [], (
+        "a decode on this path must be strict: a dropped, replaced or surrogate-escaped byte "
+        f"would make an unaccountable record look accountable. Found {offenders}")
+
+
+def test_n7r6_an_oversized_undecodable_tail_is_refused_rather_than_repaired(tmp_path):
+    """The inspection bound governs the *writer*, not the reader, and neither is widened here.
+
+    The replay tolerates the oversize torn tail -- it is the final line and nothing follows it --
+    while the append refuses, because a line it cannot classify within the bound is not a line it
+    may write after. Both halves asserted, so "fix the Unicode case by raising the ceiling" is not
+    silently available.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"'
+                     + b"c" * cr.MAX_TAIL_INSPECT_BYTES + b"\xe2\x82")
+
+    live = _assert_fully_recovered(directory, expected)
+    assert live.corrupt_records_discarded == 1, "unreadable, unterminated, and last: torn"
+    before = _state_bytes(live)
+    with pytest.raises(cr.PersistenceError) as failure:
+        live.begin_scan("owner-a", "scan-2")
+    assert "too large to identify" in str(failure.value)
+    assert not _mentions(str(failure.value), live.journal_path)
+    assert _state_bytes(live) == before, "a refused append writes nothing"
+    assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0

@@ -1353,6 +1353,14 @@ _JOURNAL_TAIL_REPAIRED = "tail-repaired"
 #: insertion order, so that spelling is stable.
 _TAIL_REPAIR_PREFIX = '{"k":"' + _JOURNAL_TAIL_REPAIRED + '"'
 
+#: [R5-P17 / N7-R6] The same needle as bytes, for the one reader that cannot work in text: a line
+#: the writer tore apart **inside a multi-byte character** is not decodable at all, and the marker
+#: that accounts for it sits after the broken sequence. The marker is pure ASCII -- it is
+#: ``json.dumps`` output with ``ensure_ascii=False`` over an ASCII key and a float -- so searching
+#: for it bytewise finds exactly what searching for it in text would have found, had the line been
+#: text. See :meth:`ReviewStore._bytes_damage_is_accounted_for`.
+_TAIL_REPAIR_PREFIX_BYTES = _TAIL_REPAIR_PREFIX.encode("utf-8")
+
 _JOURNAL_KINDS = (_JOURNAL_SCAN, _JOURNAL_DECIDE, _JOURNAL_TAIL_REPAIRED)
 
 #: [R5-P15 / N7-R3] How an unterminated final journal line is classified before anything is
@@ -1677,9 +1685,38 @@ class ReviewStore:
         A line that parses as JSON is never torn: truncating one of this writer's records always
         leaves unbalanced JSON, so a *parsable* event with a schema this build cannot account for
         is corruption or foreign content wherever it sits, and :meth:`_apply` refuses it outright.
+
+        [R5-P17 / N7-R6] **The journal is read as bytes and decoded one line at a time, because a
+        torn write does not respect character boundaries and the old text layer could not survive
+        one.** R5-P13 opened this file in text mode with strict UTF-8 and iterated it, so a single
+        undecodable byte anywhere aborted the *whole* replay -- and the writer itself produces
+        exactly that shape. An independent review interrupted a real ``decide()`` one byte into
+        the UTF-8 encoding of ``é`` in an identity: the first decision was correctly refused, the
+        classifier called the fragment torn damage, the next decision was **reported successful**,
+        the repair marker was appended -- and then every restart refused the store, including the
+        earlier decisions that had been committed before the tear. Writer and reader disagreed
+        about what was recoverable, which is the one disagreement a durability contract cannot
+        have: the append path published a success the read path could not honour. Measured again
+        here for two-, three- and four-byte characters, at every proper prefix of each.
+
+        So the loop below reads binary lines and decodes each one on its own. A line that decodes
+        takes exactly the path it always took. A line that does **not** decode is still classified
+        rather than fatal, by the same three questions in the same order, asked bytewise:
+        :meth:`_bytes_hide_a_complete_record` (a whole record behind unidentifiable bytes refuses),
+        then :meth:`_bytes_damage_is_accounted_for` (the writer's own repair evidence is honoured
+        even though the fragment it accounts for is not text), then terminated-or-not. Only an
+        undecodable, unterminated, unaccounted-for final line is the torn tail. Nothing is decoded
+        leniently: there is no ``errors=`` handler anywhere on this path, and the one place a
+        partial decode is consulted answers a question whose positive answer is a **refusal**.
+
+        Two deliberate consequences of leaving text mode: byte offsets in the message below are
+        now counted from the start of the file rather than from whichever decode buffer the text
+        layer happened to be filling, and a lone ``\\r`` no longer separates records. This writer
+        emits ``\\n`` through an ``O_BINARY`` descriptor and never emitted either shape, and
+        content that relied on them is refused here either way.
         """
         try:
-            handle = open(self.journal_path, "r", encoding="utf-8")
+            handle = open(self.journal_path, "rb")
         except OSError as exc:
             if self._absence_is_proven(self.journal_path, exc):
                 return 0, 0
@@ -1687,12 +1724,20 @@ class ReviewStore:
                 f"could not read the review journal ({_io_detail(exc)})") from exc
         applied = damaged = 0
         torn_tail = False
+        consumed = 0
         try:
             with handle:
-                for raw in handle:
-                    line = raw.strip()
-                    if not line:
-                        continue
+                for chunk in handle:
+                    offset, consumed = consumed, consumed + len(chunk)
+                    undecodable: UnicodeDecodeError | None = None
+                    try:
+                        raw = chunk.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        undecodable = exc
+                    else:
+                        line = raw.strip()
+                        if not line:
+                            continue
                     if torn_tail:
                         # Unreachable against a real file -- an unterminated line ends the
                         # iteration -- and asserted anyway, because the alternative to this raise
@@ -1701,6 +1746,31 @@ class ReviewStore:
                             "the review journal continues past an unfinished record, so what "
                             "that record held cannot be established; nothing has been changed "
                             "and both copies are exactly as they were")
+                    if undecodable is not None:
+                        fragment = chunk.strip()
+                        if self._bytes_hide_a_complete_record(fragment):
+                            # [R5-P17 / N7-R6] The same precedence the text path uses, and for the
+                            # same reason: a whole record sitting in front of bytes nothing can
+                            # identify may be a committed decision, so the marker amnesty below
+                            # must not get the chance to discard it.
+                            raise PersistenceError(
+                                f"review journal record {applied + damaged + 1} is a complete "
+                                "record followed by an unidentifiable partial write, so whether "
+                                "it was committed cannot be established; nothing has been "
+                                "changed and both copies are exactly as they were"
+                            ) from undecodable
+                        if self._bytes_damage_is_accounted_for(fragment):
+                            damaged += 1
+                            continue
+                        if chunk.endswith(b"\n"):
+                            raise PersistenceError(
+                                "the review journal is not valid UTF-8 text at a record that was "
+                                "written in full, so it is damage this process did not cause and "
+                                "what it held cannot be established (byte offset "
+                                f"{offset + undecodable.start}); nothing has been changed and "
+                                "both copies are exactly as they were") from undecodable
+                        torn_tail = True
+                        continue
                     try:
                         event = json.loads(line)
                     except ValueError as unreadable:
@@ -1737,6 +1807,12 @@ class ReviewStore:
             raise PersistenceError(
                 f"could not replay the review journal ({_io_detail(exc)})") from exc
         except UnicodeDecodeError as exc:
+            # [R5-P17 / N7-R6] No longer reachable: the loop decodes each line itself and
+            # classifies the failure in place, which is the whole fix. Kept because the
+            # alternative to a typed refusal here is a bare `UnicodeDecodeError` crossing the
+            # store boundary -- the exact R5-P12 defect this handler was added for -- and because
+            # it fails closed, so being wrong about its reachability costs availability, never a
+            # decision.
             raise PersistenceError(
                 "the review journal is not valid UTF-8 text, so it could not be replayed "
                 f"(byte offset {exc.start}); nothing has been changed and both copies are "
@@ -1799,6 +1875,10 @@ class ReviewStore:
         than described as proof of origin. :meth:`_replay_journal` consults
         :meth:`_tail_hides_a_complete_record` first, so the amnesty can no longer discard a whole
         record that is sitting in front of a marker.
+
+        [R5-P17 / N7-R6] :meth:`_bytes_damage_is_accounted_for` is the entry point for a fragment
+        that is not text at all; it delegates here, so there is exactly one marker validator and
+        the two readers cannot drift apart.
         """
         cut = line.rfind(_TAIL_REPAIR_PREFIX)
         if cut < 0:
@@ -1814,6 +1894,78 @@ class ReviewStore:
         except _EventSchemaError:
             return False
         return True
+
+    @staticmethod
+    def _longest_text_prefix(raw: bytes) -> str:
+        """[R5-P17 / N7-R6] The longest prefix of ``raw`` that is whole, valid UTF-8 text.
+
+        ``UnicodeDecodeError.start`` is the index of the **first** byte the strict decoder could
+        not account for, so everything before it is by definition complete characters and decoding
+        that slice succeeds. The loop therefore runs at most twice and never scans backwards byte
+        by byte.
+
+        This is **not** lenient decoding, and the distinction is the whole safety argument. There
+        is no ``errors=`` handler: no byte is dropped, replaced or smuggled through as a
+        surrogate, and nothing decoded here is ever applied as a record. It exists to answer one
+        question -- :meth:`_bytes_hide_a_complete_record` -- whose only positive answer is a
+        **refusal**. Reading less of the line than is there can therefore only ever cause this
+        code to miss a reason to refuse, never to manufacture a reason to accept.
+        """
+        cut = len(raw)
+        while cut > 0:
+            try:
+                return raw[:cut].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                cut = exc.start
+        return ""
+
+    @staticmethod
+    def _bytes_hide_a_complete_record(raw: bytes) -> bool:
+        """[R5-P17 / N7-R6] :meth:`_tail_hides_a_complete_record`, for a line that is not text.
+
+        An undecodable line by construction has bytes after its decodable prefix, so there is no
+        "and is there anything following it?" test to make: if a whole JSON value fits inside the
+        text prefix, something unidentifiable follows it. That is the shape an independent review
+        measured an already-initialized store accepting -- a complete, committed decision event
+        with an invalid byte appended, marker-stamped as though the record itself were the damage,
+        and a further decision then reported successful against it. It refuses here instead.
+
+        A genuine interrupted write cannot reach this answer. The multi-byte character the tear
+        landed inside is *inside* the record -- inside a JSON string, inside an unclosed object --
+        so the text before it is always unbalanced and ``raw_decode`` always fails. Pinned by the
+        real-writer matrix rather than argued from the shape.
+        """
+        text = ReviewStore._longest_text_prefix(raw).strip()
+        if not text:
+            return False
+        try:
+            json.JSONDecoder().raw_decode(text)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _bytes_damage_is_accounted_for(raw: bytes) -> bool:
+        """[R5-P17 / N7-R6] :meth:`_damage_is_accounted_for`, for a line that is not text.
+
+        The fragment in front of the marker is undecodable -- that is the entire reason this
+        exists -- but the marker itself is ASCII, so the needle is found bytewise and only the
+        suffix from the **last** occurrence is decoded. Validation is then the text validator,
+        unchanged and unduplicated: the marker must decode strictly, parse as a lone JSON object,
+        carry this build's kind and carry a numeric ``at``, all the way to the end of the line.
+
+        Anything less is not evidence. A marker whose own write was interrupted leaves fewer bytes
+        than the needle, or a needle with nothing parsable after it; either way this answers
+        ``False``, the fragment is still unterminated, and the next append repairs it again.
+        """
+        cut = raw.rfind(_TAIL_REPAIR_PREFIX_BYTES)
+        if cut < 0:
+            return False
+        try:
+            suffix = raw[cut:].decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return ReviewStore._damage_is_accounted_for(suffix)
 
     def _load(self) -> None:
         """Rebuild memory from the snapshot and the journal: **completely, or not at all**.
@@ -2122,12 +2274,26 @@ class ReviewStore:
           to choose safely is not on disk, so this refuses and keeps every byte. **The fixed writer
           cannot produce this shape** -- it writes a lone newline after a valid record, and a
           one-byte write is all-or-nothing -- so no store this build wrote can reach it.
+
+        [R5-P17 / N7-R6] **A line that is not text is still one of those four shapes, and this
+        used to call every one of them torn.** R5-P15 read ``UnicodeDecodeError`` as proof of an
+        unfinished write, which is true of an interruption inside a multi-byte character and false
+        of a complete committed record with an invalid byte stuck on the end. An independent
+        review appended ``0xff`` to a whole decision event and watched this answer
+        ``torn_fragment``, the repair stamp the committed record as accounted-for damage, and the
+        next decision come back successful -- against history the reader had already refused. So
+        the undecodable branch below asks the same complete-prefix question the text branch asks,
+        bytewise, and only a fragment with no whole record hiding in it is torn.
         """
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            # A torn write can stop mid multi-byte sequence. Not text, so not a whole record:
-            # genuine damage, repaired like any other.
+            if self._bytes_hide_a_complete_record(raw.strip()):
+                return _TAIL_TRAILING_BYTES
+            # A torn write can stop mid multi-byte sequence. Not text, and nothing whole is hiding
+            # behind the broken bytes, so this is genuine damage, repaired like any other -- and
+            # :meth:`_replay_journal` can now read the repaired result, which is what makes
+            # repairing it honest rather than a success the next restart cannot honour.
             return _TAIL_TORN_FRAGMENT
         line = text.strip()
         if not line:

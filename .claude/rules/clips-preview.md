@@ -313,9 +313,9 @@ byte before the newline. So a newline-less final line that parses *whole* was wr
 | Final unterminated line | Answer |
 |---|---|
 | Parses whole **and** satisfies the replay validator | **complete the record**: write the missing newline and nothing else, preserving its exact original bytes. `journal_tails_completed` counts it; no marker is written |
-| Does not parse | the F4 torn fragment: marker-first repair, exactly as above. `journal_tails_repaired` counts it |
+| Does not parse, and no whole JSON value is hiding in front of the bytes that stopped it | the F4 torn fragment: marker-first repair, exactly as above. `journal_tails_repaired` counts it |
 | Parses whole but describes no record this build can account for | `PersistenceError`, nothing written |
-| A complete value followed by unidentifiable bytes | `PersistenceError`, nothing written |
+| A complete value followed by unidentifiable bytes — **including bytes that are not UTF-8 text** (R5-P17 / N7-R6) | `PersistenceError`, nothing written |
 | Cannot be read, or is larger than the inspection bound | `PersistenceError`, nothing written |
 
 Validation uses the **same** `_apply` the replay path runs, against **throwaway** dicts — a tail is
@@ -352,6 +352,80 @@ a decision that is not on disk. Do not swallow it, and do not reintroduce a sing
 probe raises `PersistenceError` when it cannot determine whether the tail is terminated: an
 unknown journal state is not a licence to append, nor to write a repair into a file whose
 condition could not be read.
+
+#### Bytes written and text successfully decoded are different facts
+
+[R5-P17 / N7-R6] **A torn write stops on a byte boundary, not a character boundary, so the writer
+can leave a journal line that is not UTF-8 text at all — and both halves of the store got that
+wrong in opposite directions.** An independent review interrupted a real `decide()` one byte into
+the UTF-8 encoding of `é` in an identity. `_classify_unterminated_tail` read the
+`UnicodeDecodeError` as proof of an unfinished write, the marker-first repair fired, the next
+decision was **reported successful** — and then every restart refused the store, because
+`_replay_journal` decoded the whole file strictly in text mode and one undecodable byte anywhere
+aborted the entire replay. Not only was the reported success unrecoverable; the decisions
+committed *before* the tear were unreachable too, and a `compact()` from the still-live store
+then truncated the only bytes that held the fragment. The ASCII equivalent recovered normally
+throughout, which is what made the gap invisible. The same shape was present on the parent
+commit, so it is an uncovered F4/N2 preservation gap rather than a regression.
+
+**The invariant this adds: a decision may be reported successful only if the replay mechanism
+will accept the journal it leaves behind.** Writer and reader must agree about what is
+recoverable; a classifier that grants a repair the reader will refuse is a false success however
+carefully each half is written on its own.
+
+So the journal is read **as bytes and decoded one line at a time**, and an undecodable line is
+classified rather than fatal — by the same three questions in the same order, asked bytewise:
+
+| Undecodable journal line | Answer |
+|---|---|
+| A whole JSON value sits in front of the bytes that stopped the decode | `PersistenceError`, nothing written — it may be a committed decision, and this is checked **before** the marker amnesty |
+| It ends with a complete, valid `tail-repaired` marker | discarded; this process's own repair already accounted for it |
+| It is **terminated** and carries no valid marker | `PersistenceError`, nothing written — terminated damage is external, wherever it sits |
+| It is the final line, unterminated and unaccounted for | the F4 torn fragment: tolerated on read, marker-repaired on the next append |
+
+`_bytes_hide_a_complete_record` and `_bytes_damage_is_accounted_for` are the byte-level entry
+points, and the second one **delegates to the text validator** — one marker validator, reached two
+ways, so the repair and the reader cannot drift apart. A genuine interruption inside a character
+can never reach the first row: the character is inside the record, so the text before it is always
+unbalanced JSON. That is pinned by a real-writer matrix over two-, three- and four-byte characters
+at **every proper prefix** of each, not argued from the shape.
+
+**Hard constraints on that byte path, all of them load-bearing:**
+
+* **No lenient decoding, anywhere.** No error handler is passed to any decode on this path —
+  nothing dropped, nothing replaced, no surrogate escapes. A substituted byte would turn an
+  unaccountable record into a readable-looking one, which is the failure mode being removed.
+  `_longest_text_prefix` decodes a strict *prefix* and is not an exception to this: it answers one
+  question whose only positive answer is a **refusal**, so reading less than is there can cost a
+  reason to refuse and can never manufacture a reason to accept. The guard that keeps this true is
+  structural — it reads the call sites off the syntax tree — because a substring scan would match
+  this very rule's prose, which is how such a guard gets deleted instead of satisfied.
+* **Do not widen the inspection bound to reach a Unicode tail.** `MAX_TAIL_INSPECT_BYTES` still
+  governs the *writer*: an oversize final line is refused rather than classified, while the reader
+  tolerates it as the torn tail it is. Both halves are asserted.
+* **Do not relax the marker check.** An interrupted marker leaves fewer bytes than the needle, or
+  a needle with nothing parsable after it; either is `False`, the fragment stays unterminated, and
+  the next append repairs it again. One byte short of the closing brace is not evidence.
+* **Two deliberate consequences of leaving text mode.** Byte offsets in the refusal message are
+  now counted from the start of the file rather than from whichever decode buffer the text layer
+  happened to be filling, and a lone `\r` no longer separates records. This writer emits `\n`
+  through an `O_BINARY` descriptor and never produced either shape.
+
+**The second confirmed route, closed by the same classification.** A *complete, committed* event
+with an invalid byte appended refuses on a fresh load — it always did — but an **already open**
+store marker-stamped it as damage and reported a further decision successful. That is observable
+at the HTTP boundary: pre-fix the second decision returned `200 ok:true`, now it returns 503
+`not_durably_recorded` with both durable files byte-identical. The fresh-load 503 never covered it,
+which is why the warm-store path is tested explicitly. `src/clips_media_server.py` is unchanged by
+this: raising the right class is the whole fix.
+
+Error text stays path-free, as everywhere else on this boundary. It may legitimately mention UTF-8
+and a byte offset — that is the N7-R2 diagnosability contract — but never a pathname, a filename or
+a record's contents.
+
+**This is not universal recovery from arbitrary corrupt bytes, and must not be described as one.**
+It bounds exactly which undecodable fragments are repairable, and everything else refuses without
+writing a byte.
 
 ### Start-up recovery is all-or-nothing, and an incomplete one is never compacted
 
@@ -438,12 +512,12 @@ nothing is written and removing the damaged snapshot recovers everything from th
 | A valid snapshot, with or without later journal events | replayed in full |
 | Snapshot content that cannot be accounted for — bad JSON, bad structure, an unknown decision, a non-integer revision, bad UTF-8 | `PersistenceError`, nothing written |
 | An **unterminated** final journal line that **parses whole** | replayed as the ordinary event it is — it was written whole, only its terminator is missing (R5-P15 / N7-R3) |
-| An **unterminated** final journal line that does **not** parse | that one line discarded, everything before it preserved (F4) |
+| An **unterminated** final journal line that does **not** parse — *including one that is not UTF-8 text* | that one line discarded, everything before it preserved (F4 · R5-P17 / N7-R6) |
 | An unreadable journal line that **is** terminated, anywhere in the file | `PersistenceError`, nothing written |
-| A complete value followed by unidentifiable bytes, anywhere in the file | `PersistenceError`, nothing written — checked **before** the marker amnesty below (R5-P15 / N7-R3) |
-| An unreadable line carrying its own attached `tail-repaired` marker | discarded; the repair already accounted for it |
+| A complete value followed by unidentifiable bytes, anywhere in the file — *text or not* | `PersistenceError`, nothing written — checked **before** the marker amnesty below (R5-P15 / N7-R3 · R5-P17 / N7-R6) |
+| An unreadable line carrying its own attached `tail-repaired` marker — *even when the fragment it accounts for is not text* | discarded; the repair already accounted for it (R5-P17 / N7-R6) |
 | A parsable event with a schema or kind this build cannot account for | `PersistenceError`, nothing written |
-| A journal that is not valid UTF-8 | `PersistenceError`, nothing written |
+| Bytes that are not valid UTF-8, in a line none of the rows above account for | `PersistenceError`, nothing written. **Not** a blanket rule about the file: one undecodable byte no longer condemns the whole journal, which was the N7-R6 defect (R5-P17) |
 | A temporary I/O failure (lock, ACL, device, unresolved pathname) | `PersistenceError`, nothing written |
 | A replay that cannot be shown to be complete | `PersistenceError`, nothing written |
 
@@ -477,8 +551,10 @@ ever written a `state/clips-review/` journal or snapshot.
 #### Two bounded limitations, recorded rather than claimed closed
 
 [R5-P15 / N7-R4 · N7-R5] Both were raised by an independent review, both were classified as
-non-blocking, and **neither is closed by the N7-R3 correction.** They are written down here so that
-no later change can quietly assume they were.
+non-blocking, and **neither is closed by the N7-R3 correction, nor by the N7-R6 one.** They are
+written down here so that no later change can quietly assume they were. In particular the
+byte-level marker check added for N7-R6 makes the marker *findable* in a line that is not text; it
+does not make it *authentic*, and nothing about N7-R4 changes.
 
 * **N7-R4 — `tail-repaired` is an auditable format convention, not authenticated evidence of its
   own origin.** Anything that can write to the journal can write a well-formed marker, and

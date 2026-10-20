@@ -1321,3 +1321,160 @@ def test_n7r1_an_unaccountable_snapshot_answers_503_on_both_routes(world, tmp_pa
     assert status == 200
     assert json.loads(body)["clips"][world["entries"][0].clip_id]["decision"] == "SELECTED", (
         "the record was never in danger; only this build's ability to account for it was")
+
+
+# ---- R5-P17 / N7-R6: the same boundary, for a journal that is not UTF-8 text -----------------
+#
+# `src/clips_media_server.py` is unchanged by this commit. These two tests are the end-to-end half
+# of the core fix, and the pair of them is the point: one corrupt shape must refuse, and the other
+# -- the one the writer can actually produce -- must now be *served*, with a 200 the next process
+# start can honour. An earlier build answered that second case 200 as well and then refused to
+# open the store afterwards, which is the false success this commit removes.
+
+
+def _tear_inside_a_character(store, owner, needle=b"\xe2\x82\xac", keep=2):
+    """A REAL positive short write stopping `keep` bytes into `needle`, then a real failure."""
+    real_write, state = os.write, {"cut": None}
+
+    def short_then_fail(fd, payload):
+        if state["cut"] is None and needle in payload:
+            state["cut"] = payload.index(needle) + keep
+            real_write(fd, payload[:state["cut"]])
+            raise OSError(28, "synthetic no space left")
+        return real_write(fd, payload)
+
+    os.write = short_then_fail
+    try:
+        with pytest.raises(cr.PersistenceError):
+            store.decide(owner, "clip-€-torn", cr.SELECTED, "scan-1")
+    finally:
+        os.write = real_write
+    assert state["cut"] is not None, "the tear has to have fired inside the real payload"
+
+
+def _append_an_invalid_byte(store, suffix=b"\xff"):
+    """Strip the final newline off a whole committed event and put an unidentifiable byte there."""
+    with open(store.journal_path, "rb") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    with open(store.journal_path, "wb") as handle:
+        handle.write(b"".join(lines[:-1]) + lines[-1].rstrip(b"\n") + suffix)
+
+
+def test_n7r6_a_decision_against_a_record_behind_invalid_utf8_answers_503(world, tmp_path):
+    """The end-to-end shape of the false success, through the real route.
+
+    The store is **already open and holding the record** when the damage appears -- the cache is
+    warmed by a successful decision first -- because that is precisely the gap: a fresh load always
+    refused this, so the fresh-load 503 never covered it. Pre-fix the second decision came back
+    `200 ok:true rev:1` with a repair marker written over a committed event; the restart after that
+    could not replay the journal at all.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    app, cache = _lazily_served(world, state_dir)
+
+    status, _, body = call(app, decide_url(world, 0), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":1}')
+    assert status == 200 and json.loads(body)["rev"] == 2, body
+    assert "store" in cache, "the store is open, which is the condition under test"
+
+    _append_an_invalid_byte(seeded)
+    before = _durable_bytes(seeded)
+
+    status, headers, body = call(app, decide_url(world, 1), method="POST",
+                                 headers={"Content-Type": "application/json"},
+                                 body=b'{"to":"SELECTED","rev":0}')
+
+    assert status == 503, f"never 200, and never a 409 the client would resync away: {body}"
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload, (
+        "an unaccountable record must never be reported alongside the failure")
+    assert headers["cache-control"] == "no-store"
+    assert _durable_bytes(seeded) == before, "and not one byte was written"
+    text = body.decode("utf-8")
+    for secret in (seeded.journal_path, seeded.snapshot_path,
+                   os.path.dirname(seeded.journal_path)):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+
+
+@pytest.mark.parametrize("route", ["decide", "state"])
+def test_n7r6_a_cold_store_behind_invalid_utf8_still_refuses_on_both_routes(world, tmp_path,
+                                                                            route):
+    """The preserved half: a fresh construction refused this before and must still refuse it.
+
+    The read route can only be reached cold -- a warm store answers `/r5state` from memory and
+    never touches the file -- so this is the only route on which the shape is observable at all,
+    and it is a regression pin rather than a defect test.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    _append_an_invalid_byte(seeded)
+    before = _durable_bytes(seeded)
+
+    app, cache = _lazily_served(world, state_dir)
+    if route == "decide":
+        status, headers, body = call(app, decide_url(world, 1), method="POST",
+                                     headers={"Content-Type": "application/json"},
+                                     body=b'{"to":"REJECTED","rev":0}')
+    else:
+        status, headers, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+
+    assert status == 503, body
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload
+    assert headers["cache-control"] == "no-store"
+    assert "store" not in cache, "a refusal must not be cached"
+    assert _durable_bytes(seeded) == before
+    text = body.decode("utf-8")
+    for secret in (seeded.journal_path, seeded.snapshot_path,
+                   os.path.dirname(seeded.journal_path)):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+
+
+def test_n7r6_a_decision_after_a_torn_character_is_served_and_survives_a_restart(world, tmp_path):
+    """The other half, and the one the writer can really reach: a 200 that outlives the process.
+
+    The journal's final line is genuinely not UTF-8 text -- a real interrupted write inside a
+    three-byte character -- and the store is constructed fresh by the request, so the whole
+    recovery runs through the shipped code. Pre-fix this request raised out of the store's own
+    constructor and the route answered 503; the commit before that answered 200 and then refused
+    every later start. Neither is acceptable, so both ends are asserted here.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    _tear_inside_a_character(seeded, world["owner"])
+    with open(seeded.journal_path, "rb") as handle:
+        fragment = handle.read().splitlines(keepends=True)[-1]
+    assert not fragment.endswith(b"\n")
+    with pytest.raises(UnicodeDecodeError):
+        fragment.decode("utf-8")
+
+    app, cache = _lazily_served(world, state_dir)
+    status, _, body = call(app, decide_url(world, 0), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":1}')
+    assert status == 200, body
+    payload = json.loads(body)
+    assert payload["ok"] is True and payload["decision"] == "REJECTED" and payload["rev"] == 2
+    assert "store" in cache
+
+    restarted = cr.ReviewStore(state_dir)
+    assert restarted.get(identity) == (cr.REJECTED, 2), (
+        "a 200 the next process start cannot honour is the defect this commit removes")
+    assert restarted.get("clip-€-torn") == (cr.PENDING, 0), (
+        "and the interrupted decision stays exactly as unrecorded as it was reported")
+    assert restarted.corrupt_records_discarded == 1
+    status, _, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+    assert status == 200 and json.loads(body)["clips"][
+        world["entries"][0].clip_id]["decision"] == "REJECTED"
