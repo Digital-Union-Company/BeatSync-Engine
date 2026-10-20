@@ -1186,3 +1186,138 @@ def test_n7_the_503_body_never_discloses_a_filesystem_path(world, tmp_path, monk
     assert "review-journal" not in text and ".jsonl" not in text
     assert "simulated failure" not in text, "nor the raw OSError text"
     assert "errno 13, winerror 5" in text, "the condition stays diagnosable"
+
+
+# ---- R5-P13 / N7-R1 + N7-R2: the 503 boundary, for state that is READABLE but unaccountable ---
+#
+# Case 18 above was measured with a denied read. R5-P12 found that a readable-but-unaccountable
+# record took a different route entirely: the store reported every clip as `PENDING` with
+# `ok: true`, and two of the conditions (a non-numeric revision, non-UTF-8 bytes) escaped the store
+# as a bare `ValueError`/`UnicodeDecodeError`, which the middleware's typed branch does not catch
+# at all. Nothing in the middleware changes for this -- raising the right class is the whole fix --
+# and these tests are what makes that claim checkable. No fault is injected: the bytes on disk are
+# genuinely corrupt.
+
+
+def _damage_a_committed_record(store):
+    """Damage one historical committed decision, leaving later valid records after it."""
+    with open(store.journal_path, "rb") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    assert len(lines) >= 3, lines
+    lines[1] = b"{ damaged committed record\n"
+    with open(store.journal_path, "wb") as handle:
+        handle.write(b"".join(lines))
+
+
+@pytest.mark.parametrize("damage", ["malformed_history", "bad_schema", "not_utf8"])
+def test_n7r2_a_decision_against_an_unaccountable_record_answers_503(world, tmp_path, damage):
+    """The write half, for each shape R5-P12 found outside the typed contract."""
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    app, cache = _lazily_served(world, state_dir)
+
+    status, _, body = call(app, decide_url(world, 1), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"SELECTED","rev":0}')
+    assert status == 200 and json.loads(body)["ok"] is True, body
+    cache.clear()
+
+    if damage == "malformed_history":
+        _damage_a_committed_record(seeded)
+    else:
+        extra = (b'{"k":"decide","identity":"x","decision":"SELECTED","revision":"x"}\n'
+                 if damage == "bad_schema" else b"\xff\xfe not utf-8\n")
+        with open(seeded.journal_path, "rb") as handle:
+            lines = handle.read().splitlines(keepends=True)
+        lines.insert(1, extra)
+        with open(seeded.journal_path, "wb") as handle:
+            handle.write(b"".join(lines))
+    before = _durable_bytes(seeded)
+
+    status, headers, body = call(app, decide_url(world, 2), method="POST",
+                                 headers={"Content-Type": "application/json"},
+                                 body=b'{"to":"REJECTED","rev":0}')
+
+    assert status == 503, f"{damage}: never 200, and never a 409 the client would resync away"
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert headers["cache-control"] == "no-store"
+    assert _durable_bytes(seeded) == before, "a refused decision writes nothing"
+    assert "store" not in cache, "a refusal must not be cached"
+    text = body.decode("utf-8")
+    for secret in (seeded.journal_path, os.path.dirname(seeded.journal_path)):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+
+
+def test_n7r2_the_state_route_answers_503_for_an_unaccountable_record(world, tmp_path):
+    """The read half, which is the dangerous one: `/r5state` repaints the whole page.
+
+    Pre-fix this answered 200 with every decision reported `PENDING`, so a reviewed folder would
+    have been *shown* as untouched with `ok: true` attached.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    seeded.decide(world["owner"], identity, cr.REJECTED, "scan-1")
+    app, cache = _lazily_served(world, state_dir)
+
+    url = f"/r5state/{world['session']}/{world['page']}"
+    status, _, body = call(app, url)
+    assert status == 200
+    assert json.loads(body)["clips"][world["entries"][0].clip_id]["decision"] == "REJECTED"
+    cache.clear()
+
+    _damage_a_committed_record(seeded)
+    before = _durable_bytes(seeded)
+    status, _, body = call(app, url)
+
+    assert status == 503, body
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload, (
+        "no partial record may be reported alongside the failure")
+    assert _durable_bytes(seeded) == before
+
+
+def test_n7r1_an_unaccountable_snapshot_answers_503_on_both_routes(world, tmp_path):
+    """The N7-R1 shape at this boundary: a compacted store whose snapshot cannot be accounted for.
+
+    The journal is empty after compaction, so the snapshot is the only copy. Both routes must
+    refuse, and the retained bytes must still be there afterwards.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    seeded.compact()
+    assert os.path.getsize(seeded.journal_path) == 0
+    snapshot = json.loads(open(seeded.snapshot_path, encoding="utf-8").read())
+    snapshot["records"]["damaged-entry"] = {"revision": 1}
+    with open(seeded.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    before = _durable_bytes(seeded)
+    app, cache = _lazily_served(world, state_dir)
+
+    status, _, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+    assert status == 503, body
+    assert json.loads(body)["code"] == "not_durably_recorded"
+    cache.clear()
+    status, _, body = call(app, decide_url(world, 1), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":0}')
+    assert status == 503, body
+    assert json.loads(body)["code"] == "not_durably_recorded"
+    assert _durable_bytes(seeded) == before, "the only copy of the record is untouched"
+
+    snapshot["records"].pop("damaged-entry")
+    with open(seeded.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    cache.clear()
+    status, _, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+    assert status == 200
+    assert json.loads(body)["clips"][world["entries"][0].clip_id]["decision"] == "SELECTED", (
+        "the record was never in danger; only this build's ability to account for it was")

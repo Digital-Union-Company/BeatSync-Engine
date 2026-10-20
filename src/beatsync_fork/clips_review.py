@@ -1334,6 +1334,55 @@ def _io_detail(exc: BaseException) -> str:
 #: decision, was recovered as an empty store.
 _ERROR_FILE_NOT_FOUND = 2
 
+#: [R5-P13 / N7-R2] Every event kind this journal format defines. The writer emits exactly these
+#: three and nothing else, so a fourth kind is not a tolerable unknown -- it is corruption, or a
+#: record written by a build this one cannot interpret. Folding it in as a silent no-op is one of
+#: the two routes by which a committed decision became invisible at start-up and was then
+#: truncated away by the next compaction.
+_JOURNAL_SCAN = "scan"
+_JOURNAL_DECIDE = "decide"
+
+#: The durable, auditable evidence that an unterminated tail was deliberately closed off. It is
+#: what makes the F4 torn-tail tolerance *provable* after the fact rather than positional; see
+#: :meth:`ReviewStore._replay_journal` and :meth:`ReviewStore._terminate_damaged_tail`.
+_JOURNAL_TAIL_REPAIRED = "tail-repaired"
+
+#: The marker is appended **onto** the damaged fragment rather than onto a line of its own, so
+#: this is the needle that finds it inside an unparsable line. It is the exact leading text of
+#: ``json.dumps({"k": _JOURNAL_TAIL_REPAIRED, "at": ...}, separators=(",", ":"))``; dict order is
+#: insertion order, so that spelling is stable.
+_TAIL_REPAIR_PREFIX = '{"k":"' + _JOURNAL_TAIL_REPAIRED + '"'
+
+_JOURNAL_KINDS = (_JOURNAL_SCAN, _JOURNAL_DECIDE, _JOURNAL_TAIL_REPAIRED)
+
+
+class _EventSchemaError(Exception):
+    """[R5-P13 / N7-R2] One journal event does not describe what its kind promises to describe.
+
+    Internal to :class:`ReviewStore`: :meth:`ReviewStore._replay_journal` converts it into a
+    :class:`PersistenceError`, which is the typed, path-free class the GUI and the 503 boundary
+    already handle. It carries no pathname and no record content -- only which field was wrong --
+    because its text reaches the browser.
+    """
+
+
+def _require_number(event: dict, field: str, *, optional: bool = False) -> float:
+    value = event.get(field)
+    if value is None and optional:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _EventSchemaError(f"{field!r} is not a number")
+    return float(value)
+
+
+def _require_text(event: dict, field: str, *, allow_empty: bool = True) -> str:
+    value = event.get(field)
+    if not isinstance(value, str):
+        raise _EventSchemaError(f"{field!r} is not a string")
+    if not allow_empty and not value:
+        raise _EventSchemaError(f"{field!r} is empty")
+    return value
+
 
 def io_detail(exc: BaseException) -> str:
     """[R5-P9] The public spelling of :func:`_io_detail`, for callers outside this module.
@@ -1424,31 +1473,48 @@ class ReviewStore:
             return False
         return os.path.basename(path) not in names
 
-    def _read_snapshot(self) -> tuple[dict[str, Record], dict[str, str], int]:
-        """The snapshot, into **fresh** dicts. Returns ``(records, scans, discarded)``.
+    def _read_snapshot(self) -> tuple[dict[str, Record], dict[str, str]]:
+        """The snapshot, into **fresh** dicts. Returns ``(records, scans)``.
 
-        [R5-P11 / N7] Three outcomes, kept distinct because conflating any two of them is how a
-        committed decision was lost:
+        [R5-P11 / N7] Two outcomes, kept distinct because conflating them is how a committed
+        decision was lost:
 
         * **genuinely absent** -- an empty contribution, and the journal is the whole record;
-        * **syntactically unusable content** -- discarded so the journal can replay over it, which
-          is the deliberate corruption tolerance R5-P3 established. Nothing is written here, so
-          the unusable bytes stay on disk for inspection;
         * **unreadable** -- a lock, an ACL, a device error, an unresolved pathname. That is not an
           answer about what the snapshot holds, so it raises. The original code caught ``OSError``
           in the same clause as ``ValueError`` and therefore called a transient read failure
           "corruption", published an empty record set as authoritative, and allowed the next
           compaction to overwrite the real snapshot with it.
 
-        Records are also materialised **all at once**: the original loop assigned into the live
-        ``self._records`` as it went, so a ``KeyError`` on the third of ten records left the first
-        two installed and the rest silently absent.
+        [R5-P13 / N7-R1] **And a third outcome that used to be a fourth: readable content that
+        this format cannot account for now raises as well.** R5-P3 tolerated it -- an unusable
+        snapshot contributed nothing and the journal replayed over it -- and an independent review
+        measured where that leads. A snapshot was damaged so that one entry lacked its
+        ``decision`` while three committed records were still present in readable JSON. The
+        comprehension below raised ``KeyError``, the whole snapshot was discarded, the empty
+        record set was published as authoritative, and the next ``compact()`` -- including the
+        automatic one, with no operator action at all -- wrote a 144-byte replacement over the
+        381-byte original. All three recoverable decisions were gone for good.
+
+        The reason tolerance cannot be repaired by reading *more* carefully is structural:
+        ``compact()`` truncates the journal, so **whenever a snapshot exists at all, the journal is
+        by construction only the delta written since that snapshot landed.** A readable journal, a
+        plausible set of decisions and a matching count are therefore none of them proof that the
+        journal holds the history the snapshot was holding. This format carries no genesis marker
+        and no provenance, so that proof is not available, and inventing one implicitly is how the
+        same defect comes back wearing a check. So this fails closed: nothing is written here, the
+        damaged bytes and the journal both stay exactly as they are, and a tool or an operator can
+        still recover from them by hand.
+
+        Records are materialised **all at once**: the original loop assigned into the live
+        ``self._records`` as it went, so a failure on the third of ten records left the first two
+        installed and the rest silently absent.
         """
         try:
             handle = open(self.snapshot_path, "r", encoding="utf-8")
         except OSError as exc:
             if self._absence_is_proven(self.snapshot_path, exc):
-                return {}, {}, 0
+                return {}, {}
             raise PersistenceError(
                 f"could not read the review snapshot ({_io_detail(exc)})") from exc
         try:
@@ -1457,16 +1523,59 @@ class ReviewStore:
         except OSError as exc:
             raise PersistenceError(
                 f"could not read the review snapshot ({_io_detail(exc)})") from exc
+        except UnicodeDecodeError as exc:
+            raise PersistenceError(
+                "the review snapshot is not valid UTF-8 text, so what it holds could not be "
+                f"established (byte offset {exc.start}); nothing has been changed") from exc
         try:
-            snapshot = json.loads(raw)
-            records = {identity: Record(identity, entry["decision"], int(entry["revision"]),
-                                        str(entry.get("scan_id", "")),
-                                        float(entry.get("updated_at", 0.0)))
-                       for identity, entry in snapshot["records"].items()}
-            scans = {owner: str(scan) for owner, scan in snapshot.get("scans", {}).items()}
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return {}, {}, 1
-        return records, scans, 0
+            return self._materialise_snapshot(raw)
+        except (_EventSchemaError, ValueError) as exc:
+            raise PersistenceError(
+                f"the review snapshot could not be read as a complete record ({exc}), so the "
+                "decisions it holds cannot be established; nothing has been changed and both "
+                "copies are exactly as they were") from exc
+
+    @staticmethod
+    def _materialise_snapshot(raw: str) -> tuple[dict[str, Record], dict[str, str]]:
+        """[R5-P13 / N7-R1] Validate the snapshot in full, or raise. Writes nothing.
+
+        Strict about everything that carries a decision's substance -- the decision itself, its
+        revision, its scan -- because a snapshot entry this build cannot interpret may be an entry
+        whose decision it is about to lose. ``updated_at`` is display metadata and is allowed to
+        be absent, which is the one thing here that is *not* part of the record; and an identity
+        is required only to be a *string*, for the writer-symmetry reason given in :meth:`_apply`.
+        """
+        snapshot = json.loads(raw)
+        if not isinstance(snapshot, dict):
+            raise _EventSchemaError("the snapshot is not an object")
+        entries = snapshot.get("records")
+        if not isinstance(entries, dict):
+            raise _EventSchemaError("'records' is not an object")
+        records: dict[str, Record] = {}
+        for identity, entry in entries.items():
+            # Any string is a legitimate key -- see `_apply` on why emptiness is not checked.
+            if not isinstance(identity, str):
+                raise _EventSchemaError("a record identity is not a string")
+            if not isinstance(entry, dict):
+                raise _EventSchemaError("a record is not an object")
+            decision = _require_text(entry, "decision", allow_empty=False)
+            if decision not in DECISIONS:
+                raise _EventSchemaError("a record's decision is not a known decision")
+            revision = entry.get("revision")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                raise _EventSchemaError("a record's revision is not a non-negative integer")
+            records[identity] = Record(identity, decision, revision,
+                                       _require_text(entry, "scan_id"),
+                                       _require_number(entry, "updated_at", optional=True))
+        raw_scans = snapshot.get("scans", {})
+        if not isinstance(raw_scans, dict):
+            raise _EventSchemaError("'scans' is not an object")
+        scans: dict[str, str] = {}
+        for owner, scan in raw_scans.items():
+            if not isinstance(owner, str) or not isinstance(scan, str):
+                raise _EventSchemaError("a scan pointer is not a string keyed by a string")
+            scans[owner] = scan
+        return records, scans
 
     def _replay_journal(self, records: dict[str, Record], scans: dict[str, str]
                         ) -> tuple[int, int]:
@@ -1477,9 +1586,45 @@ class ReviewStore:
         prefix of the journal as the authoritative record -- and then let the store be written to
         and compacted, turning a transient read failure into permanent loss.
 
-        A single unparsable *line* is still discarded and the replay continues: that is the F4
-        torn-tail tolerance, and it is a statement about one record's content rather than a failed
-        read of the file.
+        [R5-P13 / N7-R2] **An unparsable line is tolerated only where it can be *accounted for*.**
+        R5-P3 discarded every unparsable line wherever it sat and continued, and its comment
+        justified that with "a damaged line can only ever be a single line, because ``_append``
+        terminates an unterminated tail before writing after it". That is true of damage this
+        process caused; it says nothing about a line damaged by anything else. An independent
+        review replaced one committed decision's line with malformed content, left the later valid
+        decisions in place, and measured the consequence: the decision recovered as ``PENDING``,
+        the store declared itself recovered, a new decision was accepted, and ``compact()`` wrote
+        a snapshot without that decision and truncated the 313 retained bytes that still held it.
+
+        So damage is tolerated in exactly two shapes, and both of them are *positive evidence*
+        rather than an absence of complaint:
+
+        * **the final line, when it is unterminated** -- a record whose write did not reach its
+          newline. ``_append`` writes a record and its newline in one ``_write_all``, which either
+          writes every byte or raises, so an unterminated line is one whose decision was *never
+          reported successful*; and nothing can follow it, so nothing committed is hiding behind
+          it. This is the F4 torn tail, unchanged. A malformed line that **is** terminated is a
+          different animal: this writer only ever terminates a line it wrote in full, and a full
+          record parses -- so terminated damage is external corruption of something that may well
+          have been committed, wherever in the file it sits, and it refuses;
+        * **damage carrying its own repair marker** -- an unparsable line that *ends* with a valid
+          ``tail-repaired`` object. :meth:`_terminate_damaged_tail` appends that marker onto the
+          fragment, so the evidence is attached to the damage rather than positioned near it, and
+          the line is terminated and documented by the same write. Without it the previously
+          accepted F4 sequence would break on the second restart: once a torn fragment has been
+          closed off it is no longer the final line, and a rule that said "only the last line may
+          be damaged" would refuse a store whose later decision had already been reported
+          successful. A marker can only reach a line through that repair, and the repair only ever
+          fires on an unterminated tail -- so a damaged line in the middle of the file cannot
+          acquire one.
+
+        Anything else -- an unparsable line with a committed event after it -- means the record it
+        held cannot be established, so recovery refuses and **nothing is written**. Both copies
+        keep their bytes and the evidence stays recoverable.
+
+        A line that parses as JSON is never torn: truncating one of this writer's records always
+        leaves unbalanced JSON, so a *parsable* event with a schema this build cannot account for
+        is corruption or foreign content wherever it sits, and :meth:`_apply` refuses it outright.
         """
         try:
             handle = open(self.journal_path, "r", encoding="utf-8")
@@ -1488,29 +1633,92 @@ class ReviewStore:
                 return 0, 0
             raise PersistenceError(
                 f"could not read the review journal ({_io_detail(exc)})") from exc
-        applied = discarded = 0
+        applied = damaged = 0
+        torn_tail = False
         try:
             with handle:
-                for line in handle:
-                    line = line.strip()
+                for raw in handle:
+                    line = raw.strip()
                     if not line:
                         continue
+                    if torn_tail:
+                        # Unreachable against a real file -- an unterminated line ends the
+                        # iteration -- and asserted anyway, because the alternative to this raise
+                        # is the defect: skipping a damaged record that something follows.
+                        raise PersistenceError(
+                            "the review journal continues past an unfinished record, so what "
+                            "that record held cannot be established; nothing has been changed "
+                            "and both copies are exactly as they were")
                     try:
                         event = json.loads(line)
-                    except ValueError:
-                        # [R5-P3 / F4] An unparsable record is discarded rather than guessed at.
-                        # A damaged line can only ever be a *single* line, because `_append`
-                        # terminates an unterminated tail before writing after it -- so a later
-                        # healthy record can no longer be swallowed by a partial one. Every
-                        # fully committed record before the damage is preserved.
-                        discarded += 1
+                    except ValueError as unreadable:
+                        if self._damage_is_accounted_for(line):
+                            damaged += 1
+                            continue
+                        if raw.endswith("\n"):
+                            raise PersistenceError(
+                                f"review journal record {applied + damaged + 1} is unreadable "
+                                "but was written in full, so it is damage this process did not "
+                                "cause and what it held cannot be established; nothing has been "
+                                "changed and both copies are exactly as they were"
+                            ) from unreadable
+                        torn_tail = True
                         continue
                     self._apply(event, records, scans)
                     applied += 1
         except OSError as exc:
             raise PersistenceError(
                 f"could not replay the review journal ({_io_detail(exc)})") from exc
-        return applied, discarded
+        except UnicodeDecodeError as exc:
+            raise PersistenceError(
+                "the review journal is not valid UTF-8 text, so it could not be replayed "
+                f"(byte offset {exc.start}); nothing has been changed and both copies are "
+                "exactly as they were") from exc
+        except _EventSchemaError as exc:
+            raise PersistenceError(
+                f"review journal record {applied + damaged + 1} does not describe a complete "
+                f"record ({exc}), so what it recorded cannot be established; nothing has been "
+                "changed and both copies are exactly as they were") from exc
+        # An unterminated final line is the torn tail: nothing committed can follow it.
+        return applied, damaged + int(torn_tail)
+
+    @staticmethod
+    def _damage_is_accounted_for(line: str) -> bool:
+        """[R5-P13 / N7-R2] Whether an unparsable ``line`` carries this process's repair evidence.
+
+        The marker is appended **onto** the damaged fragment, so it is a suffix of an unreadable
+        line rather than a line of its own. That is deliberate, and it is what makes every
+        interruption of the repair recover:
+
+        * nothing written -- the fragment is still unterminated and still the trailing damage;
+        * the marker part written -- still unterminated, so still the trailing damage, and the
+          next append repairs again and appends a second, complete marker;
+        * fully written -- the line is terminated *and* documented by the same bytes, so a later
+          successful append behind it cannot make it look like historical corruption.
+
+        A bare terminating newline cannot do this: the earlier draft of this fix wrote
+        ``"\\n" + marker`` in one call, and an interruption after exactly one byte left the
+        fragment closed off with no evidence at all. The next append then found a *terminated*
+        tail, wrote no marker, and the restart after that refused a decision that had been
+        reported successful. Measured by this correction's own interrupted-repair test.
+
+        The last occurrence is the one examined, because a partly written marker can precede a
+        complete one, and it must parse all the way to the end of the line.
+        """
+        cut = line.rfind(_TAIL_REPAIR_PREFIX)
+        if cut < 0:
+            return False
+        try:
+            marker = json.loads(line[cut:])
+        except ValueError:
+            return False
+        if not isinstance(marker, dict) or marker.get("k") != _JOURNAL_TAIL_REPAIRED:
+            return False
+        try:
+            _require_number(marker, "at")
+        except _EventSchemaError:
+            return False
+        return True
 
     def _load(self) -> None:
         """Rebuild memory from the snapshot and the journal: **completely, or not at all**.
@@ -1541,12 +1749,21 @@ class ReviewStore:
         to, so there is nothing to compact from. **Nothing in this method writes**, so a refused
         load leaves the snapshot and the journal byte-for-byte as they were and a later healthy
         attempt recovers everything.
+
+        [R5-P13 / N7-R1 / N7-R2] ``_recovered`` means *the whole persisted record has been
+        accounted for*, and after this commit it finally means only that. Reaching end of file is
+        not the same statement, and neither is a corruption counter: the two measured loss routes
+        both ended here with a tolerated discard, a ``True`` flag and a destructive compaction
+        waiting. The two reads below now raise for any content they cannot fully justify, so the
+        only damage that survives to this line is damage that cannot be hiding a committed
+        decision -- a torn final record, or one already closed off by a repair marker. A partial
+        history therefore never becomes the next snapshot, because there is no store holding it.
         """
-        records, scans, unusable_snapshot = self._read_snapshot()
+        records, scans = self._read_snapshot()
         applied, damaged_lines = self._replay_journal(records, scans)
         self._records = records
         self._scans.update(scans)
-        self.corrupt_records_discarded += unusable_snapshot + damaged_lines
+        self.corrupt_records_discarded += damaged_lines
         self.journal_records = applied
         self._recovered = True
 
@@ -1572,22 +1789,62 @@ class ReviewStore:
         [R5-P11 / N7] The explicit targets are what let :meth:`_load` stage a replay without
         publishing it: a replay that fails half way through must leave the live record untouched
         rather than half updated.
+
+        [R5-P13 / N7-R2] **Every field is validated, and anything this build cannot account for
+        raises.** The original coerced instead: ``str(event.get("decision", PENDING))`` turned a
+        missing decision into ``PENDING``, ``int(event.get("revision", 0))`` turned a missing
+        revision into ``0``, and a ``decide`` event whose ``identity`` was not a string returned
+        early -- a **silent no-op on a committed record**. An independent review replaced one
+        committed decision with an identity-less ``decide`` event and measured the result: the
+        decision recovered as ``PENDING``, ``corrupt_records_discarded`` stayed at ``0`` so even
+        the counter said nothing was wrong, and compaction then truncated the 317 bytes that still
+        held it. The same review found ``int("x")`` escaping as a bare ``ValueError`` and an
+        unknown ``k`` ignored outright -- the first bypassing the typed refusal the GUI and the
+        503 boundary are built on, the second discarding a record of a kind this build does not
+        understand.
+
+        A torn write cannot produce any of these: truncating one of this writer's records always
+        leaves JSON that will not parse, so an event that *parses* was written whole. Strictness
+        is therefore free of the torn-tail concern, and the two are kept apart deliberately --
+        damage is :meth:`_replay_journal`'s business, meaning is this method's.
+
+        ``at`` is the only optional field, because it is display metadata rather than part of the
+        decision. Raises :class:`_EventSchemaError`, which the caller types.
+
+        **A validator this strict must not be stricter than the writer**, or a decision this module
+        accepted and reported successful would be refused on the next restart -- the same
+        false-failure class the torn-tail repair exists to avoid. So ``identity`` is required to be
+        a *string* and not required to be non-empty: production identities are 64-character
+        SHA-256 digests, but :meth:`decide` does not itself forbid an empty one, and inventing a
+        new write-time refusal to justify a read-time one would be the wrong way round. ``owner``
+        *is* required non-empty, because ``_require_owner`` already guarantees that at the only
+        site that writes it. ``test_n7_every_event_this_module_writes_satisfies_its_own_replay_validator``
+        pins the agreement for all three event shapes.
         """
         records = self._records if records is None else records
         scans = self._scans if scans is None else scans
+        if not isinstance(event, dict):
+            raise _EventSchemaError("a journal event is not an object")
         kind = event.get("k")
-        if kind == "scan":
-            owner = event.get("owner")
-            if isinstance(owner, str):
-                scans[owner] = str(event.get("scan_id", ""))
-        elif kind == "decide":
-            identity = event.get("identity")
-            if not isinstance(identity, str):
-                return
-            records[identity] = Record(identity, str(event.get("decision", PENDING)),
-                                       int(event.get("revision", 0)),
-                                       str(event.get("scan_id", "")),
-                                       float(event.get("at", 0.0)))
+        if kind not in _JOURNAL_KINDS:
+            raise _EventSchemaError("a journal event has no kind this build understands")
+        if kind == _JOURNAL_TAIL_REPAIRED:
+            _require_number(event, "at")
+            return
+        if kind == _JOURNAL_SCAN:
+            scans[_require_text(event, "owner", allow_empty=False)] = \
+                _require_text(event, "scan_id")
+            return
+        identity = _require_text(event, "identity")
+        decision = _require_text(event, "decision", allow_empty=False)
+        if decision not in DECISIONS:
+            raise _EventSchemaError("'decision' is not a known decision")
+        revision = event.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise _EventSchemaError("'revision' is not a non-negative integer")
+        records[identity] = Record(identity, decision, revision,
+                                   _require_text(event, "scan_id"),
+                                   _require_number(event, "at", optional=True))
 
     def _write_all(self, handle: int, payload: bytes) -> int:
         """[R5-P3 / F4] Write every byte, or raise. Returns the number of bytes written.
@@ -1699,10 +1956,28 @@ class ReviewStore:
         [R5-P7 / N6] ``handle`` is forwarded to the probe, which is what tells it an append is in
         flight. Every reader of this method holds an open journal, so no inspection failure
         reaching it -- ``FileNotFoundError`` included -- may be read as "terminated".
+
+        [R5-P13 / N7-R2] The repair now writes **durable evidence that it happened**, appended
+        onto the damaged fragment itself and terminated in the same call. A bare newline left the
+        damaged line looking exactly like corruption of an earlier historical record -- which is
+        the thing :meth:`_replay_journal` must now refuse -- so without evidence the previously
+        accepted F4 sequence would stop recovering on its second restart: the fragment is no
+        longer last, and the decision written after it was already reported successful.
+
+        The marker goes **onto** the fragment rather than onto a line of its own because
+        ``_write_all`` guarantees all-the-bytes-or-a-raise per call but not atomicity across an
+        interruption. Writing ``"\\n" + marker`` was the first attempt and it has a one-byte hole:
+        interrupted after the newline alone, the fragment is closed off and undocumented, the next
+        append sees a terminated tail and adds no marker, and the restart after that refuses a
+        reported success. Appending the marker first closes that hole -- any prefix of this write
+        leaves the fragment still unterminated, hence still the trailing damage, and the next
+        append repairs it again. See :meth:`_damage_is_accounted_for`.
         """
         if self._journal_tail_is_terminated(handle):
             return False
-        self._write_all(handle, b"\n")
+        marker = json.dumps({"k": _JOURNAL_TAIL_REPAIRED, "at": time.time()},
+                            separators=(",", ":"), ensure_ascii=False)
+        self._write_all(handle, (marker + "\n").encode("utf-8"))
         self.journal_tails_repaired += 1
         return True
 

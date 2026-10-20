@@ -723,16 +723,34 @@ def test_a_torn_final_journal_record_is_discarded_and_the_rest_survives(tmp_path
     assert recovered.corrupt_records_discarded >= 1
 
 
-def test_an_unusable_snapshot_still_replays_the_journal(tmp_path):
+def test_an_unusable_snapshot_refuses_the_store_and_changes_nothing(tmp_path):
+    """[R5-P13 / N7-R1] **Replaces** an R5-P3 assertion that an unusable snapshot replays anyway.
+
+    The rationale for the change, stated where the old expectation lived: `compact()` truncates
+    the journal, so a snapshot's existence *means* the journal is only the delta written after it.
+    Continuing from a journal that cannot be shown to hold the rest published a partial history as
+    authoritative and let the next compaction write it over the real snapshot. The positive
+    recovery paths this used to cover are covered by `test_n7_case1`/`2`/`3` and by
+    `test_decisions_survive_compaction`, which exercise exactly the same journal-replay code.
+    """
     directory = str(tmp_path / "state")
     store = cr.ReviewStore(directory)
     store.begin_scan("owner-a", "scan-1")
     identity = "4" * 64
     store.decide("owner-a", identity, cr.SELECTED, "scan-1")
+    journal = open(store.journal_path, "rb").read()
     with open(store.snapshot_path, "w", encoding="utf-8") as handle:
         handle.write("{ this is not json")
-    recovered = cr.ReviewStore(directory)
-    assert recovered.get(identity) == (cr.SELECTED, 1)
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    assert open(store.snapshot_path, encoding="utf-8").read() == "{ this is not json", (
+        "a refused snapshot is never rewritten")
+    assert open(store.journal_path, "rb").read() == journal, "nor is the journal touched"
+
+    os.unlink(store.snapshot_path)
+    assert cr.ReviewStore(directory).get(identity) == (cr.SELECTED, 1), (
+        "the journal still holds the decision, so the refusal lost nothing")
 
 
 def test_a_journal_that_cannot_be_written_is_reported_not_swallowed(tmp_path, monkeypatch):
@@ -2687,24 +2705,36 @@ def test_n7_case9_a_torn_final_record_is_still_a_complete_recovery(tmp_path):
     _assert_fully_recovered(directory, expected, scan="scan-2")
 
 
-def test_n7_case10_a_syntactically_invalid_snapshot_still_replays_the_journal(tmp_path):
-    """Case 10. Unusable *content* stays recoverable from the journal, as R5-P3 established.
+def test_n7_case10_a_syntactically_invalid_snapshot_refuses_rather_than_guessing(tmp_path):
+    """Case 10, **reversed by R5-P13 / N7-R1**, with the before/after rationale kept here.
 
-    Preserved deliberately, and bounded deliberately: it applies when the bytes on disk are not
-    JSON, which is a definite finding about the snapshot. A read that *failed* says nothing about
-    the content and is handled by the cases above. Nothing here is written, so the unusable bytes
-    remain on disk for inspection.
+    R5-P11 asserted that unusable snapshot *content* stays recoverable from the journal, on the
+    grounds that unparsable bytes are "a definite finding about the snapshot". The finding is
+    definite; the conclusion drawn from it was not. An independent review measured the sequence it
+    licenses: the damaged snapshot is discarded, whatever the journal happens to hold is published
+    as authoritative, and the next `compact()` writes that over the retained bytes. Every
+    committed decision the journal did not happen to contain is then gone for good.
+
+    So the tolerance is withdrawn, and this test now asserts the refusal and the preservation.
+    The journal-replay coverage it used to carry has not been dropped -- see `test_n7_case1`,
+    `test_n7_case2`, `test_n7_case3` and the torn-tail group, which replay real journals through
+    the same code.
     """
     directory = str(tmp_path / "state")
     store, expected = _committed(directory)
+    assert _state_bytes(store)["snapshot"] is None, "no compaction, so there is no snapshot yet"
     with open(store.snapshot_path, "w", encoding="utf-8") as handle:
         handle.write("{ this is not json")
+    damaged = _state_bytes(store)
 
-    recovered = _assert_fully_recovered(directory, expected)
-    assert recovered.corrupt_records_discarded == 1
-    assert recovered._recovered is True                          # noqa: SLF001 - white box
-    with open(store.snapshot_path, encoding="utf-8") as handle:
-        assert handle.read() == "{ this is not json", "a refused snapshot is not rewritten"
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    assert "could not be read as a complete record" in str(failure.value)
+    assert _state_bytes(store) == damaged, "a refused snapshot is not rewritten"
+
+    # And the refusal is not a wedge: the decisions were never actually unrecoverable.
+    os.unlink(store.snapshot_path)
+    _assert_fully_recovered(directory, expected)
 
 
 @pytest.mark.parametrize("payload", [
@@ -2712,23 +2742,37 @@ def test_n7_case10_a_syntactically_invalid_snapshot_still_replays_the_journal(tm
     '{"records": {"a": "not a record"}}',
     '{"records": {"a": {"revision": 1}}}',                       # no decision key
     '{"records": {"a": {"decision": "SELECTED", "revision": "x"}}}',
+    '{"records": {"a": {"decision": "NOT_A_DECISION", "revision": 1, "scan_id": ""}}}',
+    '{"records": {"a": {"decision": "SELECTED", "revision": -1, "scan_id": ""}}}',
+    '{"records": {"a": {"decision": "SELECTED", "revision": true, "scan_id": ""}}}',
+    '{"records": {"a": {"decision": "SELECTED", "revision": 1}}}',   # no scan_id key
     '["not", "an", "object"]',
     '{"scans": 7, "records": {}}',
+    '{"scans": {"owner-a": 7}, "records": {}}',
+    '',
 ])
-def test_n7_a_structurally_invalid_snapshot_contributes_nothing_rather_than_a_prefix(tmp_path,
+def test_n7_a_structurally_invalid_snapshot_refuses_rather_than_contributing_nothing(tmp_path,
                                                                                      payload):
-    """A snapshot that parses but does not describe records must contribute **nothing**.
+    """**Replaces** "contributes nothing rather than a prefix" -- which was the wrong remedy.
 
-    The original loop assigned into the live record as it went, so a `KeyError` on the third of
-    ten entries left the first two installed and the rest silently missing -- a partial
-    publication by a different route. Records are now materialised in one expression.
+    Materialising the records in one expression did fix a *partial* publication, and that part is
+    kept: a half-built record set is still never installed. What it did not fix is that
+    contributing nothing is itself a publication -- of an empty history -- and `compact()` turns
+    it into the snapshot. Each payload here is a snapshot this build cannot account for, so each
+    one must refuse and leave both copies alone.
     """
     directory = str(tmp_path / "state")
     store, expected = _committed(directory)
     with open(store.snapshot_path, "w", encoding="utf-8") as handle:
         handle.write(payload)
-    recovered = _assert_fully_recovered(directory, expected)
-    assert recovered.corrupt_records_discarded == 1
+    damaged = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    assert _state_bytes(store) == damaged, "not one byte of either copy may change"
+
+    os.unlink(store.snapshot_path)
+    _assert_fully_recovered(directory, expected)
 
 
 # ---- 11-13: the retry, and normal service afterwards ----------------------------------------
@@ -3005,3 +3049,602 @@ def test_n7_a_compaction_failure_still_leaves_a_completely_recovered_store(tmp_p
     store.compact()
     final = _assert_fully_recovered(directory, expected, scan="scan-2")
     assert final.get("clip-after") == (cr.SELECTED, 1)
+
+
+# =============================================================================================
+# 13. R5-P13 / N7-R1 + N7-R2: a readable file is not necessarily a RECOVERABLE file
+# =============================================================================================
+#
+# R5-P11 made recovery all-or-nothing for files it could not *read*. An independent R5-P12 review
+# measured what was left: for files it could read but not account for, the store still declared
+# itself recovered, accepted a decision and compacted -- so the loss route survived intact behind
+# a different door. Both halves were reproduced executably on the frozen candidate.
+#
+# N7-R1, the decisive case. Three decisions committed and compacted; the 381-byte snapshot was
+# valid JSON and still held all three complete records, plus one entry missing its `decision`. The
+# snapshot was discarded whole, `_recovered` was set, a new decision was accepted, and `compact()`
+# wrote a 144-byte replacement holding none of the three. Restart read all three as PENDING.
+# SHA-256 efdac66e... -> 929bbca7.... The automatic 2,000-record `maybe_compact()` did the same
+# with no operator action at all.
+#
+# N7-R2. One committed decision's journal line was replaced by malformed content while later valid
+# decisions remained; the line was skipped, recovery was declared complete, and compaction
+# truncated the 313 bytes that still held it. A JSON-decodable `decide` event with no `identity`
+# did the same while leaving `corrupt_records_discarded` at 0. A non-numeric revision escaped as a
+# bare `ValueError` and non-UTF-8 bytes as a `UnicodeDecodeError` -- outside the typed refusal the
+# GUI and the 503 boundary are built on.
+#
+# The invariant these tests pin: a store becomes writable and compactable only when it can
+# JUSTIFY that the whole persisted record has been accounted for. Reaching end of file is not that
+# justification, and neither is a corruption counter.
+
+
+def _journal_lines(store):
+    with open(store.journal_path, "rb") as handle:
+        return handle.read().splitlines(keepends=True)
+
+
+def _rewrite_journal(store, lines):
+    with open(store.journal_path, "wb") as handle:
+        handle.write(b"".join(lines))
+
+
+def _destructive_sequence(directory, store):
+    """The real failure sequence from R5-P12, run in full. Returns (store_or_None, bytes_after).
+
+    Deliberately NOT a bare `pytest.raises` around the construction: if the constructor ever stops
+    refusing, this runs the genuine destructive steps -- a new decision, a real `compact()` and a
+    real threshold `maybe_compact()` -- so the caller's assertions fail on measured loss rather
+    than passing because some unrelated exception happened to arrive first.
+    """
+    try:
+        incomplete = cr.ReviewStore(directory)
+    except cr.PersistenceError:
+        incomplete = None
+    if incomplete is not None:
+        for attempt in (lambda: incomplete.begin_scan("owner-a", "scan-9"),
+                        lambda: incomplete.decide("owner-a", "clip-new", cr.SELECTED, "scan-9"),
+                        incomplete.compact):
+            try:
+                attempt()
+            except (cr.PersistenceError, cr.StaleWrite, OSError):
+                pass
+        incomplete.journal_records = cr.COMPACT_AFTER_RECORDS
+        try:
+            incomplete.maybe_compact()
+        except (cr.PersistenceError, OSError):
+            pass
+    return incomplete, _state_bytes(store)
+
+
+# ---- N7-R1: the authoritative snapshot ------------------------------------------------------
+
+def test_n7r1_three_valid_entries_plus_one_invalid_entry_destroys_nothing(tmp_path):
+    """The reproduction that made this merge-blocking, as a test.
+
+    Every byte of the three committed records is still present and readable in the snapshot. The
+    old code threw them away because a *fourth* entry was malformed, then let compaction make that
+    permanent. The corrected store refuses, and the originals are recoverable the moment the one
+    damaged entry is removed -- which is the proof that the refusal preserved something real.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    before = _state_bytes(store)
+
+    snapshot = json.loads(before["snapshot"].decode("utf-8"))
+    assert set(expected) <= set(snapshot["records"]), "all three are in the snapshot to begin with"
+    snapshot["records"]["invalid-tail"] = {"revision": 1}
+    with open(store.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, "a snapshot that cannot be accounted for must not be constructible"
+    assert after == damaged, "neither copy may be rewritten or truncated"
+
+    snapshot["records"].pop("invalid-tail")
+    with open(store.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r1_a_syntactically_invalid_snapshot_with_an_empty_journal_refuses(tmp_path):
+    """The sharpest shape: after a normal compaction the journal is EMPTY, so the snapshot is the
+    only copy of every decision. Discarding it is discarding the record."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    assert os.path.getsize(store.journal_path) == 0, "compaction emptied the journal"
+    with open(store.snapshot_path, "wb") as handle:
+        handle.write(b"{ broken snapshot still holding clip-0 clip-1 clip-2")
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None
+    assert after == damaged, "the retained damaged bytes are the only forensic copy left"
+
+
+def test_n7r1_an_invalid_snapshot_with_a_partial_delta_journal_refuses(tmp_path):
+    """The journal is readable, parses, and holds real decisions -- just not these ones.
+
+    This is why "the journal replayed cleanly" cannot be the completeness proof. After a
+    compaction the journal holds only what was written since, so a readable delta looks exactly
+    like a readable whole history.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    later = cr.ReviewStore(directory)
+    later.begin_scan("owner-a", "scan-2")
+    later.decide("owner-a", "clip-late", cr.SELECTED, "scan-2")
+    assert os.path.getsize(store.journal_path) > 0, "there is a real delta to replay"
+    with open(store.snapshot_path, "wb") as handle:
+        handle.write(b"{ broken")
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, "a readable delta is not proof of a complete history"
+    assert after == damaged
+
+
+def test_n7r1_an_invalid_snapshot_with_a_complete_journal_also_refuses(tmp_path):
+    """The deliberate, documented limit of this correction.
+
+    Here the journal really does hold the whole history -- but **nothing on disk says so**. The
+    format carries no genesis marker and no provenance, and this case is byte-for-byte
+    indistinguishable from the delta case above except by knowledge the store does not have.
+    R5-P13 refuses rather than inventing a completeness check that would be wrong exactly when it
+    mattered. The decisions are not lost: both copies are preserved, and removing the damaged
+    snapshot recovers all three from the journal alone.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)                     # no compaction: journal is whole
+    with open(store.snapshot_path, "wb") as handle:
+        handle.write(b"{ broken")
+    damaged = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    assert _state_bytes(store) == damaged
+
+    os.unlink(store.snapshot_path)
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r1_the_real_automatic_threshold_cannot_compact_an_unaccounted_snapshot(tmp_path):
+    """The automatic route, with a real journal of `COMPACT_AFTER_RECORDS` real events.
+
+    The measured N7-R1 loss needed no operator action: housekeeping alone was enough. There must
+    be no store to reach the threshold with -- and the threshold must still work for a store that
+    did recover, which the second half asserts.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    with open(store.journal_path, "a", encoding="utf-8") as handle:
+        for _ in range(cr.COMPACT_AFTER_RECORDS):
+            handle.write(json.dumps({"k": "scan", "owner": "owner-a", "scan_id": "scan-1",
+                                     "at": 0.0}, separators=(",", ":")) + "\n")
+    healthy = cr.ReviewStore(directory)
+    assert healthy.journal_records >= cr.COMPACT_AFTER_RECORDS, "the threshold is really reached"
+
+    snapshot = json.loads(open(store.snapshot_path, encoding="utf-8").read())
+    snapshot["records"]["invalid-tail"] = {"revision": 1}
+    with open(store.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    damaged = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    assert _state_bytes(store) == damaged, "the automatic route destroys nothing either"
+
+    # The housekeeping itself is not disabled: the already recovered store still compacts.
+    assert healthy.maybe_compact() is True
+    assert healthy.journal_records == 0
+
+
+# ---- N7-R2: damaged and unaccountable journal records ---------------------------------------
+
+def test_n7r2_a_malformed_historical_line_followed_by_valid_events_refuses(tmp_path):
+    """Damage in the MIDDLE is not the torn tail, and the difference is the whole finding.
+
+    R5-P3's justification was "a damaged line can only ever be a single line, because `_append`
+    terminates an unterminated tail before writing after it". That is a statement about damage
+    this process caused. Here the damage sits before later committed events, so the record it held
+    cannot be established -- and the old code skipped it, declared recovery complete and let
+    compaction truncate the only bytes that still held it.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    assert b"clip-1" in lines[2], "the line being damaged is a committed decision"
+    lines[2] = b"{ invalid committed line\n"
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, "a damaged historical record must refuse the store"
+    assert after == damaged, "the retained bytes are the only evidence of what was damaged"
+
+
+@pytest.mark.parametrize("line,why", [
+    (b'{"k":"decide","revision":1,"decision":"SELECTED","scan_id":"scan-1"}\n', "no identity"),
+    (b'{"k":"decide","identity":7,"decision":"SELECTED","revision":1,"scan_id":"s"}\n',
+     "identity is not a string"),
+    (b'{"k":"decide","identity":"clip-1","revision":1,"scan_id":"scan-1"}\n', "no decision"),
+    (b'{"k":"decide","identity":"clip-1","decision":"MAYBE","revision":1,"scan_id":"s"}\n',
+     "unknown decision"),
+    (b'{"k":"decide","identity":"clip-1","decision":"SELECTED","scan_id":"scan-1"}\n',
+     "no revision"),
+    (b'{"k":"decide","identity":"c","decision":"SELECTED","revision":"x","scan_id":"s"}\n',
+     "revision is a string"),
+    (b'{"k":"decide","identity":"c","decision":"SELECTED","revision":true,"scan_id":"s"}\n',
+     "revision is a bool"),
+    (b'{"k":"decide","identity":"c","decision":"SELECTED","revision":-1,"scan_id":"s"}\n',
+     "negative revision"),
+    (b'{"k":"decide","identity":"c","decision":"SELECTED","revision":1}\n', "no scan_id"),
+    (b'{"k":"decide","identity":"c","decision":"SELECTED","revision":1,"scan_id":"s","at":"x"}\n',
+     "at is not a number"),
+    (b'{"k":"scan","scan_id":"scan-1","at":0.0}\n', "a scan with no owner"),
+    (b'{"k":"scan","owner":"","scan_id":"scan-1","at":0.0}\n', "a scan with an empty owner"),
+    (b'{"k":"scan","owner":"owner-a","at":0.0}\n', "a scan with no scan_id"),
+    (b'{"k":"transfer","identity":"clip-1","to":"library"}\n', "an unsupported event kind"),
+    (b'{"k":7,"identity":"clip-1"}\n', "a non-string kind"),
+    (b'{"identity":"clip-1","decision":"SELECTED","revision":1}\n', "no kind at all"),
+    (b'["not","an","object"]\n', "a JSON array instead of an event"),
+    (b'"a bare string"\n', "a JSON string instead of an event"),
+    (b'{"k":"tail-repaired"}\n', "a repair marker with no timestamp"),
+], ids=lambda value: value if isinstance(value, str) else "line")
+def test_n7r2_a_semantically_invalid_event_refuses_rather_than_no_opping(tmp_path, line, why):
+    """A parsable event this build cannot account for is corruption, wherever it sits.
+
+    Torn writes cannot produce these: truncating one of this writer's records always leaves JSON
+    that will not parse, so a *parsable* event was written whole and its content is a real
+    statement -- one that may well be standing in for a committed decision. The old `_apply`
+    returned early on a non-string identity, coerced a missing decision to PENDING and a missing
+    revision to 0, and ignored an unknown kind entirely, every one of which is a silent no-op on
+    a record that may have held something.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, line)
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, f"{why} must refuse the store"
+    assert after == damaged, f"{why} must leave both copies byte-identical"
+
+    lines.pop(2)
+    _rewrite_journal(store, lines)
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r2_a_semantic_failure_is_a_typed_path_free_persistence_error(tmp_path):
+    """R5-P12 found `int("x")` escaping as a bare `ValueError`, outside the 503 contract."""
+    directory = str(tmp_path / "state")
+    store, _ = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, b'{"k":"decide","identity":"lost","revision":"x","decision":"SELECTED"}\n')
+    _rewrite_journal(store, lines)
+
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    message = str(failure.value)
+    assert "revision" in message, "the condition stays diagnosable"
+    assert not _mentions(message, store.journal_path)
+    assert not _mentions(message, store.dir)
+    assert "review-journal" not in message and ".jsonl" not in message
+
+
+def test_n7r2_a_journal_that_is_not_utf8_is_a_typed_refusal(tmp_path):
+    """R5-P12 found this escaping as a bare `UnicodeDecodeError` from the replay loop.
+
+    It is raised by the text layer during *iteration*, not inside the `json.loads` guard, so
+    catching `ValueError` around the parse never saw it -- even though `UnicodeDecodeError` is a
+    `ValueError` subclass.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, b"\xff\xfe not utf-8 at all\n")
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None
+    assert after == damaged
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    message = str(failure.value)
+    assert "UTF-8" in message and "byte offset" in message
+    assert not _mentions(message, store.journal_path)
+
+
+def test_n7r2_an_invalid_snapshot_that_is_not_utf8_is_a_typed_refusal(tmp_path):
+    """The same decoding failure on the other file. Pre-fix it was the same bare exception."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory, compact=True)
+    with open(store.snapshot_path, "wb") as handle:
+        handle.write(b'{"records": {"\xff": {}}}')
+    damaged = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    assert "UTF-8" in str(failure.value)
+    assert not _mentions(str(failure.value), store.snapshot_path)
+    assert _state_bytes(store) == damaged
+
+
+# ---- The torn-tail guarantee, preserved and now provable ------------------------------------
+
+def test_n7r2_the_accepted_f4_durable_write_sequence_still_holds_end_to_end(tmp_path):
+    """**The mandatory compatibility gate.** The full F4/N2 sequence, across two restarts.
+
+    This is the sequence a naive "only the final line may be damaged" rule would have broken, and
+    it is why the repair writes durable evidence rather than a bare newline. After
+    `_terminate_damaged_tail` closes the fragment off, the fragment is no longer the last line --
+    so on the *second* restart a positional rule would refuse a store whose later decision had
+    already been reported successful, which is exactly the false-failure mirror of the N7 defect.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+
+    first = _assert_fully_recovered(directory, expected)
+    assert first.corrupt_records_discarded == 1, "exactly the one unfinished record"
+    assert first.get("torn") == (cr.PENDING, 0), "an unfinished record never reported success"
+    first.begin_scan("owner-a", "scan-2")
+    assert first.decide("owner-a", "later", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+    assert first.journal_tails_repaired == 1
+
+    lines = _journal_lines(first)
+    damaged_at = next(index for index, line in enumerate(lines) if b'"torn"' in line)
+    assert damaged_at != len(lines) - 1, (
+        "the precondition of this test: the damaged line is no longer the final line")
+    assert lines[damaged_at].rstrip().endswith(b'}'), "the damaged line was terminated"
+    assert b'{"k":"tail-repaired"' in lines[damaged_at], (
+        "and it carries the durable evidence of its own repair")
+    assert cr.ReviewStore._damage_is_accounted_for(                 # noqa: SLF001 - white box
+        lines[damaged_at].decode("utf-8").strip())
+    with pytest.raises(ValueError):
+        json.loads(lines[damaged_at])                               # still unreadable as a record
+    assert sum(1 for line in lines if b'{"k":"tail-repaired"' in line) == 1, "one repair, once"
+
+    second = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert second.get("later") == (cr.SELECTED, 1), "a reported success must survive a restart"
+    assert second.corrupt_records_discarded == 1
+    second.compact()
+
+    third = _assert_fully_recovered(directory, expected, scan="scan-2")
+    assert third.get("later") == (cr.SELECTED, 1), "and must survive compaction too"
+    assert third.get("torn") == (cr.PENDING, 0)
+    assert third.corrupt_records_discarded == 0, "compaction removed the accounted-for damage"
+    third.begin_scan("owner-a", "scan-3")
+    assert third.decide("owner-a", "newest", cr.SELECTED, "scan-3") == (cr.SELECTED, 1)
+    _assert_fully_recovered(directory, expected, scan="scan-3")
+
+
+def test_n7r2_an_interrupted_repair_still_recovers_every_reported_success(tmp_path):
+    """The repair itself interrupted, at every measurable prefix of its single write.
+
+    `_write_all` guarantees all-the-bytes-or-a-raise per call, not atomicity across an
+    interruption, so any prefix of the marker can reach disk. Each one is checked for the property
+    that matters: every decision that was ever reported successful is still recoverable
+    afterwards, and the store is not wedged.
+
+    This test is the reason the marker is appended ONTO the fragment. The first version of the fix
+    wrote `"\\n" + marker`, and this test failed at `cut=1`: the lone newline terminated the
+    fragment without documenting it, the next append therefore found a terminated tail and wrote
+    no marker of its own, and the restart after that refused a store whose `after` decision had
+    already been reported successful -- the N7 defect's false-failure mirror image.
+    """
+    full = b'{"k":"tail-repaired","at":0.0}\n'
+    for cut in range(len(full) + 1):
+        directory = str(tmp_path / f"state-{cut}")
+        store, expected = _committed(directory)
+        with open(store.journal_path, "ab") as handle:
+            handle.write(b'{"k":"decide","identity":"torn","decision":"SELE')
+            handle.write(full[:cut])                 # the interrupted repair write
+
+        recovered = _assert_fully_recovered(directory, expected)
+        assert recovered.get("torn") == (cr.PENDING, 0)
+        recovered.begin_scan("owner-a", "scan-2")
+        assert recovered.decide("owner-a", "after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+
+        again = _assert_fully_recovered(directory, expected, scan="scan-2")
+        assert again.get("after") == (cr.SELECTED, 1), (
+            f"a reported success must survive a repair interrupted after {cut} byte(s)")
+        again.compact()
+        final = _assert_fully_recovered(directory, expected, scan="scan-2")
+        assert final.get("after") == (cr.SELECTED, 1)
+
+
+@pytest.mark.parametrize("line,why", [
+    (b'{"k":"tail-repaired","at":0.0}\n{ damaged on its own line\n',
+     "a marker on a line of its own excuses no other line"),
+    (b'{ damaged }{"k":"tail-repaired"\n', "a truncated marker is not a marker"),
+    (b'{ damaged }{"k":"tail-repaired","at":"later"}\n', "nor is one with a bad timestamp"),
+    (b'{ damaged }{"k":"tail-repaired","at":0.0} trailing\n',
+     "nor one that is not the end of the line"),
+    (b'{"k":"tail-repaired","at":0.0} { damaged }\n',
+     "nor one that precedes the damage instead of closing it"),
+])
+def test_n7r2_only_a_genuine_attached_marker_accounts_for_damage(tmp_path, line, why):
+    """The marker is evidence, not an amnesty.
+
+    Without these bounds it would be a loophole: anything resembling a repair anywhere near a
+    malformed line would license skipping it, which is the N7-R2 defect with an extra step. A
+    marker only ever reaches disk as the terminating suffix of the fragment it repaired.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, line)
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, why
+    assert after == damaged
+
+    lines.pop(2)
+    _rewrite_journal(store, lines)
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r2_a_terminated_unreadable_line_is_corruption_even_at_the_end_of_the_file(tmp_path):
+    """Tolerating the *last* unreadable line is not enough of a bound, and this is why.
+
+    An earlier draft of this fix tolerated the whole trailing run of unreadable lines, reasoning
+    that nothing committed can follow a record that was never finished. True of the unfinished
+    record; false of a **terminated** one sitting in front of it. `_append` writes a record and its
+    newline in one `_write_all` call, so a line this process terminated is a line it wrote in full
+    -- and a full record parses. Terminated damage is therefore external, may well have stood for a
+    committed decision, and under the run rule it was laundered: tolerated on the first load,
+    marked discarded, and then truncated away by the first compaction after a repair.
+
+    Both arrangements are checked, because the run rule tolerated both.
+    """
+    for name, tail in (("damage-then-tear", b'{ terminated damage\n{"k":"decide","identity":"t'),
+                       ("damage-alone", b"{ terminated damage\n")):
+        directory = str(tmp_path / name)
+        store, expected = _committed(directory)
+        with open(store.journal_path, "ab") as handle:
+            handle.write(tail)
+        damaged = _state_bytes(store)
+
+        incomplete, after = _destructive_sequence(directory, store)
+        assert incomplete is None, f"{name}: terminated damage must refuse the store"
+        assert after == damaged, f"{name}: and must not be truncated away"
+        with pytest.raises(cr.PersistenceError) as failure:
+            cr.ReviewStore(directory)
+        assert "written in full" in str(failure.value)
+        assert not _mentions(str(failure.value), store.journal_path)
+
+
+# ---- The writer and the validator must agree -------------------------------------------------
+
+def test_n7_every_event_this_module_writes_satisfies_its_own_replay_validator(tmp_path):
+    """The consistency gate for a strict validator: the strictness must not reject the writer.
+
+    Each of the three event shapes is produced by the real write path -- a scan, a decision and a
+    tail repair -- and every one is fed through `_apply` directly. A validator that rejected one of
+    these would turn the first restart after a repair into an outage, which is why this is pinned
+    rather than assumed.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"torn"')
+    store.decide("owner-a", "clip-0", cr.SELECTED, "scan-1")
+    assert store.journal_tails_repaired == 1, "all three shapes are now on disk"
+
+    kinds = set()
+    for line in _journal_lines(store):
+        text = line.decode("utf-8").strip()
+        if not text:
+            continue
+        try:
+            event = json.loads(text)
+        except ValueError:
+            # The repaired fragment. Its marker suffix is the third shape, so pull it out and
+            # replay that, which is what `_replay_journal` relies on being valid.
+            assert cr.ReviewStore._damage_is_accounted_for(text)     # noqa: SLF001 - white box
+            event = json.loads(text[text.rindex('{"k":"tail-repaired"'):])
+        store._apply(event, {}, {})                   # noqa: SLF001 - white box: must not raise
+        kinds.add(event["k"])
+    assert kinds == {"scan", "decide", "tail-repaired"}, kinds
+
+
+def test_n7_recovery_is_not_declared_complete_from_a_partial_replay(tmp_path, monkeypatch):
+    """`_recovered` must mean "all of it", not "the read returned".
+
+    The guard is checked from the other side too: a store that did not finish replaying must not
+    exist, so there is nothing holding a prefix to compact from.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    before = _state_bytes(store)
+
+    _fail_part_way_through(monkeypatch, store.journal_path, after_lines=2)
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert _state_bytes(store) == before
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r2_an_unfinished_record_may_not_be_followed_by_anything(tmp_path, monkeypatch):
+    """The guard that a real file cannot reach, exercised with a handle that can.
+
+    An unterminated line ends iteration over a real file, so "damage this process caused, with
+    committed events behind it" is not a state the filesystem can present. It is still asserted,
+    because the alternative to the raise is precisely the N7-R2 defect -- and because a guard no
+    test exercises is a guard that can be deleted by accident. A minimal handle supplies the one
+    line sequence the filesystem will not.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    before = _state_bytes(store)
+    target = os.path.normcase(os.path.abspath(store.journal_path))
+    real = open
+
+    class _Handle:
+        """Yields an unterminated record and then keeps going."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def __iter__(self):
+            yield '{"k":"decide","identity":"torn"'          # no newline: an unfinished record
+            yield ('{"k":"decide","identity":"after","decision":"SELECTED","revision":1,'
+                   '"scan_id":"scan-1","at":0.0}\n')
+
+    def opener(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (os.path.normcase(os.path.abspath(os.fspath(file))) == target
+                and "r" in str(mode) and "+" not in str(mode)):
+            return _Handle()
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(cr, "open", opener, raising=False)
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    monkeypatch.undo()
+
+    assert "continues past an unfinished record" in str(failure.value)
+    assert not _mentions(str(failure.value), store.journal_path)
+    assert _state_bytes(store) == before
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7_the_replay_validator_is_never_stricter_than_the_write_path(tmp_path):
+    """The symmetry gate. A validator stricter than the writer is a false-failure generator.
+
+    `decide` and `begin_scan` accept these; the replay must therefore accept them too, or a
+    decision this module reported successful would be refused on the next restart -- the exact
+    false-failure class the torn-tail repair exists to avoid. An empty identity is the real case:
+    production identities are 64-character SHA-256 digests, but `decide` does not forbid an empty
+    one, so the replay must not either. The fix for a stricter reader is never a new write-time
+    refusal invented to justify it.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "")                      # an empty scan id is accepted
+    assert store.decide("owner-a", "", cr.SELECTED, "") == (cr.SELECTED, 1)
+    assert store.decide("owner-a", "x" * 64, cr.PENDING, "") == (cr.PENDING, 1)
+
+    recovered = cr.ReviewStore(directory)
+    assert recovered.get("") == (cr.SELECTED, 1), "an empty identity round-trips"
+    assert recovered.get("x" * 64) == (cr.PENDING, 1)
+    assert recovered.current_scan("owner-a") == ""
+    assert recovered.corrupt_records_discarded == 0, "nothing here is corruption"
+    recovered.compact()
+    again = cr.ReviewStore(directory)
+    assert again.get("") == (cr.SELECTED, 1), "and survives the snapshot too"
+    assert again.get("x" * 64) == (cr.PENDING, 1)

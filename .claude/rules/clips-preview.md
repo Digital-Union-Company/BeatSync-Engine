@@ -263,9 +263,29 @@ count on an `OSError`.
 **The old claim that "a torn write can only damage the last line" was wrong.** Because the journal
 is `O_APPEND` and a record is one line, an append landing after a newline-less tail merges with it
 into a single unparsable line — so a *later, fully successful* decision was silently destroyed
-too. `_append` therefore closes off an unterminated tail with a newline before writing after it
+too. `_append` therefore closes off an unterminated tail before writing after it
 (`journal_tails_repaired` counts it). The damaged record becomes a self-contained discardable
 line, every fully committed record before it is preserved, and the next record is intact.
+
+[R5-P13 / N7-R2] **The repair writes durable evidence, appended onto the damaged fragment, and
+the order within that one write is load-bearing.** It appends
+`{"k":"tail-repaired","at":…}` followed by the newline — the marker *first*, the terminator last.
+Two reasons, and both were measured rather than reasoned:
+
+* A bare newline is indistinguishable from external corruption of a historical record, which is
+  the thing recovery must now refuse (below). Once a fragment has been closed off it is no longer
+  the final line, so a rule of "only the last line may be damaged" would refuse a store whose
+  later decision had **already been reported successful** — the N7 defect's false-failure mirror.
+* `_write_all` guarantees all-the-bytes-or-a-raise per call but **not** atomicity across an
+  interruption. Writing `"\n" + marker` has a one-byte hole: interrupted after the newline alone,
+  the fragment is terminated and undocumented, the next append sees a *terminated* tail and writes
+  no marker, and the restart after that refuses a reported success. With the marker first, every
+  prefix of the write leaves the fragment still unterminated — hence still the torn tail — and the
+  next append repairs it again. `test_n7r2_an_interrupted_repair_still_recovers_every_reported_success`
+  walks every prefix, and the mutation that restores newline-first order fails seven tests.
+
+Do not move the newline to the front, do not split the repair into two writes, and do not put the
+marker on a line of its own: the evidence must be attached to the damage it accounts for.
 
 A reported success now means the complete record is on disk and recoverable. **A write that fails
 raises `PersistenceError` and the endpoint answers 503** — the operator must never see a tick for
@@ -274,12 +294,15 @@ a decision that is not on disk. Do not swallow it, and do not reintroduce a sing
 
 [R5-P5 / N2 · R5-P7 / N6] **Failing to *inspect* the journal is not an answer either.** The tail
 probe raises `PersistenceError` when it cannot determine whether the tail is terminated: an
-unknown journal state is not a licence to append, nor to assume damage and write a repair newline
-into a file whose condition could not be read.
+unknown journal state is not a licence to append, nor to write a repair into a file whose
+condition could not be read.
 
 ### Start-up recovery is all-or-nothing, and an incomplete one is never compacted
 
-[R5-P11 / N7] **This closes a confirmed permanent loss of committed decisions.** Earlier reports
+[R5-P11 / N7] **This closed one half of a confirmed permanent loss of committed decisions — the
+half where a state file could not be *read*.** The other half, readable state this build cannot
+account for, stayed open until R5-P13; read the next subsection with this one, and do not restore
+any claim that R5-P11 alone eliminated N7. Earlier reports
 and an earlier version of this rule called it transient under-reporting that "loses no decision
 and self-heals on a later readable start". That was **wrong**, and the correction matters more
 than the wording: an independent review reproduced the loss, and the R5-P11 remediation
@@ -315,21 +338,82 @@ itself sufficient. **Nothing in `_load` writes**, so a refused load leaves both 
 byte-for-byte as they were and a later healthy attempt recovers everything, at the original
 revisions, with the scan state restored and no manual repair.
 
-**Six conditions, kept distinct.** Conflating any two of them is how this defect was reached:
+### A readable file is not necessarily a recoverable file
+
+[R5-P13 / N7-R1 · N7-R2] **R5-P11 closed this for files that could not be *read*. It left the loss
+route fully open for files that could be read but not accounted for, and an independent review
+measured both halves on the frozen candidate.** The rule's earlier claim — that recovery is
+complete whenever both files are readable, and that corruption tolerance is safely bounded to
+"statements about content" — was wrong, and it was wrong in the direction that destroys data.
+
+* **N7-R1, the decisive one.** Three decisions were committed and compacted. The snapshot was
+  valid JSON and still held all three complete records, plus one entry missing its `decision`.
+  Materialising the records raised, the **whole** snapshot was discarded, `_recovered` was set, a
+  new decision was accepted, and `compact()` replaced a 381-byte snapshot
+  (`efdac66e…`) with a 144-byte one (`929bbca7…`) holding none of the three. Restart read all
+  three as `PENDING, 0`. The automatic 2,000-record `maybe_compact()` did the same with **no
+  operator action at all**.
+* **N7-R2.** One committed decision's journal line was replaced by malformed content while later
+  valid decisions remained: the line was skipped, recovery was declared complete, and compaction
+  truncated the 313 bytes that still held it. A JSON-decodable `decide` event with no `identity`
+  did the same while leaving `corrupt_records_discarded` at **0**, so even the counter said nothing
+  was wrong. A non-numeric revision escaped as a bare `ValueError` and non-UTF-8 bytes as a
+  `UnicodeDecodeError` — outside the typed refusal both boundaries are built on.
+
+**The invariant, stated so it cannot be satisfied by accident: a store may become writable and
+compactable only when it can JUSTIFY that the whole persisted record has been accounted for.**
+Reaching end of file is not that justification. Neither is a corruption counter, a readable
+journal, a plausible set of decisions, or a matching count.
+
+**Why an unusable snapshot cannot be tolerated by reading more carefully.** `compact()` truncates
+the journal, so **whenever a snapshot exists at all, the journal is by construction only the delta
+written since that snapshot landed.** A readable journal is therefore indistinguishable from a
+readable *whole history* except by knowledge the store does not have. This format carries no
+genesis marker and no provenance, and inventing one implicitly is how the same defect returns
+wearing a check — so an unusable snapshot **fails closed**. The case where the journal genuinely
+is complete refuses too, deliberately and with a test that says so; nothing is lost by it, because
+nothing is written and removing the damaged snapshot recovers everything from the journal alone.
+
+**Conditions, kept distinct.** Conflating any two of them is how this defect was reached, twice:
 
 | Condition | Answer |
 |---|---|
 | Both files genuinely absent | a fresh store; ordinary first run |
-| Snapshot content is not usable JSON | discarded, the journal replays (the R5-P3 tolerance) |
-| A torn final journal line | that one line discarded, everything before it preserved |
-| A complete, readable journal | replayed in full |
+| A valid snapshot, with or without later journal events | replayed in full |
+| Snapshot content that cannot be accounted for — bad JSON, bad structure, an unknown decision, a non-integer revision, bad UTF-8 | `PersistenceError`, nothing written |
+| An **unterminated** final journal line | that one line discarded, everything before it preserved (F4) |
+| An unreadable journal line that **is** terminated, anywhere in the file | `PersistenceError`, nothing written |
+| An unreadable line carrying its own attached `tail-repaired` marker | discarded; the repair already accounted for it |
+| A parsable event with a schema or kind this build cannot account for | `PersistenceError`, nothing written |
+| A journal that is not valid UTF-8 | `PersistenceError`, nothing written |
 | A temporary I/O failure (lock, ACL, device, unresolved pathname) | `PersistenceError`, nothing written |
 | A replay that cannot be shown to be complete | `PersistenceError`, nothing written |
 
-A transient read failure is **not** corruption — that conflation *was* the defect. Corruption
-tolerance is deliberately bounded to statements about *content*: unusable bytes on disk are a
-definite finding, a read that failed is not. And N7 is never "fixed" by discarding a snapshot or
-deleting journal data; the retained bytes are what the retry recovers from.
+Two of those rows carry reasoning that is easy to lose:
+
+* **Terminated damage is not a torn write.** `_append` writes a record and its newline in one
+  `_write_all`, which writes every byte or raises — so a line this process terminated is a line it
+  wrote in full, and a full record parses. Terminated damage is therefore external, may well have
+  stood for a committed decision, and refuses wherever it sits. An earlier draft of this fix
+  tolerated the whole trailing *run* of unreadable lines; that laundered a corrupted historical
+  record whenever a torn tail happened to follow it, and the first compaction after the next repair
+  truncated it away.
+* **A parsable event was written whole.** Truncating one of this writer's records always leaves
+  JSON that will not parse, so strictness about schema costs the torn-tail tolerance nothing. The
+  two concerns are kept in separate methods on purpose: damage is `_replay_journal`'s business,
+  meaning is `_apply`'s. `at` is the only optional field, because it is display metadata rather
+  than part of the decision. A validator this strict must not reject the writer, which
+  `test_n7_every_event_this_module_writes_satisfies_its_own_replay_validator` pins.
+
+A transient read failure is **not** corruption, and corruption is **not** a licence to publish an
+empty history. N7 is never "fixed" by discarding a snapshot or deleting journal data: **the
+retained bytes are what the retry recovers from, and a refused load writes nothing at all**, so
+every forensic byte of both copies survives the refusal. The only bytes compaction may ever erase
+are ones that never represented a reported success — an unterminated fragment, or one already
+closed off by its own marker.
+
+There is **no migration concern** from this tightening: R5 is unmerged, so no deployed install has
+ever written a `state/clips-review/` journal or snapshot.
 
 **Absence is established from the directory listing, not inferred from a failure.** Do **not** use
 `os.path.exists` or `os.path.lexists` as evidence that a state file is safely absent: they answer
@@ -360,6 +444,14 @@ be produced. `/r5decide` and `/r5state` deliberately do **not** catch it: the mi
 answers that class with a path-free `503 not_durably_recorded`, which is the correct answer for a
 classification that cannot be read or written, and catching it would make an unreadable record
 indistinguishable from an ordinary refusal.
+
+[R5-P13] **No view-layer change was needed for the stricter contract, and that is the point.**
+Every new condition raises the same `PersistenceError` from the same constructor, so the handler
+and middleware paths above cover them unmodified — which the GUI and HTTP tests assert against
+*genuinely corrupt bytes*, with no fault injection at all. Read the operator wording as "could not
+be read **as a complete record**": that is what it now means, and it is still the honest thing to
+say, because the alternative reading an operator might make — a folder nobody has reviewed — is
+exactly what it exists to prevent.
 
 **The carve-out for a missing journal is conditioned on the open descriptor, never on the error
 class.** "The file is not there" is a definite answer only when no append is in flight.

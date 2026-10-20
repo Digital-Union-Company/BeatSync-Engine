@@ -23,6 +23,7 @@ The code under test is the shipped source, byte for byte -- not a reimplementati
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import secrets
@@ -1352,3 +1353,134 @@ def test_n7_the_decision_and_state_routes_let_the_503_contract_answer():
         assert "OSError" not in caught, f"{name} must not contain a bare I/O failure either"
         assert "_clips_unavailable_outputs" not in ast.unparse(node), (
             f"{name} returns JSON, not GUI outputs")
+
+
+# ---- R5-P13 / N7-R1 + N7-R2: the same refusal, for state that is READABLE but unaccountable ---
+#
+# The R5-P11 handler contract above was measured against files that could not be *read*. R5-P12
+# found the other half still open: a readable snapshot or journal that this build cannot account
+# for used to produce a store that looked healthy, reported every decided clip as undecided, and
+# then compacted the loss into the snapshot. The storage layer now refuses those too, with the same
+# `PersistenceError`, so these handlers need no new code -- which is the claim these tests make.
+#
+# Note what is NOT injected here: nothing. The state on disk is genuinely corrupt, so this is the
+# strongest form of this evidence available without a browser.
+
+
+def _corrupt_a_committed_journal_line(store):
+    """Damage one *historical* committed decision, leaving the later ones valid and readable.
+
+    Terminated damage, deliberately: that is the shape R5-P12 reproduced, and the shape that used
+    to be skipped silently rather than refused.
+    """
+    with open(store.journal_path, "rb") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    assert len(lines) >= 4, lines
+    lines[2] = b"{ damaged committed record\n"
+    with open(store.journal_path, "wb") as handle:
+        handle.write(b"".join(lines))
+    return lines
+
+
+def test_n7r2_scan_refuses_for_a_readable_but_unaccountable_record(world):
+    """Scan, against real corruption rather than a denied read.
+
+    Every assertion of case 16 has to hold for this condition too, because the operator-visible
+    consequence is identical: a grid of undecided tiles over a folder that was reviewed.
+    """
+    state_dir = str(world["tmp"] / "state")
+    seed, expected = _seed_decisions(state_dir)
+    namespace = world["ns"]
+    _corrupt_a_committed_journal_line(seed)
+    before = _durable_bytes(seed)
+    assert namespace["_CLIPS_STORE"] is None
+
+    report, grid, counts, confirm = _scan(world, "browser-n7r2-scan")
+
+    assert "could NOT be read" in report, report
+    assert confirm == {"interactive": False}
+    assert "r5-tile" not in grid, "not one clip may be painted as undecided"
+    assert "Nothing scanned yet" not in grid
+    assert "unavailable" in counts.lower(), counts
+    assert namespace["_CLIPS_STORE"] is None, "a refusal must not be cached"
+    assert namespace["_CLIPS_SCANS"].stats()["generations_issued"] == 0, (
+        "no authoritative generation may be minted from an unaccountable record")
+    assert namespace["_CLIPS_REGISTRY"].stats()["sessions"] == 0
+    assert _durable_bytes(seed) == before, "a refused scan writes nothing, so nothing is lost"
+
+    for secret in (seed.journal_path, seed.snapshot_path, state_dir):
+        for text in (report, grid, counts):
+            assert not _leaks_path(text, secret), f"a path reached the operator: {text[:200]!r}"
+    assert "review-journal" not in report and ".jsonl" not in report
+
+
+def test_n7r2_refresh_and_confirm_refuse_for_a_readable_but_unaccountable_record(world):
+    """Refresh and Confirm, with a live page on screen and real corruption underneath it.
+
+    The control arm runs first, so the refusal is measured against a page that genuinely did
+    report "Kept 3" a moment earlier.
+    """
+    namespace = world["ns"]
+    owner = "browser-n7r2-refresh"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    assert view.get("entries")
+    store = namespace["_clips_store"]()
+    for entry in view["entries"]:
+        assert namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                          {"to": cr.SELECTED, "rev": 0})["ok"]
+
+    healthy_grid, healthy_counts, healthy_confirm = namespace["_on_clips_refresh"](
+        world["request"](session_hash=owner))
+    assert healthy_confirm == {"interactive": True}, "the control arm must really be positive"
+    assert "Kept 3" in healthy_counts, healthy_counts
+
+    _corrupt_a_committed_journal_line(store)
+    before = _durable_bytes(store)
+    namespace["_CLIPS_STORE"] = None
+
+    grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+
+    assert confirm == {"interactive": False}, "Confirm must fail closed"
+    assert "r5-tile" not in grid, "a decided clip may never be repainted as undecided"
+    assert "could NOT be read" in grid
+    assert "unavailable" in counts.lower(), counts
+    assert "could NOT be read" in confirmation, confirmation
+    for forbidden in ("NOT enabled", "Recorded:", "are still undecided"):
+        assert forbidden not in confirmation, f"no readiness claim may be made ({forbidden})"
+    assert namespace["_CLIPS_STORE"] is None, "neither surface cached the refusal"
+    assert _durable_bytes(store) == before
+
+
+def test_n7r2_an_unaccountable_snapshot_also_refuses_every_surface(world):
+    """The N7-R1 shape at the handler boundary: a compacted store with a damaged snapshot.
+
+    After compaction the journal is empty, so this is the case where discarding the snapshot
+    discards the whole record -- and the GUI would have shown it as a folder nobody had reviewed.
+    """
+    state_dir = str(world["tmp"] / "state")
+    seed, expected = _seed_decisions(state_dir)
+    seed.compact()
+    assert os.path.getsize(seed.journal_path) == 0
+    snapshot = json.loads(open(seed.snapshot_path, encoding="utf-8").read())
+    snapshot["records"]["damaged-entry"] = {"revision": 1}
+    with open(seed.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    before = _durable_bytes(seed)
+    namespace = world["ns"]
+
+    report, grid, counts, confirm = _scan(world, "browser-n7r1-scan")
+    assert "could NOT be read" in report, report
+    assert confirm == {"interactive": False}
+    assert "r5-tile" not in grid
+    assert namespace["_CLIPS_STORE"] is None
+    assert _durable_bytes(seed) == before, "the only copy of the record is left untouched"
+
+    # Remove the one damaged entry and every seeded decision comes back, from the same bytes.
+    snapshot["records"].pop("damaged-entry")
+    with open(seed.snapshot_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    recovered = namespace["_clips_store"]()
+    for identity, value in expected.items():
+        assert recovered.get(identity) == value, "the refusal preserved a real record"
