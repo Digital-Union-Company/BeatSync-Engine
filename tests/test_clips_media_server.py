@@ -1478,3 +1478,136 @@ def test_n7r6_a_decision_after_a_torn_character_is_served_and_survives_a_restart
     status, _, body = call(app, f"/r5state/{world['session']}/{world['page']}")
     assert status == 200 and json.loads(body)["clips"][
         world["entries"][0].clip_id]["decision"] == "REJECTED"
+
+
+# ---- R5-P19 / N7-R7: an invalid byte in FRONT of a committed event ---------------------------
+#
+# The mirror image of the section above, and the one the suffix fix did not cover. An independent
+# review inserted one invalid byte *before* a whole committed decision event and removed that
+# event's newline. The readable prefix of such a line is empty, which the classifier scored as
+# "no complete record is hiding" rather than "nothing could be read", so the line was stamped as
+# repaired damage and the committed decision behind it was discarded: HTTP answered 200 ok:true
+# with counts, the previously accepted revision reopened as an older one, and the next compaction
+# erased the evidence. Both routes must refuse instead.
+
+def _prepend_an_invalid_byte(store, prefix=b"\xff", suffix=b""):
+    """Put unidentifiable bytes in FRONT of the final whole event and take its newline away."""
+    with open(store.journal_path, "rb") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    assert lines[-1].endswith(b"\n"), "the precondition: the event under test was written whole"
+    with open(store.journal_path, "wb") as handle:
+        handle.write(b"".join(lines[:-1]) + prefix + lines[-1].rstrip(b"\n") + suffix)
+
+
+@pytest.mark.parametrize("prefix,suffix", [
+    (b"\xff", b""),                                      # a byte no UTF-8 encoder can emit
+    (b"\xc3", b""),                                      # an incomplete two-byte sequence
+    (b"\xe2\x82", b""),                                  # an incomplete three-byte sequence
+    (b"\xff", b'{"k":"tail-repaired","at":1.0}'),        # ... already carrying a repair marker
+    (b"\xff", b"\xff"),                                  # ... damaged on both sides
+])
+def test_n7r7_a_warm_store_refuses_a_decision_behind_a_leading_invalid_byte(
+        world, tmp_path, prefix, suffix):
+    """**The mandated warm scenario.** Healthy store, published page, recorded decision, then
+    external corruption in front of that decision -- and another decision submitted to the *same*
+    cached store.
+
+    Pre-fix this answered `200 ok:true rev:1` with counts, and the accepted `REJECTED,2` reopened
+    as the older `SELECTED,1`. The marker row is the one the suffix fix could not reach at all:
+    the amnesty discarded the line without ever being able to see the record inside it.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    app, cache = _lazily_served(world, state_dir)
+
+    status, _, body = call(app, decide_url(world, 0), method="POST",
+                           headers={"Content-Type": "application/json"},
+                           body=b'{"to":"REJECTED","rev":1}')
+    assert status == 200 and json.loads(body)["rev"] == 2, body
+    assert cache["store"].get(identity) == (cr.REJECTED, 2), "the condition under test"
+
+    _prepend_an_invalid_byte(seeded, prefix, suffix)
+    before = _durable_bytes(seeded)
+
+    status, headers, body = call(app, decide_url(world, 1), method="POST",
+                                 headers={"Content-Type": "application/json"},
+                                 body=b'{"to":"SELECTED","rev":0}')
+
+    assert status == 503, f"never a success for an unrecoverable decision: {body}"
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload, (
+        "counts computed over a record that may already be lost are worse than no counts")
+    assert headers["cache-control"] == "no-store"
+    assert _durable_bytes(seeded) == before, "and not one byte was written"
+    text = body.decode("utf-8")
+    for secret in (seeded.journal_path, seeded.snapshot_path,
+                   os.path.dirname(seeded.journal_path)):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+
+
+@pytest.mark.parametrize("route", ["decide", "state"])
+def test_n7r7_a_cold_store_behind_a_leading_invalid_byte_refuses_on_both_routes(
+        world, tmp_path, route):
+    """The cold half. `/r5state` answered 200 with the stale pre-corruption decision, which is a
+    later recovery attempt returning an incomplete record as though it were authoritative."""
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    _prepend_an_invalid_byte(seeded)
+    before = _durable_bytes(seeded)
+
+    app, cache = _lazily_served(world, state_dir)
+    if route == "decide":
+        status, headers, body = call(app, decide_url(world, 1), method="POST",
+                                     headers={"Content-Type": "application/json"},
+                                     body=b'{"to":"REJECTED","rev":0}')
+    else:
+        status, headers, body = call(app, f"/r5state/{world['session']}/{world['page']}")
+
+    assert status == 503, body
+    payload = json.loads(body)
+    assert payload["ok"] is False and payload["code"] == "not_durably_recorded"
+    assert "clips" not in payload and "counts" not in payload
+    assert headers["cache-control"] == "no-store"
+    assert "store" not in cache, "a refusal must not be cached"
+    assert _durable_bytes(seeded) == before
+    text = body.decode("utf-8")
+    for secret in (seeded.journal_path, seeded.snapshot_path,
+                   os.path.dirname(seeded.journal_path)):
+        assert not _leaks(text, secret), f"a path reached the client: {text}"
+    assert "review-journal" not in text and ".jsonl" not in text
+
+
+def test_n7r7_removing_the_foreign_bytes_restores_the_decision_over_http(world, tmp_path):
+    """The refusal is an availability cost, never a loss: the record was there the whole time.
+
+    This is what distinguishes a conservative refusal from the behaviour it replaces. Pre-fix the
+    committed revision was gone from the journal by the time anyone looked; here it is still on
+    disk, byte for byte, and the route serves it again the moment the foreign byte is removed.
+    """
+    state_dir = str(tmp_path / "lazy-state")
+    seeded = _seed(state_dir, world["owner"])
+    identity = world["view"]["identity"][world["entries"][0].clip_id]
+    seeded.decide(world["owner"], identity, cr.SELECTED, "scan-1")
+    app, _ = _lazily_served(world, state_dir)
+    call(app, decide_url(world, 0), method="POST",
+         headers={"Content-Type": "application/json"}, body=b'{"to":"REJECTED","rev":1}')
+    with open(seeded.journal_path, "rb") as handle:
+        healthy = handle.read()
+
+    _prepend_an_invalid_byte(seeded)
+    cold, _ = _lazily_served(world, state_dir)
+    assert call(cold, f"/r5state/{world['session']}/{world['page']}")[0] == 503
+
+    with open(seeded.journal_path, "wb") as handle:
+        handle.write(healthy)
+    repaired, _ = _lazily_served(world, state_dir)
+    status, _, body = call(repaired, f"/r5state/{world['session']}/{world['page']}")
+    assert status == 200
+    assert json.loads(body)["clips"][world["entries"][0].clip_id] == {
+        "decision": "REJECTED", "rev": 2}, "the committed revision was never destroyed"

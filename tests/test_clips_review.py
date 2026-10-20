@@ -3955,10 +3955,19 @@ def test_n7r3_the_tail_classifier_tells_the_four_shapes_apart(tmp_path, shape, e
 
 
 def test_n7r3_a_tail_that_is_not_utf8_is_genuine_damage(tmp_path):
-    """A torn write can stop mid multi-byte sequence. Not text, so not a whole record."""
+    """A torn write can stop mid multi-byte sequence. Not text, so not a whole record.
+
+    [R5-P19 / N7-R7] The *genuine* shape is the one the writer can produce, and ``\\xff\\xfe`` is
+    not it: ``0xff`` is not a UTF-8 lead byte at all, so no encoder in this process emits it and
+    no tear can leave it behind. It is now ``unaccounted_damage`` -- a refusal -- while a real
+    truncated character is still ``torn_fragment``. Both halves are asserted here so that
+    "unreadable" and "unfinished" cannot be collapsed back into one answer.
+    """
     store = cr.ReviewStore(str(tmp_path / "state"))
     assert store._classify_unterminated_tail(                      # noqa: SLF001 - white box
-        b'{"k":"decide","identity":"\xff\xfe') == "torn_fragment"
+        b'{"k":"decide","identity":"\xff\xfe') == "unaccounted_damage"
+    assert store._classify_unterminated_tail(                      # noqa: SLF001 - white box
+        b'{"k":"decide","identity":"\xe2\x82') == "torn_fragment"
 
 
 def test_n7r3_every_event_the_writer_emits_classifies_as_a_complete_record(tmp_path):
@@ -4349,19 +4358,34 @@ def test_n7r6_a_complete_record_with_an_invalid_byte_after_it_refuses_both_ways(
     (b'{"k":"decide","identity":"clip-\xc3', "torn_fragment"),
     (b'{"k":"decide","identity":"clip-\xe2\x82', "torn_fragment"),
     (b'{"k":"decide","identity":"clip-\xf0\x9f\x98', "torn_fragment"),
-    (b'{"k":"decide","identity":"\xff\xfe', "torn_fragment"),
-    (b"\xff\xfe", "torn_fragment"),
+    (b'{"k":"decide","identity":"\xff\xfe', "unaccounted_damage"),
+    (b"\xff\xfe", "unaccounted_damage"),
     (_VALID_DECIDE + b"\xff", "trailing_bytes"),
     (_VALID_DECIDE + b"\xc3", "trailing_bytes"),
     (b'{"k":"tail-repaired","at":1.0}\xff', "trailing_bytes"),
-    (b'   \xff', "torn_fragment"),
+    (b'   \xff', "unaccounted_damage"),
+    # [R5-P19 / N7-R7] The mandated shape: an intact committed event BEHIND the damage. The
+    # readable prefix is empty, which is "nothing could be read", not "nothing is hiding".
+    (b"\xff" + _VALID_DECIDE, "unaccounted_damage"),
+    (b"\xc3" + _VALID_DECIDE, "unaccounted_damage"),
+    (b"\xff" + _VALID_DECIDE + b'{"k":"tail-repaired","at":1.0}', "unaccounted_damage"),
+    (b"\xff" + _VALID_DECIDE + b"\xff", "unaccounted_damage"),
+    # ... and behind a GENUINE truncated character, which the readable prefix does see past.
+    (b'{"a":"\xe2\x82' + _VALID_DECIDE, "unaccounted_damage"),
+    (b"{\xff" + _VALID_DECIDE, "unaccounted_damage"),
 ])
 def test_n7r6_the_classifier_tells_a_torn_character_from_a_hidden_record(
         tmp_path, raw, expected_kind):
-    """The byte-level half of the four-shape table. R5-P15 answered `torn_fragment` to all of it.
+    """The byte-level half of the shape table. R5-P15 answered `torn_fragment` to all of it.
 
     The `trailing_bytes` rows are the ones that matter: a complete record is hiding behind bytes
     nothing can identify, so it may be a committed decision and nothing may be written over it.
+
+    [R5-P19 / N7-R7] `unaccounted_damage` is the same refusal reached from the other side. R5-P17
+    answered `torn_fragment` by elimination wherever it could not *find* a reason to refuse, and
+    an empty readable prefix guarantees it cannot find one -- so an invalid byte in front of an
+    intact committed event scored as "unfinished write" and the record behind it was discarded.
+    A fragment is torn only where it can be shown to be torn.
     """
     store = cr.ReviewStore(str(tmp_path / "state"))
     before = dict(store._records)                                  # noqa: SLF001 - white box
@@ -4535,3 +4559,350 @@ def test_n7r6_an_oversized_undecodable_tail_is_refused_rather_than_repaired(tmp_
     assert not _mentions(str(failure.value), live.journal_path)
     assert _state_bytes(live) == before, "a refused append writes nothing"
     assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0
+
+
+# =============================================================================================
+# R5-P19 / N7-R7 -- unidentifiable bytes IN FRONT OF a committed record
+# =============================================================================================
+#
+# N7-R6 closed "a whole record followed by bytes nothing can identify". The mirror image stayed
+# open, and an independent review measured it: one invalid byte inserted *before* a whole
+# committed decision event, with that event's newline removed. `_longest_text_prefix` reads from
+# offset zero, so the readable prefix of such a line is **empty** -- and empty was being scored as
+# "no complete record is hiding here" when what it actually means is "nothing could be read at
+# all". Cold recovery reported the committed identity as PENDING,0, a warm `decide()` returned
+# SELECTED,1, the repair stamped the intact record as accounted-for damage, and `compact()`
+# truncated the journal and snapshotted the loss.
+#
+# The correction replaces elimination with a positive test. An unterminated line this writer left
+# behind is, and can only be,
+#
+#     <proper prefix of one record>  [<one truncated multi-byte character>]  <marker prefixes>
+#
+# because `_write_all` writes every byte or raises and the newline is the last byte of both the
+# record payload and the marker payload. Anything that does not fit that template is damage this
+# process cannot have caused, and what is hiding inside it cannot be reasoned about -- so it is
+# refused, never discarded. Automatic recovery from externally corrupted leading bytes is not
+# attempted and is not claimed.
+
+_LEADING_SHAPES = [
+    ("ff", b"\xff", b""),                               # not a UTF-8 lead byte at all
+    ("incomplete-2", b"\xc3", b""),                     # the first byte of 'e-acute'
+    ("incomplete-3", b"\xe2\x82", b""),                 # the first two bytes of 'euro'
+    ("incomplete-4", b"\xf0\x9f\x98", b""),             # the first three bytes of an emoji
+    ("several", b"\xff\xfe\xfd", b""),                  # multiple invalid bytes
+    ("before-and-after", b"\xff", b"\xff"),             # damaged on both sides of the event
+    ("before-and-torn-after", b"\xff", b"\xc3"),
+    ("before-a-marker", b"\xff", b'{"k":"tail-repaired","at":1.0}'),
+    ("before-a-partial-marker", b"\xff", b'{"k":"tail-rep'),
+    ("brace-then-ff", b"{\xff", b""),                   # a plausible-looking opening byte
+    ("after-a-real-torn-character", b'{"a":"\xe2\x82', b""),
+    ("hidden-in-head", b"{x", b"\xc3"),                 # whole record INSIDE a readable prefix
+]
+
+
+def _leading(store, prefix, suffix=b"", terminated=False):
+    """Put ``prefix`` in front of the journal's final whole event and ``suffix`` behind it.
+
+    The event itself is copied byte for byte, so whatever the reader decides about the line, the
+    committed record it holds is demonstrably still on disk.
+    """
+    lines = _journal_lines(store)
+    assert lines[-1].endswith(b"\n"), "the precondition: the last event was written whole"
+    event = lines[-1].rstrip(b"\n")
+    tail = prefix + event + suffix + (b"\n" if terminated else b"")
+    _rewrite_journal(store, lines[:-1] + [tail])
+    return event
+
+
+@pytest.mark.parametrize("label,prefix,suffix", _LEADING_SHAPES,
+                         ids=[shape[0] for shape in _LEADING_SHAPES])
+def test_n7r7_a_committed_event_behind_leading_damage_is_refused_not_discarded(
+        tmp_path, label, prefix, suffix):
+    """**The mandated reproduction, as a regression.** Cold and warm, with the full destructive
+    sequence run afterwards so a future regression fails on measured loss rather than on a
+    convenient exception.
+
+    Every refusal is checked against all six conditions the correction owes: no success, no
+    appended byte, no revision movement, byte-identical journal and snapshot, the committed record
+    still readable once the foreign bytes are removed, and a typed, path-free message.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    live = cr.ReviewStore(directory)                 # warmed while the record was still whole
+    assert live.get("clip-2") == expected["clip-2"]
+    original = _journal_lines(store)
+    _leading(store, prefix, suffix)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None, "a fresh construction must refuse"
+    assert after == damaged, "and the destructive sequence must not have run at all"
+
+    with pytest.raises(cr.PersistenceError) as load_failure:
+        cr.ReviewStore(directory)
+    assert not _mentions(str(load_failure.value), store.journal_path)
+    assert "review-journal" not in str(load_failure.value)
+
+    with pytest.raises(cr.PersistenceError) as append_failure:
+        live.decide("owner-a", "clip-new", cr.SELECTED, "scan-1")
+    assert not _mentions(str(append_failure.value), store.journal_path)
+    assert _state_bytes(store) == damaged, "a refused append writes nothing"
+    assert live.get("clip-new") == (cr.PENDING, 0), "and advances no revision"
+    assert live.journal_tails_repaired == 0 and live.journal_tails_completed == 0
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory).compact()
+    assert _state_bytes(store) == damaged, "and no compaction can erase unverified history"
+
+    _rewrite_journal(store, original)                # the record was never destroyed
+    recovered = _assert_fully_recovered(directory, expected)
+    assert recovered.corrupt_records_discarded == 0
+
+
+@pytest.mark.parametrize("label,prefix,suffix", _LEADING_SHAPES,
+                         ids=[shape[0] for shape in _LEADING_SHAPES])
+def test_n7r7_leading_damage_is_refused_with_the_final_newline_still_present(
+        tmp_path, label, prefix, suffix):
+    """The same shapes with the terminator intact. A *terminated* damaged line was already
+    refused, and must stay refused: this is the preserved half, pinned so the new classification
+    cannot accidentally turn an existing refusal into an acceptance."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    _leading(store, prefix, suffix, terminated=True)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None and after == damaged
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    assert not _mentions(str(failure.value), store.journal_path)
+    assert ".jsonl" not in str(failure.value)
+
+
+@pytest.mark.parametrize("kind", ["scan", "decide"])
+def test_n7r7_leading_damage_is_refused_on_either_event_kind(tmp_path, kind):
+    """Both shapes the writer emits, since neither is more trustworthy than the other behind
+    bytes that cannot be identified."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    if kind == "scan":
+        store.begin_scan("owner-a", "scan-2")        # a scan event is now the final line
+        assert json.loads(_journal_lines(store)[-1])["k"] == "scan"
+    else:
+        assert json.loads(_journal_lines(store)[-1])["k"] == "decide"
+    _leading(store, b"\xff")
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None and after == damaged
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)
+
+
+def test_n7r7_leading_damage_in_a_terminated_historical_line_is_refused(tmp_path):
+    """N7-R2's rule, reached through the new classifier: damage in the middle of the file, with
+    valid committed events after it, is external corruption wherever it sits."""
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    lines = _journal_lines(store)
+    lines.insert(2, b"\xff" + lines[1].rstrip(b"\n") + b"\n")
+    _rewrite_journal(store, lines)
+    damaged = _state_bytes(store)
+
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None and after == damaged
+    with pytest.raises(cr.PersistenceError) as failure:
+        cr.ReviewStore(directory)
+    message = str(failure.value)
+    assert "byte offset" in message, "the N7-R2 diagnosability contract is kept"
+    assert not _mentions(message, store.journal_path) and ".jsonl" not in message
+
+
+def test_n7r7_a_readable_but_unidentifiable_prefix_is_refused_too(tmp_path):
+    """The text twin of the same loss. `_tail_hides_a_complete_record` also looks only from
+    offset zero, so decodable junk in front of a whole committed event reached `torn_fragment`
+    by the same route, with the same consequence.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    original = _journal_lines(store)
+    for prefix in (b"xx", b"{x", b'{"k":'):
+        _rewrite_journal(store, original)
+        _leading(store, prefix)
+        damaged = _state_bytes(store)
+        incomplete, after = _destructive_sequence(directory, store)
+        assert incomplete is None, f"{prefix!r} must refuse"
+        assert after == damaged
+    _rewrite_journal(store, original)
+    _assert_fully_recovered(directory, expected)
+
+
+def test_n7r7_the_whole_loss_sequence_cannot_be_reached(tmp_path):
+    """The exact sequence the independent review ran, end to end, asserted at every stage.
+
+    decide -> corrupt -> cold read -> warm decide -> restart -> compact -> restart. Pre-fix the
+    cold read already reported the committed identity as PENDING,0 and every later stage made
+    that worse; here every stage refuses and the bytes never move.
+    """
+    directory = str(tmp_path / "state")
+    store = cr.ReviewStore(directory)
+    store.begin_scan("owner-a", "scan-1")
+    store.decide("owner-a", "earlier", cr.SELECTED, "scan-1")
+    assert store.decide("owner-a", "committed", cr.SELECTED, "scan-1") == (cr.SELECTED, 1)
+    _leading(store, b"\xff")
+    damaged = _state_bytes(store)
+
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)                               # cold
+    with pytest.raises(cr.PersistenceError):
+        store.decide("owner-a", "later", cr.SELECTED, "scan-1")  # warm
+    assert store.get("later") == (cr.PENDING, 0)
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)                               # restart
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory).compact()                     # compaction
+    with pytest.raises(cr.PersistenceError):
+        cr.ReviewStore(directory)                               # restart again
+    assert _state_bytes(store) == damaged, "not one byte moved across the whole sequence"
+    assert damaged["snapshot"] is None, "and no snapshot was ever written"
+    assert b'"committed"' in damaged["journal"], "the committed record is still on disk"
+
+
+def test_n7r7_a_genuine_tear_behind_a_leading_byte_is_still_not_recoverable_evidence(tmp_path):
+    """A real interrupted write, then external corruption in front of the *same* fragment.
+
+    The fragment on its own is a torn tail this build repairs. With a leading invalid byte it is
+    no longer anything this writer produced, so the repair must not fire -- otherwise "corrupt the
+    front of a torn fragment" would be a way to launder external damage into tolerated damage.
+    """
+    directory = str(tmp_path / "state")
+    store, expected = _committed(directory)
+    with open(store.journal_path, "ab") as handle:
+        handle.write(b'{"k":"decide","identity":"clip-\xe2\x82')
+    torn = _assert_fully_recovered(directory, expected)
+    assert torn.corrupt_records_discarded == 1, "the precondition: this alone is a torn tail"
+
+    lines = _journal_lines(store)
+    _rewrite_journal(store, lines[:-1] + [b"\xff" + lines[-1]])
+    damaged = _state_bytes(store)
+    incomplete, after = _destructive_sequence(directory, store)
+    assert incomplete is None and after == damaged
+
+
+# ---- the discriminator itself, as a table ----------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    (b"", False),
+    (b"\xc3", True), (b"\xe2", True), (b"\xe2\x82", True),
+    (b"\xf0", True), (b"\xf0\x9f", True), (b"\xf0\x9f\x98", True),
+    (b"\xe0\xa0", True), (b"\xed\x9f", True), (b"\xf4\x8f", True),
+    (b"\xc3\xa9", False),                    # a WHOLE character would have decoded
+    (b"\xe2\x82\xac", False),
+    (b"\xff", False), (b"\xfe", False), (b"\xc0", False), (b"\xc1", False), (b"\xf5", False),
+    (b"\x80", False),                        # a bare continuation byte leads nothing
+    (b"\xe0\x80", False),                    # overlong three-byte
+    (b"\xed\xa0", False),                    # a surrogate half
+    (b"\xf0\x8f", False),                    # overlong four-byte
+    (b"\xf4\x90", False),                    # past U+10FFFF
+    (b"\xe2{", False),                       # a lead byte with a non-continuation after it
+    (b"a", False),
+])
+def test_n7r7_only_a_well_formed_partial_character_counts_as_a_tear(raw, expected):
+    """What an interrupted write can leave in the middle of a character, and nothing else.
+
+    A strict decode cannot answer this -- an incomplete sequence and an invalid one both raise
+    with the same `start` and `end` -- which is precisely how `0xff` came to be read as a tear.
+    """
+    assert cr.ReviewStore._is_truncated_character(raw) is expected   # noqa: SLF001 - white box
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("", False),                                  # **the N7-R7 defect, as a unit assertion**:
+    #                                               "nothing could be read" is not "nothing hides"
+    ("{", True),
+    ('{"k":"decide","identity":"cli', True),
+    ('{"k":"tail-repaired","at":', True),
+    ('{"k":"decide","identity":"a"}', False),     # a whole value is not an unfinished one
+    ('xx{"k":"decide","identity":"a"}', False),   # junk in front of a whole record
+    ('{x{"k":"decide","identity":"a"}', False),   # ... with a plausible-looking first byte
+    ("   ", False),
+    ("[1,2", False),                              # this writer emits objects, never arrays
+])
+def test_n7r7_an_unfinished_record_is_a_prefix_of_one_and_nothing_else(text, expected):
+    """The readable half of the template, as a table.
+
+    An **empty** answer is the one that matters: `_longest_text_prefix` returns it whenever the
+    first byte is invalid, and reading it as "no complete record is hiding" is the whole N7-R7
+    loss. The last three rows are the interior probe: a whole record behind unidentifiable bytes
+    is a reason to refuse wherever in the fragment it sits.
+    """
+    assert cr.ReviewStore._is_an_unfinished_record(text) is expected   # noqa: SLF001
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("", True),
+    ('{"k":"tail-repaired","at":1.0}', True),
+    ('{"k":"tail-r', True),                                      # interrupted inside the opening
+    ('{"k":"tail-repaired","at":', True),                        # interrupted before the number
+    ('{"k":"tail-repaired","at":17', True),                      # interrupted inside the number
+    ('{"k":"tail-repaired","at":1.0}{"k":"tail-repaired","at":2.0}', True),
+    ('{"k":"tail-repaired","at":{"k":"tail-repaired","at":2.0}', True),   # measured, real writer
+    ('{"k":"tail-r{"k":"tail-repaired","at":2.0}', True),                 # measured, real writer
+    ('{"k":"tail-repaired","at":1.0} { damaged }', False),
+    ('{"k":"tail-repaired"}', False),                            # no 'at' field at all
+    ('{"k":"tail-repaired","at":"later"}', False),
+    ('{"k":"decide","identity":"a"}', False),                    # a record is not repair evidence
+    (' ', False),
+])
+def test_n7r7_only_repair_markers_may_follow_a_torn_character(text, expected):
+    """What the writer can append *behind* a torn fragment, and nothing else -- which is what
+    refuses a whole committed event hidden behind a genuine truncated character.
+
+    Not a second marker validator: `_damage_is_accounted_for` still decides, alone, whether a
+    complete marker accounts for damage. This only bounds what may be *present*.
+    """
+    assert cr.ReviewStore._is_repair_evidence_so_far(text) is expected   # noqa: SLF001
+
+
+def test_n7r7_a_fragment_whose_interior_cannot_be_ruled_out_fails_closed(tmp_path):
+    """The probe ceiling is a refusal, not a shortcut.
+
+    A record this writer emits has no interior object, so the ceiling is unreachable in practice.
+    If it ever is reached, "I ran out of budget before I could rule out a hidden record" has to
+    mean the same thing as "there is one".
+    """
+    fragment = '{"a":"' + "{" * (cr.MAX_HIDDEN_RECORD_PROBES + 1)
+    assert not cr.ReviewStore._is_an_unfinished_record(fragment)   # noqa: SLF001 - white box
+    assert cr.ReviewStore._is_an_unfinished_record(                # noqa: SLF001 - white box
+        '{"a":"' + "{" * (cr.MAX_HIDDEN_RECORD_PROBES - 1)), "below the ceiling it still answers"
+
+
+def test_n7r7_the_writer_and_the_reader_agree_on_every_real_torn_prefix(tmp_path):
+    """Writer/reader agreement, from the REAL write path, for all three mandatory characters.
+
+    `_classify_unterminated_tail` is the append side and `_replay_journal` is the read side; a
+    disagreement between them is how a success gets published that the next start cannot honour.
+    Both are asked about the same bytes, at every proper prefix of every character.
+    """
+    for character in ("é", "€", "\U0001f600"):
+        encoded = character.encode("utf-8")
+        for keep in range(1, len(encoded)):
+            directory = str(tmp_path / f"state-{character!r}-{keep}")
+            store, expected = _committed(directory)
+            with open(store.journal_path, "ab") as handle:
+                handle.write(b'{"k":"decide","identity":"clip-' + encoded[:keep])
+
+            assert store._classify_unterminated_tail(              # noqa: SLF001 - white box
+                _journal_lines(store)[-1]) == "torn_fragment"
+            live = _assert_fully_recovered(directory, expected)
+            assert live.corrupt_records_discarded == 1
+            live.begin_scan("owner-a", "scan-2")
+            assert live.decide("owner-a", "after", cr.SELECTED, "scan-2") == (cr.SELECTED, 1)
+            assert live.journal_tails_repaired == 1
+            again = _assert_fully_recovered(directory, expected, scan="scan-2")
+            assert again.get("after") == (cr.SELECTED, 1)
+            again.compact()
+            final = _assert_fully_recovered(directory, expected, scan="scan-2")
+            assert final.get("after") == (cr.SELECTED, 1), (
+                f"a reported success must survive a tear {keep} byte(s) into {character!r}")

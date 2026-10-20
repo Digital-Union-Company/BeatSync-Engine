@@ -1361,6 +1361,20 @@ _TAIL_REPAIR_PREFIX = '{"k":"' + _JOURNAL_TAIL_REPAIRED + '"'
 #: text. See :meth:`ReviewStore._bytes_damage_is_accounted_for`.
 _TAIL_REPAIR_PREFIX_BYTES = _TAIL_REPAIR_PREFIX.encode("utf-8")
 
+#: [R5-P19] The marker up to and including its one field name. Everything the repair can emit is a
+#: prefix of ``_TAIL_REPAIR_OPENING + <number> + "}"``, so this is the anchor that lets a damaged
+#: line be split into "the fragment the writer tore" and "the evidence the writer appended to it".
+#: It cannot occur inside a record by accident: a ``"`` inside a JSON string is escaped, so the
+#: literal ``'{"k":"'`` sequence only ever appears where this writer started an object.
+_TAIL_REPAIR_OPENING = _TAIL_REPAIR_PREFIX + ',"at":'
+
+#: Every character ``repr`` of a finite float can produce. Deliberately *not* a JSON number parser:
+#: this only has to recognise how far an interrupted ``at`` got, and anything it does not recognise
+#: fails closed. ``NaN``/``Infinity`` are therefore not writer-shaped here -- ``time.time()`` cannot
+#: produce them -- which is a refusal, never an acceptance, and leaves N7-R4's separate question
+#: about marker *provenance* exactly where it was.
+_TAIL_REPAIR_NUMBER = "0123456789+-.eE"
+
 _JOURNAL_KINDS = (_JOURNAL_SCAN, _JOURNAL_DECIDE, _JOURNAL_TAIL_REPAIRED)
 
 #: [R5-P15 / N7-R3] How an unterminated final journal line is classified before anything is
@@ -1381,6 +1395,15 @@ _TAIL_TRAILING_BYTES = "trailing_bytes"      # a complete value followed by some
 #                                              unidentifiable. Fail closed; see
 #                                              :meth:`ReviewStore._classify_unterminated_tail`.
 
+#: [R5-P19 / N7-R7] Damage that is **not** anything this writer can have left behind, so what it
+#: holds cannot be reasoned about at all -- the shape an independent review built by inserting an
+#: invalid byte *in front of* a whole committed event and removing that event's newline. Every
+#: earlier revision of this classifier reached "torn fragment" for it by elimination, which stamped
+#: a reported-successful decision as discardable damage and let the next ``compact()`` erase it.
+#: Elimination is now a refusal: a fragment is torn only when it can be *shown* to be one. See
+#: :meth:`ReviewStore._bytes_are_an_interrupted_write`.
+_TAIL_UNACCOUNTED_DAMAGE = "unaccounted_damage"
+
 #: Read granularity when walking backwards for the last newline. One block covers any record this
 #: writer produces, so the ordinary case is a single read.
 _TAIL_CHUNK_BYTES = 8192
@@ -1391,6 +1414,14 @@ _TAIL_CHUNK_BYTES = 8192
 #: unbounded read of the whole journal. A final line past this bound cannot be classified, and an
 #: unclassifiable line is refused rather than guessed at.
 MAX_TAIL_INSPECT_BYTES = 1 << 20
+
+#: [R5-P19 / N7-R7] How many *interior* ``{`` positions in one damaged fragment are probed for a
+#: whole JSON value hiding behind the damage in front of it. A record this writer emits has **no**
+#: interior object at all -- the schema is flat -- so the ordinary answer is zero probes and this
+#: ceiling is never approached. It exists so that one pathological line cannot turn a linear scan
+#: into a quadratic one, and exceeding it is a **refusal**: a fragment whose interior could not be
+#: ruled out is not a fragment that may be discarded.
+MAX_HIDDEN_RECORD_PROBES = 64
 
 
 class _EventSchemaError(Exception):
@@ -1759,7 +1790,16 @@ class ReviewStore:
                                 "it was committed cannot be established; nothing has been "
                                 "changed and both copies are exactly as they were"
                             ) from undecodable
-                        if self._bytes_damage_is_accounted_for(fragment):
+                        # [R5-P19 / N7-R7] **The marker amnesty is now conditional on the damage
+                        # being damage this writer could have left.** The measured loss is a whole
+                        # committed event behind an invalid byte with a repair marker already on
+                        # the end of it: the amnesty discarded that line without ever being able
+                        # to see what was inside it, because the readable prefix an invalid first
+                        # byte leaves is empty. Gating the amnesty rather than preceding it keeps
+                        # every existing refusal message -- including the N7-R2 byte-offset one
+                        # below -- exactly where it was.
+                        accountable = self._bytes_are_an_interrupted_write(fragment)
+                        if accountable and self._bytes_damage_is_accounted_for(fragment):
                             damaged += 1
                             continue
                         if chunk.endswith(b"\n"):
@@ -1769,6 +1809,14 @@ class ReviewStore:
                                 "what it held cannot be established (byte offset "
                                 f"{offset + undecodable.start}); nothing has been changed and "
                                 "both copies are exactly as they were") from undecodable
+                        if not accountable:
+                            raise PersistenceError(
+                                f"review journal record {applied + damaged + 1} is damaged in a "
+                                "way this process cannot have caused, so whether a committed "
+                                "decision is hidden behind the damage cannot be established "
+                                f"(byte offset {offset + undecodable.start}); nothing has been "
+                                "changed and both copies are exactly as they were"
+                            ) from undecodable
                         torn_tail = True
                         continue
                     try:
@@ -1789,7 +1837,12 @@ class ReviewStore:
                                 "it was committed cannot be established; nothing has been "
                                 "changed and both copies are exactly as they were"
                             ) from unreadable
-                        if self._damage_is_accounted_for(line):
+                        # [R5-P19 / N7-R7] The readable half of the same rule. The byte path's
+                        # loss has a text twin -- unidentifiable but *decodable* bytes in front of
+                        # a whole committed event -- which `_tail_hides_a_complete_record` cannot
+                        # see either, because it too only looks from offset zero.
+                        accountable = self._text_is_an_interrupted_write(line)
+                        if accountable and self._damage_is_accounted_for(line):
                             damaged += 1
                             continue
                         if raw.endswith("\n"):
@@ -1798,6 +1851,13 @@ class ReviewStore:
                                 "but was written in full, so it is damage this process did not "
                                 "cause and what it held cannot be established; nothing has been "
                                 "changed and both copies are exactly as they were"
+                            ) from unreadable
+                        if not accountable:
+                            raise PersistenceError(
+                                f"review journal record {applied + damaged + 1} is damaged in a "
+                                "way this process cannot have caused, so whether a committed "
+                                "decision is hidden behind the damage cannot be established; "
+                                "nothing has been changed and both copies are exactly as they were"
                             ) from unreadable
                         torn_tail = True
                         continue
@@ -1966,6 +2026,216 @@ class ReviewStore:
         except UnicodeDecodeError:
             return False
         return ReviewStore._damage_is_accounted_for(suffix)
+
+    # ---- [R5-P19 / N7-R7] is this damage something THIS writer can have left? ---------------
+    #
+    # Every question above asks what a damaged line *contains*. None of them asks the one question
+    # that decides whether the line may be thrown away: **could this process have produced these
+    # exact bytes?** R5-P17 answered it by elimination -- not a complete record in the readable
+    # prefix, not carrying a marker, not terminated, therefore torn -- and an independent review
+    # measured where elimination leads. It put one invalid byte in *front* of a whole committed
+    # decision and removed that event's newline. The readable prefix is then empty, which is not
+    # "no record is hiding" but "nothing could be read at all"; the classifier called it torn, the
+    # repair stamped the committed record as accounted-for damage, the next decision was reported
+    # successful against it, and ``compact()`` made the loss permanent.
+    #
+    # So the four helpers below replace elimination with a **positive** test, derived from the
+    # writer rather than from the shape of the damage. ``_append`` writes exactly two things
+    # through ``_write_all``, which writes every byte or raises:
+    #
+    #   * one record, ``json.dumps(event) + "\n"``, and
+    #   * one repair marker, ``json.dumps({"k": ..., "at": ...}) + "\n"``, appended onto a fragment.
+    #
+    # The newline is the last byte of each, so an interrupted write leaves a **proper prefix** with
+    # no newline in it, and the next append may add another such prefix. An unterminated line this
+    # writer left is therefore, and only ever,
+    #
+    #     <proper prefix of one record>  [<truncated character>]  <prefixes of repair markers>
+    #
+    # with two consequences that are the whole discriminator. The record prefix always begins with
+    # ``{`` and never parses whole. And the *only* undecodable bytes anywhere in it are the one
+    # truncated multi-byte character the tear landed inside -- a marker is pure ASCII, and a record
+    # is valid UTF-8 up to the cut. Anything that does not fit that template is external damage
+    # whose contents cannot be reasoned about, and it is refused rather than discarded.
+
+    @staticmethod
+    def _is_repair_evidence_so_far(text: str) -> bool:
+        """[R5-P19 / N7-R7] Whether ``text`` is only repair markers and interrupted repair markers.
+
+        Not a second marker validator and deliberately weaker than one: :meth:`
+        _damage_is_accounted_for` decides whether a *complete* marker accounts for damage, and that
+        decision is untouched here. This answers the narrower structural question of whether the
+        bytes the writer appended **after** a torn fragment are the only thing that could have been
+        appended there, so that a complete record cannot be sitting among them.
+
+        Accepts any run of marker *prefixes*, complete or not and in any order, because that is
+        exactly what the writer can leave: each interrupted repair abandons its prefix in place
+        and the next append starts a fresh marker directly against it. Two genuine shapes that an
+        earlier draft of this grammar wrongly refused, both produced by the real write path and
+        both measured here: ``…,"at":`` immediately followed by a whole second marker, and a
+        12-byte stub ``{"k":"tail-r`` immediately followed by a whole second marker.
+
+        The split is unambiguous because ``{`` occurs in the marker payload **only** as its first
+        byte -- the rest is one ASCII key, one ASCII value and one number -- so a ``{`` anywhere
+        in this suffix can only be where another repair attempt began.
+        """
+        if not text:
+            return True
+        if not text.startswith("{"):
+            return False
+        return all(ReviewStore._is_repair_marker_prefix("{" + piece)
+                   for piece in text.split("{")[1:])
+
+    @staticmethod
+    def _is_repair_marker_prefix(piece: str) -> bool:
+        """[R5-P19 / N7-R7] Whether ``piece`` is a prefix of one repair-marker payload."""
+        if _TAIL_REPAIR_OPENING.startswith(piece):
+            return True                          # interrupted inside the fixed opening
+        if not piece.startswith(_TAIL_REPAIR_OPENING):
+            return False
+        rest = piece[len(_TAIL_REPAIR_OPENING):]
+        number = rest[:-1] if rest.endswith("}") else rest
+        return all(character in _TAIL_REPAIR_NUMBER for character in number)
+
+    @staticmethod
+    def _is_an_unfinished_record(text: str) -> bool:
+        """[R5-P19 / N7-R7] Whether ``text`` is a proper prefix of one of this writer's records.
+
+        Three requirements, each of which rules out a measured loss shape:
+
+        * it opens with ``{``, because every record and every marker does -- so unidentifiable
+          bytes cannot be sitting in front of whatever follows them;
+        * it does not parse whole, because a whole value is not an unfinished write and the caller
+          refuses on that separately (:meth:`_tail_hides_a_complete_record`);
+        * **no whole JSON value starts anywhere inside it.** This is the requirement the earlier
+          revisions lacked. ``raw_decode`` is asked only at offset zero, so ``{x`` followed by an
+          entire committed decision fails to parse at offset zero and was called torn. A record
+          this writer emits has no interior object, so probing every interior ``{`` costs nothing
+          on a real fragment and refuses the hidden-record shape outright.
+
+        The probe is **not** a search for a record to trust -- the value found is discarded
+        unexamined and nothing is ever recovered from it. Finding one is only ever a reason to
+        refuse, which is why "it might be a JSON object" is a safe thing to act on here and would
+        not be anywhere else.
+        """
+        if not text.startswith("{"):
+            return False
+        decoder = json.JSONDecoder()
+        try:
+            decoder.raw_decode(text)
+        except ValueError:
+            pass
+        else:
+            return False
+        probes = 0
+        start = text.find("{", 1)
+        while start >= 0:
+            probes += 1
+            if probes > MAX_HIDDEN_RECORD_PROBES:
+                return False                     # could not be ruled out, so it is not ruled out
+            try:
+                decoder.raw_decode(text, start)
+            except ValueError:
+                start = text.find("{", start + 1)
+            else:
+                return False
+        return True
+
+    @staticmethod
+    def _is_truncated_character(raw: bytes) -> bool:
+        """[R5-P19 / N7-R7] Whether ``raw`` is a well-formed *proper* prefix of one UTF-8 character.
+
+        The ranges are UTF-8's own, written out rather than inferred from a decoder, because the
+        decoder cannot be asked this question: a strict decode of an incomplete sequence and a
+        strict decode of an invalid one both raise, with the same ``start`` and ``end``. Reading
+        the first as the second is how ``0xff`` came to be treated as an interrupted write.
+
+        ``0xC0``/``0xC1`` (overlong two-byte), ``0xE0 0x80`` (overlong three-byte), ``0xED 0xA0``
+        (surrogate), ``0xF4 0x90``/``0xF5``–``0xFF`` (past U+10FFFF) are rejected: no encoder this
+        process uses can emit them, so a tear cannot have produced them either. A *complete*
+        sequence is rejected too -- it would have decoded, so the line would not be here.
+        """
+        if not raw:
+            return False
+        lead = raw[0]
+        if 0xC2 <= lead <= 0xDF:
+            width, low, high = 2, 0x80, 0xBF
+        elif 0xE0 <= lead <= 0xEF:
+            width = 3
+            low, high = ((0xA0, 0xBF) if lead == 0xE0
+                         else (0x80, 0x9F) if lead == 0xED else (0x80, 0xBF))
+        elif 0xF0 <= lead <= 0xF4:
+            width = 4
+            low, high = ((0x90, 0xBF) if lead == 0xF0
+                         else (0x80, 0x8F) if lead == 0xF4 else (0x80, 0xBF))
+        else:
+            return False
+        if len(raw) >= width:
+            return False
+        for index, byte in enumerate(raw[1:], start=1):
+            lower, upper = (low, high) if index == 1 else (0x80, 0xBF)
+            if not lower <= byte <= upper:
+                return False
+        return True
+
+    @staticmethod
+    def _text_is_an_interrupted_write(line: str) -> bool:
+        """[R5-P19 / N7-R7] Whether a readable, unparsable ``line`` is one this writer left behind.
+
+        The split point is the first repair-marker opening, which is unambiguous: ``"`` is escaped
+        inside a JSON string, so ``'{"k":"tail-repaired","at":'`` cannot occur inside a record's
+        content and only ever marks where a repair began. Everything before it must be an
+        unfinished record; everything from it on must be repair evidence and nothing else.
+
+        A shorter interrupted marker -- one that did not reach the end of that fixed opening --
+        contains no split point, so it stays part of the fragment, which still does not parse. The
+        answer is the same either way.
+        """
+        cut = line.find(_TAIL_REPAIR_OPENING)
+        fragment, evidence = (line, "") if cut < 0 else (line[:cut], line[cut:])
+        return (ReviewStore._is_an_unfinished_record(fragment)
+                and ReviewStore._is_repair_evidence_so_far(evidence))
+
+    @staticmethod
+    def _bytes_are_an_interrupted_write(raw: bytes) -> bool:
+        """[R5-P19 / N7-R7] The same question for a line that is not text. **The N7-R7 fix.**
+
+        An undecodable line the writer left has exactly one undecodable region: the character the
+        tear landed inside. So the line splits, byte-exactly and without dropping or substituting
+        anything, into
+
+            <readable prefix of a record> <truncated character> <ASCII repair evidence>
+
+        and all three parts are checked. The readable prefix must be an unfinished record, which an
+        **empty** prefix is not -- that is the whole of the N7-R7 defect, because an invalid first
+        byte makes the prefix empty and "I could read nothing" was being scored as "nothing is
+        hiding". The undecodable region must be a well-formed partial character rather than merely
+        unreadable bytes, which is what refuses a leading ``0xff`` ahead of an intact committed
+        event. And whatever follows it must be ASCII repair evidence, which is what refuses the
+        same event hidden behind a genuine torn character.
+
+        Nothing here recovers anything: the only outcomes are "this is a torn write, which the
+        caller already knows how to repair" and "this cannot be accounted for", and the second one
+        writes no byte.
+        """
+        text = ReviewStore._longest_text_prefix(raw)
+        head = len(text.encode("utf-8"))
+        if head == len(raw):
+            return False                         # decodable in full; a different question
+        if not ReviewStore._is_an_unfinished_record(text):
+            return False
+        rest = raw[head:]
+        for held in (1, 2, 3):
+            if held > len(rest):
+                break
+            if not ReviewStore._is_truncated_character(rest[:held]):
+                continue
+            tail = rest[held:]
+            if any(byte > 0x7F for byte in tail):
+                continue                         # a second undecodable region: not one tear
+            if ReviewStore._is_repair_evidence_so_far(tail.decode("ascii")):
+                return True
+        return False
 
     def _load(self) -> None:
         """Rebuild memory from the snapshot and the journal: **completely, or not at all**.
@@ -2288,8 +2558,15 @@ class ReviewStore:
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            if self._bytes_hide_a_complete_record(raw.strip()):
+            fragment = raw.strip()
+            if self._bytes_hide_a_complete_record(fragment):
                 return _TAIL_TRAILING_BYTES
+            if not self._bytes_are_an_interrupted_write(fragment):
+                # [R5-P19 / N7-R7] The writer and the reader have to agree, so the append path
+                # asks the same positive question :meth:`_replay_journal` now asks: not "have I
+                # failed to find a reason to refuse?" but "can I show this writer produced these
+                # bytes?". An invalid byte in front of an intact committed event answers no.
+                return _TAIL_UNACCOUNTED_DAMAGE
             # A torn write can stop mid multi-byte sequence. Not text, and nothing whole is hiding
             # behind the broken bytes, so this is genuine damage, repaired like any other -- and
             # :meth:`_replay_journal` can now read the repaired result, which is what makes
@@ -2304,6 +2581,8 @@ class ReviewStore:
             try:
                 _value, end = json.JSONDecoder().raw_decode(line)
             except ValueError:
+                if not self._text_is_an_interrupted_write(line):
+                    return _TAIL_UNACCOUNTED_DAMAGE
                 return _TAIL_TORN_FRAGMENT          # the ordinary F4 torn tail
             if line[end:].strip():
                 return _TAIL_TRAILING_BYTES
@@ -2382,6 +2661,11 @@ class ReviewStore:
                 "the review journal's final record is followed by an unidentifiable partial "
                 "write, so whether it held a committed decision cannot be established; nothing "
                 "has been changed and both copies are exactly as they were")
+        if shape == _TAIL_UNACCOUNTED_DAMAGE:
+            raise PersistenceError(
+                "the review journal's final record is damaged in a way this process cannot have "
+                "caused, so whether a committed decision is hidden behind the damage cannot be "
+                "established; nothing has been changed and both copies are exactly as they were")
         marker = json.dumps({"k": _JOURNAL_TAIL_REPAIRED, "at": time.time()},
                             separators=(",", ":"), ensure_ascii=False)
         self._write_all(handle, (marker + "\n").encode("utf-8"))

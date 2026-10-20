@@ -316,6 +316,7 @@ byte before the newline. So a newline-less final line that parses *whole* was wr
 | Does not parse, and no whole JSON value is hiding in front of the bytes that stopped it | the F4 torn fragment: marker-first repair, exactly as above. `journal_tails_repaired` counts it |
 | Parses whole but describes no record this build can account for | `PersistenceError`, nothing written |
 | A complete value followed by unidentifiable bytes — **including bytes that are not UTF-8 text** (R5-P17 / N7-R6) | `PersistenceError`, nothing written |
+| Damage this writer cannot have produced — most importantly unidentifiable bytes *in front of* a whole record (R5-P19 / N7-R7) | `PersistenceError`, nothing written |
 | Cannot be read, or is larger than the inspection bound | `PersistenceError`, nothing written |
 
 Validation uses the **same** `_apply` the replay path runs, against **throwaway** dicts — a tail is
@@ -379,6 +380,7 @@ classified rather than fatal — by the same three questions in the same order, 
 | Undecodable journal line | Answer |
 |---|---|
 | A whole JSON value sits in front of the bytes that stopped the decode | `PersistenceError`, nothing written — it may be a committed decision, and this is checked **before** the marker amnesty |
+| The bytes are not a shape this writer can have produced (R5-P19 / N7-R7) | `PersistenceError`, nothing written — **and the marker amnesty below is skipped**, because a forged-looking or externally damaged line may be hiding a whole record the amnesty would discard unseen |
 | It ends with a complete, valid `tail-repaired` marker | discarded; this process's own repair already accounted for it |
 | It is **terminated** and carries no valid marker | `PersistenceError`, nothing written — terminated damage is external, wherever it sits |
 | It is the final line, unterminated and unaccounted for | the F4 torn fragment: tolerated on read, marker-repaired on the next append |
@@ -426,6 +428,86 @@ a record's contents.
 **This is not universal recovery from arbitrary corrupt bytes, and must not be described as one.**
 It bounds exactly which undecodable fragments are repairable, and everything else refuses without
 writing a byte.
+
+#### A fragment is torn only where it can be *shown* to be torn
+
+[R5-P19 / N7-R7] **Every classifier up to R5-P17 reached "torn fragment" by elimination, and
+elimination is unsound here.** The questions it asked were all of the form *have I found a reason
+to refuse?* — a whole record in the readable prefix, a valid marker, a terminator. An independent
+review built the one input for which no such reason can ever be found: it put a single invalid
+byte **in front of** a whole committed decision event and removed that event's newline.
+`_longest_text_prefix` reads from offset zero, so the readable prefix of that line is **empty** —
+and empty was being scored as "no complete record is hiding" when what it actually means is
+"nothing could be read at all". Measured consequence, in order: cold recovery reported the
+committed identity as `PENDING,0`; a warm `decide()` returned `SELECTED,1`; the repair stamped the
+intact record as accounted-for damage; `compact()` truncated the journal and snapshotted the loss.
+Through the unchanged ASGI middleware the warm decision answered **HTTP 200 `ok:true`** with
+counts, and the previously accepted `REJECTED,2` reopened as the older `SELECTED,1`.
+
+The correction replaces elimination with a **positive** test derived from the writer, not from the
+shape of the damage. `_append` writes exactly two payloads through `_write_all`, which writes every
+byte or raises, and the newline is the last byte of each — so an interruption leaves a *proper
+prefix* with no newline in it, and the next append may leave another against it. An unterminated
+line this writer produced is therefore, and can only be:
+
+```
+<proper prefix of one record>  [<one truncated multi-byte character>]  <repair-marker prefixes>
+```
+
+Three properties of that template do all the work, and each one refuses a shape that previously
+destroyed data:
+
+* **the readable part must be an unfinished record** — it opens with `{`, it does not parse whole,
+  and no whole JSON value starts anywhere inside it. An *empty* readable part is not an unfinished
+  record, which is the N7-R7 defect itself; `{x` followed by an entire committed decision is not
+  one either, which is the same loss with a plausible-looking first byte.
+* **the undecodable part must be a well-formed partial character** (`_is_truncated_character`),
+  not merely unreadable bytes. A strict decode cannot answer this — an incomplete sequence and an
+  invalid one raise with the same `start` and `end` — so the UTF-8 ranges are written out, and
+  overlong, surrogate and out-of-range prefixes are rejected because no encoder here emits them.
+  This is what refuses a leading `0xff` in front of an intact event.
+* **whatever follows it must be repair evidence and nothing else**
+  (`_is_repair_evidence_so_far`). This is what refuses the same committed event hidden behind a
+  *genuine* truncated character. Two chains the real writer does produce, and which an earlier
+  draft of this grammar wrongly refused, are pinned by test: `…,"at":` immediately followed by a
+  whole second marker, and the 12-byte stub `{"k":"tail-r` immediately followed by one.
+
+**The marker amnesty is now conditional on that test, not preceded by it.** The amnesty runs only
+for damage the writer could have left, because the measured loss includes a variant where the
+corrupted line *already carries a valid marker* — and the amnesty would discard it without ever
+being able to see the record inside. Gating rather than reordering is deliberate: every existing
+refusal message, including the N7-R2 byte-offset one, stays exactly where it was.
+
+Hard constraints, all of them load-bearing:
+
+* **Do not restore classification by elimination.** "I did not find a record" and "I could not
+  read anything" are different answers and the second one must refuse.
+* **Do not strip, skip or leniently decode the invalid bytes.** Automatic recovery from externally
+  corrupted leading bytes is explicitly *not* attempted — the refusal is an availability cost, and
+  the record is still on disk byte for byte, so removing the foreign bytes recovers every decision
+  at its original revision. A test asserts exactly that.
+* **Do not treat a `{` byte as identifying a record.** The interior probe in
+  `_is_an_unfinished_record` never applies, parses out or trusts what it finds; finding a whole
+  value there is only ever a **reason to refuse**, which is why acting on "this might be an
+  object" is safe here and would not be anywhere else. Its budget (`MAX_HIDDEN_RECORD_PROBES`)
+  exists so one pathological line cannot make a linear scan quadratic, and **exceeding it is a
+  refusal** — a fragment whose interior could not be ruled out is not ruled out.
+* **Do not broaden the marker amnesty.** `_damage_is_accounted_for` is still the only validator
+  that decides whether a complete marker accounts for damage; `_is_repair_evidence_so_far` only
+  bounds what may be *present* in the suffix. **N7-R4 is untouched**: a forged marker on a
+  writer-shaped fragment is still accepted, and that remains an open, accepted limitation.
+* **The same rule applies to the readable path.** Decodable-but-unidentifiable bytes in front of a
+  whole committed event (`xx{…}`) reached the identical loss, because
+  `_tail_hides_a_complete_record` also looks only from offset zero.
+  `_text_is_an_interrupted_write` closes it, splitting the line at the first marker opening —
+  unambiguous, because `"` is escaped inside JSON strings, so that literal can only mark where a
+  repair began.
+
+*Residual, recorded rather than claimed closed:* a non-finite `at` (`NaN`/`Infinity`) is not
+writer-shaped under `_TAIL_REPAIR_NUMBER`, so such a line refuses rather than being repaired.
+`time.time()` cannot produce one, the direction is fail-closed, and the separate question of
+whether the marker *grammar* should exclude them (raised by R5-P18) is an owner decision that this
+correction does not make.
 
 ### Start-up recovery is all-or-nothing, and an incomplete one is never compacted
 
@@ -512,9 +594,10 @@ nothing is written and removing the damaged snapshot recovers everything from th
 | A valid snapshot, with or without later journal events | replayed in full |
 | Snapshot content that cannot be accounted for — bad JSON, bad structure, an unknown decision, a non-integer revision, bad UTF-8 | `PersistenceError`, nothing written |
 | An **unterminated** final journal line that **parses whole** | replayed as the ordinary event it is — it was written whole, only its terminator is missing (R5-P15 / N7-R3) |
-| An **unterminated** final journal line that does **not** parse — *including one that is not UTF-8 text* | that one line discarded, everything before it preserved (F4 · R5-P17 / N7-R6) |
+| An **unterminated** final journal line that does **not** parse — *including one that is not UTF-8 text* — **and is a shape this writer can have produced** | that one line discarded, everything before it preserved (F4 · R5-P17 / N7-R6 · R5-P19 / N7-R7) |
 | An unreadable journal line that **is** terminated, anywhere in the file | `PersistenceError`, nothing written |
 | A complete value followed by unidentifiable bytes, anywhere in the file — *text or not* | `PersistenceError`, nothing written — checked **before** the marker amnesty below (R5-P15 / N7-R3 · R5-P17 / N7-R6) |
+| Unidentifiable bytes *in front of* a whole record, or any other shape this writer cannot have produced — *text or not* | `PersistenceError`, nothing written; the marker amnesty is **skipped** for it (R5-P19 / N7-R7) |
 | An unreadable line carrying its own attached `tail-repaired` marker — *even when the fragment it accounts for is not text* | discarded; the repair already accounted for it (R5-P17 / N7-R6) |
 | A parsable event with a schema or kind this build cannot account for | `PersistenceError`, nothing written |
 | Bytes that are not valid UTF-8, in a line none of the rows above account for | `PersistenceError`, nothing written. **Not** a blanket rule about the file: one undecodable byte no longer condemns the whole journal, which was the N7-R6 defect (R5-P17) |
@@ -542,8 +625,10 @@ empty history. N7 is never "fixed" by discarding a snapshot or deleting journal 
 retained bytes are what the retry recovers from, and a refused load writes nothing at all**, so
 every forensic byte of both copies survives the refusal. The only bytes compaction may ever erase
 are ones that never represented a reported success — an unterminated fragment **that does not
-parse**, or one already closed off by its own marker. A newline-less line that parses whole is a
-record, not a fragment, and it is kept (R5-P15 / N7-R3).
+parse and that this writer can be shown to have produced** (R5-P19 / N7-R7), or one already closed
+off by its own marker. A newline-less line that parses whole is a record, not a fragment, and it is
+kept (R5-P15 / N7-R3). A damaged line whose history cannot be accounted for never becomes
+compactable at all: the store refuses before `compact()` can be reached.
 
 There is **no migration concern** from this tightening: R5 is unmerged, so no deployed install has
 ever written a `state/clips-review/` journal or snapshot.
@@ -551,10 +636,12 @@ ever written a `state/clips-review/` journal or snapshot.
 #### Two bounded limitations, recorded rather than claimed closed
 
 [R5-P15 / N7-R4 · N7-R5] Both were raised by an independent review, both were classified as
-non-blocking, and **neither is closed by the N7-R3 correction, nor by the N7-R6 one.** They are
-written down here so that no later change can quietly assume they were. In particular the
-byte-level marker check added for N7-R6 makes the marker *findable* in a line that is not text; it
-does not make it *authentic*, and nothing about N7-R4 changes.
+non-blocking, and **neither is closed by the N7-R3 correction, nor by the N7-R6 one, nor by the
+N7-R7 one.** They are written down here so that no later change can quietly assume they were. In
+particular the byte-level marker check added for N7-R6 makes the marker *findable* in a line that
+is not text; it does not make it *authentic*, and nothing about N7-R4 changes. N7-R7 narrows
+*when* the amnesty is consulted — only for writer-shaped damage — but a forged marker on a
+writer-shaped fragment is still accepted, which is exactly N7-R4 and is still open.
 
 * **N7-R4 — `tail-repaired` is an auditable format convention, not authenticated evidence of its
   own origin.** Anything that can write to the journal can write a well-formed marker, and
