@@ -83,12 +83,18 @@ import errno
 # staged copy by re-reading it, so it needs a digest. Stdlib only, like everything else here.
 import hashlib
 import html as html_lib
+# [FORK] Digital-Union (R5-P3): used to emit operator text into the gallery script as a properly
+# escaped JS string literal. Interpolating it bare is how an apostrophe in the wording broke the
+# whole script's compilation.
+import json
 import multiprocessing
 import queue
 import re
+import secrets
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 import socket
 import uuid
 from typing import Callable, Iterator, TypeAlias, Tuple, Dict, List
@@ -209,6 +215,14 @@ from beatsync_fork import smart_mix as fork_smart_mix
 # it is only reached when the operator presses a Raw Cutter button, and a module-level import
 # would add an FFmpeg-touching dependency to every GUI start for a tool most sessions never open.
 from beatsync_fork import raw_cutter as fork_cutter
+# [FORK] Digital-Union (R5 Clips Preview Selector): the stdlib-only secure core --
+# opaque ids, the authorization gates, descriptor-identity revalidation, Range
+# parsing, path-relationship refusal, the decision journal and the gallery markup.
+from beatsync_fork import clips_review as fork_clips
+# [FORK] Digital-Union (R5): the ASGI media endpoint and Starlette's middleware wrapper. The
+# wrapper is a Gradio dependency already, so this adds nothing to requirements.
+from clips_media_server import ClipMediaMiddleware
+from starlette.middleware import Middleware
 # [FORK] Digital-Union (Raw Cutter Batch V1): the pure batch bookkeeping — the outcome vocabulary,
 # the collision-safe output layout, the totals, the manifest payload and every line of report text.
 # Stdlib-only like its sibling, so it imports here at module scope; only the FFmpeg adapter is
@@ -435,6 +449,317 @@ button#cut-batch-cancel-button:disabled {
     cursor: not-allowed !important;
 }
 """
+
+# [FORK] Digital-Union (R5 Clips Preview Selector, P1): the gallery grid.
+#
+# `minmax(300px, 1fr)` is chosen for the specification's 3-4 columns per desktop row, not the
+# five the R5-P0 prototype produced at 1448 px with a 250 px minimum. An explicit cap of four
+# columns keeps a very wide monitor from drifting to five, and the floor keeps a narrow window
+# from collapsing to one.
+#
+# Colour is never the only status signal: every tile also carries a badge glyph, its `aria-label`
+# names the decision in words, and focus is a visible ring rather than a colour change.
+CLIPS_GALLERY_CSS = """
+#clips-gallery .r5-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px;
+}
+@media (min-width: 1500px) {
+    #clips-gallery .r5-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+#clips-gallery .r5-tile {
+    position: relative;
+    border: 3px solid #8a8a8a;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #16181c;
+    cursor: pointer;
+    outline: none;
+}
+#clips-gallery .r5-tile:focus-visible {
+    outline: 3px solid #4da3ff;
+    outline-offset: 2px;
+}
+#clips-gallery .r5-media {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+}
+#clips-gallery .r5-poster,
+#clips-gallery .r5-slot video {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+}
+#clips-gallery .r5-slot { position: absolute; inset: 0; }
+#clips-gallery .r5-nopreview {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; text-align: center; gap: 4px;
+}
+#clips-gallery .r5-nopreview-main { color: #ffb4b4; font-size: 12px; }
+#clips-gallery .r5-nopreview-sub { color: #8a8a8a; font-size: 10px; }
+#clips-gallery .r5-bar {
+    display: flex; align-items: center; gap: 8px; padding: 5px 8px; font-size: 12px;
+    color: #dcdcdc;
+}
+#clips-gallery .r5-label { flex: 1; font-family: monospace; }
+#clips-gallery .r5-badge { font-weight: 700; font-size: 15px; }
+#clips-gallery .r5-reset {
+    background: #2c2f36; color: #cfcfcf; border: 1px solid #555; border-radius: 5px;
+    cursor: pointer; font-size: 11px; line-height: 1; padding: 3px 6px;
+}
+#clips-gallery .r5-reset:focus-visible { outline: 2px solid #4da3ff; outline-offset: 1px; }
+#clips-gallery .r5-pending { border-color: #d8b11a; }
+#clips-gallery .r5-pending .r5-badge { color: #d8b11a; }
+#clips-gallery .r5-selected { border-color: #2ea043; background: #10240f; }
+#clips-gallery .r5-selected .r5-badge { color: #46d16a; }
+#clips-gallery .r5-rejected { border-color: #d02828; background: #26100f; }
+#clips-gallery .r5-rejected .r5-badge { color: #ff6b6b; }
+#clips-gallery .r5-empty { padding: 24px; color: #8a8a8a; font-style: italic; }
+"""
+
+# [FORK] Digital-Union (R5 Clips Preview Selector, P1): gallery interaction.
+#
+# Decisions POST to `/r5decide`, the server's own authorized endpoint, and NOT through a Gradio
+# event. That is a measured constraint, not a preference: on the pinned gradio 6.19.0, setting a
+# hidden Textbox's value and dispatching `input` does not make Gradio fire its `.input()` event
+# -- no request is issued at all -- so the technique that worked in Gradio 4 is simply gone. The
+# endpoint is also the better shape here: a click does not queue a Gradio event, and the decision
+# travels through the same authorization the media bytes already pass.
+#
+# A tile is repainted ONLY from a server response. The DOM is a rendering of the decision record,
+# never the record itself.
+CLIPS_GALLERY_JS = r"""
+() => {
+  if (window.__r5Installed) { return; }
+  window.__r5Installed = true;
+  const CLS = {PENDING: 'r5-pending', SELECTED: 'r5-selected', REJECTED: 'r5-rejected'};
+  const BADGE = {PENDING: '?', SELECTED: '✓', REJECTED: '✗'};
+  let active = null;          // the single mounted <video>, if any
+  let lastNonce = null;
+
+  const grid = () => document.querySelector('#clips-gallery .r5-grid');
+  const tileOf = (el) => (el && el.closest) ? el.closest('#clips-gallery .r5-tile') : null;
+
+  function paint(clip, decision, rev) {
+    const tile = document.querySelector('#clips-gallery .r5-tile[data-clip="' + clip + '"]');
+    if (!tile) { return; }
+    tile.classList.remove('r5-pending', 'r5-selected', 'r5-rejected');
+    tile.classList.add(CLS[decision] || 'r5-pending');
+    if (rev !== undefined && rev !== null) { tile.dataset.rev = String(rev); }
+    const badge = tile.querySelector('.r5-badge');
+    if (badge) { badge.textContent = BADGE[decision] || '?'; }
+    const label = tile.querySelector('.r5-label');
+    if (label) {
+      tile.setAttribute('aria-label', label.textContent + ', ' + String(decision).toLowerCase());
+    }
+  }
+
+  function countsBox() {
+    return document.querySelector('#clips-counts-box textarea, #clips-counts-box input');
+  }
+
+  function paintCounts(counts) {
+    const box = countsBox();
+    if (!box || !counts) { return; }
+    let text = 'Kept ' + counts.SELECTED + '   ·   Discarded ' + counts.REJECTED +
+               '   ·   Undecided ' + counts.PENDING + '   ·   Total ' + counts.TOTAL;
+    // [R5-P3 / F8] Decisions do not travel through a Gradio event, so this response cannot
+    // change the Confirm button's enabled state -- only Refresh can, and it derives that state
+    // from the durable record. Rather than leave the operator looking at "Undecided 0" beside a
+    // greyed-out Confirm with no explanation, say what is needed. This is display text only: it
+    // never enables anything, and the authority stays on the server.
+    if (counts.TOTAL > 0 && counts.PENDING === 0) { text += '\n' + __REFRESH_HINT__; }
+    box.value = text;
+  }
+
+  function sayProblem(message) {
+    const box = countsBox();
+    if (box) { box.value = message; }
+  }
+
+  // [R5-P3 / F2] The WHOLE attribute must be a non-negative integer. `parseInt` is not usable
+  // here: it accepts a numeric prefix ("3abc" -> 3) and returns NaN for anything else, and
+  // `JSON.stringify` turns NaN into `null`, which the server used to read as "no concurrency
+  // check requested". So a tampered `data-rev` disabled the very guarantee it was meant to feed.
+  function validRevision(text) {
+    if (typeof text !== 'string' || !/^(0|[1-9][0-9]*)$/.test(text)) { return null; }
+    const value = Number(text);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+
+  async function send(clip, to, rev) {
+    const g = grid();
+    if (!g) { return; }
+    let res, body;
+    try {
+      res = await fetch('/r5decide/' + g.dataset.session + '/' + g.dataset.page + '/' + clip, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({to: to, rev: rev}),
+      });
+      body = await res.json();
+    } catch (err) {
+      window.__r5Last = {ok: false, code: 'network_error'};
+      return;
+    }
+    window.__r5Last = Object.assign({status: res.status}, body);
+    if (body && body.counts) { paintCounts(body.counts); }
+    // Repaint on refusal too, so a stale tab is corrected rather than left lying.
+    if (body && body.decision) { paint(clip, body.decision, body.rev); }
+  }
+
+  async function decide(tile, to) {
+    if (!tile) { return; }
+    const rev = validRevision(tile.dataset.rev);
+    if (rev === null) {
+      // The DOM revision is not trustworthy. Send NOTHING, re-read the server's record, and
+      // repaint from it. If even that fails, say so rather than leaving a silent dead click.
+      window.__r5Last = {ok: false, code: 'local_revision_invalid'};
+      const body = await window.__r5Resync();
+      if (!body || !body.ok) {
+        sayProblem('Could not read the decision record from the server. ' +
+                   'Press "Re-read the server\'s record" before deciding again.');
+      }
+      return;
+    }
+    send(tile.dataset.clip, to, rev);
+  }
+
+  // Lazy media: no <video> exists until hover, and exactly one exists at a time.
+  function mount(tile) {
+    if (!tile) { return; }
+    if (active && active.tile === tile) { active.el.play().catch(() => {}); return; }
+    unmount();
+    const slot = tile.querySelector('.r5-slot');
+    if (!slot) { return; }
+    const video = document.createElement('video');
+    video.muted = true;
+    video.loop = true;
+    video.preload = 'metadata';
+    video.playsInline = true;
+    video.setAttribute('aria-hidden', 'true');
+    video.src = tile.dataset.video;
+    slot.appendChild(video);
+    active = {tile: tile, el: video};
+    video.play().catch(() => {});
+  }
+
+  function unmount() {
+    if (!active) { return; }
+    try {
+      active.el.pause();
+      active.el.removeAttribute('src');
+      active.el.load();
+    } catch (err) { /* tearing down is best-effort */ }
+    if (active.el.parentNode) { active.el.parentNode.removeChild(active.el); }
+    active = null;
+  }
+
+  window.__r5Mounted = () => document.querySelectorAll('#clips-gallery .r5-tile video').length;
+
+  document.addEventListener('mouseover', (e) => { const t = tileOf(e.target); if (t) { mount(t); } });
+  document.addEventListener('mouseout', (e) => {
+    const t = tileOf(e.target);
+    if (t && active && active.tile === t && !t.contains(e.relatedTarget)) { unmount(); }
+  });
+  document.addEventListener('click', (e) => {
+    const reset = e.target.closest ? e.target.closest('#clips-gallery .r5-reset') : null;
+    if (reset) {
+      e.preventDefault(); e.stopPropagation();
+      decide(tileOf(reset), 'PENDING');
+      return;
+    }
+    const tile = tileOf(e.target);
+    if (tile) { tile.focus(); decide(tile, 'SELECTED'); }
+  });
+  document.addEventListener('contextmenu', (e) => {
+    const tile = tileOf(e.target);
+    if (tile) { e.preventDefault(); tile.focus(); decide(tile, 'REJECTED'); }
+  });
+  document.addEventListener('auxclick', (e) => {
+    if (e.button !== 1) { return; }
+    const tile = tileOf(e.target);
+    if (tile) { e.preventDefault(); decide(tile, 'PENDING'); }
+  });
+  document.addEventListener('keydown', (e) => {
+    const tile = tileOf(document.activeElement);
+    if (!tile) { return; }
+    const tiles = Array.from(document.querySelectorAll('#clips-gallery .r5-tile'));
+    const index = tiles.indexOf(tile);
+    const columns = Math.max(1, Math.round(tile.parentElement.clientWidth / tile.offsetWidth));
+    let next = -1;
+    switch (e.key) {
+      case 'ArrowRight': next = index + 1; break;
+      case 'ArrowLeft': next = index - 1; break;
+      case 'ArrowDown': next = index + columns; break;
+      case 'ArrowUp': next = index - columns; break;
+      case 's': case 'S': case 'Enter':
+        e.preventDefault(); decide(tile, 'SELECTED'); return;
+      case 'r': case 'R': case 'Delete':
+        e.preventDefault(); decide(tile, 'REJECTED'); return;
+      case 'p': case 'P':
+        e.preventDefault(); decide(tile, 'PENDING'); return;
+      case ' ':
+        e.preventDefault();
+        if (active && active.tile === tile) {
+          if (active.el.paused) { active.el.play().catch(() => {}); } else { active.el.pause(); }
+        } else { mount(tile); }
+        return;
+      default: return;
+    }
+    if (next >= 0 && next < tiles.length) {
+      e.preventDefault();
+      tiles[next].focus();
+      mount(tiles[next]);
+    }
+  });
+
+  // Re-read the server's record for every tile on the page.
+  window.__r5Resync = async () => {
+    const g = grid();
+    if (!g) { return {ok: false, code: 'no_grid'}; }
+    // [R5-P3 / F2] Never throws: `decide` depends on this answering so that an untrustworthy DOM
+    // revision results in a resync or a visible failure, not an unhandled rejection.
+    let body;
+    try {
+      const res = await fetch('/r5state/' + g.dataset.session + '/' + g.dataset.page);
+      body = await res.json();
+    } catch (err) {
+      return {ok: false, code: 'network_error'};
+    }
+    if (!body || !body.ok) { return body || {ok: false, code: 'no_body'}; }
+    Object.keys(body.clips).forEach((clip) => {
+      paint(clip, body.clips[clip].decision, body.clips[clip].rev);
+    });
+    paintCounts(body.counts);
+    return body;
+  };
+
+  // A freshly delivered grid seeds its counters from the server instead of sitting at zero.
+  const host = document.querySelector('#clips-gallery');
+  if (host) {
+    new MutationObserver(() => {
+      const g = grid();
+      if (g && g.dataset.nonce !== lastNonce) {
+        lastNonce = g.dataset.nonce;
+        unmount();
+        window.__r5Resync();
+      }
+    }).observe(host, {childList: true, subtree: true});
+  }
+}
+""".replace('__REFRESH_HINT__', json.dumps(CLIPS_REFRESH_TO_ENABLE_HINT))
+# [R5-P3 / F8] Operator-facing wording stays in `ui_content.py` like every other string in this
+# app; the gallery layer is a raw JS literal, so it is substituted in rather than interpolated.
+#
+# The substitution emits a COMPLETE JS string literal via `json.dumps`, and the placeholder above
+# is deliberately NOT wrapped in quotes in the JS. Dropping raw text inside `'...'` was wrong and
+# the real browser caught it: this hint contains an apostrophe ("the server's record"), which
+# closed the literal and made the whole gallery script fail to compile --
+# `SyntaxError: Unexpected identifier 's'` out of Gradio's `new AsyncFunction`, which silently
+# costs every listener on the page. JSON encoding is the only safe way to move operator text into
+# a script; never interpolate it bare, and never assume a constant has no quote in it.
 
 
 def _stage_status(stage_number: int) -> str:
@@ -5915,6 +6240,493 @@ def cleanup_on_startup():
         print(f"   ⚠️  Warning during startup cleanup: {e}")
 
 
+# =============================================================================================
+# [FORK] Digital-Union (R5 Clips Preview Selector, P1): the fifth tab's server side.
+#
+# READ-ONLY BY CONSTRUCTION. Nothing below moves, renames, deletes or re-encodes a reviewed
+# clip; the only write anywhere in this block is the decision journal and the poster cache, both
+# under `state/clips-review/`. Transfer is a separate, separately authorized phase, and it is
+# deliberately absent rather than present-and-disabled -- there is no code path here that could
+# be switched on by a flag.
+#
+# Everything with a rule in it lives in `beatsync_fork.clips_review`: opaque ids, the six
+# authorization gates, descriptor-identity revalidation, Range parsing, path-relationship
+# refusal, the journal, and the gallery markup. This layer is Gradio wiring, so the security
+# model stays testable on a bare interpreter.
+# =============================================================================================
+
+CLIPS_STATE_DIR = os.path.join(ROOT_DIR, 'state', 'clips-review')
+CLIPS_POSTER_DIR = os.path.join(CLIPS_STATE_DIR, 'posters')
+
+#: One registry and one store per process. The registry is scoped per owner internally, so two
+#: browser sessions cannot see or revoke each other's pages.
+_CLIPS_REGISTRY = fork_clips.ClipRegistry()
+_CLIPS_STORE_LOCK = threading.Lock()
+_CLIPS_STORE = None
+
+#: [R5-P3 / F1] Per-owner scan generations AND the authoritative per-owner view, in one object so
+#: that "is my scan still the newest?" and "change the authoritative state" cannot drift apart.
+#: Replaces the bare `_CLIPS_PAGES` dict, whose unconditional writes let a slow older scan
+#: republish its own revoked session after a newer scan had already superseded it.
+CLIPS_MAX_TRACKED_SESSIONS = 32
+_CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
+
+
+def _clips_store():
+    """The decision store, created on first use so importing `gui` writes nothing.
+
+    [R5-P11 / N7] `ReviewStore` now raises `PersistenceError` rather than returning a store that
+    recovered only part of the durable record, and **that failure must not be cached**. The global
+    is therefore bound from a local that only exists once the constructor has returned: if the
+    snapshot or journal was transiently unreadable -- a backup or indexer holding an exclusive
+    share is enough -- `_CLIPS_STORE` stays `None` and the next call retries the recovery from
+    scratch. Caching a refusal, or a half-loaded store, would turn a passing lock into a
+    process-lifetime outage; caching a half-loaded one would also re-arm the loss path, because
+    every later caller would be writing to a record the disk does not hold.
+    """
+    global _CLIPS_STORE
+    with _CLIPS_STORE_LOCK:
+        if _CLIPS_STORE is None:
+            recovered = fork_clips.ReviewStore(CLIPS_STATE_DIR)
+            _CLIPS_STORE = recovered
+        return _CLIPS_STORE
+
+
+def _clips_state_unavailable_text(failure) -> str:
+    """[R5-P11 / N7] The operator-facing wording for a durable record that could not be read.
+
+    Three things it must do, because the pre-fix behaviour did none of them. Say plainly that the
+    saved decisions could **not** be read, so a page of `PENDING` tiles is never mistaken for a
+    folder nobody has reviewed. Say that nothing was changed or lost, which is now true by
+    construction -- a refused load writes nothing. And name the retry, because the condition this
+    reports is usually transient.
+
+    It carries no filesystem path: `_clips_failure_text` reduces a bare `OSError` to numbers, and
+    `PersistenceError` is already path-free by the R5-P7 contract.
+    """
+    return ("⚠️  Your saved decisions could NOT be read, so nothing has been loaded.\n"
+            "Nothing was changed, overwritten or lost — the record on disk is untouched.\n"
+            "This is usually temporary (a backup or indexer holding the file). "
+            "Wait a moment and try again.\n"
+            f"({_clips_failure_text(failure)})")
+
+
+def _clips_unavailable_outputs(failure):
+    """[R5-P11 / N7] The four scan outputs for a durable record that could not be read.
+
+    Shaped so that every surface is honest at once, because the surfaces do not all get a status
+    box. Refresh's outputs are `(gallery, counts, Confirm)` -- no report -- so the **gallery**
+    carries the message rather than the "Nothing scanned yet" placeholder, which would read as a
+    folder nobody has reviewed. The counters are replaced rather than recomputed: "Undecided 0"
+    derived from a record that could not be read is precisely the misreading this exists to
+    prevent, and so is a grid of `PENDING` tiles. Confirm is disabled, by the F8 rule -- its state
+    comes only from the durable record, and there isn't one to read.
+    """
+    import html as _html
+
+    message = _clips_state_unavailable_text(failure)
+    grid = ('<div class="r5-empty">'
+            + '<br>'.join(_html.escape(line) for line in message.splitlines())
+            + '</div>')
+    return (message, grid, 'Saved decisions unavailable — nothing was loaded.',
+            gr.update(interactive=False))
+
+
+def _clips_owner(request) -> str:
+    """The owner key for a review session is the Gradio browser session hash.
+
+    [R5-P3 / F3] Stated accurately, because the earlier wording here was wrong. `gr.Request`
+    *injects* this value into the handler -- it is a real parameter, never listed in a click's
+    `inputs`, so it is not a widget the browser can set directly. But the **value itself
+    originates in the Gradio client**: `gradio/route_utils.py` reads it from the request body, and
+    the browser mints it with `Math.random().toString(36).substring(2)`, which is not a
+    cryptographically secure generator. So this is **not** an authenticated operator identity, and
+    a non-conforming local client can choose any owner key it likes.
+
+    What that does and does not cost. It scopes one browser session's pages and rescans against
+    another's, which is its whole job. It is **not** what protects the media: the HTTP layer
+    authorizes on server-minted `secrets.token_urlsafe` session/page/clip ids and asks the
+    registry who owns them, so no owner identity is ever read from a request. The app stays
+    localhost-only and claims no multi-user authentication.
+
+    Absent or unusable identity **fails closed**: there is deliberately no shared anonymous
+    registry to fall back into, because that is exactly how one browser's rescan would be able to
+    revoke another's authorization.
+    """
+    session_hash = getattr(request, 'session_hash', None) if request is not None else None
+    if not session_hash:
+        raise fork_clips.Refusal(403, 'no_session_identity')
+    return str(session_hash)
+
+
+def _clips_remember(owner: str, generation, view: dict) -> bool:
+    """Publish `view` as the owner's current page, but only if `generation` is still the newest.
+
+    [R5-P3 / F1] The unconditional last-write-wins version of this function is what let an older
+    scan reinstate its own revoked session. Publication is now conditional and the decision is
+    made inside the coordinator's lock.
+    """
+    return _CLIPS_SCANS.publish(owner, generation, view)
+
+
+def _clips_view(owner: str) -> dict:
+    return _CLIPS_SCANS.view(owner)
+
+
+def _clips_failure_text(failure) -> str:
+    """Operator-visible text for a failed clips operation, carrying no filesystem path.
+
+    [R5-P9] `PersistenceError` and `Refusal` already carry a deliberately path-free message --
+    that is the R5-P7 contract the HTTP 503 body depends on, and it says more than a number does,
+    so it is used as-is. A bare `OSError` is the opposite: it stringifies with `filename` (and
+    `filename2`) attached whenever the failing call was made by pathname, so interpolating one put
+    the journal's or the snapshot's absolute path into the status box the operator is looking at.
+    Those are reported as numbers, by the same formatter the 503 body uses.
+    """
+    if isinstance(failure, OSError):
+        return fork_clips.io_detail(failure)
+    return str(failure)
+
+
+def _clips_poster_exists(entry) -> bool:
+    try:
+        return os.path.getsize(fork_clips.poster_path_for(CLIPS_POSTER_DIR, entry)) > 0
+    except OSError:
+        return False
+
+
+def _clips_poster_resolver(entry):
+    return fork_clips.poster_path_for(CLIPS_POSTER_DIR, entry)
+
+
+def _clips_identities(view: dict) -> list:
+    return [view['identity'][entry.clip_id] for entry in view.get('entries', ())]
+
+
+def _on_clips_check(input_folder, library_folder, rejected_folder):
+    """Read-only validation of the three roots. Creates no directory and reads no media."""
+    verdict, roots = fork_clips.validate_roots(input_folder, library_folder, rejected_folder,
+                                               app_root=ROOT_DIR)
+    if not verdict.ok:
+        return f"❌ REFUSED: {verdict.code}\n{verdict.detail}"
+    lines = ["✅ Folders accepted. Nothing was created, read or moved.", ""]
+    for role in (fork_clips.ROLE_INPUT, fork_clips.ROLE_LIBRARY, fork_clips.ROLE_REJECTED):
+        root = roots[role]
+        suffix = '   [link resolved]' if root.is_reparse else ''
+        missing = '' if root.exists else '   [does not exist yet — not created]'
+        lines.append(f"  {role:<9} -> {root.real}{suffix}{missing}")
+    return "\n".join(lines)
+
+
+def _clips_render_current(owner: str, report: str):
+    """Render whatever the server currently holds for `owner`, with `report` as the message.
+
+    [R5-P3 / F1] Used by Refresh *and* by a superseded scan. A superseded scan must not hand the
+    browser the grid it built -- that page's session was revoked the moment the newer scan opened
+    its own, so every tile in it would answer 403. Repainting the authoritative page instead means
+    that whichever response the browser receives last, what it displays is current.
+    """
+    view = _clips_view(owner)
+    if not view.get('entries'):
+        return (report, CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
+                gr.update(interactive=False))
+    # [R5-P11 / N7] Refresh is the operator's recovery route, so it must survive the condition it
+    # is recovering from. A store that cannot completely recover now refuses rather than reporting
+    # an empty record, and repainting this page from a record that could not be read would show
+    # every decided clip as undecided -- the exact misreading the refusal exists to replace.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_unavailable_outputs(failure)
+    identities = _clips_identities(view)
+    counts = store.counts(identities)
+    grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
+                                   view['identity'], view['session'], view['page'],
+                                   _clips_poster_exists)
+    return (report, grid, fork_clips.counts_text(counts),
+            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+
+
+def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, page_size,
+                   request: gr.Request = None):
+    """Validate, enumerate, freeze one page, mint opaque ids and build the grid.
+
+    Order matters twice over.
+
+    The roots are refused **before** anything is read, so a destination that overlaps the input
+    never reaches the filesystem.
+
+    And [R5-P3 / F1] the scan now runs under an explicit per-owner generation:
+
+    1. refusals that change nothing happen first, so a scan rejected for a bad folder or an empty
+       enumeration never takes a generation and therefore cannot supersede a running scan;
+    2. `begin()` takes the generation -- from here on this scan is visible as "the newest", even
+       though it has not finished;
+    3. the authority-changing calls (`begin_scan`, `new_session`, `publish_page`) run inside
+       `authority(...)`, which re-checks the generation **while holding the owner's lock**;
+    4. the slow poster pass runs **outside** that lock, and takes no render lock;
+    5. `publish()` installs the view only if this generation is still the newest;
+    6. [R5-P9 / N1] the response itself is then rendered from the **authoritative view**, not from
+       this scan's locals, so a scan superseded after it published repaints what is current
+       instead of returning markup whose session has already been revoked;
+    7. [R5-P9 / N5] the optional journal compaction cannot destroy a scan that has succeeded.
+
+    A superseded scan therefore changes nothing and repaints the authoritative page; a newest scan
+    that *fails* discards the view rather than leaving an older revoked page looking current.
+    """
+    empty = (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT)
+    try:
+        owner = _clips_owner(request)
+    except fork_clips.Refusal as refusal:
+        return (f"❌ No browser session identity ({refusal.reason}). Reload the page.",
+                empty[0], empty[1], gr.update(interactive=False))
+
+    verdict, _ = fork_clips.validate_roots(input_folder, library_folder, rejected_folder,
+                                           app_root=ROOT_DIR)
+    if not verdict.ok:
+        return (f"❌ REFUSED before reading anything: {verdict.code}\n{verdict.detail}",
+                empty[0], empty[1], gr.update(interactive=False))
+
+    found = fork_clips.discover_clips(input_folder, recursive)
+    if found.error:
+        return (f"❌ {found.error}", empty[0], empty[1], gr.update(interactive=False))
+    if not found.files:
+        return ("No reviewable clips found (0 enumerated).\n"
+                "Supported: " + ", ".join(fork_clips.SERVABLE_SUFFIXES),
+                empty[0], empty[1], gr.update(interactive=False))
+
+    try:
+        size = max(1, min(int(page_size), fork_clips.MAX_CLIPS_PER_PAGE))
+    except (TypeError, ValueError):
+        size = 100
+
+    # [R5-P11 / N7] The durable record is obtained BEFORE a generation is taken, and that ordering
+    # is the whole containment. A refused recovery therefore changes nothing at all: no generation
+    # is minted, so no running scan is superseded and no current page is blanked; `begin_scan` and
+    # `new_session` are never reached, so no review session is opened against a record the server
+    # could not read; and the poster pass never starts. The operator is told what happened instead
+    # of being handed a folder that looks entirely undecided.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_unavailable_outputs(failure)
+    scan_id = secrets.token_urlsafe(12)
+    generation = _CLIPS_SCANS.begin(owner)
+    try:
+        # Outside the lock: one stat per file, and it touches no authoritative state.
+        frozen = fork_clips.freeze_page(found.files, 0, size)
+        with _CLIPS_SCANS.authority(owner, generation):
+            store.begin_scan(owner, scan_id)
+            session_id = _CLIPS_REGISTRY.new_session(owner, scan_id)
+            page_token, entries = _CLIPS_REGISTRY.publish_page(owner, session_id, 1, frozen)
+
+        from ffmpeg_processing import FFMPEG_PATH      # local: no module-level import is added
+        # The runner lives in the fork core, not here: two suites pin this module's
+        # `subprocess.run` site count at exactly two (the delivery preview and the Director), and
+        # that invariant keeps process launching out of the view layer.
+        posters = fork_clips.ensure_posters(entries, CLIPS_POSTER_DIR, FFMPEG_PATH,
+                                            fork_clips.run_poster_command)
+
+        identity = {entry.clip_id: fork_clips.decision_identity(entry.path, entry.size,
+                                                                entry.mtime_ns)
+                    for entry in entries}
+        view = {'session': session_id, 'page': page_token, 'scan_id': scan_id,
+                'entries': entries, 'identity': identity, 'total': len(found.files),
+                'root': found.root, 'page_size': size}
+        if not _clips_remember(owner, generation, view):
+            raise fork_clips.SupersededScan(generation, _CLIPS_SCANS.newest(owner))
+    except fork_clips.SupersededScan:
+        return _clips_render_current(owner, CLIPS_SCAN_SUPERSEDED_TEXT)
+    except (fork_clips.Refusal, fork_clips.PersistenceError, OSError) as failure:
+        # A failed NEWEST scan must leave an honest empty state. Resurrecting the previous page
+        # would present a revoked session as current.
+        _CLIPS_SCANS.discard(owner, generation)
+        return (f"❌ The scan failed and nothing is loaded: {_clips_failure_text(failure)}",
+                empty[0], empty[1], gr.update(interactive=False))
+
+    # [R5-P9 / N5] Compaction is an optimisation over the journal, never the record itself, and
+    # it runs *after* this scan has already published a valid page and minted live credentials.
+    # Letting its failure escape therefore destroyed a scan that had entirely succeeded: the
+    # operator lost the gallery they were already entitled to, for a failure that costs nothing.
+    # The journal stays authoritative and every committed decision remains recoverable, so the
+    # page is served and the failure is reported honestly instead. Only the two I/O classes are
+    # contained -- a `TypeError` from a programming mistake in `compact()` must still surface.
+    compaction_notice = ''
+    try:
+        store.maybe_compact()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        # [R5-P11] The reassurance here used to say every decision already made "is still in the
+        # journal". That overstates what the storage contract guarantees, and an independent review
+        # found it inaccurate: after a *successful* compaction the snapshot is the authoritative
+        # copy and the journal is empty, so the journal alone is not the record. What is true, and
+        # is what matters to the operator, is that compaction only ever runs against a completely
+        # recovered record and that a failed one destroys neither copy -- either the snapshot has
+        # not been replaced yet, or it has landed and the journal still replays onto it
+        # idempotently. Promise the recoverability, not the location.
+        compaction_notice = (
+            "\n⚠️  Journal housekeeping (compaction) failed and was skipped "
+            f"({_clips_failure_text(failure)}). Your decisions are safe: every decision already "
+            "made stays recoverable from the snapshot plus the journal, and a failed compaction "
+            "discards neither.")
+
+    # [R5-P9 / N1] Render from the authoritative view, never from this scan's own locals.
+    # Publication succeeded above, but the poster pass and the compaction below both take real
+    # time, and a second scan can supersede this one in between -- after which `entries`,
+    # `identity`, `session_id` and `page_token` name a session `new_session` has already revoked.
+    # Handing that markup to the browser is the F1 symptom returning by a later route: every tile
+    # answers 403. Deriving the response from `_clips_view` means a superseded scan repaints
+    # whatever is current instead, so whichever response the browser receives last is live.
+    current = _clips_view(owner)
+    if current.get('generation') != generation:
+        return _clips_render_current(owner, CLIPS_SCAN_SUPERSEDED_TEXT)
+
+    identities = _clips_identities(current)
+    counts = store.counts(identities)
+    grid = fork_clips.gallery_html(current['entries'], store.snapshot_of(identities),
+                                   current['identity'], current['session'], current['page'],
+                                   _clips_poster_exists)
+    report = (
+        f"Enumerated {len(found.files)} clip(s) under:\n{found.root}\n"
+        f"Subfolders: {'included' if recursive else 'excluded'}\n"
+        f"Not reviewable (unsupported, empty or unreadable): {len(found.rejected)}\n"
+        f"This page shows {len(entries)} of {len(found.files)}.\n"
+        f"scan {found.scan_seconds:.3f}s · posters {posters.seconds:.3f}s "
+        f"(cached {posters.hits}, made {posters.generated}, "
+        f"no frame {posters.failures}, {posters.workers} worker(s))\n"
+        "Read-only: metadata and one poster frame per clip. No file was moved, renamed or deleted."
+    ) + compaction_notice
+    return (report, grid, fork_clips.counts_text(counts),
+            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+
+
+def _clips_decide(owner, session_id, page_token, entry, payload):
+    """The ONE decision entry point, called by the media server for POST /r5decide.
+
+    Everything is revalidated here. The browser supplied an opaque id and a desired state; it did
+    not name a file, and any `path` it put in the body is ignored.
+    """
+    view = _clips_view(owner)
+    if view.get('session') != session_id or view.get('page') != page_token:
+        return {'ok': False, 'code': 'not_the_active_page'}
+    target = payload.get('to')
+    if not isinstance(target, str) or target not in fork_clips.DECISIONS:
+        return {'ok': False, 'code': 'illegal_transition'}
+    identity = view['identity'].get(entry.clip_id)
+    if identity is None:
+        return {'ok': False, 'code': 'clip_not_on_page'}
+
+    # [R5-P11 / N7] Deliberately NOT contained here. `_clips_store` raises `PersistenceError` when
+    # the durable record could not be completely recovered, and the middleware already answers that
+    # class with 503 `not_durably_recorded` and a path-free body -- which is the correct answer for
+    # a classification that cannot be read or written. Catching it to return a JSON `ok: False`
+    # would make an unreadable record indistinguishable from an ordinary refusal, and catching it
+    # to return `ok: True` would be the false success the whole durability contract forbids.
+    store = _clips_store()
+    identities = _clips_identities(view)
+
+    def refuse(code):
+        """A refusal that discloses the server's current record to the already-authorized page.
+
+        Nothing is appended and no revision moves: this returns before `store.decide` is reached.
+        """
+        current, revision = store.get(identity)
+        return {'ok': False, 'code': code, 'clip': entry.clip_id, 'decision': current,
+                'rev': revision, 'counts': store.counts(identities)}
+
+    # [R5-P3 / F2] The expected revision is MANDATORY and strictly typed. The previous code did
+    # `int(payload.get('rev'))` inside a try/except that assigned `None`, so a missing, null,
+    # string, bool, float, list or dict revision all became "no concurrency check requested" --
+    # a fail-open, and one reachable from the shipped client, because `parseInt` of a tampered
+    # non-numeric `data-rev` is `NaN` and `JSON.stringify(NaN)` is `null`. Validation now happens
+    # before anything is written, and a bad revision is refused with its own stable code.
+    try:
+        expected = fork_clips.parse_expected_revision(payload)
+    except fork_clips.RevisionError as bad:
+        return refuse(bad.code)
+
+    # Identity is revalidated on the OPENED DESCRIPTOR, so a path repointed between enumeration
+    # and now is caught rather than inherited.
+    if not _CLIPS_REGISTRY.live_identity_ok(entry):
+        return refuse('identity_changed')
+    try:
+        decision, revision = store.decide(owner, identity, target, view['scan_id'], expected)
+    except fork_clips.StaleWrite as stale:
+        return {'ok': False, 'code': stale.code, 'clip': entry.clip_id,
+                'decision': stale.current, 'rev': stale.revision,
+                'counts': store.counts(identities)}
+    return {'ok': True, 'clip': entry.clip_id, 'decision': decision, 'rev': revision,
+            'counts': store.counts(identities)}
+
+
+def _clips_state(owner, session_id, page_token):
+    """The authoritative record for one page, for GET /r5state.
+
+    [R5-P11 / N7] A `PersistenceError` from `_clips_store` is left to propagate for the same
+    reason as in `_clips_decide`: this route's entire purpose is to be believed, so an unreadable
+    record must answer 503 rather than report every clip as `PENDING` with `ok: True`.
+    """
+    view = _clips_view(owner)
+    if view.get('session') != session_id or view.get('page') != page_token:
+        return {'ok': False, 'code': 'not_the_active_page'}
+    store = _clips_store()
+    identities = _clips_identities(view)
+    snapshot = store.snapshot_of(identities)
+    return {
+        'ok': True,
+        'counts': store.counts(identities),
+        'clips': {entry.clip_id: {
+            'decision': snapshot[view['identity'][entry.clip_id]][0],
+            'rev': snapshot[view['identity'][entry.clip_id]][1],
+        } for entry in view['entries']},
+    }
+
+
+def _on_clips_refresh(request: gr.Request = None):
+    """Re-render the grid from the server's record. This is the proof that the DOM is not the
+    decision: whatever the page currently shows, this repaints it to what the server holds.
+
+    [R5-P3 / F8] This is also the only thing that moves the Confirm button, and it derives that
+    state solely from `store.counts()` -- the durable record. So a clip put back to PENDING
+    disables Confirm again on the next Refresh, and no amount of DOM editing can enable it.
+    """
+    try:
+        owner = _clips_owner(request)
+    except fork_clips.Refusal:
+        return (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
+                gr.update(interactive=False))
+    return _clips_render_current(owner, '')[1:]
+
+
+def _on_clips_confirm(request: gr.Request = None):
+    """Report readiness. **Moves nothing.**
+
+    There is no transfer code behind this -- not disabled, not feature-flagged, not present. It
+    reads the server's durable record and says what a later, separately authorized phase would
+    do with it.
+    """
+    try:
+        owner = _clips_owner(request)
+    except fork_clips.Refusal:
+        return "Reload the page: this browser session has no identity."
+    view = _clips_view(owner)
+    if not view.get('entries'):
+        return "Nothing has been scanned on this page."
+    # [R5-P11 / N7] A readiness report derived from a record that could not be read would be a
+    # false negative with the authority of a positive statement -- "0 kept, 0 discarded" reads as
+    # a reviewed page rather than an unreadable one. Refuse to report instead.
+    try:
+        store = _clips_store()
+    except (fork_clips.PersistenceError, OSError) as failure:
+        return _clips_state_unavailable_text(failure)
+    counts = store.counts(_clips_identities(view))
+    if counts[fork_clips.PENDING]:
+        return (f"{CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
+                f"{counts[fork_clips.PENDING]} of {counts['TOTAL']} clip(s) are still undecided.")
+    return (f"{CLIPS_CONFIRM_READY_TEXT}\n\n"
+            f"Recorded: {counts[fork_clips.SELECTED]} kept, "
+            f"{counts[fork_clips.REJECTED]} discarded, {counts['TOTAL']} total.")
+
+
 def create_ui() -> gr.Blocks:
     # These definitions are needed within the function's scope
     python_status = "✅ Portable (bin/python-3.13.14-embed-amd64/)" if USING_PORTABLE_PYTHON else "⚠️  System Python"
@@ -5927,7 +6739,7 @@ def create_ui() -> gr.Blocks:
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
     app = gr.Blocks(title='BeatSync Engine', theme='ocean',
-                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS)
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -7037,6 +7849,99 @@ def create_ui() -> gr.Blocks:
                         elem_id='prep-sample-report-box',
                     )
 
+            # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
+            #
+            # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
+            # It keeps Advanced Tools at tab index 3, so every existing containment assertion in
+            # `test_gui_tabs.py` needs no index change; and it keeps this tab's markup out of the
+            # Raw-Cutter-to-Advanced source span that
+            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
+            #
+            # Page size is a Number widget, and that is also not cosmetic. A tab placed last
+            # falls inside the source span that
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # guards -- measured in R5-P0 as ~39 k characters, running past `source_outputs = [`
+            # into the event wiring. That test enforces the approved sample resource policy by
+            # OMISSION, so the forbidden widget type must not appear anywhere in this span, not
+            # even in a comment explaining why: the guard is a substring check, and prose naming
+            # the banned token trips it exactly as real code would. (It has now done so five
+            # times in this repository.) The test is right; the widget is a Number and this
+            # comment does not name the alternative.
+            with gr.Tab(LABEL_TAB_CLIPS_PREVIEW, id='tab-clips-preview'):
+                gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
+                with gr.Row():
+                    clips_input = gr.Textbox(
+                        label=LABEL_CLIPS_INPUT,
+                        info=INFO_CLIPS_INPUT,
+                        placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
+                        elem_id='clips-input-folder',
+                    )
+                    clips_recursive = gr.Checkbox(
+                        value=True,
+                        label=LABEL_CLIPS_RECURSIVE,
+                        info=INFO_CLIPS_RECURSIVE,
+                        elem_id='clips-recursive',
+                    )
+                with gr.Row():
+                    clips_library = gr.Textbox(
+                        label=LABEL_CLIPS_LIBRARY,
+                        info=INFO_CLIPS_LIBRARY,
+                        placeholder=r"J:\Media Library",
+                        elem_id='clips-library-folder',
+                    )
+                    clips_rejected = gr.Textbox(
+                        label=LABEL_CLIPS_REJECTED,
+                        info=INFO_CLIPS_REJECTED,
+                        placeholder=r"J:\Discarded",
+                        elem_id='clips-rejected-folder',
+                    )
+                with gr.Row():
+                    clips_page_size = gr.Number(
+                        value=100,
+                        precision=0,
+                        minimum=1,
+                        maximum=fork_clips.MAX_CLIPS_PER_PAGE,
+                        label=LABEL_CLIPS_PAGE_SIZE,
+                        info=INFO_CLIPS_PAGE_SIZE,
+                        elem_id='clips-page-size',
+                    )
+                    clips_check_btn = gr.Button(
+                        LABEL_CLIPS_CHECK, variant='secondary', elem_id='clips-check-button')
+                    clips_scan_btn = gr.Button(
+                        LABEL_CLIPS_SCAN, variant='primary', elem_id='clips-scan-button')
+                    clips_refresh_btn = gr.Button(
+                        LABEL_CLIPS_REFRESH, variant='secondary',
+                        elem_id='clips-refresh-button')
+                clips_report = gr.Textbox(
+                    label=LABEL_CLIPS_REPORT,
+                    value=CLIPS_REPORT_INITIAL_TEXT,
+                    interactive=False,
+                    lines=7,
+                    max_lines=14,
+                    elem_id='clips-report-box',
+                )
+                clips_counts = gr.Textbox(
+                    label=LABEL_CLIPS_COUNTS,
+                    value=CLIPS_COUNTS_INITIAL_TEXT,
+                    interactive=False,
+                    elem_id='clips-counts-box',
+                )
+                # The grid is server-rendered markup. The browser never receives a path, only
+                # opaque ids, and the authority for what each tile says is the decision journal.
+                clips_gallery = gr.HTML(
+                    CLIPS_GALLERY_INITIAL_HTML, elem_id='clips-gallery')
+                clips_confirm_btn = gr.Button(
+                    LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
+                    elem_id='clips-confirm-button')
+                clips_confirm_out = gr.Textbox(
+                    label=LABEL_CLIPS_CONFIRM_OUT,
+                    value=CLIPS_CONFIRM_DISABLED_TEXT,
+                    interactive=False,
+                    lines=5,
+                    max_lines=10,
+                    elem_id='clips-confirm-box',
+                )
+
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.
         #
         # Every one of these events routes through beatsync_fork.input_session, so any source change
@@ -7730,6 +8635,51 @@ def create_ui() -> gr.Blocks:
             concurrency_limit=1,
         )
 
+        # [FORK] Digital-Union (R5 Clips Preview Selector, P1): four registrations, all isolated.
+        #
+        # None of them writes `status_output`, `video_output`, `process_btn`, `source_state`, any
+        # element of `source_outputs` or `prep_outputs`, any creative or audio widget, any Raw
+        # Cutter widget or any render state -- so reviewing clips cannot clear a confirmed source
+        # set, change what a render would do, or disturb a cutter job.
+        #
+        # No `concurrency_id` and `concurrency_limit=None` on every one, for the measured S2-A R3
+        # reason: on the pinned gradio 6.19.0 a full concurrency group leaves the event QUEUED
+        # rather than delivering it. None of these takes `_RENDER_LOCK` either -- a read-only
+        # gallery is not a render, and its poster pass is one short bounded FFmpeg read per clip
+        # rather than the four concurrent reads D0 traced extraction timeouts to.
+        #
+        # `gr.Request` is injected and is NOT listed in `inputs`: the owner of a review session is
+        # the server-side session hash, never a value the browser could supply.
+        clips_check_btn.click(
+            fn=_on_clips_check,
+            inputs=[clips_input, clips_library, clips_rejected],
+            outputs=[clips_report],
+            concurrency_limit=None,
+        )
+        clips_scan_btn.click(
+            fn=_on_clips_scan,
+            inputs=[clips_input, clips_recursive, clips_library, clips_rejected,
+                    clips_page_size],
+            outputs=[clips_report, clips_gallery, clips_counts, clips_confirm_btn],
+            concurrency_limit=None,
+        )
+        clips_refresh_btn.click(
+            fn=_on_clips_refresh,
+            inputs=[],
+            outputs=[clips_gallery, clips_counts, clips_confirm_btn],
+            concurrency_limit=None,
+        )
+        clips_confirm_btn.click(
+            fn=_on_clips_confirm,
+            inputs=[],
+            outputs=[clips_confirm_out],
+            concurrency_limit=None,
+        )
+
+        # The gallery's interaction layer. `fn=None` means this registers no server call: it only
+        # installs the listeners once per page load.
+        app.load(fn=None, inputs=None, outputs=None, js=CLIPS_GALLERY_JS)
+
     return app
 
 if __name__ == '__main__':
@@ -7743,10 +8693,36 @@ if __name__ == '__main__':
     
     app = create_ui()
     launch_port = find_launch_port()
+    # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the clips media endpoint is attached
+    # here, through the PUBLIC `app_kwargs` parameter, which `Blocks.launch` forwards to the
+    # FastAPI constructor. That is the whole integration: no second Uvicorn, no helper that mounts
+    # this app inside another one, no launcher replacement, no new dependency (Starlette already
+    # ships with Gradio), and `allowed_paths` / `set_static_paths` / `blocked_paths` are untouched.
+    # (The rejected alternatives are named in `.claude/rules/clips-preview.md` rather than here:
+    # a sibling suite scans this file's raw text for them, so prose naming one would trip it.)
+    #
+    # It has to be a middleware rather than Gradio's own file route because Gradio serves only its
+    # `created_paths` (`[upload_dir, cache_folder]`): an arbitrary operator media path is served
+    # 403. Widening `allowed_paths` to a media root would expose that whole tree to every request
+    # the browser can make, and copying a page of clips into Gradio's cache would duplicate
+    # gigabytes to draw thumbnails. So R5 serves its own bytes under its own authorization.
+    #
+    # Localhost binding is unchanged.
     app.launch(
         server_name="127.0.0.1",
         server_port=launch_port,
         share=False,
         inbrowser=True,
-        show_error=True
+        show_error=True,
+        app_kwargs={
+            'middleware': [
+                Middleware(
+                    ClipMediaMiddleware,
+                    registry=_CLIPS_REGISTRY,
+                    poster_resolver=_clips_poster_resolver,
+                    decide_handler=_clips_decide,
+                    state_handler=_clips_state,
+                ),
+            ],
+        },
     )

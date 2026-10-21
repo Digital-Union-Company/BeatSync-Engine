@@ -662,11 +662,39 @@ def test_the_batch_reuses_the_shared_execution_settings_rather_than_duplicating_
         assert len(assigns) == 1, f"{name} is declared {len(assigns)} times"
 
 
-def test_batch_mode_is_not_a_fifth_top_level_tab(gui_source):
-    """The requirement says so explicitly: extend the existing Raw Cutter tab."""
-    assert gui_source.count("gr.Tab(") == 4
+def test_batch_mode_is_not_a_top_level_tab_of_its_own(gui_source):
+    """The requirement says so explicitly: extend the existing Raw Cutter tab.
+
+    Amended for R5-P1. The original name and its `count("gr.Tab(") == 4` dated from when four was
+    the whole topology, so the count did double duty: it kept Folder Batch inside Raw Cutter *and*
+    incidentally banned any fifth tab. R5 legitimately added the fifth, so the count alone can no
+    longer carry the real claim — and renumbering it to 5 would let Folder Batch become that fifth
+    tab, which is precisely what this test forbids.
+
+    The claim is therefore asserted directly: batch mode's widgets live **inside** the Raw Cutter
+    tab, there is no tab label of its own, and the whole tab set is the documented five.
+    """
+    expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
+                "LABEL_TAB_ADVANCED", "LABEL_TAB_CLIPS_PREVIEW")
+    assert gui_source.count("gr.Tab(") == len(expected), "the top-level tab set changed"
+    for label in expected:
+        assert f"gr.Tab({label}" in gui_source, f"{label} is not a top-level tab"
+    # No batch tab exists under any spelling.
+    for forbidden in ("LABEL_TAB_BATCH", "LABEL_TAB_FOLDER_BATCH", "LABEL_TAB_RAW_CUTTER_BATCH"):
+        assert f"gr.Tab({forbidden}" not in gui_source, f"{forbidden} became a tab"
+
     assert "LABEL_TAB_RAW_CUTTER" in gui_source
     assert gui_source.count("LABEL_CUT_MODE") >= 1, "the mode selector lives inside that tab"
+
+    # And the mode selector plus every batch widget sit inside the Raw Cutter tab's own block,
+    # which is the containment the old count was standing in for.
+    cutter = gui_source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
+    advanced = gui_source.index("gr.Tab(LABEL_TAB_ADVANCED")
+    assert cutter < advanced
+    block = gui_source[cutter:advanced]
+    for widget in ("cut_mode", "cut_batch_folder", "cut_batch_recursive", "cut_batch_start_btn",
+                   "cut_batch_cancel_btn", "cut_batch_status", "cut_batch_summary"):
+        assert f"{widget} = gr." in block, f"{widget} is not inside the Raw Cutter tab"
 
 
 def test_the_mode_switch_writes_only_visibilities(gui_tree):

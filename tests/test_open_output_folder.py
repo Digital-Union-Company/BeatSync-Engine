@@ -606,24 +606,265 @@ def test_gradio_file_serving_permissions_were_not_widened():
         assert kwargs.get("server_name", "'127.0.0.1'") in ("'127.0.0.1'", '"127.0.0.1"'), kwargs
 
 
+#: Browser-side mechanisms Open Output Folder must never acquire. The approved behaviour is a
+#: Windows shell verb on the machine running the backend; anything here would move the action into
+#: the browser.
+#:
+#: Every entry is a precise API name. A bare `"download"` was tried and removed: the handler's own
+#: docstring explains *why* a download control was rejected, so the word appears in prose and the
+#: substring ban fired on the explanation rather than on any mechanism. Download mechanisms are
+#: named exactly below, and `test_nothing_the_product_owner_rejected_was_implemented` keeps
+#: guarding `gr.DownloadButton`, `FileResponse` and `send_file` across the whole module.
+BROWSER_SIDE_FORBIDDEN = ("file://", "window.open", "navigator.", "document.querySelector",
+                          "document.location", "window.location", "showDirectoryPicker",
+                          "showSaveFilePicker", "createObjectURL", "gr.DownloadButton",
+                          "FileResponse", "send_file")
+
+
 def test_no_browser_side_file_navigation_or_javascript_was_added():
     """Section 4: the folder opens on the machine running the backend, by design.
 
-    Structural: no event may carry a `js`/`_js` keyword, and no string literal anywhere may be a
-    `file://` URL or browser API call. A substring scan of the raw source would trip on prose.
-    """
-    tree = _tree(_GUI)
-    for call in ast.walk(tree):
-        if isinstance(call, ast.Call):
-            for banned_kw in ("js", "_js"):
-                assert banned_kw not in [kw.arg for kw in call.keywords], \
-                    f"{banned_kw}= passed to {ast.unparse(call.func)}"
+    Scoped to the Open Output Folder feature -- its handler and its one event registration -- and
+    that scope is the correction R5-P1 required.
 
-    literals = [n.value for n in ast.walk(tree)
-                if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    for text in literals:
-        for forbidden in ("file://", "window.open", "navigator.", "document.querySelector"):
-            assert forbidden not in text, f"{forbidden} in a string literal: {text[:80]!r}"
+    The original version walked the WHOLE of `gui.py`: no `js`/`_js` keyword on any call, and no
+    browser-API substring in any literal anywhere in the module. That was wider than the claim it
+    was written to defend (this test's own docstring names one button), and it made the file an
+    application-wide ban on client-side code. R5's Clips Preview gallery legitimately needs a
+    JavaScript interaction layer -- hover preview, keyboard navigation, one active player at a
+    time -- which the accepted specification mandates, so the global form had to go.
+
+    Nothing this test actually protected is given up. The handler still may not reach a browser
+    API, its registration still may not carry `js`/`_js`, and it still may not acquire a download
+    path. `test_nothing_the_product_owner_rejected_was_implemented` continues to guard the
+    rejected-mechanism list module-wide, and a negative control in the R5-P1 R2 closeout proves a
+    deliberate `window.open` planted in this handler still fails here.
+    """
+    # 1. The handler itself: no browser-side mechanism, in code or in any string it builds.
+    #    Docstrings stripped via this module's existing `_code` helper -- this handler's own prose
+    #    explains which mechanisms were rejected and why, so an un-stripped scan fires on the
+    #    explanation rather than on code. `_code`'s own docstring records that this has happened
+    #    repeatedly here.
+    handler = _code(_func(_GUI, HANDLER))
+    for forbidden in BROWSER_SIDE_FORBIDDEN:
+        assert forbidden not in handler, f"{forbidden} reached {HANDLER}"
+
+    # 2. Its one registration: no JavaScript may be attached to this event.
+    registration = _click(BUTTON)
+    for banned_kw in ("js", "_js"):
+        assert banned_kw not in [kw.arg for kw in registration.keywords], \
+            f"{banned_kw}= passed to {BUTTON}.click"
+
+    # 3. Nothing the handler calls may smuggle one in either. Walked by name through the module,
+    #    so a rename cannot evade it.
+    tree = _tree(_GUI)
+    called = {node.func.id for node in ast.walk(_func(_GUI, HANDLER))
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    for name in sorted(called):
+        helper = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == name), None)
+        if helper is None:
+            continue
+        rendered = _code(helper)
+        for forbidden in BROWSER_SIDE_FORBIDDEN:
+            assert forbidden not in rendered, f"{forbidden} reached {name}, called by {HANDLER}"
+
+    # 4. `file://` is refused module-wide, independently of scope: the app never navigates a
+    #    browser to a local path, and no feature has a reason to build such a URL.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "file://" not in node.value, \
+                f"a file:// URL appears in a string literal: {node.value[:80]!r}"
+
+
+#: [R5-P3 / F9] The ONLY event registrations in `gui.py` permitted to carry client-side
+#: JavaScript, as (callee, argument) pairs read from the AST.
+#:
+#: Why an allowlist and not the old blanket ban. Before R5-P1 this file forbade `js=`/`_js=` on
+#: *any* call in `gui.py`, which was wider than the one-button claim its own docstring makes --
+#: and it had to go when the R5 gallery legitimately needed an interaction layer the accepted
+#: specification mandates. The independent review (F9) recorded the cost of that narrowing: with
+#: the global form gone, any future feature could attach JavaScript anywhere with no test
+#: objecting. This restores the blast radius without re-banning the one legitimate case.
+#:
+#: Structural rather than a substring scan: the pair comes from `ast.unparse` of the call's `func`
+#: and of the keyword's value, so a renamed variable holding the same script, or the same keyword
+#: on a different event, both show up as a new pair rather than slipping through a text match.
+AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
+    ("app.load", "CLIPS_GALLERY_JS"),
+)
+
+
+#: Gradio's event-registration methods. Calling one of these is how a component attaches
+#: behaviour -- including client-side script -- to the app. Any *other* call is ordinary Python
+#: and is none of this guard's business, which is what keeps the fail-closed rule below from
+#: rejecting unrelated code.
+GRADIO_EVENT_METHODS = frozenset({
+    "blur", "change", "clear", "click", "collapse", "download", "edit", "end", "expand",
+    "focus", "input", "key_up", "like", "load", "pause", "play", "release", "retry",
+    "select", "stop", "stream", "submit", "success", "then", "tick", "undo", "upload",
+})
+
+#: What :func:`_javascript_registrations` reports for an event registration whose keywords cannot
+#: be read statically. Deliberately not a script name, so it can never match the allowlist.
+OPAQUE_REGISTRATION = "**<keywords not statically readable>"
+
+
+def _javascript_registrations(tree):
+    """Every call in `gui.py` that can carry client-side JavaScript, as (callee, argument) pairs.
+
+    [R5-P9 / N3] **Fails closed on keyword unpacking.** `ast` represents `**mapping` as a
+    `keyword` whose `arg` is `None`, so the old loop -- which only ever compared `keyword.arg`
+    against the two names -- skipped it silently. An event registered through a dynamic keyword
+    dictionary therefore produced *no* pair at all, the exact-equality check below compared the
+    allowlist against a set that simply did not contain it, and the guard passed something it had
+    never looked at. That is the worst failure mode a guard can have: not a wrong answer, but a
+    confident answer about code it did not read.
+
+    The rule is structural, not textual: if a **Gradio event method** is called with keywords that
+    cannot be resolved statically, the registration is reported as :data:`OPAQUE_REGISTRATION`,
+    which is on no allowlist and so fails the comparison. The guard does not try to prove what is
+    inside the mapping -- it cannot, in general -- it refuses to certify what it cannot read.
+
+    Scoping to :data:`GRADIO_EVENT_METHODS` is what keeps this honest in the other direction.
+    `gui.py` legitimately calls `sink.update(**payload)` and `fork_cutter_batch.BatchItem(**fields)`;
+    neither can attach script to the app, and neither is rejected. A positive control for the one
+    approved registration, and negative controls for both evasion shapes, are below.
+    """
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (getattr(node.func, "attr", None) in GRADIO_EVENT_METHODS
+                and any(keyword.arg is None for keyword in node.keywords)):
+            found.append((ast.unparse(node.func), OPAQUE_REGISTRATION))
+        for keyword in node.keywords:
+            if keyword.arg in ("js", "_js"):
+                found.append((ast.unparse(node.func), ast.unparse(keyword.value)))
+    return sorted(found)
+
+
+def test_only_the_authorized_registration_carries_client_side_javascript():
+    """Application-wide, and deliberately exact.
+
+    Adding a `js=` anywhere in `gui.py` fails this test until the pair is added to the allowlist
+    above -- which is a decision someone has to make on purpose, with a reviewer looking at it.
+    """
+    registrations = _javascript_registrations(_tree(_GUI))
+    assert registrations == sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS), (
+        "an unauthorized client-side JavaScript registration appeared in gui.py: "
+        f"{registrations!r} != {sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)!r}")
+
+
+def test_the_authorized_registration_is_the_gallery_installer_and_nothing_else():
+    """The one permitted entry is pinned to what it actually is: a listener installer that
+    registers no server call (`fn=None`), not a hidden channel for decisions."""
+    tree = _tree(_GUI)
+    loads = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and ast.unparse(node.func) == "app.load"
+             and any(keyword.arg == "js" for keyword in node.keywords)]
+    assert len(loads) == 1, f"expected exactly one JavaScript app.load, found {len(loads)}"
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in loads[0].keywords}
+    assert keywords.get("js") == "CLIPS_GALLERY_JS"
+    assert keywords.get("fn") == "None", "the installer must register no server call"
+    assert keywords.get("inputs") == "None" and keywords.get("outputs") == "None"
+
+
+def test_the_allowlist_itself_rejects_a_planted_registration():
+    """An executable negative control for the allowlist's own comparison.
+
+    The mutation controls in the task report plant a real `js=` in `gui.py` and show this suite
+    failing. This checks the comparison that makes that happen, without editing the source: a
+    pair that is not on the list must not compare equal.
+    """
+    planted = sorted(list(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+                     + [("process_btn.click", "SOME_OTHER_SCRIPT")])
+    assert planted != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+    assert ("open_output_folder_btn.click", "ANY_SCRIPT") not in \
+        AUTHORIZED_JAVASCRIPT_REGISTRATIONS, (
+        "the protected button must never be allowlisted for JavaScript")
+
+
+# ---------------------------------------------------------------------------------------------
+# [R5-P9 / N3] The allowlist must not be evadable by keyword unpacking.
+#
+# The fixtures below are parsed from source built at run time, and the keyword name is assembled
+# rather than written out. Two reasons, in order of importance. First, these tests must fail
+# because of the *shape* of the registration in the AST, never because some literal happens to
+# appear in this file -- a guard that trips on its own explanatory text proves nothing about the
+# behaviour it claims to pin. Second, this repository carries raw-source substring guards, and
+# planting a forbidden literal where one of them might read it has produced false failures before.
+# ---------------------------------------------------------------------------------------------
+
+_JS_KEYWORD = "j" + "s"
+
+
+def _registration_fixture(source):
+    """Parse a one-line fixture and return what the guard makes of it."""
+    return _javascript_registrations(ast.parse(source))
+
+
+def test_a_registration_hidden_behind_keyword_unpacking_cannot_evade_the_allowlist():
+    """The N3 bypass, as an assertion.
+
+    `ast` reports `keyword.arg is None` for `**mapping`, so before this fix the guard returned an
+    empty list for the registration below and the exact-equality check passed it without ever
+    reading it. Now the call is reported as opaque, which is on no allowlist.
+    """
+    hidden = "{'" + _JS_KEYWORD + "': EVIL_SCRIPT}"
+    source = f"protected_btn.click(fn=None, inputs=None, outputs=None, **{hidden})"
+
+    # The fixture really is the shape under test: an event call with an unreadable keyword.
+    call = ast.parse(source).body[0].value
+    assert isinstance(call, ast.Call) and call.func.attr in GRADIO_EVENT_METHODS
+    assert any(keyword.arg is None for keyword in call.keywords), \
+        "the fixture must use keyword unpacking, or it is not testing N3"
+
+    found = _registration_fixture(source)
+    assert found == [("protected_btn.click", OPAQUE_REGISTRATION)], (
+        "an event registration whose keywords cannot be read statically must be reported, "
+        f"not silently skipped: {found!r}")
+    assert found != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS), \
+        "the opaque registration must not compare equal to the allowlist"
+
+
+def test_an_unauthorized_named_javascript_keyword_on_another_event_is_still_reported():
+    """The ordinary, non-unpacked evasion. This never regressed; it must not start to."""
+    source = f"process_btn.click(fn=None, {_JS_KEYWORD}=EVIL_SCRIPT)"
+    found = _registration_fixture(source)
+    assert found == [("process_btn.click", "EVIL_SCRIPT")]
+    assert found != sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+
+
+def test_the_approved_installer_still_reads_as_the_only_registration():
+    """The positive control: the fix must not reject the one legitimate case.
+
+    Read from the shipped `gui.py`, so this fails if the real registration ever stops matching.
+    """
+    assert _javascript_registrations(_tree(_GUI)) == sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)
+
+
+def test_ordinary_keyword_unpacking_is_not_mistaken_for_an_event_registration():
+    """Fail-closed on event registrations, not on `**kwargs` as such.
+
+    Grounded in the real source rather than a hypothetical: `gui.py` genuinely contains calls that
+    unpack a mapping, and none of them is a Gradio event method. If a future change made the guard
+    reject plain `**kwargs`, the suite would start failing on unrelated, legitimate code -- so this
+    asserts both that such calls exist and that they are ignored.
+    """
+    for source in ("sink.update(**payload)",
+                   "fork_cutter_batch.BatchItem(**fields)",
+                   "helper(**options)"):
+        assert _registration_fixture(source) == [], f"{source} must not be reported"
+
+    unpacking_calls = [
+        node for node in ast.walk(_tree(_GUI))
+        if isinstance(node, ast.Call) and any(k.arg is None for k in node.keywords)]
+    assert unpacking_calls, "expected gui.py to contain at least one **kwargs call"
+    assert all(getattr(node.func, "attr", None) not in GRADIO_EVENT_METHODS
+               for node in unpacking_calls), (
+        "gui.py now unpacks keywords into a Gradio event registration; that is exactly what the "
+        "N3 guard refuses to certify, and it needs a deliberate decision rather than a test edit")
 
 
 def test_no_progress_stage_was_invented_for_the_folder_button():

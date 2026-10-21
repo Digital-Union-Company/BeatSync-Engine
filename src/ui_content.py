@@ -634,6 +634,100 @@ LABEL_TAB_CREATIVE_STUDIO = "🎨 Creative Studio"
 LABEL_TAB_RAW_CUTTER = "✂️ Raw Cutter"
 LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
 
+# [FORK] Digital-Union: R5 Clips Preview Selector — a FIFTH top-level tab, placed LAST.
+# Placed after Advanced Tools deliberately: it keeps Advanced at tab index 3 so the existing
+# containment assertions need no index change, and it keeps this tab's markup out of the
+# Raw-Cutter-to-Advanced source span that `test_gui_tabs.py` scans for `gr.Accordion`.
+LABEL_TAB_CLIPS_PREVIEW = "🖼️ Clips Preview"
+
+# ============================================================================
+# [FORK] Digital-Union: R5 Clips Preview Selector (P1 — read-only review)
+# Post-cut triage in its own tab: browse, play and classify the clips the Raw
+# Cutter produced. P1 moves nothing; transfer is a separate authorized phase.
+# ============================================================================
+
+INFO_TAB_CLIPS_PREVIEW = (
+    "**Review the clips you just cut, and mark each one keep or discard.** Point it at a folder of "
+    "clips, press Scan, then classify: left click keeps, right click discards, and the ↺ button "
+    "puts a clip back to undecided. Every decision is recorded on the server, so a reload, a second "
+    "browser tab or a restart cannot change what you decided.\n\n"
+    "**This phase does not move any file.** Classifying is read-only — the clips stay exactly where "
+    "they are, and the destination folders below are validated but never written to. Actually "
+    "moving the selected and discarded clips is a separate, separately reviewed step."
+)
+
+LABEL_CLIPS_INPUT = "📂 Clips folder (the clips to review)"
+INFO_CLIPS_INPUT = (
+    "Read in place — nothing is uploaded, copied or modified. Point this at a Raw Cutter output "
+    "folder, or any folder of clips. The enumeration order is the Raw Cutter's own, so the two "
+    "always agree about what 'the files, in order' means."
+)
+
+LABEL_CLIPS_RECURSIVE = "📁 Include subfolders"
+INFO_CLIPS_RECURSIVE = (
+    "On by default, matching Folder Batch. A Raw Cutter batch writes one folder per source, so "
+    "leaving this on is what finds the clips inside them."
+)
+
+LABEL_CLIPS_LIBRARY = "✅ Media Library folder (where KEPT clips would go)"
+INFO_CLIPS_LIBRARY = (
+    "Validated now, written to later. It must not be inside the clips folder, must not contain it, "
+    "and must not be the discard folder or a protected runtime directory — those are refused before "
+    "anything is read, and the check follows junctions and symlinks rather than comparing the text "
+    "you typed."
+)
+
+LABEL_CLIPS_REJECTED = "🗑️ Discarded folder (quarantine, never deletion)"
+INFO_CLIPS_REJECTED = (
+    "Discarding is quarantine, not deletion: a discarded clip would be moved here, intact, for you "
+    "to deal with outside this tool. There is no retention expiry and no permanent delete."
+)
+
+LABEL_CLIPS_PAGE_SIZE = "Clips per page"
+INFO_CLIPS_PAGE_SIZE = (
+    "100 is the measured default: a warm page of 100 becomes interactive in about half a second, "
+    "with one video decoder at most, because the grid shows poster frames and only creates a "
+    "player when you hover. Lower it if your clips are unusually large."
+)
+
+LABEL_CLIPS_CHECK = "🔎 Check folders"
+LABEL_CLIPS_SCAN = "📂 Scan and build page"
+LABEL_CLIPS_REFRESH = "🔁 Re-read the server's record"
+LABEL_CLIPS_CONFIRM = "✅ Confirm (moving is not enabled yet)"
+LABEL_CLIPS_REPORT = "Scan report"
+LABEL_CLIPS_COUNTS = "Decisions (server record)"
+LABEL_CLIPS_CONFIRM_OUT = "Confirm"
+
+CLIPS_REPORT_INITIAL_TEXT = "Press Check folders, then Scan."
+CLIPS_COUNTS_INITIAL_TEXT = "Kept 0   ·   Discarded 0   ·   Undecided 0   ·   Total 0"
+CLIPS_GALLERY_INITIAL_HTML = (
+    '<div class="r5-empty">Nothing scanned yet. Choose a clips folder and press Scan.</div>'
+)
+CLIPS_CONFIRM_DISABLED_TEXT = (
+    "Confirm is disabled until every clip on the page is decided. Undecided is not a decision."
+)
+# [R5-P3 / F8] Classifying posts straight to the server rather than through a Gradio event, which
+# is deliberate -- but it means a decision cannot re-enable the Confirm button by itself. Without
+# this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
+# It is display text: it enables nothing, and only Refresh moves the button, from the durable
+# record.
+CLIPS_REFRESH_TO_ENABLE_HINT = (
+    'All clips decided — press "Re-read the server\'s record" to enable Confirm.'
+)
+# [R5-P3 / F1] A scan that was overtaken by a newer scan of the same browser session. It changed
+# nothing, and the gallery it is replacing shows the newest page rather than its own, whose
+# session the newer scan already revoked.
+CLIPS_SCAN_SUPERSEDED_TEXT = (
+    "This scan was superseded by a newer one and was discarded.\n"
+    "Nothing was changed. The gallery below shows the newest scan's page."
+)
+CLIPS_CONFIRM_READY_TEXT = (
+    "Every clip on this page is decided.\n\n"
+    "**Moving files is NOT enabled in this phase.** Nothing has been moved, renamed or deleted. "
+    "The decisions are recorded durably on the server and will still be here when the transfer "
+    "step is separately authorized and reviewed."
+)
+
 # ============================================================================
 # [FORK] Digital-Union: Raw Cutter V1
 # Split one long source video at its existing edits, to curate footage before

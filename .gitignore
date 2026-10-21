@@ -15,6 +15,13 @@
 # Rendered output.
 /output/
 
+# Durable runtime state created by the app, not by a developer: at present the R5 Clips Preview
+# Selector's decision journal, its snapshot and its poster cache under state/clips-review/.
+# Untracked, and NOT disposable -- the journal is the authoritative record of which clips an
+# operator kept or discarded, so the PCBUS-HK-v1 retention rules apply exactly as they do to
+# output/ and input/video_analysis_cache/. Never delete it as housekeeping.
+/state/
+
 # Python bytecode and caches.
 __pycache__/
 *.pyc

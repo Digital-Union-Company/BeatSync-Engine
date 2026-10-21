@@ -54,8 +54,9 @@ chooses to run. Cutting itself stays uninterrupted and uninteractive. A design t
 approval *inside* the cut loop would be the rejected idea wearing a new name.
 
 With batch processing shipped and deployed (R4-A) and live progress now merged and deployed (R4-B),
-the active work is **naming the output** (R4-C — open draft PR #72, not merged) and
-**triaging the result** (R5, the next feature to build). The ordering is in the status summary at the
+and output naming merged and deployed (R4-C), the active work is
+**triaging the result** (R5 — the read-only review phase is implemented; moving the reviewed
+clips is not). The ordering is in the status summary at the
 end of this document.
 
 ---
@@ -86,7 +87,8 @@ Mechanical, deterministic, quality-first shot selection. No AI involved anywhere
 this work, so the Raw Cutter is **not** in that package. `D:\BeatSync-Playtest-77b854a1\` was built
 from `77b854a1` and **does** contain Raw Cutter V1 but not batch mode. Batch mode is in the later
 packages, built from `dd2e08e4` (PR #69) and `894814aa` (scene guards and VFR-safe exports).
-**No Playtest package contains R4-C**, which is still an open pull request.
+**No Playtest package contains R4-C**: it merged and deployed after the latest package was
+built, and no Playtest has been built from `0aed35d6`.
 
 ---
 
@@ -308,14 +310,18 @@ observed the bar advancing 0 → 11 → 22 → 33 → 44 → 56 → 67 → 78 �
 0/9 → 9/9 and each clip named as it encoded. Two independent reviews (P19-R3, P19-R5) and the
 remediation of both their MAJOR findings are recorded in the pull request.
 
-#### R4-C — Synthetic output naming · **OPEN DRAFT PR #72 — NOT merged, NOT deployed**
+#### R4-C — Synthetic output naming · **DONE — merged in PR #72, deployed at `0aed35d6`**
 
-Implemented on `feat/raw-cutter-synthetic-output-naming`, independently reviewed, and published as
-**open draft pull request #72**. It is **not on `main`** and **production does not have it** —
-production remains at `2044f360`. The independent review returned a QUALIFIED verdict with two
-non-blocking MINOR findings; the source-index ordering one has since been corrected by product-owner
-decision (see the counter bullet below), which is a further local change on top of the published
-commit and is itself awaiting independent delta review.
+Implemented on `feat/raw-cutter-synthetic-output-naming`, independently reviewed twice, merged as
+PR #72 and deployed to production at `0aed35d6`.
+
+Both reviews returned **QUALIFIED**, not an unconditional pass, and the owner accepted three
+MINOR findings as non-blocking when merging. They remain open and are recorded here rather than
+quietly dropped: the historical P1 report diffstat was wrong (`+905/-83`; the real figure is
+`+2051/-83`); the *private* GUI handlers `_on_cut_run` and `_on_cut_batch_run` gained a required
+positional argument, so no compatibility is claimed for unsupported out-of-tree callers; and
+`OutputNaming.source_total` defaults to 1 and is not validated, so a malformed out-of-tree
+construction can mix widths — unreachable from the GUI, which freezes the true discovered count.
 
 An **opt-in** checkbox, **Rename output clips**, default **OFF**, shared by both modes. With it off,
 naming is exactly what it is today — this adds a mode, it does not change one.
@@ -364,9 +370,9 @@ RawCutter_Single_20261018_153000\        RawCutter_Batch_20261018_153000\
   Measured against the real binary: the mode changes the output path and nothing else about the
   FFmpeg command, and adds no transcode and no extra pass.
 
-Measured locally: full suite **7 182 passed, 8 skipped, 0 failed** (PR #72 as published is
-7 094 / 8 / 0, and the accepted `main` baseline is 6 953 / 8 / 0), including a new
-`tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide source width at totals of
+Measured locally at the merged commit: full suite **7 182 passed, 8 skipped, 0 failed** (PR #72
+as first published was 7 094 / 8 / 0, and the pre-R4-C `main` baseline 6 953 / 8 / 0), including a
+new `tests/test_raw_cutter_naming.py`. The 88 added tests cover the job-wide source width at totals of
 1, 2, 9, 10, 99, 100, 999, 1 000, 1 001, 1 200 and 10 000 — including an end-to-end 1 000-source
 batch through the real handler and an executable negative control in which the superseded
 per-index rule fails the ordering requirement.
@@ -380,11 +386,17 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **PLANNED, NOT IMPLEMENTED — next high-priority workflow**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — transfer NOT implemented**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
 Folder Batch exists precisely so that cutting needs no interaction.
+
+**What P1 does and does not do.** Discovery, authorized preview playback, poster frames,
+server-authoritative classification, durable decisions and the gallery are implemented and
+measured. **Moving the reviewed clips is not implemented at all** — not disabled, not
+feature-flagged, not written. Confirm reports readiness and moves nothing. The transfer contract
+below remains a design that needs its own authorization and its own review.
 
 - A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
 - **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to
@@ -399,9 +411,10 @@ Folder Batch exists precisely so that cutting needs no interaction.
 
 Full specification: [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md).
 
-**The 100-clip page size is a product target, not a measured performance claim.** It needs
-benchmarking at 25 / 50 / 100 items in the pinned Windows + Gradio environment before anyone
-promises it.
+**The 100-clip page size has been benchmarked** at 25 / 50 / 100 items on the live tab in the
+pinned Windows + Gradio 6.19.0 environment, cold and warm, with zero video elements mounted at
+rest and at most one playing. The figures are in the R5-P1 task report; the specification carries
+the method. If a page size ever fails to hold, the page size gives — not the safety rules.
 
 ---
 
@@ -417,8 +430,8 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 | **R4-A** — Automatic folder batch mode | **DONE** — merged in PR #69, **deployed** |
 | **Scene guards + VFR-safe exports** — conservative 0.20 s guard at detected cuts, `-fps_mode:v passthrough -enc_time_base:v demux` | **DONE** — merged in PR #70, **deployed** |
 | **R4-B** — Live progress and active controls | **DONE** — merged in PR #71, **deployed** at `2044f360` |
-| **R4-C** — Synthetic output naming (opt-in, default off) | **OPEN DRAFT PR #72** on `feat/raw-cutter-synthetic-output-naming`; **not merged, not deployed**. One reviewed MINOR (source-index sort order above 999) has been corrected locally on top of the published commit and awaits independent delta review |
-| **R5** — Clips Preview Selector (post-cut triage tab) | **PLANNED** — specified in `docs/claude/clips-preview-selector-v1.md`, not implemented |
+| **R4-C** — Synthetic output naming (opt-in, default off) | **DONE** — merged in PR #72, **deployed** at `0aed35d6`. Two QUALIFIED independent reviews; three MINOR findings accepted as non-blocking and still open (see the section above) |
+| **R5** — Clips Preview Selector (post-cut triage tab) | **P1 IMPLEMENTED** — the fifth tab reviews and classifies clips, read-only and measured; **moving files is NOT implemented**. Specification: `docs/claude/clips-preview-selector-v1.md`; contract: `.claude/rules/clips-preview.md` |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
@@ -426,12 +439,13 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 ### Current priority order (product-owner decision)
 
 1. ~~**Finish R4-B** live progress and get it reviewed.~~ **Done** — merged in PR #71 and deployed.
-2. **R4-C** synthetic output naming — **open draft PR #72**. Independently reviewed (QUALIFIED); the
-   source-index ordering MINOR has been corrected locally since, so the next step is an independent
-   delta review of that correction. Nothing about it is merged or deployed.
-3. **R5** Clips Preview Selector — the next high-priority feature to build, and the reserved fifth
-   top-level tab. The interactive gallery first, safe file movement second. The accepted
-   specification in `docs/claude/clips-preview-selector-v1.md` is unchanged.
+2. ~~**R4-C** synthetic output naming.~~ **Done** — merged in PR #72 and deployed at `0aed35d6`,
+   with three accepted MINOR findings still open.
+3. **R5** Clips Preview Selector — the gallery first, safe file movement second, exactly as
+   planned. **P1 (the gallery) is implemented**; the next step is independent review of it, and
+   only after that a separately authorized transfer phase. The accepted specification in
+   `docs/claude/clips-preview-selector-v1.md` is unchanged in substance and now records which
+   parts are built.
 4. **R3 / Smart Passages** only once the post-cut review workflow exists. It stays **opt-in** by
    design, and it must not be mixed with Stage-5 cache identity or the existing Qwen worker.
 
