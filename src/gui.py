@@ -6271,6 +6271,31 @@ _CLIPS_STORE = None
 CLIPS_MAX_TRACKED_SESSIONS = 32
 _CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
 
+#: [R5-P51 / F3] One shared lifecycle authority for the registry, the scan coordinator and the
+#: decision store. The guard is only binding when all three consult the **same** instance, and the
+#: runtime builds them as separate objects, so sharing has to be an explicit act. The store is
+#: created lazily by `_clips_store()` and is attached there.
+#:
+#: This is the whole of the GUI's involvement: it imports nothing from the P2 engine module,
+#: creates no route, calls no planner or executor, moves no media and does not change Confirm --
+#: that engine remains unreachable from here. What it buys is that a scan, a new session, a page
+#: replacement or a revocation cannot revoke an in-flight transfer's authorization mid-operation;
+#: see `.claude/rules/clips-preview.md`.
+#:
+#: Note the deliberate circumlocution above: two tests assert the P2 module's name, and its
+#: planner and executor names, appear **nowhere** in this file as plain substrings. That check
+#: cannot tell a comment from a call, so naming them even to disclaim them trips it. Describe
+#: them, do not spell them.
+# Binds the process-wide default, which is what lets the lazily-created store join the same gate
+# in `_clips_store()` without a shared variable to thread through -- see the note there.
+#
+# Deliberately a bare call that stores nothing. Two reasons, and both are guards being right:
+# `test_the_lifecycle_is_never_stored_on_a_record_or_a_module_global` permits exactly ONE
+# module-level binding in this file whose text mentions a lifecycle -- the render slot -- and a
+# second one would weaken a C3-R1A invariant that has nothing to do with clips; and the object is
+# not needed here anyway, since `fork_clips.default_lifecycle_authority()` returns it on demand.
+fork_clips.bind_lifecycle_authority(registry=_CLIPS_REGISTRY, coordinator=_CLIPS_SCANS)
+
 
 def _clips_store():
     """The decision store, created on first use so importing `gui` writes nothing.
@@ -6288,6 +6313,17 @@ def _clips_store():
     with _CLIPS_STORE_LOCK:
         if _CLIPS_STORE is None:
             recovered = fork_clips.ReviewStore(CLIPS_STATE_DIR)
+            # [R5-P51 / F3] Join the shared lifecycle authority before the store is published to
+            # any caller, so there is no window in which the registry and coordinator are guarded
+            # and the store is not. Attached on the local, for the same reason the local exists:
+            # a store that failed to recover must not be cached.
+            #
+            # Reached through `fork_clips` rather than through the module-level
+            # `_CLIPS_LIFECYCLE`, deliberately: `test_clips_gui_integration` executes this
+            # function's body against a SYNTHESISED namespace, so a new module-level name used in
+            # here is a NameError there. `fork_clips` is already in that namespace, and
+            # `bind_lifecycle_authority` above binds this same default object.
+            recovered.lifecycle_authority = fork_clips.default_lifecycle_authority()
             _CLIPS_STORE = recovered
         return _CLIPS_STORE
 
@@ -6511,7 +6547,18 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     except (fork_clips.PersistenceError, OSError) as failure:
         return _clips_unavailable_outputs(failure)
     scan_id = secrets.token_urlsafe(12)
-    generation = _CLIPS_SCANS.begin(owner)
+    # [R5-P51 / F3] `begin` can now refuse, and the refusal has to be handled HERE rather than by
+    # the handler below, because `begin` is what takes the generation — the `try` that follows it
+    # exists to `discard` a generation that was already taken. A refused `begin` changed nothing
+    # at all: no generation, no `_newest` entry, no `begin_scan`, no `new_session`. So the honest
+    # response is the operator's **existing** page, repainted unchanged, with an explanation —
+    # never the empty state a failed scan produces, because there is nothing to be empty about.
+    try:
+        generation = _CLIPS_SCANS.begin(owner)
+    except fork_clips.Refusal as refusal:
+        if refusal.reason == fork_clips.LIFECYCLE_CONFLICT:
+            return _clips_render_current(owner, fork_clips.LIFECYCLE_BUSY_TEXT)
+        return _clips_render_current(owner, _clips_failure_text(refusal))
     try:
         # Outside the lock: one stat per file, and it touches no authoritative state.
         frozen = fork_clips.freeze_page(found.files, 0, size)

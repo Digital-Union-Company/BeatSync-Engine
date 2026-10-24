@@ -20,6 +20,220 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-24 (Clips Preview: a binding lifecycle authority for in-flight transfers)
+
+The last of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The transfer engine remains unwired and Confirm still moves nothing.
+
+- **A transfer now holds the authority it depends on, and conflicting lifecycle work is refused.**
+  Execution revalidated the decision, its revision, the scan generation and the session *per item*,
+  and the R5-P47 lease stopped a decision moving across the commit point — but nothing else was
+  held. Measured: `revoke_owner`, `new_session`, `begin_scan`, `publish_page`,
+  `ScanCoordinator.begin` and a whole new scan were all **accepted** after revalidation and before
+  `os.rename`, and the clip published anyway and reported `COMPLETE`; in two cases the session was
+  already revoked at the commit point, and in another the gallery had already blanked. The window
+  is O(file size), because the source is hashed in between. `LifecycleAuthority` is an owner-scoped
+  gate that every authority-changing operation consults **before** mutating anything, refusing a
+  conflicting same-owner operation **fail-fast** with the existing `transfer_in_progress` token —
+  no queue, no wait, no silent invalidation, no implicit cancellation — retryable once released.
+- **The guard sits in `ScanCoordinator.begin`, which a `begin_scan`-only fix would miss.** `begin`
+  makes a new generation the newest *before* the session and page are replaced, and a stored view
+  stops being current the moment it is not the newest — so `begin` **alone** blanks the gallery.
+  Guarding only `ReviewStore.begin_scan` would have refused the scan after the damage. A refused
+  scan now changes nothing at all, and tests assert the authoritative view is byte-identical
+  across it.
+- **Eviction is not an exemption.** The owner, session and page caps and `ScanCoordinator._prune`
+  all revoke authority, so a leased owner is skipped rather than evicted; if every tracked owner is
+  leased the cap is allowed to exceed, because a cap bounds memory while a lease protects an
+  irreversible operation in flight.
+- **"Generation changed but the store still shows the old scan" is not valid authority.** A
+  transfer cannot acquire while a newer generation has not yet published its view (`scan_in_flight`),
+  and becomes acquirable again as soon as the transition completes.
+- **One lock order, documented and asserted:** scan coordinator → registry → store →
+  lifecycle authority (leaf, never held while taking another). The one method that must read the
+  coordinator does so before taking its own lock, and a test pins that ordering on the source
+  because a cycle would deadlock rather than fail. No subsystem lock is held across hashing,
+  copying, FFmpeg work or `fsync`.
+- **Release discipline:** released on every terminal state and on an unexpected exception; one plan
+  cannot release another's; an owner mismatch releases nothing; a failed acquisition rolls back only
+  what that caller took.
+
+Binding is explicit, so every existing P1 construction keeps working unguarded and production binds
+in one call. The only `gui.py` changes are that call, the lazy store joining it, and a typed handler
+so a refused scan repaints the operator's existing page instead of an empty one — no import of the
+transfer engine, no route, no media movement, no Confirm change. Process-local scope only; a second
+process on the same state directory is explicitly not claimed to be protected.
+
+**Still open:** the same-volume rollback target is still not no-replace-probed (R5-P48 / F5,
+advisory); cross-volume source removal remains withheld, so the accepted `… → REMOVE SOURCE`
+contract is still unmet and an owner decision; decisions written by today's P1 path still carry no
+content fingerprint; there is no transfer GUI/HTTP integration; and OD-A off-machine retention is
+unresolved. No `ctypes`, no native helper, no pathname source deletion, no new dependency.
+
+### Changed — 2026-10-24 (Clips Preview P2: recovery completion semantics)
+
+The third of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The engine remains unwired and Confirm still moves nothing.
+
+- **Recovery no longer reports an unfinished plan as complete.** `recover()` aggregated as
+  `RECOVERY_REQUIRED if needs_operator else COMPLETE`, so `COMPLETE` meant *"nothing needs a
+  human"* while reusing a constant that means *"done"* everywhere else in the engine. Measured on
+  two real volumes: a cross-volume copy-only transfer returned `SOURCE_REMOVAL_BLOCKED`, the batch
+  correctly reported `PARTIAL` with `advance_page=False`, and `recover()` on the identical
+  filesystem answered `COMPLETE` / `needs_operator=False` — while its own finding read
+  `operator_may_remove_duplicate`. The same aggregation called a three-clip batch COMPLETE with two
+  clips still in the review folder, and a mutation control proved no test pinned either behaviour.
+  There are now three independent signals: `RecoveryReport.plan_finished` (the only completion
+  signal, defaulting to `False`), `needs_operator`, and a `state` drawn from `RECOVERY_STATES` —
+  `COMPLETE`, the new `RECOVERY_INCOMPLETE`, or `RECOVERY_REQUIRED`. `needs_operator=False` is
+  never a synonym for `plan_finished=True`.
+- **Completion requires durable evidence, not just matching bytes.** Matching content at the
+  destination with an empty source path is necessary and not sufficient — an unjournalled
+  publication looks identical on disk — so an item is reported finished only when the journal's
+  last record for it is `COMPLETE`. `SOURCE_REMOVAL_BLOCKED` and `PUBLISHED_UNJOURNALLED` are
+  terminal but never completion. An absent *batch* summary is reported as a qualification where
+  every item is individually proven, rather than escalated.
+- **`operator_may_remove_duplicate` now counts as both unfinished work and an operator action**, so
+  a report can no longer recommend that the operator remove an original while claiming no human is
+  involved. `retry_safe` is unfinished work that needs no operator decision. The per-item action
+  vocabulary is deliberately unchanged at four values.
+- **Recovery remains strictly non-destructive** — a test spies on every destructive `os` primitive
+  and requires zero calls. A recommended action is never permission to perform it.
+
+Four pre-existing assertions encoded the old semantics and were corrected with the reason recorded
+in place; three of them were added by the R5-P49 commit below. `ItemOutcome`, `TransferResult`,
+`RecoveryFinding` and `advance_page` are unchanged, `RecoveryReport` gains one trailing field with a
+safe default, and older journal records remain readable.
+
+**Still open, so this is not clearance:** session, scan and page revocation still take effect only
+between items (R5-P48 / F3), whose lifecycle and lease logic is deliberately untouched; the
+rollback target directory is still unprobed (F5); cross-volume source removal remains withheld, so
+the accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and
+decisions written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper,
+no new dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
+### Changed — 2026-10-24 (Clips Preview P2: post-commit outcome truthfulness and journal-tail safety)
+
+A **second** independent adversarial review (R5-P48) of the engine below confirmed all eight
+corrections in the entry that follows and reproduced **three new MAJOR** defects. Two are corrected
+here. The engine is still unwired, Confirm still moves nothing, and three tests pin that.
+
+- **A reporting failure can no longer retract a completed filesystem operation.** Every journal
+  append after the commit point was unguarded. `TransferJournal.append` converts any `OSError` into
+  `TransferRefused`, and `execute_transfer`'s broad handler turned that into `ItemOutcome(REFUSED)`
+  — whose defaults assert `source_removed=False` and `published_path=""` — reported about a clip
+  that was already in the operator's Media Library with its source path empty. Reproduced with a
+  real Windows sharing violation on the journal file. A persistent failure was worse: the
+  batch-summary append sat outside the per-item `try`, so `execute_transfer` **raised** and the
+  caller received no `TransferResult` at all — no outcomes, no counts, no sign a file had moved.
+  There is now a `PUBLISHED_UNJOURNALLED` state carrying the real published path, byte count and
+  SHA-256, reporting `source_removed` according to what actually happened to the source; it is
+  never `COMPLETE`, keeps `advance_page` false and stops the batch, because the durability
+  guarantee the page depends on is gone. A batch whose summary cannot be journalled is downgraded
+  to `PARTIAL` without rewriting any item outcome. No rollback, retry or deletion is attempted to
+  compensate — a test counts the renames and requires exactly one.
+- **An appended journal record can no longer vanish behind a torn tail.** `O_APPEND` writes at the
+  end of the *file*, not the end of the last *record*, so with an unterminated fragment on disk the
+  next append was concatenated onto it, the two became one unparseable line, and the newly
+  committed event was **silently lost** — absent after a cold reopen, with the write having
+  reported success. The final bytes are now classified before every append: a terminated file is
+  untouched; a complete record that merely lost its newline is **preserved as real history** (not
+  treated as damage); a provably torn fragment is preserved and closed off with a self-describing
+  separator record that carries no `clip_id` or `state` and so can never be read as an outcome; a
+  malformed complete record is surfaced rather than discarded; and an uninspectable tail **refuses
+  the write**. Nothing is truncated or rewritten, repair is idempotent, and a crash part-way
+  through a separator leaves a boundary the next append repairs. `records()` marks damaged lines,
+  `damage()` reports them, and `recover()` escalates on them, since a damaged record has no
+  `clip_id` and a per-clip reading would ignore it. Appends are serialised by a process-local lock;
+  cross-process concurrency is explicitly not claimed.
+
+**Deliberately still open after this change**, and recorded so the entry is not read as clearance:
+`recover()` still aggregates intentionally-unfinished work into `COMPLETE` (R5-P48 / F2); session,
+scan and page revocation still take effect only between items, not within one (F3); the rollback's
+target directory is still unprobed (F5); cross-volume source removal remains withheld, so the
+accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and decisions
+written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper, no new
+dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
+### Changed — 2026-10-24 (Clips Preview P2: security remediation after an independent review)
+
+An independent adversarial review of the engine below reproduced **four MAJOR** defects and four
+MINOR ones. All eight are addressed here. The engine is still unwired and still moves nothing
+through the UI; what changed is what it would do if it ever were called.
+
+- **A failure after an irreversible step is no longer reported as "nothing moved."** The
+  same-volume path verified the published object *after* the rename and reported `REFUSED` when it
+  did not match — about a source path that was by then empty, with unapproved content in the Media
+  Library. Content is now checked against the approved fingerprint **before** the rename, and a
+  post-rename verification failure is **rolled back** by renaming the object back onto the vacated
+  source path (`ROLLED_BACK`), or escalated (`RECOVERY_REQUIRED`) if that is refused.
+- **The engine no longer deletes a source at all.** The cross-volume path deleted by *pathname*
+  after proving identity on a descriptor and closing it; a file substituted into that gap was
+  destroyed while the engine reported success. On Windows, within this package's dependency rules,
+  there is no way to delete the object whose identity was proven — measured: no `os.unlinkat` or
+  `dir_fd`, a held handle makes the path undeletable, and `O_TEMPORARY`'s delete-on-close cannot be
+  cancelled without `ctypes`. The copy is therefore published and verified and the deletion is
+  **withheld** (`SOURCE_REMOVAL_BLOCKED`), leaving both copies and a recorded obligation.
+- **A frozen plan is no longer authority at execution time.** `execute_transfer` requires the live
+  store and registry and revalidates the decision, revision, scan generation and session per item,
+  under an exclusive **transfer lease** that makes `ReviewStore.decide` refuse the leased identity —
+  so the decision cannot change across the commit point and one plan cannot execute twice.
+  `expected_revisions` is now **mandatory** rather than an opt-in that defaulted to off.
+- **Approval is a content fingerprint.** `ReviewStore.decide` accepts an optional
+  `content_sha256`, persisted through the journal and the snapshot; `plan_transfer` refuses any
+  decision without one. Metadata identity cannot distinguish a same-length edit with a restored
+  timestamp from the reviewed file, and the existing contract accepts that limitation only because
+  P1 mutates nothing. Decisions written by today's P1 HTTP path carry no fingerprint and are
+  therefore **not transferable** — the intended fail-closed state, not an oversight.
+- Four MINOR corrections: the no-replace probe must observe a *collision-specific* refusal plus a
+  successful free-name rename plus unaltered payloads (any `OSError` used to count as proof);
+  reparse inspection is tri-state and `UNKNOWN` **refuses**; the staging descriptor is closed on
+  every failure path (a failed source open used to leak it and orphan a `.part` file in the Media
+  Library); and `recover()` takes its expected digest from the plan's approved fingerprint rather
+  than from whichever hash field the journal last carried, and never deletes.
+- `src/beatsync_fork/clips_review.py` — the one P1 file touched, in a backward-compatible way:
+  an optional `Record.content_sha256`, its strict optional validator on both persistence paths,
+  `fingerprints_of()`, and the `begin_transfer`/`end_transfer`/`active_transfer` lease. Every
+  existing caller and signature is unchanged; the P1 suite passes unmodified.
+- `tests/test_clips_review_transfer_security.py` — new. One regression per finding, each asserting
+  the final filesystem state, the journal **and** the returned result, plus the properties the
+  review confirmed were already holding. 19 negative mutation controls, 18 caught, the one
+  survivor recorded as an equivalent mutant with the reason it cannot be distinguished.
+
+### Added — 2026-10-24 (Clips Preview P2: the safe-transfer core, written and unwired)
+
+The engine that will move reviewed clips to the Media Library or to quarantine. It is **isolated on
+purpose**: nothing calls it. Confirm still reports readiness and moves nothing, `src/gui.py` does
+not import it, and no HTTP route exposes it — three tests pin exactly that, alongside the unchanged
+guard that the media layer contains no mutating filesystem call at all. Enabling it is a further
+phase with its own authorization after independent review.
+
+The product decision behind it: rejection is **quarantine, not deletion**, and no existing
+destination file is ever overwritten. Those two rules shape every path below.
+
+- `src/beatsync_fork/clips_review_transfer.py` — new, pure, stdlib-only. The server-authoritative
+  immutable plan (one entry per clip; `plan_transfer` has **no** source-path parameter, so the
+  sources can only come from `ClipRegistry.page_entries`), the ten-state append-only intent/outcome
+  journal, the same-volume **atomic no-replace move**, the cross-volume
+  **stage → verify → publish → remove source** sequence, and identity-based recovery that compares
+  recorded intent against the real filesystem rather than replaying a historical status.
+- `tests/test_clips_review_transfer.py` — new. 66 cases against **real files on the real
+  filesystem** through the real `ClipRegistry` and `ReviewStore`, including a genuinely
+  cross-volume arm gated on `BEATSYNC_TEST_CROSSVOL` (the convention `test_audio_mixdown.py`
+  already uses for real FFmpeg).
+
+It reuses rather than reinvents: `decision_identity` for source identity, `validate_roots` for every
+path-relationship refusal, and `ReviewStore` for the durable decisions. The no-replace primitive is
+`os.rename`, which on Windows *is* `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`; because that
+is a behavioural claim it is **measured** per destination directory by
+`probe_no_replace_rename`, and the engine refuses when it cannot be demonstrated. `os.replace` is
+never aimed at a destination — a test fails the build if it ever is.
+
+Known and disclosed: a narrow window remains between the final `fstat` on the source descriptor and
+the rename that names its path, which the package's stdlib allowlist cannot close; the no-replace
+rename, the post-publication re-read and source removal ordering are what make it safe rather than
+the window being eliminated.
+
 ### Added — 2026-10-17 (Raw Cutter Batch V1: a whole folder, one press)
 
 A second input mode inside the existing **✂️ Raw Cutter** tab — not a fifth tab. **Single Video**

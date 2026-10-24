@@ -230,6 +230,278 @@ class Session:
 
 
 # --------------------------------------------------------------------------------------------
+# Lifecycle authority  [R5-P51 / F3]
+# --------------------------------------------------------------------------------------------
+
+#: [R5-P51 / F3] ``transfer_in_progress`` is reused as the refusal reason for a conflicting
+#: lifecycle operation, because it is already the stable 409-class token this system uses for
+#: "something is holding this and you may retry after it releases". A new token would mean two
+#: spellings of one condition.
+#:
+#: Spelled as a literal rather than as ``= TRANSFER_IN_PROGRESS`` only because that constant is
+#: defined further down the module and this is evaluated at import time. An assertion beside that
+#: definition keeps the two from drifting, so there is still one source of truth.
+LIFECYCLE_CONFLICT = "transfer_in_progress"
+
+#: The lifecycle operations a lease refuses. Names are stable and appear in refusal details.
+LIFECYCLE_SCAN_BEGIN = "scan_begin"
+LIFECYCLE_SCAN_RECORD = "scan_record"
+LIFECYCLE_SESSION_NEW = "session_new"
+LIFECYCLE_SESSION_REVOKE = "session_revoke"
+LIFECYCLE_PAGE_PUBLISH = "page_publish"
+LIFECYCLE_OWNER_EVICT = "owner_evict"
+
+LIFECYCLE_OPERATIONS = (LIFECYCLE_SCAN_BEGIN, LIFECYCLE_SCAN_RECORD, LIFECYCLE_SESSION_NEW,
+                        LIFECYCLE_SESSION_REVOKE, LIFECYCLE_PAGE_PUBLISH, LIFECYCLE_OWNER_EVICT)
+
+
+@dataclass(frozen=True)
+class TransferLease:
+    """One owner's exclusive hold on the authority a transfer depends on."""
+
+    owner: str
+    plan_id: str
+    session_id: str
+    page_token: str
+    scan_id: str
+    identities: frozenset
+
+
+class LifecycleAuthority:
+    """[R5-P51 / F3] The binding gate between a running transfer and the lifecycle that could
+    revoke its authorization.
+
+    The defect this closes (independent review R5-P48 / F3). ``execute_transfer`` revalidates the
+    decision, its revision, the scan generation and the session **per item**, and the R5-P47
+    transfer lease made ``ReviewStore.decide`` refuse a leased identity — so the *decision* could
+    not move across the commit point. Nothing else was held. Measured on this candidate, all of
+    ``ClipRegistry.revoke_owner``, ``ClipRegistry.new_session``, ``ReviewStore.begin_scan``,
+    ``ClipRegistry.publish_page``, ``ScanCoordinator.begin`` and a whole new scan were **accepted**
+    after ``_revalidate()`` returned and before ``os.rename``, and the clip was published anyway
+    and reported ``COMPLETE``. In two of those the session was already revoked at the commit
+    point; in another the gallery had already been blanked. The window is O(file size), because the
+    source is hashed in between.
+
+    **The owner-selected strategy is a binding lease, not a narrower recheck.** A final
+    pre-commit revalidation would only shrink the window; this refuses the conflicting operation
+    instead, *before it changes any authoritative state*, and the operator may retry once the
+    transfer releases.
+
+    Why this is a separate object rather than more state inside the three subsystems: it is the
+    **leaf lock**. Nothing that holds :attr:`_lock` acquires any other lock, so the three
+    subsystem locks (``ScanCoordinator``'s owner lock, ``ClipRegistry._lock``,
+    ``ReviewStore._lock``) can each reach into it while holding their own without any possibility
+    of a cycle. The one place that needed care is :meth:`acquire`, which must consult the
+    coordinator — and does so *before* taking its own lock, so there is never an edge in the other
+    direction. See *Lock ordering* below.
+
+    Lock ordering
+    -------------
+    ``ScanCoordinator._lock`` / owner lock  →  ``ClipRegistry._lock``  →  ``ReviewStore._lock``
+    →  **LifecycleAuthority._lock (leaf, never held while taking another)**
+
+    Scope, stated rather than implied
+    ---------------------------------
+    Process-local, exactly like the R5-P47 decision lease, and for the same reason: it guards the
+    in-process objects a single Gradio app owns. A second process opening the same review-state
+    directory is **outside** this mechanism and is **not** claimed to be protected. This is not a
+    cross-process lock and must never be described as one.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._leases: dict[str, TransferLease] = {}
+        #: identity -> owner, so an identity-scoped question needs no scan of every lease.
+        self._identities: dict[str, str] = {}
+        #: Set by :func:`bind_lifecycle_authority`. Read **outside** ``_lock``; see `acquire`.
+        self._coordinator: Any = None
+        self.refusals = 0
+
+    # ---- queries ---------------------------------------------------------------------
+
+    def holder(self, owner: Any) -> str:
+        """The plan id leasing *owner*'s lifecycle, or ``""``."""
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return ""
+        with self._lock:
+            lease = self._leases.get(key)
+            return lease.plan_id if lease else ""
+
+    def lease_for(self, owner: Any) -> TransferLease | None:
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return None
+        with self._lock:
+            return self._leases.get(key)
+
+    def identity_holder(self, identity: Any) -> str:
+        with self._lock:
+            return self._identities.get(str(identity), "")
+
+    # ---- the gate --------------------------------------------------------------------
+
+    def guard(self, owner: Any, operation: str, *, detail: str = "") -> None:
+        """Refuse *operation* on *owner* while a transfer holds that owner's lifecycle.
+
+        **Call this before mutating any authoritative state.** Every call site does, and that
+        ordering is the whole correction: a guard placed after the mutation would refuse an
+        operation whose damage had already been done. ``ScanCoordinator.begin`` is the sharpest
+        example — it makes a new generation the newest, which alone blanks the current view, so
+        guarding only ``ReviewStore.begin_scan`` would have left a refused scan with an empty
+        gallery.
+
+        Raises :class:`Refusal` (409, :data:`LIFECYCLE_CONFLICT`). Never raises for an owner that
+        holds no lease, and never blocks: there is no queue, no wait and no implicit cancellation.
+        """
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            raise
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is None:
+                return
+            self.refusals += 1
+        raise Refusal(409, LIFECYCLE_CONFLICT)
+
+    def guarded(self, owner: Any) -> bool:
+        """Non-raising form, for eviction paths that must *skip* rather than refuse."""
+        try:
+            return self.holder(owner) != ""
+        except Refusal:
+            return False
+
+    # ---- lease lifecycle -------------------------------------------------------------
+
+    def acquire(self, owner: Any, plan_id: str, *, session_id: str, page_token: str,
+                scan_id: str, identities: Iterable[str]) -> TransferLease:
+        """Take *owner*'s exclusive lifecycle lease for one transfer plan.
+
+        Refuses when: the owner already holds a lease; the same ``plan_id`` is executing; any
+        identity is already leased; or — [R5-P51 §6 inverse] — a scan has taken a newer generation
+        whose authoritative view has not been published yet. That last case is the one worth
+        spelling out: ``ScanCoordinator.begin`` makes a generation the newest *before* the
+        session and page are replaced, so there is an interval in which ``ReviewStore`` still
+        reports the **old** scan id while the page it belongs to is already logically superseded.
+        Treating that as valid authority is exactly the mistake §6 warns about, so a transfer may
+        not acquire during it.
+
+        The coordinator probe happens **before** ``_lock`` is taken, so this method never holds the
+        leaf lock while acquiring a subsystem lock. See *Lock ordering*.
+        """
+        key = _require_owner(owner)
+        wanted = {str(i) for i in identities}
+
+        # -- probe the scan transition FIRST, with no lock of our own held
+        coordinator = self._coordinator
+        if coordinator is not None:
+            try:
+                in_transition = (coordinator.newest(key) > 0
+                                 and coordinator.view(key) == {})
+            except Exception:                               # a coordinator that cannot answer
+                in_transition = True                        # fails closed
+            if in_transition:
+                with self._lock:
+                    self.refusals += 1
+                raise Refusal(409, "scan_in_flight")
+
+        with self._lock:
+            if key in self._leases:
+                self.refusals += 1
+                raise Refusal(409, LIFECYCLE_CONFLICT)
+            if any(l.plan_id == str(plan_id) for l in self._leases.values()):
+                self.refusals += 1
+                raise Refusal(409, "transfer_plan_already_executing")
+            clashing = wanted & set(self._identities)
+            if clashing:
+                self.refusals += 1
+                raise Refusal(409, LIFECYCLE_CONFLICT)
+            lease = TransferLease(key, str(plan_id), str(session_id), str(page_token),
+                                  str(scan_id), frozenset(wanted))
+            self._leases[key] = lease
+            for identity in wanted:
+                self._identities[identity] = key
+            return lease
+
+    def release(self, owner: Any, plan_id: str) -> bool:
+        """Release *owner*'s lease, but **only** if *plan_id* is the holder.
+
+        One plan cannot release another's, and an owner mismatch releases nothing — a release is
+        an authority change too, and letting the wrong caller perform it would reopen the race
+        from the other side. Releasing twice is not an error.
+        """
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return False
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is None or lease.plan_id != str(plan_id):
+                return False
+            del self._leases[key]
+            for identity in lease.identities:
+                if self._identities.get(identity) == key:
+                    del self._identities[identity]
+            return True
+
+
+#: [R5-P51 / F3] Operator-facing wording for a refused lifecycle operation. It lives **here**
+#: rather than in the view layer for two reasons: the refusal originates here, and
+#: ``test_clips_gui_integration`` runs ``gui.py`` function bodies against a *synthesised* namespace,
+#: so a new module-level name referenced inside one of those functions is a ``NameError``. Reaching
+#: it through ``fork_clips`` — already present in that namespace — keeps the GUI diff to names that
+#: already resolve. Says what happened, that nothing changed, and what to do.
+LIFECYCLE_BUSY_TEXT = (
+    "⏳ A clip transfer is in progress for this session, so the scan was not started. "
+    "Nothing was changed and your current gallery is still valid — try again once the "
+    "transfer has finished."
+)
+
+#: [R5-P51 / F3] The process-wide default authority. :func:`bind_lifecycle_authority` uses it when
+#: no explicit instance is passed, so the three subsystems a single app owns share one gate without
+#: the caller having to thread an object through lazily-constructed objects. Tests that need
+#: isolation construct their own :class:`LifecycleAuthority` and pass it explicitly.
+_DEFAULT_LIFECYCLE_AUTHORITY = LifecycleAuthority()
+
+
+def default_lifecycle_authority() -> LifecycleAuthority:
+    """The process-wide default :class:`LifecycleAuthority`. See
+    :data:`_DEFAULT_LIFECYCLE_AUTHORITY`."""
+    return _DEFAULT_LIFECYCLE_AUTHORITY
+
+
+def bind_lifecycle_authority(*, registry: Any = None, store: Any = None,
+                             coordinator: Any = None,
+                             authority: LifecycleAuthority | None = None
+                             ) -> LifecycleAuthority:
+    """[R5-P51 / F3] Give one :class:`LifecycleAuthority` to all three subsystems.
+
+    The guard is only binding when the registry, the store and the scan coordinator consult the
+    **same** instance — the runtime builds them as three separate objects, so sharing has to be an
+    explicit act. Returns the authority so a caller can inspect it.
+
+    Each subsystem keeps working with no authority attached, which is what lets the existing P1
+    suites construct a bare ``ReviewStore`` or ``ClipRegistry`` unchanged. An unbound subsystem is
+    simply unguarded, so production must bind.
+
+    With no ``authority`` given this binds :func:`default_lifecycle_authority`, so a lazily
+    constructed store can join the same gate later with no shared variable to thread through.
+    """
+    shared = authority or _DEFAULT_LIFECYCLE_AUTHORITY
+    if registry is not None:
+        registry.lifecycle_authority = shared
+    if store is not None:
+        store.lifecycle_authority = shared
+    if coordinator is not None:
+        coordinator.lifecycle_authority = shared
+        shared._coordinator = coordinator
+    return shared
+
+
+# --------------------------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------------------------
 
@@ -244,6 +516,9 @@ class ClipRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        #: [R5-P51 / F3] Shared :class:`LifecycleAuthority`, or ``None`` for an unguarded
+        #: registry. Set by :func:`bind_lifecycle_authority`; production must bind.
+        self.lifecycle_authority: Any = None
         self._owners: "OrderedDict[str, OrderedDict[str, Session]]" = OrderedDict()
         #: session_id -> owner. The HTTP layer authorizes on the server-minted session id and the
         #: owner is looked up HERE, so no owner identity is ever taken from a request. A browser
@@ -255,15 +530,30 @@ class ClipRegistry:
     # ---- lifecycle -------------------------------------------------------------------
 
     def new_session(self, owner: Any, scan_id: str = "") -> str:
-        """Open a review session for ``owner``, revoking that owner's previous sessions only."""
+        """Open a review session for ``owner``, revoking that owner's previous sessions only.
+
+        [R5-P51 / F3] Refuses while a transfer holds this owner's lifecycle lease, **before** the
+        previous session is revoked. Opening a session is not itself destructive, but it revokes
+        the owner's existing one, which is precisely the authority a running transfer depends on.
+        """
         key = _require_owner(owner)
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.guard(key, LIFECYCLE_SESSION_NEW)
         with self._lock:
             sessions = self._owners.get(key)
             if sessions is None:
                 sessions = OrderedDict()
                 self._owners[key] = sessions
                 while len(self._owners) > MAX_OWNERS:
-                    _, dropped = self._owners.popitem(last=False)
+                    # [R5-P51 / F3] Owner-cap eviction revokes somebody else's sessions, so a
+                    # leased owner must not be evicted. Skip to the oldest *unleased* owner
+                    # instead; if every tracked owner is leased, the cap is allowed to exceed
+                    # rather than revoke an authority a transfer is relying on. The cap exists to
+                    # bound memory, not to override a lease.
+                    victim = self._oldest_evictable_owner()
+                    if victim is None:
+                        break
+                    dropped = self._owners.pop(victim)
                     for session in dropped.values():
                         self._mark_revoked(session)
             self._owners.move_to_end(key)
@@ -274,9 +564,25 @@ class ClipRegistry:
                                            created_at=time.time(), scan_id=str(scan_id))
             self._session_owner[session_id] = key
             while len(sessions) > MAX_SESSIONS_PER_OWNER:
+                # Session-cap eviction only ever drops THIS owner's older sessions, and reaching
+                # here means the owner is unleased (the guard above refused otherwise), so there
+                # is no leased session to protect.
                 _, old = sessions.popitem(last=False)
                 self._mark_revoked(old)
             return session_id
+
+    def _oldest_evictable_owner(self) -> str | None:
+        """[R5-P51 / F3] The oldest tracked owner that no transfer is leasing, or ``None``.
+
+        Caller holds ``self._lock``. Consults the authority, which is the leaf lock, so this
+        ordering (registry → authority) is the documented one and cannot form a cycle.
+        """
+        authority = self.lifecycle_authority
+        for candidate in list(self._owners):
+            if authority is not None and authority.guarded(candidate):
+                continue
+            return candidate
+        return None
 
     def _mark_revoked(self, session: Session) -> None:
         session.revoked = True
@@ -292,8 +598,14 @@ class ClipRegistry:
 
         ``files`` is ``[(index, abs_path, size, mtime_ns, dev, ino)]`` in the caller's already
         frozen enumeration order. This function never scans, sorts or re-reads the filesystem.
+
+        [R5-P51 / F3] Refuses while a transfer holds this owner's lifecycle lease, **before** the
+        previous page is revoked and its clip map cleared — that map is what
+        ``page_entries`` serves the transfer's own revalidation from.
         """
         key = _require_owner(owner)
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.guard(key, LIFECYCLE_PAGE_PUBLISH)
         with self._lock:
             session = self._session(key, session_id)
             if session.active_page_token:
@@ -326,7 +638,16 @@ class ClipRegistry:
             return token, entries
 
     def revoke_owner(self, owner: Any) -> None:
+        """[R5-P51 / F3] Refuses while a transfer holds this owner's lifecycle lease.
+
+        This is the bluntest of the four original races: measured on the pre-R5-P51 candidate,
+        revoking the owner mid-transfer was accepted, ``owner_of`` raised at the commit point, and
+        the clip was published anyway and reported ``COMPLETE``. The operator may revoke once the
+        transfer releases.
+        """
         key = _require_owner(owner)
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.guard(key, LIFECYCLE_SESSION_REVOKE)
         with self._lock:
             for session in self._owners.pop(key, OrderedDict()).values():
                 self._mark_revoked(session)
@@ -533,6 +854,9 @@ class ScanCoordinator:
 
     def __init__(self, max_owners: int = MAX_OWNERS) -> None:
         self._lock = threading.RLock()
+        #: [R5-P51 / F3] Shared :class:`LifecycleAuthority`, or ``None`` for an unguarded
+        #: coordinator. Set by :func:`bind_lifecycle_authority`; production must bind.
+        self.lifecycle_authority: Any = None
         self._max_owners = max(1, int(max_owners))
         self._counter = 0
         self._newest: "OrderedDict[str, int]" = OrderedDict()
@@ -548,8 +872,24 @@ class ScanCoordinator:
         Call this only once a scan is actually going to change state: a scan refused for a bad
         folder or an empty enumeration never takes a generation, so it cannot supersede a running
         one.
+
+        [R5-P51 / F3 §6] **This is the guard that matters most, and it has to be here rather than
+        one call later.** Taking a generation makes every older view non-current — :meth:`view`
+        compares the stored generation against ``_newest`` and returns ``{}`` when they differ — so
+        ``begin`` *alone* blanks the operator's gallery, before ``begin_scan``, ``new_session`` or
+        ``publish_page`` are reached. A guard placed only on ``ReviewStore.begin_scan`` would
+        therefore refuse the scan **after** the old page had already stopped being current, which
+        is the failure §6 names: a refused scan must not leave the gallery blank. Measured on the
+        pre-R5-P51 candidate: ``begin`` mid-transfer was accepted, ``view`` went empty, and the
+        clip was published and reported ``COMPLETE`` regardless.
+
+        Refuses with :data:`LIFECYCLE_CONFLICT` and changes **nothing** — no counter increment, no
+        ``_newest`` entry, no pruning — so the owner's existing authority and current view survive
+        intact and the scan can simply be retried after the transfer releases.
         """
         key = _require_owner(owner)
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.guard(key, LIFECYCLE_SCAN_BEGIN)
         with self._lock:
             self._counter += 1
             generation = self._counter
@@ -602,10 +942,26 @@ class ScanCoordinator:
             return lock
 
     def _prune(self) -> None:
+        """[R5-P51 / F3] Evict the oldest tracked owners, **never a leased one**.
+
+        Pruning drops an owner's newest-generation entry, its view and its lock, which would make
+        a running transfer's authority unknowable. A leased owner is skipped; if every tracked
+        owner is leased the cap is allowed to exceed rather than evict one, because the cap bounds
+        memory and a lease protects an irreversible operation in flight.
+        """
+        authority = self.lifecycle_authority
         while len(self._newest) > self._max_owners:
-            dropped, _ = self._newest.popitem(last=False)
-            self._views.pop(dropped, None)
-            self._locks.pop(dropped, None)
+            victim = None
+            for candidate in list(self._newest):
+                if authority is not None and authority.guarded(candidate):
+                    continue
+                victim = candidate
+                break
+            if victim is None:
+                return
+            self._newest.pop(victim, None)
+            self._views.pop(victim, None)
+            self._locks.pop(victim, None)
 
     # ---- the authoritative view ------------------------------------------------------
 
@@ -1468,6 +1824,28 @@ def _require_text(event: dict, field: str, *, allow_empty: bool = True) -> str:
     return value
 
 
+def _require_fingerprint(event: dict, field: str) -> str:
+    """[R5-P47 / H] An **optional** content fingerprint, strict about what it accepts.
+
+    Absent or ``None`` is the ordinary case: every decision written before this field existed, and
+    every decision the P1 HTTP path writes today, carries no content binding. That is recorded as
+    an empty string and the transfer engine refuses on it — the absence must never be mistaken for
+    a fingerprint that happened to match.
+
+    A value that is *present but not a well-formed digest* is a different thing entirely and
+    raises, because :meth:`ReviewStore.decide` validates with the same predicate before writing,
+    so no fingerprint this writer produced can fail here. Reader and writer agree by construction,
+    which is the invariant ``test_n7_every_event_this_module_writes_satisfies_its_own_replay_validator``
+    exists to keep.
+    """
+    value = event.get(field)
+    if value is None or value == "":
+        return ""
+    if not is_content_fingerprint(value):
+        raise _EventSchemaError(f"{field!r} is not a SHA-256 content fingerprint")
+    return value
+
+
 def io_detail(exc: BaseException) -> str:
     """[R5-P9] The public spelling of :func:`_io_detail`, for callers outside this module.
 
@@ -1483,6 +1861,28 @@ def io_detail(exc: BaseException) -> str:
     return _io_detail(exc)
 
 
+#: [R5-P47 / C] ``decide`` refuses with this code while a transfer lease covers the identity.
+TRANSFER_IN_PROGRESS = "transfer_in_progress"
+
+#: [R5-P51 / F3] One token, two names, enforced at import time rather than hoped for.
+assert LIFECYCLE_CONFLICT == TRANSFER_IN_PROGRESS, \
+    "LIFECYCLE_CONFLICT and TRANSFER_IN_PROGRESS must remain the same refusal token"
+
+
+def is_content_fingerprint(value: object) -> bool:
+    """Is *value* a well-formed SHA-256 content fingerprint?
+
+    [R5-P47 / H] Exactly 64 lowercase hex characters. Deliberately strict and deliberately total:
+    the writer validates with it before journalling and the replay validates with it on the way
+    back, so the two halves cannot drift into disagreeing about what a fingerprint is. Anything
+    else — including an uppercase digest, a truncated one or a non-string — is **not** a
+    fingerprint, and the absence of a fingerprint is never read as permission.
+    """
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
 @dataclass(slots=True)
 class Record:
     identity: str
@@ -1490,6 +1890,11 @@ class Record:
     revision: int
     scan_id: str
     updated_at: float
+    #: [R5-P47 / H] The SHA-256 of the bytes the operator actually classified, when the deciding
+    #: caller supplied one. Empty means **no content binding exists for this decision** — which is
+    #: the honest answer for every decision P1 has ever written, and which the P2 transfer engine
+    #: treats as a refusal rather than as permission. See :func:`is_content_fingerprint`.
+    content_sha256: str = ""
 
 
 class ReviewStore:
@@ -1500,6 +1905,11 @@ class ReviewStore:
     later transfer phase needs *intent before the mutation, outcome after*, which is natively an
     append-only log rather than a row to update.
     """
+
+    #: [R5-P51 / F3] Shared :class:`LifecycleAuthority`, or ``None`` for an unguarded store. A
+    #: class attribute so every existing ``ReviewStore(dir)`` construction keeps working untouched
+    #: and the P1 suites need no change; :func:`bind_lifecycle_authority` sets it per instance.
+    lifecycle_authority: Any = None
 
     def __init__(self, directory: str) -> None:
         self.dir = os.path.abspath(directory)
@@ -1517,6 +1927,11 @@ class ReviewStore:
         self._lock = threading.RLock()
         self._records: dict[str, Record] = {}
         self._scans: dict[str, str] = {}               # owner -> current scan id
+        #: [R5-P47 / C] identity -> plan_id, while a transfer holds it. Process-local and
+        #: deliberately **not** persisted: a lease is a statement about a live execution, and a
+        #: lease surviving the process that took it would be a stuck decision nobody can release.
+        self._transfer_leases: dict[str, str] = {}
+        self._transfer_owners: dict[str, str] = {}     # plan_id -> owner
         self.corrupt_records_discarded = 0
         self.journal_records = 0
         #: [R5-P3 / F4] How many times an unterminated tail was closed off before appending.
@@ -1655,7 +2070,8 @@ class ReviewStore:
                 raise _EventSchemaError("a record's revision is not a non-negative integer")
             records[identity] = Record(identity, decision, revision,
                                        _require_text(entry, "scan_id"),
-                                       _require_number(entry, "updated_at", optional=True))
+                                       _require_number(entry, "updated_at", optional=True),
+                                       _require_fingerprint(entry, "content_sha256"))
         raw_scans = snapshot.get("scans", {})
         if not isinstance(raw_scans, dict):
             raise _EventSchemaError("'scans' is not an object")
@@ -2596,7 +3012,8 @@ class ReviewStore:
             raise _EventSchemaError("'revision' is not a non-negative integer")
         records[identity] = Record(identity, decision, revision,
                                    _require_text(event, "scan_id"),
-                                   _require_number(event, "at", optional=True))
+                                   _require_number(event, "at", optional=True),
+                                   _require_fingerprint(event, "content_sha256"))
 
     def _write_all(self, handle: int, payload: bytes) -> int:
         """[R5-P3 / F4] Write every byte, or raise. Returns the number of bytes written.
@@ -2969,7 +3386,8 @@ class ReviewStore:
             snapshot = {
                 "scans": dict(self._scans),
                 "records": {i: {"decision": r.decision, "revision": r.revision,
-                                "scan_id": r.scan_id, "updated_at": r.updated_at}
+                                "scan_id": r.scan_id, "updated_at": r.updated_at,
+                                "content_sha256": r.content_sha256}
                             for i, r in self._records.items()},
             }
             handle, temporary = tempfile.mkstemp(dir=self.dir, prefix=".snapshot-", suffix=".tmp")
@@ -3000,8 +3418,16 @@ class ReviewStore:
 
     def begin_scan(self, owner: str, scan_id: str) -> None:
         """Register a new enumeration for one owner. Decisions quoting an earlier scan of the
-        same owner become refusable; another owner's scan is unaffected."""
+        same owner become refusable; another owner's scan is unaffected.
+
+        [R5-P51 / F3] Refuses while a transfer holds this owner's lifecycle lease, **before** the
+        scan record is appended and ``_scans`` is updated — a transfer revalidates against
+        ``current_scan``, so changing it mid-flight is what made ``stale_scan`` unreachable for the
+        item already past its check.
+        """
         key = _require_owner(owner)
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.guard(key, LIFECYCLE_SCAN_RECORD)
         with self._lock:
             self._append({"k": "scan", "owner": key, "scan_id": str(scan_id), "at": time.time()})
             self._scans[key] = str(scan_id)
@@ -3018,7 +3444,8 @@ class ReviewStore:
             return (record.decision, record.revision) if record else (PENDING, 0)
 
     def decide(self, owner: str, identity: str, decision: str, scan_id: str,
-               expected_revision: int | None = None) -> tuple[str, int]:
+               expected_revision: int | None = None, *,
+               content_sha256: str | None = None) -> tuple[str, int]:
         """Record one decision durably, then return it.
 
         ``expected_revision`` is optimistic concurrency: a second tab holding a stale view sends
@@ -3038,7 +3465,22 @@ class ReviewStore:
         if expected_revision is not None and (isinstance(expected_revision, bool)
                                               or not isinstance(expected_revision, int)):
             raise StaleWrite(MALFORMED_REVISION, *self.get(identity))
+        # [R5-P47 / H] Validate the fingerprint *before* the lock and before anything is written,
+        # with the same predicate the replay validator uses, so a malformed digest can never reach
+        # the journal and no fingerprint this method writes can be refused on the way back.
+        if content_sha256 is not None and content_sha256 != "" \
+                and not is_content_fingerprint(content_sha256):
+            raise StaleWrite("malformed_content_fingerprint", *self.get(identity))
         with self._lock:
+            # [R5-P47 / C] A transfer lease makes the decision immutable for its duration. Without
+            # it, revalidating a decision just before an irreversible filesystem step is only a
+            # smaller window: the decision could still change between that check and the step.
+            # Refusing here is what lets the transfer engine treat its revalidation as binding.
+            holder = self._transfer_leases.get(identity)
+            if holder:
+                record = self._records.get(identity)
+                raise StaleWrite(TRANSFER_IN_PROGRESS, record.decision if record else PENDING,
+                                 record.revision if record else 0)
             if str(scan_id) != self._scans.get(key, ""):
                 record = self._records.get(identity)
                 raise StaleWrite("stale_scan", record.decision if record else PENDING,
@@ -3049,12 +3491,101 @@ class ReviewStore:
             if expected_revision is not None and int(expected_revision) != revision:
                 raise StaleWrite(REVISION_CONFLICT, current, revision)
             revision += 1
+            fingerprint = content_sha256 or ""
             event = {"k": "decide", "identity": identity, "decision": decision,
                      "revision": revision, "scan_id": str(scan_id), "at": time.time()}
+            if fingerprint:
+                # Only written when there is one, so an ordinary P1 decision's journal line is
+                # byte-for-byte the shape it has always been.
+                event["content_sha256"] = fingerprint
             self._append(event)
             self._records[identity] = Record(identity, decision, revision, str(scan_id),
-                                             event["at"])
+                                             event["at"], fingerprint)
             return decision, revision
+
+    # ---- content fingerprints and transfer leases (R5-P47) ---------------------------
+
+    def fingerprints_of(self, identities: Iterable[str]) -> dict[str, str]:
+        """[R5-P47 / H] The recorded content fingerprint per identity; ``""`` where none exists.
+
+        A separate accessor rather than a wider :meth:`snapshot_of` return type, so every existing
+        P1 caller and test of ``snapshot_of`` keeps the exact shape it has today.
+        """
+        with self._lock:
+            out: dict[str, str] = {}
+            for identity in identities:
+                record = self._records.get(identity)
+                out[identity] = record.content_sha256 if record else ""
+            return out
+
+    def begin_transfer(self, owner: str, plan_id: str, identities: Iterable[str], *,
+                       session_id: str = "", page_token: str = "", scan_id: str = "") -> None:
+        """[R5-P47 / C] Take an exclusive lease over *identities* for one transfer plan.
+
+        While the lease is held, :meth:`decide` refuses those identities with
+        :data:`TRANSFER_IN_PROGRESS`. Two things follow, and both are the point:
+
+        * a decision cannot change across the transfer's commit point, so the engine's
+          revalidation is binding rather than merely recent;
+        * a second execution of the same plan — or any overlapping plan — cannot start, because
+          the lease is refused.
+
+        **Scope, stated rather than implied:** the lease is process-local, guarding the in-process
+        ``ReviewStore`` that the single Gradio app owns. It is not a cross-process file lock and
+        must not be described as one; a second process opening the same state directory is outside
+        this mechanism, as it is outside every other invariant this store maintains.
+
+        [R5-P51 / F3] When a shared :class:`LifecycleAuthority` is bound, this **also** takes the
+        owner-scoped lifecycle lease, which is what extends the hold from "this decision" to "the
+        session, page and scan generation this transfer depends on".
+
+        The authority is acquired **before** ``self._lock``, deliberately. ``acquire`` consults the
+        scan coordinator, and taking the store lock first would create a store → coordinator edge
+        against the documented coordinator → registry → store → authority order. Acquiring first
+        keeps every edge pointing one way. If the identity map then refuses, the lifecycle lease is
+        released again, so a failed acquisition rolls back only what this caller took.
+        """
+        key = _require_owner(owner)
+        wanted = [str(i) for i in identities]
+        authority = self.lifecycle_authority
+        if authority is not None:
+            authority.acquire(key, plan_id, session_id=session_id, page_token=page_token,
+                              scan_id=scan_id, identities=wanted)
+        try:
+            with self._lock:
+                held = {i: h for i, h in self._transfer_leases.items() if i in set(wanted)}
+                if held:
+                    raise Refusal(409, TRANSFER_IN_PROGRESS)
+                if any(h == str(plan_id) for h in self._transfer_leases.values()):
+                    raise Refusal(409, "transfer_plan_already_executing")
+                for identity in wanted:
+                    self._transfer_leases[identity] = str(plan_id)
+                self._transfer_owners[str(plan_id)] = key
+        except BaseException:
+            if authority is not None:
+                authority.release(key, plan_id)
+            raise
+
+    def end_transfer(self, owner: str, plan_id: str) -> None:
+        """Release every identity leased by *plan_id*. Releasing twice is not an error.
+
+        [R5-P51 / F3] Also releases the owner-scoped lifecycle lease. The authority refuses a
+        release whose ``plan_id`` is not the holder, so one plan cannot release another's and an
+        owner mismatch releases nothing — a release is an authority change too.
+        """
+        _require_owner(owner)
+        with self._lock:
+            for identity in [i for i, h in self._transfer_leases.items() if h == str(plan_id)]:
+                del self._transfer_leases[identity]
+            self._transfer_owners.pop(str(plan_id), None)
+        # Outside `self._lock`, to keep the one-way lock ordering intact.
+        if self.lifecycle_authority is not None:
+            self.lifecycle_authority.release(owner, plan_id)
+
+    def active_transfer(self, identity: str) -> str:
+        """The plan id currently leasing *identity*, or ``""``."""
+        with self._lock:
+            return self._transfer_leases.get(str(identity), "")
 
     def counts(self, identities: Iterable[str]) -> dict[str, int]:
         with self._lock:
@@ -3082,7 +3613,12 @@ __all__ = [
     "MALFORMED_REVISION",
     "REVISION_CONFLICT",
     "REVISION_REQUIRED",
+    "TRANSFER_IN_PROGRESS",
+    "TransferLease",
+    "bind_lifecycle_authority",
+    "default_lifecycle_authority",
     "RevisionError",
+    "is_content_fingerprint",
     "ScanCoordinator",
     "SupersededScan",
     "build_poster_command",
@@ -3095,6 +3631,16 @@ __all__ = [
     "prune_poster_cache",
     "Discovery",
     "MAX_CLIPS_PER_PAGE",
+    "LIFECYCLE_CONFLICT",
+    "LIFECYCLE_OPERATIONS",
+    "LIFECYCLE_OWNER_EVICT",
+    "LIFECYCLE_PAGE_PUBLISH",
+    "LIFECYCLE_SCAN_BEGIN",
+    "LIFECYCLE_SCAN_RECORD",
+    "LIFECYCLE_SESSION_NEW",
+    "LIFECYCLE_SESSION_REVOKE",
+    "LIFECYCLE_BUSY_TEXT",
+    "LifecycleAuthority",
     "MAX_OWNERS",
     "MAX_PAGES_PER_SESSION",
     "MAX_SESSIONS_PER_OWNER",

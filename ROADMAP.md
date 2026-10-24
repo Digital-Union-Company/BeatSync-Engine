@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — transfer NOT implemented**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, ALL THREE MAJORS CLOSED, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -394,9 +394,73 @@ Folder Batch exists precisely so that cutting needs no interaction.
 
 **What P1 does and does not do.** Discovery, authorized preview playback, poster frames,
 server-authoritative classification, durable decisions and the gallery are implemented and
-measured. **Moving the reviewed clips is not implemented at all** — not disabled, not
-feature-flagged, not written. Confirm reports readiness and moves nothing. The transfer contract
-below remains a design that needs its own authorization and its own review.
+measured. **Confirm still reports readiness and moves nothing.**
+
+**P2, as of R5-P51, is a twice-reviewed transfer core with every reported MAJOR closed, that nothing calls.**
+`src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
+same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
+the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
+wired into `_on_clips_confirm`, no HTTP route reaches it, and tests pin all three of those facts.
+So the accurate statement is "written, independently reviewed, remediated, exercised only from
+tests, and unreachable from the running GUI". Wiring it up is a separate phase with its own
+authorization.
+
+**Three things an independent review (R5-P46) changed about what P2 would do, and two of them bound
+what it *can* do.** The review reproduced four MAJOR defects; the R5-P47 remediation closed all of
+them, and two corrections are limitations rather than fixes and must be read as such:
+
+- **Cross-volume transfers publish a verified copy and do not delete the original.** On Windows,
+  within the fork package's dependency rules, there is no way to delete *the object whose identity
+  was proven* rather than whatever currently owns a pathname — the alternatives were measured, and
+  the one handle-anchored primitive that exists cannot have its disposition cancelled. So the
+  engine stops at `SOURCE_REMOVAL_BLOCKED` with both copies intact. Closing this needs an **owner
+  decision** on a capability the current rules prohibit; until then cross-volume is a verified copy,
+  not a move.
+- **No decision made through today's UI is transferable.** Transfer now requires a decision-time
+  SHA-256 content fingerprint, because metadata identity cannot tell a same-length edit with a
+  restored timestamp from the reviewed file — and unlike P1, P2 acts irreversibly on that
+  distinction. The store records a fingerprint when the deciding caller supplies one; the P1 HTTP
+  path does not yet, so every existing decision fails closed. Supplying it is part of the GUI
+  integration phase.
+- `expected_revisions` is mandatory, and execution revalidates the decision, its revision, the scan
+  generation and the session against the live store and registry, per item, under an exclusive
+  transfer lease.
+
+**A second independent review (R5-P48) confirmed all eight of those corrections and found three new
+MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last; **no MAJOR remains open.** The
+engine is still unwired, so none of this is reachable from the GUI — and the PR is still **not**
+cleared for integration, because what remains is a product decision rather than a defect:
+
+- **CLOSED (R5-P49) — no status may claim "nothing moved" after an irreversible step.** Every
+  journal append after the commit point was unguarded, so a journal write failure — an ordinary
+  Windows event: an antivirus lock, a full volume, a permission change — reported `REFUSED` with
+  `source_removed=False` and an empty `published_path` about a clip already in the Media Library.
+  A persistent failure made `execute_transfer` raise and discard the entire outcome list. There is
+  now a `PUBLISHED_UNJOURNALLED` state carrying the real path, size and digest; it is never
+  `COMPLETE`, it stops the batch, and a batch whose summary cannot be journalled is downgraded
+  rather than claiming durable completion.
+- **CLOSED (R5-P49) — a journal append can no longer vanish behind a torn tail.** `O_APPEND` writes
+  at the end of the *file*, not the last *record*, so an append after an unterminated fragment was
+  glued onto it and the committed event was silently lost. The tail is now classified before every
+  write, a complete-but-unterminated record is preserved as history, a torn one is closed off with
+  an identifiable separator, and an uninspectable tail refuses the write.
+- **CLOSED (R5-P50) — recovery no longer reports unfinished work as complete.** A copy-only
+  cross-volume item, and clips never attempted, both used to aggregate to
+  `COMPLETE`/`needs_operator=False`. There are now three independent signals — `plan_finished`
+  (the only completion signal), `needs_operator`, and a `state` of `COMPLETE`,
+  `RECOVERY_INCOMPLETE` or `RECOVERY_REQUIRED` — and completion additionally requires a durable
+  terminal journal record, because matching bytes alone cannot distinguish a finished move from an
+  unjournalled publication.
+- **CLOSED (R5-P51) — a transfer now holds the authority it depends on.** Session, scan and page
+  revocation were all accepted after the per-item revalidation and before the commit, and the item
+  completed anyway. A shared owner-scoped `LifecycleAuthority` now refuses a conflicting same-owner
+  lifecycle operation **before it changes any authoritative state**, fail-fast and retryable. The
+  guard sits in `ScanCoordinator.begin`, because taking a generation alone already blanks the
+  gallery, so a `begin_scan`-only fix would have refused the scan after the damage. Eviction caps
+  skip a leased owner, and a transfer cannot acquire over a page a newer generation has already
+  superseded.
+- **OPEN (ADVISORY)** — the rollback renames into the source directory, whose no-replace semantics
+  are never probed.
 
 - A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
 - **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to
@@ -408,6 +472,7 @@ below remains a design that needs its own authorization and its own review.
 - Colour is never the decision record: server-side clip IDs and durable per-file outcomes are.
 - Transfers are verified — atomic no-replace moves on one volume, staged verified copies across
   volumes — with per-file intent recorded so a partial failure is recoverable rather than silent.
+  Across volumes the original is currently **kept** rather than deleted; see the R5-P47 note above.
 
 Full specification: [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md).
 
