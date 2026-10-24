@@ -254,6 +254,39 @@ LIFECYCLE_OWNER_EVICT = "owner_evict"
 LIFECYCLE_OPERATIONS = (LIFECYCLE_SCAN_BEGIN, LIFECYCLE_SCAN_RECORD, LIFECYCLE_SESSION_NEW,
                         LIFECYCLE_SESSION_REVOKE, LIFECYCLE_PAGE_PUBLISH, LIFECYCLE_OWNER_EVICT)
 
+#: [R5-P53 / F53-A] A transfer may not acquire while a lifecycle mutation holds a reservation.
+#: Distinct from :data:`LIFECYCLE_CONFLICT` on purpose: the two name opposite directions of the
+#: same exclusion, and an operator retrying needs to know which side is holding.
+LIFECYCLE_PENDING = "lifecycle_mutation_pending"
+
+#: [R5-P53 / F53-B] A transfer acquisition whose coordinator probe and final arbitration observed
+#: different lifecycle epochs. The probe result is stale and is never silently accepted.
+LIFECYCLE_EPOCH_MOVED = "lifecycle_epoch_moved"
+
+#: How many times :meth:`LifecycleAuthority.acquire` may re-probe when the epoch moved underneath
+#: it. Bounded, and the bound is small: a retry is only worth attempting because the mover may have
+#: finished, and failing closed is always an acceptable outcome. This is **not** a spin lock -- each
+#: pass does one lock-free probe and one short arbitration, and exhaustion refuses.
+ACQUIRE_PROBE_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class MutationReservation:
+    """[R5-P53 / F53-A] One lifecycle mutation's right to change an owner's authority.
+
+    Held as a *logical token* across the subsystem mutation it authorizes — never as a mutex. The
+    authority's own lock is taken only to grant it and to release it, so no file hashing, journal
+    write or media copy ever happens under that lock.
+
+    ``token`` is unique per reservation so that :meth:`LifecycleAuthority.release_mutation`
+    releases exactly one reservation and a stale or foreign token frees nothing.
+    """
+
+    owner: str
+    token: str
+    operation: str
+    epoch: int
+
 
 @dataclass(frozen=True)
 class TransferLease:
@@ -295,10 +328,47 @@ class LifecycleAuthority:
     coordinator — and does so *before* taking its own lock, so there is never an edge in the other
     direction. See *Lock ordering* below.
 
+    [R5-P53] **A check was not enough, and independent review R5-P52 proved it.** The original
+    design gated each mutation with :meth:`guard`, which read the lease map and released the lock
+    before the mutation ran. On all five lifecycle operations the ordering *guard succeeds →
+    transfer acquires → transfer revalidates → mutation executes → transfer publishes* was
+    accepted: the clip moved, the batch said ``COMPLETE``, and the authority had been destroyed.
+    Separately, :meth:`acquire` probed the coordinator outside its lock and a scan beginning
+    between the probe and the lease record went unnoticed.
+
+    So the exclusion is now a **reservation protocol with one arbitration point**:
+
+    * a lifecycle mutation calls :meth:`reserve_mutation`, which refuses if a lease exists and
+      otherwise grants a token **and bumps the owner's epoch**, both inside ``_lock``;
+    * the token is held *across* the subsystem mutation and released in a ``finally``;
+    * :meth:`acquire` refuses while any reservation is pending, and validates that the epoch it
+      captured before its lock-free coordinator probe is still current when it installs the lease.
+
+    Both directions are therefore decided by the same lock, rather than by two separate moments
+    in time. The reservation is a **logical token, never a mutex**: ``_lock`` is taken only to
+    grant and to release it, so no file hashing, journal write, media copy or FFmpeg call ever
+    happens under it.
+
+    Reservations do **not** exclude each other. Two same-owner lifecycle mutations are legitimate
+    — two tabs rescanning — and the scan-generation contract exists precisely so the newer
+    supersedes the older; serialising them here would break it.
+
+    :meth:`guard` and :meth:`guarded` survive as **diagnostic probes** and must never be used as a
+    gate again; a test asserts that no mutation site calls them.
+
     Lock ordering
     -------------
     ``ScanCoordinator._lock`` / owner lock  →  ``ClipRegistry._lock``  →  ``ReviewStore._lock``
     →  **LifecycleAuthority._lock (leaf, never held while taking another)**
+
+    The reservation protocol preserves this exactly. Every nested edge in the implementation runs
+    downhill: ``ScanCoordinator.begin`` and ``_prune`` reach the authority while holding the
+    coordinator lock; ``ClipRegistry``'s eviction reaches it while holding the registry lock;
+    ``ReviewStore.begin_transfer`` acquires the authority *before* taking the store lock. The one
+    method that must read another subsystem — :meth:`acquire`, which probes the coordinator —
+    does so with **no** lock of its own held, both before and between arbitration passes. Nothing
+    holding ``_lock`` calls into a subsystem, so no reverse edge exists and no cycle is
+    constructible.
 
     Scope, stated rather than implied
     ---------------------------------
@@ -316,6 +386,18 @@ class LifecycleAuthority:
         #: Set by :func:`bind_lifecycle_authority`. Read **outside** ``_lock``; see `acquire`.
         self._coordinator: Any = None
         self.refusals = 0
+        # ---- [R5-P53] the arbitration state -------------------------------------------
+        #: owner -> monotonic lifecycle epoch. Bumped **atomically with granting** a mutation
+        #: reservation, which is what lets `acquire` detect a scan that started underneath its
+        #: lock-free coordinator probe (F53-B).
+        self._epochs: dict[str, int] = {}
+        #: owner -> {token: MutationReservation}. A **dict, not a flag**: two same-owner lifecycle
+        #: mutations are legitimately concurrent (two tabs rescanning; the scan-generation
+        #: contract exists precisely so the newer supersedes the older), so reservations must not
+        #: serialise each other. They only exclude *transfer acquisition*.
+        self._pending: dict[str, dict[str, MutationReservation]] = {}
+        self.mutation_reservations = 0
+        self.epoch_conflicts = 0
 
     # ---- queries ---------------------------------------------------------------------
 
@@ -340,6 +422,16 @@ class LifecycleAuthority:
     def identity_holder(self, identity: Any) -> str:
         with self._lock:
             return self._identities.get(str(identity), "")
+
+    def has_any_lease(self) -> bool:
+        """[R5-P53] Is any owner's lifecycle leased right now?
+
+        Used by :func:`bind_lifecycle_authority` to refuse a rebinding that would orphan a live
+        lease. Deliberately *not* a per-owner question: rebinding replaces the gate for **every**
+        owner at once, so any live lease makes the whole operation unsafe.
+        """
+        with self._lock:
+            return bool(self._leases)
 
     # ---- the gate --------------------------------------------------------------------
 
@@ -368,11 +460,114 @@ class LifecycleAuthority:
         raise Refusal(409, LIFECYCLE_CONFLICT)
 
     def guarded(self, owner: Any) -> bool:
-        """Non-raising form, for eviction paths that must *skip* rather than refuse."""
+        """Non-raising form. **Diagnostic only since R5-P53.**
+
+        This is a *probe*: it answers "is there a lease right now", and the answer stops being
+        true the instant the lock is released. It must never be used as the gate in front of a
+        mutation — that is exactly the check-then-act R5-P52 reproduced. Eviction paths now call
+        :meth:`try_reserve_mutation`, which answers the same question and *keeps* the answer true
+        for the duration of the eviction.
+        """
         try:
             return self.holder(owner) != ""
         except Refusal:
             return False
+
+    # ---- [R5-P53 / F53-A] atomic lifecycle mutation reservations ----------------------
+
+    def epoch(self, owner: Any) -> int:
+        """The owner's current lifecycle epoch. Monotonic; only a *granted* reservation moves it."""
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return 0
+        with self._lock:
+            return self._epochs.get(key, 0)
+
+    def pending_count(self, owner: Any) -> int:
+        """How many lifecycle mutations currently hold a reservation on *owner*."""
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return 0
+        with self._lock:
+            return len(self._pending.get(key, ()))
+
+    def reserve_mutation(self, owner: Any, operation: str) -> MutationReservation:
+        """Reserve the right to mutate *owner*'s authority, atomically against lease acquisition.
+
+        **This replaces :meth:`guard` at every mutation site, and the difference is the whole of
+        the R5-P53 correction.** ``guard`` answered "no lease *right now*" and then released the
+        lock; the mutation happened afterwards, so a transfer could acquire in between and the
+        mutation would land inside the lease. Measured by independent review R5-P52 on all five
+        lifecycle operations: the clip moved, the batch reported ``COMPLETE``, and the authority
+        the operator was acting under had been destroyed.
+
+        A reservation instead *persists* across the mutation. It is granted only when no lease
+        exists, and while it is held :meth:`acquire` refuses — so the exclusion is symmetric and
+        is decided at one arbitration point (``self._lock``) rather than at two moments in time.
+
+        Granting a reservation **bumps the owner's epoch** in the same critical section, which is
+        what makes a stale coordinator probe detectable in :meth:`acquire` (F53-B). A **refused**
+        reservation changes nothing at all — no epoch movement, no bookkeeping — so a refused
+        lifecycle operation is still invisible to everything else.
+
+        Concurrent same-owner reservations are *allowed*. Serialising them would break the
+        scan-generation contract, under which a newer scan is supposed to supersede an older one.
+
+        Raises :class:`Refusal` (409, :data:`LIFECYCLE_CONFLICT`). The caller **must** release in a
+        ``finally``; see :meth:`release_mutation`.
+        """
+        key = _require_owner(owner)
+        with self._lock:
+            if key in self._leases:
+                self.refusals += 1
+                raise Refusal(409, LIFECYCLE_CONFLICT)
+            epoch = self._epochs.get(key, 0) + 1
+            self._epochs[key] = epoch
+            token = secrets.token_urlsafe(12)
+            reservation = MutationReservation(key, token, str(operation), epoch)
+            self._pending.setdefault(key, {})[token] = reservation
+            self.mutation_reservations += 1
+            return reservation
+
+    def try_reserve_mutation(self, owner: Any,
+                             operation: str) -> MutationReservation | None:
+        """Non-raising :meth:`reserve_mutation`, for eviction paths that must *skip*.
+
+        Returns ``None`` when the owner is leased, when another mutation already holds a
+        reservation, or when the owner is not a valid key. An eviction acts on *somebody else's*
+        authority, so refusing the caller would be wrong — but deleting state a transfer is
+        relying on would be worse, and the check-and-delete it used to do was not atomic. This
+        makes the decision and the licence the same act.
+        """
+        try:
+            key = _require_owner(owner)
+        except Refusal:
+            return None
+        with self._lock:
+            if key in self._leases or self._pending.get(key):
+                return None
+            return self.reserve_mutation(key, operation)
+
+    def release_mutation(self, reservation: MutationReservation | None) -> bool:
+        """Release exactly the reservation given. Releasing twice is not an error.
+
+        A stale or foreign token frees nothing: the token is matched before anything is removed,
+        so one lifecycle operation can never release another's reservation and a token kept from a
+        finished mutation can never authorize a new one. The epoch is **not** rewound — it is
+        monotonic, and a completed mutation really did change the owner's authority.
+        """
+        if reservation is None:
+            return False
+        with self._lock:
+            held = self._pending.get(reservation.owner)
+            if not held or held.get(reservation.token) is not reservation:
+                return False
+            del held[reservation.token]
+            if not held:
+                del self._pending[reservation.owner]
+            return True
 
     # ---- lease lifecycle -------------------------------------------------------------
 
@@ -391,40 +586,88 @@ class LifecycleAuthority:
 
         The coordinator probe happens **before** ``_lock`` is taken, so this method never holds the
         leaf lock while acquiring a subsystem lock. See *Lock ordering*.
+
+        [R5-P53 / F53-B] That lock-free probe is why the result must be **version-validated**.
+        Independent review R5-P52 measured a scan taking a new generation between the probe and the
+        lease record, after which the transfer committed while holding a lease in exactly the state
+        the probe exists to refuse, with the operator's gallery blank. So the protocol is now:
+
+        1. capture the owner's lifecycle epoch under ``_lock``, with the cheap state checks;
+        2. probe the coordinator holding **no** lock of our own;
+        3. re-enter ``_lock`` and require the epoch to be **unchanged** — a granted mutation
+           reservation always moves it, so any intervening lifecycle mutation is detected;
+        4. re-check the lease, plan, identity and pending-reservation state;
+        5. install the lease in that same critical section.
+
+        A moved epoch is retried a bounded number of times (the mover may simply have finished)
+        and then **fails closed** with :data:`LIFECYCLE_EPOCH_MOVED`. A stale probe result is never
+        silently accepted, and nothing is mutated before the lease is installed.
         """
         key = _require_owner(owner)
         wanted = {str(i) for i in identities}
 
-        # -- probe the scan transition FIRST, with no lock of our own held
-        coordinator = self._coordinator
-        if coordinator is not None:
-            try:
-                in_transition = (coordinator.newest(key) > 0
-                                 and coordinator.view(key) == {})
-            except Exception:                               # a coordinator that cannot answer
-                in_transition = True                        # fails closed
-            if in_transition:
-                with self._lock:
-                    self.refusals += 1
-                raise Refusal(409, "scan_in_flight")
+        def _arbitrate() -> int:
+            """Cheap state checks plus the epoch snapshot, under one short critical section."""
+            with self._lock:
+                self._reject_if_unavailable(key, plan_id, wanted)
+                return self._epochs.get(key, 0)
+
+        for _ in range(ACQUIRE_PROBE_ATTEMPTS):
+            captured = _arbitrate()
+
+            # -- probe the scan transition with NO lock of our own held
+            coordinator = self._coordinator
+            if coordinator is not None:
+                try:
+                    in_transition = (coordinator.newest(key) > 0
+                                     and coordinator.view(key) == {})
+                except Exception:                           # a coordinator that cannot answer
+                    in_transition = True                    # fails closed
+                if in_transition:
+                    with self._lock:
+                        self.refusals += 1
+                    raise Refusal(409, "scan_in_flight")
+
+            with self._lock:
+                if self._epochs.get(key, 0) != captured:
+                    # A lifecycle mutation was granted a reservation while we were probing, so the
+                    # probe described authority that no longer holds. Retry; never accept it.
+                    self.epoch_conflicts += 1
+                    continue
+                self._reject_if_unavailable(key, plan_id, wanted)
+                lease = TransferLease(key, str(plan_id), str(session_id), str(page_token),
+                                      str(scan_id), frozenset(wanted))
+                self._leases[key] = lease
+                for identity in wanted:
+                    self._identities[identity] = key
+                return lease
 
         with self._lock:
-            if key in self._leases:
-                self.refusals += 1
-                raise Refusal(409, LIFECYCLE_CONFLICT)
-            if any(l.plan_id == str(plan_id) for l in self._leases.values()):
-                self.refusals += 1
-                raise Refusal(409, "transfer_plan_already_executing")
-            clashing = wanted & set(self._identities)
-            if clashing:
-                self.refusals += 1
-                raise Refusal(409, LIFECYCLE_CONFLICT)
-            lease = TransferLease(key, str(plan_id), str(session_id), str(page_token),
-                                  str(scan_id), frozenset(wanted))
-            self._leases[key] = lease
-            for identity in wanted:
-                self._identities[identity] = key
-            return lease
+            self.refusals += 1
+        raise Refusal(409, LIFECYCLE_EPOCH_MOVED)
+
+    def _reject_if_unavailable(self, key: str, plan_id: str, wanted: set) -> None:
+        """Every reason a lease may not be installed. Caller holds ``_lock``.
+
+        Factored out so the pre-probe pass and the final arbitration apply **identically** the
+        same predicate — a second copy is how one of them drifts and the final check becomes
+        weaker than the first.
+        """
+        if key in self._leases:
+            self.refusals += 1
+            raise Refusal(409, LIFECYCLE_CONFLICT)
+        if self._pending.get(key):
+            # [R5-P53 / F53-A] A lifecycle mutation holds a reservation on this owner. Its
+            # mutation may not have happened yet, which is precisely why acquiring now is unsafe:
+            # it would land inside the lease exactly as R5-P52 reproduced.
+            self.refusals += 1
+            raise Refusal(409, LIFECYCLE_PENDING)
+        if any(l.plan_id == str(plan_id) for l in self._leases.values()):
+            self.refusals += 1
+            raise Refusal(409, "transfer_plan_already_executing")
+        if wanted & set(self._identities):
+            self.refusals += 1
+            raise Refusal(409, LIFECYCLE_CONFLICT)
 
     def release(self, owner: Any, plan_id: str) -> bool:
         """Release *owner*'s lease, but **only** if *plan_id* is the holder.
@@ -489,14 +732,32 @@ def bind_lifecycle_authority(*, registry: Any = None, store: Any = None,
 
     With no ``authority`` given this binds :func:`default_lifecycle_authority`, so a lazily
     constructed store can join the same gate later with no shared variable to thread through.
+
+    [R5-P53] **Rebinding to a different authority while any lease is live is refused.** R5-P52
+    measured the alternative: the live lease stayed on the old instance, the newly bound one saw no
+    lease, and a lifecycle operation that should have been refused succeeded — the guard silently
+    stopped applying. Rebinding the *same* instance stays idempotent, which is what keeps the lazy
+    store attachment and P1 startup working. The decision is made for **all** targets before any
+    assignment, so a refusal leaves every existing binding exactly as it was and no subsystem is
+    left pointing at a different gate from its siblings.
     """
     shared = authority or _DEFAULT_LIFECYCLE_AUTHORITY
-    if registry is not None:
-        registry.lifecycle_authority = shared
-    if store is not None:
-        store.lifecycle_authority = shared
+
+    targets = [("registry", registry), ("store", store), ("coordinator", coordinator)]
+    for name, target in targets:
+        if target is None:
+            continue
+        current = getattr(target, "lifecycle_authority", None)
+        if current is None or current is shared:
+            continue
+        if current.has_any_lease() or shared.has_any_lease():
+            raise Refusal(409, "lifecycle_authority_rebind_refused")
+
+    for name, target in targets:
+        if target is None:
+            continue
+        target.lifecycle_authority = shared
     if coordinator is not None:
-        coordinator.lifecycle_authority = shared
         shared._coordinator = coordinator
     return shared
 
@@ -537,8 +798,19 @@ class ClipRegistry:
         the owner's existing one, which is precisely the authority a running transfer depends on.
         """
         key = _require_owner(owner)
-        if self.lifecycle_authority is not None:
-            self.lifecycle_authority.guard(key, LIFECYCLE_SESSION_NEW)
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            # [R5-P53 / F53-A] Held across the revocation below, not merely checked before it.
+            reservation = authority.reserve_mutation(key, LIFECYCLE_SESSION_NEW)
+        try:
+            return self._new_session_locked(key, scan_id)
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
+
+    def _new_session_locked(self, key: str, scan_id: str) -> str:
+        """The authoritative part of :meth:`new_session`. Caller holds the mutation reservation."""
         with self._lock:
             sessions = self._owners.get(key)
             if sessions is None:
@@ -550,12 +822,19 @@ class ClipRegistry:
                     # instead; if every tracked owner is leased, the cap is allowed to exceed
                     # rather than revoke an authority a transfer is relying on. The cap exists to
                     # bound memory, not to override a lease.
-                    victim = self._oldest_evictable_owner()
+                    #
+                    # [R5-P53 / F53-A] The victim is now *reserved* rather than probed, so a
+                    # transfer cannot acquire between choosing it and revoking its sessions.
+                    victim, victim_hold = self._reserve_evictable_owner()
                     if victim is None:
                         break
-                    dropped = self._owners.pop(victim)
-                    for session in dropped.values():
-                        self._mark_revoked(session)
+                    try:
+                        dropped = self._owners.pop(victim)
+                        for session in dropped.values():
+                            self._mark_revoked(session)
+                    finally:
+                        if self.lifecycle_authority is not None:
+                            self.lifecycle_authority.release_mutation(victim_hold)
             self._owners.move_to_end(key)
             for session in sessions.values():
                 self._mark_revoked(session)
@@ -571,18 +850,25 @@ class ClipRegistry:
                 self._mark_revoked(old)
             return session_id
 
-    def _oldest_evictable_owner(self) -> str | None:
-        """[R5-P51 / F3] The oldest tracked owner that no transfer is leasing, or ``None``.
+    def _reserve_evictable_owner(self):
+        """[R5-P53 / F53-A] The oldest evictable owner **together with a reservation on it**.
+
+        Returns ``(owner, reservation)`` or ``(None, None)``. Replaces R5-P51's
+        ``_oldest_evictable_owner``, which returned a name chosen by a ``guarded()`` probe whose
+        answer expired with the lock — leaving a window in which a transfer could acquire the
+        victim's authority before the caller revoked its sessions.
 
         Caller holds ``self._lock``. Consults the authority, which is the leaf lock, so this
         ordering (registry → authority) is the documented one and cannot form a cycle.
         """
         authority = self.lifecycle_authority
         for candidate in list(self._owners):
-            if authority is not None and authority.guarded(candidate):
-                continue
-            return candidate
-        return None
+            if authority is None:
+                return candidate, None
+            reservation = authority.try_reserve_mutation(candidate, LIFECYCLE_OWNER_EVICT)
+            if reservation is not None:
+                return candidate, reservation
+        return None, None
 
     def _mark_revoked(self, session: Session) -> None:
         session.revoked = True
@@ -604,8 +890,21 @@ class ClipRegistry:
         ``page_entries`` serves the transfer's own revalidation from.
         """
         key = _require_owner(owner)
-        if self.lifecycle_authority is not None:
-            self.lifecycle_authority.guard(key, LIFECYCLE_PAGE_PUBLISH)
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            # [R5-P53 / F53-A] Held across the previous page's revocation and clip-map clear.
+            reservation = authority.reserve_mutation(key, LIFECYCLE_PAGE_PUBLISH)
+        try:
+            return self._publish_page_locked(key, session_id, page_index, files)
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
+
+    def _publish_page_locked(self, key: str, session_id: str, page_index: int,
+                             files: Iterable[tuple[int, str, int, int, int, int]]
+                             ) -> tuple[str, list[ClipEntry]]:
+        """The authoritative part of :meth:`publish_page`. Caller holds the reservation."""
         with self._lock:
             session = self._session(key, session_id)
             if session.active_page_token:
@@ -646,11 +945,19 @@ class ClipRegistry:
         transfer releases.
         """
         key = _require_owner(owner)
-        if self.lifecycle_authority is not None:
-            self.lifecycle_authority.guard(key, LIFECYCLE_SESSION_REVOKE)
-        with self._lock:
-            for session in self._owners.pop(key, OrderedDict()).values():
-                self._mark_revoked(session)
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            # [R5-P53 / F53-A] Held across the revocation, so a transfer cannot acquire between
+            # the refusal decision and the owner's sessions actually being dropped.
+            reservation = authority.reserve_mutation(key, LIFECYCLE_SESSION_REVOKE)
+        try:
+            with self._lock:
+                for session in self._owners.pop(key, OrderedDict()).values():
+                    self._mark_revoked(session)
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
 
     def _session(self, owner: str, session_id: Any) -> Session:
         if not _valid_token(session_id):
@@ -888,15 +1195,23 @@ class ScanCoordinator:
         intact and the scan can simply be retried after the transfer releases.
         """
         key = _require_owner(owner)
-        if self.lifecycle_authority is not None:
-            self.lifecycle_authority.guard(key, LIFECYCLE_SCAN_BEGIN)
-        with self._lock:
-            self._counter += 1
-            generation = self._counter
-            self._newest[key] = generation
-            self._newest.move_to_end(key)
-            self._prune()
-            return generation
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            # [R5-P53 / F53-A] A *reservation*, not a check. It is held across the mutation below,
+            # so a transfer cannot acquire between this line and the generation actually moving.
+            reservation = authority.reserve_mutation(key, LIFECYCLE_SCAN_BEGIN)
+        try:
+            with self._lock:
+                self._counter += 1
+                generation = self._counter
+                self._newest[key] = generation
+                self._newest.move_to_end(key)
+                self._prune()
+                return generation
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
 
     def newest(self, owner: Any) -> int:
         key = _require_owner(owner)
@@ -952,16 +1267,29 @@ class ScanCoordinator:
         authority = self.lifecycle_authority
         while len(self._newest) > self._max_owners:
             victim = None
+            reservation = None
             for candidate in list(self._newest):
-                if authority is not None and authority.guarded(candidate):
+                if authority is None:
+                    victim = candidate
+                    break
+                # [R5-P53 / F53-A] Reserve the victim's own authority rather than probing it:
+                # `guarded(candidate)` answered a question that stopped being true the moment its
+                # lock was released, so a transfer could acquire between the check and the three
+                # deletions below. `try_reserve_mutation` decides and licenses in one act.
+                reservation = authority.try_reserve_mutation(candidate, LIFECYCLE_OWNER_EVICT)
+                if reservation is None:
                     continue
                 victim = candidate
                 break
             if victim is None:
                 return
-            self._newest.pop(victim, None)
-            self._views.pop(victim, None)
-            self._locks.pop(victim, None)
+            try:
+                self._newest.pop(victim, None)
+                self._views.pop(victim, None)
+                self._locks.pop(victim, None)
+            finally:
+                if authority is not None:
+                    authority.release_mutation(reservation)
 
     # ---- the authoritative view ------------------------------------------------------
 
@@ -1041,11 +1369,26 @@ class ScanCoordinator:
             return True
 
     def forget(self, owner: Any) -> None:
+        """[R5-P53] Drop the owner's generation, view and per-owner lock.
+
+        Reserved like any other authority mutation. R5-P52 recorded this as the one coordinator
+        mutator with neither a lease check nor a caller; mid-transfer it destroyed the operator's
+        gallery and the lock that orders their scans. It refuses under a lease now rather than
+        relying on having no caller, because "unreachable today" is not a safety property.
+        """
         key = _require_owner(owner)
-        with self._lock:
-            self._newest.pop(key, None)
-            self._views.pop(key, None)
-            self._locks.pop(key, None)
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            reservation = authority.reserve_mutation(key, LIFECYCLE_OWNER_EVICT)
+        try:
+            with self._lock:
+                self._newest.pop(key, None)
+                self._views.pop(key, None)
+                self._locks.pop(key, None)
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
 
     def stats(self) -> dict:
         with self._lock:
@@ -3426,11 +3769,20 @@ class ReviewStore:
         item already past its check.
         """
         key = _require_owner(owner)
-        if self.lifecycle_authority is not None:
-            self.lifecycle_authority.guard(key, LIFECYCLE_SCAN_RECORD)
-        with self._lock:
-            self._append({"k": "scan", "owner": key, "scan_id": str(scan_id), "at": time.time()})
-            self._scans[key] = str(scan_id)
+        authority = self.lifecycle_authority
+        reservation = None
+        if authority is not None:
+            # [R5-P53 / F53-A] Held across the durable append AND the in-memory update, so a
+            # transfer cannot acquire between the refusal decision and `current_scan` moving.
+            reservation = authority.reserve_mutation(key, LIFECYCLE_SCAN_RECORD)
+        try:
+            with self._lock:
+                self._append({"k": "scan", "owner": key, "scan_id": str(scan_id),
+                              "at": time.time()})
+                self._scans[key] = str(scan_id)
+        finally:
+            if authority is not None:
+                authority.release_mutation(reservation)
 
     def current_scan(self, owner: str) -> str:
         with self._lock:
@@ -3640,6 +3992,10 @@ __all__ = [
     "LIFECYCLE_SESSION_NEW",
     "LIFECYCLE_SESSION_REVOKE",
     "LIFECYCLE_BUSY_TEXT",
+    "LIFECYCLE_PENDING",
+    "LIFECYCLE_EPOCH_MOVED",
+    "ACQUIRE_PROBE_ATTEMPTS",
+    "MutationReservation",
     "LifecycleAuthority",
     "MAX_OWNERS",
     "MAX_PAGES_PER_SESSION",

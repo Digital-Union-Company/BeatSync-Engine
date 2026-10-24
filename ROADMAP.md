@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, ALL THREE MAJORS CLOSED, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core THREE TIMES REVIEWED, R5-P52's TWO MAJORS REMEDIATED, AWAITING R5-P54, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,7 +396,14 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P51, is a twice-reviewed transfer core with every reported MAJOR closed, that nothing calls.**
+**P2, as of R5-P53, is a three-times-reviewed transfer core whose every reported MAJOR has been
+remediated and which still awaits its next independent review (R5-P54), that nothing calls.**
+A third independent review, **R5-P52**, reproduced two MAJOR race conditions that R5-P51's
+check-style guard had left open — the reverse-order lifecycle guard race on all five lifecycle
+operations, and a coordinator probe/acquire race — and returned `CHANGES_REQUIRED`. **R5-P53
+replaced the check with an atomic per-owner mutation reservation plus an epoch-validated
+acquisition protocol and closed both.** Being remediated is not the same as being cleared: the
+R5-P53 corrections have **not** themselves been independently reviewed.
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -427,9 +434,26 @@ them, and two corrections are limitations rather than fixes and must be read as 
   transfer lease.
 
 **A second independent review (R5-P48) confirmed all eight of those corrections and found three new
-MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last; **no MAJOR remains open.** The
-engine is still unwired, so none of this is reachable from the GUI — and the PR is still **not**
-cleared for integration, because what remains is a product decision rather than a defect:
+MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last — but a third review (R5-P52) then
+showed R5-P51's fix had narrowed rather than closed its finding, and reproduced two MAJOR races.
+**R5-P53 closed both, and they have not yet been independently reviewed.** The engine is still
+unwired, so none of this is reachable from the GUI — and the PR is still **not** cleared for
+integration:
+
+- **CLOSED (R5-P53) — a lifecycle guard that is only a check does not bind.** R5-P51 called
+  `guard()`, which read the lease map and released the lock *before* the mutation ran, while
+  `acquire()` took no subsystem lock at all. R5-P52 measured the consequence on all five lifecycle
+  operations: with the guard evaluated before the lease was taken and the mutation landing after
+  revalidation, the clip moved, the batch said `COMPLETE` with `advance_page=True`, and the
+  authority was already destroyed. A per-owner **mutation reservation** replaces the check — granted
+  only when no lease exists, held *across* the mutation, and refusing transfer acquisition while
+  pending — so both directions are arbitrated by one lock instead of two moments in time.
+- **CLOSED (R5-P53) — a lock-free coordinator probe must be version-validated.** `acquire()` probed
+  `ScanCoordinator` outside its lock and then recorded the lease, so a scan taking a generation in
+  between went unseen and the transfer committed against a superseded page. Acquisition now captures
+  a per-owner monotonic epoch, probes with no lock held, and requires the epoch to be unchanged
+  before installing the lease, failing closed after a bounded retry. R5-P52's own reproduction for
+  this finding passes unchanged against the fix.
 
 - **CLOSED (R5-P49) — no status may claim "nothing moved" after an irreversible step.** Every
   journal append after the commit point was unguarded, so a journal write failure — an ordinary

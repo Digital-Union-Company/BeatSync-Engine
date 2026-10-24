@@ -20,6 +20,64 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-24 (Clips Preview P2: atomic lifecycle reservations — R5-P52 F53-A/F53-B)
+
+Independent review **R5-P52** reproduced two MAJOR race conditions against the previous commit and
+returned `R5_P52_PR75_CHANGES_REQUIRED`. Both are closed here. The transfer engine remains
+**unwired**, Confirm still moves nothing, and `src/gui.py` is **not modified by this change at all**.
+
+- **F53-A — the reverse-order lifecycle guard race.** The previous design gated each lifecycle
+  mutation with a *check*: `guard()` took the authority lock, read the lease map and released it,
+  and the mutation then ran under a different lock. `acquire()` took no subsystem lock at all. So
+  the ordering *guard succeeds → transfer acquires → transfer revalidates → mutation executes →
+  transfer publishes* was accepted on **all five** operations (`ScanCoordinator.begin`,
+  `ReviewStore.begin_scan`, `ClipRegistry.new_session`, `ClipRegistry.publish_page`,
+  `ClipRegistry.revoke_owner`): the clip moved, the batch reported `COMPLETE` with
+  `advance_page=True`, and the authority was already gone — gallery blank, session revoked, page
+  revoked, or `current_scan` replaced. A **reservation** replaces the check. `reserve_mutation()`
+  refuses while a lease is held and otherwise grants a token *and* bumps a per-owner monotonic
+  epoch, both inside one critical section; the token is held across the mutation and released in a
+  `finally`; and `acquire()` refuses while any reservation is pending. Both directions are now
+  arbitrated by the same lock instead of by two moments in time.
+- **F53-B — the coordinator probe/acquire race.** `acquire()` probed `ScanCoordinator` outside its
+  own lock and then recorded the lease, so a scan taking a generation in between was not seen and
+  the transfer committed while holding a lease in exactly the state the `scan_in_flight` probe
+  exists to refuse. Acquisition is now a versioned protocol: capture the epoch under the lock,
+  probe with no lock held, re-enter and require the epoch to be unchanged before installing the
+  lease. A moved epoch retries a bounded three times and then **fails closed**
+  (`lifecycle_epoch_moved`). A stale probe result is never silently accepted. The original R5-P52
+  reproduction for this finding now passes **unchanged**.
+- **The reservation is a logical token, never a mutex.** The authority lock is taken only to grant
+  and release it, so no SHA-256 hashing, journal `fsync`, media copy or FFmpeg call runs under it.
+- **Reservations deliberately do not exclude each other.** Two same-owner lifecycle mutations are
+  legitimate — two tabs rescanning — and the per-owner scan-generation contract exists so the newer
+  supersedes the older. Serialising them would have broken that contract to fix a transfer bug; a
+  test pins that two concurrent same-owner scans still both complete.
+- **Eviction now decides and licenses in one act.** `ScanCoordinator._prune` and the registry's
+  owner-cap eviction chose a victim with a `guarded()` probe whose answer expired with the lock.
+  They call `try_reserve_mutation(victim)` instead, which returns `None` when the victim is leased
+  or already being mutated. If no owner is available the cap is allowed to exceed: a cap bounds
+  memory, a lease protects an irreversible operation in flight.
+- **`ScanCoordinator.forget()` is reserved.** R5-P52 recorded it as the one coordinator mutator
+  with neither a lease check nor a caller; "unreachable today" is not a safety property.
+  `publish` and `discard` stay deliberately unreserved — they write only `_views`, which
+  revalidation never reads — and that conclusion carries a test rather than only prose.
+- **Rebinding can no longer orphan a lease.** `bind_lifecycle_authority()` refuses to point a
+  subsystem at a *different* authority while any lease is live, all-or-nothing across the three
+  targets. Rebinding the same instance stays idempotent, and attaching a subsystem whose authority
+  is still unset is always permitted — the lazy store path and P1 startup are unchanged.
+- `guard()` and `guarded()` survive as **diagnostic probes only**, and a test walks every mutation
+  site's AST and fails if any of them calls either.
+- `tests/test_clips_review_atomic_lifecycle.py` — new. 36 cases covering all thirty mandated race
+  scenarios plus a 60-round barrier-directed stress matrix that exercises both boundaries (30
+  rounds each) and asserts the real filesystem outcome, not an exception string.
+
+Unchanged and still open, so no reader infers clearance: **F5** (the rollback target is still never
+no-replace-probed), the **cross-volume source removal** (withheld; an owner decision; no `ctypes`,
+no native helper, no pathname source delete), **decision-time content fingerprints** (no existing
+P1 decision is transferable), **cross-process locking** (the model is process-local), and
+**GUI/HTTP integration**. Independent review **R5-P54** is required.
+
 ### Changed — 2026-10-24 (Clips Preview: a binding lifecycle authority for in-flight transfers)
 
 The last of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
