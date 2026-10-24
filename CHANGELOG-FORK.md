@@ -20,6 +20,40 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-24 (Clips Preview P2: the safe-transfer core, written and unwired)
+
+The engine that will move reviewed clips to the Media Library or to quarantine. It is **isolated on
+purpose**: nothing calls it. Confirm still reports readiness and moves nothing, `src/gui.py` does
+not import it, and no HTTP route exposes it — three tests pin exactly that, alongside the unchanged
+guard that the media layer contains no mutating filesystem call at all. Enabling it is a further
+phase with its own authorization after independent review.
+
+The product decision behind it: rejection is **quarantine, not deletion**, and no existing
+destination file is ever overwritten. Those two rules shape every path below.
+
+- `src/beatsync_fork/clips_review_transfer.py` — new, pure, stdlib-only. The server-authoritative
+  immutable plan (one entry per clip; `plan_transfer` has **no** source-path parameter, so the
+  sources can only come from `ClipRegistry.page_entries`), the ten-state append-only intent/outcome
+  journal, the same-volume **atomic no-replace move**, the cross-volume
+  **stage → verify → publish → remove source** sequence, and identity-based recovery that compares
+  recorded intent against the real filesystem rather than replaying a historical status.
+- `tests/test_clips_review_transfer.py` — new. 66 cases against **real files on the real
+  filesystem** through the real `ClipRegistry` and `ReviewStore`, including a genuinely
+  cross-volume arm gated on `BEATSYNC_TEST_CROSSVOL` (the convention `test_audio_mixdown.py`
+  already uses for real FFmpeg).
+
+It reuses rather than reinvents: `decision_identity` for source identity, `validate_roots` for every
+path-relationship refusal, and `ReviewStore` for the durable decisions. The no-replace primitive is
+`os.rename`, which on Windows *is* `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`; because that
+is a behavioural claim it is **measured** per destination directory by
+`probe_no_replace_rename`, and the engine refuses when it cannot be demonstrated. `os.replace` is
+never aimed at a destination — a test fails the build if it ever is.
+
+Known and disclosed: a narrow window remains between the final `fstat` on the source descriptor and
+the rename that names its path, which the package's stdlib allowlist cannot close; the no-replace
+rename, the post-publication re-read and source removal ordering are what make it safe rather than
+the window being eliminated.
+
 ### Added — 2026-10-17 (Raw Cutter Batch V1: a whole folder, one press)
 
 A second input mode inside the existing **✂️ Raw Cutter** tab — not a fifth tab. **Single Video**

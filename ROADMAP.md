@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — transfer NOT implemented**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core WRITTEN BUT UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -394,9 +394,16 @@ Folder Batch exists precisely so that cutting needs no interaction.
 
 **What P1 does and does not do.** Discovery, authorized preview playback, poster frames,
 server-authoritative classification, durable decisions and the gallery are implemented and
-measured. **Moving the reviewed clips is not implemented at all** — not disabled, not
-feature-flagged, not written. Confirm reports readiness and moves nothing. The transfer contract
-below remains a design that needs its own authorization and its own review.
+measured. **Confirm still reports readiness and moves nothing.**
+
+**P2, as of R5-P45, is a written and tested transfer core that nothing calls.**
+`src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
+same-volume atomic no-replace move, the cross-volume stage→verify→publish→remove sequence, the
+append-only intent/outcome journal and identity-based recovery. It is deliberately **not** wired
+into `_on_clips_confirm`, no HTTP route reaches it, and tests pin all three of those facts. So the
+accurate statement is no longer "not written" but "written, exercised only from tests, and
+unreachable from the running GUI". Wiring it up is a separate phase needing its own authorization
+after independent review of the core.
 
 - A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
 - **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to

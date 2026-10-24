@@ -1,9 +1,11 @@
 ---
 paths:
   - "src/beatsync_fork/clips_review.py"
+  - "src/beatsync_fork/clips_review_transfer.py"
   - "src/clips_media_server.py"
   - "tests/test_clips_review.py"
   - "tests/test_clips_media_server.py"
+  - "tests/test_clips_review_transfer.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -22,10 +24,17 @@ Cutter produced. **R5-P1 is read-only.** The specification is
 | **P1 implements** | discovery, authorized preview playback, poster frames, server-authoritative classification, durable decisions, the 100-clip gallery |
 | **P1 does NOT implement** | any file movement — no move, copy, stage, quarantine execution or delete |
 
-**There is no transfer code, not even disabled.** No flag, constant or dead branch can be switched
-on to make P1 move a file; a test asserts the media layer contains no mutating filesystem call at
-all. Transfer is a separate phase requiring its own authorization after independent review, and
-designing it does not authorize it.
+**P1 itself contains no transfer code, not even disabled.** No flag, constant or dead branch can be
+switched on to make P1 move a file; a test asserts the media layer contains no mutating filesystem
+call at all. Transfer is a separate phase requiring its own authorization after independent review,
+and designing it does not authorize it.
+
+[R5-P45] **The P2 transfer core now exists as an isolated module and is still not reachable.**
+`src/beatsync_fork/clips_review_transfer.py` is written and tested; it is *not* wired into
+`_on_clips_confirm`, no HTTP route exposes it, and `src/gui.py` does not import it. Three tests pin
+exactly that, alongside the unchanged media-layer guard. Its sources come only from
+`ClipRegistry.page_entries`, so `plan_transfer` has no source-path parameter a browser could fill.
+Enabling Confirm to call it is a further phase with its own authorization.
 
 ## The one idea everything rests on
 
