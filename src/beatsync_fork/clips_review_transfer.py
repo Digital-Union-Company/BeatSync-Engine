@@ -37,14 +37,53 @@ directory being written to, and :func:`execute_transfer` refuses when the guaran
 established. A preceding ``os.path.exists`` check is *not* relied on: it is a time-of-check /
 time-of-use gap, and the atomic failure of the rename itself is what makes a collision safe.
 
+Approval is content, not metadata
+--------------------------------
+[R5-P47 / H] A decision is only transferable if it carries a **content fingerprint** recorded when
+the operator classified the clip, and the bytes on disk still hash to it. Metadata identity — size,
+``mtime_ns``, ``st_ino``, ``st_dev`` — cannot distinguish the reviewed file from a same-length edit
+whose timestamp was restored, and ``.claude/rules/clips-preview.md`` accepts that limitation
+explicitly *because P1 mutates nothing*: "the residual case costs a stale preview, never a wrong
+move". This engine performs the wrong move, so it cannot inherit that reasoning. A decision with no
+fingerprint is **refused**, which is every decision the P1 HTTP path writes today. Nothing here
+back-fills a digest onto an old decision and calls it consent.
+
+Why the source is not deleted
+-----------------------------
+[R5-P47 / B] The cross-volume path publishes a verified copy and then **withholds the deletion**,
+reporting :data:`SOURCE_REMOVAL_BLOCKED`. This is not an oversight and not a bug to be tidied up
+later; it is the only honest outcome available, and the alternatives were measured rather than
+assumed:
+
+* ``os.unlinkat``, ``os.renameat`` and ``dir_fd`` support are **absent** on Windows, so there is no
+  directory-relative delete;
+* holding the verified descriptor across the delete does not work either — a normal ``O_RDONLY``
+  handle makes the path undeletable (winerror 32), which is *why* the original closed it first and
+  *why* a substitution could land in the gap;
+* ``os.open(path, O_RDONLY | O_TEMPORARY)`` genuinely **is** a handle-anchored delete: it opens with
+  ``FILE_SHARE_DELETE`` and the object is removed when the handle closes. But the disposition cannot
+  be cancelled without ``SetFileInformationByHandle``, i.e. ``ctypes``. So the only race-free
+  ordering commits to deleting whatever the pathname named *before* its identity could be checked,
+  turning a rare wrong delete into a certain one.
+
+Closing this properly needs a capability outside the approved dependency rules, which is an owner
+decision and not one this module may make for itself. Until then: the operator keeps both copies,
+the obligation is journalled, and no state ever claims a move completed when it did not.
+
+Same-volume is different, and the difference is the whole reason A is fixable and B is not: a
+no-replace ``os.rename`` **relocates the object** rather than deleting it, so a wrong outcome can be
+undone by renaming it back (measured: the reverse rename succeeds onto the vacated path and refuses
+with winerror 183 if anything has taken it). A wrong delete cannot be undone by anything.
+
 What is *not* claimed
 ---------------------
-Identity is proven by opening the source and calling ``os.fstat`` on the handle, not by trusting a
-pathname. But a rename names a path, so a narrow window remains between the final ``fstat`` and the
-rename in which the name could be repointed. That window cannot be closed with the primitives on
-this package's allowlist, so it is **disclosed** rather than papered over: the no-replace rename
-cannot overwrite anything, the published object is re-verified afterwards, and the source is removed
-only once a verified publication exists. See ``untested_windows_conditions`` in the R5-P45 report.
+Identity is proven on a descriptor, never on a pathname — but a rename names a path, so a narrow
+window remains between the final ``fstat`` and the rename in which the name could be repointed. That
+window is not closed; it is **contained**. The no-replace rename cannot overwrite anything, the
+published object is re-verified against the approved fingerprint, and a failure past the commit
+point is rolled back and reported as such rather than as "nothing happened". The transfer lease
+closes the *decision* race completely (``ReviewStore.decide`` refuses a leased identity); it does
+nothing about the filesystem one, and must not be described as if it did.
 """
 
 from __future__ import annotations
@@ -87,9 +126,18 @@ REFUSED = "REFUSED"
 PARTIAL = "PARTIAL"
 RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
+#: [R5-P47 / A] The destination was published but did not verify, and the moved object was put back
+#: by an atomic no-replace rename. Nothing was lost and nothing unapproved remains published.
+ROLLED_BACK = "ROLLED_BACK"
+
+#: [R5-P47 / B] The copy is published and verified; the original is **deliberately still there**,
+#: because this engine cannot prove a pathname delete would remove the object it verified. Not a
+#: failure of the copy — a withheld deletion. See *Why the source is not deleted* in the docstring.
+SOURCE_REMOVAL_BLOCKED = "SOURCE_REMOVAL_BLOCKED"
+
 #: Every state a transfer can be in. Ordered as the happy path progresses, then the terminals.
 STATES = (PLANNED, INTENT_RECORDED, STAGED, VERIFIED, PUBLISHED, SOURCE_REMOVED, COMPLETE,
-          REFUSED, PARTIAL, RECOVERY_REQUIRED)
+          REFUSED, PARTIAL, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED)
 
 #: The two transfer operations. The choice is made from the *measured* device of each side, never
 #: from the drive letter: a junction or a ``subst`` can put two different letters on one volume.
@@ -135,6 +183,12 @@ class TransferItem:
     identity: str
     decision: str
     revision: int
+    #: [R5-P47 / H] SHA-256 of the bytes the operator classified, taken from the durable decision
+    #: record at plan time. Never computed from the file at transfer time: a digest first measured
+    #: during the move proves only that the copy matches the thing being moved, which is not the
+    #: question. ``plan_transfer`` refuses an item that has no fingerprint, so this is never empty
+    #: on an item that reaches execution.
+    approved_sha256: str
     destination_role: str
     destination_dir: str
     destination_name: str
@@ -340,12 +394,44 @@ class TransferJournal:
 # Identity helpers
 # --------------------------------------------------------------------------------------------
 
-def _is_reparse(path: str) -> bool:
+#: [R5-P47 / M2] The three answers a reparse-point inspection can give. The original returned a
+#: bare ``bool``, so "I could not look" and "I looked, and it is an ordinary file" were the same
+#: value — a gate whose whole purpose is to refuse answered *safe* when it could not tell.
+REPARSE_NO = "ORDINARY_FILE"
+REPARSE_YES = "REPARSE_POINT"
+REPARSE_UNKNOWN = "INSPECTION_FAILED"
+
+
+def reparse_state(path: str) -> str:
+    """Classify *path* as an ordinary file, a reparse point, or **not inspectable**.
+
+    [R5-P47 / M2] Returns one of :data:`REPARSE_NO`, :data:`REPARSE_YES`,
+    :data:`REPARSE_UNKNOWN`. The caller must treat ``UNKNOWN`` as a refusal: a path whose
+    attributes cannot be read may be a junction pointing anywhere, and this engine's containment
+    reasoning is only meaningful for files whose real location is known.
+
+    ``AttributeError`` is kept distinct from ``OSError`` on purpose, and the two get different
+    answers. ``OSError`` means *this path* could not be inspected, which is ``UNKNOWN`` and
+    refuses. ``AttributeError`` means ``st_file_attributes`` does not exist — a non-Windows
+    interpreter — and there the portable ``os.path.islink`` is a genuine inspection of the same
+    question, so it answers rather than refusing. This module is Windows-only in production, but
+    CLAUDE.md requires the suite to run on a bare interpreter, and a check that degraded to
+    ``UNKNOWN`` off Windows would refuse every transfer there instead of testing one. Being unable
+    to *run* the check is still never permission to skip it — that is what the ``OSError`` arm is.
+    """
     try:
         attrs = os.lstat(path).st_file_attributes       # Windows only
-    except (OSError, AttributeError):
-        return False
-    return bool(attrs & getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except AttributeError:
+        try:
+            return REPARSE_YES if os.path.islink(path) else REPARSE_NO
+        except OSError:
+            return REPARSE_UNKNOWN
+    except OSError:
+        return REPARSE_UNKNOWN
+    flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if not flag:
+        return REPARSE_UNKNOWN
+    return REPARSE_YES if bool(attrs & flag) else REPARSE_NO
 
 
 def _norm(path: str) -> str:
@@ -408,28 +494,86 @@ def probe_no_replace_rename(directory: str) -> bool:
     try to rename one onto the other. Returns ``True`` only when the attempt raised.
 
     Cleans up only its **own** two temporaries, and never touches anything else.
+
+    [R5-P47 / M1] **Any failure used to count as proof.** The original caught a bare ``OSError``
+    and concluded the guarantee held, so an access-denied destination, a sharing violation or a
+    transient device error all read as *no-replace PROVEN* — the engine's stated precondition was
+    established by the very conditions that should have refused it. And nothing checked the
+    positive case at all, so a directory in which *every* rename fails passed.
+
+    Three things are now required, and all three are necessary:
+
+    1. the collision attempt must fail **specifically** because the target exists —
+       ``FileExistsError`` or winerror 183. Any other ``OSError`` raises
+       ``no_replace_probe_inconclusive`` rather than returning an answer;
+    2. a rename onto a **free** name in the same directory must *succeed*, so a wholly broken
+       directory cannot pass by failing everything;
+    3. both probe files must still hold their original bytes afterwards, so a filesystem that
+       "refused" while actually merging or truncating cannot pass either.
     """
-    first = second = None
+    first = second = moved = None
+    marker_a = b"R5P47-PROBE-A"
+    marker_b = b"R5P47-PROBE-B-DIFFERENT-LENGTH"
     try:
         handle_a, first = tempfile.mkstemp(prefix=_STAGING_PREFIX, suffix=".probe-a", dir=directory)
-        os.close(handle_a)
+        try:
+            _write_all(handle_a, marker_a)
+        finally:
+            os.close(handle_a)
         handle_b, second = tempfile.mkstemp(prefix=_STAGING_PREFIX, suffix=".probe-b", dir=directory)
-        os.close(handle_b)
+        try:
+            _write_all(handle_b, marker_b)
+        finally:
+            os.close(handle_b)
     except OSError as exc:
         raise TransferRefused("no_replace_probe_failed", io_detail(exc)) from exc
-    refused = False
+
     try:
-        os.rename(first, second)
-    except OSError:
-        refused = True
+        # ---- 1. the collision must be refused, and refused for the RIGHT reason
+        collided = False
+        try:
+            os.rename(first, second)
+        except FileExistsError:
+            collided = True
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == _ERROR_ALREADY_EXISTS:
+                collided = True
+            else:
+                # Not evidence about no-replace semantics at all. Refusing to answer is the only
+                # honest outcome: returning False would read as "replacement is possible" and
+                # returning True would be the M1 defect.
+                raise TransferRefused("no_replace_probe_inconclusive", io_detail(exc)) from exc
+        if not collided:
+            return False                                # the rename replaced the target
+
+        # ---- 2. the positive control: a rename onto a FREE name must work
+        moved = second + ".moved"
+        try:
+            os.rename(second, moved)
+        except OSError as exc:
+            raise TransferRefused("no_replace_probe_inconclusive",
+                                  f"a rename onto a free name failed: {io_detail(exc)}") from exc
+        second = None                                   # it lives at `moved` now
+
+        # ---- 3. neither probe payload may have been altered by the refused rename
+        try:
+            with open(first, "rb") as handle:
+                kept_a = handle.read()
+            with open(moved, "rb") as handle:
+                kept_b = handle.read()
+        except OSError as exc:
+            raise TransferRefused("no_replace_probe_inconclusive", io_detail(exc)) from exc
+        if kept_a != marker_a or kept_b != marker_b:
+            raise TransferRefused("no_replace_probe_inconclusive",
+                                  "a refused rename altered the probe payloads")
+        return True
     finally:
-        for leftover in (first, second):
+        for leftover in (first, second, moved):
             if leftover:
                 try:
                     os.unlink(leftover)                 # only ever this probe's own temporaries
                 except OSError:
                     pass
-    return refused
 
 
 def _device_of(path: str) -> int:
@@ -483,8 +627,27 @@ def plan_transfer(registry: Any, store: Any, *, session_id: str, page_token: str
 
     Returns a plan whose ``refusals`` tuple is non-empty when the batch must not run. A refused
     plan still enumerates what it found, so the caller can report precisely why.
+
+    [R5-P47 / C] ``expected_revisions`` is **mandatory**. It used to default to ``None``, which
+    skipped the optimistic-concurrency check entirely — so the only defence against a stale
+    decision was opt-in, and a caller that simply omitted it got none. ``None`` is now a refusal
+    for the whole batch, and a missing or non-integer entry is a refusal for that clip.
+
+    [R5-P47 / H] Every item additionally requires a **decision-time content fingerprint** that
+    matches the bytes on disk now. Metadata identity (size, mtime, inode) cannot tell a
+    same-length edit with a restored timestamp from the reviewed file, and this engine performs
+    irreversible operations on the strength of the decision. No fingerprint means no transfer.
     """
     refusals: list[PlanRefusal] = []
+
+    if expected_revisions is None:
+        return TransferPlan(
+            plan_id=plan_id or _mint_plan_id(), session_id=str(session_id),
+            page_token=str(page_token), scan_id=str(scan_id), owner=str(owner),
+            created_at=now(), input_real="", library_real="", rejected_real="",
+            refusals=(PlanRefusal(
+                "expected_revisions_required",
+                "P2 execution requires the revision each decision is believed to be at"),))
 
     verdict, ids = validate_roots(input_folder, library_folder, rejected_folder, app_root)
     if not verdict.ok:
@@ -528,6 +691,19 @@ def plan_transfer(registry: Any, store: Any, *, session_id: str, page_token: str
 
     identities = [decision_identity(e.path, e.size, e.mtime_ns) for e in entries]
     snapshot = store.snapshot_of(identities)
+    # [R5-P47 / H] A store too old to answer this fails closed rather than transferring unbound
+    # content. `getattr` is not a compatibility shim here: it is the fail-closed branch.
+    fingerprints: dict[str, str] = {}
+    fingerprints_of = getattr(store, "fingerprints_of", None)
+    if fingerprints_of is None:
+        refusals.append(PlanRefusal(
+            "content_fingerprints_unavailable",
+            "this review store records no decision-time content fingerprint"))
+    else:
+        try:
+            fingerprints = fingerprints_of(identities)
+        except Exception:                               # a store that cannot answer fails closed
+            refusals.append(PlanRefusal("content_fingerprints_unavailable"))
 
     items: list[TransferItem] = []
     claimed: dict[str, str] = {}                        # normalised destination -> clip_id
@@ -542,15 +718,14 @@ def plan_transfer(registry: Any, store: Any, *, session_id: str, page_token: str
             refusals.append(PlanRefusal("undecidable_state", decision, entry.clip_id))
             continue
 
-        if expected_revisions is not None:
-            expected = expected_revisions.get(entry.clip_id)
-            if expected is None or isinstance(expected, bool) or not isinstance(expected, int):
-                refusals.append(PlanRefusal("revision_required", entry.label, entry.clip_id))
-                continue
-            if expected != revision:
-                refusals.append(PlanRefusal(
-                    "stale_revision", f"expected {expected}, durable {revision}", entry.clip_id))
-                continue
+        expected = expected_revisions.get(entry.clip_id)
+        if expected is None or isinstance(expected, bool) or not isinstance(expected, int):
+            refusals.append(PlanRefusal("revision_required", entry.label, entry.clip_id))
+            continue
+        if expected != revision:
+            refusals.append(PlanRefusal(
+                "stale_revision", f"expected {expected}, durable {revision}", entry.clip_id))
+            continue
 
         # The source must still be the file that was reviewed. A changed file's decision does not
         # apply any more -- `decision_identity` folds size and mtime in, so this is structural.
@@ -558,8 +733,24 @@ def plan_transfer(registry: Any, store: Any, *, session_id: str, page_token: str
             refusals.append(PlanRefusal("source_identity_changed", entry.label, entry.clip_id))
             continue
 
-        if _is_reparse(entry.path):
-            refusals.append(PlanRefusal("source_is_reparse_point", entry.label, entry.clip_id))
+        # [R5-P47 / H] ...and metadata identity is not enough, because this engine then does
+        # something irreversible. The decision must carry the digest of the bytes the operator
+        # classified, and those bytes must still be what is on disk.
+        approved_sha = fingerprints.get(identity, "")
+        if not approved_sha:
+            refusals.append(PlanRefusal(
+                "content_fingerprint_missing", entry.label, entry.clip_id))
+            continue
+
+        inspection = reparse_state(entry.path)
+        if inspection != REPARSE_NO:
+            # [R5-P47 / M2] UNKNOWN refuses exactly as YES does. A path whose attributes could not
+            # be read may be a junction to anywhere, and every containment check below would then
+            # be reasoning about the wrong file.
+            refusals.append(PlanRefusal(
+                "source_is_reparse_point" if inspection == REPARSE_YES
+                else "source_not_inspectable",
+                entry.label, entry.clip_id))
             continue
         if not _is_within(entry.path, input_real):
             # Catches a junction alias that put a page entry outside the confirmed input root.
@@ -599,6 +790,7 @@ def plan_transfer(registry: Any, store: Any, *, session_id: str, page_token: str
             clip_id=entry.clip_id, index=entry.index, source_path=entry.path,
             source_size=entry.size, source_mtime_ns=entry.mtime_ns, source_dev=entry.dev,
             source_ino=entry.ino, identity=identity, decision=decision, revision=revision,
+            approved_sha256=approved_sha,
             destination_role=role, destination_dir=dest_dir, destination_name=dest_name,
             destination_path=dest_path, operation=operation))
 
@@ -619,12 +811,73 @@ def _mint_plan_id() -> str:
 # Execution
 # --------------------------------------------------------------------------------------------
 
+def _revalidate(item: TransferItem, plan: TransferPlan, store: Any, registry: Any) -> None:
+    """[R5-P47 / C] Re-prove, under the transfer lease, that the plan still reflects authority.
+
+    A frozen plan used to be the sole authority at execution time: ``execute_transfer`` consulted
+    neither the store nor the registry, so a decision reversed after planning still executed, a
+    clip put back to ``PENDING`` still moved, and a revoked session or superseded scan changed
+    nothing. This re-reads all four facts from the server.
+
+    It is called **while the lease is held**, which is what makes it binding rather than merely
+    recent: :meth:`ReviewStore.decide` refuses a leased identity, so the decision cannot move
+    between this check and the irreversible step that follows it. Without the lease this would be
+    a smaller window, not a closed one.
+
+    Raises :class:`TransferRefused`; never touches the filesystem.
+    """
+    # -- the session must still be live and still belong to the planning owner
+    try:
+        current_owner = registry.owner_of(plan.session_id)
+    except Refusal as exc:
+        raise TransferRefused("session_revoked", str(exc)) from exc
+    if str(current_owner) != str(plan.owner):
+        raise TransferRefused("owner_mismatch", "the session now belongs to another owner")
+    try:
+        registry.page_entries(plan.session_id, plan.page_token)
+    except Refusal as exc:
+        raise TransferRefused("page_revoked", str(exc)) from exc
+
+    # -- the scan generation must still be the one the plan was built under
+    try:
+        current_scan = store.current_scan(str(plan.owner))
+    except Exception as exc:                            # a store that cannot answer fails closed
+        raise TransferRefused("scan_unavailable", str(exc)) from exc
+    if str(current_scan) != str(plan.scan_id):
+        raise TransferRefused("stale_scan",
+                              f"plan scan_id={plan.scan_id} current={current_scan}")
+
+    # -- the durable decision and its revision must be unchanged
+    try:
+        snapshot = store.snapshot_of([item.identity])
+    except Exception as exc:
+        raise TransferRefused("decision_unavailable", str(exc)) from exc
+    decision, revision = snapshot.get(item.identity, (PENDING, 0))
+    if decision != item.decision or revision != item.revision:
+        raise TransferRefused(
+            "decision_changed",
+            f"planned {item.decision}@{item.revision}, durable {decision}@{revision}")
+
+    # -- and the approved content fingerprint must still be the one the plan carries
+    fingerprints_of = getattr(store, "fingerprints_of", None)
+    if fingerprints_of is None:
+        raise TransferRefused("content_fingerprints_unavailable", item.label)
+    try:
+        current_sha = fingerprints_of([item.identity]).get(item.identity, "")
+    except Exception as exc:
+        raise TransferRefused("content_fingerprints_unavailable", str(exc)) from exc
+    if current_sha != item.approved_sha256:
+        raise TransferRefused("content_fingerprint_changed", item.label)
+
+
 def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
+                     store: Any = None, registry: Any = None,
                      now: Callable[[], float] = time.time,
                      before_publish: Callable[[TransferItem], None] | None = None,
                      after_publish: Callable[[TransferItem], None] | None = None,
                      after_intent: Callable[[TransferItem], None] | None = None,
-                     after_stage: Callable[[TransferItem], None] | None = None) -> TransferResult:
+                     after_stage: Callable[[TransferItem], None] | None = None,
+                     before_item: Callable[[TransferItem], None] | None = None) -> TransferResult:
     """Execute an already-derived plan, recording durable intent and outcome per item.
 
     A refused plan is never executed. Each item is independent: one item's failure leaves the
@@ -640,41 +893,87 @@ def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
         return TransferResult(plan.plan_id, REFUSED, (),
                               {"refused": len(plan.refusals), "moved": 0, "remaining": len(plan.items)})
 
-    journal.append({**plan.to_event(), "state": PLANNED, "at": now()})
+    # [R5-P47 / C] The store and the registry are the live authority and are therefore required.
+    # They are keyword arguments with a `None` default only so this refusal can be returned as a
+    # typed result instead of a TypeError; `None` is never an accepted value.
+    if store is None or registry is None:
+        journal.append({**plan.to_event(), "state": REFUSED,
+                        "reason": "live_authority_required", "at": now()})
+        return TransferResult(plan.plan_id, REFUSED, (),
+                              {"refused": 1, "moved": 0, "remaining": len(plan.items)})
 
-    outcomes: list[ItemOutcome] = []
-    moved = 0
-    failed = 0
+    # [R5-P47 / C] One exclusive lease over every identity in the plan, for the whole batch. While
+    # it is held `decide()` refuses those identities, so `_revalidate` is binding; and a second
+    # execution of this plan -- or of any overlapping plan -- cannot acquire it.
+    identities = [i.identity for i in plan.items]
+    try:
+        store.begin_transfer(plan.owner, plan.plan_id, identities)
+    except Refusal as exc:
+        journal.append({**plan.to_event(), "state": REFUSED,
+                        "reason": getattr(exc, "reason", "transfer_lease_refused"), "at": now()})
+        return TransferResult(plan.plan_id, REFUSED, (),
+                              {"refused": 1, "moved": 0, "remaining": len(plan.items)})
 
-    for position, item in enumerate(plan.items):
-        try:
-            outcome = _transfer_one(item, plan, journal, now=now,
-                                    before_publish=before_publish, after_publish=after_publish,
-                                    after_intent=after_intent, after_stage=after_stage)
-        except TransferRefused as exc:
-            outcome = ItemOutcome(item.clip_id, REFUSED, exc.code, exc.detail)
-        outcomes.append(outcome)
-        if outcome.state == COMPLETE:
-            moved += 1
-        else:
+    try:
+        journal.append({**plan.to_event(), "state": PLANNED, "at": now()})
+
+        outcomes: list[ItemOutcome] = []
+        moved = 0
+        published_only = 0
+        failed = 0
+
+        for position, item in enumerate(plan.items):
+            try:
+                if before_item is not None:
+                    before_item(item)
+                _revalidate(item, plan, store, registry)
+                outcome = _transfer_one(item, plan, journal, now=now,
+                                        before_publish=before_publish,
+                                        after_publish=after_publish,
+                                        after_intent=after_intent, after_stage=after_stage)
+            except TransferRefused as exc:
+                outcome = ItemOutcome(item.clip_id, REFUSED, exc.code, exc.detail)
+            outcomes.append(outcome)
+
+            if outcome.state == COMPLETE:
+                moved += 1
+                continue
+            if outcome.state == SOURCE_REMOVAL_BLOCKED:
+                # The copy is published and verified and the original is intact -- nothing is
+                # ambiguous, so the remaining clips can still be processed. The batch can never
+                # report COMPLETE though, which is what keeps `advance_page` false.
+                published_only += 1
+                continue
+
             failed += 1
-            # Stop at the first failure. The remaining clips stay untouched and are reported as
-            # such, because a page is the unit of durable commitment.
+            # Stop at the first genuine failure. The remaining clips stay untouched and are
+            # reported as such, because a page is the unit of durable commitment.
             remaining = plan.items[position + 1:]
             for skipped in remaining:
                 outcomes.append(ItemOutcome(skipped.clip_id, PLANNED, "not_attempted",
                                             "an earlier item in this page failed"))
-            state = PARTIAL if moved else REFUSED
+            state = PARTIAL if (moved or published_only) else REFUSED
             journal.append({"k": "batch", "plan_id": plan.plan_id, "state": state,
-                            "moved": moved, "failed": failed, "remaining": len(remaining),
-                            "at": now()})
+                            "moved": moved, "published_only": published_only,
+                            "failed": failed, "remaining": len(remaining), "at": now()})
             return TransferResult(plan.plan_id, state, tuple(outcomes),
-                                  {"moved": moved, "failed": failed, "remaining": len(remaining)})
+                                  {"moved": moved, "published_only": published_only,
+                                   "failed": failed, "remaining": len(remaining)})
 
-    journal.append({"k": "batch", "plan_id": plan.plan_id, "state": COMPLETE,
-                    "moved": moved, "failed": 0, "remaining": 0, "at": now()})
-    return TransferResult(plan.plan_id, COMPLETE, tuple(outcomes),
-                          {"moved": moved, "failed": 0, "remaining": 0})
+        state = PARTIAL if published_only else COMPLETE
+        journal.append({"k": "batch", "plan_id": plan.plan_id, "state": state,
+                        "moved": moved, "published_only": published_only,
+                        "failed": 0, "remaining": 0, "at": now()})
+        return TransferResult(plan.plan_id, state, tuple(outcomes),
+                              {"moved": moved, "published_only": published_only,
+                               "failed": 0, "remaining": 0})
+    finally:
+        # Always released, including on an unexpected exception: a lease outliving its execution
+        # would be a decision nobody can change and nobody can unblock.
+        try:
+            store.end_transfer(plan.owner, plan.plan_id)
+        except Exception:                               # pragma: no cover - release must not mask
+            pass
 
 
 def _item_event(item: TransferItem, plan: TransferPlan, state: str, **extra: Any) -> dict:
@@ -722,6 +1021,20 @@ def _transfer_one(item: TransferItem, plan: TransferPlan, journal: TransferJourn
         raise TransferRefused("source_identity_changed",
                               f"read {size} bytes, expected {item.source_size}")
 
+    # ---- 2b. [R5-P47 / H] the bytes must be the bytes the operator APPROVED --------------------
+    # This is the check metadata identity cannot make. ``digest`` came from the same descriptor
+    # whose ``fstat`` proved size/mtime/inode, and ``approved_sha256`` came from the durable
+    # decision record — so a same-length edit that restored the original timestamp is caught here
+    # and nowhere else in the system.
+    if not item.approved_sha256:
+        # Unreachable through `plan_transfer`, which refuses first. Kept because this function is
+        # the last gate before an irreversible step, and a gate that trusts its caller is not one.
+        raise TransferRefused("content_fingerprint_missing", item.label)
+    if digest != item.approved_sha256:
+        raise TransferRefused(
+            "content_not_approved",
+            f"on-disk sha={digest} does not match the approved sha={item.approved_sha256}")
+
     # ---- 3. durable intent, BEFORE anything moves ---------------------------------------------
     journal.append(_item_event(item, plan, INTENT_RECORDED, source_sha256=digest, at=now()))
     if after_intent is not None:
@@ -738,7 +1051,28 @@ def _same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourna
                  now: Callable[[], float],
                  before_publish: Callable[[TransferItem], None] | None,
                  after_publish: Callable[[TransferItem], None] | None) -> ItemOutcome:
-    """Atomic no-replace move. One step, and it either happened or it did not."""
+    """Atomic no-replace move, with a **rollback** when the published object does not verify.
+
+    [R5-P47 / A] The original renamed first and verified second, and turned a verification failure
+    into ``REFUSED`` — a status meaning *nothing moved*, reported about a source path that was by
+    then empty while an unapproved file sat in the operator's Media Library. Two corrections, and
+    the second is what makes the first honest:
+
+    * content is checked against the **approved fingerprint before** the rename
+      (``_transfer_one`` step 2b), so the ordinary changed-source case never reaches this function;
+    * if the published object still fails to verify — the residual window between the final
+      ``fstat`` and the rename, which this allowlist cannot close — the rename is **undone** by
+      renaming the destination back onto the now-vacated source path.
+
+    The rollback is itself a no-replace rename, which is what makes it safe: measured on this
+    platform it succeeds onto the vacated path, and raises ``FileExistsError``/winerror 183 if
+    anything has taken that path meanwhile, so it can never overwrite a new occupant. A successful
+    rollback reports ``ROLLED_BACK``; a failed one reports ``RECOVERY_REQUIRED`` with both paths
+    recorded. Neither claims nothing happened, and neither leaves unapproved content published.
+
+    A same-volume rename **relocates the object** rather than deleting it, which is why this path
+    is recoverable and the cross-volume one is not. See *Why the source is not deleted*.
+    """
     if before_publish is not None:
         before_publish(item)
     try:
@@ -753,8 +1087,12 @@ def _same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourna
             raise TransferRefused("source_missing", io_detail(exc)) from exc
         raise TransferRefused("move_failed", io_detail(exc)) from exc
 
-    # Verify the published object before claiming anything, then record it.
-    published = _verify_published(item, digest)
+    # The rename is a COMMIT POINT. Past here a failure may not be reported as "nothing moved".
+    try:
+        published = _verify_published(item, digest)
+    except TransferRefused as exc:
+        return _rollback_same_volume(item, plan, journal, exc, now=now)
+
     journal.append(_item_event(item, plan, PUBLISHED, published_sha256=published[0],
                                published_bytes=published[1], at=now()))
     if after_publish is not None:
@@ -766,6 +1104,33 @@ def _same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourna
     journal.append(_item_event(item, plan, COMPLETE, at=now()))
     return ItemOutcome(item.clip_id, COMPLETE, published_path=item.destination_path,
                        source_removed=True, bytes_copied=published[1], sha256=published[0])
+
+
+def _rollback_same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJournal,
+                          cause: TransferRefused, *,
+                          now: Callable[[], float]) -> ItemOutcome:
+    """[R5-P47 / A] Put the moved object back, and report what actually happened.
+
+    Never retried and never forced: the reverse rename is no-replace, so if the source path has
+    been taken meanwhile the rollback refuses and the operator is told, rather than one of the two
+    files being destroyed to make the outcome look tidy.
+    """
+    try:
+        os.rename(item.destination_path, item.source_path)
+    except OSError as exc:
+        journal.append(_item_event(
+            item, plan, RECOVERY_REQUIRED, reason="rollback_failed",
+            detail=io_detail(exc), publication_failure=cause.code, at=now()))
+        return ItemOutcome(
+            item.clip_id, RECOVERY_REQUIRED, "rollback_failed",
+            f"{cause.code}; the object is at the destination and could not be put back: "
+            f"{io_detail(exc)}",
+            published_path=item.destination_path, source_removed=True)
+
+    journal.append(_item_event(item, plan, ROLLED_BACK, reason="published_object_unverified",
+                               detail=cause.code, at=now()))
+    return ItemOutcome(item.clip_id, ROLLED_BACK, "published_object_unverified", cause.detail,
+                       published_path="", source_removed=False)
 
 
 def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJournal, digest: str, *,
@@ -780,6 +1145,7 @@ def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourn
     recovery resolves by identity rather than by replaying a delete.
     """
     staging_path = ""
+    staging_handle = -1
     try:
         try:
             staging_handle, staging_path = tempfile.mkstemp(
@@ -790,21 +1156,34 @@ def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourn
             raise TransferRefused("staging_unavailable", io_detail(exc)) from exc
 
         # ---- STAGE: copy source -> unique destination-local temporary --------------------------
-        copied = 0
-        copy_digest = hashlib.sha256()
-        source_handle = open_verified_source(item)
+        # [R5-P47 / M3] The staging descriptor is closed by a `finally` that begins the statement
+        # after `mkstemp` returned it. Previously the only `finally` closing it was *inside* the
+        # block guarded by `open_verified_source`, so a source that failed to open left the
+        # descriptor open — and the outer cleanup's `os.unlink` then failed with a sharing
+        # violation (winerror 32) and was swallowed, leaving an orphaned `.part` file in the
+        # operator's Media Library that nothing would ever remove.
         try:
-            while True:
-                block = os.read(source_handle, _COPY_CHUNK)
-                if not block:
-                    break
-                _write_all(staging_handle, block)
-                copy_digest.update(block)
-                copied += len(block)
-            os.fsync(staging_handle)
+            copied = 0
+            copy_digest = hashlib.sha256()
+            source_handle = open_verified_source(item)
+            try:
+                while True:
+                    block = os.read(source_handle, _COPY_CHUNK)
+                    if not block:
+                        break
+                    _write_all(staging_handle, block)
+                    copy_digest.update(block)
+                    copied += len(block)
+                os.fsync(staging_handle)
+            finally:
+                os.close(source_handle)
         finally:
-            os.close(source_handle)
-            os.close(staging_handle)
+            if staging_handle >= 0:
+                try:
+                    os.close(staging_handle)
+                except OSError:
+                    pass
+                staging_handle = -1
 
         journal.append(_item_event(item, plan, STAGED, staging_path=staging_path,
                                    staged_bytes=copied, staged_sha256=copy_digest.hexdigest(),
@@ -844,34 +1223,39 @@ def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourn
         if after_publish is not None:
             after_publish(item)
 
-        # ---- REMOVE SOURCE: only now, and only after re-proving the original ------------------
-        try:
-            source_handle = open_verified_source(item)
-        except TransferRefused as exc:
-            # The published copy is verified and recorded, so the data is safe; the original is no
-            # longer what we copied. Do NOT delete something whose identity we cannot prove.
-            journal.append(_item_event(item, plan, RECOVERY_REQUIRED,
-                                       reason="source_changed_before_removal", detail=exc.code,
-                                       at=now()))
-            return ItemOutcome(item.clip_id, RECOVERY_REQUIRED, "source_changed_before_removal",
-                               exc.detail, published_path=item.destination_path,
-                               source_removed=False, bytes_copied=published[1],
-                               sha256=published[0])
-        os.close(source_handle)
-        try:
-            os.unlink(item.source_path)
-        except OSError as exc:
-            journal.append(_item_event(item, plan, RECOVERY_REQUIRED,
-                                       reason="source_removal_failed", detail=io_detail(exc),
-                                       at=now()))
-            return ItemOutcome(item.clip_id, RECOVERY_REQUIRED, "source_removal_failed",
-                               io_detail(exc), published_path=item.destination_path,
-                               source_removed=False, bytes_copied=published[1],
-                               sha256=published[0])
-        journal.append(_item_event(item, plan, SOURCE_REMOVED, at=now()))
-        journal.append(_item_event(item, plan, COMPLETE, at=now()))
-        return ItemOutcome(item.clip_id, COMPLETE, published_path=item.destination_path,
-                           source_removed=True, bytes_copied=published[1], sha256=published[0])
+        # ---- SOURCE REMOVAL: deliberately NOT performed --------------------------------------
+        # [R5-P47 / B] This is where the original proved the source's identity on a descriptor,
+        # closed it, and then called `os.unlink(item.source_path)` — a **pathname** delete. An
+        # independent review substituted a different file into the close-to-unlink gap and the
+        # engine destroyed it while reporting COMPLETE.
+        #
+        # There is no stdlib primitive that closes this. Measured on this platform, CPython 3.14:
+        #
+        #   * `os.unlinkat` / `os.renameat` / `dir_fd` support   -- absent on Windows;
+        #   * a normal `O_RDONLY` handle makes the path undeletable (winerror 32), so the
+        #     descriptor cannot simply be held across the delete;
+        #   * `os.open(path, O_RDONLY | O_TEMPORARY)` *is* a genuinely handle-anchored delete: it
+        #     opens with FILE_SHARE_DELETE and the file is gone when the handle closes. But the
+        #     disposition **cannot be cancelled** without `SetFileInformationByHandle`, which needs
+        #     `ctypes`. So the only ordering that is race-free deletes whatever the pathname
+        #     happened to name *before* its identity could be checked, which converts a rare wrong
+        #     delete into a guaranteed one. That is strictly worse, and it is why this is not used.
+        #
+        # So the copy is published and verified, and the deletion is **withheld**. Nothing is
+        # lost: the operator has the clip in the Media Library and still has the original. The
+        # obligation is recorded so a later authorized phase — or an operator — can act on it.
+        # A safe failure is preferable to an unsafe successful move.
+        journal.append(_item_event(
+            item, plan, SOURCE_REMOVAL_BLOCKED,
+            reason="no_handle_anchored_delete_available",
+            published_sha256=published[0], published_bytes=published[1],
+            source_sha256=digest, source_still_present=True, at=now()))
+        return ItemOutcome(
+            item.clip_id, SOURCE_REMOVAL_BLOCKED, "source_removal_withheld",
+            "the copy is published and verified; the original was NOT deleted because this engine "
+            "cannot prove a pathname delete would remove the object it verified",
+            published_path=item.destination_path, source_removed=False,
+            bytes_copied=published[1], sha256=published[0])
     finally:
         # Only ever this attempt's own temporary, never the destination. The R5-P3 / F6 poster
         # defect was a failing attempt unlinking a perfectly valid published object.
@@ -908,6 +1292,53 @@ def _verify_published(item: TransferItem, expected_sha: str) -> tuple[str, int]:
 # Recovery
 # --------------------------------------------------------------------------------------------
 
+#: [R5-P47 / M4] The order in which this engine writes per-item states. Used to decide whether a
+#: recorded history is one this engine can have produced; it is **not** a permission table, and
+#: nothing is replayed from it.
+_ITEM_STATE_ORDER = (INTENT_RECORDED, STAGED, VERIFIED, PUBLISHED, SOURCE_REMOVED, COMPLETE)
+_ITEM_TERMINALS = (COMPLETE, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED)
+
+
+def _history_fault(events: Sequence[dict]) -> str:
+    """Is this per-item journal history one this engine can have written? Returns why not, or ``""``.
+
+    [R5-P47 / M4] Recovery used to read whatever fields the history offered without ever asking
+    whether the history made sense. Four shapes are now refused, because for each of them the
+    meaning of the record cannot be established and guessing favours the destructive reading:
+
+    * a state this build does not know;
+    * a **terminal** state that is not the last record, or more than one terminal;
+    * progress states that run **backwards** through the write order;
+    * contradictory digests for the same state — two different ``published_sha256`` values for one
+      clip cannot both be what was published.
+
+    Being unable to interpret the history is an escalation, never a licence to act on part of it.
+    """
+    if not events:
+        return ""
+    seen_digests: dict[str, set] = {}
+    highest = -1
+    for position, event in enumerate(events):
+        state = event.get("state")
+        if not isinstance(state, str) or state not in STATES:
+            return "the journal records a state this build does not understand"
+        if state in _ITEM_TERMINALS and position != len(events) - 1:
+            return f"a terminal state ({state}) is followed by further records"
+        if state in _ITEM_STATE_ORDER:
+            rank = _ITEM_STATE_ORDER.index(state)
+            if rank < highest:
+                return "the journal records progress states out of order"
+            highest = rank
+        for key in ("source_sha256", "staged_sha256", "verified_sha256", "published_sha256"):
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                seen = seen_digests.setdefault(key, set())
+                seen.add(value)
+                if len(seen) > 1:
+                    return f"the journal records contradictory {key} values"
+    return ""
+
+
 def recover(plan: TransferPlan, journal: TransferJournal, *,
             now: Callable[[], float] = time.time) -> RecoveryReport:
     """Reconcile recorded intent against the **actual** filesystem.
@@ -925,6 +1356,17 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
         events = history.get(item.clip_id, [])
         recorded = events[-1].get("state", PLANNED) if events else PLANNED
 
+        # [R5-P47 / M4] The history itself must be interpretable before anything is concluded from
+        # it. A contradictory, duplicated, forged or out-of-order sequence is escalated rather than
+        # read for whichever fields happen to suit.
+        history_fault = _history_fault(events)
+        if history_fault:
+            needs_operator = True
+            findings.append(RecoveryFinding(
+                item.clip_id, recorded, "history=uninterpretable", "operator_required",
+                history_fault))
+            continue
+
         source_exists = os.path.lexists(item.source_path)
         dest_exists = os.path.lexists(item.destination_path)
 
@@ -932,25 +1374,30 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
         if source_exists:
             try:
                 handle = open_verified_source(item)
-                os.close(handle)
-                source_matches = True
-            except TransferRefused:
+                try:
+                    source_sha, _read = _sha256_of_fd(handle)
+                finally:
+                    os.close(handle)
+                # Metadata identity AND the approved content, for the same reason the transfer
+                # path requires both: a size-preserving edit with a restored mtime passes the first
+                # and must not pass the second.
+                source_matches = (source_sha == item.approved_sha256)
+            except (TransferRefused, OSError):
                 source_matches = False
 
+        # [R5-P47 / M4] The expected digest is the plan's **approved** fingerprint, which comes
+        # from the durable decision record. It is no longer scavenged from the journal by scanning
+        # every event for the last populated hash field — a forged or corrupted record carrying a
+        # different `published_sha256` used to redefine what recovery believed the destination
+        # should be, and a same-length stranger then passed as a valid publication.
         dest_matches = False
-        if dest_exists:
-            expected_sha = ""
-            for event in events:
-                for key in ("source_sha256", "verified_sha256", "published_sha256"):
-                    if isinstance(event.get(key), str) and event[key]:
-                        expected_sha = event[key]
-            if expected_sha:
-                try:
-                    observed_sha, observed_size = _hash_file(item.destination_path)
-                    dest_matches = (observed_sha == expected_sha
-                                    and observed_size == item.source_size)
-                except OSError:
-                    dest_matches = False
+        if dest_exists and item.approved_sha256:
+            try:
+                observed_sha, observed_size = _hash_file(item.destination_path)
+                dest_matches = (observed_sha == item.approved_sha256
+                                and observed_size == item.source_size)
+            except OSError:
+                dest_matches = False
 
         observed = f"source={'match' if source_matches else ('present' if source_exists else 'absent')}," \
                    f"destination={'match' if dest_matches else ('present' if dest_exists else 'absent')}"
@@ -960,12 +1407,14 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
                                             "the move completed; nothing to do"))
             continue
         if dest_matches and source_matches:
-            # Published and verified, but the source survived -- the crash-after-publication case.
-            # The safe resolution is to remove the now-redundant source, and that is only safe
-            # because the destination has been hash-matched against the recorded intent just now.
+            # Published and verified while the source survived -- the crash-after-publication case,
+            # and also the ordinary outcome of the cross-volume path, which withholds the delete.
+            # Recovery **recommends** and never deletes: this engine has no delete it can prove
+            # correct, so neither does its recovery. The operator decides.
             findings.append(RecoveryFinding(
-                item.clip_id, recorded, observed, "remove_redundant_source",
-                "destination hash-matches the recorded intent and the source is unchanged"))
+                item.clip_id, recorded, observed, "operator_may_remove_duplicate",
+                "both copies match the approved content fingerprint; this engine will not delete "
+                "either, because it cannot prove a pathname delete removes the verified object"))
             continue
         if not dest_exists and source_matches:
             findings.append(RecoveryFinding(
@@ -1020,8 +1469,13 @@ __all__ = [
     "PlanRefusal",
     "RECOVERY_REQUIRED",
     "REFUSED",
+    "REPARSE_NO",
+    "REPARSE_UNKNOWN",
+    "REPARSE_YES",
+    "ROLLED_BACK",
     "RecoveryFinding",
     "RecoveryReport",
+    "SOURCE_REMOVAL_BLOCKED",
     "SOURCE_REMOVED",
     "STAGED",
     "STATES",
@@ -1036,5 +1490,6 @@ __all__ = [
     "plan_transfer",
     "probe_no_replace_rename",
     "recover",
+    "reparse_state",
     "staging_leftovers",
 ]

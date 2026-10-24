@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core WRITTEN BUT UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core REVIEWED, REMEDIATED, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,14 +396,35 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P45, is a written and tested transfer core that nothing calls.**
+**P2, as of R5-P47, is a reviewed and remediated transfer core that nothing calls.**
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
-same-volume atomic no-replace move, the cross-volume stage→verify→publish→remove sequence, the
-append-only intent/outcome journal and identity-based recovery. It is deliberately **not** wired
-into `_on_clips_confirm`, no HTTP route reaches it, and tests pin all three of those facts. So the
-accurate statement is no longer "not written" but "written, exercised only from tests, and
-unreachable from the running GUI". Wiring it up is a separate phase needing its own authorization
-after independent review of the core.
+same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
+the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
+wired into `_on_clips_confirm`, no HTTP route reaches it, and tests pin all three of those facts.
+So the accurate statement is "written, independently reviewed, remediated, exercised only from
+tests, and unreachable from the running GUI". Wiring it up is a separate phase with its own
+authorization.
+
+**Three things an independent review (R5-P46) changed about what P2 would do, and two of them bound
+what it *can* do.** The review reproduced four MAJOR defects; the R5-P47 remediation closed all of
+them, and two corrections are limitations rather than fixes and must be read as such:
+
+- **Cross-volume transfers publish a verified copy and do not delete the original.** On Windows,
+  within the fork package's dependency rules, there is no way to delete *the object whose identity
+  was proven* rather than whatever currently owns a pathname — the alternatives were measured, and
+  the one handle-anchored primitive that exists cannot have its disposition cancelled. So the
+  engine stops at `SOURCE_REMOVAL_BLOCKED` with both copies intact. Closing this needs an **owner
+  decision** on a capability the current rules prohibit; until then cross-volume is a verified copy,
+  not a move.
+- **No decision made through today's UI is transferable.** Transfer now requires a decision-time
+  SHA-256 content fingerprint, because metadata identity cannot tell a same-length edit with a
+  restored timestamp from the reviewed file — and unlike P1, P2 acts irreversibly on that
+  distinction. The store records a fingerprint when the deciding caller supplies one; the P1 HTTP
+  path does not yet, so every existing decision fails closed. Supplying it is part of the GUI
+  integration phase.
+- `expected_revisions` is mandatory, execution revalidates against the live store and registry
+  under an exclusive transfer lease, and no status may claim "nothing moved" after an irreversible
+  step.
 
 - A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
 - **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to
@@ -415,6 +436,7 @@ after independent review of the core.
 - Colour is never the decision record: server-side clip IDs and durable per-file outcomes are.
 - Transfers are verified — atomic no-replace moves on one volume, staged verified copies across
   volumes — with per-file intent recorded so a partial failure is recoverable rather than silent.
+  Across volumes the original is currently **kept** rather than deleted; see the R5-P47 note above.
 
 Full specification: [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md).
 

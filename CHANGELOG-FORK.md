@@ -20,6 +20,51 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-24 (Clips Preview P2: security remediation after an independent review)
+
+An independent adversarial review of the engine below reproduced **four MAJOR** defects and four
+MINOR ones. All eight are addressed here. The engine is still unwired and still moves nothing
+through the UI; what changed is what it would do if it ever were called.
+
+- **A failure after an irreversible step is no longer reported as "nothing moved."** The
+  same-volume path verified the published object *after* the rename and reported `REFUSED` when it
+  did not match — about a source path that was by then empty, with unapproved content in the Media
+  Library. Content is now checked against the approved fingerprint **before** the rename, and a
+  post-rename verification failure is **rolled back** by renaming the object back onto the vacated
+  source path (`ROLLED_BACK`), or escalated (`RECOVERY_REQUIRED`) if that is refused.
+- **The engine no longer deletes a source at all.** The cross-volume path deleted by *pathname*
+  after proving identity on a descriptor and closing it; a file substituted into that gap was
+  destroyed while the engine reported success. On Windows, within this package's dependency rules,
+  there is no way to delete the object whose identity was proven — measured: no `os.unlinkat` or
+  `dir_fd`, a held handle makes the path undeletable, and `O_TEMPORARY`'s delete-on-close cannot be
+  cancelled without `ctypes`. The copy is therefore published and verified and the deletion is
+  **withheld** (`SOURCE_REMOVAL_BLOCKED`), leaving both copies and a recorded obligation.
+- **A frozen plan is no longer authority at execution time.** `execute_transfer` requires the live
+  store and registry and revalidates the decision, revision, scan generation and session per item,
+  under an exclusive **transfer lease** that makes `ReviewStore.decide` refuse the leased identity —
+  so the decision cannot change across the commit point and one plan cannot execute twice.
+  `expected_revisions` is now **mandatory** rather than an opt-in that defaulted to off.
+- **Approval is a content fingerprint.** `ReviewStore.decide` accepts an optional
+  `content_sha256`, persisted through the journal and the snapshot; `plan_transfer` refuses any
+  decision without one. Metadata identity cannot distinguish a same-length edit with a restored
+  timestamp from the reviewed file, and the existing contract accepts that limitation only because
+  P1 mutates nothing. Decisions written by today's P1 HTTP path carry no fingerprint and are
+  therefore **not transferable** — the intended fail-closed state, not an oversight.
+- Four MINOR corrections: the no-replace probe must observe a *collision-specific* refusal plus a
+  successful free-name rename plus unaltered payloads (any `OSError` used to count as proof);
+  reparse inspection is tri-state and `UNKNOWN` **refuses**; the staging descriptor is closed on
+  every failure path (a failed source open used to leak it and orphan a `.part` file in the Media
+  Library); and `recover()` takes its expected digest from the plan's approved fingerprint rather
+  than from whichever hash field the journal last carried, and never deletes.
+- `src/beatsync_fork/clips_review.py` — the one P1 file touched, in a backward-compatible way:
+  an optional `Record.content_sha256`, its strict optional validator on both persistence paths,
+  `fingerprints_of()`, and the `begin_transfer`/`end_transfer`/`active_transfer` lease. Every
+  existing caller and signature is unchanged; the P1 suite passes unmodified.
+- `tests/test_clips_review_transfer_security.py` — new. One regression per finding, each asserting
+  the final filesystem state, the journal **and** the returned result, plus the properties the
+  review confirmed were already holding. 19 negative mutation controls, 18 caught, the one
+  survivor recorded as an equivalent mutant with the reason it cannot be distinguished.
+
 ### Added — 2026-10-24 (Clips Preview P2: the safe-transfer core, written and unwired)
 
 The engine that will move reviewed clips to the Media Library or to quarantine. It is **isolated on

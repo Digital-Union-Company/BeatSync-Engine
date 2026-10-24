@@ -1468,6 +1468,28 @@ def _require_text(event: dict, field: str, *, allow_empty: bool = True) -> str:
     return value
 
 
+def _require_fingerprint(event: dict, field: str) -> str:
+    """[R5-P47 / H] An **optional** content fingerprint, strict about what it accepts.
+
+    Absent or ``None`` is the ordinary case: every decision written before this field existed, and
+    every decision the P1 HTTP path writes today, carries no content binding. That is recorded as
+    an empty string and the transfer engine refuses on it — the absence must never be mistaken for
+    a fingerprint that happened to match.
+
+    A value that is *present but not a well-formed digest* is a different thing entirely and
+    raises, because :meth:`ReviewStore.decide` validates with the same predicate before writing,
+    so no fingerprint this writer produced can fail here. Reader and writer agree by construction,
+    which is the invariant ``test_n7_every_event_this_module_writes_satisfies_its_own_replay_validator``
+    exists to keep.
+    """
+    value = event.get(field)
+    if value is None or value == "":
+        return ""
+    if not is_content_fingerprint(value):
+        raise _EventSchemaError(f"{field!r} is not a SHA-256 content fingerprint")
+    return value
+
+
 def io_detail(exc: BaseException) -> str:
     """[R5-P9] The public spelling of :func:`_io_detail`, for callers outside this module.
 
@@ -1483,6 +1505,24 @@ def io_detail(exc: BaseException) -> str:
     return _io_detail(exc)
 
 
+#: [R5-P47 / C] ``decide`` refuses with this code while a transfer lease covers the identity.
+TRANSFER_IN_PROGRESS = "transfer_in_progress"
+
+
+def is_content_fingerprint(value: object) -> bool:
+    """Is *value* a well-formed SHA-256 content fingerprint?
+
+    [R5-P47 / H] Exactly 64 lowercase hex characters. Deliberately strict and deliberately total:
+    the writer validates with it before journalling and the replay validates with it on the way
+    back, so the two halves cannot drift into disagreeing about what a fingerprint is. Anything
+    else — including an uppercase digest, a truncated one or a non-string — is **not** a
+    fingerprint, and the absence of a fingerprint is never read as permission.
+    """
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
 @dataclass(slots=True)
 class Record:
     identity: str
@@ -1490,6 +1530,11 @@ class Record:
     revision: int
     scan_id: str
     updated_at: float
+    #: [R5-P47 / H] The SHA-256 of the bytes the operator actually classified, when the deciding
+    #: caller supplied one. Empty means **no content binding exists for this decision** — which is
+    #: the honest answer for every decision P1 has ever written, and which the P2 transfer engine
+    #: treats as a refusal rather than as permission. See :func:`is_content_fingerprint`.
+    content_sha256: str = ""
 
 
 class ReviewStore:
@@ -1517,6 +1562,11 @@ class ReviewStore:
         self._lock = threading.RLock()
         self._records: dict[str, Record] = {}
         self._scans: dict[str, str] = {}               # owner -> current scan id
+        #: [R5-P47 / C] identity -> plan_id, while a transfer holds it. Process-local and
+        #: deliberately **not** persisted: a lease is a statement about a live execution, and a
+        #: lease surviving the process that took it would be a stuck decision nobody can release.
+        self._transfer_leases: dict[str, str] = {}
+        self._transfer_owners: dict[str, str] = {}     # plan_id -> owner
         self.corrupt_records_discarded = 0
         self.journal_records = 0
         #: [R5-P3 / F4] How many times an unterminated tail was closed off before appending.
@@ -1655,7 +1705,8 @@ class ReviewStore:
                 raise _EventSchemaError("a record's revision is not a non-negative integer")
             records[identity] = Record(identity, decision, revision,
                                        _require_text(entry, "scan_id"),
-                                       _require_number(entry, "updated_at", optional=True))
+                                       _require_number(entry, "updated_at", optional=True),
+                                       _require_fingerprint(entry, "content_sha256"))
         raw_scans = snapshot.get("scans", {})
         if not isinstance(raw_scans, dict):
             raise _EventSchemaError("'scans' is not an object")
@@ -2596,7 +2647,8 @@ class ReviewStore:
             raise _EventSchemaError("'revision' is not a non-negative integer")
         records[identity] = Record(identity, decision, revision,
                                    _require_text(event, "scan_id"),
-                                   _require_number(event, "at", optional=True))
+                                   _require_number(event, "at", optional=True),
+                                   _require_fingerprint(event, "content_sha256"))
 
     def _write_all(self, handle: int, payload: bytes) -> int:
         """[R5-P3 / F4] Write every byte, or raise. Returns the number of bytes written.
@@ -2969,7 +3021,8 @@ class ReviewStore:
             snapshot = {
                 "scans": dict(self._scans),
                 "records": {i: {"decision": r.decision, "revision": r.revision,
-                                "scan_id": r.scan_id, "updated_at": r.updated_at}
+                                "scan_id": r.scan_id, "updated_at": r.updated_at,
+                                "content_sha256": r.content_sha256}
                             for i, r in self._records.items()},
             }
             handle, temporary = tempfile.mkstemp(dir=self.dir, prefix=".snapshot-", suffix=".tmp")
@@ -3018,7 +3071,8 @@ class ReviewStore:
             return (record.decision, record.revision) if record else (PENDING, 0)
 
     def decide(self, owner: str, identity: str, decision: str, scan_id: str,
-               expected_revision: int | None = None) -> tuple[str, int]:
+               expected_revision: int | None = None, *,
+               content_sha256: str | None = None) -> tuple[str, int]:
         """Record one decision durably, then return it.
 
         ``expected_revision`` is optimistic concurrency: a second tab holding a stale view sends
@@ -3038,7 +3092,22 @@ class ReviewStore:
         if expected_revision is not None and (isinstance(expected_revision, bool)
                                               or not isinstance(expected_revision, int)):
             raise StaleWrite(MALFORMED_REVISION, *self.get(identity))
+        # [R5-P47 / H] Validate the fingerprint *before* the lock and before anything is written,
+        # with the same predicate the replay validator uses, so a malformed digest can never reach
+        # the journal and no fingerprint this method writes can be refused on the way back.
+        if content_sha256 is not None and content_sha256 != "" \
+                and not is_content_fingerprint(content_sha256):
+            raise StaleWrite("malformed_content_fingerprint", *self.get(identity))
         with self._lock:
+            # [R5-P47 / C] A transfer lease makes the decision immutable for its duration. Without
+            # it, revalidating a decision just before an irreversible filesystem step is only a
+            # smaller window: the decision could still change between that check and the step.
+            # Refusing here is what lets the transfer engine treat its revalidation as binding.
+            holder = self._transfer_leases.get(identity)
+            if holder:
+                record = self._records.get(identity)
+                raise StaleWrite(TRANSFER_IN_PROGRESS, record.decision if record else PENDING,
+                                 record.revision if record else 0)
             if str(scan_id) != self._scans.get(key, ""):
                 record = self._records.get(identity)
                 raise StaleWrite("stale_scan", record.decision if record else PENDING,
@@ -3049,12 +3118,73 @@ class ReviewStore:
             if expected_revision is not None and int(expected_revision) != revision:
                 raise StaleWrite(REVISION_CONFLICT, current, revision)
             revision += 1
+            fingerprint = content_sha256 or ""
             event = {"k": "decide", "identity": identity, "decision": decision,
                      "revision": revision, "scan_id": str(scan_id), "at": time.time()}
+            if fingerprint:
+                # Only written when there is one, so an ordinary P1 decision's journal line is
+                # byte-for-byte the shape it has always been.
+                event["content_sha256"] = fingerprint
             self._append(event)
             self._records[identity] = Record(identity, decision, revision, str(scan_id),
-                                             event["at"])
+                                             event["at"], fingerprint)
             return decision, revision
+
+    # ---- content fingerprints and transfer leases (R5-P47) ---------------------------
+
+    def fingerprints_of(self, identities: Iterable[str]) -> dict[str, str]:
+        """[R5-P47 / H] The recorded content fingerprint per identity; ``""`` where none exists.
+
+        A separate accessor rather than a wider :meth:`snapshot_of` return type, so every existing
+        P1 caller and test of ``snapshot_of`` keeps the exact shape it has today.
+        """
+        with self._lock:
+            out: dict[str, str] = {}
+            for identity in identities:
+                record = self._records.get(identity)
+                out[identity] = record.content_sha256 if record else ""
+            return out
+
+    def begin_transfer(self, owner: str, plan_id: str, identities: Iterable[str]) -> None:
+        """[R5-P47 / C] Take an exclusive lease over *identities* for one transfer plan.
+
+        While the lease is held, :meth:`decide` refuses those identities with
+        :data:`TRANSFER_IN_PROGRESS`. Two things follow, and both are the point:
+
+        * a decision cannot change across the transfer's commit point, so the engine's
+          revalidation is binding rather than merely recent;
+        * a second execution of the same plan — or any overlapping plan — cannot start, because
+          the lease is refused.
+
+        **Scope, stated rather than implied:** the lease is process-local, guarding the in-process
+        ``ReviewStore`` that the single Gradio app owns. It is not a cross-process file lock and
+        must not be described as one; a second process opening the same state directory is outside
+        this mechanism, as it is outside every other invariant this store maintains.
+        """
+        key = _require_owner(owner)
+        wanted = [str(i) for i in identities]
+        with self._lock:
+            held = {i: h for i, h in self._transfer_leases.items() if i in set(wanted)}
+            if held:
+                raise Refusal(409, TRANSFER_IN_PROGRESS)
+            if any(h == str(plan_id) for h in self._transfer_leases.values()):
+                raise Refusal(409, "transfer_plan_already_executing")
+            for identity in wanted:
+                self._transfer_leases[identity] = str(plan_id)
+            self._transfer_owners[str(plan_id)] = key
+
+    def end_transfer(self, owner: str, plan_id: str) -> None:
+        """Release every identity leased by *plan_id*. Releasing twice is not an error."""
+        _require_owner(owner)
+        with self._lock:
+            for identity in [i for i, h in self._transfer_leases.items() if h == str(plan_id)]:
+                del self._transfer_leases[identity]
+            self._transfer_owners.pop(str(plan_id), None)
+
+    def active_transfer(self, identity: str) -> str:
+        """The plan id currently leasing *identity*, or ``""``."""
+        with self._lock:
+            return self._transfer_leases.get(str(identity), "")
 
     def counts(self, identities: Iterable[str]) -> dict[str, int]:
         with self._lock:
@@ -3082,7 +3212,9 @@ __all__ = [
     "MALFORMED_REVISION",
     "REVISION_CONFLICT",
     "REVISION_REQUIRED",
+    "TRANSFER_IN_PROGRESS",
     "RevisionError",
+    "is_content_fingerprint",
     "ScanCoordinator",
     "SupersededScan",
     "build_poster_command",

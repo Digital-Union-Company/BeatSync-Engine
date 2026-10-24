@@ -38,6 +38,11 @@ SCAN = "scan-1"
 # Fixtures
 # =============================================================================================
 
+#: Sentinel so a test can ask for a decision with *no* content fingerprint by passing ``None``,
+#: which is a different thing from "use the default".
+_UNSET = object()
+
+
 def _write(path: str, payload: bytes) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as handle:
@@ -89,27 +94,48 @@ def world(tmp_path):
     }
 
 
-def _decide(world, entry, decision):
-    return world["store"].decide(OWNER, world["identities"][entry.clip_id], decision, SCAN)
+def _decide(world, entry, decision, content_sha256=_UNSET):
+    """[R5-P47 / H] A decision now carries the digest of the bytes being classified.
+
+    The default hashes the file as it is *at decision time*, which is what the operator is looking
+    at. Pass ``content_sha256=None`` to record a decision with **no** content binding — the shape
+    every decision the P1 HTTP path writes today has, and which P2 must refuse.
+    """
+    sha = _sha(entry.path) if content_sha256 is _UNSET else content_sha256
+    return world["store"].decide(OWNER, world["identities"][entry.clip_id], decision, SCAN,
+                                 content_sha256=sha)
 
 
-def _decide_all(world, decision=cr.SELECTED):
+def _decide_all(world, decision=cr.SELECTED, content_sha256=_UNSET):
     for entry in world["entries"]:
-        _decide(world, entry, decision)
+        _decide(world, entry, decision, content_sha256)
+
+
+def _revisions(world, entries=None):
+    """The durable revision of every entry, i.e. what an up-to-date caller would believe."""
+    out = {}
+    for entry in (entries if entries is not None else world["entries"]):
+        out[entry.clip_id] = world["store"].get(world["identities"][entry.clip_id])[1]
+    return out
 
 
 def _plan(world, **overrides):
+    # [R5-P47 / C] `expected_revisions` is mandatory, so the default helper supplies the honest
+    # up-to-date set. A test that wants a stale or malformed one overrides it explicitly.
     kwargs = dict(
         session_id=world["session"], page_token=world["page"], owner=OWNER, scan_id=SCAN,
         input_folder=world["review"], library_folder=world["library"],
-        rejected_folder=world["rejected"],
+        rejected_folder=world["rejected"], expected_revisions=_revisions(world),
     )
     kwargs.update(overrides)
     return tr.plan_transfer(world["registry"], world["store"], **kwargs)
 
 
 def _run(world, plan=None, **hooks):
-    return tr.execute_transfer(plan or _plan(world), world["journal"], **hooks)
+    # [R5-P47 / C] The live store and registry are required: execution revalidates against them
+    # under a transfer lease rather than trusting the frozen plan.
+    return tr.execute_transfer(plan or _plan(world), world["journal"],
+                               store=world["store"], registry=world["registry"], **hooks)
 
 
 def _codes(plan):
@@ -134,9 +160,9 @@ def test_01_selected_clips_move_to_the_library(world):
     assert {i.operation for i in plan.items} == {tr.OP_SAME_VOLUME}
     assert {i.destination_role for i in plan.items} == {cr.ROLE_LIBRARY}
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.COMPLETE
-    assert result.counts == {"moved": 4, "failed": 0, "remaining": 0}
+    assert result.counts == {"moved": 4, "published_only": 0, "failed": 0, "remaining": 0}
     assert result.advance_page is True
 
     for item in plan.items:
@@ -158,7 +184,7 @@ def test_02_rejected_clips_move_to_quarantine_and_are_not_deleted(world):
 
     plan = _plan(world)
     assert {i.destination_role for i in plan.items} == {cr.ROLE_REJECTED}
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.COMPLETE
 
     assert sorted(os.listdir(world["rejected"])) == [
@@ -194,7 +220,7 @@ def test_03_a_single_pending_clip_refuses_the_whole_page(world):
     assert not plan.ok
     assert "pending_decision" in _codes(plan)
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.REFUSED
     assert result.advance_page is False
     assert os.listdir(world["library"]) == [] and os.listdir(world["rejected"]) == []
@@ -215,7 +241,7 @@ def test_04_a_stale_expected_revision_refuses_that_clip(world):
     plan = _plan(world, expected_revisions=expected)
     assert not plan.ok
     assert "stale_revision" in _codes(plan)
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.REFUSED
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.REFUSED
     assert os.listdir(world["library"]) == []
 
 
@@ -224,7 +250,7 @@ def test_04b_a_matching_revision_set_is_accepted(world):
     expected = {e.clip_id: 1 for e in world["entries"]}
     plan = _plan(world, expected_revisions=expected)
     assert plan.ok, _codes(plan)
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.COMPLETE
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.COMPLETE
 
 
 def test_04c_a_missing_or_non_integer_revision_is_refused_not_coerced(world):
@@ -245,7 +271,7 @@ def test_05_a_revoked_owner_refuses_the_plan(world):
     world["registry"].revoke_owner(OWNER)
     plan = _plan(world)
     assert not plan.ok
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.REFUSED
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.REFUSED
     assert os.listdir(world["library"]) == []
 
 
@@ -284,7 +310,7 @@ def test_06_a_source_deleted_after_planning_refuses_that_item(world):
     assert plan.ok
     os.unlink(plan.items[1].source_path)                # vanishes between plan and execute
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.PARTIAL
     outcomes = {o.clip_id: o for o in result.outcomes}
     assert outcomes[plan.items[1].clip_id].code == "source_missing"
@@ -318,7 +344,7 @@ def test_07b_a_source_modified_between_plan_and_execute_is_refused_at_execute_ti
     with open(plan.items[0].source_path, "ab") as handle:
         handle.write(b"later")
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "source_identity_changed"
     assert os.path.isfile(plan.items[0].source_path), "a refused item must stay put"
@@ -340,7 +366,7 @@ def test_08_a_same_size_replacement_is_still_caught(world):
     os.replace(replacement, item.source_path)
     assert os.path.getsize(item.source_path) == size, "the swap kept the length identical"
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "source_identity_changed"
     assert os.listdir(world["library"]) == []
@@ -370,7 +396,7 @@ def test_09b_a_target_that_appears_between_plan_and_execute_is_still_refused(wor
     squatter = _write(plan.items[0].destination_path, b"APPEARED-LATE")
     before = _sha(squatter)
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "target_exists"
     assert _sha(plan.items[0].destination_path) == before, "no overwrite"
@@ -393,11 +419,12 @@ def test_10_two_clips_with_the_same_basename_are_refused_not_suffixed(world, tmp
     token, entries = registry.publish_page(OWNER, session, 1, cr.freeze_page(found.files, 0, 20))
     for entry in entries:
         store.decide(OWNER, cr.decision_identity(entry.path, entry.size, entry.mtime_ns),
-                     cr.SELECTED, SCAN)
+                     cr.SELECTED, SCAN, content_sha256=_sha(entry.path))
 
     plan = tr.plan_transfer(registry, store, session_id=session, page_token=token, owner=OWNER,
                             scan_id=SCAN, input_folder=str(tmp_path / "review"),
-                            library_folder=world["library"], rejected_folder=world["rejected"])
+                            library_folder=world["library"], rejected_folder=world["rejected"],
+                            expected_revisions={e.clip_id: 1 for e in entries})
     assert not plan.ok
     assert "duplicate_destination" in _codes(plan)
     assert os.listdir(world["library"]) == [], "nothing moved"
@@ -476,13 +503,32 @@ def test_12_a_junction_alias_to_the_input_root_cannot_become_a_destination(world
 def test_13_the_reparse_detector_sees_a_real_junction(tmp_path):
     """Measured on a real reparse point, not asserted from a flag."""
     plain = _write(str(tmp_path / "plain.mp4"), b"x" * 32)
-    assert tr._is_reparse(plain) is False
+    assert tr.reparse_state(plain) == tr.REPARSE_NO
     target = str(tmp_path / "target")
     os.makedirs(target, exist_ok=True)
     link = str(tmp_path / "linkdir")
     if not _try_junction(link, target):
         pytest.skip("creating a directory junction is unavailable in this environment")
-    assert tr._is_reparse(link) is True
+    assert tr.reparse_state(link) == tr.REPARSE_YES
+
+
+def test_13d_an_uninspectable_path_is_UNKNOWN_and_not_mistaken_for_an_ordinary_file(monkeypatch,
+                                                                                    tmp_path):
+    """[R5-P47 / M2] The three answers must be three answers.
+
+    The original returned a bare ``bool`` and answered ``False`` — *ordinary file* — when the
+    inspection itself failed, so a gate whose only purpose is to refuse said "safe" precisely when
+    it could not tell.
+    """
+    target = _write(str(tmp_path / "x.mp4"), b"x" * 16)
+    assert tr.reparse_state(target) == tr.REPARSE_NO
+
+    def lstat_denied(path, *args, **kwargs):
+        raise PermissionError(13, "Access is denied", path, 5)
+
+    monkeypatch.setattr(os, "lstat", lstat_denied)
+    assert tr.reparse_state(target) == tr.REPARSE_UNKNOWN
+    assert tr.reparse_state(target) != tr.REPARSE_NO, "UNKNOWN must not read as an ordinary file"
 
 
 def test_13b_a_source_replaced_by_a_reparse_point_is_refused_and_nothing_moves(world, tmp_path):
@@ -537,7 +583,7 @@ def test_14_an_unwritable_destination_refuses_without_losing_the_source(world, t
     # A non-existent library is allowed by validate_roots (only input must exist), so execution is
     # where it must refuse -- and it must refuse without touching a source.
     if plan.ok:
-        result = tr.execute_transfer(plan, world["journal"])
+        result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
         assert result.state == tr.REFUSED
         assert result.outcomes[0].code in ("destination_not_a_directory",
                                            "destination_access_denied",
@@ -563,21 +609,40 @@ def _force_cross(plan):
     return tr.TransferPlan(**{**plan.__dict__, "items": items})
 
 
-def test_15_the_cross_volume_sequence_completes_on_real_files(world):
+def test_15_the_cross_volume_sequence_publishes_and_WITHHOLDS_the_deletion(world):
+    """[R5-P47 / B] The copy is published and verified; the original is deliberately kept.
+
+    This used to assert ``COMPLETE`` with the source gone. The deletion was a **pathname** delete
+    performed after the identity proof had been made on a descriptor and that descriptor closed,
+    and an independent review substituted a different file into the gap and watched the engine
+    destroy it while reporting success. There is no stdlib primitive on this platform that closes
+    that window — see *Why the source is not deleted* — so the engine now stops at a verified
+    publication and says so.
+    """
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     before = {i.source_path: _sha(i.source_path) for i in plan.items}
 
-    result = tr.execute_transfer(plan, world["journal"])
-    assert result.state == tr.COMPLETE
-    for item in plan.items:
-        assert not os.path.exists(item.source_path)
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
+    assert result.state == tr.PARTIAL, "a withheld deletion is never a COMPLETE batch"
+    assert result.advance_page is False, "and it must never advance the gallery"
+    assert result.counts == {"moved": 0, "published_only": 4, "failed": 0, "remaining": 0}
+
+    for item, outcome in zip(plan.items, result.outcomes):
+        assert outcome.state == tr.SOURCE_REMOVAL_BLOCKED
+        assert outcome.code == "source_removal_withheld"
+        assert outcome.source_removed is False
+        # the copy is real, verified and byte-identical
         assert _sha(item.destination_path) == before[item.source_path]
+        # and the original is still exactly where it was
+        assert os.path.isfile(item.source_path)
+        assert _sha(item.source_path) == before[item.source_path]
     assert tr.staging_leftovers(world["library"]) == [], "no .part temporary may survive"
 
     states = [e["state"] for e in world["journal"].states_for(plan.plan_id)[plan.items[0].clip_id]]
     assert states == [tr.INTENT_RECORDED, tr.STAGED, tr.VERIFIED, tr.PUBLISHED,
-                      tr.SOURCE_REMOVED, tr.COMPLETE], states
+                      tr.SOURCE_REMOVAL_BLOCKED], states
+    assert tr.SOURCE_REMOVED not in states, "nothing may claim the source was removed"
 
 
 def test_16_a_corrupted_staged_payload_refuses_and_keeps_the_source(world):
@@ -591,7 +656,7 @@ def test_16_a_corrupted_staged_payload_refuses_and_keeps_the_source(world):
                 handle.seek(0)
                 handle.write(b"XXXX")                   # same length, different bytes
 
-    result = tr.execute_transfer(plan, world["journal"], after_stage=corrupt)
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_stage=corrupt)
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "staged_copy_mismatch"
     assert os.path.isfile(plan.items[0].source_path), "the original must survive"
@@ -616,7 +681,7 @@ def test_16b_the_published_object_is_re_read_and_a_wrong_payload_is_caught(world
             with open(leftover, "wb") as handle:
                 handle.write(b"Q" * size)               # same length, different bytes
 
-    result = tr.execute_transfer(plan, world["journal"], before_publish=swap_staged_payload)
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], before_publish=swap_staged_payload)
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "published_mismatch", result.outcomes[0]
     assert os.path.isfile(plan.items[0].source_path), "the original must survive"
@@ -653,7 +718,7 @@ def test_17_a_destination_that_appears_during_verification_cannot_be_replaced(wo
     def squat(item):
         _write(item.destination_path, b"SQUATTER")
 
-    result = tr.execute_transfer(plan, world["journal"], before_publish=squat)
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], before_publish=squat)
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "target_exists"
     assert open(plan.items[0].destination_path, "rb").read() == b"SQUATTER", "no overwrite"
@@ -677,7 +742,7 @@ def test_18_interruption_after_durable_intent_leaves_the_source_intact(world):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_intent=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_intent=_interrupt)
 
     assert os.path.isfile(plan.items[0].source_path), "intent is not a move"
     assert not os.path.exists(plan.items[0].destination_path)
@@ -689,7 +754,7 @@ def test_19_interruption_after_staging_leaves_the_source_intact(world):
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_stage=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_stage=_interrupt)
 
     assert os.path.isfile(plan.items[0].source_path), "a crash before publication keeps the source"
     assert not os.path.exists(plan.items[0].destination_path), "nothing was published"
@@ -703,7 +768,7 @@ def test_20_interruption_after_publication_leaves_both_copies_and_is_recoverable
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_publish=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_publish=_interrupt)
 
     item = plan.items[0]
     assert os.path.isfile(item.destination_path), "the verified copy is published"
@@ -714,8 +779,11 @@ def test_20_interruption_after_publication_leaves_both_copies_and_is_recoverable
 
     report = tr.recover(plan, world["journal"])
     finding = {f.clip_id: f for f in report.findings}[item.clip_id]
-    assert finding.action == "remove_redundant_source"
+    # [R5-P47 / M4] Recovery recommends; it never deletes, and it no longer frames the duplicate
+    # as something the engine should remove, because this engine has no delete it can prove right.
+    assert finding.action == "operator_may_remove_duplicate"
     assert report.state == tr.RECOVERY_REQUIRED or not report.needs_operator
+    assert os.path.isfile(item.source_path), "recovery must not have removed anything"
 
 
 def test_21_a_crash_before_source_removal_never_loses_data(world):
@@ -723,7 +791,7 @@ def test_21_a_crash_before_source_removal_never_loses_data(world):
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_publish=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_publish=_interrupt)
     item = plan.items[0]
     assert os.path.isfile(item.source_path) and os.path.isfile(item.destination_path)
     assert _sha(item.source_path) == _sha(item.destination_path)
@@ -736,7 +804,7 @@ def test_21_a_crash_before_source_removal_never_loses_data(world):
 def test_22_recovery_is_idempotent_and_never_overwrites(world):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.COMPLETE
 
     published = {i.destination_path: _sha(i.destination_path) for i in plan.items}
@@ -752,7 +820,7 @@ def test_22b_recovery_escalates_rather_than_guessing_when_a_stranger_holds_the_d
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_stage=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_stage=_interrupt)
     # a different file now occupies the destination
     _write(plan.items[0].destination_path, b"NOT-THE-CLIP")
 
@@ -768,7 +836,7 @@ def test_22c_recovery_never_replays_a_delete_from_a_historical_status(world):
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
     with pytest.raises(_Interrupt):
-        tr.execute_transfer(plan, world["journal"], after_publish=_interrupt)
+        tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_publish=_interrupt)
     item = plan.items[0]
     # The journal records PUBLISHED. Now make the destination wrong and re-run recovery: a naive
     # implementation would trust the status and delete the source.
@@ -788,7 +856,7 @@ def test_23_a_mixed_success_and_failure_reports_partial(world):
     plan = _plan(world)
     _write(plan.items[2].destination_path, b"BLOCKED")  # third item will collide
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.PARTIAL
     assert result.counts["moved"] == 2
     assert result.counts["failed"] == 1
@@ -802,7 +870,7 @@ def test_24_a_failure_preserves_every_unprocessed_clip(world):
     plan = _plan(world)
     _write(plan.items[1].destination_path, b"BLOCKED")
 
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.PARTIAL
     assert os.path.isfile(plan.items[1].source_path), "the failed clip stays put"
     assert os.path.isfile(plan.items[2].source_path), "unprocessed clips stay put"
@@ -815,7 +883,7 @@ def test_30_a_partial_failure_never_advances_the_page(world):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
     _write(plan.items[1].destination_path, b"BLOCKED")
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.PARTIAL
     assert result.advance_page is False
 
@@ -826,7 +894,7 @@ def test_30_a_partial_failure_never_advances_the_page(world):
 
 def test_30b_a_refused_plan_never_advances_the_page(world):
     plan = _plan(world)                                 # everything PENDING
-    assert tr.execute_transfer(plan, world["journal"]).advance_page is False
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).advance_page is False
 
 
 # =============================================================================================
@@ -836,10 +904,10 @@ def test_30b_a_refused_plan_never_advances_the_page(world):
 def test_25_replaying_a_completed_plan_cannot_duplicate_the_move(world):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.COMPLETE
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.COMPLETE
     published = {i.destination_path: _sha(i.destination_path) for i in plan.items}
 
-    again = tr.execute_transfer(plan, world["journal"])  # the very same immutable plan
+    again = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])  # the very same immutable plan
     assert again.state == tr.REFUSED
     assert again.outcomes[0].code == "source_missing"
     for path, digest in published.items():
@@ -852,22 +920,30 @@ def test_25_replaying_a_completed_plan_cannot_duplicate_the_move(world):
 # =============================================================================================
 
 def test_26_no_source_is_removed_before_a_verified_publication(world):
-    """Asserted from the journal order, which is the durable record of what happened."""
+    """Asserted from the journal order, which is the durable record of what happened.
+
+    [R5-P47 / B] On the cross-volume path the stronger property now holds: no source is removed at
+    **all**, so ``SOURCE_REMOVED`` never appears and the ordering invariant is satisfied
+    vacuously. Both halves are asserted, because "it never happens" is only reassuring if the
+    engine also still records the steps that did.
+    """
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.COMPLETE
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.PARTIAL
 
     for item in plan.items:
         states = [e["state"] for e in world["journal"].states_for(plan.plan_id)[item.clip_id]]
-        assert states.index(tr.VERIFIED) < states.index(tr.PUBLISHED) < states.index(tr.SOURCE_REMOVED)
         assert states.index(tr.INTENT_RECORDED) == 0, "intent precedes everything"
+        assert states.index(tr.VERIFIED) < states.index(tr.PUBLISHED)
+        assert tr.SOURCE_REMOVED not in states
+        assert states[-1] == tr.SOURCE_REMOVAL_BLOCKED
 
 
 def test_27_rejected_footage_is_quarantined_and_never_deleted(world):
     _decide_all(world, cr.REJECTED)
     before = {e.path: (os.path.getsize(e.path), _sha(e.path)) for e in world["entries"]}
     plan = _plan(world)
-    assert tr.execute_transfer(plan, world["journal"]).state == tr.COMPLETE
+    assert tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"]).state == tr.COMPLETE
 
     assert len(os.listdir(world["rejected"])) == 4
     for item in plan.items:
@@ -925,7 +1001,7 @@ def test_28b_a_forged_path_cannot_enter_a_plan(world, tmp_path):
     plan = _plan(world)
     assert all(i.source_path != victim for i in plan.items)
     assert all(tr._is_within(i.source_path, plan.input_real) for i in plan.items)
-    tr.execute_transfer(plan, world["journal"])
+    tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert os.path.isfile(victim) and _sha(victim) == before
 
 
@@ -935,7 +1011,7 @@ def test_28b_a_forged_path_cannot_enter_a_plan(world, tmp_path):
 
 def test_29_nothing_outside_the_fixture_is_touched(world, tmp_path):
     _decide_all(world, cr.SELECTED)
-    assert tr.execute_transfer(_plan(world), world["journal"]).state == tr.COMPLETE
+    assert _run(world).state == tr.COMPLETE
     assert os.path.isfile(world["outside"])
     assert _sha(world["outside"]) == world["outside_sha"], "the sentinel is untouched"
     # every path the plan ever named lives under tmp_path
@@ -983,7 +1059,7 @@ def test_execution_refuses_when_no_replace_cannot_be_proven(world, monkeypatch):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
     monkeypatch.setattr(tr, "probe_no_replace_rename", lambda directory: False)
-    result = tr.execute_transfer(plan, world["journal"])
+    result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     assert result.state == tr.REFUSED
     assert result.outcomes[0].code == "no_replace_not_guaranteed"
     for entry in world["entries"]:
@@ -997,7 +1073,7 @@ def test_execution_refuses_when_no_replace_cannot_be_proven(world, monkeypatch):
 def test_the_journal_is_append_only_and_records_every_state(world):
     _decide_all(world, cr.SELECTED)
     plan = _force_cross(_plan(world))
-    tr.execute_transfer(plan, world["journal"])
+    tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
 
     raw = open(world["journal"].path, encoding="utf-8").read()
     lines = [line for line in raw.splitlines() if line.strip()]
@@ -1006,8 +1082,11 @@ def test_the_journal_is_append_only_and_records_every_state(world):
 
     seen = {json.loads(line).get("state") for line in lines}
     for required in (tr.PLANNED, tr.INTENT_RECORDED, tr.STAGED, tr.VERIFIED, tr.PUBLISHED,
-                     tr.SOURCE_REMOVED, tr.COMPLETE):
+                     tr.SOURCE_REMOVAL_BLOCKED):
         assert required in seen, required
+    # [R5-P47 / B] and the two states that would claim a deletion are absent, because none happened
+    assert tr.SOURCE_REMOVED not in seen
+    assert tr.COMPLETE not in seen
 
     # appending again only grows the file
     length = len(raw)
@@ -1025,7 +1104,7 @@ def test_a_journal_record_never_precedes_the_filesystem_state_it_claims(world):
         states = [e["state"] for e in world["journal"].states_for(plan.plan_id)[item.clip_id]]
         observed.append((states[-1], os.path.isfile(item.destination_path)))
 
-    tr.execute_transfer(plan, world["journal"], after_publish=at_publish)
+    tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_publish=at_publish)
     assert observed, "the hook ran"
     for state, exists in observed:
         assert state == tr.PUBLISHED and exists, "the record follows the verified filesystem state"
@@ -1046,7 +1125,7 @@ def test_an_unusable_journal_directory_refuses_before_any_move(world, tmp_path):
 def test_a_torn_journal_tail_is_reported_not_invented(world):
     _decide_all(world, cr.SELECTED)
     plan = _plan(world)
-    tr.execute_transfer(plan, world["journal"])
+    tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
     with open(world["journal"].path, "a", encoding="utf-8") as handle:
         handle.write('{"k":"item","plan_id":"x","state":"COMP')      # torn
     records = world["journal"].records()
@@ -1059,7 +1138,9 @@ def test_a_torn_journal_tail_is_reported_not_invented(world):
 
 @pytest.mark.skipif(not _crossvol_root(),
                     reason="set BEATSYNC_TEST_CROSSVOL to a directory on another volume")
-def test_a_real_cross_volume_move_completes_and_removes_the_source(world):
+def test_a_real_cross_volume_publishes_and_withholds_the_deletion(world):
+    """[R5-P47 / B] On a genuinely different device, the copy is published and verified and the
+    original is deliberately kept. See *Why the source is not deleted*."""
     root = _crossvol_root()
     library = os.path.join(root, "r5p45-library")
     os.makedirs(library, exist_ok=True)
@@ -1071,11 +1152,13 @@ def test_a_real_cross_volume_move_completes_and_removes_the_source(world):
             "the devices must genuinely differ for this arm to mean anything")
         before = {i.source_path: _sha(i.source_path) for i in plan.items}
 
-        result = tr.execute_transfer(plan, world["journal"])
-        assert result.state == tr.COMPLETE
+        result = tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"])
+        assert result.state == tr.PARTIAL
+        assert result.advance_page is False
         for item in plan.items:
-            assert not os.path.exists(item.source_path)
-            assert _sha(item.destination_path) == before[item.source_path]
+            assert _sha(item.destination_path) == before[item.source_path], "the copy is real"
+            assert os.path.isfile(item.source_path), "and the original is kept"
+            assert _sha(item.source_path) == before[item.source_path]
         assert tr.staging_leftovers(library) == []
     finally:
         for name in os.listdir(library):               # only this test's own files
@@ -1100,13 +1183,15 @@ def test_a_real_cross_volume_crash_after_publication_keeps_both_copies(world):
         plan = _plan(world, library_folder=library)
         assert {i.operation for i in plan.items} == {tr.OP_CROSS_VOLUME}
         with pytest.raises(_Interrupt):
-            tr.execute_transfer(plan, world["journal"], after_publish=_interrupt)
+            tr.execute_transfer(plan, world["journal"], store=world["store"], registry=world["registry"], after_publish=_interrupt)
         item = plan.items[0]
         assert os.path.isfile(item.source_path) and os.path.isfile(item.destination_path)
         assert _sha(item.source_path) == _sha(item.destination_path)
         report = tr.recover(plan, world["journal"])
         finding = {f.clip_id: f for f in report.findings}[item.clip_id]
-        assert finding.action == "remove_redundant_source"
+        # [R5-P47 / M4] Recovery recommends; it never deletes.
+        assert finding.action == "operator_may_remove_duplicate"
+        assert os.path.isfile(item.source_path)
     finally:
         for name in os.listdir(library):
             try:
@@ -1172,9 +1257,12 @@ def test_the_transfer_core_imports_only_stdlib_and_the_fork_package():
     assert imported <= allowed, sorted(imported - allowed)
 
 
-def test_all_ten_journal_states_exist_and_are_distinct():
-    assert len(tr.STATES) == 10
-    assert len(set(tr.STATES)) == 10
+def test_all_twelve_journal_states_exist_and_are_distinct():
+    assert len(tr.STATES) == 12
+    assert len(set(tr.STATES)) == 12
     for name in ("PLANNED", "INTENT_RECORDED", "STAGED", "VERIFIED", "PUBLISHED",
-                 "SOURCE_REMOVED", "COMPLETE", "REFUSED", "PARTIAL", "RECOVERY_REQUIRED"):
+                 "SOURCE_REMOVED", "COMPLETE", "REFUSED", "PARTIAL", "RECOVERY_REQUIRED",
+                 # [R5-P47] A and B each needed a state the engine did not have: an undone move,
+                 # and a verified publication whose deletion was deliberately not performed.
+                 "ROLLED_BACK", "SOURCE_REMOVAL_BLOCKED"):
         assert getattr(tr, name) in tr.STATES

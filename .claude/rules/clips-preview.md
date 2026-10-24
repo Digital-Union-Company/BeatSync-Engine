@@ -6,6 +6,7 @@ paths:
   - "tests/test_clips_review.py"
   - "tests/test_clips_media_server.py"
   - "tests/test_clips_review_transfer.py"
+  - "tests/test_clips_review_transfer_security.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -35,6 +36,62 @@ and designing it does not authorize it.
 exactly that, alongside the unchanged media-layer guard. Its sources come only from
 `ClipRegistry.page_entries`, so `plan_transfer` has no source-path parameter a browser could fill.
 Enabling Confirm to call it is a further phase with its own authorization.
+
+### [R5-P47] What the transfer engine may and may not do, after an independent review found four MAJORs
+
+An independent adversarial review (R5-P46) reproduced four MAJOR defects in the R5-P45 engine. The
+corrections below are **contract**, not implementation detail, and each exists because the
+alternative was measured and found unsafe.
+
+**Approval is a content fingerprint, and its absence refuses.** A decision is transferable only if
+it carries the SHA-256 of the bytes the operator classified *and* the file still hashes to it.
+Note what this rule already says above about metadata identity: it is accepted as sufficient
+**"because P1 mutates nothing, the residual case costs a stale preview, never a wrong move"**. P2
+makes the wrong move, so it cannot inherit that reasoning — a same-length edit with a restored
+`mtime` passes every metadata check and was measured publishing unreviewed content. `decide()` now
+takes an optional `content_sha256`; `plan_transfer` **refuses** an item without one. The P1 HTTP
+decision path does not yet record one, so **no decision made through today's UI is transferable**,
+and that is the intended fail-closed state. Never back-fill a digest onto an older decision and
+call it historical approval.
+
+**The engine never deletes a source. Not anywhere, not by any path.** The cross-volume path
+publishes a verified copy and then stops at `SOURCE_REMOVAL_BLOCKED`, leaving the original in
+place. This is deliberate and measured: on Windows, with this package's allowlist, there is no way
+to delete *the object whose identity was proven* rather than whatever currently owns a pathname.
+`os.unlinkat`/`dir_fd` do not exist; a held `O_RDONLY` handle makes the path undeletable
+(winerror 32); and `O_TEMPORARY` **is** a handle-anchored delete but its disposition cannot be
+cancelled without `ctypes`, so the only race-free ordering commits to deleting an object before it
+can be checked. A test enumerates every `os.unlink`/`os.remove` call site and requires each to
+target this engine's own temporary. **Do not add a source delete back** without an owner decision
+on the missing Windows capability; a safe failure beats an unsafe successful move.
+
+**Same-volume is a relocation, not a deletion, and that asymmetry is the whole design.** A
+no-replace `os.rename` moves the object, so a bad outcome is reversible: the content is verified
+against the approved fingerprint *before* the rename, and if the published object still fails to
+verify the rename is **undone** by renaming it back (measured: the reverse rename succeeds onto the
+vacated path, and refuses with winerror 183 if anything has taken it). The result is `ROLLED_BACK`,
+never `REFUSED`. **No status may claim "nothing moved" after an irreversible step** — that was the
+original defect, reported while the source path was already empty.
+
+**A frozen plan is not authority.** `execute_transfer` requires the live `store` and `registry` and
+re-reads the decision, its revision, the scan generation and the session's validity per item. The
+check is made **binding** rather than merely recent by a transfer **lease**: `ReviewStore.decide`
+refuses a leased identity with `transfer_in_progress`, so the decision cannot move across the
+commit point, and a second execution of the same plan cannot acquire the lease. `expected_revisions`
+is **mandatory** — it used to default to `None`, which silently skipped the only stale-decision
+defence. The lease is **process-local** and guards the in-process store the single Gradio app owns;
+it is not a cross-process file lock and must not be described as one.
+
+**Three smaller rules.** The no-replace probe must observe a *collision-specific* refusal
+(`FileExistsError`/183) **and** a successful rename onto a free name **and** unaltered probe
+payloads — any `OSError` used to count as proof, so the precondition was established by the very
+failures that should have refused it. Reparse inspection is tri-state and **`UNKNOWN` refuses**: a
+path whose attributes cannot be read is not an ordinary file. And `recover()` takes its expected
+digest from the **plan's approved fingerprint**, never from whichever hash field the journal last
+carried, because a forged record used to redefine what recovery believed and a same-length stranger
+then passed as a valid publication; recovery recommends and **never deletes**.
+
+Still true, and unchanged by any of this: the engine remains unreachable from the GUI.
 
 ## The one idea everything rests on
 
