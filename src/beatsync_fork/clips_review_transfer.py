@@ -105,6 +105,28 @@ speculative rollback is attempted to make reporting tidier. Where the truth is a
 a check that has *already* run, that knowledge is reported rather than re-derived from a second,
 equally fallible look at the filesystem.
 
+"Nothing needs a human" is not "the plan is done"
+-------------------------------------------------
+[R5-P50 / F2] :func:`recover` used to aggregate as
+``RECOVERY_REQUIRED if needs_operator else COMPLETE``, which made ``COMPLETE`` mean *"nothing needs
+a human"* while reusing a constant that means *"done"* everywhere else in this module. Measured on
+two real volumes: a cross-volume copy-only transfer returned
+:data:`SOURCE_REMOVAL_BLOCKED`, the batch correctly reported ``PARTIAL`` with ``advance_page``
+false, and ``recover()`` on the identical filesystem answered ``COMPLETE`` /
+``needs_operator=False`` — while its own finding read ``operator_may_remove_duplicate``. The same
+aggregation called a three-clip batch COMPLETE with two clips still in their original folder.
+
+Three questions are now separate: :attr:`RecoveryReport.plan_finished` (is the plan done?),
+:attr:`RecoveryReport.needs_operator` (does a human have something to do?) and the aggregate
+:attr:`RecoveryReport.state`, one of :data:`RECOVERY_STATES`. **``plan_finished`` is the only
+completion signal**, and ``needs_operator=False`` is never a synonym for it.
+
+Completion also needs *evidence*, not just matching bytes. Matching content at the destination with
+an empty source path is necessary and **not sufficient**: an unjournalled publication (see F1
+above) looks exactly like that on disk, so an item is reported finished only when the durable
+journal's last record for it is ``COMPLETE``. :data:`SOURCE_REMOVAL_BLOCKED` and
+:data:`PUBLISHED_UNJOURNALLED` are terminal but are never completion.
+
 What is *not* claimed
 ---------------------
 Identity is proven on a descriptor, never on a pathname — but a rename names a path, so a narrow
@@ -183,10 +205,29 @@ SOURCE_REMOVAL_BLOCKED = "SOURCE_REMOVAL_BLOCKED"
 #: same-volume rename that moved it, ``False`` for the cross-volume copy that deliberately did not.
 PUBLISHED_UNJOURNALLED = "PUBLISHED_UNJOURNALLED"
 
+#: [R5-P50 / F2] A **recovery-only** aggregate: there is known remaining work, and identifying it
+#: needs neither a destructive action nor a human decision — a safe retry, typically. It is
+#: deliberately *not* in :data:`STATES`, because no *item* is ever in this state and no journal
+#: record carries it; adding it there would make ``_history_fault`` accept it as an item state.
+#: See :data:`RECOVERY_STATES`.
+RECOVERY_INCOMPLETE = "RECOVERY_INCOMPLETE"
+
 #: Every state a transfer can be in. Ordered as the happy path progresses, then the terminals.
+#: This is the **item/batch** vocabulary and is what the journal may legitimately contain.
 STATES = (PLANNED, INTENT_RECORDED, STAGED, VERIFIED, PUBLISHED, SOURCE_REMOVED, COMPLETE,
           REFUSED, PARTIAL, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED,
           PUBLISHED_UNJOURNALLED)
+
+#: [R5-P50 / F2] The three aggregates :func:`recover` may return. ``COMPLETE`` and
+#: ``RECOVERY_REQUIRED`` are shared with :data:`STATES` and keep their existing meanings exactly;
+#: ``RECOVERY_INCOMPLETE`` is new and recovery-only.
+RECOVERY_STATES = (COMPLETE, RECOVERY_INCOMPLETE, RECOVERY_REQUIRED)
+
+#: [R5-P50 / F2] The recorded item states that are terminal but explicitly **not** completion.
+#: An item whose last durable record is one of these can never be reported as finished, however
+#: well its bytes match: one is a withheld deletion and the other is a publication with no durable
+#: evidence, and both are exactly the conditions R5-P47 and R5-P49 introduced to be honest about.
+_UNFINISHED_TERMINALS = (SOURCE_REMOVAL_BLOCKED, PUBLISHED_UNJOURNALLED)
 
 #: [R5-P49 / F1] The states that assert an irreversible filesystem change happened. An outcome in
 #: one of these may never report ``source_removed=False`` *and* an empty ``published_path``; the
@@ -330,6 +371,24 @@ class TransferResult:
         return self.state == COMPLETE
 
 
+#: The four per-item recovery actions. Deliberately **not** extended by R5-P50: the vocabulary is
+#: pinned by ``test_holds_every_recovery_action_is_one_of_four``, and ``ACTION_OPERATOR_REQUIRED``
+#: already means exactly "the filesystem or journal does not permit a safe automated conclusion".
+#: The added precision lives in each finding's ``detail`` and in the aggregate state.
+ACTION_NONE = "none"
+ACTION_RETRY_SAFE = "retry_safe"
+ACTION_MAY_REMOVE_DUPLICATE = "operator_may_remove_duplicate"
+ACTION_OPERATOR_REQUIRED = "operator_required"
+
+#: [R5-P50 / F2] The actions that mean **a human has something to do**. Note that
+#: ``operator_may_remove_duplicate`` is in here: a report must not claim there is no operator-facing
+#: action while, in the same breath, recommending that the operator remove an original.
+_OPERATOR_ACTIONS = (ACTION_OPERATOR_REQUIRED, ACTION_MAY_REMOVE_DUPLICATE)
+
+#: [R5-P50 / F2] The only action that means **this item is done**.
+_COMPLETING_ACTIONS = (ACTION_NONE,)
+
+
 @dataclass(frozen=True)
 class RecoveryFinding:
     clip_id: str
@@ -341,13 +400,55 @@ class RecoveryFinding:
 
 @dataclass(frozen=True)
 class RecoveryReport:
+    """[R5-P50 / F2] Three *independent* signals, because collapsing them was the defect.
+
+    ``recover()`` used to compute ``state = RECOVERY_REQUIRED if needs_operator else COMPLETE``,
+    so ``COMPLETE`` meant only *"nothing needs a human"* — while reusing a constant that means
+    *"done"* in the item and batch vocabularies. An independent review measured the consequence on
+    two real volumes: a cross-volume copy-only transfer returned ``SOURCE_REMOVAL_BLOCKED``, the
+    batch correctly reported ``PARTIAL`` with ``advance_page=False``, and ``recover()`` on the very
+    same filesystem answered ``COMPLETE`` / ``needs_operator=False`` — with its own finding reading
+    ``operator_may_remove_duplicate``. The same aggregation called a three-clip batch COMPLETE when
+    two clips had never left their original folder.
+
+    So the three questions are now asked and answered separately:
+
+    * :attr:`plan_finished` — **is the original transfer plan done?** ``True`` only when every item
+      is independently established as completed. This is the only field a caller may use to decide
+      that a page needs no further work.
+    * :attr:`needs_operator` — **does a human have something to do?** Independent of the above: an
+      unfinished plan may need no human (a safe retry), and a plan may need a human for something
+      that is not ambiguous (removing a verified duplicate).
+    * :attr:`state` — the aggregate classification: :data:`COMPLETE`,
+      :data:`RECOVERY_INCOMPLETE` or :data:`RECOVERY_REQUIRED`.
+
+    ``needs_operator=False`` is **never** a synonym for ``plan_finished=True``.
+    """
+
     plan_id: str
     state: str
     findings: tuple[RecoveryFinding, ...] = ()
+    #: [R5-P50 / F2] Set explicitly by :func:`recover`. Defaults to ``False`` so that a report
+    #: built any other way is never mistaken for a finished plan — the safe direction.
+    plan_finished: bool = False
 
     @property
     def needs_operator(self) -> bool:
-        return self.state == RECOVERY_REQUIRED
+        """Is there an operator-facing action anywhere in this report?
+
+        The ``state == RECOVERY_REQUIRED`` arm is kept as a floor so a report constructed without
+        findings behaves exactly as it did before R5-P50; the findings arm is what adds the
+        ``operator_may_remove_duplicate`` case the old definition could not express.
+        """
+        if self.state == RECOVERY_REQUIRED:
+            return True
+        return any(finding.action in _OPERATOR_ACTIONS for finding in self.findings)
+
+    @property
+    def remaining_items(self) -> tuple[str, ...]:
+        """Clip ids this report cannot establish as completed. Empty iff :attr:`plan_finished`."""
+        return tuple(f.clip_id for f in self.findings
+                     if f.clip_id and f.action not in _COMPLETING_ACTIONS)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1701,6 +1802,23 @@ def _history_fault(events: Sequence[dict]) -> str:
     return ""
 
 
+def _batch_record(journal: TransferJournal, plan_id: str) -> dict | None:
+    """[R5-P50 / F2 §6] The last batch-level summary record for *plan_id*, or ``None``.
+
+    Read separately from :meth:`TransferJournal.states_for`, which only returns records carrying a
+    ``clip_id`` and is therefore structurally blind to the batch line.
+    """
+    found = None
+    try:
+        records = journal.records()
+    except TransferRefused:
+        return None
+    for event in records:
+        if event.get("k") == "batch" and event.get("plan_id") == plan_id:
+            found = event
+    return found
+
+
 def recover(plan: TransferPlan, journal: TransferJournal, *,
             now: Callable[[], float] = time.time) -> RecoveryReport:
     """Reconcile recorded intent against the **actual** filesystem.
@@ -1790,46 +1908,94 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
                    f"destination={'match' if dest_matches else ('present' if dest_exists else 'absent')}"
 
         if dest_matches and not source_exists:
-            findings.append(RecoveryFinding(item.clip_id, recorded, observed, "none",
-                                            "the move completed; nothing to do"))
+            # [R5-P50 / F2] Matching bytes at the destination and an empty source path are
+            # *necessary* for completion and not *sufficient*. The transfer is only finished if the
+            # durable journal also says so: an unjournalled publication (R5-P49) looks exactly like
+            # this on disk, and reading it as a completed, durably recorded move is precisely the
+            # inference F2 was about. So require a terminal record that proves completion.
+            if recorded == COMPLETE:
+                findings.append(RecoveryFinding(item.clip_id, recorded, observed, ACTION_NONE,
+                                                "the move completed and is durably recorded"))
+                continue
+            needs_operator = True
+            findings.append(RecoveryFinding(
+                item.clip_id, recorded, observed, ACTION_OPERATOR_REQUIRED,
+                f"the destination holds the approved content and the source path is empty, but the "
+                f"journal's last record for this clip is {recorded!r}, not {COMPLETE} — the move "
+                f"cannot be shown to have completed durably, so it is not reported as finished"))
             continue
         if dest_matches and source_matches:
             # Published and verified while the source survived -- the crash-after-publication case,
             # and also the ordinary outcome of the cross-volume path, which withholds the delete.
             # Recovery **recommends** and never deletes: this engine has no delete it can prove
             # correct, so neither does its recovery. The operator decides.
+            #
+            # [R5-P50 / F2] This is **unfinished work**, not a completed move, and the operator is
+            # the one who has to act -- so it contributes to neither `plan_finished` nor a
+            # `needs_operator=False` claim. Both of those used to be wrong here simultaneously.
             findings.append(RecoveryFinding(
-                item.clip_id, recorded, observed, "operator_may_remove_duplicate",
+                item.clip_id, recorded, observed, ACTION_MAY_REMOVE_DUPLICATE,
                 "both copies match the approved content fingerprint; this engine will not delete "
-                "either, because it cannot prove a pathname delete removes the verified object"))
+                "either, because it cannot prove a pathname delete removes the verified object. "
+                "The move is UNFINISHED: removing the original is a separately authorized "
+                "operator-managed step"))
             continue
         if not dest_exists and source_matches:
             findings.append(RecoveryFinding(
-                item.clip_id, recorded, observed, "retry_safe",
-                "nothing was published and the source is intact"))
+                item.clip_id, recorded, observed, ACTION_RETRY_SAFE,
+                "nothing was published and the source is intact; this clip has NOT been "
+                "transferred and a retry is safe, but recovery neither retries nor moves anything"))
             continue
         if dest_exists and not dest_matches:
             needs_operator = True
             findings.append(RecoveryFinding(
-                item.clip_id, recorded, observed, "operator_required",
+                item.clip_id, recorded, observed, ACTION_OPERATOR_REQUIRED,
                 "a different file occupies the destination; it will not be overwritten"))
             continue
         if not source_exists and not dest_exists:
             needs_operator = True
             findings.append(RecoveryFinding(
-                item.clip_id, recorded, observed, "operator_required",
+                item.clip_id, recorded, observed, ACTION_OPERATOR_REQUIRED,
                 "neither the source nor the destination is present"))
             continue
         needs_operator = True
-        findings.append(RecoveryFinding(item.clip_id, recorded, observed, "operator_required",
+        findings.append(RecoveryFinding(item.clip_id, recorded, observed,
+                                        ACTION_OPERATOR_REQUIRED,
                                         "the source is present but its identity does not match"))
 
-    state = RECOVERY_REQUIRED if needs_operator else COMPLETE
+    # ---- aggregate: three independent questions ------------------------------------------
+    # [R5-P50 / F2] `plan_finished` is the ONLY completion signal. It is true exactly when every
+    # item in the original plan was independently established as completed -- not when nothing
+    # unsafe happens to be required. A plan with no items is vacuously finished, which matches
+    # `execute_transfer`, where an empty plan also reports COMPLETE.
+    item_findings = [f for f in findings if f.clip_id]
+    unfinished = [f for f in item_findings if f.action not in _COMPLETING_ACTIONS]
+    plan_finished = not needs_operator and not unfinished
+
+    # [R5-P50 / F2 §6] The batch-level record is checked, and it is checked for what it can
+    # actually prove. Where every item already carries its own durable COMPLETE record, the batch
+    # summary adds no proof, so its absence is reported as a qualification rather than escalated --
+    # escalating it would be a second inaccuracy, in the opposite direction.
+    if plan_finished and plan.items and not _batch_record(journal, plan.plan_id):
+        findings.append(RecoveryFinding(
+            "", "", "batch_summary=absent", ACTION_NONE,
+            "every item carries its own durable COMPLETE record, so the plan is finished; note "
+            "that the batch-level summary record is absent, which is why the executing run could "
+            "not itself claim durable batch completion"))
+
+    if needs_operator:
+        state = RECOVERY_REQUIRED
+    elif unfinished:
+        state = RECOVERY_INCOMPLETE
+    else:
+        state = COMPLETE
+
     # [R5-P49 / F1] Recovery is a read-only reconciliation; failing to record that it ran must not
     # discard the findings it produced, which are the whole point of calling it.
     _try_journal(journal, {"k": "recovery", "plan_id": plan.plan_id, "state": state,
+                           "plan_finished": plan_finished, "remaining": len(unfinished),
                            "findings": len(findings), "at": now()})
-    return RecoveryReport(plan.plan_id, state, tuple(findings))
+    return RecoveryReport(plan.plan_id, state, tuple(findings), plan_finished)
 
 
 def staging_leftovers(directory: str) -> list[str]:
@@ -1847,6 +2013,10 @@ def staging_leftovers(directory: str) -> list[str]:
 
 
 __all__ = [
+    "ACTION_MAY_REMOVE_DUPLICATE",
+    "ACTION_NONE",
+    "ACTION_OPERATOR_REQUIRED",
+    "ACTION_RETRY_SAFE",
     "COMPLETE",
     "INTENT_RECORDED",
     "ItemOutcome",
@@ -1858,7 +2028,9 @@ __all__ = [
     "PUBLISHED",
     "PUBLISHED_UNJOURNALLED",
     "PlanRefusal",
+    "RECOVERY_INCOMPLETE",
     "RECOVERY_REQUIRED",
+    "RECOVERY_STATES",
     "REFUSED",
     "REPARSE_NO",
     "REPARSE_UNKNOWN",

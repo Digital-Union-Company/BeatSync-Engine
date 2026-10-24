@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, PARTLY REMEDIATED, TWO MAJORS OPEN, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, ONE MAJOR OPEN, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,7 +396,7 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P49, is a twice-reviewed and partly remediated transfer core that nothing calls.**
+**P2, as of R5-P50, is a twice-reviewed transfer core with one MAJOR still open, that nothing calls.**
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -427,8 +427,9 @@ them, and two corrections are limitations rather than fixes and must be read as 
   transfer lease.
 
 **A second independent review (R5-P48) confirmed all eight of those corrections and found three new
-MAJORs. R5-P49 closed two of them; two remain OPEN.** The engine is still unwired, so none of this
-is reachable from the GUI — but the PR is **not** cleared for integration:
+MAJORs. R5-P49 closed two of them and R5-P50 closed the third; one MAJOR remains OPEN.** The engine
+is still unwired, so none of this is reachable from the GUI — but the PR is **not** cleared for
+integration:
 
 - **CLOSED (R5-P49) — no status may claim "nothing moved" after an irreversible step.** Every
   journal append after the commit point was unguarded, so a journal write failure — an ordinary
@@ -443,10 +444,13 @@ is reachable from the GUI — but the PR is **not** cleared for integration:
   glued onto it and the committed event was silently lost. The tail is now classified before every
   write, a complete-but-unterminated record is preserved as history, a torn one is closed off with
   an identifiable separator, and an uninspectable tail refuses the write.
-- **OPEN (MAJOR) — `recover()` reports `COMPLETE` for work that is not finished.** A copy-only
-  cross-volume item, and clips never attempted, both aggregate to
-  `COMPLETE`/`needs_operator=False`. Correct next-page advancement therefore cannot be relied on
-  yet, and no caller may gate on the recovery state until this is fixed.
+- **CLOSED (R5-P50) — recovery no longer reports unfinished work as complete.** A copy-only
+  cross-volume item, and clips never attempted, both used to aggregate to
+  `COMPLETE`/`needs_operator=False`. There are now three independent signals — `plan_finished`
+  (the only completion signal), `needs_operator`, and a `state` of `COMPLETE`,
+  `RECOVERY_INCOMPLETE` or `RECOVERY_REQUIRED` — and completion additionally requires a durable
+  terminal journal record, because matching bytes alone cannot distinguish a finished move from an
+  unjournalled publication.
 - **OPEN (MAJOR) — revocation does not take effect before the next irreversible step.** Session,
   scan and page revocation are all accepted after the per-item revalidation and before the commit,
   and the item still completes; the window is O(file size) because the source is hashed in between.

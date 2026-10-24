@@ -589,7 +589,19 @@ def test_F1_18_interruption_after_the_rename_leaves_a_recoverable_filesystem(wor
     assert os.path.isfile(item.destination_path)
     assert world["store"].active_transfer(item.identity) == "", "the lease was released"
     report = tr.recover(plan, tr.TransferJournal(world["journal"].directory))
-    assert report.findings[0].action == "none", "recovery sees the completed move"
+    # [R5-P50 / F2] This assertion originally read `action == "none"` -- "recovery sees the
+    # completed move". That was this file writing down the F2 defect: the journal here stops at
+    # PUBLISHED because the interruption fired before the COMPLETE record, so the move is
+    # physically done and **not durably confirmed**. Matching bytes plus an empty source path are
+    # necessary for completion, never sufficient, since an unjournalled publication looks
+    # identical on disk. Recovery therefore escalates instead of declaring it finished.
+    assert [e["state"] for e in
+            tr.TransferJournal(world["journal"].directory).states_for(plan.plan_id)[item.clip_id]] \
+        == [tr.INTENT_RECORDED, tr.PUBLISHED], "no COMPLETE record was ever written"
+    assert report.findings[0].action == "operator_required"
+    assert report.state == tr.RECOVERY_REQUIRED
+    assert report.plan_finished is False
+    assert "cannot be shown to have completed durably" in report.findings[0].detail
 
 
 def test_F1_19_interruption_after_publication_is_reconstructible_from_the_filesystem(world):
@@ -608,9 +620,20 @@ def test_F1_19_interruption_after_publication_is_reconstructible_from_the_filesy
         "the journal genuinely lacks any publication record"
     report = tr.recover(plan, cold_journal)
     moved = [f for f in report.findings if f.clip_id == item.clip_id]
-    assert moved and moved[0].action == "none", \
-        "recovery establishes the completed move from the filesystem, not from the journal"
-    assert os.path.isfile(item.destination_path)
+    # [R5-P50 / F2] This originally asserted `action == "none"` on the reasoning that recovery
+    # "establishes the completed move from the filesystem, not from the journal". R5-P48 / F2
+    # showed that reasoning is the defect: the filesystem cannot distinguish a durably completed
+    # move from an unjournalled publication, and this very test constructs the latter. The
+    # correct answer is to report what IS known -- the bytes are published and the source path is
+    # empty -- while refusing to call it finished, because no durable record proves it.
+    assert moved and moved[0].action == "operator_required"
+    assert report.state == tr.RECOVERY_REQUIRED
+    assert report.plan_finished is False, "an unjournalled publication is not a finished plan"
+    assert report.needs_operator is True
+    assert os.path.isfile(item.destination_path), "and the published object is left exactly alone"
+    assert tr.PUBLISHED_UNJOURNALLED not in [
+        e["state"] for e in cold_journal.states_for(plan.plan_id).get(item.clip_id, [])], \
+        "the best-effort condition record could not be written either, which is why this escalates"
 
 
 @windows_only
@@ -1063,9 +1086,18 @@ def test_COMBINED_a_journal_that_recovers_afterwards_can_record_the_next_item(wo
              for item in plan.items}
     assert before == after, "recovery mutated nothing"
     actions = {f.clip_id: f.action for f in report.findings if f.clip_id}
-    assert actions[plan.items[0].clip_id] == "none", "the published clip is recognised as moved"
+    # [R5-P50 / F2] The first clip was published but its PUBLISHED record failed, so the journal
+    # carries PUBLISHED_UNJOURNALLED as its last state -- terminal, but explicitly NOT completion.
+    # This assertion previously read `== "none"` ("recognised as moved"), which is the inference
+    # F2 forbids: recovery may report that the object is published without calling the transfer
+    # finished.
+    assert actions[plan.items[0].clip_id] == "operator_required", \
+        "published, but with no durable proof of completion"
     for skipped in plan.items[1:]:
         assert actions[skipped.clip_id] == "retry_safe", "the untouched clips are retry-safe"
+    assert report.state == tr.RECOVERY_REQUIRED
+    assert report.plan_finished is False
+    assert len(report.remaining_items) == len(plan.items), "no clip is established as finished"
 
 
 def test_COMBINED_a_failed_batch_summary_never_erases_known_item_outcomes(world):

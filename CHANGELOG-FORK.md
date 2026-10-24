@@ -20,6 +20,48 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-24 (Clips Preview P2: recovery completion semantics)
+
+The third of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The engine remains unwired and Confirm still moves nothing.
+
+- **Recovery no longer reports an unfinished plan as complete.** `recover()` aggregated as
+  `RECOVERY_REQUIRED if needs_operator else COMPLETE`, so `COMPLETE` meant *"nothing needs a
+  human"* while reusing a constant that means *"done"* everywhere else in the engine. Measured on
+  two real volumes: a cross-volume copy-only transfer returned `SOURCE_REMOVAL_BLOCKED`, the batch
+  correctly reported `PARTIAL` with `advance_page=False`, and `recover()` on the identical
+  filesystem answered `COMPLETE` / `needs_operator=False` — while its own finding read
+  `operator_may_remove_duplicate`. The same aggregation called a three-clip batch COMPLETE with two
+  clips still in the review folder, and a mutation control proved no test pinned either behaviour.
+  There are now three independent signals: `RecoveryReport.plan_finished` (the only completion
+  signal, defaulting to `False`), `needs_operator`, and a `state` drawn from `RECOVERY_STATES` —
+  `COMPLETE`, the new `RECOVERY_INCOMPLETE`, or `RECOVERY_REQUIRED`. `needs_operator=False` is
+  never a synonym for `plan_finished=True`.
+- **Completion requires durable evidence, not just matching bytes.** Matching content at the
+  destination with an empty source path is necessary and not sufficient — an unjournalled
+  publication looks identical on disk — so an item is reported finished only when the journal's
+  last record for it is `COMPLETE`. `SOURCE_REMOVAL_BLOCKED` and `PUBLISHED_UNJOURNALLED` are
+  terminal but never completion. An absent *batch* summary is reported as a qualification where
+  every item is individually proven, rather than escalated.
+- **`operator_may_remove_duplicate` now counts as both unfinished work and an operator action**, so
+  a report can no longer recommend that the operator remove an original while claiming no human is
+  involved. `retry_safe` is unfinished work that needs no operator decision. The per-item action
+  vocabulary is deliberately unchanged at four values.
+- **Recovery remains strictly non-destructive** — a test spies on every destructive `os` primitive
+  and requires zero calls. A recommended action is never permission to perform it.
+
+Four pre-existing assertions encoded the old semantics and were corrected with the reason recorded
+in place; three of them were added by the R5-P49 commit below. `ItemOutcome`, `TransferResult`,
+`RecoveryFinding` and `advance_page` are unchanged, `RecoveryReport` gains one trailing field with a
+safe default, and older journal records remain readable.
+
+**Still open, so this is not clearance:** session, scan and page revocation still take effect only
+between items (R5-P48 / F3), whose lifecycle and lease logic is deliberately untouched; the
+rollback target directory is still unprobed (F5); cross-volume source removal remains withheld, so
+the accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and
+decisions written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper,
+no new dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
 ### Changed — 2026-10-24 (Clips Preview P2: post-commit outcome truthfulness and journal-tail safety)
 
 A **second** independent adversarial review (R5-P48) of the engine below confirmed all eight

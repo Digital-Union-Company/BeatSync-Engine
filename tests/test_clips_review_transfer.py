@@ -782,7 +782,21 @@ def test_20_interruption_after_publication_leaves_both_copies_and_is_recoverable
     # [R5-P47 / M4] Recovery recommends; it never deletes, and it no longer frames the duplicate
     # as something the engine should remove, because this engine has no delete it can prove right.
     assert finding.action == "operator_may_remove_duplicate"
-    assert report.state == tr.RECOVERY_REQUIRED or not report.needs_operator
+    # [R5-P50 / F2] This assertion used to read
+    #     `report.state == tr.RECOVERY_REQUIRED or not report.needs_operator`
+    # which is satisfied by BOTH of the two possible answers and therefore pinned nothing. It was
+    # the aggregation ambiguity R5-P48 / F2 reported, written down as a test. The contract is now
+    # explicit: both copies exist, so the move is UNFINISHED; nothing is ambiguous, so this is
+    # INCOMPLETE rather than REQUIRED; and an operator-managed removal is being recommended, so
+    # the report must not simultaneously claim no human is involved.
+    assert report.state == tr.RECOVERY_INCOMPLETE
+    assert report.plan_finished is False, "a withheld deletion is not a finished plan"
+    assert report.needs_operator is True, \
+        "it recommends an operator-managed removal, so it may not claim otherwise"
+    # The interruption fired on the first item, so the rest were never attempted and are
+    # retry-safe. Every clip in the plan is therefore unfinished, this one included.
+    assert item.clip_id in report.remaining_items
+    assert len(report.remaining_items) == len(plan.items)
     assert os.path.isfile(item.source_path), "recovery must not have removed anything"
 
 

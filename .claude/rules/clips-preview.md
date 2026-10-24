@@ -8,6 +8,7 @@ paths:
   - "tests/test_clips_review_transfer.py"
   - "tests/test_clips_review_transfer_security.py"
   - "tests/test_clips_review_transfer_journal_integrity.py"
+  - "tests/test_clips_review_transfer_recovery_semantics.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -94,6 +95,45 @@ then passed as a valid publication; recovery recommends and **never deletes**.
 
 Still true, and unchanged by any of this: the engine remains unreachable from the GUI.
 
+### [R5-P50] "Nothing needs a human" is not "the plan is done"
+
+`recover()` aggregated as `RECOVERY_REQUIRED if needs_operator else COMPLETE`, so `COMPLETE` meant
+*"nothing needs a human"* while reusing a constant that means *"done"* everywhere else in the
+engine. Measured on two real volumes: a cross-volume copy-only transfer returned
+`SOURCE_REMOVAL_BLOCKED`, the batch correctly reported `PARTIAL` with `advance_page=False`, and
+`recover()` on the identical filesystem answered `COMPLETE` / `needs_operator=False` — while its own
+finding read `operator_may_remove_duplicate`. The same aggregation called a three-clip batch
+COMPLETE with two clips still sitting in the review folder. An R5-P48 mutation control proved **no
+test pinned either behaviour**.
+
+**Three signals, independent by construction.** `RecoveryReport.plan_finished` answers *is the plan
+done?* and is the **only** completion signal a caller may gate on; `needs_operator` answers *does a
+human have something to do?*; and `state` is one of `RECOVERY_STATES` — `COMPLETE`,
+`RECOVERY_INCOMPLETE` (known remaining work, nothing ambiguous) or `RECOVERY_REQUIRED` (evidence
+inconsistent, unavailable or needing a decision). **`needs_operator=False` is never a synonym for
+`plan_finished=True`**, and `plan_finished` defaults to `False` so a report built any other way is
+never mistaken for a finished plan.
+
+**Completion needs evidence, not just matching bytes.** Matching content at the destination with an
+empty source path is **necessary and not sufficient** — an unjournalled publication looks exactly
+like that on disk. An item is reported finished only when the durable journal's last record for it
+is `COMPLETE`. `SOURCE_REMOVAL_BLOCKED` and `PUBLISHED_UNJOURNALLED` are terminal but are **never**
+completion, however well the bytes match. Where every item carries its own durable `COMPLETE`
+record, an absent *batch* summary is reported as a qualification rather than escalated: the items
+are individually proven, so escalating would be the opposite inaccuracy.
+
+**`operator_may_remove_duplicate` is unfinished work AND an operator action.** It contributes to
+neither `plan_finished` nor a `needs_operator=False` claim — both used to be wrong there at once.
+`retry_safe` is unfinished work needing **no** operator decision. The action vocabulary is
+deliberately still exactly four values; the added precision lives in each finding's `detail` and in
+the aggregate state.
+
+**Recovery stays strictly non-destructive.** It deletes, moves, retries, replaces and rewrites
+nothing; a test spies on `os.unlink`/`remove`/`rename`/`replace`/`rmdir`/`truncate` and requires
+**zero** calls. A recommended action is never permission to perform it. `RECOVERY_INCOMPLETE` is
+deliberately **not** in `STATES`: no item is ever in it and no journal record carries it, and
+adding it there would make `_history_fault` accept it as an item state.
+
 ### [R5-P49] Reporting may not retract a completed operation, and a journal append may not vanish
 
 A second independent review (R5-P48) confirmed all eight corrections above and found **three new
@@ -147,10 +187,9 @@ not described as a cross-process file lock.
 
 **What R5-P49 does NOT close, stated here so no reader infers clearance:**
 
-- **F2 (MAJOR, OPEN)** — `recover()` still aggregates intentionally-unfinished work into
-  `COMPLETE`/`needs_operator=False`: a copy-only cross-volume item whose own finding is
-  `operator_may_remove_duplicate`, and clips that were never attempted, both read as "nothing needs
-  a human". The journal-integrity escalation added here is a *different* check and does not fix it.
+- **F2 — CLOSED by R5-P50**, see the next section. (At the time of the R5-P49 commit it was open:
+  `recover()` aggregated intentionally-unfinished work into `COMPLETE`/`needs_operator=False`. The
+  journal-integrity escalation R5-P49 added was a *different* check and did not fix it.)
 - **F3 (MAJOR, OPEN)** — session, scan and page revocation are still accepted after `_revalidate()`
   and before the commit, and the item still completes. `ReviewStore.begin_scan`,
   `ClipRegistry.revoke_owner` and the transfer-lease model are deliberately **untouched** here.
