@@ -20,6 +20,56 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-24 (Clips Preview: a binding lifecycle authority for in-flight transfers)
+
+The last of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The transfer engine remains unwired and Confirm still moves nothing.
+
+- **A transfer now holds the authority it depends on, and conflicting lifecycle work is refused.**
+  Execution revalidated the decision, its revision, the scan generation and the session *per item*,
+  and the R5-P47 lease stopped a decision moving across the commit point — but nothing else was
+  held. Measured: `revoke_owner`, `new_session`, `begin_scan`, `publish_page`,
+  `ScanCoordinator.begin` and a whole new scan were all **accepted** after revalidation and before
+  `os.rename`, and the clip published anyway and reported `COMPLETE`; in two cases the session was
+  already revoked at the commit point, and in another the gallery had already blanked. The window
+  is O(file size), because the source is hashed in between. `LifecycleAuthority` is an owner-scoped
+  gate that every authority-changing operation consults **before** mutating anything, refusing a
+  conflicting same-owner operation **fail-fast** with the existing `transfer_in_progress` token —
+  no queue, no wait, no silent invalidation, no implicit cancellation — retryable once released.
+- **The guard sits in `ScanCoordinator.begin`, which a `begin_scan`-only fix would miss.** `begin`
+  makes a new generation the newest *before* the session and page are replaced, and a stored view
+  stops being current the moment it is not the newest — so `begin` **alone** blanks the gallery.
+  Guarding only `ReviewStore.begin_scan` would have refused the scan after the damage. A refused
+  scan now changes nothing at all, and tests assert the authoritative view is byte-identical
+  across it.
+- **Eviction is not an exemption.** The owner, session and page caps and `ScanCoordinator._prune`
+  all revoke authority, so a leased owner is skipped rather than evicted; if every tracked owner is
+  leased the cap is allowed to exceed, because a cap bounds memory while a lease protects an
+  irreversible operation in flight.
+- **"Generation changed but the store still shows the old scan" is not valid authority.** A
+  transfer cannot acquire while a newer generation has not yet published its view (`scan_in_flight`),
+  and becomes acquirable again as soon as the transition completes.
+- **One lock order, documented and asserted:** scan coordinator → registry → store →
+  lifecycle authority (leaf, never held while taking another). The one method that must read the
+  coordinator does so before taking its own lock, and a test pins that ordering on the source
+  because a cycle would deadlock rather than fail. No subsystem lock is held across hashing,
+  copying, FFmpeg work or `fsync`.
+- **Release discipline:** released on every terminal state and on an unexpected exception; one plan
+  cannot release another's; an owner mismatch releases nothing; a failed acquisition rolls back only
+  what that caller took.
+
+Binding is explicit, so every existing P1 construction keeps working unguarded and production binds
+in one call. The only `gui.py` changes are that call, the lazy store joining it, and a typed handler
+so a refused scan repaints the operator's existing page instead of an empty one — no import of the
+transfer engine, no route, no media movement, no Confirm change. Process-local scope only; a second
+process on the same state directory is explicitly not claimed to be protected.
+
+**Still open:** the same-volume rollback target is still not no-replace-probed (R5-P48 / F5,
+advisory); cross-volume source removal remains withheld, so the accepted `… → REMOVE SOURCE`
+contract is still unmet and an owner decision; decisions written by today's P1 path still carry no
+content fingerprint; there is no transfer GUI/HTTP integration; and OD-A off-machine retention is
+unresolved. No `ctypes`, no native helper, no pathname source deletion, no new dependency.
+
 ### Changed — 2026-10-24 (Clips Preview P2: recovery completion semantics)
 
 The third of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.

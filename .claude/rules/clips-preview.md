@@ -9,6 +9,7 @@ paths:
   - "tests/test_clips_review_transfer_security.py"
   - "tests/test_clips_review_transfer_journal_integrity.py"
   - "tests/test_clips_review_transfer_recovery_semantics.py"
+  - "tests/test_clips_review_lifecycle_authority.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -94,6 +95,67 @@ carried, because a forged record used to redefine what recovery believed and a s
 then passed as a valid publication; recovery recommends and **never deletes**.
 
 Still true, and unchanged by any of this: the engine remains unreachable from the GUI.
+
+### [R5-P51] A transfer holds the authority it depends on, and conflicting lifecycle work is refused
+
+`execute_transfer` revalidated the decision, its revision, the scan generation and the session
+**per item**, and the R5-P47 lease made `decide` refuse a leased identity — so the *decision* could
+not move across the commit point. **Nothing else was held.** Measured on the R5-P50 candidate, all
+of `ClipRegistry.revoke_owner`, `ClipRegistry.new_session`, `ReviewStore.begin_scan`,
+`ClipRegistry.publish_page`, `ScanCoordinator.begin` and a whole new scan were **accepted** after
+`_revalidate()` returned and before `os.rename`; the clip published anyway and reported `COMPLETE`.
+In two of those the session was already revoked at the commit point, and in another the gallery had
+already gone blank. The window is O(file size), because the source is hashed in between.
+
+**The owner-selected strategy is a binding lease, not a narrower recheck.** `LifecycleAuthority` is
+an owner-scoped gate that every authority-changing operation consults **before** it mutates
+anything. A conflicting same-owner operation is refused **fail-fast** with the existing 409-class
+token `transfer_in_progress`; there is no queue, no wait, no silent invalidation and no implicit
+cancellation of the transfer, and the operation may simply be retried once the lease releases.
+A final pre-commit revalidation would only shrink the window and is **not** what this is.
+
+**`ScanCoordinator.begin` is the guard that matters most, and a `begin_scan`-only fix misses it.**
+The real P1 flow is `begin → authority → begin_scan → new_session → publish_page → publish`, and
+`begin` makes a new generation the newest *before* the other three run. Since `view()` returns `{}`
+whenever the stored generation is not the newest, **`begin` alone blanks the operator's gallery** —
+so a guard placed only on `ReviewStore.begin_scan` would refuse the scan *after* the old page had
+stopped being current, which is precisely the "refused scan left the gallery blank" failure. The
+guard therefore sits in `begin`, before the counter moves, and a refused scan changes nothing: no
+generation, no `_newest` entry, no durable scan record, no minted session or page. Tests assert the
+authoritative view is **byte-identical** across a refused scan.
+
+**Eviction is not an exemption.** The three caps (`MAX_OWNERS`, `MAX_SESSIONS_PER_OWNER`,
+`MAX_PAGES_PER_SESSION`) and `ScanCoordinator._prune` all revoke authority. A leased owner is
+**skipped** rather than evicted, and if every tracked owner is leased the cap is allowed to exceed:
+the cap bounds memory, a lease protects an irreversible operation already in flight.
+
+**The §6 inverse is resolved explicitly.** "Generation changed but `ReviewStore` still shows the old
+scan" is **not** valid authority. `acquire` refuses with `scan_in_flight` while a newer generation
+has not published its view, so a transfer cannot take authority over a page that is already
+logically superseded. It becomes acquirable again as soon as the transition completes.
+
+**Lock ordering, one direction only.**
+`ScanCoordinator` lock → `ClipRegistry._lock` → `ReviewStore._lock` → **`LifecycleAuthority._lock`
+(leaf — never held while acquiring another)**. The one method that must read the coordinator,
+`acquire`, does so **before** taking its own lock, and a test asserts that ordering on the source
+because a cycle here would be a deadlock rather than a failing assertion. `begin_transfer` likewise
+acquires the authority *before* `ReviewStore._lock`, so no store → coordinator edge exists. No
+subsystem lock is held across hashing, copying, FFmpeg work or `fsync`.
+
+**Release discipline.** The lease is released on `COMPLETE`, `REFUSED`, `PARTIAL`, `ROLLED_BACK`,
+`RECOVERY_REQUIRED`, `PUBLISHED_UNJOURNALLED` and on an unexpected exception. One plan cannot
+release another's and an owner mismatch releases nothing — a release is an authority change too.
+A failed acquisition rolls back only what that caller took.
+
+**Scope, stated rather than implied.** Process-local, exactly like the R5-P47 decision lease. A
+second process opening the same review-state directory is **outside** this mechanism and is **not**
+claimed to be protected. This is not a cross-process lock.
+
+**Binding is explicit.** Each subsystem works unbound, which is what lets the existing P1 suites
+construct bare objects unchanged — so **production must bind**, and `gui.py` does, in one call
+beside the objects it already creates. That call imports nothing from `clips_review_transfer`,
+creates no route, moves no media and does not change Confirm; the only other GUI change is a typed
+handler so a refused `begin` repaints the operator's **existing** page rather than an empty one.
 
 ### [R5-P50] "Nothing needs a human" is not "the plan is done"
 

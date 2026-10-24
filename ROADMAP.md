@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, ONE MAJOR OPEN, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, ALL THREE MAJORS CLOSED, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,7 +396,7 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P50, is a twice-reviewed transfer core with one MAJOR still open, that nothing calls.**
+**P2, as of R5-P51, is a twice-reviewed transfer core with every reported MAJOR closed, that nothing calls.**
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -427,9 +427,9 @@ them, and two corrections are limitations rather than fixes and must be read as 
   transfer lease.
 
 **A second independent review (R5-P48) confirmed all eight of those corrections and found three new
-MAJORs. R5-P49 closed two of them and R5-P50 closed the third; one MAJOR remains OPEN.** The engine
-is still unwired, so none of this is reachable from the GUI — but the PR is **not** cleared for
-integration:
+MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last; **no MAJOR remains open.** The
+engine is still unwired, so none of this is reachable from the GUI — and the PR is still **not**
+cleared for integration, because what remains is a product decision rather than a defect:
 
 - **CLOSED (R5-P49) — no status may claim "nothing moved" after an irreversible step.** Every
   journal append after the commit point was unguarded, so a journal write failure — an ordinary
@@ -451,10 +451,14 @@ integration:
   `RECOVERY_INCOMPLETE` or `RECOVERY_REQUIRED` — and completion additionally requires a durable
   terminal journal record, because matching bytes alone cannot distinguish a finished move from an
   unjournalled publication.
-- **OPEN (MAJOR) — revocation does not take effect before the next irreversible step.** Session,
-  scan and page revocation are all accepted after the per-item revalidation and before the commit,
-  and the item still completes; the window is O(file size) because the source is hashed in between.
-  The lease guards `decide()` only.
+- **CLOSED (R5-P51) — a transfer now holds the authority it depends on.** Session, scan and page
+  revocation were all accepted after the per-item revalidation and before the commit, and the item
+  completed anyway. A shared owner-scoped `LifecycleAuthority` now refuses a conflicting same-owner
+  lifecycle operation **before it changes any authoritative state**, fail-fast and retryable. The
+  guard sits in `ScanCoordinator.begin`, because taking a generation alone already blanks the
+  gallery, so a `begin_scan`-only fix would have refused the scan after the damage. Eviction caps
+  skip a leased owner, and a transfer cannot acquire over a page a newer generation has already
+  superseded.
 - **OPEN (ADVISORY)** — the rollback renames into the source directory, whose no-replace semantics
   are never probed.
 

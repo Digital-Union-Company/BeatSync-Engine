@@ -1248,8 +1248,16 @@ def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
     # [R5-P47 / C] One exclusive lease over every identity in the plan, for the whole batch. While
     # it is held `decide()` refuses those identities, so `_revalidate` is binding; and a second
     # execution of this plan -- or of any overlapping plan -- cannot acquire it.
+    # [R5-P51 / F3] The lease is now owner-scoped as well as identity-scoped: the plan's session,
+    # page and scan generation travel with it, so a bound LifecycleAuthority can refuse the
+    # lifecycle operations that would revoke this transfer's authorization mid-flight. On a store
+    # with no authority bound this is exactly the R5-P47 identity lease, unchanged.
     identities = [i.identity for i in plan.items]
     try:
+        store.begin_transfer(plan.owner, plan.plan_id, identities,
+                             session_id=plan.session_id, page_token=plan.page_token,
+                             scan_id=plan.scan_id)
+    except TypeError:                                   # a store predating the scoped signature
         store.begin_transfer(plan.owner, plan.plan_id, identities)
     except Refusal as exc:
         journal.append({**plan.to_event(), "state": REFUSED,
