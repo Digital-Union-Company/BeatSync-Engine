@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core THREE TIMES REVIEWED, R5-P52's TWO MAJORS REMEDIATED, AWAITING R5-P54, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core FOUR TIMES REVIEWED, R5-P54's MAJOR REMEDIATED, AWAITING R5-P56, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,14 +396,23 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P53, is a three-times-reviewed transfer core whose every reported MAJOR has been
-remediated and which still awaits its next independent review (R5-P54), that nothing calls.**
+**P2, as of R5-P55, is a four-times-reviewed transfer core whose every reported MAJOR has been
+remediated and which still awaits its next independent review (R5-P56), that nothing calls.**
 A third independent review, **R5-P52**, reproduced two MAJOR race conditions that R5-P51's
 check-style guard had left open — the reverse-order lifecycle guard race on all five lifecycle
 operations, and a coordinator probe/acquire race — and returned `CHANGES_REQUIRED`. **R5-P53
 replaced the check with an atomic per-owner mutation reservation plus an epoch-validated
-acquisition protocol and closed both.** Being remediated is not the same as being cleared: the
-R5-P53 corrections have **not** themselves been independently reviewed.
+acquisition protocol and closed both.** A fourth independent review, **R5-P54**, confirmed both
+closed — in both acquisition orderings, against the real engine and the real filesystem — and then
+reproduced one new MAJOR of the same class in the rebinding gate R5-P53 had itself added:
+**F54-1**, a rebind taken while a mutation reservation was pending, which orphaned the reservation
+and reinstated the F53-A outcome in full (clip moved, `COMPLETE`, `advance_page=True`). **R5-P55
+closed it with a two-phase quiescence barrier whose linearization point is stated and tested** —
+not with the `has_any_pending()` predicate R5-P54 itself warned would merely narrow the window —
+and extended quiescence to cover an acquisition already inside its coordinator-probe window, which
+was the same defect with the lease and the reservation exchanged. Being remediated is not the same
+as being cleared: the R5-P55 correction has **not** itself been independently reviewed, and four
+lower-severity R5-P54 findings (F54-2, F54-3 MINOR; F54-4, F54-5 ADVISORY) remain open.
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -436,9 +445,24 @@ them, and two corrections are limitations rather than fixes and must be read as 
 **A second independent review (R5-P48) confirmed all eight of those corrections and found three new
 MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last — but a third review (R5-P52) then
 showed R5-P51's fix had narrowed rather than closed its finding, and reproduced two MAJOR races.
-**R5-P53 closed both, and they have not yet been independently reviewed.** The engine is still
-unwired, so none of this is reachable from the GUI — and the PR is still **not** cleared for
-integration:
+**R5-P53 closed both; a fourth review (R5-P54) independently confirmed that, then reproduced one
+new MAJOR in R5-P53's own rebinding gate, which R5-P55 closed — and the R5-P55 correction has not
+yet been independently reviewed.** The engine is still unwired, so none of this is reachable from
+the GUI — and the PR is still **not** cleared for integration:
+
+- **CLOSED (R5-P55) — a rebinding gate that is only a check orphans what it was protecting.**
+  R5-P53's `bind_lifecycle_authority()` refused a rebind that would orphan a live *lease* but asked
+  nothing about a pending mutation *reservation*. R5-P54 reproduced it 3/3: the reservation was
+  orphaned, the transfer acquired on the newly bound authority, and the clip moved with `COMPLETE`
+  and `advance_page=True` while the session and page were already revoked — the F53-A outcome
+  returning one layer up, which is why adding one more predicate was the wrong answer. A
+  **two-phase quiescence barrier** replaces it: every authority whose live state is at stake is
+  observed quiescent *and* closed to further acquisition in one critical section, before any
+  assignment, with the last successful barrier as the linearization point. Quiescence includes an
+  acquisition still inside its lock-free coordinator probe, because "no lease installed" is not
+  "no acquisition in flight" and a rebinding that began and finished in that interval would have
+  orphaned the lease instead. Initial attachment and same-authority rebinding take no barrier, so
+  startup and the lazy store path are untouched.
 
 - **CLOSED (R5-P53) — a lifecycle guard that is only a check does not bind.** R5-P51 called
   `guard()`, which read the lease map and released the lock *before* the mutation ran, while

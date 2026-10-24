@@ -10,6 +10,7 @@ paths:
   - "tests/test_clips_review_transfer_journal_integrity.py"
   - "tests/test_clips_review_transfer_recovery_semantics.py"
   - "tests/test_clips_review_lifecycle_authority.py"
+  - "tests/test_clips_review_authority_rebind_safety.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -331,6 +332,101 @@ refused succeeded). Rebinding the *same* instance stays idempotent, and attachin
 authority is still `None` is always allowed — that is the lazy `_clips_store()` path and P1
 startup, neither of which changed.
 
+### R5-P55 / F54-1 — rebinding is linearizable, not merely checked
+
+**R5-P53's rebinding gate was half-built, and it was itself a check-then-act.** It asked
+`has_any_lease()` and nothing about `_pending`. Independent review **R5-P54** reproduced the
+consequence 3/3 on real files: a rebind taken while a lifecycle mutation held a reservation
+orphaned that reservation, the transfer then acquired on the newly bound authority, and the clip
+**moved** with `batch=COMPLETE`, `advance_page=True` and no refusal record in the journal — while
+the session and page the operation had been planned against were already revoked. Bit-for-bit the
+F53-A outcome the reservation protocol exists to prevent, one layer up.
+
+**Adding `has_any_pending()` to the old predicate is not the fix.** R5-P54 said so explicitly, and
+it is right: asking a question and then assigning leaves the identical window, because a
+reservation granted between the question and the assignment is orphaned just as completely. That is
+the defect class R5-P52 already proved fatal.
+
+So the gate is a **two-phase quiescence barrier** with a stated linearization point:
+
+1. Work out which authorities are actually being **replaced**. Initial attachment (`current is
+   None`) and idempotent same-authority binding detach nothing, so they have no live state to
+   orphan, take **no barrier**, and cannot be made to refuse — which is what keeps `gui.py`'s
+   import-time bind and the lazy `_clips_store()` attachment working unchanged. A startup path
+   that can fail closed on a check it does not need is an outage, not a safeguard.
+2. If something *is* being replaced, `LifecycleAuthority.begin_rebind()` is called on every
+   distinct authority whose live state is at stake — each outgoing one **and** the incoming one.
+   Each call observes that authority quiescent and installs the barrier **in one critical
+   section**, after which `reserve_mutation`, `try_reserve_mutation` and `acquire` all refuse with
+   `lifecycle_authority_rebinding`. Any `False` refuses the whole rebinding.
+3. Only once **every** barrier is installed are the three attribute assignments performed.
+4. Every barrier is released in a `finally`, on the refusal path too.
+
+**Quiescent means three things, not one:** no lease, no pending reservation, **and no acquisition
+in flight**. The third is load-bearing and was not in R5-P54's proposed patch. `acquire` is not one
+critical section — it deliberately drops the lock to probe the coordinator — so between its two
+arbitrations no lease is installed yet and `_leases` alone reports the authority idle. A rebinding
+that began *and finished* inside that interval would be accepted and the lease would then be
+installed on an authority nothing consults: **F54-1 with the lease and the reservation exchanged.**
+`_acquiring` is incremented before the first arbitration and cleared in a `finally`, so the barrier
+spans the whole acquisition.
+
+**Linearization point: the last successful `begin_rebind()`.** After it, every involved authority
+is simultaneously free of leases, free of reservations, free of in-flight acquisitions and refusing
+new ones, and stays so until the binder finishes — only the binder that installed a barrier can
+lift it. A concurrent `reserve_mutation` or `acquire` therefore either completed strictly *before*
+that point, in which case some `begin_rebind` observes it and the whole rebinding fails closed, or
+is ordered strictly *after* it, in which case it is refused. There is no interleaving in which one
+is accepted and then detached.
+
+**No new deadlock and no new lock edge.** The barriers are taken one authority at a time, never two
+locks at once; `begin_rebind` **never waits** — it refuses, because a barrier that blocked on a
+live reservation would invert the documented order; and it never blocks `release_mutation` or
+`release`, so a live operation can always drain and an operator retry always succeeds. The barrier
+takes only the authority's own leaf lock, and nothing hashes, copies, journals or calls FFmpeg
+inside it.
+
+**Partial target sets stay supported for attachment and refused for replacement.** Partial binding
+*is* the production arrangement — `gui.py` binds the registry and coordinator, and the store joins
+later — so it is not forbidden. What may not happen is a partial **replacement** that leaves one
+subsystem consulting a different gate from its siblings while a mutation is mid-flight. All seven
+subsets are pinned by test.
+
+**A release frees by identity, never by equality.** `MutationReservation` is a frozen dataclass, so
+it has a generated `__eq__` and two reservations carrying the same four field values compare equal
+while being different objects. `release_mutation` matches with `is not`. Measured for R5-P55:
+relaxing that to `!=` survives the whole R5-P53 atomic-lifecycle suite untouched, because that
+suite's forged-token case differs in `operation` and so fails an equality test too. The
+field-for-field forgery is the only shape that distinguishes the two, and it now carries a test.
+
+**What R5-P55 does NOT close**, stated so no reader infers clearance:
+
+* **A direct `target.lifecycle_authority = other` assignment bypasses `bind_lifecycle_authority`
+  entirely.** No property of the API prevents it. The only reason F54-1 was never reachable in the
+  shipped application is that the one direct assignment `gui.py` performs — in `_clips_store()` —
+  is an *initial* attachment, on a store constructed three lines earlier whose authority is still
+  `None`; initial attachment detaches nothing and so cannot orphan anything. That is a property of
+  today's source rather than of the design, so it is **pinned by an AST test**: if a second binding
+  call appears, or that assignment becomes a replacement, the test fails and the bypass is
+  re-assessed instead of shipping silently. `gui.py` was **not modified by R5-P55**.
+* **F54-5 (ADVISORY) is unchanged.** The `current is None` carve-out still lets an unbound
+  subsystem join a *different* authority while another holds a live lease. Preserving lazy
+  attachment requires the carve-out; closing it is a separate decision.
+* **F54-2 (MINOR) is not patched, and is no longer reachable.** `ClipRegistry._new_session_locked`'s
+  eviction release and `ReviewStore.end_transfer` re-read `self.lifecycle_authority` instead of the
+  local their reservation or lease was taken from. Both are now unreachable *by construction*: a
+  pending reservation and a live lease each refuse the rebind that would be needed to make the
+  re-read resolve to a different object. Recorded, not relied upon.
+* **F54-3 (MINOR) and F54-4 (ADVISORY) are untouched** and still open — the two
+  outcome-preserving/atomicity-removing assertions R5-P54 asked for, and the unreserved
+  `publish`/`discard`, which must be **re-opened when the GUI transfer handler is written**: the
+  natural implementation (run a transfer, then repaint the gallery) is exactly the shape that makes
+  `publish` reachable under a live lease.
+* Everything R5-P53 left open stays open: **F5**, **cross-volume source removal**,
+  **decision-time content fingerprints**, **cross-process locking** (the model is process-local and
+  must never be described otherwise) and **GUI/HTTP integration**. The engine is still unwired and
+  Confirm still moves nothing. Independent review **R5-P56** is required.
+
 **Lock order is unchanged and still acyclic:**
 `ScanCoordinator` → `ClipRegistry` → `ReviewStore` → **`LifecycleAuthority` (leaf)**. Every nested
 edge runs downhill; the only method that reads another subsystem is `acquire`, and it holds no lock
@@ -343,6 +439,12 @@ path still records none, so no existing decision is transferable), **cross-proce
 model is process-local and must not be described otherwise), and **GUI/HTTP integration** — the
 engine is still unwired, Confirm still moves nothing, and `gui.py` was **not modified by R5-P53 at
 all**. Independent review **R5-P54** is required.
+
+> **R5-P54 ran, and returned `R5_P54_PR75_CHANGES_REQUIRED`.** Both R5-P52 MAJOR races were
+> independently confirmed closed, and one new MAJOR — **F54-1** — was reproduced 3/3 in the
+> rebinding gate described immediately above. R5-P55 corrects it; see the next section. Four
+> lower-severity findings (F54-2, F54-3 MINOR; F54-4, F54-5 ADVISORY) remain open and are
+> enumerated at the end of that section.
 
 ## The one idea everything rests on
 

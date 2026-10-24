@@ -263,6 +263,18 @@ LIFECYCLE_PENDING = "lifecycle_mutation_pending"
 #: different lifecycle epochs. The probe result is stale and is never silently accepted.
 LIFECYCLE_EPOCH_MOVED = "lifecycle_epoch_moved"
 
+#: [R5-P55 / F54-1] A lifecycle mutation reservation or a transfer acquisition attempted while an
+#: authority rebinding holds that authority's quiescence barrier. Distinct from
+#: :data:`LIFECYCLE_PENDING` and :data:`LIFECYCLE_CONFLICT` because it names a *third* holder: not
+#: another mutation and not a transfer, but the binder that is replacing the gate itself. The
+#: window is the three attribute assignments in :func:`bind_lifecycle_authority` and nothing else
+#: — no I/O, no hashing, no subsystem call — so an operator retry always succeeds.
+LIFECYCLE_REBINDING = "lifecycle_authority_rebinding"
+
+#: [R5-P55 / F54-1] A rebinding refused because an involved authority was not quiescent. Spelled
+#: as the literal R5-P53 already shipped so the wording an operator and a test see does not change.
+LIFECYCLE_REBIND_REFUSED = "lifecycle_authority_rebind_refused"
+
 #: How many times :meth:`LifecycleAuthority.acquire` may re-probe when the epoch moved underneath
 #: it. Bounded, and the bound is small: a retry is only worth attempting because the mover may have
 #: finished, and failing closed is always an acceptable outcome. This is **not** a spin lock -- each
@@ -398,6 +410,22 @@ class LifecycleAuthority:
         self._pending: dict[str, dict[str, MutationReservation]] = {}
         self.mutation_reservations = 0
         self.epoch_conflicts = 0
+        # ---- [R5-P55 / F54-1] the rebinding quiescence barrier ------------------------
+        #: True while :func:`bind_lifecycle_authority` holds this authority closed so that it can
+        #: be attached to, or detached from, a subsystem without a reservation or a lease being
+        #: created across the transition. Set **only** by :meth:`begin_rebind`, which observes
+        #: quiescence and installs the barrier in one critical section — that single atomic act is
+        #: what makes the rebind linearizable rather than check-then-act. Guarded by ``_lock``.
+        self._rebinding = False
+        self.rebind_barriers = 0
+        #: [R5-P55 / F54-1] How many :meth:`acquire` calls are currently *between* their first
+        #: arbitration and their final one. An acquisition is **not** a single critical section —
+        #: it deliberately releases ``_lock`` to probe the coordinator — so "no lease installed"
+        #: is not the same question as "no acquisition in flight", and quiescence needs the
+        #: second one too. Without it a rebinding could begin *and complete* inside that window,
+        #: leaving the lease installed on an authority no subsystem consults any more: F54-1 with
+        #: the lease and the reservation swapped over. Guarded by ``_lock``.
+        self._acquiring = 0
 
     # ---- queries ---------------------------------------------------------------------
 
@@ -432,6 +460,102 @@ class LifecycleAuthority:
         """
         with self._lock:
             return bool(self._leases)
+
+    def has_any_pending(self) -> bool:
+        """[R5-P55 / F54-1] Is any owner's lifecycle mutation holding a reservation right now?
+
+        **Diagnostic only, exactly like :meth:`guarded`, and for exactly the same reason.** The
+        answer stops being true the instant ``_lock`` is released, so this must never be the gate
+        in front of a rebinding — *that* is the check-then-act R5-P52 reproduced and R5-P54 warned
+        would be reintroduced by a naive fix to F54-1. :meth:`begin_rebind` is the gate; this is
+        for reports, assertions and tests.
+
+        Deliberately not a per-owner question, for the same reason as :meth:`has_any_lease`:
+        rebinding replaces the gate for **every** owner at once.
+        """
+        with self._lock:
+            return any(self._pending.values())
+
+    def is_rebinding(self) -> bool:
+        """[R5-P55 / F54-1] Is a rebinding currently holding this authority's barrier?
+
+        Diagnostic. A caller deciding anything on this would be racing the binder; the refusals
+        inside :meth:`reserve_mutation` and :meth:`_reject_if_unavailable` are the real enforcement.
+        """
+        with self._lock:
+            return self._rebinding
+
+    def acquiring_count(self) -> int:
+        """[R5-P55 / F54-1] How many :meth:`acquire` calls are inside their probe window.
+
+        Diagnostic, for the same reason as :meth:`has_any_pending`. :meth:`begin_rebind` is the
+        only thing that may *decide* on this, and it does so in the same critical section.
+        """
+        with self._lock:
+            return self._acquiring
+
+    # ---- [R5-P55 / F54-1] the rebinding quiescence barrier ---------------------------
+
+    def begin_rebind(self) -> bool:
+        """Atomically require quiescence **and** close this authority to new acquisition.
+
+        [R5-P55 / F54-1] This exists because R5-P53's rebinding gate was check-then-act in the
+        way R5-P52 had already proved fatal, one layer up. R5-P54 reproduced the consequence 3/3:
+        a rebind during a pending mutation reservation moved the clip, reported ``COMPLETE`` and
+        advanced the page, with the authority the operation was planned against already destroyed.
+
+        The naive repair — ask :meth:`has_any_pending`, then assign — does not close it. It only
+        narrows the window, because a reservation may be granted between the question and the
+        assignment. So the two acts are fused: this method observes ``_leases`` and ``_pending``
+        empty and installs ``_rebinding`` **in one critical section**, after which
+        :meth:`reserve_mutation`, :meth:`try_reserve_mutation` and :meth:`acquire` all refuse.
+
+        Returns ``True`` when this call installed the barrier and the caller now owns it;
+        ``False`` when the authority holds a lease, holds a reservation, **has an acquisition in
+        flight**, or is already barriered by another binder. A ``False`` return means **refuse the
+        rebind** — never retry in a loop and never proceed; failing closed is always acceptable
+        here.
+
+        The in-flight-acquisition clause is not decoration. :meth:`acquire` releases ``_lock`` to
+        probe the coordinator, so between its two arbitration passes there is a real interval in
+        which no lease is installed yet and ``_leases`` alone reports the authority quiescent. A
+        rebinding that began *and finished* inside that interval would be accepted by every other
+        clause here, and the lease would then be installed on an authority that no subsystem
+        consults — F54-1 exactly, with the lease and the reservation exchanged. Requiring
+        ``_acquiring == 0`` makes the barrier span the whole acquisition, so the linearization
+        point below really does cover lease acquisition and not merely lease *installation*.
+
+        The caller **must** release in a ``finally``; see :meth:`end_rebind`.
+
+        Three properties this relies on, each load-bearing:
+
+        * It never **waits**. A barrier that blocked on a live reservation would invert the lock
+          order (the binder would hold nothing but would depend on a mutation that may itself be
+          reaching into this authority) and could deadlock. It refuses instead.
+        * It does not block :meth:`release_mutation` or :meth:`release`. Those *reduce* live
+          state; blocking them would be the deadlock a non-waiting barrier is meant to avoid.
+        * It takes only ``_lock`` — the leaf. No subsystem is consulted, so the documented order
+          ``coordinator → registry → store → authority`` gains no edge and no cycle is
+          constructible. A binder that must barrier several authorities takes each lock
+          separately and never two at once.
+        """
+        with self._lock:
+            if self._rebinding:
+                return False
+            if self._leases or any(self._pending.values()) or self._acquiring:
+                return False
+            self._rebinding = True
+            self.rebind_barriers += 1
+            return True
+
+    def end_rebind(self) -> None:
+        """Release the barrier installed by :meth:`begin_rebind`. Idempotent.
+
+        Always called from a ``finally``, including on the refusal path, so a failed rebinding can
+        never leave an authority permanently closed to lifecycle operations.
+        """
+        with self._lock:
+            self._rebinding = False
 
     # ---- the gate --------------------------------------------------------------------
 
@@ -520,6 +644,12 @@ class LifecycleAuthority:
         """
         key = _require_owner(owner)
         with self._lock:
+            if self._rebinding:
+                # [R5-P55 / F54-1] A rebinding holds this authority's quiescence barrier. Granting
+                # now would create exactly the reservation the barrier was installed to prove
+                # absent, and it would be orphaned the moment the subsystems are reassigned.
+                self.refusals += 1
+                raise Refusal(409, LIFECYCLE_REBINDING)
             if key in self._leases:
                 self.refusals += 1
                 raise Refusal(409, LIFECYCLE_CONFLICT)
@@ -536,17 +666,22 @@ class LifecycleAuthority:
         """Non-raising :meth:`reserve_mutation`, for eviction paths that must *skip*.
 
         Returns ``None`` when the owner is leased, when another mutation already holds a
-        reservation, or when the owner is not a valid key. An eviction acts on *somebody else's*
-        authority, so refusing the caller would be wrong — but deleting state a transfer is
-        relying on would be worse, and the check-and-delete it used to do was not atomic. This
-        makes the decision and the licence the same act.
+        reservation, when a rebinding holds the barrier [R5-P55 / F54-1], or when the owner is not
+        a valid key. An eviction acts on *somebody else's* authority, so refusing the caller would
+        be wrong — but deleting state a transfer is relying on would be worse, and the
+        check-and-delete it used to do was not atomic. This makes the decision and the licence the
+        same act.
         """
         try:
             key = _require_owner(owner)
         except Refusal:
             return None
         with self._lock:
-            if key in self._leases or self._pending.get(key):
+            # `_rebinding` is tested here as well as inside `reserve_mutation`, not instead of it:
+            # this method's contract is to *skip*, so the barrier must become a `None` rather than
+            # the `Refusal` the raising form owes its callers. `_lock` is an RLock, so the nested
+            # call re-tests it harmlessly under the same critical section.
+            if self._rebinding or key in self._leases or self._pending.get(key):
                 return None
             return self.reserve_mutation(key, operation)
 
@@ -612,47 +747,69 @@ class LifecycleAuthority:
                 self._reject_if_unavailable(key, plan_id, wanted)
                 return self._epochs.get(key, 0)
 
-        for _ in range(ACQUIRE_PROBE_ATTEMPTS):
-            captured = _arbitrate()
+        # [R5-P55 / F54-1] Mark the acquisition in flight **before** the first arbitration and
+        # keep it marked until a lease is installed or the attempt fails. This is what lets
+        # `begin_rebind` see the probe window; see its in-flight-acquisition clause. Entering is
+        # itself refused while a barrier is held, so the two can never overlap in either order.
+        with self._lock:
+            if self._rebinding:
+                self.refusals += 1
+                raise Refusal(409, LIFECYCLE_REBINDING)
+            self._acquiring += 1
+        try:
+            for _ in range(ACQUIRE_PROBE_ATTEMPTS):
+                captured = _arbitrate()
 
-            # -- probe the scan transition with NO lock of our own held
-            coordinator = self._coordinator
-            if coordinator is not None:
-                try:
-                    in_transition = (coordinator.newest(key) > 0
-                                     and coordinator.view(key) == {})
-                except Exception:                           # a coordinator that cannot answer
-                    in_transition = True                    # fails closed
-                if in_transition:
-                    with self._lock:
-                        self.refusals += 1
-                    raise Refusal(409, "scan_in_flight")
+                # -- probe the scan transition with NO lock of our own held
+                coordinator = self._coordinator
+                if coordinator is not None:
+                    try:
+                        in_transition = (coordinator.newest(key) > 0
+                                         and coordinator.view(key) == {})
+                    except Exception:                       # a coordinator that cannot answer
+                        in_transition = True                # fails closed
+                    if in_transition:
+                        with self._lock:
+                            self.refusals += 1
+                        raise Refusal(409, "scan_in_flight")
+
+                with self._lock:
+                    if self._epochs.get(key, 0) != captured:
+                        # A lifecycle mutation was granted a reservation while we were probing, so
+                        # the probe described authority that no longer holds. Retry; never accept.
+                        self.epoch_conflicts += 1
+                        continue
+                    self._reject_if_unavailable(key, plan_id, wanted)
+                    lease = TransferLease(key, str(plan_id), str(session_id), str(page_token),
+                                          str(scan_id), frozenset(wanted))
+                    self._leases[key] = lease
+                    for identity in wanted:
+                        self._identities[identity] = key
+                    return lease
 
             with self._lock:
-                if self._epochs.get(key, 0) != captured:
-                    # A lifecycle mutation was granted a reservation while we were probing, so the
-                    # probe described authority that no longer holds. Retry; never accept it.
-                    self.epoch_conflicts += 1
-                    continue
-                self._reject_if_unavailable(key, plan_id, wanted)
-                lease = TransferLease(key, str(plan_id), str(session_id), str(page_token),
-                                      str(scan_id), frozenset(wanted))
-                self._leases[key] = lease
-                for identity in wanted:
-                    self._identities[identity] = key
-                return lease
-
-        with self._lock:
-            self.refusals += 1
-        raise Refusal(409, LIFECYCLE_EPOCH_MOVED)
+                self.refusals += 1
+            raise Refusal(409, LIFECYCLE_EPOCH_MOVED)
+        finally:
+            with self._lock:
+                self._acquiring -= 1
 
     def _reject_if_unavailable(self, key: str, plan_id: str, wanted: set) -> None:
         """Every reason a lease may not be installed. Caller holds ``_lock``.
 
         Factored out so the pre-probe pass and the final arbitration apply **identically** the
         same predicate — a second copy is how one of them drifts and the final check becomes
-        weaker than the first.
+        weaker than the first. [R5-P55 / F54-1] That factoring is why the rebinding barrier is
+        tested *here* rather than at the top of :meth:`acquire`: it has to hold at the final
+        arbitration, not merely before the coordinator probe, or a rebind landing between the two
+        would be accepted.
         """
+        if self._rebinding:
+            # [R5-P55 / F54-1] A rebinding holds the barrier. The subsystems this lease would be
+            # planned against are about to be pointed at a different gate, so the authority is
+            # not ours to grant. Refusing is free: the barrier spans three attribute assignments.
+            self.refusals += 1
+            raise Refusal(409, LIFECYCLE_REBINDING)
         if key in self._leases:
             self.refusals += 1
             raise Refusal(409, LIFECYCLE_CONFLICT)
@@ -740,25 +897,108 @@ def bind_lifecycle_authority(*, registry: Any = None, store: Any = None,
     store attachment and P1 startup working. The decision is made for **all** targets before any
     assignment, so a refusal leaves every existing binding exactly as it was and no subsystem is
     left pointing at a different gate from its siblings.
+
+    [R5-P55 / F54-1] **That gate was half-built, and it was check-then-act.** It asked
+    ``has_any_lease()`` and nothing about ``_pending``, so independent review R5-P54 reproduced
+    3/3: a rebind taken while a lifecycle mutation held a reservation orphaned the reservation,
+    the transfer then acquired on the newly bound authority, and the clip moved with
+    ``batch=COMPLETE`` and ``advance_page=True`` while the session and page the operation was
+    planned against had already been revoked. Bit-for-bit the F53-A outcome R5-P53 existed to
+    close, one layer up.
+
+    Adding ``has_any_pending()`` to the predicate is **not** the fix, and R5-P54 said so
+    explicitly. Asking a question and then assigning leaves the same window R5-P52 proved fatal:
+    a reservation granted between the question and the assignment is orphaned just as thoroughly.
+
+    So the invariant is enforced by a **two-phase quiescence barrier**, and the rebind is
+    linearizable with respect to both reservation and lease acquisition:
+
+    1. Determine which authorities are actually being **replaced**. Initial attachment
+       (``current is None``) and idempotent same-authority binding detach nothing, so they have no
+       live state to orphan and take no barrier — which is what keeps the ``gui.py`` startup shape
+       and the lazy store attachment working unchanged.
+    2. If anything *is* being replaced, call :meth:`LifecycleAuthority.begin_rebind` on every
+       distinct authority whose live state is at stake — each outgoing one **and** ``shared``.
+       Each call observes that authority quiescent — no lease, no reservation, **and no
+       acquisition in flight** — and closes it to further acquisition **in one critical
+       section**. Any ``False`` refuses the whole rebinding.
+    3. Only once every barrier is installed are the three attribute assignments performed.
+    4. Release every barrier in a ``finally``, on the refusal path too.
+
+    **Linearization point: the last successful** :meth:`~LifecycleAuthority.begin_rebind`. After
+    it, every involved authority is simultaneously free of leases, free of reservations, and
+    refusing new ones — and stays that way until this call finishes, because only this binder can
+    lift a barrier it installed. A concurrent ``reserve_mutation`` or ``acquire`` therefore either
+    completed strictly *before* that point, in which case a ``begin_rebind`` observes it and the
+    whole rebinding fails closed, or is ordered strictly *after* it, in which case it is refused
+    with :data:`LIFECYCLE_REBINDING`. There is no interleaving in which one is accepted and then
+    detached, which is precisely what F54-1 was. An acquisition already *inside* its probe window
+    is the third possibility, and it is covered by the same clause: it makes ``begin_rebind``
+    return ``False``, so the rebinding refuses rather than slipping between the two arbitrations.
+
+    Fail-closed in both orderings, and no new deadlock risk: the barriers are taken one authority
+    at a time, never two locks at once; :meth:`~LifecycleAuthority.begin_rebind` never waits; and
+    it never blocks ``release_mutation`` or ``release``, so a live operation can always drain. No
+    lock is held across the assignments, and nothing here hashes, copies, journals or calls
+    FFmpeg.
+
+    Still **not** closed here, deliberately and on the record: a direct
+    ``target.lifecycle_authority = other`` assignment bypasses this function entirely. Measured
+    for R5-P55 — the shipped application does that exactly once, on a freshly constructed store
+    whose authority is ``None`` (an *initial attachment*, which cannot orphan anything), so there
+    is no reachable bypass today; and F54-5's ``current is None`` carve-out still lets an unbound
+    subsystem join a different authority while another holds a live lease. Both are recorded in
+    ``.claude/rules/clips-preview.md``.
     """
     shared = authority or _DEFAULT_LIFECYCLE_AUTHORITY
 
     targets = [("registry", registry), ("store", store), ("coordinator", coordinator)]
+
+    #: The distinct authorities actually being detached. Identity, never equality: two different
+    #: `LifecycleAuthority` objects must never be treated as one gate.
+    outgoing: list = []
     for name, target in targets:
         if target is None:
             continue
         current = getattr(target, "lifecycle_authority", None)
         if current is None or current is shared:
             continue
-        if current.has_any_lease() or shared.has_any_lease():
-            raise Refusal(409, "lifecycle_authority_rebind_refused")
+        if not any(seen is current for seen in outgoing):
+            outgoing.append(current)
 
-    for name, target in targets:
-        if target is None:
-            continue
-        target.lifecycle_authority = shared
-    if coordinator is not None:
-        shared._coordinator = coordinator
+    if not outgoing:
+        # Initial attachment and/or idempotent rebinding. Nothing is detached, so no reservation
+        # and no lease can be orphaned and no barrier is warranted. Taking one here would make
+        # `gui.py`'s import-time bind and the lazy store attachment refusable for no safety gain.
+        for name, target in targets:
+            if target is None:
+                continue
+            target.lifecycle_authority = shared
+        if coordinator is not None:
+            shared._coordinator = coordinator
+        return shared
+
+    barriered: list = []
+    try:
+        for auth in (*outgoing, shared):
+            if any(seen is auth for seen in barriered):
+                continue
+            if not auth.begin_rebind():
+                # Not quiescent, or another binder owns the barrier. Nothing has been assigned,
+                # so every existing binding — and every `_coordinator` pointer — is untouched.
+                raise Refusal(409, LIFECYCLE_REBIND_REFUSED)
+            barriered.append(auth)
+
+        # ---- past the linearization point: every involved authority is quiescent and closed ----
+        for name, target in targets:
+            if target is None:
+                continue
+            target.lifecycle_authority = shared
+        if coordinator is not None:
+            shared._coordinator = coordinator
+    finally:
+        for auth in barriered:
+            auth.end_rebind()
     return shared
 
 
@@ -3994,6 +4234,8 @@ __all__ = [
     "LIFECYCLE_BUSY_TEXT",
     "LIFECYCLE_PENDING",
     "LIFECYCLE_EPOCH_MOVED",
+    "LIFECYCLE_REBINDING",
+    "LIFECYCLE_REBIND_REFUSED",
     "ACQUIRE_PROBE_ATTEMPTS",
     "MutationReservation",
     "LifecycleAuthority",
