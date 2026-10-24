@@ -75,6 +75,36 @@ no-replace ``os.rename`` **relocates the object** rather than deleting it, so a 
 undone by renaming it back (measured: the reverse rename succeeds onto the vacated path and refuses
 with winerror 183 if anything has taken it). A wrong delete cannot be undone by anything.
 
+Reporting may not retract a completed operation
+-----------------------------------------------
+[R5-P49 / F1] Once an irreversible filesystem step succeeds, **no later failure may produce an
+outcome claiming nothing moved**. That sounds obvious and was violated: every journal append after
+the commit point was unguarded, ``TransferJournal.append`` converts any ``OSError`` into
+``TransferRefused``, and ``execute_transfer``'s broad ``except TransferRefused`` turned it into
+``ItemOutcome(REFUSED)`` — whose defaults assert ``source_removed=False`` and
+``published_path=""``. An independent review reproduced it with a real Windows sharing violation on
+the journal file: the clip was in the Media Library, the source path was empty, and the engine
+reported that nothing had happened. Worse, the *batch* summary append sat outside the per-item
+``try``, so a persistent journal failure raised and the caller received no :class:`TransferResult`
+at all — no outcomes, no counts, no indication a file had moved.
+
+Seven situations are now distinguishable, and the state alone tells them apart:
+
+===================================  ==================================================
+No publication occurred              ``REFUSED``
+Published, verified and journalled   ``COMPLETE``
+Published and verified, not recorded :data:`PUBLISHED_UNJOURNALLED`
+Verification failed, rollback worked  ``ROLLED_BACK``
+Verification failed, rollback did not ``RECOVERY_REQUIRED``
+Cross-volume copy, delete withheld   :data:`SOURCE_REMOVAL_BLOCKED`
+Actual state cannot be established    ``RECOVERY_REQUIRED``
+===================================  ==================================================
+
+A journal failure is never permission to repeat, undo or delete a completed operation, and no
+speculative rollback is attempted to make reporting tidier. Where the truth is already known from
+a check that has *already* run, that knowledge is reported rather than re-derived from a second,
+equally fallible look at the filesystem.
+
 What is *not* claimed
 ---------------------
 Identity is proven on a descriptor, never on a pathname — but a rename names a path, so a narrow
@@ -93,6 +123,7 @@ import json
 import os
 import stat as stat_module
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -135,9 +166,34 @@ ROLLED_BACK = "ROLLED_BACK"
 #: failure of the copy — a withheld deletion. See *Why the source is not deleted* in the docstring.
 SOURCE_REMOVAL_BLOCKED = "SOURCE_REMOVAL_BLOCKED"
 
+#: [R5-P49 / F1] The irreversible publication **succeeded and verified**, and the durable journal
+#: record for it could not be written. The filesystem has changed; the evidence has not.
+#:
+#: This state exists because the alternative was measured and was a lie. ``TransferJournal.append``
+#: turns any ``OSError`` into :class:`TransferRefused`, and ``execute_transfer``'s
+#: ``except TransferRefused`` turned that into ``ItemOutcome(REFUSED)`` whose dataclass defaults say
+#: ``source_removed=False`` and ``published_path=""`` — reported about a source path that was by
+#: then empty, with the operator's clip already in their Media Library. That is precisely the
+#: R5-P46 / A defect, reached through a different post-commit step, and the module's own comment at
+#: the rename said it must not happen.
+#:
+#: It is **never** COMPLETE: durable completion cannot be proven, so ``advance_page`` stays false
+#: and the batch stops. It carries the real ``published_path``, the real byte count and the real
+#: SHA-256, and ``source_removed`` reflects what actually happened to the source — ``True`` for the
+#: same-volume rename that moved it, ``False`` for the cross-volume copy that deliberately did not.
+PUBLISHED_UNJOURNALLED = "PUBLISHED_UNJOURNALLED"
+
 #: Every state a transfer can be in. Ordered as the happy path progresses, then the terminals.
 STATES = (PLANNED, INTENT_RECORDED, STAGED, VERIFIED, PUBLISHED, SOURCE_REMOVED, COMPLETE,
-          REFUSED, PARTIAL, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED)
+          REFUSED, PARTIAL, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED,
+          PUBLISHED_UNJOURNALLED)
+
+#: [R5-P49 / F1] The states that assert an irreversible filesystem change happened. An outcome in
+#: one of these may never report ``source_removed=False`` *and* an empty ``published_path``; the
+#: regression test ``test_F1_no_outcome_may_claim_nothing_moved_after_a_commit`` enforces exactly
+#: that, and it is the invariant the whole finding reduces to.
+PUBLICATION_ASSERTED = (COMPLETE, SOURCE_REMOVAL_BLOCKED, PUBLISHED_UNJOURNALLED,
+                        RECOVERY_REQUIRED)
 
 #: The two transfer operations. The choice is made from the *measured* device of each side, never
 #: from the drive letter: a junction or a ``subst`` can put two different letters on one volume.
@@ -298,6 +354,24 @@ class RecoveryReport:
 # Journal
 # --------------------------------------------------------------------------------------------
 
+#: [R5-P49 / F4] The four things a journal's final bytes can be. ``append`` must establish a safe
+#: record boundary before writing, and the right action differs for each.
+TAIL_EMPTY = "EMPTY_OR_TERMINATED"
+TAIL_COMPLETE_UNTERMINATED = "COMPLETE_RECORD_MISSING_NEWLINE"
+TAIL_INCOMPLETE = "INCOMPLETE_RECORD"
+TAIL_MALFORMED = "MALFORMED_COMPLETE_RECORD"
+TAIL_UNKNOWN = "TAIL_NOT_INSPECTABLE"
+
+#: ``k`` of the record :meth:`TransferJournal.append` writes to close off a damaged tail. It is a
+#: *separator*, never an outcome: nothing reads it as transfer history, and a half-written one
+#: cannot parse at all, so it can never be mistaken for a successful event.
+TAIL_REPAIR_KIND = "tail_separator"
+
+#: How much of the end of the file the tail classifier reads. A journal record is a single JSON
+#: object of a few hundred bytes; 1 MiB is far more than one record and bounds the read.
+_TAIL_WINDOW = 1 << 20
+
+
 class TransferJournal:
     """Append-only JSONL intent/outcome log, one file per transfer journal directory.
 
@@ -312,11 +386,49 @@ class TransferJournal:
     A journal record never claims a destructive step completed before the filesystem has been
     verified: ``PUBLISHED`` is written after the published object is re-read, and
     ``SOURCE_REMOVED`` after the source is confirmed gone.
+
+    Tail safety
+    -----------
+    [R5-P49 / F4] ``O_APPEND`` writes at the end of the file, **not at the end of the last
+    record**. An independent review measured the consequence: with an unterminated final fragment
+    on disk, the next ``append`` was concatenated onto it, the two became one unparseable line, and
+    the newly committed event was **silently lost** — it did not survive a cold reopen and no
+    reader could see it. The write had reported success.
+
+    So ``append`` now classifies the final bytes first (:meth:`tail_state`) and establishes a
+    record boundary before writing:
+
+    * :data:`TAIL_EMPTY` — nothing to do;
+    * :data:`TAIL_COMPLETE_UNTERMINATED` — a **committed** record that merely lost its newline.
+      It is preserved and a terminator is added. It is *not* damage, and misclassifying it as
+      damage would discard real history (the R5-P15 / N7-R3 lesson, restated for this journal);
+    * :data:`TAIL_INCOMPLETE` — provably torn. The bytes are preserved, and a terminator plus a
+      self-describing :data:`TAIL_REPAIR_KIND` separator is appended so the fragment becomes its
+      own independently recognisable line;
+    * :data:`TAIL_MALFORMED` — a complete line that is not a usable record. Boundary-wise it needs
+      only a terminator; it is **never** silently discarded and :meth:`records` surfaces it;
+    * :data:`TAIL_UNKNOWN` — the tail could not be read. **Refuses the write.** Being unable to
+      look at the end of the file is not evidence that it ends on a record boundary.
+
+    Nothing is ever truncated or rewritten; every repair is itself an append. A crash part-way
+    through writing the separator leaves either a clean boundary or a new torn fragment, and the
+    next ``append`` repairs that — so the operation is idempotent and never manufactures an event.
+
+    **Writer model, stated rather than implied.** Appends are serialised by a process-local lock,
+    which is the same scope as every other invariant this engine maintains (see
+    ``ReviewStore.begin_transfer``'s note on its process-local lease). Read-classify-then-append is
+    *not* atomic across processes, so a second process writing this journal concurrently is
+    **outside** this mechanism and is not claimed to be safe. This is deliberately not described as
+    a cross-process file lock.
     """
 
     def __init__(self, directory: str, name: str = "transfer-journal.jsonl") -> None:
         self.directory = directory
         self.path = os.path.join(directory, name)
+        #: Serialises classify-then-append within this process. See the writer-model note above.
+        self._lock = threading.Lock()
+        #: Diagnostics only — how many damaged tails this instance has closed off.
+        self.tails_separated = 0
 
     def _write_all(self, handle: int, payload: bytes) -> int:
         """Write every byte. A positive short write is not an error and raises nothing."""
@@ -329,53 +441,171 @@ class TransferJournal:
             written += count
         return written
 
-    def append(self, event: dict) -> None:
+    def _tail_bytes(self) -> bytes:
+        """The trailing fragment after the last record terminator, or ``b""``.
+
+        Read in **binary** on purpose. The append descriptor is opened without ``O_BINARY``, so on
+        Windows CPython translates ``\\n`` to ``\\r\\n`` on the way out and the bytes on disk end
+        ``\\r\\n``. Both spellings end in ``\\n``, so testing for that one byte covers both without
+        this class having to care which it is looking at.
+        """
+        with open(self.path, "rb") as handle:
+            try:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+            except OSError:
+                size = 0
+            if size == 0:
+                return b""
+            handle.seek(max(0, size - _TAIL_WINDOW))
+            window = handle.read()
+        if window.endswith(b"\n"):
+            return b""
+        index = window.rfind(b"\n")
+        return window if index < 0 else window[index + 1:]
+
+    def tail_state(self) -> tuple[str, int]:
+        """Classify the journal's final bytes. Returns ``(state, fragment_length)``.
+
+        [R5-P49 / F4] Never raises: an inspection failure is an *answer* —
+        :data:`TAIL_UNKNOWN` — because the caller must refuse rather than assume.
+        """
+        try:
+            fragment = self._tail_bytes()
+        except OSError as exc:
+            code = getattr(exc, "winerror", None)
+            if code in (_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND) \
+                    or getattr(exc, "errno", None) == _ERROR_FILE_NOT_FOUND:
+                return TAIL_EMPTY, 0                    # no journal yet is a safe boundary
+            return TAIL_UNKNOWN, 0
+        except ValueError:                              # a closed/detached handle, defensively
+            return TAIL_UNKNOWN, 0
+        if not fragment:
+            return TAIL_EMPTY, 0
+        if not fragment.strip():
+            # whitespace only: a boundary for parsing purposes, but still give it a terminator
+            return TAIL_COMPLETE_UNTERMINATED, len(fragment)
+        try:
+            text = fragment.decode("utf-8")
+        except UnicodeDecodeError:
+            # a torn multi-byte sequence cannot be a complete record (the R5-P17 lesson)
+            return TAIL_INCOMPLETE, len(fragment)
+        try:
+            parsed = json.loads(text.strip())
+        except ValueError:
+            return TAIL_INCOMPLETE, len(fragment)
+        if not isinstance(parsed, dict):
+            return TAIL_MALFORMED, len(fragment)
+        return TAIL_COMPLETE_UNTERMINATED, len(fragment)
+
+    def _separator_for(self, state: str, length: int, now: float) -> bytes:
+        """The bytes that turn an unterminated tail into a closed record boundary.
+
+        One payload, so a short write degrades safely: a partial write leaves either a bare
+        terminator (a clean boundary) or a torn separator record (repaired by the next append).
+        Neither can parse as a transfer event, because a separator's ``k`` is
+        :data:`TAIL_REPAIR_KIND` and carries no ``clip_id``, ``plan_id`` or ``state``.
+        """
+        if state == TAIL_COMPLETE_UNTERMINATED:
+            # A committed record that lost its newline. It needs a boundary and nothing else --
+            # annotating it would imply damage that did not occur.
+            return b"\n"
+        marker = {"k": TAIL_REPAIR_KIND, "tail": state, "fragment_bytes": int(length),
+                  "at": now}
+        return b"\n" + json.dumps(marker, separators=(",", ":"),
+                                  sort_keys=True).encode("utf-8") + b"\n"
+
+    def append(self, event: dict, *, now: Callable[[], float] = time.time) -> None:
         payload = (json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
         try:
             os.makedirs(self.directory, exist_ok=True)
         except OSError as exc:
             raise TransferRefused("journal_unavailable", io_detail(exc)) from exc
-        handle = None
-        try:
-            handle = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            self._write_all(handle, payload)
-            os.fsync(handle)
-        except OSError as exc:
-            raise TransferRefused("journal_unavailable", io_detail(exc)) from exc
-        finally:
-            if handle is not None:
-                try:
-                    os.close(handle)
-                except OSError:
-                    pass
+
+        with self._lock:
+            # [R5-P49 / F4] Establish a record boundary BEFORE the event, or refuse. A write that
+            # lands behind a torn fragment is reported as durable and is not.
+            state, length = self.tail_state()
+            if state == TAIL_UNKNOWN:
+                raise TransferRefused(
+                    "journal_tail_not_inspectable",
+                    "the journal's final bytes could not be read, so it cannot be shown to end on "
+                    "a record boundary")
+            separator = b"" if state == TAIL_EMPTY else self._separator_for(state, length, now())
+
+            handle = None
+            try:
+                handle = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                if separator:
+                    self._write_all(handle, separator)
+                    os.fsync(handle)
+                    self.tails_separated += 1
+                self._write_all(handle, payload)
+                os.fsync(handle)
+            except OSError as exc:
+                raise TransferRefused("journal_unavailable", io_detail(exc)) from exc
+            finally:
+                if handle is not None:
+                    try:
+                        os.close(handle)
+                    except OSError:
+                        pass
 
     def records(self) -> list[dict]:
-        """Every parseable record, in order. An unparseable tail line is reported, not guessed at.
+        """Every record, in order, with damaged ones **surfaced** rather than quietly dropped.
 
-        A torn final line is *skipped* rather than repaired here: this journal is append-only
-        evidence for recovery, and inventing a record would be worse than having one fewer.
+        A torn line is never repaired here and never guessed at: this journal is append-only
+        evidence, and inventing a record would be worse than reporting one as damaged.
+
+        [R5-P49 / F4] A line that parses but is not a JSON object, and a line that is not valid
+        JSON at all, are both reported as :data:`~TAIL_MALFORMED`-style damage markers carrying
+        ``damaged: True``. :meth:`damage` counts them and :func:`recover` escalates on them, so a
+        reader can no longer silently conclude that a history with unreadable records is complete.
         """
         out: list[dict] = []
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                for line in handle:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as handle:
+                for number, line in enumerate(handle, start=1):
                     text = line.strip()
                     if not text:
                         continue
                     try:
                         event = json.loads(text)
                     except ValueError:
-                        out.append({"k": "unparseable", "raw_length": len(text)})
+                        out.append({"k": "unparseable", "damaged": True, "line": number,
+                                    "raw_length": len(text)})
                         continue
                     if isinstance(event, dict):
                         out.append(event)
                     else:
-                        out.append({"k": "unparseable", "raw_length": len(text)})
+                        out.append({"k": "unparseable", "damaged": True, "line": number,
+                                    "raw_length": len(text)})
         except OSError as exc:
             if getattr(exc, "winerror", None) in (_ERROR_FILE_NOT_FOUND, _ERROR_PATH_NOT_FOUND) \
                     or getattr(exc, "errno", None) == _ERROR_FILE_NOT_FOUND:
                 return []
             raise TransferRefused("journal_unavailable", io_detail(exc)) from exc
+        return out
+
+    def damage(self) -> list[dict]:
+        """Every damaged record and every tail separator this journal carries.
+
+        [R5-P49 / F4] The point of a separate accessor is that damage is **not** attributable to a
+        clip — a torn fragment has no ``clip_id`` — so :meth:`states_for` cannot see it and a
+        per-clip reading of the history would silently ignore it. :func:`recover` consults this.
+        """
+        return [event for event in self.records()
+                if event.get("damaged") is True or event.get("k") == TAIL_REPAIR_KIND]
+
+    def states_for(self, plan_id: str) -> dict[str, list[dict]]:
+        """Per-clip record history for one plan, in journal order."""
+        out: dict[str, list[dict]] = {}
+        for event in self.records():
+            if event.get("plan_id") != plan_id:
+                continue
+            clip_id = event.get("clip_id")
+            if isinstance(clip_id, str) and clip_id:
+                out.setdefault(clip_id, []).append(event)
         return out
 
     def states_for(self, plan_id: str) -> dict[str, list[dict]]:
@@ -888,6 +1118,18 @@ def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
     durable boundary without patching the filesystem. They are not part of the production contract
     and default to ``None``.
     """
+    # [R5-P49 / F1] The journal appends in this function split cleanly in two, and only the second
+    # kind was the defect:
+    #
+    # * **before any filesystem mutation** -- the refused-plan, live-authority, lease and PLANNED
+    #   records. A failure here genuinely means nothing moved, there is no outcome list to lose,
+    #   and refusing loudly is right: without a durable intent log no clip may be transferred at
+    #   all. These deliberately still raise, which is what
+    #   ``test_an_unusable_journal_directory_refuses_before_any_move`` pins.
+    # * **after an irreversible step** -- the per-item post-commit records (handled in
+    #   ``_same_volume`` / ``_cross_volume`` / ``_rollback_same_volume``) and the batch SUMMARY
+    #   below. These may never raise or retract: the moves already happened and the outcomes are
+    #   already decided.
     if not plan.ok:
         journal.append({**plan.to_event(), "state": REFUSED, "at": now()})
         return TransferResult(plan.plan_id, REFUSED, (),
@@ -946,27 +1188,48 @@ def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
                 continue
 
             failed += 1
+            # [R5-P49 / F1] An unjournalled publication counts here, and deliberately stops the
+            # batch: the durability guarantee the page depends on is gone, so continuing would
+            # produce further irreversible moves that no journal can witness. It is counted
+            # separately from `failed` because something really was published.
+            unjournalled = 1 if outcome.state == PUBLISHED_UNJOURNALLED else 0
+            if unjournalled:
+                failed -= 1
             # Stop at the first genuine failure. The remaining clips stay untouched and are
             # reported as such, because a page is the unit of durable commitment.
             remaining = plan.items[position + 1:]
             for skipped in remaining:
                 outcomes.append(ItemOutcome(skipped.clip_id, PLANNED, "not_attempted",
                                             "an earlier item in this page failed"))
-            state = PARTIAL if (moved or published_only) else REFUSED
-            journal.append({"k": "batch", "plan_id": plan.plan_id, "state": state,
-                            "moved": moved, "published_only": published_only,
-                            "failed": failed, "remaining": len(remaining), "at": now()})
-            return TransferResult(plan.plan_id, state, tuple(outcomes),
-                                  {"moved": moved, "published_only": published_only,
-                                   "failed": failed, "remaining": len(remaining)})
+            state = PARTIAL if (moved or published_only or unjournalled) else REFUSED
+            counts = {"moved": moved, "published_only": published_only, "failed": failed,
+                      "remaining": len(remaining)}
+            if unjournalled:
+                counts["published_unjournalled"] = unjournalled
+                counts["recovery_reason"] = outcome.code or "post_commit_journal_failure"
+            # Best-effort: the per-item outcomes above are already decided, and losing the summary
+            # record must not discard them.
+            summary_note = _try_journal(
+                journal, {"k": "batch", "plan_id": plan.plan_id, "state": state, **counts,
+                          "at": now()})
+            if summary_note:
+                counts["summary_unjournalled"] = summary_note
+            return TransferResult(plan.plan_id, state, tuple(outcomes), counts)
 
         state = PARTIAL if published_only else COMPLETE
-        journal.append({"k": "batch", "plan_id": plan.plan_id, "state": state,
-                        "moved": moved, "published_only": published_only,
-                        "failed": 0, "remaining": 0, "at": now()})
-        return TransferResult(plan.plan_id, state, tuple(outcomes),
-                              {"moved": moved, "published_only": published_only,
-                               "failed": 0, "remaining": 0})
+        counts = {"moved": moved, "published_only": published_only, "failed": 0, "remaining": 0}
+        summary_note = _try_journal(
+            journal, {"k": "batch", "plan_id": plan.plan_id, "state": state, **counts,
+                      "at": now()})
+        if summary_note:
+            # [R5-P49 / F1] Every item reached a durably recorded terminal state, but the batch
+            # summary did not. Durable *completion of the batch* therefore cannot be proven, so
+            # COMPLETE is downgraded and the page does not advance. No filesystem state changes and
+            # no per-item outcome is rewritten -- the items are exactly as they were decided.
+            counts["summary_unjournalled"] = summary_note
+            counts["recovery_reason"] = "batch_summary_journal_failure"
+            state = PARTIAL
+        return TransferResult(plan.plan_id, state, tuple(outcomes), counts)
     finally:
         # Always released, including on an unexpected exception: a lease outliving its execution
         # would be a decision nobody can change and nobody can unblock.
@@ -1093,17 +1356,77 @@ def _same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourna
     except TransferRefused as exc:
         return _rollback_same_volume(item, plan, journal, exc, now=now)
 
-    journal.append(_item_event(item, plan, PUBLISHED, published_sha256=published[0],
-                               published_bytes=published[1], at=now()))
-    if after_publish is not None:
-        after_publish(item)
-    # A same-volume rename removes the source as part of the one atomic operation, so there is no
-    # separate delete to record -- and nothing to recover between publication and removal.
-    journal.append(_item_event(item, plan, SOURCE_REMOVED, note="atomic rename moved the source",
-                               at=now()))
-    journal.append(_item_event(item, plan, COMPLETE, at=now()))
+    # [R5-P49 / F1] Every step from here on is *reporting*, and reporting cannot fail its way back
+    # to "nothing happened". The object is at the destination and the source path is empty; the
+    # only question left is whether that can be recorded durably.
+    try:
+        journal.append(_item_event(item, plan, PUBLISHED, published_sha256=published[0],
+                                   published_bytes=published[1], at=now()))
+        if after_publish is not None:
+            after_publish(item)
+        # A same-volume rename removes the source as part of the one atomic operation, so there is
+        # no separate delete to record -- and nothing to recover between publication and removal.
+        journal.append(_item_event(item, plan, SOURCE_REMOVED,
+                                   note="atomic rename moved the source", at=now()))
+        journal.append(_item_event(item, plan, COMPLETE, at=now()))
+    except TransferRefused as exc:
+        return _published_unjournalled(
+            item, plan, journal, exc, published, source_removed=True, now=now)
     return ItemOutcome(item.clip_id, COMPLETE, published_path=item.destination_path,
                        source_removed=True, bytes_copied=published[1], sha256=published[0])
+
+
+def _try_journal(journal: TransferJournal, event: dict) -> str:
+    """[R5-P49 / F1] A best-effort post-commit append. Returns ``""`` or the failure code.
+
+    Used only *after* an irreversible step, where the filesystem fact is already established and
+    the append is the last thing that could still fail. The caller's outcome is decided by what
+    happened on disk, never by whether this succeeded — but it is still worth attempting, because
+    a transient lock may well have cleared by now and a recorded condition is better evidence than
+    an unrecorded one.
+    """
+    try:
+        journal.append(event)
+    except TransferRefused as exc:
+        return exc.code or "journal_unavailable"
+    return ""
+
+
+def _published_unjournalled(item: TransferItem, plan: TransferPlan, journal: TransferJournal,
+                            cause: TransferRefused, published: tuple[str, int], *,
+                            source_removed: bool,
+                            now: Callable[[], float]) -> ItemOutcome:
+    """[R5-P49 / F1] The publication happened and verified; the durable record did not.
+
+    Reports the **filesystem truth** — the real destination path, byte count and digest, and
+    whether the source still exists — together with the fact that durable evidence is missing. It
+    is deliberately not COMPLETE, so ``advance_page`` stays false and the batch stops rather than
+    producing further publications no journal can witness.
+
+    Three things this must not do, each because the alternative is worse than an honest
+    recovery-required report:
+
+    * **no rollback.** Verification *succeeded*; undoing a correct publication to tidy up a
+      reporting failure would turn a bookkeeping problem into a second irreversible operation.
+    * **no re-inspection relied upon.** ``published`` is what ``_verify_published`` already read
+      from the destination. Re-reading now could fail for the same reason the journal did, and a
+      fallible second look must not be allowed to downgrade a fact already established.
+    * **no deletion.** A missing journal record is not permission to touch either object.
+    """
+    note = _try_journal(journal, _item_event(
+        item, plan, PUBLISHED_UNJOURNALLED, reason="post_commit_journal_failure",
+        detail=cause.code, published_sha256=published[0], published_bytes=published[1],
+        source_removed=source_removed, at=now()))
+    detail = (f"the object is published and verified at the destination"
+              f"{' and the source path is empty' if source_removed else ' and the original is intact'}"
+              f", but the durable journal record could not be written ({cause.code}"
+              f"{': ' + cause.detail if cause.detail else ''})")
+    if note:
+        detail += f"; the condition itself could not be journalled either ({note})"
+    return ItemOutcome(
+        item.clip_id, PUBLISHED_UNJOURNALLED, "post_commit_journal_failure", detail,
+        published_path=item.destination_path, source_removed=source_removed,
+        bytes_copied=published[1], sha256=published[0])
 
 
 def _rollback_same_volume(item: TransferItem, plan: TransferPlan, journal: TransferJournal,
@@ -1114,21 +1437,38 @@ def _rollback_same_volume(item: TransferItem, plan: TransferPlan, journal: Trans
     Never retried and never forced: the reverse rename is no-replace, so if the source path has
     been taken meanwhile the rollback refuses and the operator is told, rather than one of the two
     files being destroyed to make the outcome look tidy.
+
+    [R5-P49 / F1] Both journal appends here are **post-commit** and therefore best-effort: the
+    rename already happened, so a failure to record the rollback may not reopen the question of
+    whether anything moved. A rollback that succeeded is still reported as ``ROLLED_BACK`` — that
+    *is* the observed source and destination situation — with a code that distinguishes the
+    unrecorded case, and never as ``REFUSED``.
     """
     try:
         os.rename(item.destination_path, item.source_path)
     except OSError as exc:
-        journal.append(_item_event(
+        note = _try_journal(journal, _item_event(
             item, plan, RECOVERY_REQUIRED, reason="rollback_failed",
             detail=io_detail(exc), publication_failure=cause.code, at=now()))
         return ItemOutcome(
             item.clip_id, RECOVERY_REQUIRED, "rollback_failed",
             f"{cause.code}; the object is at the destination and could not be put back: "
-            f"{io_detail(exc)}",
+            f"{io_detail(exc)}"
+            + (f"; this condition could not be journalled either ({note})" if note else ""),
             published_path=item.destination_path, source_removed=True)
 
-    journal.append(_item_event(item, plan, ROLLED_BACK, reason="published_object_unverified",
-                               detail=cause.code, at=now()))
+    note = _try_journal(journal, _item_event(
+        item, plan, ROLLED_BACK, reason="published_object_unverified",
+        detail=cause.code, at=now()))
+    if note:
+        # The reverse rename is known to have succeeded, so the filesystem is unambiguous and
+        # there is nothing to escalate about it -- but the operator is still told the evidence is
+        # missing, and the batch still cannot report COMPLETE.
+        return ItemOutcome(
+            item.clip_id, ROLLED_BACK, "rollback_unjournalled",
+            f"{cause.detail}; the rollback succeeded and the source was restored, but the "
+            f"durable record of it could not be written ({note})",
+            published_path="", source_removed=False)
     return ItemOutcome(item.clip_id, ROLLED_BACK, "published_object_unverified", cause.detail,
                        published_path="", source_removed=False)
 
@@ -1217,11 +1557,23 @@ def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourn
 
         # ---- verify the PUBLISHED object, then record it --------------------------------------
         published = _verify_published(item, digest)
-        journal.append(_item_event(item, plan, PUBLISHED, published_sha256=published[0],
-                                   published_bytes=published[1],
-                                   staging_path=published_staging, at=now()))
-        if after_publish is not None:
-            after_publish(item)
+        # [R5-P49 / F1] Past the publish rename everything left is reporting. A journal failure
+        # here previously produced `REFUSED` with `published_path=""` about a copy that was sitting
+        # verified in the operator's Media Library, while the original was still on disk -- so the
+        # operator was told nothing had been published and the duplicate went unmentioned.
+        try:
+            journal.append(_item_event(item, plan, PUBLISHED, published_sha256=published[0],
+                                       published_bytes=published[1],
+                                       staging_path=published_staging, at=now()))
+            if after_publish is not None:
+                after_publish(item)
+        except TransferRefused as exc:
+            # `source_removed=False`: the cross-volume path deliberately never deletes the
+            # original, so both objects exist and the outcome names both. This is NOT
+            # SOURCE_REMOVAL_BLOCKED -- that state means "published, verified and journalled, with
+            # the deletion withheld by policy", and the journal record is exactly what is missing.
+            return _published_unjournalled(
+                item, plan, journal, exc, published, source_removed=False, now=now)
 
         # ---- SOURCE REMOVAL: deliberately NOT performed --------------------------------------
         # [R5-P47 / B] This is where the original proved the source's identity on a descriptor,
@@ -1245,11 +1597,17 @@ def _cross_volume(item: TransferItem, plan: TransferPlan, journal: TransferJourn
         # lost: the operator has the clip in the Media Library and still has the original. The
         # obligation is recorded so a later authorized phase — or an operator — can act on it.
         # A safe failure is preferable to an unsafe successful move.
-        journal.append(_item_event(
-            item, plan, SOURCE_REMOVAL_BLOCKED,
-            reason="no_handle_anchored_delete_available",
-            published_sha256=published[0], published_bytes=published[1],
-            source_sha256=digest, source_still_present=True, at=now()))
+        # [R5-P49 / F1] Also post-commit: the copy is already published and verified, so a failure
+        # to record the withheld deletion must not retract the publication in the report.
+        try:
+            journal.append(_item_event(
+                item, plan, SOURCE_REMOVAL_BLOCKED,
+                reason="no_handle_anchored_delete_available",
+                published_sha256=published[0], published_bytes=published[1],
+                source_sha256=digest, source_still_present=True, at=now()))
+        except TransferRefused as exc:
+            return _published_unjournalled(
+                item, plan, journal, exc, published, source_removed=False, now=now)
         return ItemOutcome(
             item.clip_id, SOURCE_REMOVAL_BLOCKED, "source_removal_withheld",
             "the copy is published and verified; the original was NOT deleted because this engine "
@@ -1296,7 +1654,11 @@ def _verify_published(item: TransferItem, expected_sha: str) -> tuple[str, int]:
 #: recorded history is one this engine can have produced; it is **not** a permission table, and
 #: nothing is replayed from it.
 _ITEM_STATE_ORDER = (INTENT_RECORDED, STAGED, VERIFIED, PUBLISHED, SOURCE_REMOVED, COMPLETE)
-_ITEM_TERMINALS = (COMPLETE, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED)
+#: [R5-P49 / F1] ``PUBLISHED_UNJOURNALLED`` is terminal for the item: the publication happened and
+#: the engine stopped there. It is written best-effort *after* the record it replaces failed, so it
+#: legitimately appears as the last record of a history whose earlier states are intact.
+_ITEM_TERMINALS = (COMPLETE, RECOVERY_REQUIRED, ROLLED_BACK, SOURCE_REMOVAL_BLOCKED,
+                   PUBLISHED_UNJOURNALLED)
 
 
 def _history_fault(events: Sequence[dict]) -> str:
@@ -1351,6 +1713,31 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
     history = journal.states_for(plan.plan_id)
     findings: list[RecoveryFinding] = []
     needs_operator = False
+
+    # [R5-P49 / F4] Damaged records carry no `clip_id`, so `states_for` cannot see them and a
+    # purely per-clip reading of the history would ignore them completely -- which is exactly how
+    # a journal with unreadable records could be read as a complete history. Surface them once,
+    # for the plan, and escalate: the filesystem checks below are still authoritative for *what to
+    # do*, but the evidence is known to be incomplete and that is the operator's to weigh.
+    #
+    # This is narrowly about journal integrity. It does NOT address R5-P48 / F2, which is about
+    # `recover()` aggregating intentionally-unfinished work into COMPLETE; F2 remains OPEN.
+    try:
+        damaged = journal.damage()
+    except TransferRefused:
+        damaged = []
+        needs_operator = True
+        findings.append(RecoveryFinding(
+            "", "", "journal=unreadable", "operator_required",
+            "the transfer journal could not be read, so no history can be relied on"))
+    if damaged:
+        needs_operator = True
+        kinds = sorted({str(event.get("tail") or event.get("k")) for event in damaged})
+        findings.append(RecoveryFinding(
+            "", "", f"journal=damaged_records={len(damaged)}", "operator_required",
+            f"the transfer journal carries {len(damaged)} damaged or separated record(s) "
+            f"({', '.join(kinds)}); the recorded history is incomplete and must not be read as "
+            f"a complete one"))
 
     for item in plan.items:
         events = history.get(item.clip_id, [])
@@ -1438,8 +1825,10 @@ def recover(plan: TransferPlan, journal: TransferJournal, *,
                                         "the source is present but its identity does not match"))
 
     state = RECOVERY_REQUIRED if needs_operator else COMPLETE
-    journal.append({"k": "recovery", "plan_id": plan.plan_id, "state": state,
-                    "findings": len(findings), "at": now()})
+    # [R5-P49 / F1] Recovery is a read-only reconciliation; failing to record that it ran must not
+    # discard the findings it produced, which are the whole point of calling it.
+    _try_journal(journal, {"k": "recovery", "plan_id": plan.plan_id, "state": state,
+                           "findings": len(findings), "at": now()})
     return RecoveryReport(plan.plan_id, state, tuple(findings))
 
 
@@ -1465,7 +1854,9 @@ __all__ = [
     "OP_SAME_VOLUME",
     "PARTIAL",
     "PLANNED",
+    "PUBLICATION_ASSERTED",
     "PUBLISHED",
+    "PUBLISHED_UNJOURNALLED",
     "PlanRefusal",
     "RECOVERY_REQUIRED",
     "REFUSED",
@@ -1479,6 +1870,12 @@ __all__ = [
     "SOURCE_REMOVED",
     "STAGED",
     "STATES",
+    "TAIL_COMPLETE_UNTERMINATED",
+    "TAIL_EMPTY",
+    "TAIL_INCOMPLETE",
+    "TAIL_MALFORMED",
+    "TAIL_REPAIR_KIND",
+    "TAIL_UNKNOWN",
     "TransferItem",
     "TransferJournal",
     "TransferPlan",

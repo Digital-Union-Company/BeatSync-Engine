@@ -7,6 +7,7 @@ paths:
   - "tests/test_clips_media_server.py"
   - "tests/test_clips_review_transfer.py"
   - "tests/test_clips_review_transfer_security.py"
+  - "tests/test_clips_review_transfer_journal_integrity.py"
   - "docs/claude/clips-preview-selector-v1.md"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
@@ -92,6 +93,73 @@ carried, because a forged record used to redefine what recovery believed and a s
 then passed as a valid publication; recovery recommends and **never deletes**.
 
 Still true, and unchanged by any of this: the engine remains unreachable from the GUI.
+
+### [R5-P49] Reporting may not retract a completed operation, and a journal append may not vanish
+
+A second independent review (R5-P48) confirmed all eight corrections above and found **three new
+MAJORs**. Two of them, F1 and F4, are corrected here; **F2 and F3 remain OPEN** and are restated
+below so nothing reads this section as overall clearance.
+
+**Once an irreversible filesystem step succeeds, no later failure may report that nothing moved.**
+Every journal append after the commit point used to be unguarded. `TransferJournal.append` turns
+any `OSError` into `TransferRefused`, and `execute_transfer`'s broad `except TransferRefused`
+produced `ItemOutcome(REFUSED)` — whose defaults assert `source_removed=False` and
+`published_path=""` — about a clip already in the Media Library with its source path empty. A real
+Windows sharing violation on the journal file reproduced it. Worse, the **batch-summary** append sat
+outside the per-item `try`, so a persistent journal failure raised and the caller received **no
+`TransferResult` at all**: no outcomes, no counts, no sign a file had moved.
+
+Seven situations are now distinguishable by state alone: nothing published (`REFUSED`); published,
+verified and journalled (`COMPLETE`); **published and verified but not recorded**
+(`PUBLISHED_UNJOURNALLED`, new); verification failed and rollback worked (`ROLLED_BACK`);
+verification failed and rollback did not (`RECOVERY_REQUIRED`); cross-volume copy with the deletion
+withheld (`SOURCE_REMOVAL_BLOCKED`); and state unestablishable (`RECOVERY_REQUIRED`).
+`PUBLISHED_UNJOURNALLED` carries the real published path, byte count and SHA-256, reports
+`source_removed` according to what actually happened to the source (`True` same-volume, `False`
+cross-volume), is **never** `COMPLETE`, keeps `advance_page` false and **stops the batch** — the
+durability guarantee a page depends on is gone, so further unwitnessed publications must not happen.
+A batch whose *summary* cannot be journalled is downgraded from `COMPLETE` to `PARTIAL` for the same
+reason, without rewriting any item outcome. **A journal failure is never permission to repeat, undo
+or delete a completed operation**, and no speculative rollback is attempted to tidy up reporting;
+a test counts the renames and requires exactly one. Pre-mutation appends deliberately still *raise*:
+there no outcome list exists, nothing has moved, and refusing loudly is right.
+
+**`O_APPEND` writes at the end of the file, not the end of the last record.** With an unterminated
+fragment on disk the next append was concatenated onto it, the two became one unparseable line, and
+the **newly committed event was silently lost** — gone after a cold reopen, with the write having
+reported success. `append` now classifies the final bytes first and establishes a boundary:
+a terminated or empty file is untouched; a **complete record that merely lost its newline** gets a
+terminator and is preserved as real history (misclassifying it as damage would discard a committed
+record — the R5-P15 lesson); a **provably torn** fragment is preserved and closed off with a
+self-describing `tail_separator` record carrying no `clip_id` or `state`, so it can never be read as
+an outcome; a **malformed complete** record is surfaced, never discarded; and an **uninspectable**
+tail **refuses the write** — being unable to read the end of the file is not evidence that it ends
+on a record boundary. Nothing is ever truncated or rewritten, every repair is itself an append,
+repair is idempotent, and a crash part-way through a separator leaves either a clean boundary or a
+new torn fragment that the next append repairs. `records()` now marks damaged lines `damaged: True`,
+`damage()` reports them, and `recover()` **escalates** on them, because a damaged record carries no
+`clip_id` and a per-clip reading of the history would otherwise ignore it entirely.
+
+Appends are serialised by a **process-local lock**. Classify-then-append is not atomic across
+processes, so a second process writing the same journal is **outside** this mechanism and is not
+claimed to be safe — the same honest scope as the process-local transfer lease, and deliberately
+not described as a cross-process file lock.
+
+**What R5-P49 does NOT close, stated here so no reader infers clearance:**
+
+- **F2 (MAJOR, OPEN)** — `recover()` still aggregates intentionally-unfinished work into
+  `COMPLETE`/`needs_operator=False`: a copy-only cross-volume item whose own finding is
+  `operator_may_remove_duplicate`, and clips that were never attempted, both read as "nothing needs
+  a human". The journal-integrity escalation added here is a *different* check and does not fix it.
+- **F3 (MAJOR, OPEN)** — session, scan and page revocation are still accepted after `_revalidate()`
+  and before the commit, and the item still completes. `ReviewStore.begin_scan`,
+  `ClipRegistry.revoke_owner` and the transfer-lease model are deliberately **untouched** here.
+- **F5 (ADVISORY, OPEN)** — the rollback's target directory is still never no-replace-probed.
+- **The cross-volume source removal remains withheld**, so the accepted
+  `STAGE → VERIFY → PUBLISH → REMOVE SOURCE` contract is still **unmet** and remains an owner
+  decision. No `ctypes`, no native helper and no pathname source delete were added.
+- **Decisions written by today's P1 HTTP path remain non-transferable**; no fingerprint was
+  back-filled and neither `gui.py` nor any HTTP route was touched.
 
 ## The one idea everything rests on
 

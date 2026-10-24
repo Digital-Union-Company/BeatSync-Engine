@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core REVIEWED, REMEDIATED, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core TWICE REVIEWED, PARTLY REMEDIATED, TWO MAJORS OPEN, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -396,7 +396,7 @@ Folder Batch exists precisely so that cutting needs no interaction.
 server-authoritative classification, durable decisions and the gallery are implemented and
 measured. **Confirm still reports readiness and moves nothing.**
 
-**P2, as of R5-P47, is a reviewed and remediated transfer core that nothing calls.**
+**P2, as of R5-P49, is a twice-reviewed and partly remediated transfer core that nothing calls.**
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -422,9 +422,37 @@ them, and two corrections are limitations rather than fixes and must be read as 
   distinction. The store records a fingerprint when the deciding caller supplies one; the P1 HTTP
   path does not yet, so every existing decision fails closed. Supplying it is part of the GUI
   integration phase.
-- `expected_revisions` is mandatory, execution revalidates against the live store and registry
-  under an exclusive transfer lease, and no status may claim "nothing moved" after an irreversible
-  step.
+- `expected_revisions` is mandatory, and execution revalidates the decision, its revision, the scan
+  generation and the session against the live store and registry, per item, under an exclusive
+  transfer lease.
+
+**A second independent review (R5-P48) confirmed all eight of those corrections and found three new
+MAJORs. R5-P49 closed two of them; two remain OPEN.** The engine is still unwired, so none of this
+is reachable from the GUI — but the PR is **not** cleared for integration:
+
+- **CLOSED (R5-P49) — no status may claim "nothing moved" after an irreversible step.** Every
+  journal append after the commit point was unguarded, so a journal write failure — an ordinary
+  Windows event: an antivirus lock, a full volume, a permission change — reported `REFUSED` with
+  `source_removed=False` and an empty `published_path` about a clip already in the Media Library.
+  A persistent failure made `execute_transfer` raise and discard the entire outcome list. There is
+  now a `PUBLISHED_UNJOURNALLED` state carrying the real path, size and digest; it is never
+  `COMPLETE`, it stops the batch, and a batch whose summary cannot be journalled is downgraded
+  rather than claiming durable completion.
+- **CLOSED (R5-P49) — a journal append can no longer vanish behind a torn tail.** `O_APPEND` writes
+  at the end of the *file*, not the last *record*, so an append after an unterminated fragment was
+  glued onto it and the committed event was silently lost. The tail is now classified before every
+  write, a complete-but-unterminated record is preserved as history, a torn one is closed off with
+  an identifiable separator, and an uninspectable tail refuses the write.
+- **OPEN (MAJOR) — `recover()` reports `COMPLETE` for work that is not finished.** A copy-only
+  cross-volume item, and clips never attempted, both aggregate to
+  `COMPLETE`/`needs_operator=False`. Correct next-page advancement therefore cannot be relied on
+  yet, and no caller may gate on the recovery state until this is fixed.
+- **OPEN (MAJOR) — revocation does not take effect before the next irreversible step.** Session,
+  scan and page revocation are all accepted after the per-item revalidation and before the commit,
+  and the item still completes; the window is O(file size) because the source is hashed in between.
+  The lease guards `decide()` only.
+- **OPEN (ADVISORY)** — the rollback renames into the source directory, whose no-replace semantics
+  are never probed.
 
 - A gallery of up to **100 clips per page**, 3–4 per desktop row, each starting **PENDING**.
 - **Left click selects** (green ✓), **right click rejects** (red ✗), with an explicit way back to

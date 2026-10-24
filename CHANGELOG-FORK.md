@@ -20,6 +20,49 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-24 (Clips Preview P2: post-commit outcome truthfulness and journal-tail safety)
+
+A **second** independent adversarial review (R5-P48) of the engine below confirmed all eight
+corrections in the entry that follows and reproduced **three new MAJOR** defects. Two are corrected
+here. The engine is still unwired, Confirm still moves nothing, and three tests pin that.
+
+- **A reporting failure can no longer retract a completed filesystem operation.** Every journal
+  append after the commit point was unguarded. `TransferJournal.append` converts any `OSError` into
+  `TransferRefused`, and `execute_transfer`'s broad handler turned that into `ItemOutcome(REFUSED)`
+  — whose defaults assert `source_removed=False` and `published_path=""` — reported about a clip
+  that was already in the operator's Media Library with its source path empty. Reproduced with a
+  real Windows sharing violation on the journal file. A persistent failure was worse: the
+  batch-summary append sat outside the per-item `try`, so `execute_transfer` **raised** and the
+  caller received no `TransferResult` at all — no outcomes, no counts, no sign a file had moved.
+  There is now a `PUBLISHED_UNJOURNALLED` state carrying the real published path, byte count and
+  SHA-256, reporting `source_removed` according to what actually happened to the source; it is
+  never `COMPLETE`, keeps `advance_page` false and stops the batch, because the durability
+  guarantee the page depends on is gone. A batch whose summary cannot be journalled is downgraded
+  to `PARTIAL` without rewriting any item outcome. No rollback, retry or deletion is attempted to
+  compensate — a test counts the renames and requires exactly one.
+- **An appended journal record can no longer vanish behind a torn tail.** `O_APPEND` writes at the
+  end of the *file*, not the end of the last *record*, so with an unterminated fragment on disk the
+  next append was concatenated onto it, the two became one unparseable line, and the newly
+  committed event was **silently lost** — absent after a cold reopen, with the write having
+  reported success. The final bytes are now classified before every append: a terminated file is
+  untouched; a complete record that merely lost its newline is **preserved as real history** (not
+  treated as damage); a provably torn fragment is preserved and closed off with a self-describing
+  separator record that carries no `clip_id` or `state` and so can never be read as an outcome; a
+  malformed complete record is surfaced rather than discarded; and an uninspectable tail **refuses
+  the write**. Nothing is truncated or rewritten, repair is idempotent, and a crash part-way
+  through a separator leaves a boundary the next append repairs. `records()` marks damaged lines,
+  `damage()` reports them, and `recover()` escalates on them, since a damaged record has no
+  `clip_id` and a per-clip reading would ignore it. Appends are serialised by a process-local lock;
+  cross-process concurrency is explicitly not claimed.
+
+**Deliberately still open after this change**, and recorded so the entry is not read as clearance:
+`recover()` still aggregates intentionally-unfinished work into `COMPLETE` (R5-P48 / F2); session,
+scan and page revocation still take effect only between items, not within one (F3); the rollback's
+target directory is still unprobed (F5); cross-volume source removal remains withheld, so the
+accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and decisions
+written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper, no new
+dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
 ### Changed — 2026-10-24 (Clips Preview P2: security remediation after an independent review)
 
 An independent adversarial review of the engine below reproduced **four MAJOR** defects and four

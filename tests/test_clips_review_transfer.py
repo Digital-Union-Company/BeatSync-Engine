@@ -1257,12 +1257,16 @@ def test_the_transfer_core_imports_only_stdlib_and_the_fork_package():
     assert imported <= allowed, sorted(imported - allowed)
 
 
-def test_all_twelve_journal_states_exist_and_are_distinct():
-    assert len(tr.STATES) == 12
-    assert len(set(tr.STATES)) == 12
+def test_all_thirteen_journal_states_exist_and_are_distinct():
+    assert len(tr.STATES) == 13
+    assert len(set(tr.STATES)) == 13
     for name in ("PLANNED", "INTENT_RECORDED", "STAGED", "VERIFIED", "PUBLISHED",
                  "SOURCE_REMOVED", "COMPLETE", "REFUSED", "PARTIAL", "RECOVERY_REQUIRED",
                  # [R5-P47] A and B each needed a state the engine did not have: an undone move,
                  # and a verified publication whose deletion was deliberately not performed.
-                 "ROLLED_BACK", "SOURCE_REMOVAL_BLOCKED"):
+                 "ROLLED_BACK", "SOURCE_REMOVAL_BLOCKED",
+                 # [R5-P49 / F1] ...and F1 needed one more: a publication that succeeded and
+                 # verified while its durable record could not be written. Without it the only
+                 # vocabulary available was REFUSED, which asserts the opposite of what happened.
+                 "PUBLISHED_UNJOURNALLED"):
         assert getattr(tr, name) in tr.STATES
