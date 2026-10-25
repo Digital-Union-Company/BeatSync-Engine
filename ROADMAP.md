@@ -410,9 +410,15 @@ and reinstated the F53-A outcome in full (clip moved, `COMPLETE`, `advance_page=
 closed it with a two-phase quiescence barrier whose linearization point is stated and tested** —
 not with the `has_any_pending()` predicate R5-P54 itself warned would merely narrow the window —
 and extended quiescence to cover an acquisition already inside its coordinator-probe window, which
-was the same defect with the lease and the reservation exchanged. Being remediated is not the same
-as being cleared: the R5-P55 correction has **not** itself been independently reviewed, and four
-lower-severity R5-P54 findings (F54-2, F54-3 MINOR; F54-4, F54-5 ADVISORY) remain open.
+was the same defect with the lease and the reservation exchanged. **A fifth review (R5-P56) then
+broke that barrier three more ways** — a stale outgoing snapshot (F56-1), a partial replacement
+of an *idle* authority that split the gate with no concurrency at all (F56-2), and a coordinator
+pointer that could be retargeted or left absent outside the barrier (F56-3) — each reproduced to
+a completed, irreversible move. **R5-P57 stops making the protocol more elaborate and removes the
+capability instead: the authority topology is write-once, and replacing a bound authority is
+refused unconditionally, idle or not.** Being remediated is not the same as being cleared: the
+R5-P57 correction has **not** itself been independently reviewed, and the lower-severity R5-P54
+findings (F54-2, F54-3 MINOR; F54-4, F54-5 ADVISORY) remain open.
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -446,9 +452,31 @@ them, and two corrections are limitations rather than fixes and must be read as 
 MAJORs. R5-P49 closed two, R5-P50 the third and R5-P51 the last — but a third review (R5-P52) then
 showed R5-P51's fix had narrowed rather than closed its finding, and reproduced two MAJOR races.
 **R5-P53 closed both; a fourth review (R5-P54) independently confirmed that, then reproduced one
-new MAJOR in R5-P53's own rebinding gate, which R5-P55 closed — and the R5-P55 correction has not
-yet been independently reviewed.** The engine is still unwired, so none of this is reachable from
-the GUI — and the PR is still **not** cleared for integration:
+new MAJOR in R5-P53's own rebinding gate, which R5-P55 closed — and a fifth review (R5-P56) broke
+R5-P55's barrier three more ways, which R5-P57 closes by retiring runtime authority replacement
+altogether. The R5-P57 correction has not yet been independently reviewed.** The engine is still
+unwired, so none of this is reachable from the GUI — and the PR is still **not** cleared for
+integration:
+
+- **CLOSED (R5-P57) — a lifecycle authority is bound once and never replaced.** Four protocols in a
+  row tried to make runtime replacement safe, and three independent reviews broke all of them
+  through the same permission: *an idle authority may be replaced.* R5-P56 reproduced three MAJORs
+  in R5-P55's barrier — a stale outgoing snapshot that let one of two concurrent binders detach an
+  authority it had never enumerated (**F56-1**); a partial replacement of a completely idle
+  authority that left `registry=B, store=A, coordinator=A`, after which a session revocation passed
+  through one gate while the transfer held a lease on the other and the clip published against a
+  revoked session, **with no concurrency at all** (**F56-2**); and a coordinator pointer that could
+  be retargeted mid-probe or left absent entirely, which makes `acquire()` *skip* the scan-in-flight
+  arbitration rather than perform it (**F56-3**). The owner's decision was to remove the capability
+  rather than guard it a fourth time. `bind_lifecycle_authority()` is now **write-once**: initial
+  attachment and same-authority idempotence are supported, and replacing a bound component is
+  refused **unconditionally**, idle or not. The coordinator pointer is write-once too, decision and
+  writes share one critical section that re-reads the live attributes, and a new
+  `lifecycle_topology_fault()` refuses a transfer whose registry and store consult different
+  authorities or whose authority has no coordinator — at the execution site *and* inside `acquire`,
+  because an absent coordinator is not an idle one. The retired barrier API is **deleted**, which is
+  how R5-P56's F56-4 and F56-5 are dispositioned. Partial *attachment* stays supported because
+  production depends on it. Independent review **R5-P58** is required.
 
 - **CLOSED (R5-P55) — a rebinding gate that is only a check orphans what it was protecting.**
   R5-P53's `bind_lifecycle_authority()` refused a rebind that would orphan a live *lease* but asked

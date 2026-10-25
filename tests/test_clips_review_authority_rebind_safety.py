@@ -1,39 +1,42 @@
-"""R5-P55 — authority rebinding may never orphan a reservation or a lease (F54-1).
+"""R5-P57 — the lifecycle authority topology is immutable: bound once, never replaced.
 
-Independent review R5-P54 returned ``R5_P54_PR75_CHANGES_REQUIRED`` on one reproduced MAJOR.
-``bind_lifecycle_authority`` refused a rebind that would orphan a live *lease*
-(``has_any_lease()``) but asked nothing about a pending mutation *reservation*. Rebinding across
-that window reinstated the R5-P52 F53-A outcome in full, measured 3/3 on real files: the clip
-moved, the batch reported ``COMPLETE``, ``advance_page`` was ``True``, there was no refusal record
-in the journal — and the session and page the operation had been planned against were already
-revoked.
+This module replaces R5-P55's hot-rebinding safety suite. **The old assertions are not deleted
+lightly and not deleted quietly**: they are preserved verbatim in the R5-P53 and R5-P55 evidence
+packages under ``D:\\PROJECT_FILES\\Projects\\BeatSync-Engine-DigitalUnion\\Evidence\\``, and §10 of
+this file records exactly which ones were superseded and why.
 
-**The naive repair is not the fix, and R5-P54 said so.** Adding ``has_any_pending()`` to the old
-predicate and then assigning is check-then-act: a reservation granted between the question and the
-assignment is orphaned exactly as thoroughly. That is the same defect class R5-P52 proved fatal one
-layer down, which is why the correction here is a **two-phase quiescence barrier** with a stated
-linearization point rather than one more predicate.
+Why they were superseded
+------------------------
+Three independent reviews reproduced an authority-rebinding bypass in three successive protocols:
 
-What this module pins, in the work order's own case lettering:
+* **R5-P52** broke R5-P51's check-then-act predicate (`has_any_lease()` then assign).
+* **R5-P54** broke R5-P53's replacement gate: it asked about leases and nothing about pending
+  mutation *reservations*, so a rebind orphaned a reservation and the clip moved with
+  ``batch=COMPLETE`` against a revoked session. Reproduced 3/3 on real files.
+* **R5-P56** broke R5-P55's two-phase quiescence barrier **three separate ways**, each reaching the
+  same completed, irreversible move:
 
-* **A** — a reservation taken first makes the rebind refuse, leaves all three bindings on the old
-  authority, lets the mutation complete, and permits the rebind once the reservation releases.
-* **B** — the binder taken first wins: a reservation or an acquisition attempted *inside* the
-  window between the barrier and the assignments is refused. Both sub-orderings are driven, and
-  each test asserts the pause was genuinely reached — a race test that never reaches its program
-  point proves nothing, and R5-P54 recorded exactly that trap for the obsolete ``guard`` tests.
-* **C** — an acquisition in flight is part of quiescence. ``acquire`` releases ``_lock`` to probe
-  the coordinator, so "no lease installed" is not "no acquisition in flight"; a rebinding that
-  began and finished inside that window would leave the lease on a detached authority, which is
-  F54-1 with the lease and the reservation exchanged.
-* **D** — initial attachment, lazy store attachment and same-authority idempotence all still work,
-  including under a live reservation and under a live lease, and independent worlds stay
-  independent.
-* **E** — all seven partial target sets refuse while the old authority is non-quiescent.
+  - **F56-1 (MAJOR)** — the outgoing-authority snapshot was computed with no synchronisation and
+    never re-validated, so of two concurrent binders the first could detach an authority the second
+    had installed and the first had never enumerated. Measured with a pending reservation *and*
+    with a live transfer lease on the detached authority.
+  - **F56-2 (MAJOR)** — a *partial* replacement of a completely idle authority was accepted and
+    left ``registry=B, store=A, coordinator=A``. A transfer then leased A, a session revocation
+    passed through B and was accepted, and the clip published with ``batch=COMPLETE`` and
+    ``advance_page=True`` against ``<revoked:unknown_session>``. **No concurrency at all.**
+  - **F56-3 (MAJOR)** — the no-barrier fast path could retarget ``shared._coordinator`` with an
+    acquisition in flight, and a rebind omitting ``coordinator=`` left the incoming authority with
+    none at all, silently disabling the scan-in-flight arbitration.
 
-Plus the two structural pins that keep the gate from being bypassed instead of broken: no mutation
-site may treat the barrier as advisory, and ``gui.py``'s single direct attribute assignment must
-stay an *initial* attachment, which is the only reason it is not a reachable bypass today.
+Every one of those entered through the same permission: *an idle authority may be replaced.* The
+owner's R5-P57 decision removes the permission instead of guarding it a fourth time. The supported
+operations are initial attachment, idempotent re-attachment, and nothing else.
+
+What this module pins
+---------------------
+The §10 adversarial binding matrix, in its own numbering, plus the three R5-P56 MAJOR
+reproductions re-run against the corrected implementation and asserted to be refused at the
+*binding* site rather than merely survivable at the transfer site.
 
 Threads, events and task-owned synthetic files only. Nothing here touches production media, the
 ``F:`` journal backups or the ``J:`` retention archives.
@@ -48,6 +51,7 @@ import threading
 import pytest
 
 from beatsync_fork import clips_review as cr
+from beatsync_fork import clips_review_transfer as tr
 
 from test_clips_review_atomic_lifecycle import World
 
@@ -57,19 +61,36 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 _GUI = os.path.join(_SRC, "gui.py")
 _CLIPS_REVIEW = os.path.join(_SRC, "beatsync_fork", "clips_review.py")
 
+REBIND_REFUSED = cr.LIFECYCLE_REBIND_REFUSED
+COORD_REFUSED = cr.LIFECYCLE_COORDINATOR_REBIND_REFUSED
+
 
 # ---------------------------------------------------------------------------------- helpers
 
-#: The lifecycle operations whose reservation must block a rebind. The three R5-P54 reproduced
-#: directly come first; the remaining two are included because the defect was never specific to an
-#: operation — it was in the binding predicate, which is operation-blind.
-REBIND_BLOCKING_OPS = {
-    cr.LIFECYCLE_SESSION_REVOKE: lambda w: w.registry.revoke_owner(w.owner),
-    cr.LIFECYCLE_SCAN_BEGIN: lambda w: w.coordinator.begin(w.owner),
-    cr.LIFECYCLE_SESSION_NEW: lambda w: w.registry.new_session(w.owner, "r5p55-intruder"),
-    cr.LIFECYCLE_SCAN_RECORD: lambda w: w.store.begin_scan(w.owner, "r5p55-intruder"),
-    cr.LIFECYCLE_PAGE_PUBLISH: lambda w: w.registry.publish_page(w.owner, w.session, 2, w.frozen),
-}
+@pytest.fixture(autouse=True)
+def _binding_lock_is_never_left_held():
+    """No test in this module may leave ``_BINDING_LOCK`` held, in either direction.
+
+    This is an invariant worth asserting on its own — a leaked configuration lock is a
+    process-lifetime outage, and every refusal path in :func:`bind_lifecycle_authority` runs
+    through a ``with`` statement precisely so it cannot happen.
+
+    It is also what makes that failure mode *testable*. A leak does not produce a failing
+    assertion by itself; it produces a **hang**, because the next binding call blocks forever on a
+    lock nobody will release. Measured here during R5-P57's own negative-control run: the mutation
+    that leaks the lock parked pytest with no CPU until the driver's module timeout, and a timeout
+    is deliberately never counted as a caught mutation. Checking at teardown turns the hang into a
+    failure in the very test that caused it, before any later test can block on it.
+
+    ``acquire(blocking=False)`` is essential: a blocking probe would itself hang.
+    """
+    assert cr._BINDING_LOCK.acquire(blocking=False), (
+        "the binding lock was already held when this test started")
+    cr._BINDING_LOCK.release()
+    yield
+    assert cr._BINDING_LOCK.acquire(blocking=False), (
+        "this test left the binding lock held, which would wedge every later binding call")
+    cr._BINDING_LOCK.release()
 
 
 def _bindings(w):
@@ -79,37 +100,50 @@ def _bindings(w):
             w.coordinator.lifecycle_authority)
 
 
+def _fresh_graph(tmp_path, name="graph"):
+    """A registry, coordinator and store, all unbound, plus a fresh authority."""
+    registry = cr.ClipRegistry()
+    coordinator = cr.ScanCoordinator()
+    store = cr.ReviewStore(os.path.join(str(tmp_path), name))
+    assert registry.lifecycle_authority is None
+    assert coordinator.lifecycle_authority is None
+    assert store.lifecycle_authority is None
+    return registry, coordinator, store, cr.LifecycleAuthority()
+
+
 class _PausedReservation:
     """Hold a real reservation on ``authority`` across a real lifecycle mutation.
 
-    The mutation thread is parked **after its reservation has been granted and before it mutates
-    anything** — the same program point R5-P53's own suite uses, and the one R5-P54 proved is the
-    valid replacement for the removed ``guard`` return.
+    ``reserve_mutation`` is *wrapped*, not replaced: the genuine method runs first, so ``_pending``
+    really holds a reservation and every predicate that reads it sees real state. The mutation
+    thread parks after the reservation is granted and before it mutates anything.
     """
 
-    def __init__(self, world, operation):
+    def __init__(self, world, operation, action):
         self.world = world
         self.operation = operation
+        self.action = action
         self.authority = world.authority
         self.reserved = threading.Event()
         self.may_mutate = threading.Event()
         self.finished = threading.Event()
+        self.reached = False
         self.error = None
         self._real = self.authority.reserve_mutation
-        self._thread = None
 
     def __enter__(self):
         def traced(owner, operation):
             reservation = self._real(owner, operation)      # the REAL reservation, unchanged
             if operation == self.operation:
+                self.reached = True
                 self.reserved.set()
-                assert self.may_mutate.wait(TIMEOUT), "the rebind attempt never finished"
+                assert self.may_mutate.wait(TIMEOUT), "the binding attempt never finished"
             return reservation
 
         def run():
             try:
-                REBIND_BLOCKING_OPS[self.operation](self.world)
-            except Exception as exc:                        # noqa: BLE001 - recorded, not swallowed
+                self.action(self.world)
+            except Exception as exc:                        # noqa: BLE001 - recorded
                 self.error = exc
             finally:
                 self.finished.set()
@@ -121,7 +155,6 @@ class _PausedReservation:
             "the reservation boundary was never reached, so this test proves nothing")
         assert self.authority.pending_count(self.world.owner) == 1
         assert self.authority.has_any_pending() is True
-        assert self.authority.has_any_lease() is False, "a lease would confound the finding"
         return self
 
     def release(self):
@@ -136,781 +169,921 @@ class _PausedReservation:
         return False
 
 
-# ======================================================== Case A — the reservation comes first
+# ============================================= §10.1-3  Rule A — initial attachment still works
 
-@pytest.mark.parametrize("operation", list(REBIND_BLOCKING_OPS))
-def test_a_rebinding_is_refused_while_a_mutation_reservation_is_pending(tmp_path, operation):
-    """Case A, and the direct closure of R5-P54 F54-1.
+def test_01_a_fresh_registry_and_coordinator_bind(tmp_path):
+    """The exact gui.py import-time shape: registry + coordinator, no store yet."""
+    registry, coordinator, _store, shared = _fresh_graph(tmp_path, "one")
+    got = cr.bind_lifecycle_authority(registry=registry, coordinator=coordinator,
+                                      authority=shared)
+    assert got is shared
+    assert registry.lifecycle_authority is shared
+    assert coordinator.lifecycle_authority is shared
+    assert shared._coordinator is coordinator
 
-    R5-P54's measurement on this exact sequence was ``rebind=ACCEPTED`` with ``A_pending=1``. The
-    rebind must refuse, and refusing has to be *total*: every binding unchanged, and — the part a
-    looser fix would miss — neither authority's coordinator pointer touched either.
+
+def test_02_a_fresh_registry_coordinator_and_store_bind_together(tmp_path):
+    registry, coordinator, store, shared = _fresh_graph(tmp_path, "two")
+    cr.bind_lifecycle_authority(registry=registry, store=store, coordinator=coordinator,
+                               authority=shared)
+    assert registry.lifecycle_authority is shared
+    assert store.lifecycle_authority is shared
+    assert coordinator.lifecycle_authority is shared
+    assert cr.lifecycle_topology_fault(registry, store) == ""
+
+
+def test_03_a_lazily_created_store_joins_the_established_authority(tmp_path):
+    """The production sequence: bind registry+coordinator at import, store joins on first use."""
+    registry, coordinator, _unused, shared = _fresh_graph(tmp_path, "three")
+    cr.bind_lifecycle_authority(registry=registry, coordinator=coordinator, authority=shared)
+    late = cr.ReviewStore(os.path.join(str(tmp_path), "late"))
+    assert late.lifecycle_authority is None
+    assert cr.lifecycle_topology_fault(registry, late) == cr.LIFECYCLE_TOPOLOGY_INCOHERENT
+    cr.bind_lifecycle_authority(store=late, authority=shared)
+    assert late.lifecycle_authority is shared
+    assert cr.lifecycle_topology_fault(registry, late) == ""
+
+
+# ============================================= §10.4-6  Rule B — idempotence, including when busy
+
+def test_04_same_authority_binding_is_idempotent(tmp_path):
+    w = World(tmp_path, count=1)
+    before = _bindings(w)
+    again = cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                        coordinator=w.coordinator, authority=w.authority)
+    assert again is w.authority
+    assert _bindings(w) == before
+    assert w.authority._coordinator is w.coordinator
+
+
+def test_05_same_authority_binding_is_permitted_during_a_transfer_lease(tmp_path):
+    """P1 startup and the lazy store attachment depend on this staying permitted."""
+    w = World(tmp_path, count=1)
+    w.decide_all(cr.SELECTED)
+    plan = w.lease()
+    before = _bindings(w)
+    again = cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                        coordinator=w.coordinator, authority=w.authority)
+    assert again is w.authority
+    assert _bindings(w) == before
+    assert w.authority.holder(w.owner) == plan.plan_id          # the lease is untouched
+    w.store.end_transfer(plan.owner, plan.plan_id)
+
+
+def test_06_same_authority_binding_is_permitted_during_a_mutation_reservation(tmp_path):
+    w = World(tmp_path, count=1)
+    with _PausedReservation(w, cr.LIFECYCLE_SESSION_REVOKE,
+                            lambda ww: ww.registry.revoke_owner(ww.owner)) as parked:
+        assert parked.reached is True
+        before = _bindings(w)
+        epoch = w.authority.epoch(w.owner)
+        again = cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                            coordinator=w.coordinator, authority=w.authority)
+        assert again is w.authority
+        assert _bindings(w) == before
+        # Idempotence changed no live state at all: not the reservation, not the epoch.
+        assert w.authority.pending_count(w.owner) == 1
+        assert w.authority.epoch(w.owner) == epoch
+    assert parked.error is None
+
+
+# ============================= §10.7-11  Rule C/D — replacement is refused, idle or not
+
+@pytest.mark.parametrize("names", [
+    ("registry",), ("store",), ("coordinator",),
+    ("registry", "store"), ("registry", "coordinator"), ("store", "coordinator"),
+    ("registry", "store", "coordinator"),
+])
+def test_07_11_every_replacement_subset_is_refused_even_when_completely_idle(tmp_path, names):
+    """§10.7-10.11 together. **This is the R5-P57 contract.**
+
+    R5-P53 and R5-P55 both *permitted* each of these seven while the outgoing authority was idle.
+    R5-P56 F56-1 and F56-2 are what that permission cost. Every subset is now refused, and the
+    refusal is asserted against an authority that is idle on every measure the old gates consulted.
     """
     w = World(tmp_path, count=1)
     usurper = cr.LifecycleAuthority()
-    before_bindings = _bindings(w)
-    old_coordinator = w.authority._coordinator
-    assert usurper._coordinator is None
+    subsystems = {"registry": w.registry, "store": w.store, "coordinator": w.coordinator}
 
-    with _PausedReservation(w, operation) as held:
+    assert w.authority.has_any_lease() is False
+    assert w.authority.has_any_pending() is False
+    before = _bindings(w)
+    before_coordinator = w.authority._coordinator
+
+    with pytest.raises(cr.Refusal) as caught:
+        cr.bind_lifecycle_authority(authority=usurper,
+                                    **{n: subsystems[n] for n in names})
+    assert caught.value.reason == REBIND_REFUSED
+    assert caught.value.status == 409
+    # §10.24 — a refused bind leaves every original binding intact...
+    assert _bindings(w) == before
+    assert all(x is w.authority for x in before)
+    # ...and never attaches the usurper to anything, so no split can exist afterwards.
+    assert usurper._coordinator is None
+    assert w.authority._coordinator is before_coordinator
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == ""
+
+
+def test_12_two_binders_racing_different_initial_authorities_cannot_both_win(tmp_path):
+    """§10.12. One wins outright; the loser is refused and overwrites nothing."""
+    registry, coordinator, store, first = _fresh_graph(tmp_path, "race")
+    second = cr.LifecycleAuthority()
+    outcomes = {}
+    gate = threading.Barrier(2, timeout=TIMEOUT)
+
+    def bind(tag, authority):
+        gate.wait()
+        try:
+            cr.bind_lifecycle_authority(registry=registry, store=store, coordinator=coordinator,
+                                        authority=authority)
+            outcomes[tag] = "ACCEPTED"
+        except cr.Refusal as exc:
+            outcomes[tag] = "REFUSED:%s" % exc.reason
+
+    threads = [threading.Thread(target=bind, args=a, daemon=True)
+               for a in (("first", first), ("second", second))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(TIMEOUT)
+    assert not any(t.is_alive() for t in threads), "a binder hung"
+
+    assert sorted(outcomes) == ["first", "second"]
+    accepted = [k for k, v in outcomes.items() if v == "ACCEPTED"]
+    assert len(accepted) == 1, outcomes
+    winner = first if accepted[0] == "first" else second
+    loser = second if accepted[0] == "first" else first
+    assert outcomes[("second" if accepted[0] == "first" else "first")] == (
+        "REFUSED:%s" % REBIND_REFUSED)
+    # No last-writer-wins and no split: all three went to exactly one authority.
+    assert registry.lifecycle_authority is winner
+    assert store.lifecycle_authority is winner
+    assert coordinator.lifecycle_authority is winner
+    assert loser._coordinator is None
+    assert cr.lifecycle_topology_fault(registry, store) == ""
+
+
+def test_13_two_binders_racing_different_replacements_are_both_refused(tmp_path):
+    """§10.13. Neither may replace, so the established graph is untouched by both."""
+    w = World(tmp_path, count=1)
+    outcomes = {}
+    gate = threading.Barrier(2, timeout=TIMEOUT)
+
+    def bind(tag):
+        authority = cr.LifecycleAuthority()
+        gate.wait()
+        try:
+            cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                        coordinator=w.coordinator, authority=authority)
+            outcomes[tag] = "ACCEPTED"
+        except cr.Refusal as exc:
+            outcomes[tag] = "REFUSED:%s" % exc.reason
+
+    threads = [threading.Thread(target=bind, args=(t,), daemon=True) for t in ("x", "y")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(TIMEOUT)
+    assert not any(t.is_alive() for t in threads)
+    assert outcomes == {"x": "REFUSED:%s" % REBIND_REFUSED,
+                        "y": "REFUSED:%s" % REBIND_REFUSED}
+    assert all(x is w.authority for x in _bindings(w))
+
+
+def test_14_a_binder_paused_after_inspecting_its_targets_cannot_use_a_stale_view(tmp_path):
+    """§10.14 — **the direct F56-1 closure, at the binding site.**
+
+    R5-P56 drove exactly this interleaving and measured a completed move: binder X read the
+    bindings, parked, binder Y installed a new authority, live state landed on it, and X's resumed
+    assignment detached it. X is parked here at the same place — inside the decision phase,
+    with its view of the targets already taken — and must not be able to act on it.
+
+    The pause is driven by wrapping ``getattr`` on the *first* target read, which is the earliest
+    point at which a binder has looked at a binding, and the test asserts the pause was reached.
+    """
+    registry, coordinator, store, authority_y = _fresh_graph(tmp_path, "stale")
+    authority_x = cr.LifecycleAuthority()
+
+    entered = threading.Event()
+    may_proceed = threading.Event()
+    reached = {"v": False}
+    real_lock = cr._BINDING_LOCK
+
+    class ParkingLock:
+        """Parks binder X *after* it has entered the binding critical section."""
+
+        def __enter__(self):
+            real_lock.acquire()
+            if not reached["v"] and threading.current_thread().name == "binder-x":
+                reached["v"] = True
+                entered.set()
+                # Release so Y can run to completion while X is parked holding its stale view.
+                real_lock.release()
+                assert may_proceed.wait(TIMEOUT), "driver never released binder X"
+                real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real_lock.release()
+            return False
+
+    cr._BINDING_LOCK = ParkingLock()
+    out = {}
+    try:
+        def binder_x():
+            try:
+                cr.bind_lifecycle_authority(registry=registry, store=store,
+                                            coordinator=coordinator, authority=authority_x)
+                out["x"] = "ACCEPTED"
+            except cr.Refusal as exc:
+                out["x"] = "REFUSED:%s" % exc.reason
+
+        thread = threading.Thread(target=binder_x, name="binder-x", daemon=True)
+        thread.start()
+        assert entered.wait(TIMEOUT), "binder X never reached the binding critical section"
+        assert reached["v"] is True
+
+        # Binder Y completes the whole binding while X is parked.
+        cr.bind_lifecycle_authority(registry=registry, store=store, coordinator=coordinator,
+                                    authority=authority_y)
+        assert registry.lifecycle_authority is authority_y
+
+        # Real live state now exists on the authority X never looked at.
+        w = World(os.path.join(str(tmp_path), "live"), count=1, authority=authority_y,
+                  coordinator=coordinator)
+        reservation = authority_y.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
+        assert authority_y.has_any_pending() is True
+
+        may_proceed.set()
+        thread.join(TIMEOUT)
+        assert not thread.is_alive()
+    finally:
+        cr._BINDING_LOCK = real_lock
+
+    # X must refuse, and above all must not have detached authority_y.
+    assert out["x"] == "REFUSED:%s" % REBIND_REFUSED
+    assert registry.lifecycle_authority is authority_y
+    assert store.lifecycle_authority is authority_y
+    assert coordinator.lifecycle_authority is authority_y
+    assert authority_x._coordinator is None
+    # The reservation on authority_y was never orphaned.
+    assert authority_y.pending_count(w.owner) == 1
+    assert authority_y.release_mutation(reservation) is True
+
+
+def test_15_replacement_is_refused_while_a_mutation_reservation_is_pending(tmp_path):
+    """§10.15. The R5-P54 F54-1 ordering, still refused — now for a stronger reason."""
+    w = World(tmp_path, count=1)
+    usurper = cr.LifecycleAuthority()
+    with _PausedReservation(w, cr.LIFECYCLE_SESSION_REVOKE,
+                            lambda ww: ww.registry.revoke_owner(ww.owner)) as parked:
+        assert parked.reached is True
         with pytest.raises(cr.Refusal) as caught:
             cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
                                         coordinator=w.coordinator, authority=usurper)
-        assert caught.value.status == 409
-        assert caught.value.reason == cr.LIFECYCLE_REBIND_REFUSED
-
-        # A refusal leaves every existing binding exactly as it was.
-        assert _bindings(w) == before_bindings
-        assert all(a is w.authority for a in _bindings(w))
-        # ...including the coordinator pointer on BOTH authorities.
-        assert w.authority._coordinator is old_coordinator
-        assert usurper._coordinator is None
-        # The reservation is still live on the authority that is still in force.
-        assert w.authority.pending_count(w.owner) == 1
-        # And no barrier was left behind on either side.
-        assert w.authority.is_rebinding() is False
-        assert usurper.is_rebinding() is False
-
-        held.release()
-
-    assert held.error is None, "the reserved mutation must still complete normally"
-    assert w.authority.pending_count(w.owner) == 0
-
-    # Once quiescent again, the very same rebind is permitted. The gate is a quiescence
-    # condition, not a permanent prohibition.
-    assert cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                       coordinator=w.coordinator,
-                                       authority=usurper) is usurper
-    assert all(a is usurper for a in _bindings(w))
-    assert usurper._coordinator is w.coordinator
+        assert caught.value.reason == REBIND_REFUSED
+        assert all(x is w.authority for x in _bindings(w))
+        assert w.authority.pending_count(w.owner) == 1          # not orphaned
+    assert parked.error is None
+    assert w.authority.pending_count(w.owner) == 0              # released cleanly
 
 
-def test_a_the_reserved_mutation_still_excludes_the_transfer_after_the_refusal(tmp_path):
-    """Case A, end to end on the real filesystem — the F54-1 outcome itself.
+def test_16_replacement_is_refused_while_a_transfer_lease_exists(tmp_path):
+    """§10.16."""
+    w = World(tmp_path, count=1)
+    w.decide_all(cr.SELECTED)
+    plan = w.lease()
+    usurper = cr.LifecycleAuthority()
+    with pytest.raises(cr.Refusal) as caught:
+        cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                    coordinator=w.coordinator, authority=usurper)
+    assert caught.value.reason == REBIND_REFUSED
+    assert w.authority.holder(w.owner) == plan.plan_id
+    assert all(x is w.authority for x in _bindings(w))
+    w.store.end_transfer(plan.owner, plan.plan_id)
 
-    R5-P54 measured: clip moved, ``batch=COMPLETE``, ``advance_page=True``, no refusal record. The
-    point of refusing the rebind is that the *transfer* is still refused, so this asserts the
-    filesystem and the batch, not merely the binding.
+
+def test_17_replacement_is_refused_while_an_acquisition_is_in_flight(tmp_path):
+    """§10.17. R5-P55 needed ``_acquiring`` to answer this; the contract answers it for free.
+
+    The acquisition is parked inside ``acquire``'s real lock-free coordinator probe — the window
+    in which no lease is installed yet, so every quiescence measure the old barrier consulted
+    reports the authority idle. Replacement is refused anyway, because idleness is no longer the
+    question.
     """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
     plan = w.plan()
-    assert plan.ok, plan.refusals
-    before_review = w.review_files()
+    usurper = cr.LifecycleAuthority()
 
-    with _PausedReservation(w, cr.LIFECYCLE_SESSION_REVOKE) as held:
-        usurper = cr.LifecycleAuthority()
-        with pytest.raises(cr.Refusal):
-            cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                        coordinator=w.coordinator, authority=usurper)
+    entered = threading.Event()
+    may = threading.Event()
+    reached = {"v": False}
+    real_newest = w.coordinator.newest
 
-        # The acquisition is refused for the intended reason, not by a timeout or a generic error.
-        with pytest.raises(cr.Refusal) as refused:
-            w.lease(plan)
-        assert refused.value.status == 409
-        assert refused.value.reason == cr.LIFECYCLE_PENDING
+    def traced_newest(owner):
+        if not reached["v"]:
+            reached["v"] = True
+            entered.set()
+            assert may.wait(TIMEOUT), "driver never released the parked probe"
+        return real_newest(owner)
 
-        # Executed as a batch rather than acquired directly, it refuses and does not advance.
-        outcome = w.run(plan)
-        assert outcome.state == "REFUSED"
-        assert outcome.advance_page is False
-        # Nothing moved, and the usurper never became a usable gate.
-        assert w.library_files() == []
-        assert w.review_files() == before_review
-        assert usurper.holder(w.owner) == ""
-        assert w.authority.holder(w.owner) == ""
-        held.release()
+    w.coordinator.newest = traced_newest
+    result = {}
 
-
-# ======================================================== Case B — the binder comes first
-
-class _PausedRebind:
-    """Park ``bind_lifecycle_authority`` inside its barrier window.
-
-    ``pause_on`` selects which authority's ``begin_rebind`` blocks, which selects *where* in the
-    protocol the pause lands:
-
-    * the outgoing authority → after it is barriered, before the incoming one is, and before any
-      assignment;
-    * the incoming authority → after the **last** barrier, i.e. immediately past the linearization
-      point and immediately before the first attribute assignment.
-
-    Both are windows in which a concurrent reservation or acquisition must be refused.
-    """
-
-    def __init__(self, pause_on):
-        self.pause_on = pause_on
-        self.inside = threading.Event()
-        self.may_finish = threading.Event()
-        self.reached = False
-        self._real = pause_on.begin_rebind
-
-    def __enter__(self):
-        def traced():
-            installed = self._real()
-            if installed:
-                self.reached = True
-                self.inside.set()
-                assert self.may_finish.wait(TIMEOUT), "the racing operation never completed"
-            return installed
-
-        self.pause_on.begin_rebind = traced
-        return self
-
-    def restore(self):
-        self.pause_on.begin_rebind = self._real
-
-    def __exit__(self, *exc):
-        self.may_finish.set()
-        self.restore()
-        return False
-
-
-def _rebind_in_thread(w, authority):
-    """Run the rebind on its own thread; returns (thread, result-dict)."""
-    out = {}
-
-    def run():
+    def acquirer():
         try:
-            cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                        coordinator=w.coordinator, authority=authority)
-            out["result"] = "ACCEPTED"
+            lease = w.authority.acquire(w.owner, plan.plan_id, session_id=plan.session_id,
+                                        page_token=plan.page_token, scan_id=plan.scan_id,
+                                        identities=[i.identity for i in plan.items])
+            result["r"] = lease.plan_id
         except cr.Refusal as exc:
-            out["result"] = "REFUSED:%s" % exc.reason
+            result["r"] = "REFUSED:%s" % exc.reason
 
-    thread = threading.Thread(target=run, daemon=True)
+    thread = threading.Thread(target=acquirer, daemon=True)
     thread.start()
-    return thread, out
-
-
-@pytest.mark.parametrize("pause_where", ["outgoing", "incoming"])
-def test_b_a_reservation_attempted_inside_the_barrier_window_is_refused(tmp_path, pause_where):
-    """Case B — the binder confirms quiescence, then pauses; a mutation tries to reserve.
-
-    This is the test R5-P54 asked for by name and the reason ``has_any_pending()`` alone is not
-    the fix: a naive implementation would be *inside exactly this window* with the authority still
-    accepting reservations. The barrier is installed in the same critical section that observed
-    quiescence, so the reservation is refused and the binder wins.
-    """
-    w = World(tmp_path, count=1)
-    usurper = cr.LifecycleAuthority()
-    paused_on = w.authority if pause_where == "outgoing" else usurper
-
-    with _PausedRebind(paused_on) as parked:
-        thread, out = _rebind_in_thread(w, usurper)
-        assert parked.inside.wait(TIMEOUT), (
-            "the binder never reached the window between its quiescence check and its "
-            "assignment, so this test proves nothing")
-        assert parked.reached is True
-
-        # The barrier really is installed on the authority that was paused.
-        assert paused_on.is_rebinding() is True
-
-        # A lifecycle mutation may not reserve here. It is refused, and named as a rebinding.
-        with pytest.raises(cr.Refusal) as caught:
-            paused_on.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-        assert caught.value.status == 409
-        assert caught.value.reason == cr.LIFECYCLE_REBINDING
-        assert paused_on.pending_count(w.owner) == 0, "a refused reservation records nothing"
-
-        # The non-raising form skips rather than raising, as eviction paths require.
-        assert paused_on.try_reserve_mutation(w.owner, cr.LIFECYCLE_OWNER_EVICT) is None
-
-        # A real lifecycle mutation through a real subsystem is refused too, and changes nothing.
-        before = w.snapshot()
-        if paused_on is w.authority:
-            with pytest.raises(cr.Refusal) as mutation:
-                w.registry.revoke_owner(w.owner)
-            assert mutation.value.reason == cr.LIFECYCLE_REBINDING
-            assert w.snapshot() == before
-
-        parked.may_finish.set()
-
-    thread.join(TIMEOUT)
-    assert out["result"] == "ACCEPTED"
-    # The binder won cleanly: one coherent binding, no split, no barrier left behind.
-    assert all(a is usurper for a in _bindings(w))
-    assert w.authority.is_rebinding() is False
-    assert usurper.is_rebinding() is False
-    assert usurper.pending_count(w.owner) == 0
-    assert w.authority.pending_count(w.owner) == 0
-
-
-def test_b_a_reservation_granted_on_the_incoming_authority_fails_the_whole_rebind(tmp_path):
-    """Case B, the other ordering — quiescence is re-checked per authority, so a reservation that
-    lands on the *incoming* authority between the two barriers refuses the whole operation.
-
-    This is the interleaving a single combined predicate would miss. The barrier on the outgoing
-    authority succeeded; the one on the incoming authority must still fail closed, and the
-    already-installed barrier must be released by the ``finally``.
-    """
-    w = World(tmp_path, count=1)
-    usurper = cr.LifecycleAuthority()
-    before_bindings = _bindings(w)
-    smuggled = {}
-    real_begin = w.authority.begin_rebind
-
-    def traced():
-        installed = real_begin()
-        if installed and "reservation" not in smuggled:
-            # Exactly the race: between barriering the outgoing authority and barriering the
-            # incoming one, a lifecycle mutation reserves on the incoming one.
-            smuggled["reservation"] = usurper.reserve_mutation(w.owner,
-                                                               cr.LIFECYCLE_SESSION_REVOKE)
-        return installed
-
-    w.authority.begin_rebind = traced
     try:
+        assert entered.wait(TIMEOUT), "the probe window was never reached"
+        # Mid-probe: no lease installed yet, nothing pending. The old gate would have allowed it.
+        assert w.authority.has_any_lease() is False
+        assert w.authority.has_any_pending() is False
         with pytest.raises(cr.Refusal) as caught:
             cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
                                         coordinator=w.coordinator, authority=usurper)
-        assert caught.value.reason == cr.LIFECYCLE_REBIND_REFUSED
+        assert caught.value.reason == REBIND_REFUSED
+        assert all(x is w.authority for x in _bindings(w))
     finally:
-        w.authority.begin_rebind = real_begin
+        may.set()
+        thread.join(TIMEOUT)
+        w.coordinator.newest = real_newest
 
-    assert "reservation" in smuggled, "the interleaving never happened; the test proves nothing"
-    assert _bindings(w) == before_bindings
-    assert usurper._coordinator is None
-    # The barrier taken on the outgoing authority was released on the refusal path.
-    assert w.authority.is_rebinding() is False
-    assert usurper.is_rebinding() is False
-    # ...and the authority is not left permanently closed to lifecycle operations.
-    reservation = w.authority.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-    assert w.authority.release_mutation(reservation) is True
-    assert usurper.release_mutation(smuggled["reservation"]) is True
+    # The acquisition completed on the authority it started on, which is still the bound one.
+    assert result["r"] == plan.plan_id
+    assert w.authority.holder(w.owner) == plan.plan_id
+    w.authority.release(w.owner, plan.plan_id)
 
 
-def test_b_the_barrier_never_blocks_a_release(tmp_path):
-    """A barrier that blocked ``release`` would be a deadlock, not a safety property.
+def test_18_initial_attachment_still_works_while_the_existing_graph_is_busy(tmp_path):
+    """§10.18. Rule A may not be made refusable by activity elsewhere: that would be an outage.
 
-    ``begin_rebind`` refuses rather than waiting, and the two release paths stay open while it is
-    held, so a live operation can always drain and an operator retry always succeeds.
-    """
-    w = World(tmp_path, count=1)
-    assert w.authority.begin_rebind() is True
-    try:
-        # Both releases are reachable under the barrier and neither blocks.
-        assert w.authority.release_mutation(None) is False
-        assert w.authority.release(w.owner, "no-such-plan") is False
-        # A second binder cannot take the same barrier...
-        assert w.authority.begin_rebind() is False
-        # ...and acquisition is closed while it is held.
-        with pytest.raises(cr.Refusal) as caught:
-            w.authority.acquire(w.owner, "plan-x", session_id=w.session, page_token=w.page,
-                                scan_id=w.scan_id, identities=["i1"])
-        assert caught.value.reason == cr.LIFECYCLE_REBINDING
-    finally:
-        w.authority.end_rebind()
-    assert w.authority.is_rebinding() is False
-    # end_rebind is idempotent.
-    w.authority.end_rebind()
-    assert w.authority.is_rebinding() is False
-
-
-def test_b_a_non_quiescent_authority_cannot_be_barriered_at_all(tmp_path):
-    """The barrier primitive's own contract, asserted directly rather than through the binder."""
-    w = World(tmp_path, count=1)
-    w.decide_all(cr.SELECTED)
-
-    # ...with a reservation held
-    reservation = w.authority.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-    assert w.authority.has_any_pending() is True
-    assert w.authority.begin_rebind() is False
-    assert w.authority.release_mutation(reservation) is True
-
-    # ...with a lease held
-    plan = w.lease()
-    assert w.authority.has_any_lease() is True
-    assert w.authority.begin_rebind() is False
-    w.store.end_transfer(plan.owner, plan.plan_id)
-
-    # ...and quiescent again
-    assert w.authority.has_any_pending() is False
-    assert w.authority.has_any_lease() is False
-    assert w.authority.acquiring_count() == 0
-    assert w.authority.begin_rebind() is True
-    w.authority.end_rebind()
-
-
-# ======================================================== Case C — acquisition races the rebind
-
-def test_c_rebinding_during_a_live_lease_is_still_refused(tmp_path):
-    """Case C, first row — R5-P53's original property, re-driven rather than assumed."""
-    w = World(tmp_path, count=1)
-    w.decide_all(cr.SELECTED)
-    plan = w.lease()
-    usurper = cr.LifecycleAuthority()
-    before_bindings = _bindings(w)
-    with pytest.raises(cr.Refusal) as caught:
-        cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                    coordinator=w.coordinator, authority=usurper)
-    assert caught.value.reason == cr.LIFECYCLE_REBIND_REFUSED
-    assert _bindings(w) == before_bindings
-    assert usurper._coordinator is None
-    w.store.end_transfer(plan.owner, plan.plan_id)
-
-
-def test_c_an_acquisition_in_flight_refuses_the_rebind(tmp_path):
-    """Case C, the sharp row — a rebind attempted **between** ``acquire``'s two arbitrations.
-
-    ``acquire`` deliberately drops ``_lock`` to probe the coordinator, so in that window no lease
-    is installed yet and ``has_any_lease()`` reports the authority quiescent. A rebinding accepted
-    here would install the lease on an authority nothing consults — F54-1 with the lease and the
-    reservation exchanged. Driven from inside the real probe, so the window is genuinely occupied.
+    This is the F54-5 carve-out, retained deliberately and now the *only* way a component joins.
     """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
-    usurper = cr.LifecycleAuthority()
-    seen = {}
-    real_view = w.coordinator.view
-
-    def probing_view(owner):
-        if "rebind" not in seen:
-            seen["acquiring_during_probe"] = w.authority.acquiring_count()
-            seen["lease_during_probe"] = w.authority.has_any_lease()
-            try:
-                cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                            coordinator=w.coordinator, authority=usurper)
-                seen["rebind"] = "ACCEPTED"
-            except cr.Refusal as exc:
-                seen["rebind"] = "REFUSED:%s" % exc.reason
-        return real_view(owner)
-
-    w.coordinator.view = probing_view
-    try:
-        plan = w.lease()                       # a real begin_transfer -> real acquire
-    finally:
-        w.coordinator.view = real_view
-
-    assert "rebind" in seen, "the probe window was never entered; the test proves nothing"
-    # The window really was the one claimed: in flight, with no lease installed yet.
-    assert seen["acquiring_during_probe"] == 1
-    assert seen["lease_during_probe"] is False
-    # And the rebind was refused on exactly that basis.
-    assert seen["rebind"] == "REFUSED:%s" % cr.LIFECYCLE_REBIND_REFUSED
-    assert all(a is w.authority for a in _bindings(w))
-    assert usurper._coordinator is None
-    # The acquisition itself was unaffected: a binding attempt must not break an in-flight one.
+    plan = w.lease()
+    late = cr.ReviewStore(os.path.join(str(tmp_path), "late"))
+    cr.bind_lifecycle_authority(store=late, authority=w.authority)
+    assert late.lifecycle_authority is w.authority
     assert w.authority.holder(w.owner) == plan.plan_id
     w.store.end_transfer(plan.owner, plan.plan_id)
-    assert w.authority.acquiring_count() == 0
 
 
-def test_c_a_rebind_during_an_epoch_retry_is_refused(tmp_path):
-    """Case C — the same window, entered on an epoch-conflict retry rather than the first pass.
+# ====================================== §10.19-21  Rule E — the coordinator cannot move
 
-    A retry re-enters the probe, so the in-flight marker must still be set; if it were cleared and
-    re-taken per pass, a rebind could slip into the gap between two attempts.
+def test_19_a_foreign_coordinator_cannot_replace_the_established_one(tmp_path):
+    """§10.19."""
+    w = World(tmp_path, count=1)
+    assert w.authority._coordinator is w.coordinator
+    intruder = cr.ScanCoordinator()
+    with pytest.raises(cr.Refusal) as caught:
+        cr.bind_lifecycle_authority(coordinator=intruder, authority=w.authority)
+    assert caught.value.reason == COORD_REFUSED
+    assert w.authority._coordinator is w.coordinator
+    assert intruder.lifecycle_authority is None
+    # Supplying the SAME coordinator again stays idempotent.
+    cr.bind_lifecycle_authority(coordinator=w.coordinator, authority=w.authority)
+    assert w.authority._coordinator is w.coordinator
+
+
+def test_20_a_transfer_refuses_when_the_bound_authority_has_no_coordinator(tmp_path):
+    """§10.20 — **the direct F56-3 closure at the execution site.**
+
+    R5-P56 measured a lease granted mid-scan because ``_coordinator`` was ``None`` and the probe
+    was skipped entirely. An absent coordinator is not an idle one, so the transfer fails closed.
+    """
+    w = World(tmp_path, count=1, bind=False)
+    orphan = cr.LifecycleAuthority()
+    cr.bind_lifecycle_authority(registry=w.registry, store=w.store, authority=orphan)
+    assert orphan._coordinator is None
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == cr.LIFECYCLE_COORDINATOR_UNAVAILABLE
+
+    w.decide_all(cr.SELECTED)
+    plan = w.plan()
+    source = plan.items[0].source_path
+    result = w.run(plan)
+    assert result.state == tr.REFUSED
+    assert result.advance_page is False
+    assert os.path.exists(source), "nothing may move through an incomplete topology"
+    assert w.library_files() == []
+    reasons = [r.get("reason") for r in w.journal.records()]
+    assert cr.LIFECYCLE_COORDINATOR_UNAVAILABLE in reasons
+    # And once the coordinator joins, the same transfer proceeds.
+    cr.bind_lifecycle_authority(coordinator=w.coordinator, authority=orphan)
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == ""
+
+
+def test_20b_a_bound_authority_without_a_coordinator_refuses_the_lease_itself(tmp_path):
+    """§10.20, acquisition site. `execute_transfer` is not the only way to reach `acquire`.
+
+    ``ReviewStore.begin_transfer`` calls ``acquire`` directly and is public, so the topology
+    precondition one layer up is necessary but not sufficient. A *bound* authority owes its callers
+    the scan-in-flight arbitration; if it cannot perform it, it must refuse rather than skip it.
+
+    The distinction that keeps this from being an outage is ``_bound``: a bare authority a unit
+    test constructed never promised arbitration, and is unaffected.
+    """
+    registry, coordinator, store, bound = _fresh_graph(tmp_path, "nocoord")
+    cr.bind_lifecycle_authority(registry=registry, store=store, authority=bound)
+    assert bound._bound is True and bound._coordinator is None
+
+    with pytest.raises(cr.Refusal) as caught:
+        bound.acquire("owner-x", "plan-x", session_id="s", page_token="p", scan_id="sc",
+                      identities=["id-1"])
+    assert caught.value.reason == cr.LIFECYCLE_COORDINATOR_UNAVAILABLE
+    assert caught.value.status == 409
+    assert bound.holder("owner-x") == "", "no lease may be installed"
+    assert bound.identity_holder("id-1") == ""
+
+    # A bare, never-bound authority is deliberately NOT affected: it is the legacy P1 object.
+    bare = cr.LifecycleAuthority()
+    assert bare._bound is False and bare._coordinator is None
+    lease = bare.acquire("owner-y", "plan-y", session_id="s", page_token="p", scan_id="sc",
+                         identities=["id-2"])
+    assert lease.plan_id == "plan-y"
+    assert bare.release("owner-y", "plan-y") is True
+
+    # And once the coordinator joins the bound graph, acquisition works there too.
+    cr.bind_lifecycle_authority(coordinator=coordinator, authority=bound)
+    assert bound._coordinator is coordinator
+    ok = bound.acquire("owner-x", "plan-x", session_id="s", page_token="p", scan_id="sc",
+                       identities=["id-1"])
+    assert ok.plan_id == "plan-x"
+    assert bound.release("owner-x", "plan-x") is True
+
+
+def test_21_the_coordinator_pointer_cannot_be_retargeted_during_the_lock_free_probe(tmp_path):
+    """§10.21 — the other half of F56-3, at the binding site.
+
+    R5-P56 retargeted ``_coordinator`` from inside ``acquire``'s probe with zero barriers taken,
+    and the lease was installed against a superseded coordinator. Write-once makes the retarget
+    itself impossible, so the probe cannot observe a different object than it started with.
     """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
+    plan = w.plan()
+    replacement = cr.ScanCoordinator()
+    replacement.begin(w.owner)                   # mid-transition: newest > 0 and view == {}
+    assert replacement.newest(w.owner) > 0 and replacement.view(w.owner) == {}
+
+    entered = threading.Event()
+    may = threading.Event()
+    reached = {"v": False}
+    real_newest = w.coordinator.newest
+
+    def traced_newest(owner):
+        if not reached["v"]:
+            reached["v"] = True
+            entered.set()
+            assert may.wait(TIMEOUT)
+        return real_newest(owner)
+
+    w.coordinator.newest = traced_newest
+    result = {}
+
+    def acquirer():
+        try:
+            result["r"] = w.authority.acquire(
+                w.owner, plan.plan_id, session_id=plan.session_id, page_token=plan.page_token,
+                scan_id=plan.scan_id, identities=[i.identity for i in plan.items]).plan_id
+        except cr.Refusal as exc:
+            result["r"] = "REFUSED:%s" % exc.reason
+
+    thread = threading.Thread(target=acquirer, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(TIMEOUT), "the probe window was never reached"
+        with pytest.raises(cr.Refusal) as caught:
+            cr.bind_lifecycle_authority(coordinator=replacement, authority=w.authority)
+        assert caught.value.reason == COORD_REFUSED
+        assert w.authority._coordinator is w.coordinator
+    finally:
+        may.set()
+        thread.join(TIMEOUT)
+        w.coordinator.newest = real_newest
+
+    assert result["r"] == plan.plan_id
+    w.authority.release(w.owner, plan.plan_id)
+
+
+# ============================== §10.22-25  failure atomicity and refusal inertness
+
+def test_22_a_failure_on_a_later_target_assigns_nothing_at_all(tmp_path):
+    """§10.22. The decision phase precedes every write, so a refusal cannot be partial.
+
+    R5-P56 F56-2 and the §9 'raise during assignment' finding both produced split graphs. The
+    decide-then-write split means the only way to reach the write phase is with every target
+    already proved attachable.
+    """
+    registry, coordinator, store, shared = _fresh_graph(tmp_path, "atomic")
+    # store is already on a different authority: the third target is the one that fails.
+    other = cr.LifecycleAuthority()
+    cr.bind_lifecycle_authority(store=store, authority=other)
+    assert store.lifecycle_authority is other
+
+    with pytest.raises(cr.Refusal) as caught:
+        cr.bind_lifecycle_authority(registry=registry, store=store, coordinator=coordinator,
+                                    authority=shared)
+    assert caught.value.reason == REBIND_REFUSED
+    # registry is named FIRST and is unbound, so a write-as-you-go binder would have attached it.
+    assert registry.lifecycle_authority is None
+    assert coordinator.lifecycle_authority is None
+    assert store.lifecycle_authority is other
+    assert shared._coordinator is None
+
+
+def test_23_a_coordinator_refusal_assigns_no_subsystem_either(tmp_path):
+    """§10.23. The coordinator decision also precedes every write."""
+    w = World(tmp_path, count=1)
+    late = cr.ReviewStore(os.path.join(str(tmp_path), "late"))
+    intruder = cr.ScanCoordinator()
+    with pytest.raises(cr.Refusal) as caught:
+        cr.bind_lifecycle_authority(store=late, coordinator=intruder, authority=w.authority)
+    assert caught.value.reason == COORD_REFUSED
+    # `late` is unbound and named first; it must NOT have been attached before the refusal.
+    assert late.lifecycle_authority is None
+    assert w.authority._coordinator is w.coordinator
+    assert intruder.lifecycle_authority is None
+
+
+def test_24_a_refused_bind_changes_no_acquisition_or_mutation_state(tmp_path):
+    """§10.25."""
+    w = World(tmp_path, count=1)
     usurper = cr.LifecycleAuthority()
-    calls = {"n": 0}
-    seen = {}
-    real_view = w.coordinator.view
-
-    def probing_view(owner):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            # Move the epoch so the first arbitration loses and `acquire` retries.
-            bump = w.authority.reserve_mutation(owner, cr.LIFECYCLE_SCAN_RECORD)
-            w.authority.release_mutation(bump)
-        elif calls["n"] == 2 and "rebind" not in seen:
-            seen["acquiring_on_retry"] = w.authority.acquiring_count()
-            try:
-                cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                            coordinator=w.coordinator, authority=usurper)
-                seen["rebind"] = "ACCEPTED"
-            except cr.Refusal as exc:
-                seen["rebind"] = "REFUSED:%s" % exc.reason
-        return real_view(owner)
-
-    w.coordinator.view = probing_view
-    try:
-        plan = w.lease()
-    finally:
-        w.coordinator.view = real_view
-
-    assert calls["n"] >= 2, "the retry path was never taken; the test proves nothing"
-    assert seen.get("acquiring_on_retry") == 1, "the in-flight marker did not span the retry"
-    assert seen["rebind"] == "REFUSED:%s" % cr.LIFECYCLE_REBIND_REFUSED
-    assert all(a is w.authority for a in _bindings(w))
-    assert w.authority.epoch_conflicts >= 1
-    w.store.end_transfer(plan.owner, plan.plan_id)
+    before = (w.authority.epoch(w.owner), w.authority.pending_count(w.owner),
+              w.authority.refusals, w.authority.mutation_reservations,
+              w.authority.epoch_conflicts)
+    for _ in range(3):
+        with pytest.raises(cr.Refusal):
+            cr.bind_lifecycle_authority(registry=w.registry, authority=usurper)
+    after = (w.authority.epoch(w.owner), w.authority.pending_count(w.owner),
+             w.authority.refusals, w.authority.mutation_reservations,
+             w.authority.epoch_conflicts)
+    assert before == after, "a refused bind touched lifecycle bookkeeping"
 
 
-def test_c_an_acquisition_entered_under_a_barrier_is_refused_before_it_probes(tmp_path):
-    """Case C — and the mirror of Case B: the barrier closes acquisition at the door.
-
-    The refusal has to land before the coordinator is consulted, so a barriered authority never
-    leaves a half-entered acquisition for ``begin_rebind`` to trip over.
-    """
+def test_25_a_refused_bind_never_leaves_the_binding_lock_held(tmp_path):
+    """§10.30. A leaked configuration lock would be a process-lifetime outage."""
     w = World(tmp_path, count=1)
-    probes = {"n": 0}
-    real_view = w.coordinator.view
-
-    def counting_view(owner):
-        probes["n"] += 1
-        return real_view(owner)
-
-    w.coordinator.view = counting_view
-    assert w.authority.begin_rebind() is True
-    try:
-        with pytest.raises(cr.Refusal) as caught:
-            w.authority.acquire(w.owner, "plan-y", session_id=w.session, page_token=w.page,
-                                scan_id=w.scan_id, identities=["i1"])
-        assert caught.value.reason == cr.LIFECYCLE_REBINDING
-    finally:
-        w.authority.end_rebind()
-        w.coordinator.view = real_view
-    assert probes["n"] == 0, "a refused acquisition must not have probed the coordinator"
-    assert w.authority.acquiring_count() == 0, "a refused entry must not leak the in-flight marker"
+    usurper = cr.LifecycleAuthority()
+    intruder = cr.ScanCoordinator()
+    for kwargs in ({"registry": w.registry, "authority": usurper},
+                   {"coordinator": intruder, "authority": w.authority},
+                   {"registry": w.registry, "store": w.store, "coordinator": w.coordinator,
+                    "authority": usurper}):
+        with pytest.raises(cr.Refusal):
+            cr.bind_lifecycle_authority(**kwargs)
+        assert cr._BINDING_LOCK.acquire(blocking=False) is True, "the binding lock leaked"
+        cr._BINDING_LOCK.release()
+    # And a supported call still works afterwards.
+    assert cr.bind_lifecycle_authority(registry=w.registry, authority=w.authority) is w.authority
 
 
-def test_c_a_barrier_appearing_during_the_probe_refuses_at_the_final_arbitration(tmp_path):
-    """Case C — defence in depth, and the reason the barrier lives in the *shared* predicate.
+# =============================== §10.26-29  interaction with live lifecycle and transfers
 
-    ``_acquiring`` already stops a legitimate ``begin_rebind`` from landing inside the probe
-    window, so this forces the state the barrier would have if that first line of defence were
-    ever bypassed — a future caller, a wider quiescence rule, a refactor — and requires the
-    acquisition to refuse anyway. Checking the barrier only at ``acquire``'s door would pass this
-    while leaving the final arbitration weaker than the first, which is precisely the drift
-    ``_reject_if_unavailable`` was factored out to prevent.
+def test_26_a_concurrent_scan_during_initial_binding_is_unaffected(tmp_path):
+    """§10.26. Binding takes no lifecycle lock, so a scan cannot be blocked or corrupted by it."""
+    w = World(tmp_path, count=1)
+    late = cr.ReviewStore(os.path.join(str(tmp_path), "late"))
+    outcomes = {}
+    gate = threading.Barrier(2, timeout=TIMEOUT)
+
+    def scan():
+        gate.wait()
+        try:
+            outcomes["generation"] = w.scan()
+        except Exception as exc:                            # noqa: BLE001
+            outcomes["generation"] = "ERR:%s" % exc
+
+    def bind():
+        gate.wait()
+        try:
+            cr.bind_lifecycle_authority(store=late, authority=w.authority)
+            outcomes["bind"] = "ACCEPTED"
+        except cr.Refusal as exc:
+            outcomes["bind"] = "REFUSED:%s" % exc.reason
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (scan, bind)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(TIMEOUT)
+    assert not any(t.is_alive() for t in threads), "binding and scanning deadlocked"
+    assert outcomes["bind"] == "ACCEPTED"
+    assert isinstance(outcomes["generation"], int)
+    assert late.lifecycle_authority is w.authority
+
+
+def test_27_a_transfer_succeeds_through_a_complete_coherent_topology(tmp_path):
+    """§10.27. The contract must not have broken the working path."""
+    w = World(tmp_path, count=1)
+    w.decide_all(cr.SELECTED)
+    plan = w.plan()
+    source = plan.items[0].source_path
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == ""
+    result = w.run(plan)
+    assert result.state == tr.COMPLETE
+    assert result.advance_page is True
+    assert os.path.exists(source) is False
+    assert w.library_files() == ["clip0001.mp4"]
+
+
+def test_28_a_transfer_refuses_a_split_topology_without_moving_anything(tmp_path):
+    """§10.28 — **the F56-2 consequence, closed at the execution site too.**
+
+    The binding API can no longer manufacture this split, so it is constructed here by the direct
+    attribute assignment that remains an unsupported internal bypass (see test_30). The point is
+    that even then nothing moves: the split is detected before any lease is taken.
     """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
-    seen = {}
-    real_view = w.coordinator.view
+    plan = w.plan()
+    source = plan.items[0].source_path
 
-    def probing_view(owner):
-        if "forced" not in seen:
-            seen["forced"] = True
-            # Force the barrier mid-probe, past acquire's entry check.
-            with w.authority._lock:
-                w.authority._rebinding = True
-        return real_view(owner)
+    foreign = cr.LifecycleAuthority()
+    foreign._coordinator = w.coordinator
+    w.registry.lifecycle_authority = foreign                # the bypass, done deliberately
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == cr.LIFECYCLE_TOPOLOGY_INCOHERENT
 
-    w.coordinator.view = probing_view
-    try:
-        with pytest.raises(cr.Refusal) as caught:
-            w.lease()
-        assert caught.value.reason == cr.LIFECYCLE_REBINDING
-    finally:
-        w.coordinator.view = real_view
-        with w.authority._lock:
-            w.authority._rebinding = False
+    result = w.run(plan)
+    assert result.state == tr.REFUSED
+    assert result.advance_page is False
+    assert os.path.exists(source), "a split topology must not move a clip"
+    assert w.library_files() == []
+    assert foreign.holder(w.owner) == ""
+    assert w.authority.holder(w.owner) == ""
+    reasons = [r.get("reason") for r in w.journal.records()]
+    assert cr.LIFECYCLE_TOPOLOGY_INCOHERENT in reasons
 
-    assert seen.get("forced") is True, "the probe never ran; the test proves nothing"
-    assert w.authority.has_any_lease() is False, "no lease may be installed under a barrier"
-    assert w.authority.acquiring_count() == 0
+
+def test_29_an_unrelated_world_is_unaffected_by_a_refused_configuration_attempt(tmp_path):
+    """§10.29. Per-graph isolation: one app's refused bind cannot disturb another's."""
+    first = World(os.path.join(str(tmp_path), "first"), count=1)
+    second = World(os.path.join(str(tmp_path), "second"), count=1)
+    assert first.authority is not second.authority
+
+    with pytest.raises(cr.Refusal):
+        cr.bind_lifecycle_authority(registry=first.registry, authority=second.authority)
+    assert all(x is first.authority for x in _bindings(first))
+    assert all(x is second.authority for x in _bindings(second))
+
+    # Both graphs still work independently.
+    second.decide_all(cr.SELECTED)
+    assert second.run(second.plan()).state == tr.COMPLETE
+    first.registry.revoke_owner(first.owner)
+
+
+def test_29b_topology_coherence_is_decided_by_identity_not_equality(tmp_path):
+    """Two authorities that *compare equal* are still two gates.
+
+    `lifecycle_topology_fault` uses `is not`. Relaxing that to `!=` is invisible today, because
+    `LifecycleAuthority` inherits `object.__eq__` and so equality already means identity — exactly
+    the trap R5-P55's M10 recorded for `MutationReservation`, where a frozen dataclass's generated
+    `__eq__` made the two spellings indistinguishable to the whole suite. An authority that claims
+    equality with everything is the only shape that tells them apart, so it is constructed here.
+    """
+    class Agreeable(cr.LifecycleAuthority):
+        """Claims equality with any other authority while remaining a different object."""
+
+        def __eq__(self, other):
+            return isinstance(other, cr.LifecycleAuthority)
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        __hash__ = cr.LifecycleAuthority.__hash__
+
+    w = World(tmp_path, count=1)
+    impostor = Agreeable()
+    impostor._coordinator = w.coordinator
+    assert impostor == w.authority and impostor is not w.authority
+    assert not (impostor != w.authority), "the fixture must defeat an equality-based check"
+
+    w.decide_all(cr.SELECTED)
+    plan = w.plan()
+    source = plan.items[0].source_path
+
+    w.registry.lifecycle_authority = impostor               # the unsupported direct bypass
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == cr.LIFECYCLE_TOPOLOGY_INCOHERENT, (
+        "an equality-claiming authority must not be mistaken for the bound one")
+
+    result = w.run(plan)
+    assert result.state == tr.REFUSED
+    assert os.path.exists(source)
     assert w.library_files() == []
 
 
-def test_c_a_failed_acquisition_does_not_leak_the_in_flight_marker(tmp_path):
-    """Every ``acquire`` exit path must clear ``_acquiring``, or the authority becomes
-    permanently un-rebindable — a leak that would be invisible until a rebind refused forever."""
+def test_29c_an_idempotent_bind_never_perturbs_a_concurrent_acquisition(tmp_path):
+    """Rule B must change *no effective state* — including transiently.
+
+    `_coordinator` is read **outside** `_lock` by `acquire`, so an idempotent re-bind that cleared
+    and re-set it would be invisible to every single-threaded test and still make a concurrent
+    acquisition observe `None` and refuse `lifecycle_coordinator_unavailable`. That is fail-closed
+    rather than unsafe, which is precisely why nothing else would catch it.
+
+    The acquisition is parked inside its real probe, the idempotent bind is performed, and the
+    acquisition must still succeed.
+    """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
+    plan = w.plan()
 
-    # (a) refused for a pending reservation
-    reservation = w.authority.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-    with pytest.raises(cr.Refusal):
-        w.authority.acquire(w.owner, "p1", session_id=w.session, page_token=w.page,
-                            scan_id=w.scan_id, identities=["i1"])
-    assert w.authority.acquiring_count() == 0
-    assert w.authority.release_mutation(reservation) is True
+    entered = threading.Event()
+    may = threading.Event()
+    reached = {"v": False}
+    real_newest = w.coordinator.newest
 
-    # (b) refused because a scan is in flight
-    generation = w.coordinator.begin(w.owner)
-    with pytest.raises(cr.Refusal) as caught:
-        w.authority.acquire(w.owner, "p2", session_id=w.session, page_token=w.page,
-                            scan_id=w.scan_id, identities=["i2"])
-    assert caught.value.reason == "scan_in_flight"
-    assert w.authority.acquiring_count() == 0
-    # `discard` deliberately leaves an honest *empty* view rather than resurrecting the older
-    # page, so the owner stays in transition until a scan publishes again. Re-scan to restore a
-    # published generation; otherwise case (c) would refuse as `scan_in_flight` and never reach
-    # the epoch logic it exists to exercise.
-    w.coordinator.discard(w.owner, generation)
-    w.scan()
-    assert w.coordinator.view(w.owner) != {}
+    def traced_newest(owner):
+        if not reached["v"]:
+            reached["v"] = True
+            entered.set()
+            assert may.wait(TIMEOUT)
+        return real_newest(owner)
 
-    # (c) refused by epoch exhaustion
-    real_view = w.coordinator.view
+    w.coordinator.newest = traced_newest
+    result = {}
 
-    def always_moving(owner):
-        bump = w.authority.reserve_mutation(owner, cr.LIFECYCLE_SCAN_RECORD)
-        w.authority.release_mutation(bump)
-        return real_view(owner)
+    def acquirer():
+        try:
+            result["r"] = w.authority.acquire(
+                w.owner, plan.plan_id, session_id=plan.session_id, page_token=plan.page_token,
+                scan_id=plan.scan_id, identities=[i.identity for i in plan.items]).plan_id
+        except cr.Refusal as exc:
+            result["r"] = "REFUSED:%s" % exc.reason
 
-    w.coordinator.view = always_moving
+    thread = threading.Thread(target=acquirer, daemon=True)
+    thread.start()
     try:
-        with pytest.raises(cr.Refusal) as caught:
-            w.authority.acquire(w.owner, "p3", session_id=w.session, page_token=w.page,
-                                scan_id=w.scan_id, identities=["i3"])
-        assert caught.value.reason == cr.LIFECYCLE_EPOCH_MOVED
-    finally:
-        w.coordinator.view = real_view
-    assert w.authority.acquiring_count() == 0
-
-    # (d) an invalid owner raises before the marker is taken
-    with pytest.raises(cr.Refusal):
-        w.authority.acquire("", "p4", session_id=w.session, page_token=w.page,
-                            scan_id=w.scan_id, identities=["i4"])
-    assert w.authority.acquiring_count() == 0
-
-    # Quiescent, so a rebind is still possible. This is the property the leak would destroy.
-    assert w.authority.begin_rebind() is True
-    w.authority.end_rebind()
-
-
-# ======================================================== Case D — initial and idempotent binding
-
-def test_d_a_fresh_initial_binding_takes_no_barrier(tmp_path):
-    """Case D — nothing is detached, so nothing can be orphaned and no barrier is warranted.
-
-    This is why ``gui.py``'s import-time bind cannot be made to refuse, which matters: a startup
-    path that can fail closed on a safety check it does not need is an outage, not a safeguard.
-    """
-    registry = cr.ClipRegistry()
-    coordinator = cr.ScanCoordinator()
-    store = cr.ReviewStore(os.path.join(str(tmp_path), "fresh"))
-    assert registry.lifecycle_authority is None
-    authority = cr.LifecycleAuthority()
-    assert cr.bind_lifecycle_authority(registry=registry, store=store,
-                                       coordinator=coordinator, authority=authority) is authority
-    assert registry.lifecycle_authority is authority
-    assert store.lifecycle_authority is authority
-    assert coordinator.lifecycle_authority is authority
-    assert authority._coordinator is coordinator
-    assert authority.rebind_barriers == 0, "an initial attachment must not barrier anything"
-
-
-def test_d_the_lazy_store_attachment_still_works(tmp_path):
-    """Case D — the ``gui.py`` shape: registry and coordinator bound eagerly, store later."""
-    registry = cr.ClipRegistry()
-    coordinator = cr.ScanCoordinator()
-    shared = cr.bind_lifecycle_authority(registry=registry, coordinator=coordinator,
-                                         authority=cr.LifecycleAuthority())
-    store = cr.ReviewStore(os.path.join(str(tmp_path), "late"))
-    assert store.lifecycle_authority is None
-    cr.bind_lifecycle_authority(store=store, authority=shared)
-    assert store.lifecycle_authority is shared
-    assert shared.rebind_barriers == 0
-
-
-@pytest.mark.parametrize("hold", ["reservation", "lease"])
-def test_d_same_authority_rebinding_stays_idempotent_under_live_activity(tmp_path, hold):
-    """Case D — idempotence must survive both kinds of live activity.
-
-    Rebinding an authority to itself detaches nothing, so refusing it would buy no safety and
-    would break P1 startup and the lazy attachment. Under a reservation *and* under a lease.
-    """
-    w = World(tmp_path, count=1)
-    w.decide_all(cr.SELECTED)
-    plan = None
-    reservation = None
-    if hold == "lease":
-        plan = w.lease()
-        assert w.authority.has_any_lease() is True
-    else:
-        reservation = w.authority.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-        assert w.authority.has_any_pending() is True
-
-    again = cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+        assert entered.wait(TIMEOUT), "the probe window was never reached"
+        observed = []
+        for _ in range(40):
+            cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
                                         coordinator=w.coordinator, authority=w.authority)
-    assert again is w.authority
-    assert all(a is w.authority for a in _bindings(w))
-    assert w.authority.rebind_barriers == 0, "idempotent rebinding must take no barrier"
-    # The live activity is untouched.
-    if hold == "lease":
-        assert w.authority.holder(w.owner) == plan.plan_id
-        w.store.end_transfer(plan.owner, plan.plan_id)
-    else:
-        assert w.authority.pending_count(w.owner) == 1
-        assert w.authority.release_mutation(reservation) is True
+            observed.append(w.authority._coordinator)
+        assert all(c is w.coordinator for c in observed), (
+            "an idempotent bind made `_coordinator` observably leave its established value")
+    finally:
+        may.set()
+        thread.join(TIMEOUT)
+        w.coordinator.newest = real_newest
+
+    assert result["r"] == plan.plan_id, (
+        "an idempotent bind perturbed a concurrent acquisition: %r" % (result.get("r"),))
+    w.authority.release(w.owner, plan.plan_id)
 
 
-def test_d_independent_worlds_do_not_block_each_others_rebinding(tmp_path):
-    """Case D — the barrier is per-authority, so one reviewer-owned world's live reservation must
-    not refuse an unrelated world's rebind. A process-wide flag would fail this."""
-    first = World(tmp_path / "w1", count=1)
-    second = World(tmp_path / "w2", count=1)
-    assert first.authority is not second.authority
+# ============================================ structural pins
 
-    with _PausedReservation(first, cr.LIFECYCLE_SESSION_REVOKE) as held:
-        other = cr.LifecycleAuthority()
-        # The unrelated world rebinds happily...
-        assert cr.bind_lifecycle_authority(registry=second.registry, store=second.store,
-                                           coordinator=second.coordinator,
-                                           authority=other) is other
-        assert all(a is other for a in _bindings(second))
-        # ...while the world holding the reservation still refuses.
-        with pytest.raises(cr.Refusal):
-            cr.bind_lifecycle_authority(registry=first.registry, store=first.store,
-                                        coordinator=first.coordinator,
-                                        authority=cr.LifecycleAuthority())
-        held.release()
+def test_30_the_production_direct_assignment_is_only_an_initial_attachment():
+    """The one bypass that remains, pinned by source contract rather than claimed to be closed.
 
-
-# ======================================================== Case E — incomplete target sets
-
-_TARGET_SETS = [
-    ("registry",), ("store",), ("coordinator",),
-    ("registry", "store"), ("registry", "coordinator"), ("store", "coordinator"),
-    ("registry", "store", "coordinator"),
-]
-
-
-@pytest.mark.parametrize("names", _TARGET_SETS, ids=["+".join(n) for n in _TARGET_SETS])
-def test_e_every_partial_target_set_refuses_while_a_reservation_is_pending(tmp_path, names):
-    """Case E — all seven subsets, because a gate that only covers the full set is not a gate.
-
-    Partial binding is the *production* arrangement (``gui.py`` binds registry and coordinator,
-    then the store joins later), so it stays supported for initial attachment. What may not happen
-    is a partial **replacement** that leaves one subsystem consulting a different gate from its
-    siblings while a mutation is mid-flight.
+    ``bind_lifecycle_authority`` cannot prevent ``target.lifecycle_authority = other``. The reason
+    that is not a reachable defect is a property of *today's source*: ``gui.py`` performs exactly
+    one such assignment, onto a ``ReviewStore`` constructed a few lines earlier whose authority is
+    still ``None``. If that ever becomes a replacement, or a second assignment appears, this fails
+    and the bypass is re-assessed instead of shipping silently.
     """
-    w = World(tmp_path, count=1)
-    usurper = cr.LifecycleAuthority()
-    before_bindings = _bindings(w)
-    subsystems = {"registry": w.registry, "store": w.store, "coordinator": w.coordinator}
-
-    with _PausedReservation(w, cr.LIFECYCLE_SESSION_REVOKE) as held:
-        with pytest.raises(cr.Refusal) as caught:
-            cr.bind_lifecycle_authority(authority=usurper,
-                                        **{n: subsystems[n] for n in names})
-        assert caught.value.reason == cr.LIFECYCLE_REBIND_REFUSED
-        # No subsystem moved -- not even one outside the requested set.
-        assert _bindings(w) == before_bindings
-        assert usurper._coordinator is None
-        assert w.authority.is_rebinding() is False
-        assert usurper.is_rebinding() is False
-        held.release()
-
-    # ...and the same partial set is accepted once the authority is quiescent again.
-    cr.bind_lifecycle_authority(authority=usurper, **{n: subsystems[n] for n in names})
-    for name in names:
-        assert subsystems[name].lifecycle_authority is usurper
-
-
-# ======================================================== release discipline
-
-def test_a_reservation_release_is_by_identity_not_by_equality(tmp_path):
-    """A release must free *exactly* the reservation it was given.
-
-    ``MutationReservation`` is a frozen dataclass, so it has a generated ``__eq__`` and two
-    reservations carrying the same four field values compare **equal** while being different
-    objects. ``release_mutation`` matches with ``is not``, which is the whole protection — and the
-    R5-P53 suite's own forged-token case cannot see it, because its forgery differs in
-    ``operation`` and so fails an equality test too. Measured for R5-P55: relaxing ``is not`` to
-    ``!=`` survives that suite untouched. This pins the field-for-field forgery, which is the only
-    shape that distinguishes the two.
-    """
-    w = World(tmp_path, count=1)
-    real = w.authority.reserve_mutation(w.owner, cr.LIFECYCLE_SESSION_REVOKE)
-
-    forged = cr.MutationReservation(real.owner, real.token, real.operation, real.epoch)
-    assert forged == real, "the forgery must be equal, or it proves nothing about identity"
-    assert forged is not real
-
-    assert w.authority.release_mutation(forged) is False, (
-        "an equal-but-distinct reservation released the real one")
-    assert w.authority.pending_count(w.owner) == 1, "the real reservation must still be held"
-
-    # ...and a transfer is still excluded, which is what the reservation was protecting.
-    assert w.authority.has_any_pending() is True
-    assert w.authority.begin_rebind() is False
-
-    # The genuine object still releases, and only once.
-    assert w.authority.release_mutation(real) is True
-    assert w.authority.release_mutation(real) is False
-    assert w.authority.pending_count(w.owner) == 0
-
-
-# ======================================================== structural pins
-
-def test_no_lifecycle_mutation_site_bypasses_the_reservation_protocol():
-    """The R5-P53 pin, restated for R5-P55: the barrier is enforced *inside* the reservation and
-    acquisition primitives, so it cannot be bypassed by a mutation site that forgets it.
-
-    Asserted structurally because a behavioural test can only cover the sites that exist today.
-    """
-    tree = ast.parse(open(_CLIPS_REVIEW, encoding="utf-8").read())
-    authority = next(n for n in ast.walk(tree)
-                     if isinstance(n, ast.ClassDef) and n.name == "LifecycleAuthority")
-    methods = {n.name: n for n in authority.body if isinstance(n, ast.FunctionDef)}
-
-    for name in ("begin_rebind", "end_rebind", "has_any_pending", "is_rebinding",
-                 "acquiring_count"):
-        assert name in methods, "%s is part of the F54-1 contract" % name
-
-    def reads_rebinding(node):
-        return any(isinstance(n, ast.Attribute) and n.attr == "_rebinding"
-                   for n in ast.walk(node))
-
-    # Every gate that may create live state must consult the barrier itself.
-    for name in ("reserve_mutation", "try_reserve_mutation", "_reject_if_unavailable", "acquire"):
-        assert reads_rebinding(methods[name]), (
-            "%s may create or grant live state and must honour the rebinding barrier" % name)
-
-    # The barrier must be tested in the shared predicate, which is what makes it apply at the
-    # FINAL arbitration and not merely before the coordinator probe.
-    assert reads_rebinding(methods["_reject_if_unavailable"])
-
-    # `begin_rebind` must require all three quiescence conditions, not just the lease map.
-    source = ast.get_source_segment(open(_CLIPS_REVIEW, encoding="utf-8").read(),
-                                    methods["begin_rebind"])
-    for fragment in ("_leases", "_pending", "_acquiring", "_rebinding"):
-        assert fragment in source, "begin_rebind must consider %s" % fragment
-
-
-def test_gui_binds_once_and_its_direct_assignment_is_only_an_initial_attachment():
-    """The §7 bypass assessment, pinned.
-
-    A direct ``target.lifecycle_authority = other`` assignment bypasses
-    ``bind_lifecycle_authority`` entirely, so the only reason F54-1 was never reachable in the
-    shipped application is that the one direct assignment ``gui.py`` performs is an *initial*
-    attachment, on a store constructed three lines earlier whose authority is still ``None``.
-    Initial attachment detaches nothing and therefore cannot orphan anything.
-
-    That is a property of today's source, not of the API, so it is pinned here: if someone later
-    adds a second binding call, or turns this assignment into a replacement, this test fails and
-    the bypass gets re-assessed instead of shipping silently.
-    """
-    source = open(_GUI, encoding="utf-8").read()
-    tree = ast.parse(source)
-
-    binds = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-             and n.func.attr == "bind_lifecycle_authority"]
-    assert len(binds) == 1, "gui.py must bind exactly once; found %d" % len(binds)
-
-    assignments = [(n, t) for n in ast.walk(tree) if isinstance(n, ast.Assign)
-                   for t in n.targets
-                   if isinstance(t, ast.Attribute) and t.attr == "lifecycle_authority"]
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    assignments = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr == "lifecycle_authority":
+                assignments.append((node, target))
     assert len(assignments) == 1, (
         "gui.py must contain exactly one direct lifecycle_authority assignment; found %d"
         % len(assignments))
 
-    assign, target = assignments[0]
-    # It assigns the process-wide default -- the same object the single bind call above binds.
-    assert isinstance(assign.value, ast.Call)
-    assert isinstance(assign.value.func, ast.Attribute)
-    assert assign.value.func.attr == "default_lifecycle_authority"
-    # Its target is a plain local, not a module global or a record field.
+    node, target = assignments[0]
+    # It must assign the process-wide default...
+    assert isinstance(node.value, ast.Call)
+    assert getattr(node.value.func, "attr", "") == "default_lifecycle_authority"
+    # ...onto a NAME that was bound by a `ReviewStore(...)` construction in the same function.
     assert isinstance(target.value, ast.Name)
     local = target.value.id
 
-    enclosing = next(fn for fn in ast.walk(tree)
-                     if isinstance(fn, ast.FunctionDef)
-                     and any(node is assign for node in ast.walk(fn)))
-    constructed = [n for n in ast.walk(enclosing) if isinstance(n, ast.Assign)
-                   and any(isinstance(t, ast.Name) and t.id == local for t in n.targets)
-                   and isinstance(n.value, ast.Call)
-                   and isinstance(n.value.func, ast.Attribute)
-                   and n.value.func.attr == "ReviewStore"]
+    owner = None
+    for candidate in ast.walk(tree):
+        if isinstance(candidate, ast.FunctionDef) and node in ast.walk(candidate):
+            owner = candidate
+            break
+    assert owner is not None, "the assignment is not inside a function"
+    constructed = [
+        stmt for stmt in ast.walk(owner)
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == local for t in stmt.targets)
+        and isinstance(stmt.value, ast.Call)
+        and getattr(stmt.value.func, "attr", "") == "ReviewStore"
+    ]
     assert constructed, (
-        "the direct assignment must target a freshly constructed ReviewStore -- that is what "
-        "makes it an initial attachment rather than a replacement, and therefore not a bypass")
-    assert constructed[0].lineno < assign.lineno
+        "the direct assignment's target must be a freshly constructed ReviewStore local, which is "
+        "what makes it an initial attachment rather than a replacement")
+
+
+def test_31_no_mutation_site_bypasses_the_reservation_protocol():
+    """Carried forward from R5-P55: `guard`/`guarded` must stay diagnostic.
+
+    Every lifecycle mutation must take a reservation. A site that called the probe instead would
+    be the R5-P52 check-then-act again.
+    """
+    tree = ast.parse(open(_CLIPS_REVIEW, encoding="utf-8").read())
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name in ("guard", "guarded"):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and getattr(inner.func, "attr", "") in ("guard", "guarded")
+                    and getattr(getattr(inner.func, "value", None), "attr", "")
+                    in ("lifecycle_authority", "_lifecycle")):
+                offenders.append(node.name)
+    assert offenders == [], "these mutation sites still gate on a probe: %r" % (offenders,)
+
+
+def test_32_the_retired_hot_rebinding_api_is_gone():
+    """[R5-P57] The vulnerable operation is removed, not merely documented as unsupported.
+
+    R5-P56 F56-4 recorded that the barrier-spans-the-assignments property was unasserted, and
+    F56-5 that barrier ownership was call discipline rather than code. Both are dispositioned by
+    deletion: there is no barrier to span anything and no ownership to enforce. This test exists so
+    that a future reintroduction has to be deliberate.
+    """
+    for name in ("begin_rebind", "end_rebind", "is_rebinding", "acquiring_count"):
+        assert not hasattr(cr.LifecycleAuthority, name), (
+            "%s is back; the R5-P57 contract does not need it and R5-P56 broke it" % name)
+    authority = cr.LifecycleAuthority()
+    for attr in ("_rebinding", "_acquiring", "rebind_barriers"):
+        assert not hasattr(authority, attr), "%s bookkeeping is back" % attr
+    assert not hasattr(cr, "LIFECYCLE_REBINDING")
+    # The refusal reasons the contract DOES use are exported.
+    for name in ("LIFECYCLE_REBIND_REFUSED", "LIFECYCLE_COORDINATOR_REBIND_REFUSED",
+                 "LIFECYCLE_TOPOLOGY_INCOHERENT", "LIFECYCLE_COORDINATOR_UNAVAILABLE"):
+        assert name in cr.__all__, "%s must be part of the public contract" % name
+
+
+def test_32b_the_binder_never_clears_the_coordinator_pointer():
+    """`_coordinator` may only go ``None`` -> one object. It may never be written back to ``None``.
+
+    This is a **source-contract** pin, and it is one deliberately, because the runtime window is
+    not reachable by a test. A binder that cleared the pointer before re-setting it
+    (``_coordinator = None; _coordinator = coordinator``) leaves the final state identical, so
+    every single-threaded assertion passes — and `test_29c` cannot see it either, because
+    `acquire` reads `_coordinator` once into a local and the transient exists only between two
+    bytecodes inside the lock. Measured as exactly that during R5-P57's negative-control run: the
+    mutation survived the whole runtime suite.
+
+    The consequence would be fail-closed rather than unsafe (a concurrent acquisition reading
+    `None` on a bound authority refuses `lifecycle_coordinator_unavailable`), so this is a
+    robustness pin, not a security one. It is asserted structurally because that is the only way
+    to assert it deterministically — and saying so is the point: an unreachable window is pinned
+    by shape or it is not pinned at all.
+    """
+    tree = ast.parse(open(_CLIPS_REVIEW, encoding="utf-8").read())
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "bind_lifecycle_authority")
+    writes = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and target.attr == "_coordinator":
+                writes.append(ast.unparse(node.value))
+    assert writes, "the binder must still establish the coordinator pointer"
+    assert writes == ["coordinator"], (
+        "the binder may assign `_coordinator` only from its `coordinator` argument, never clear "
+        "it or route it through anything else; found %r" % (writes,))
+
+
+def test_33_the_binding_lock_is_never_held_across_io_or_a_subsystem_call():
+    """The lock-order proof, as a source contract.
+
+    ``bind_lifecycle_authority`` must take no other lock and perform no I/O while holding
+    ``_BINDING_LOCK``; otherwise it would create the reverse edge the documented order forbids.
+    """
+    tree = ast.parse(open(_CLIPS_REVIEW, encoding="utf-8").read())
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "bind_lifecycle_authority")
+    withs = [n for n in ast.walk(func) if isinstance(n, ast.With)]
+    assert len(withs) == 1, "exactly one critical section is expected"
+    body = withs[0]
+    forbidden = ("acquire", "release", "open", "fsync", "rename", "replace", "write",
+                 "begin", "publish", "decide", "reserve_mutation", "run", "append")
+    for inner in ast.walk(body):
+        if isinstance(inner, ast.With):
+            continue
+        if isinstance(inner, ast.Call):
+            name = getattr(inner.func, "attr", None) or getattr(inner.func, "id", None)
+            assert name not in forbidden, (
+                "bind_lifecycle_authority calls %r inside _BINDING_LOCK" % name)

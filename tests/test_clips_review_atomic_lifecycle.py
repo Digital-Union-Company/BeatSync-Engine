@@ -689,6 +689,15 @@ def test_23_forget_is_refused_during_a_transfer(tmp_path):
 # ============================================================ §11.24  rebinding
 
 def test_24_rebinding_during_an_active_lease_is_refused(tmp_path):
+    """[R5-P57] Superseded tail, replaced rather than deleted.
+
+    R5-P53 shipped this test asserting that *"once released, rebinding is permitted again"* --
+    an idle authority could be replaced. R5-P56 then reproduced three MAJOR bypasses that all
+    entered through exactly that permission (F56-1, F56-2, F56-3), and the owner's R5-P57
+    decision retires the capability: replacement is refused whether or not anything is idle.
+    So the refusal half of this test is unchanged and the permission half is now its negation.
+    The original assertion is preserved verbatim in the R5-P53/R5-P55 evidence packages.
+    """
     w = World(tmp_path, count=1)
     w.decide_all(cr.SELECTED)
     plan = w.lease()
@@ -705,10 +714,19 @@ def test_24_rebinding_during_an_active_lease_is_refused(tmp_path):
     with pytest.raises(cr.Refusal):
         w.registry.revoke_owner(w.owner)
     w.store.end_transfer(plan.owner, plan.plan_id)
-    # Once released, rebinding is permitted again.
-    cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
-                                coordinator=w.coordinator, authority=usurper)
-    assert w.registry.lifecycle_authority is usurper
+    # [R5-P57] And releasing the lease does NOT unlock replacement: the authority is now idle on
+    # every measure the old gate consulted, and the refusal is identical.
+    assert w.authority.has_any_lease() is False
+    assert w.authority.has_any_pending() is False
+    with pytest.raises(cr.Refusal) as idle:
+        cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                    coordinator=w.coordinator, authority=usurper)
+    assert idle.value.reason == "lifecycle_authority_rebind_refused"
+    assert w.registry.lifecycle_authority is w.authority
+    assert w.store.lifecycle_authority is w.authority
+    assert w.coordinator.lifecycle_authority is w.authority
+    # The lifecycle still works afterwards: a refused bind is inert, not a wedge.
+    w.registry.revoke_owner(w.owner)
 
 
 def test_24b_rebinding_the_same_authority_is_idempotent_even_under_a_lease(tmp_path):

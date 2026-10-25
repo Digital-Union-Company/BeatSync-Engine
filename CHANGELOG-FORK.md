@@ -20,6 +20,87 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-25 (Clips Preview P2: the authority topology is immutable — R5-P56 F56-1/2/3)
+
+Independent review **R5-P56** confirmed R5-P54's F54-1 closed (3/3 refused, filesystem unchanged)
+and the acquisition-in-flight accounting clean on all fourteen fault paths — then reproduced **three
+new MAJOR authority-rebinding bypasses** in the two-phase quiescence barrier the previous entry
+added, and returned `R5_P56_PR75_CHANGES_REQUIRED`. Each reached a completed, irreversible move:
+clip published, `batch=COMPLETE`, `advance_page=True`, no refusal in the journal, session and page
+already revoked.
+
+The owner's decision for this entry is **not** a fourth rebinding protocol. Runtime replacement of a
+bound lifecycle authority is **removed**. The transfer engine remains **unwired**, Confirm still
+moves nothing, and `src/gui.py` is **not modified by this change at all**.
+
+- **F56-1 — a stale outgoing-authority snapshot.** `bind_lifecycle_authority()` enumerated the
+  authorities it was about to detach *without synchronisation*, barriered that snapshot, and then
+  assigned while re-reading nothing. Of two concurrent binders the first could therefore detach an
+  authority the second had installed and the first had never seen. Reproduced with a pending
+  mutation reservation on the detached authority and, separately, with a live transfer lease on it.
+  The barrier was correct; the set of authorities it was applied to was stale.
+- **F56-2 — a partial replacement of an idle authority split the gate.** `bind(registry=…,
+  authority=B)` against a quiescent graph was accepted and left `registry=B, store=A,
+  coordinator=A`. A transfer then leased A, a session revocation passed through B and was
+  **accepted**, and the clip published against `<revoked:unknown_session>`. **No concurrency at
+  all** — fully deterministic.
+- **F56-3 — the coordinator pointer escaped the barrier.** The no-barrier fast path could retarget
+  `authority._coordinator` with an acquisition inside its lock-free probe, and a rebind that omitted
+  `coordinator=` left the incoming authority with no coordinator at all — which makes `acquire()`
+  **skip** the scan-in-flight arbitration rather than perform it. A lease was granted in exactly the
+  mid-scan state that arbitration exists to refuse.
+
+**The correction is a write-once binding contract.** `bind_lifecycle_authority()` now supports
+initial attachment of an unbound component, and idempotent re-attachment to the *same* object
+(`is`, never equality). Replacing a bound component with a different authority is **refused
+unconditionally** — including when every authority involved is completely idle, which is the
+permission R5-P51, R5-P53 and R5-P55 all granted and all three were broken through. An idle
+authority is not a safe one to detach; it is merely one whose next operation has not started yet.
+
+- Decision and writes happen in one critical section under a new `_BINDING_LOCK`, decision first,
+  both re-reading the live attributes. The lock is used **only** by the binding API, adds no edge to
+  `ScanCoordinator → ClipRegistry → ReviewStore → LifecycleAuthority`, and is never held across
+  hashing, copying, journalling, fsync or transfer execution. An AST test pins that.
+- A second binder cannot overwrite a completed binding: the write loop assigns only where the live
+  value is `None`. Last-writer-wins is not expressible.
+- `authority._coordinator` is write-once as well — `None` → one object, never object → object — so
+  F56-3's retarget is impossible rather than merely detected.
+- **An absent coordinator is not an idle one.** Both layers fail closed: the new
+  `lifecycle_topology_fault(registry, store)` refuses a plan with `lifecycle_authority_incoherent`
+  or `lifecycle_coordinator_unavailable` before any lease is taken, and `acquire()` refuses with the
+  same reason because `ReviewStore.begin_transfer` reaches it directly. The discriminator is a
+  write-once `_bound` flag, which separates a live gate that owes its callers arbitration from a
+  bare instance a unit test constructed — so the pre-R5-P51 P1 suites stay valid without weakening
+  the runtime contract.
+- Partial binding stays supported, because production depends on it (`gui.py` binds registry and
+  coordinator at import; the store joins in `_clips_store()`). What it can no longer do is replace
+  anything, so it can no longer manufacture a split.
+
+**The retired API is deleted, not deprecated.** `begin_rebind`, `end_rebind`, `is_rebinding`,
+`acquiring_count`, `_rebinding`, `_acquiring`, `rebind_barriers` and `LIFECYCLE_REBINDING` are gone,
+and a test asserts they stay gone. That is how R5-P56's **F56-4** (the barrier-spans-the-assignments
+property was unasserted — a mutation removing it survived the entire suite) and **F56-5** (barrier
+ownership was call discipline, not code) are dispositioned: the vulnerable operation was removed
+rather than re-documented. **F56-6** (a raise mid-assignment left a partial binding) goes with them,
+because the decision phase now precedes every write.
+
+**Superseded test assumptions, named rather than quietly dropped.** Two places asserted that an idle
+authority could be replaced, and both are now their own negation:
+`test_clips_review_atomic_lifecycle.py::test_24`'s tail, and R5-P55's 32-case hot-rebinding suite in
+`tests/test_clips_review_authority_rebind_safety.py`, replaced by the 36-case immutable-topology
+matrix. The originals are preserved verbatim in the R5-P53 and R5-P55 evidence packages. No test of
+initial binding, same-authority idempotence, leases, reservations, epochs or scan generations was
+weakened, removed or adjusted.
+
+Still open, so no reader infers clearance: a direct `target.lifecycle_authority = other` assignment
+bypasses the binding API (not reachable — the application's one direct assignment is an initial
+attachment, pinned by AST test, and `lifecycle_topology_fault` catches the consequence anyway);
+**F5**; the **cross-volume source removal**; **decision-time content fingerprints**;
+**cross-process locking** (process-local, and never to be described otherwise); and **GUI/HTTP
+integration**. This is the author's own remediation evidence and is not a security clearance.
+Independent review **R5-P58** is required.
+
+
 ### Fixed — 2026-10-25 (Clips Preview P2: authority rebinding is linearizable — R5-P54 F54-1)
 
 Independent review **R5-P54** independently confirmed both R5-P52 MAJOR races closed and returned

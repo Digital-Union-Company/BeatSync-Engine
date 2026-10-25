@@ -427,6 +427,121 @@ field-for-field forgery is the only shape that distinguishes the two, and it now
   must never be described otherwise) and **GUI/HTTP integration**. The engine is still unwired and
   Confirm still moves nothing. Independent review **R5-P56** is required.
 
+> **R5-P56 ran, and returned `R5_P56_PR75_CHANGES_REQUIRED`.** F54-1 was independently confirmed
+> closed (3/3 refused, filesystem unchanged) and the `_acquiring` accounting was clean on all
+> fourteen fault paths. But the barrier above was broken **three more ways**, each reproduced to a
+> completed, irreversible move: **F56-1** (the outgoing snapshot was stale), **F56-2** (a partial
+> replacement of an *idle* authority split the gate, with no concurrency at all) and **F56-3** (the
+> coordinator pointer could be retargeted, or left absent, outside the barrier). Three MINORs
+> followed: **F56-4** (the barrier-spans-the-assignments property was unasserted — a mutation
+> removing it survived the whole suite), **F56-5** (barrier ownership was call discipline, not code)
+> and **F56-6** (a raise mid-assignment left a partial binding). R5-P57 retires the capability; see
+> the next section.
+
+### [R5-P57] The authority topology is immutable: bound once, never replaced
+
+**The owner's decision, and the reason for it.** Four protocols in a row tried to make runtime
+authority replacement safe — R5-P51's predicate, R5-P53's gate, R5-P55's two-phase quiescence
+barrier — and three independent reviews broke all of them, each time through the same permission:
+*an idle authority may be replaced.* Each fix was more elaborate than the last and left a smaller
+version of the identical hole. BeatSync has never needed the capability: the supported architecture
+is **one process-local authority per app**, connecting one `ClipRegistry`, one `ScanCoordinator` and
+one lazily created `ReviewStore`. So the capability is **removed**, not guarded a fourth time.
+
+`bind_lifecycle_authority` now supports exactly three operations, and the third is a refusal:
+
+| Rule | Operation | Outcome |
+|---|---|---|
+| **A** | attach an **unbound** component to the authority | performed |
+| **B** | re-attach a component to the **same** object (`is`) | no-op, permitted |
+| **C** | replace a bound component with a **different** object | **refused, always** |
+
+**Rule C refuses unconditionally.** Not "while a lease is held", not "while a reservation is
+pending" — *always*, including when every authority involved is completely idle. That is the whole
+of the correction, and it is what R5-P53 and R5-P55 both got wrong: an idle authority is not a safe
+one to detach, it is merely one whose next operation has not started yet. The refusal reason is
+unchanged (`lifecycle_authority_rebind_refused`), so operator- and test-visible wording did not move;
+what changed is that it no longer depends on quiescence.
+
+**Rule D — partial binding stays supported, and can no longer split the graph.** Partial binding
+*is* the production arrangement: `gui.py` binds the registry and coordinator at import, and the
+store joins in `_clips_store()` once constructed. What partial binding can no longer do is
+*replace* anything, so the F56-2 split is unreachable through the API. Coherence of the whole graph
+is additionally proved where both halves are in hand — at execution time, by
+`lifecycle_topology_fault(registry, store)`, which refuses
+`lifecycle_authority_incoherent` before a plan is executed. A binder handed only the store
+genuinely cannot see the registry, so this check belongs at the execution site and not at the
+binding site.
+
+**Rule E — the coordinator pointer is write-once too.** `authority._coordinator` may go
+`None` → one object and never object → object. Supplying the coordinator it already has is
+idempotent; supplying a different one is refused with `lifecycle_coordinator_rebind_refused`. This
+closes F56-3's retarget *without* having to ask whether an acquisition is in flight — which is
+exactly what the deleted `_acquiring` bookkeeping existed to answer.
+
+**An absent coordinator is not an idle one.** A bound authority with `_coordinator is None` would
+make `acquire` skip the scan-in-flight arbitration rather than perform it, and R5-P56 measured a
+lease granted in precisely the mid-scan state that arbitration exists to refuse. Both layers now
+fail closed: `lifecycle_topology_fault` refuses the plan with
+`lifecycle_coordinator_unavailable`, and `acquire` itself refuses with the same reason, because
+`ReviewStore.begin_transfer` reaches `acquire` directly and the execution-site check alone would
+not cover it.
+
+The discriminator is `LifecycleAuthority._bound`, write-once, set when the binder attaches the
+authority to any subsystem. It answers one question only: is this a **live gate** that owes its
+callers arbitration, or a bare instance a unit test built to exercise the lease algebra? A bound
+gate with no coordinator refuses; a never-bound instance is left alone, which is what keeps the
+pre-R5-P51 P1 suites valid **without** weakening the runtime contract. Production is always bound.
+
+**Linearization point: the single critical section under `_BINDING_LOCK`.** Every decision and
+every write happen inside it, decision first, and both re-read the live attributes rather than a
+snapshot — F56-1 was precisely a decision taken against a snapshot followed by a write that re-read
+nothing. `_BINDING_LOCK` is a plain module-level lock used *only* by the binding API; it adds **no
+edge** to the lifecycle order, because nothing holding a lifecycle lock ever takes it and
+`bind_lifecycle_authority` takes no other lock at all while holding it. Nothing is hashed, copied,
+journalled, fsynced or executed under it. An AST test pins that.
+
+**Why a second binder cannot overwrite the first completed binding**, as a property rather than a
+hope: the write loop assigns only where the live value is `None`, and it reads that value inside the
+same critical section as the write. A second binder with a different authority finds a non-`None`
+value in the decision phase and refuses; one with the same authority finds every target already
+bound and writes nothing. Last-writer-wins is not expressible.
+
+**The retired API is deleted, not deprecated.** `begin_rebind`, `end_rebind`, `is_rebinding`,
+`acquiring_count`, `_rebinding`, `_acquiring`, `rebind_barriers` and `LIFECYCLE_REBINDING` are
+**gone**, and a test asserts they stay gone. That is how F56-4 and F56-5 are dispositioned: there is
+no barrier left to span the assignments and no barrier ownership left to enforce. R5-P56 was
+explicit that a reachable weakness is not fixed by changing its documentation — so the operation
+itself was removed. F56-6 goes with them: the decision phase precedes every write, so a refusal
+cannot be partial.
+
+**Superseded test assumptions, named rather than quietly dropped.** Two places asserted that an
+*idle* authority could be replaced, and both are now their own negation:
+
+* `test_clips_review_atomic_lifecycle.py::test_24` — its tail asserted *"once released, rebinding is
+  permitted again"*. It now asserts the refusal is identical once the lease is released.
+* `tests/test_clips_review_authority_rebind_safety.py` — R5-P55's 32-case hot-rebinding suite is
+  replaced by the R5-P57 immutable-topology matrix (36 cases). The original assertions are preserved
+  verbatim in the R5-P53 and R5-P55 evidence packages under
+  `D:\PROJECT_FILES\Projects\BeatSync-Engine-DigitalUnion\Evidence\`.
+
+**Nothing else was weakened.** Initial attachment, lazy attachment, same-authority idempotence
+(including under a live lease and under a live reservation), the reservation/lease exclusion in both
+orderings, epoch validation, bounded acquisition retries, scan-generation behaviour and per-owner
+isolation are all unchanged and still asserted.
+
+**What R5-P57 does NOT close**, stated so no reader infers clearance: a direct
+`target.lifecycle_authority = other` assignment still bypasses the binding API — Python offers no
+cheap prohibition, and the one such assignment the app performs (in `_clips_store()`) is an
+*initial attachment* onto a store constructed three lines earlier, pinned by an AST test rather than
+assumed. `lifecycle_topology_fault` catches the *consequence* of any such bypass at execution time.
+Everything earlier phases left open stays open: **F5**, **cross-volume source removal**,
+**decision-time content fingerprints**, **cross-process locking** (process-local, and never to be
+described otherwise) and **GUI/HTTP integration** — the engine is still unwired, Confirm still moves
+nothing, and `gui.py` was **not modified by R5-P57 at all**. Independent review **R5-P58** is
+required.
+
+
 **Lock order is unchanged and still acyclic:**
 `ScanCoordinator` → `ClipRegistry` → `ReviewStore` → **`LifecycleAuthority` (leaf)**. Every nested
 edge runs downhill; the only method that reads another subsystem is `acquire`, and it holds no lock

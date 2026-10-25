@@ -161,6 +161,7 @@ from beatsync_fork.clips_review import (
     Refusal,
     decision_identity,
     io_detail,
+    lifecycle_topology_fault,
     validate_roots,
 )
 
@@ -1242,6 +1243,25 @@ def execute_transfer(plan: TransferPlan, journal: TransferJournal, *,
     if store is None or registry is None:
         journal.append({**plan.to_event(), "state": REFUSED,
                         "reason": "live_authority_required", "at": now()})
+        return TransferResult(plan.plan_id, REFUSED, (),
+                              {"refused": 1, "moved": 0, "remaining": len(plan.items)})
+
+    # [R5-P57 / F56-2, F56-3] The registry and the store must be ONE coherent authority, and that
+    # authority must actually have its scan coordinator, BEFORE any lease is taken. Both halves are
+    # only in hand here, which is why this check lives at the execution site and not at the binding
+    # site: `bind_lifecycle_authority` can be handed the store alone and cannot see the registry.
+    #
+    # R5-P56 reproduced both faults to a completed, irreversible move. A split graph let a session
+    # revocation pass through one authority while the transfer held a lease on the other, and the
+    # clip published with `batch=COMPLETE` against an already-revoked session. An authority with no
+    # coordinator made `acquire` skip the scan-in-flight arbitration rather than perform it, so a
+    # lease was granted in exactly the mid-scan state that arbitration exists to refuse.
+    #
+    # This is a pre-mutation refusal, so it belongs to the first of the two journal classes in the
+    # note above: nothing has moved, there is no outcome list to lose, and refusing loudly is right.
+    topology = lifecycle_topology_fault(registry, store)
+    if topology:
+        journal.append({**plan.to_event(), "state": REFUSED, "reason": topology, "at": now()})
         return TransferResult(plan.plan_id, REFUSED, (),
                               {"refused": 1, "moved": 0, "remaining": len(plan.items)})
 
