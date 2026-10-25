@@ -1087,3 +1087,189 @@ def test_33_the_binding_lock_is_never_held_across_io_or_a_subsystem_call():
             name = getattr(inner.func, "attr", None) or getattr(inner.func, "id", None)
             assert name not in forbidden, (
                 "bind_lifecycle_authority calls %r inside _BINDING_LOCK" % name)
+
+
+# ====================================== §11  R5-P58 F58-6 — Rule C decides by identity, not equality
+#
+# R5-P58's independent mutation M1 relaxed the binder's Rule C comparison from
+# ``current is not shared`` to ``current != shared`` and **survived the entire 8237-case suite**.
+# The author had exactly this pin for `lifecycle_topology_fault`
+# (`test_29b_topology_coherence_is_decided_by_identity_not_equality`) but not for the binder, one
+# layer up. R5-P59 adds the symmetric pin.
+#
+# The classification matters and is stated rather than glossed. R5-P58 measured M1 as an
+# **equivalent mutant for every authority this repository can construct**: `LifecycleAuthority`
+# defines no `__eq__`, there is no subclass of it anywhere in `src/`, and the single production
+# bind call site (`gui.py:6297`) omits `authority=` entirely. The mutant diverges only for a
+# caller-supplied authority that defines `__eq__`, which no supported path produces — so this is a
+# MUTATION-COVERAGE gap, **not** a reachable vulnerability, and nothing here should be read as
+# claiming a destructive MAJOR.
+#
+# What the mutant actually does, measured by R5-P58 (`m1_probe.json`) and re-asserted below:
+# phase 1 stops refusing, so the binder returns a **false ACCEPTED** — but the replacement still
+# does not happen, because phase 2's write-once `is None` re-read refuses to overwrite a bound
+# slot. Defence in depth holds; only the caller's return signal is wrong. That is precisely why
+# the detection below asserts **the refusal**, and not "the clip did not move": a test that
+# scored safety on the filesystem alone would pass against the mutant and pin nothing.
+
+class _EqualityClaimingAuthority(cr.LifecycleAuthority):
+    """A distinct authority object that claims equality with any other authority.
+
+    The only shape that can tell ``is not`` apart from ``!=`` here. `LifecycleAuthority` inherits
+    `object.__eq__`, so for every authority the application can build the two spellings are
+    indistinguishable — the same trap R5-P55's M10 recorded for `MutationReservation`, where a
+    frozen dataclass's generated `__eq__` made an identity assertion vacuous.
+    """
+
+    def __eq__(self, other):
+        return isinstance(other, cr.LifecycleAuthority)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = cr.LifecycleAuthority.__hash__
+
+
+#: (case, bound-authority factory, incoming-authority factory). The three cases R5-P58 measured as
+#: diverging under M1, plus the plain/plain control that does **not** diverge — carried here
+#: deliberately, because it is the reason an ordinary authority cannot be used as the fixture.
+_EQ_SHAPES = [
+    ("plain_vs_eq", cr.LifecycleAuthority, _EqualityClaimingAuthority),
+    ("eq_vs_plain", _EqualityClaimingAuthority, cr.LifecycleAuthority),
+    ("eq_vs_eq", _EqualityClaimingAuthority, _EqualityClaimingAuthority),
+    ("plain_vs_plain", cr.LifecycleAuthority, cr.LifecycleAuthority),
+]
+
+
+@pytest.mark.parametrize("case,bound_cls,incoming_cls", _EQ_SHAPES,
+                         ids=[s[0] for s in _EQ_SHAPES])
+def test_34_rule_c_refuses_an_equality_claiming_replacement_by_identity(
+        tmp_path, case, bound_cls, incoming_cls):
+    """F58-6. Rule C must compare authorities with ``is``, so an impostor that *claims* equality
+    with the bound authority is still refused — and nothing on either side is partially assigned.
+
+    A live transfer lease is held across the attempt, so the eight §9 properties are checked in
+    the state where a wrongly accepted replacement would do the most damage: an orphaned lease on
+    a detached gate.
+    """
+    bound = bound_cls()
+    w = World(tmp_path, count=1, authority=bound)
+    assert w.authority is bound
+
+    incoming = incoming_cls()
+    intruder_coordinator = cr.ScanCoordinator()
+    assert incoming is not bound                                     # §9.2 — a distinct object
+
+    diverges = case != "plain_vs_plain"
+    if diverges:
+        # §9.2 — the fixture must actually defeat an equality-based comparison, in the exact
+        # direction the mutated expression evaluates it: `current != shared`, i.e. bound != incoming.
+        assert not (bound != incoming), (
+            "fixture %s does not defeat `!=`, so it would pin nothing" % case)
+    else:
+        assert bound != incoming, (
+            "two plain authorities must compare unequal — this control is why an ordinary "
+            "authority cannot serve as the fixture for this finding")
+
+    w.decide_all(cr.SELECTED)
+    plan = w.lease()                                                 # a real, live transfer lease
+    assert bound.holder(w.owner) == plan.plan_id
+
+    with pytest.raises(cr.Refusal) as caught:                        # §9.3
+        cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                    coordinator=intruder_coordinator, authority=incoming)
+
+    # §9.4 — refused with the documented Rule C code. This is the assertion M1 fails: the mutant
+    # returns a LifecycleAuthority instead of raising.
+    assert caught.value.reason == REBIND_REFUSED
+    assert caught.value.status == 409
+
+    # §9.5 — every binding is still `bound`, by identity. `is`, never `==`: with the
+    # equality-claiming fixture in play an `==` assertion here would pass against the impostor too.
+    assert all(x is bound for x in _bindings(w))
+    assert all(x is not incoming for x in _bindings(w))
+
+    # §9.6 / §9.7 — no partial assignment, and the incoming coordinator was not installed.
+    assert bound._coordinator is w.coordinator
+    assert bound._coordinator is not intruder_coordinator
+    assert incoming._coordinator is None
+    assert incoming._bound is False
+    assert intruder_coordinator.lifecycle_authority is None
+
+    # §9.8 — the lease the refusal ran alongside is intact and still enforceable.
+    assert bound.holder(w.owner) == plan.plan_id
+    assert cr.lifecycle_topology_fault(w.registry, w.store) == ""
+
+    # And the coherent graph still works afterwards: the refusal cost the operator nothing.
+    w.store.end_transfer(plan.owner, plan.plan_id)
+    result = w.run(w.plan())
+    assert result.state == tr.COMPLETE
+    assert len(w.library_files()) == 1
+
+
+def test_35_an_equality_claiming_replacement_never_orphans_a_pending_reservation(tmp_path):
+    """F58-6, the R5-P54 F54-1 ordering with an equality-claiming impostor.
+
+    `test_15` already pins that a *plain* usurper cannot orphan a pending mutation reservation.
+    Under M1 that test still passes, because two plain authorities compare unequal. This is the
+    same ordering with the fixture that actually distinguishes the two comparisons.
+    """
+    w = World(tmp_path, count=1)
+    impostor = _EqualityClaimingAuthority()
+    assert not (w.authority != impostor)
+
+    with _PausedReservation(w, cr.LIFECYCLE_SESSION_REVOKE,
+                            lambda ww: ww.registry.revoke_owner(ww.owner)) as parked:
+        assert parked.reached is True
+        with pytest.raises(cr.Refusal) as caught:
+            cr.bind_lifecycle_authority(registry=w.registry, store=w.store,
+                                        coordinator=w.coordinator, authority=impostor)
+        assert caught.value.reason == REBIND_REFUSED
+        assert all(x is w.authority for x in _bindings(w))
+        assert w.authority.pending_count(w.owner) == 1               # not orphaned
+        assert impostor._bound is False
+    assert parked.error is None
+    assert w.authority.pending_count(w.owner) == 0
+
+
+def test_36_the_binder_compares_authorities_with_identity_in_source():
+    """F58-6, structurally — the companion pin, and why both exist.
+
+    `test_34` is the behavioural detection and is the one that matters. This adds the source
+    contract, for the same reason `test_32b` exists: the behavioural test needs a hand-built
+    `__eq__` subclass to see the difference at all, and a future reader deleting that fixture as
+    "unused exotica" would silently un-pin the contract. Asserting the shape as well makes the
+    requirement legible at the site that must honour it.
+
+    The rule: inside `bind_lifecycle_authority`, every comparison against `shared` must be an
+    identity comparison. `==` / `!=` against it is forbidden outright.
+    """
+    tree = ast.parse(open(_CLIPS_REVIEW, encoding="utf-8").read())
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "bind_lifecycle_authority")
+
+    identity_comparisons = 0
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left] + list(node.comparators)
+        # `shared` itself (Rule C: `current is not shared`) or an attribute of it
+        # (Rule E's write-once re-read: `shared._coordinator is None`).
+        mentions_shared = any(isinstance(inner, ast.Name) and inner.id == "shared"
+                              for o in operands for inner in ast.walk(o))
+        if not mentions_shared:
+            continue
+        for op in node.ops:
+            assert not isinstance(op, (ast.Eq, ast.NotEq)), (
+                "bind_lifecycle_authority compares an authority with %s: `%s`. Rule C and Rule E "
+                "must use `is` / `is not` -- an authority that defines `__eq__` would otherwise be "
+                "accepted as the one already bound (R5-P58 F58-6)."
+                % (type(op).__name__, ast.unparse(node)))
+            assert isinstance(op, (ast.Is, ast.IsNot)), (
+                "unexpected comparison operator %s against `shared`: `%s`"
+                % (type(op).__name__, ast.unparse(node)))
+            identity_comparisons += 1
+
+    assert identity_comparisons >= 2, (
+        "expected at least the Rule C authority check and the Rule E coordinator check to compare "
+        "against `shared` by identity; found %d" % identity_comparisons)

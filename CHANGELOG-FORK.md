@@ -20,6 +20,84 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-25 (Clips Preview P2: R5-P58 returned QUALIFIED; its six MINOR findings dispositioned — R5-P59)
+
+Independent review **R5-P58** of the immutable authority topology returned
+`R5_P58_PR75_IMMUTABLE_AUTHORITY_TOPOLOGY_QUALIFIED`. All three R5-P56 MAJORs (F56-1, F56-2, F56-3)
+are independently **closed**: each was reproduced on the frozen `6532bf81` control to a measured
+unsafe outcome and each flips to safe on the candidate. Across 16 Rule C combinations, 12
+coordinator write-once cases, 11 `_bound` cases, 8 threaded concurrency experiments (up to 24
+concurrent binders), 12 lock/exception cases and 16 independent mutations, **no API-reachable
+authority-bypass path was found** and **no new destructive transfer vulnerability was observed**.
+
+**QUALIFIED is not an unconditional pass.** Product readiness remains incomplete, the transfer
+engine is still **unwired**, `src/gui.py` is **not modified by this change at all** (zero lines),
+and no merge, GUI/HTTP wiring or deployment is authorized. This entry is documentation and test
+coverage only — **no runtime implementation file changed**.
+
+Six MINOR findings, dispositioned:
+
+- **F58-1 — the `_bound` guarantee is conditional, and is now stated that way.** "Both layers fail
+  closed" holds **when the supported binding API established the topology**. `_bound` tracks binder
+  use only, so a graph attached entirely by direct assignment has `_bound=false` and leaves the
+  `acquire`-site half uncovered (measured: `acquire_direct=GRANTED`,
+  `store_begin_transfer=GRANTED`). The execution-site `lifecycle_topology_fault` still refuses, so
+  nothing moves, and `gui.py:6297` binds through the API at import. Documentation corrected; the
+  binding precondition is recorded as a requirement on any future production transfer integration.
+- **F58-2 — a raising assignment does not always leave a detectable partial state.** A failure at
+  the **first** write leaves the graph completely unchanged: nothing assigned, `_bound=false`, and
+  the unbound/unbound legacy carve-out returns `""`. The exception does reach the caller and the
+  lock is free, but this is **not** a partial-state refusal. The three outcomes — no state change,
+  detectable partially bound state, fully bound coherent state — are now tabulated and
+  distinguished.
+- **F58-3 — "catches the consequence of *any* such bypass" was too strong.**
+  `lifecycle_topology_fault` checks the topology **at the point it runs**, once, before the lease.
+  It catches incoherence already present at that boundary; it cannot by itself guarantee safety
+  against a *subsequent* unsupported direct attribute mutation, which R5-P58 measured reaching a
+  completed move. No production caller performs one. **Deliberately no extra pre-rename check and
+  no new synchronization was added** — the obligation is stated instead: runtime use must preserve
+  the immutable authority bindings established by the supported API.
+- **F58-4 — the topology check does not validate the coordinator's own authority pointer.** It
+  proves registry and store share one authority and that the authority has *a* coordinator, not
+  that the coordinator agrees. The mismatch was constructible **only** by unsupported direct
+  mutation; **no supported binding-API path and no production caller created it**
+  (`API_REACHABLE: false`). Recorded as a depth-of-check observation, together with a mandatory
+  **GUI/HTTP integration acceptance gate**: a runtime about to expose destructive transfer must
+  prove registry, store, coordinator and the authority's coordinator reference form one coherent
+  bound topology. That gate is **not implemented here**.
+- **F58-5 — a provenance statement was inaccurate.** It claimed both superseded suites were
+  "preserved verbatim in the R5-P53 and R5-P55 evidence packages". They are in two different
+  places, measured here: the `test_clips_review_atomic_lifecycle.py` original is in the **R5-P53**
+  package, byte-identical; the **32-case rebinding suite is in Git only**, at
+  `6532bf81c08519410775cfc6addb95c578de1813` (916 lines, 32 cases) — the R5-P55 commit that
+  *created* it, confirmed absent in that commit's parent. R5-P55's package holds 29 manifested
+  files and **no copy of it**; its `artifacts/source.diff` covers only `clips_review.py`. **The
+  suite was never lost**; this is a corrected claim, not a recovered file and not a retention
+  failure. The matrix size was also misstated as 36 and collects **39**. No historical evidence
+  package was edited, repaired or regenerated, and no Git history was rewritten.
+- **F58-6 — Rule C's identity comparison is now pinned by test.** R5-P58's mutation M1 relaxed the
+  binder's `current is not shared` to `current != shared` and survived the whole 8237-case suite;
+  the equivalent pin existed for `lifecycle_topology_fault` but not for the binder. Three new tests
+  in `tests/test_clips_review_authority_rebind_safety.py` close it: `test_34` (behavioural, four
+  equality shapes, with a live lease held across the refusal), `test_35` (the R5-P54 reservation
+  ordering with an equality-claiming impostor) and `test_36` (the source contract). M1 is an
+  **equivalent mutant for every authority this repository can construct** — a mutation-coverage
+  gap, **not** a reachable vulnerability and not a destructive MAJOR: under the mutant the binder
+  returns a false `ACCEPTED`, but phase 2's write-once `is None` re-read still blocks the
+  replacement, so no clip moves. The new tests therefore assert **the refusal**, because a test
+  scored on the filesystem alone passes against the mutant and pins nothing. Re-measured here: the
+  mutation is detected by 5 of the 6 new cases with `DID NOT RAISE Refusal` at the Rule C
+  assertion, the pre-R5-P59 39 cases still pass under it, and the suite is restored byte-exact.
+
+The immutable-authority implementation is **not** reopened: no guard was added against direct
+Python attribute writes, which are explicitly outside the supported API. Still open and unchanged:
+**F5**; the **cross-volume source removal** (`SOURCE_REMOVAL_BLOCKED` remains the terminal
+cross-volume result, and the engine still deletes no source by any path — an owner decision
+memorandum comparing the three candidate routes is recorded in the R5-P59 evidence package, with no
+route implemented or authorized); **decision-time content fingerprints**, so no decision made
+through today's UI is transferable; **cross-process locking** (process-local, and never to be
+described otherwise); and **GUI/HTTP integration**.
+
 ### Changed — 2026-10-25 (Clips Preview P2: the authority topology is immutable — R5-P56 F56-1/2/3)
 
 Independent review **R5-P56** confirmed R5-P54's F54-1 closed (3/3 refused, filesystem unchanged)
@@ -65,13 +143,17 @@ authority is not a safe one to detach; it is merely one whose next operation has
   value is `None`. Last-writer-wins is not expressible.
 - `authority._coordinator` is write-once as well — `None` → one object, never object → object — so
   F56-3's retarget is impossible rather than merely detected.
-- **An absent coordinator is not an idle one.** Both layers fail closed: the new
-  `lifecycle_topology_fault(registry, store)` refuses a plan with `lifecycle_authority_incoherent`
-  or `lifecycle_coordinator_unavailable` before any lease is taken, and `acquire()` refuses with the
-  same reason because `ReviewStore.begin_transfer` reaches it directly. The discriminator is a
-  write-once `_bound` flag, which separates a live gate that owes its callers arbitration from a
-  bare instance a unit test constructed — so the pre-R5-P51 P1 suites stay valid without weakening
-  the runtime contract.
+- **An absent coordinator is not an idle one.** Both layers fail closed **when the supported
+  binding API established the topology**: the new `lifecycle_topology_fault(registry, store)`
+  refuses a plan with `lifecycle_authority_incoherent` or `lifecycle_coordinator_unavailable`
+  before any lease is taken, and `acquire()` refuses with the same reason because
+  `ReviewStore.begin_transfer` reaches it directly. The discriminator is a write-once `_bound` flag,
+  which separates a live gate that owes its callers arbitration from a bare instance a unit test
+  constructed — so the pre-R5-P51 P1 suites stay valid without weakening the runtime contract.
+  (**Corrected by R5-P59 / F58-1**: `_bound` tracks binder use only, so a graph attached entirely
+  by direct assignment leaves the `acquire`-site half uncovered. The execution-site layer still
+  refuses and nothing moves, and production binds through the API at import. This is **not**
+  unconditional protection for arbitrary direct attribute assignment.)
 - Partial binding stays supported, because production depends on it (`gui.py` binds registry and
   coordinator at import; the store joins in `_clips_store()`). What it can no longer do is replace
   anything, so it can no longer manufacture a split.
@@ -87,14 +169,24 @@ because the decision phase now precedes every write.
 **Superseded test assumptions, named rather than quietly dropped.** Two places asserted that an idle
 authority could be replaced, and both are now their own negation:
 `test_clips_review_atomic_lifecycle.py::test_24`'s tail, and R5-P55's 32-case hot-rebinding suite in
-`tests/test_clips_review_authority_rebind_safety.py`, replaced by the 36-case immutable-topology
-matrix. The originals are preserved verbatim in the R5-P53 and R5-P55 evidence packages. No test of
-initial binding, same-authority idempotence, leases, reservations, epochs or scan generations was
-weakened, removed or adjusted.
+`tests/test_clips_review_authority_rebind_safety.py`, replaced by the **39-case** immutable-topology
+matrix. (**Corrected by R5-P59 / F58-5**, because the two superseded suites do not live in the same
+place: the `test_clips_review_atomic_lifecycle.py` original is in the **R5-P53** evidence package,
+byte-identical; the 32-case rebinding suite is in **Git only**, at
+`6532bf81c08519410775cfc6addb95c578de1813` — the R5-P55 commit that created it, confirmed absent in
+that commit's parent. R5-P55's package holds no copy of it; its `artifacts/source.diff` covers only
+`src/beatsync_fork/clips_review.py`. The matrix size was also misstated as 36 and collects 39.
+Nothing was lost; this is a corrected provenance statement, not a recovered file, and no historical
+evidence package was edited and no Git history rewritten.) No test of initial binding,
+same-authority idempotence, leases, reservations,
+epochs or scan generations was weakened, removed or adjusted.
 
 Still open, so no reader infers clearance: a direct `target.lifecycle_authority = other` assignment
 bypasses the binding API (not reachable — the application's one direct assignment is an initial
-attachment, pinned by AST test, and `lifecycle_topology_fault` catches the consequence anyway);
+attachment, pinned by AST test, and `lifecycle_topology_fault` catches a bypass that **precedes**
+the check — **corrected by R5-P59 / F58-3**, which measured that a direct assignment performed
+*after* the check and before publish reaches a completed move, so "catches the consequence anyway"
+was too strong);
 **F5**; the **cross-volume source removal**; **decision-time content fingerprints**;
 **cross-process locking** (process-local, and never to be described otherwise); and **GUI/HTTP
 integration**. This is the author's own remediation evidence and is not a security clearance.

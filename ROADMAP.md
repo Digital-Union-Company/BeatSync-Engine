@@ -386,7 +386,7 @@ per-index rule fails the ordering requirement.
 
 ---
 
-### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core FOUR TIMES REVIEWED, R5-P54's MAJOR REMEDIATED, AWAITING R5-P56, STILL UNWIRED**
+### R5 — Clips Preview Selector · **P1 IMPLEMENTED (read-only review) — P2 transfer core SIX TIMES REVIEWED, R5-P58 returned QUALIFIED, ITS SIX MINORs DISPOSITIONED (R5-P59), NOT MERGED, STILL UNWIRED**
 
 A **fifth top-level tab** for reviewing clips *after* the Raw Cutter has produced them. This is
 post-cut media triage, deliberately **not** a per-cut confirmation step inside the Raw Cutter —
@@ -416,9 +416,14 @@ of an *idle* authority that split the gate with no concurrency at all (F56-2), a
 pointer that could be retargeted or left absent outside the barrier (F56-3) — each reproduced to
 a completed, irreversible move. **R5-P57 stops making the protocol more elaborate and removes the
 capability instead: the authority topology is write-once, and replacing a bound authority is
-refused unconditionally, idle or not.** Being remediated is not the same as being cleared: the
-R5-P57 correction has **not** itself been independently reviewed, and the lower-severity R5-P54
-findings (F54-2, F54-3 MINOR; F54-4, F54-5 ADVISORY) remain open.
+refused unconditionally, idle or not.** **A sixth review (R5-P58) then examined that correction and
+returned `QUALIFIED`**: all three F56 MAJORs independently closed, no API-reachable authority bypass
+and no new destructive transfer vulnerability found, plus six MINOR findings — four of them
+over-strong statements in the project's own prose — which **R5-P59 dispositioned** through
+documentation correction and one focused identity regression, with no runtime implementation change.
+Being reviewed is not the same as being cleared: `QUALIFIED` is explicitly **not** an unconditional
+pass, product readiness remains incomplete, and the lower-severity R5-P54 findings (F54-2, F54-3
+MINOR; F54-4, F54-5 ADVISORY) remain open.
 `src/beatsync_fork/clips_review_transfer.py` implements the server-authoritative plan, the
 same-volume atomic no-replace move with rollback, the cross-volume stage→verify→publish sequence,
 the append-only intent/outcome journal and identity-based recovery. It is deliberately **not**
@@ -454,9 +459,9 @@ showed R5-P51's fix had narrowed rather than closed its finding, and reproduced 
 **R5-P53 closed both; a fourth review (R5-P54) independently confirmed that, then reproduced one
 new MAJOR in R5-P53's own rebinding gate, which R5-P55 closed — and a fifth review (R5-P56) broke
 R5-P55's barrier three more ways, which R5-P57 closes by retiring runtime authority replacement
-altogether. The R5-P57 correction has not yet been independently reviewed.** The engine is still
-unwired, so none of this is reachable from the GUI — and the PR is still **not** cleared for
-integration:
+altogether. A sixth review (R5-P58) examined that and returned `QUALIFIED` with six MINOR findings,
+dispositioned by R5-P59.** The engine is still unwired, so none of this is reachable from the GUI —
+and the PR is still **not** cleared for integration:
 
 - **CLOSED (R5-P57) — a lifecycle authority is bound once and never replaced.** Four protocols in a
   row tried to make runtime replacement safe, and three independent reviews broke all of them
@@ -476,7 +481,15 @@ integration:
   authorities or whose authority has no coordinator — at the execution site *and* inside `acquire`,
   because an absent coordinator is not an idle one. The retired barrier API is **deleted**, which is
   how R5-P56's F56-4 and F56-5 are dispositioned. Partial *attachment* stays supported because
-  production depends on it. Independent review **R5-P58** is required.
+  production depends on it. **Independent review R5-P58 ran and returned
+  `R5_P58_PR75_IMMUTABLE_AUTHORITY_TOPOLOGY_QUALIFIED`** — F56-1/2/3 independently closed, no
+  API-reachable authority bypass, six MINOR findings. **R5-P59 dispositioned all six**: the
+  conditional `_bound` guarantee (F58-1), the first-write exception leaving no partial state
+  (F58-2), `lifecycle_topology_fault` checking only at the point it runs (F58-3), the unvalidated
+  coordinator authority pointer plus a mandatory GUI/HTTP integration acceptance gate (F58-4), a
+  corrected evidence-provenance claim (F58-5), and a new identity-vs-equality pin on the binder's
+  Rule C (F58-6). Documentation and tests only — **no runtime implementation file changed**, and
+  the immutable-authority design was deliberately not reopened.
 
 - **CLOSED (R5-P55) — a rebinding gate that is only a check orphans what it was protecting.**
   R5-P53's `bind_lifecycle_authority()` refused a rebind that would orphan a live *lease* but asked
