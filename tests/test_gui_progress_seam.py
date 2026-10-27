@@ -464,7 +464,9 @@ class _RenderHarness:
             "Iterator": __import__("typing").Iterator,
             "StatusResult": __import__("typing").Tuple,
             "fork_creative": type("X", (), {"CreativeProfile": object}),
-            "fork_audio_mix": type("X", (), {"AudioMixConfig": object}),
+            "fork_audio_mix": type("X", (), {"AudioMixConfig": object,
+                                             "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": object}),
         }
 
@@ -547,7 +549,9 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
             "fork_creative": type("X", (), {
                 "CreativeProfile": type("P", (), {
                     "from_widgets": staticmethod(lambda **_k: object())})}),
-            "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object()}),
+            "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object(),
+                                             "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": lambda **_k: object()}),
             "GuardedResult": __import__("typing").Tuple,
         })
@@ -628,7 +632,9 @@ def test_closing_the_batch_mid_candidate_waits_for_that_candidate_worker():
             "fork_creative": type("X", (), {
                 "CreativeProfile": type("P", (), {
                     "from_widgets": staticmethod(lambda **_k: object())})}),
-            "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object()}),
+            "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object(),
+                                             "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": lambda **_k: object()}),
             "GuardedResult": __import__("typing").Tuple,
             "Tuple": __import__("typing").Tuple,

@@ -1639,3 +1639,73 @@ INFO_AUDIO_LAYERS_TIP = (
     "Voice** controls how far the music is ducked while a clip plays. Nothing about Audio Layers "
     "changes in R7 — these files are ordinary WAV/FLAC and it already accepts them."
 )
+
+
+# [FORK] Digital-Union (R7.1): Audio Layers Comfort Mix. OPTIONAL and OFF by default.
+LABEL_VOICE_AUTO_BALANCE = "\u2696\ufe0f Auto Balance Voice & Music"
+INFO_VOICE_AUTO_BALANCE = (
+    "Off by default, and off means the mix is exactly what it has always been. "
+    "On, BeatSync measures how loud the music and your voice clips actually are (EBU R128) and "
+    "evens them out BEFORE mixing, so the speech does not have to be rescued by ducking the music "
+    "harder. Corrections are bounded and a near-silent clip is never amplified. It is a more "
+    "comfortable balance, not a louder master."
+)
+LABEL_MUSIC_RETURN = "\u23f3 Music return / fade back (seconds)"
+INFO_MUSIC_RETURN = (
+    "How long the music takes to come back up to full after a voice clip ends. The original "
+    "behaviour is 0.4s, which on a loud track can feel like the music jumps back in. With Auto "
+    "Balance on, around 2s is a good starting point. This changes only how the music returns \u2014 "
+    "it never moves a voice clip or a video cut."
+)
+LABEL_BALANCE_REPORT = "Auto Balance measurement"
+
+
+# [FORK] Digital-Union (R7.1): the Audio Cutter review gallery.
+INFO_AUDIO_GALLERY = (
+    "**Hover a tile to hear it** \u2014 it loops until you move away, and only one clip ever plays "
+    "at a time. **Left-click keeps**, **right-click discards**, **middle-click** (or **P**) puts a "
+    "clip back to undecided. With a tile focused, **S** / **R** / **P** do the same and the "
+    "**arrow keys** move between clips. **Shift+wheel** scrubs inside a tile. Edit a name in its "
+    "box before confirming if you want to.\n\n"
+    "**Nothing moves until you press Confirm and Sort.** Classifying is just a decision."
+)
+LABEL_AUDIO_ENABLE_HOVER = "\U0001f50a Enable hover audio"
+INFO_AUDIO_ENABLE_HOVER = (
+    "Chrome blocks sound until you have interacted with the page. If a tile says "
+    "\u201cclick Enable hover audio\u201d, press this once."
+)
+LABEL_AUDIO_CONFIRM = "\u2705 Confirm and Sort"
+LABEL_AUDIO_COUNTS = "Decisions"
+AUDIO_COUNTS_INITIAL_TEXT = "Keep 0   \u00b7   Discard 0   \u00b7   Undecided 0   \u00b7   Total 0"
+AUDIO_CONFIRM_DISABLED_TEXT = (
+    "Confirm is refused while any clip is still undecided. Undecided is not a decision."
+)
+
+AUDIO_GALLERY_CSS = """
+<style>
+#r7-grid { display:flex; flex-wrap:wrap; gap:10px; }
+#r7-grid .r7-tile { width:190px; border:2px solid #3a3a3a; border-radius:8px; padding:8px;
+  background:#1f1f1f; cursor:pointer; user-select:none; transition:border-color .12s,
+  box-shadow .12s; }
+#r7-grid .r7-tile:focus { outline:none; box-shadow:0 0 0 2px #6ea8fe; }
+#r7-grid .r7-tile.r7-playing { border-color:#6ea8fe; box-shadow:0 0 10px rgba(110,168,254,.55); }
+#r7-grid .r7-tile.r7-selected { border-color:#2ea043; background:#132b18; }
+#r7-grid .r7-tile.r7-rejected { border-color:#d14; background:#2b1316; }
+#r7-grid .r7-tile.r7-pending { border-color:#3a3a3a; }
+#r7-grid .r7-head { display:flex; justify-content:space-between; align-items:center;
+  font-weight:600; font-size:13px; }
+#r7-grid .r7-badge { font-size:15px; }
+#r7-grid .r7-time { font-size:12px; opacity:.85; margin:3px 0; }
+#r7-grid .r7-src { opacity:.6; }
+#r7-grid .r7-wave { height:26px; display:flex; align-items:center; justify-content:center;
+  border-radius:4px; background:#161616; font-size:11px; opacity:.7; margin-bottom:6px; }
+#r7-grid .r7-tile.r7-playing .r7-wave { background:#16263d; opacity:1; }
+#r7-grid .r7-note { font-size:11px; opacity:.6; margin-bottom:4px; }
+#r7-grid .r7-name { width:100%; box-sizing:border-box; font-size:11px; padding:3px 4px;
+  border-radius:4px; border:1px solid #3a3a3a; background:#141414; color:inherit; }
+#r7-grid .r7-audio { display:none; }
+#r7-grid .r7-empty { opacity:.7; padding:12px; }
+#audio-enable-hover.r7-needed button { outline:2px solid #e3b341 !important; }
+#audio-decisions { display:none !important; }
+</style>
+"""

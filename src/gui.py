@@ -3427,6 +3427,15 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # (`process_video_guarded` / `render_selected_variants_guarded`)
                                     # -- this core only threads it down and reads its invocation_id
                                     # to publish on every yield.
+                                    # [FORK] R7.1: appended with legacy defaults -- no existing
+                                    # caller or positional index moves, and omitting them
+                                    # reproduces the previous behaviour exactly. Placed BEFORE
+                                    # `lifecycle` because the C3-R1A cancellation seam requires
+                                    # `lifecycle` to remain the LAST parameter of every seam it
+                                    # threads through; both of these are keyword-passed, so the
+                                    # ordering costs nothing.
+                                    voice_auto_balance: bool = False,
+                                    voice_music_return: float = 0.4,
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -3532,6 +3541,11 @@ def _process_video_guarded_unlocked(audio_file: str,
         min_gap_seconds=voice_min_gap,
         avoid_drops=voice_avoid_drops,
         music_under_voice_percent=music_under_voice,
+        # [FORK] R7.1: both normalised on construction like every other field. With Auto Balance
+        # off, `normalize_music_return` leaves the value alone, so the legacy 0.4s release — and
+        # therefore the legacy filtergraph — is what reaches the executor.
+        auto_balance=voice_auto_balance,
+        music_return_seconds=voice_music_return,
     )
 
     # [FORK] Digital-Union (Smart Mix V1 / E): the three raw Smart Mix widget values become one
@@ -4180,6 +4194,11 @@ def process_video_guarded(audio_file: str,
                           freestyle_breakdown: str | None = None,
                           freestyle_verse: str | None = None,
                           freestyle_body: str | None = None,
+                          # [FORK] R7.1 (Comfort Mix): appended at the END with legacy defaults,
+                          # exactly as Freestyle was, so every existing positional index in the
+                          # `process_btn.click(inputs=...)` contract is unchanged.
+                          voice_auto_balance: bool = False,
+                          voice_music_return: float = fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
                           ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
@@ -4234,6 +4253,8 @@ def process_video_guarded(audio_file: str,
              freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
              freestyle_breakdown, freestyle_verse, freestyle_body),
             lifecycle=lifecycle,
+            voice_auto_balance=voice_auto_balance,
+            voice_music_return=voice_music_return,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -8256,6 +8277,22 @@ def create_ui() -> gr.Blocks:
                         info=INFO_MUSIC_UNDER_VOICE,
                         elem_id='music-under-voice-slider',
                     )
+                    # [FORK] R7.1 (Comfort Mix): two optional controls. Both default to the legacy
+                    # behaviour, so an operator who never touches them gets the identical mix.
+                    voice_auto_balance = gr.Checkbox(
+                        label=LABEL_VOICE_AUTO_BALANCE,
+                        value=False,
+                        info=INFO_VOICE_AUTO_BALANCE,
+                        elem_id='voice-auto-balance-checkbox',
+                    )
+                    voice_music_return = gr.Number(
+                        label=LABEL_MUSIC_RETURN,
+                        value=fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
+                        minimum=0.1,
+                        maximum=fork_audio_mix.MUSIC_RETURN_MAX_SECONDS,
+                        info=INFO_MUSIC_RETURN,
+                        elem_id='music-return-input',
+                    )
                     audio_layers_report = gr.Textbox(
                         label=LABEL_AUDIO_LAYERS_REPORT,
                         value='',
@@ -9571,6 +9608,11 @@ def create_ui() -> gr.Blocks:
                 freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
                 freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
                 freestyle_verse, freestyle_body,
+                # [FORK] R7.1 (Comfort Mix): appended at the END of the list, matching the two
+                # parameters appended at the end of `process_video_guarded`. Gradio passes these
+                # positionally, so list order and signature order are one contract -- a seam test
+                # pins them name-for-name.
+                voice_auto_balance, voice_music_return,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or
