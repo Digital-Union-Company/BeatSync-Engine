@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import ast
 import os
-import subprocess
-import sys
 
 import pytest
 
@@ -302,17 +300,66 @@ def current():
         return _builders(handle.read())
 
 
+#: The exact argv the pre-R7.1 builder produced for `_plan()` and for a music-only plan,
+#: captured from commit `06c1362` (Raw Audio Cutter V1) and frozen here.
+#:
+#: **Frozen rather than read from git, and that is the whole point.** The first version of
+#: this suite loaded the historical function with `git show HEAD:src/audio_mixdown.py` and
+#: skipped when HEAD already contained the new builder. It worked perfectly until R7.1 was
+#: committed -- at which point the three most important assertions in this file began
+#: SKIPPING instead of running, silently and without failing. A frozen literal cannot do
+#: that: it needs no git, no history and no network, and it keeps asserting the legacy
+#: shape for as long as the file exists.
+#:
+#: If a future change legitimately alters the Auto-Balance-OFF command, THIS is what has to
+#: be edited, deliberately, with the reason recorded. That friction is the point.
+_FROZEN_LEGACY_ARGV = \
+['ffmpeg.exe',
+ '-y',
+ '-i',
+ 'music.mp3',
+ '-i',
+ 'v1.wav',
+ '-i',
+ 'v2.wav',
+ '-filter_complex',
+ "aevalsrc='1-0.650000*(max(min(clip((t-4.750000)/0.250000\\,0\\,1)\\,clip((7.000000+0.400000-t)/0.400000\\,0\\,1))\\,min(clip((t-19.750000)/0.250000\\,0\\,1)\\,clip((21.500000+0.400000-t)/0.400000\\,0\\,1))))':s=48000:c=stereo:d=60.000000,aformat=sample_fmts=fltp:channel_layouts=stereo[env];[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[mus];[mus][env]amultiply[music];[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=5000:all=1[v1];[2:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=20000:all=1[v2];[music][v1][v2]amix=inputs=3:duration=longest:dropout_transition=0:normalize=0[mixed];[mixed]alimiter=limit=0.97:attack=1:release=50:level=0:latency=1,apad,atrim=end=60.000000,asetpts=N/SR/TB[outa]",
+ '-map',
+ '[outa]',
+ '-c:a',
+ 'pcm_s24le',
+ '-ar',
+ '48000',
+ '-ac',
+ '2',
+ 'out.wav']
+
+_FROZEN_LEGACY_MUSIC_ONLY_ARGV = \
+['ffmpeg.exe',
+ '-y',
+ '-i',
+ 'music.mp3',
+ '-filter_complex',
+ '[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[music];[music]amix=inputs=1:duration=longest:dropout_transition=0:normalize=0[mixed];[mixed]alimiter=limit=0.97:attack=1:release=50:level=0:latency=1,apad,atrim=end=60.000000,asetpts=N/SR/TB[outa]',
+ '-map',
+ '[outa]',
+ '-c:a',
+ 'pcm_s24le',
+ '-ar',
+ '48000',
+ '-ac',
+ '2',
+ 'out.wav']
+
+
 @pytest.fixture(scope="module")
 def previous():
-    """The committed pre-R7.1 builder, taken from git rather than from a copy."""
-    result = subprocess.run(["git", "show", "HEAD:src/audio_mixdown.py"],
-                            cwd=_REPO_ROOT, capture_output=True, text=True)
-    if result.returncode != 0:
-        pytest.skip("git is unavailable, so the historical builder cannot be loaded")
-    source = result.stdout
-    if "balance" in source.split("def build_mix_command")[1][:400]:
-        pytest.skip("HEAD already contains the R7.1 builder; nothing historical to compare")
-    return _builders(source)
+    """The frozen pre-R7.1 argv, shaped like the builder it replaces."""
+    return {
+        "build_mix_command": lambda music, plan, out, **_kw: (
+            list(_FROZEN_LEGACY_MUSIC_ONLY_ARGV) if not plan.placements
+            else list(_FROZEN_LEGACY_ARGV)),
+    }
 
 
 def _plan(config=None):
