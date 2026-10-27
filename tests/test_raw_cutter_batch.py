@@ -19,6 +19,9 @@ import pytest
 
 from beatsync_fork import raw_cutter as cutter
 from beatsync_fork import raw_cutter_batch as batch
+# [FORK] R6: the handlers reference `fork_profiles` for the output-profile default, so the
+# AST-executed namespace must carry it just as it carries the other two fork aliases.
+from beatsync_fork import raw_cutter_profiles as profiles
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
@@ -612,13 +615,14 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
     assert ast.unparse(analyze["fn"]) == "_on_cut_analyze"
     run = _kwargs(_click(gui_tree, "cut_run_btn"))
     assert ast.unparse(run["fn"]) == "_on_cut_run"
-    # [FORK] R4-C: the shared Rename output clips checkbox is APPENDED. The original seven are
-    # pinned as a prefix in their original order -- nothing removed, nothing reordered -- and the
-    # one addition is listed explicitly rather than waved through, so an accidental second
-    # addition would still fail here.
+    # [FORK] R4-C, then R6: the two shared settings are APPENDED, in that order. The original
+    # seven are still pinned as a prefix in their original order -- nothing removed, nothing
+    # reordered -- and each addition is listed explicitly rather than waved through, so an
+    # accidental third addition would still fail here.
     assert _names(run["inputs"]) == ["cut_plan_state", "cut_source", "cut_output",
                                      "cut_sensitivity", "cut_min_seconds", "cut_max_seconds",
-                                     "cut_remove_audio", "cut_rename_output"]
+                                     "cut_remove_audio", "cut_rename_output",
+                                     "cut_output_profile"]
     # [FORK] Raw Cutter progress P1: this test's purpose is that BATCH work did not disturb the
     # single-video workflow, so it pins the original widgets as a PREFIX that is still written in
     # the original order -- nothing removed, nothing reordered. The progress panel and the three
@@ -1112,7 +1116,8 @@ class _BatchRun:
 
 def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
                probe_fault=None, export_hook=None, manifest_error="", manifest_raises=False,
-               prelock=False, batch_dir_error="", ui=False, rename_output=False):
+               prelock=False, batch_dir_error="", ui=False, rename_output=False,
+               profile=profiles.SAME_AS_SOURCE):
     """Execute the real `_on_cut_batch_run` against a synthesised adapter and a real filesystem.
 
     [FORK] P19-R4: with ``ui=True`` the run is driven through the real `_on_cut_batch_run_ui`
@@ -1186,7 +1191,11 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         return _Res(succeeded=True, times=[10.0, 20.0, 30.0, 40.0], error="")
 
     def export_segments(source=None, plan=None, run_directory=None, remove_audio=True,
-                        encoder="", job=None, on_complete=None, naming=None):
+                        encoder="", job=None, on_complete=None, naming=None,
+                        output_profile=None):
+        # [FORK] R6: the real `export_segments` gained an optional `output_profile`; the double
+        # accepts it and records it so the freeze can be asserted.
+        events.append("profile:" + str(output_profile))
         events.append("export:" + os.path.basename(source.path))
         if export_hook:
             return export_hook(source, plan, run_directory, job, on_complete, naming)
@@ -1237,7 +1246,8 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
 
     namespace.update(
         os=os, time=_time, datetime=_datetime, List=list, Any=object, Dict=dict,
-        fork_cutter=cutter, fork_cutter_batch=batch, _RENDER_LOCK=_Lock(),
+        fork_cutter=cutter, fork_cutter_batch=batch, fork_profiles=profiles,
+        _RENDER_LOCK=_Lock(),
         _mark_lock_holder=lambda token: events.append("holder:" + (token or "cleared")),
         _LOCK_HOLDER_CUTTER="cutter",
         _install_cutter_job=lambda job: events.append("job:installed"),
@@ -1258,7 +1268,7 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     try:
         for value in namespace[entry](
                 str(src_root), False, str(out_root), 50, 1.0, 8.0, True,
-                bool(rename_output)):
+                bool(rename_output), profile):
             yields.append(value)
     except BaseException as exc:                              # noqa: BLE001 - must be observable
         yields.append(("__ESCAPED__", type(exc).__name__ + ": " + str(exc)))

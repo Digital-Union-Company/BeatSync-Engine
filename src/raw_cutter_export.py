@@ -288,7 +288,8 @@ class SegmentResult:
 
 
 def build_segment_command(source_path: str, destination: str, start: float, duration: float,
-                          remove_audio: bool, encoder: str, has_audio: bool) -> list[str]:
+                          remove_audio: bool, encoder: str, has_audio: bool,
+                          profile: str | None = None) -> list[str]:
     """The argv for one segment. A LIST, never a shell string, and never with ``-y``.
 
     `-ss` before `-i` is the fast accurate seek: FFmpeg seeks to the preceding keyframe and decodes
@@ -396,6 +397,29 @@ def build_segment_command(source_path: str, destination: str, start: float, dura
         '-fps_mode:v', 'passthrough',
         '-enc_time_base:v', 'demux',
     ]
+
+    # [FORK] Digital-Union (R6): an optional output profile, applied as an explicit SUBSTITUTION
+    # over the list above rather than by branching around it. Two reasons, both deliberate:
+    #
+    #   * The Same-as-source argv stays the reviewed artefact, verbatim and in one piece. With no
+    #     profile this function is byte-for-byte the P8 command, and every measurement in the
+    #     docstring still describes the code that runs. The seam suite's mutation targets quote
+    #     those exact source lines, which is the same contract stated as a test.
+    #   * The import is LOCAL and reached only for a real profile, so a harness that
+    #     AST-extracts this function and executes it with nothing but `FFMPEG_PATH` -- which
+    #     several suites do -- keeps working untouched.
+    #
+    # The profile replaces the video filter and the two P8 timing options; `-enc_time_base:v
+    # demux` is dropped rather than carried, because on a fixed grid it produces a clip stamped
+    # on the demuxer's tick rate (measured: 61440 frames for 4 s). See
+    # `raw_cutter_profiles.timing_options`.
+    if profile:
+        from beatsync_fork import raw_cutter_profiles as profiles
+        chosen = profiles.resolve(profile)
+        if chosen is not None:
+            command[command.index('-vf') + 1] = profiles.video_filter(chosen, duration)
+            timing = command.index('-fps_mode:v')
+            command[timing:timing + 4] = profiles.timing_options(chosen)
     if remove_audio or not has_audio:
         # `-an` drops the stream itself, not merely its level: the output container ends up with
         # no audio stream at all, which is what "Remove Audio" has to mean to be worth having.
@@ -440,7 +464,8 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
                     job: CutterJob | None = None,
                     on_progress: Callable[[int, int, str], None] | None = None,
                     on_complete: Callable[["SegmentResult"], None] | None = None,
-                    *, naming: "fork_cutter.OutputNaming | None" = None
+                    *, naming: "fork_cutter.OutputNaming | None" = None,
+                    output_profile: str | None = None
                     ) -> list[SegmentResult]:
     """Export every planned segment into ``run_directory``.
 
@@ -534,7 +559,8 @@ def export_segments(source: fork_cutter.SourceInfo, plan: fork_cutter.SegmentPla
         # clip on the frames' own timestamps instead. See its docstring for the five shapes that
         # were measured over the same 69 boundaries and why `trim` is the only one that holds.
         command = build_segment_command(source.path, staging, segment.start, segment.duration,
-                                        remove_audio, encoder, source.has_audio)
+                                        remove_audio, encoder, source.has_audio,
+                                        output_profile)
         failure = ""
         try:
             result = _run_media_command(command, timeout=EXPORT_TIMEOUT_SECONDS)

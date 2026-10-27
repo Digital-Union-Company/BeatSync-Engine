@@ -416,13 +416,132 @@ pinned Windows + Gradio 6.19.0 environment, cold and warm, with zero video eleme
 rest and at most one playing. The figures are in the R5-P1 task report; the specification carries
 the method. If a page size ever fails to hold, the page size gives — not the safety rules.
 
+#### R5-UX — Clips Preview usability and local sorting · **ACCEPTED CANDIDATE, PUBLISHED IN A FEATURE PR, NOT DEPLOYED**
+
+> **Read this status literally.** The work below was built as a local playtest candidate at
+> `CLIPS-UX-PLAYTEST/app`, was **accepted by the owner after a hands-on test**, and is now
+> **published for review in the FUN feature PR** `feat/fun-clips-preview-v4-raw-cutter-r6`
+> together with R6. It is **not** on `main`, **not** in PR #75, and **not** running in the
+> owner's production installation. It has been exercised in real Chrome and by the full test
+> suite; it has had **no independent review**.
+
+Four increments, built and browser-verified in order:
+
+| | What it does | Verified |
+|---|---|---|
+| **V1** | Confirm enables/disables itself the moment the page becomes fully decided, by asking the server to re-derive the state. Stale-response guard on rapid clicking. | Chrome: enable → disable → re-enable, all automatic |
+| **V2** | Real clip length in every tile (`Clip 0001 (00:14)`) from the portable FFprobe, cached on clip identity; adaptive Shift+wheel seeking — 1 s under 20 s, 2 s to 90 s, 5 s beyond | Chrome: six clips at 10/19/20/45/90/120 s, correct step at both boundaries |
+| **V3** | **Confirm actually sorts**: SELECTED → Media Library, REJECTED → Discarded, same-volume `os.rename` only. No overwrite, no collision renaming, no deletion; cross-volume refused in words rather than copied. Partial results preserved; next batch loads automatically | Chrome 12/12, 6 clips sorted across two batches, every checksum identical |
+| **V4** | Native Windows folder picker on six folder fields, and saved default folders in `state/preferences.json` | Chrome: pick, cancel, save, restart, restore |
+
+**What V3 deliberately does not do.** It is a **V1 sorter**, not the reviewed transfer engine. It
+has no content fingerprint, no journal, no staging and no recovery report — it is `os.rename`
+inside one volume, chosen precisely because that call refuses an existing destination and *raises*
+across volumes instead of copying. The separately reviewed transfer engine
+(`clips_review_transfer.py`) and the accepted Win32 primitive remain **unwired**, and the owner
+decisions A/B/C/F that govern them remain **open**. Nothing in R5-UX closes any of them.
+
+**Next for R5-UX:** independent review, then a decision about whether this simple sorter is the
+shipping answer or whether the reviewed engine should replace it.
+
+---
+
+### R6 — Raw Cutter output video profiles · **ACCEPTED CANDIDATE, PUBLISHED IN A FEATURE PR, NOT DEPLOYED**
+
+Today every exported clip inherits its source's dimensions and frame rate, so a folder of mixed
+recordings produces a library that is mixed in exactly the same way. The next Raw Cutter feature
+is one **Output Video Profile** selector, shared by Single Video and Folder Batch.
+
+| Preset | Note |
+|---|---|
+| **Same as source** | **DEFAULT.** Byte-for-byte the current behaviour — the existing export path, unchanged |
+| 1080p / 25 fps · 1080p / 30 fps | |
+| 720p / 25 fps · 720p / 30 fps | |
+| 1080p / 60 fps · 720p / 60 fps | later, once the first four are proven |
+
+> **Built and measured** in the `R6-OUTPUT-PROFILES` playtest, on top of the R5-UX V4 candidate.
+> Four profiles ship: **1080p/30, 1080p/25, 720p/30, 720p/25**, plus **Same as source** as the
+> default. 60 fps is still deliberately absent.
+>
+> **Same as source is byte-identical to the pre-R6 command**, proven by extracting
+> `build_segment_command` from both trees and comparing the argv for both encoder branches. The
+> profile is applied as an explicit substitution over the reviewed list rather than by branching
+> around it, so the P8 measurements still describe the code that runs.
+>
+> **`-enc_time_base:v demux` is NOT carried into the fixed branch**, and that is a measurement
+> rather than a preference: with it, a 4-second 25 fps export came out as **61,440 frames at
+> 15360/1**; with `-fps_mode:v cfr` alone it is **100 frames at 25/1**, uniformly spaced.
+>
+> Verified with FFprobe across 1080p30, 720p25, 4:3, portrait 9:16, anamorphic (SAR 16:15), VFR
+> and an audio fixture, on **both** NVENC and libx264: exact dimensions, `r_frame_rate` equal to
+> `avg_frame_rate`, exact frame counts, DAR preserved by padding (never stretching), audio
+> duration matching video exactly at an unchanged sample rate, and no frames leaking past the
+> planned boundary.
+
+Requirements for whoever built it:
+
+- Re-encode to consistent dimensions and frame rate.
+- **Preserve aspect ratio by padding, never by stretching.**
+- Scene-cut start/end positions stay conceptually unchanged.
+- **Say plainly that fixed-fps conversion duplicates or drops frames.** A 24 fps source at 30 fps
+  is not the same footage; the UI must not imply it is.
+- NVENC when available, CPU fallback when not.
+- No overwrite, and **Remove audio** keeps working exactly as it does now.
+- One profile for an entire Folder Batch, recorded in `batch_manifest.json`.
+- **Same as source must leave the current code path untouched**, so the default cannot regress.
+
+### R7 — Raw Audio Cutter V1 · **PLANNED, NOT IMPLEMENTED**
+
+A new tool — its own Audio Cutter tab, or a grouped audio workspace — for building a reusable
+library of dialogue, isolated words and phrases, vocal expressions and sound effects pulled out of
+videos and recordings.
+
+**V1 is deliberately mechanical. No AI.**
+
+- Accept common video and audio inputs; extract audio without touching the original.
+- Detect silence: default **minimum 0.5 s**, adjustable threshold (around **−35 dB**).
+- Cut into segments around the detected pauses, with small configurable padding either side.
+- Mark or skip segments that are too short.
+- Export **WAV or FLAC**.
+- Preview each segment; keep, discard or rename it individually.
+- Write a segment manifest recording source and timestamps.
+
+**Two things it must not claim.** It will not identify every individual spoken word, and it
+**cannot remove music from an already-mixed track** — a pause detector finds quiet, not vocals.
+Output should later be consumable by Audio Layers and Smart Mix.
+
+### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
+
+Only once R7 has proven useful in practice:
+
+- Transcribe spoken material where suitable ASR is available.
+- Classify segments as Voice, Dialogue, Impact, Mechanical, Nature, Ambience, Other.
+- Suggest descriptive names and tags, with the operator free to confirm or change every one.
+- Reuse the existing Qwen **text** model for classifying transcripts where that is enough.
+- **Do not assume Qwen3-VL can understand raw audio.** Audio-capable models get investigated only
+  after the mechanical cutter has earned it.
+
+No new model, dependency or inference pipeline is to be added for this now.
+
+### R9 — Audio Layers usability · **PLANNED, NOT IMPLEMENTED**
+
+Audio Layers and Smart Mix work, and are hard to approach. This is documentation and explanation,
+**not a redesign**:
+
+- What each input actually does.
+- How voices are positioned relative to the music.
+- What **Music under Voice** means in practice.
+- How to use a library built by the Raw Audio Cutter.
+- One simple reproducible example, start to finish.
+
 ---
 
 ## Status summary
 
-Three different things are distinguished deliberately below, because conflating them is how a
+Four different things are distinguished deliberately below, because conflating them is how a
 roadmap starts lying: **deployed** (running in production), **merged** (on `main`, not necessarily
-deployed), and **local candidate** (exists on a branch, validated, but neither merged nor shipped).
+deployed), **local candidate** (exists on a branch or a playtest copy, validated, but neither
+merged nor shipped), and **planned** (agreed, not written).
 
 | Item | Status |
 |---|---|
@@ -432,22 +551,39 @@ deployed), and **local candidate** (exists on a branch, validated, but neither m
 | **R4-B** — Live progress and active controls | **DONE** — merged in PR #71, **deployed** at `2044f360` |
 | **R4-C** — Synthetic output naming (opt-in, default off) | **DONE** — merged in PR #72, **deployed** at `0aed35d6`. Two QUALIFIED independent reviews; three MINOR findings accepted as non-blocking and still open (see the section above) |
 | **R5** — Clips Preview Selector (post-cut triage tab) | **P1 IMPLEMENTED** — the fifth tab reviews and classifies clips, read-only and measured; **moving files is NOT implemented**. Specification: `docs/claude/clips-preview-selector-v1.md`; contract: `.claude/rules/clips-preview.md` |
+| **R5-UX** — Clips Preview usability V1–V4 (auto-Confirm, durations, adaptive seek, same-volume sorting, native folder picker, saved defaults) | **ACCEPTED CANDIDATE, PUBLISHED** — browser-verified; owner-accepted after a hands-on test; published in the FUN feature PR with R6; whole suite 7,912 passed / 9 skipped. **Not merged, not deployed, not independently reviewed** |
+| **R6** — Raw Cutter output video profiles | **ACCEPTED CANDIDATE, PUBLISHED** — four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders; owner-accepted after a hands-on test; published in the same FUN feature PR. **Not merged, not deployed** |
+| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **PLANNED, NOT IMPLEMENTED** |
+| **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL** — not planned for implementation; gated on R7 proving useful |
+| **R9** — Audio Layers usability and tutorial | **PLANNED, NOT IMPLEMENTED** — documentation, not a redesign |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
 
 ### Current priority order (product-owner decision)
 
+Re-set by the owner after the V3 playtest: **practical usability first, one feature at a time.**
+
 1. ~~**Finish R4-B** live progress and get it reviewed.~~ **Done** — merged in PR #71 and deployed.
 2. ~~**R4-C** synthetic output naming.~~ **Done** — merged in PR #72 and deployed at `0aed35d6`,
    with three accepted MINOR findings still open.
-3. **R5** Clips Preview Selector — the gallery first, safe file movement second, exactly as
-   planned. **P1 (the gallery) is implemented**; the next step is independent review of it, and
-   only after that a separately authorized transfer phase. The accepted specification in
-   `docs/claude/clips-preview-selector-v1.md` is unchanged in substance and now records which
-   parts are built.
-4. **R3 / Smart Passages** only once the post-cut review workflow exists. It stays **opt-in** by
-   design, and it must not be mixed with Stage-5 cache identity or the existing Qwen worker.
+3. **R5 / R5-UX — Clips Preview, finish the usability work.** The gallery (P1) is merged and
+   deployed; the usability and sorting work is a **local candidate only**. Next: owner playtest,
+   then a decision on whether the simple same-volume sorter ships as-is or is replaced by the
+   separately reviewed transfer engine. The A/B/C/F owner decisions stay open either way.
+4. **R6 — Raw Cutter output video profiles.** The recommended next build: it is bounded, it has a
+   default that cannot regress anything (*Same as source*), and it makes the clip library usable
+   as a whole rather than as a pile of mismatched formats.
+5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI.
+6. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
+7. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
+   **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
+   Qwen worker.
+
+> **The security research programme is separate and is not re-prioritised here.** PR #75, the
+> Win32 primitive and the A/B/C/F owner decisions are recorded in their own evidence packages and
+> in `.claude/rules/clips-preview.md`. Nothing in this product roadmap closes, reopens or
+> reinterprets any of them.
 
 ---
 

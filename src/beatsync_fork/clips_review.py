@@ -1033,6 +1033,129 @@ def ensure_posters(entries: Iterable[ClipEntry], cache_dir: str, ffmpeg: str, ru
     return outcome
 
 
+#: One FFprobe per clip is cheap, but a page is up to 100 of them, so the pass is bounded exactly
+#: like the poster pass and the answers are cached on the clip's identity.
+DURATION_TIMEOUT_SECONDS = 10
+DURATION_MAX_WORKERS = 4
+DURATION_CACHE_MAX_ENTRIES = 4096
+_DURATION_CACHE: dict[str, float | None] = {}
+
+
+def build_duration_command(ffprobe: str, source: str) -> list[str]:
+    """The one duration argv. Built here so the GUI never becomes a command-construction site.
+
+    No ``-nostdin``: that is an **ffmpeg** option and ffprobe does not have it. Passing it does not
+    error cleanly -- ffprobe treats the next token as its value and dies with
+    ``Failed to set value '-show_entries' for option 'nostdin'``, so every clip probes as unknown.
+    Measured; the poster command above legitimately uses it because that one really is ffmpeg.
+    """
+    return [str(ffprobe), "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(source)]
+
+
+def run_duration_command(argv, timeout: int = DURATION_TIMEOUT_SECONDS) -> str:
+    """Execute one already-built probe argv, windowless and bounded; return raw stdout.
+
+    Here rather than in `gui.py` for the same reason `run_poster_command` is: two suites pin that
+    module's `subprocess.run` site count at exactly two. A failure returns `""`, never an
+    exception -- an unreadable duration must leave the clip classifiable.
+
+    ``stdin=DEVNULL`` is load-bearing rather than tidiness. FFprobe has no ``-nostdin`` -- that is
+    an ffmpeg option -- so without this the child inherits whatever stdin the parent happens to
+    have and can block on it indefinitely. Measured: it hung the GUI integration suite until the
+    timeout. Detaching stdin is what ``-nostdin`` buys the poster command, done portably.
+    """
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            list(argv), capture_output=True, timeout=timeout, text=True,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if int(completed.returncode) != 0:
+            return ""
+        return completed.stdout or ""
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+
+def parse_duration(text: str) -> float | None:
+    """Turn FFprobe's `format=duration` output into seconds, or **None**.
+
+    `None` is the whole point. `ffmpeg_processing.get_video_duration` answers a **fabricated
+    10.0** when the probe fails, which is correct for its caller (a render needs *a* number to
+    plan with) and completely wrong here: the gallery would print a confident `(00:10)` over a
+    clip of unknown length. `N/A`, an empty probe, `nan`, `inf` and a negative are all refusals.
+    """
+    try:
+        value = float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return None
+    return value
+
+
+def format_duration(seconds: float | None) -> str:
+    """`(00:14)`, `(01:05)`, `(1:12:08)` -- and `–:–` when the length is genuinely unknown.
+
+    Hours are only shown once there are hours, so a short clip is not padded out to `0:00:14`.
+    """
+    if seconds is None:
+        return "–:–"
+    whole = int(seconds)                      # truncate: a 14.9s clip is not yet 15s
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def ensure_durations(entries: Iterable[ClipEntry], ffprobe: str, runner,
+                     workers: int = DURATION_MAX_WORKERS,
+                     timeout: int = DURATION_TIMEOUT_SECONDS) -> dict[str, float | None]:
+    """Probe each clip's real length, bounded and cached. Returns ``clip_id -> seconds or None``.
+
+    ``runner`` is an injected ``(argv, timeout) -> str`` so the path is testable without FFprobe
+    existing, the same shape ``ensure_posters`` uses.
+
+    Cached on :func:`poster_key` -- the established clip identity of path, size and mtime -- so a
+    Refresh re-renders from memory and an edited clip is re-probed rather than answered from a
+    stale entry. A probe that fails is cached as ``None`` too: a file FFprobe cannot read will not
+    become readable on the next repaint, and retrying 100 of those on every Refresh would make the
+    page crawl.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    entries = list(entries)
+    keys = {entry.clip_id: poster_key(entry.path, entry.size, entry.mtime_ns)
+            for entry in entries}
+    pending = [entry for entry in entries if keys[entry.clip_id] not in _DURATION_CACHE]
+
+    def one(entry: ClipEntry) -> tuple[str, float | None]:
+        try:
+            raw = runner(build_duration_command(ffprobe, entry.path), timeout)
+        except Exception:                                  # noqa: BLE001 - a duration is optional
+            raw = ""
+        return keys[entry.clip_id], parse_duration(raw)
+
+    if pending:
+        lanes = max(1, min(int(workers), DURATION_MAX_WORKERS))
+        if lanes == 1:
+            probed = [one(entry) for entry in pending]
+        else:
+            with ThreadPoolExecutor(max_workers=lanes,
+                                    thread_name_prefix="r5probe") as pool:
+                probed = list(pool.map(one, pending))
+        if len(_DURATION_CACHE) > DURATION_CACHE_MAX_ENTRIES:
+            _DURATION_CACHE.clear()                        # bounded, and cheap to refill
+        _DURATION_CACHE.update(probed)
+
+    return {entry.clip_id: _DURATION_CACHE.get(keys[entry.clip_id]) for entry in entries}
+
+
 def prune_poster_cache(cache_dir: str, limit: int = POSTER_CACHE_MAX_FILES) -> int:
     """Keep the cache bounded, oldest first. Returns how many files were removed.
 
@@ -1223,20 +1346,168 @@ _BADGES = {PENDING: "?", SELECTED: "✓", REJECTED: "✗"}
 _CLASSES = {PENDING: "r5-pending", SELECTED: "r5-selected", REJECTED: "r5-rejected"}
 
 
+# --------------------------------------------------------------------------------------------
+# Sorting the decided clips into the two destination folders (V1: same volume only)
+# --------------------------------------------------------------------------------------------
+
+#: What happened to one clip. Every value except MOVED left the source exactly where it was.
+MOVED = "moved"
+MISSING = "missing"
+CHANGED = "changed"
+OCCUPIED = "occupied"
+CROSS_VOLUME = "cross_volume"
+IN_USE = "in_use"
+FAILED = "failed"
+
+
+@dataclass
+class MoveOutcome:
+    clip_id: str
+    label: str
+    decision: str
+    status: str
+    destination: str = ""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == MOVED
+
+
+def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
+    """Relocate one clip into ``destination_dir``. Never overwrites, never deletes, never renames.
+
+    The whole operation is a single ``os.rename``, and that is the design rather than an
+    implementation detail:
+
+    * **Same volume only.** ``os.rename`` across volumes raises instead of copying, so a
+      cross-volume request cannot silently degrade into copy-then-delete -- the one shape that
+      could destroy an original. The device is compared up front so the operator gets a sentence
+      instead of a winerror, but the syscall is the real guarantee.
+    * **No overwrite.** On Windows ``os.rename`` refuses an existing destination with
+      ``FileExistsError``. The pre-check below exists for the message; the refusal is enforced by
+      the call itself, so a file that appears in the gap is still not clobbered. ``os.replace``
+      would overwrite and is deliberately never used here.
+    * **No collision renaming.** A taken name is reported as :data:`OCCUPIED` and the clip stays
+      put. Inventing ``clip (2).mp4`` would quietly produce a library the operator never approved.
+    * **Nothing is deleted.** There is no ``unlink`` on any path through this function.
+
+    The clip's identity is re-checked against what the scan recorded immediately before the move,
+    so a file that was replaced or edited while the operator was reviewing is skipped rather than
+    sorted on a stale decision.
+    """
+    result = MoveOutcome(clip_id=entry.clip_id, label=entry.label, decision="", status=FAILED)
+    try:
+        live = os.stat(entry.path)
+    except FileNotFoundError:
+        result.status, result.detail = MISSING, "the file is no longer at its scanned location"
+        return result
+    except OSError as exc:
+        result.status, result.detail = FAILED, io_detail(exc)
+        return result
+
+    if (live.st_size != entry.size or live.st_mtime_ns != entry.mtime_ns
+            or (entry.ino not in (-1, 0) and live.st_ino != entry.ino)):
+        result.status = CHANGED
+        result.detail = "the file changed after it was scanned, so the decision may not describe it"
+        return result
+
+    try:
+        destination_dev = os.stat(destination_dir).st_dev
+    except OSError as exc:
+        result.status, result.detail = FAILED, io_detail(exc)
+        return result
+    if entry.dev not in (-1, 0) and destination_dev != entry.dev:
+        result.status = CROSS_VOLUME
+        result.detail = "the destination is on a different drive"
+        return result
+
+    target = os.path.join(destination_dir, os.path.basename(entry.path))
+    result.destination = target
+    if os.path.exists(target):
+        result.status = OCCUPIED
+        result.detail = "a file of that name is already there; nothing was overwritten"
+        return result
+    try:
+        os.rename(entry.path, target)
+    except FileExistsError:
+        result.status = OCCUPIED
+        result.detail = "a file of that name appeared there first; nothing was overwritten"
+        return result
+    except OSError as exc:
+        # Cross-volume shows up here too on some filesystems; report it as what it is.
+        if getattr(exc, "winerror", None) == 17 or getattr(exc, "errno", None) == 18:
+            result.status, result.detail = CROSS_VOLUME, "the destination is on a different drive"
+        elif getattr(exc, "winerror", None) == 32:
+            # ERROR_SHARING_VIOLATION. Measured in the browser: hovering a tile mounts a <video>
+            # on that clip, and Windows will not rename a file another handle still holds open,
+            # so the last clip the operator hovered was the one that would not sort. The client
+            # now releases the player before Confirm runs; this stays as the honest explanation
+            # for any other holder (an editor, a player, an antivirus scan).
+            result.status = IN_USE
+            result.detail = "another program still has it open"
+        else:
+            result.status, result.detail = FAILED, io_detail(exc)
+        return result
+    result.status = MOVED
+    return result
+
+
+def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: dict[str, str],
+                       ) -> list[MoveOutcome]:
+    """Move each decided clip to the folder its decision names. Returns one outcome per clip.
+
+    ``decision_of(entry) -> str`` reads the **server's durable record**; nothing here looks at
+    markup, tile classes or anything the browser sent. ``destinations`` maps
+    :data:`SELECTED`/:data:`REJECTED` to a directory.
+
+    One clip failing does not stop the others, and it does not undo the ones already moved: each
+    rename is independently complete the moment it returns, so a partial batch is a real partial
+    result and is reported as one. A :data:`PENDING` clip is never touched -- Confirm is not
+    offered until the page has none, and this refuses to act on one even if it were.
+    """
+    outcomes: list[MoveOutcome] = []
+    made: set[str] = set()
+    for entry in entries:
+        decision = decision_of(entry)
+        destination_dir = destinations.get(decision)
+        if destination_dir is None:
+            outcomes.append(MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
+                                        detail="undecided clips are never sorted"))
+            continue
+        if destination_dir not in made:
+            try:
+                os.makedirs(destination_dir, exist_ok=True)
+            except OSError as exc:
+                outcomes.append(MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
+                                            detail=io_detail(exc)))
+                continue
+            made.add(destination_dir)
+        outcome = move_decided_clip(entry, destination_dir)
+        outcome.decision = decision
+        outcomes.append(outcome)
+    return outcomes
+
+
 def tile_html(entry: ClipEntry, decision: str, revision: int, session_id: str,
-              page_token: str, has_poster: bool) -> str:
+              page_token: str, has_poster: bool, duration: float | None = None) -> str:
     """One tile.
 
     Every interpolated value is escaped, and the only text that comes anywhere near the clip is
     the server-generated ``Clip 0001`` label -- the basename is never inserted, so a filename
     cannot carry markup or script into the page. Status is carried by a badge glyph as well as a
     colour class, so colour is not the only signal.
+
+    ``duration`` appends the clip's real length, as ``Clip 0001 (00:14)``. It is a number of
+    seconds and discloses nothing about the file's name or location, so it is safe in markup that
+    deliberately carries neither. ``None`` renders ``(–:–)`` rather than a guess -- see
+    :func:`parse_duration` for why a fabricated length is worse than an honest unknown.
     """
     import html as _html
 
     decision = decision if decision in _CLASSES else PENDING
     clip = _html.escape(entry.clip_id, quote=True)
-    label = entry.label
+    label = f"{entry.label} ({format_duration(duration)})"
     poster_url = f"/r5poster/{session_id}/{page_token}/{entry.clip_id}"
     video_url = f"/r5clip/{session_id}/{page_token}/{entry.clip_id}"
     media = (f'<img class="r5-poster" loading="lazy" decoding="async" '
@@ -1261,7 +1532,7 @@ def tile_html(entry: ClipEntry, decision: str, revision: int, session_id: str,
 
 def gallery_html(entries: Iterable[ClipEntry], decisions: dict[str, tuple[str, int]],
                  identities: dict[str, str], session_id: str, page_token: str,
-                 poster_exists) -> str:
+                 poster_exists, durations: dict[str, float | None] | None = None) -> str:
     """The whole grid.
 
     Carries a nonce because a ``gr.HTML`` update whose markup is byte-identical to the previous
@@ -1273,7 +1544,8 @@ def gallery_html(entries: Iterable[ClipEntry], decisions: dict[str, tuple[str, i
         identity = identities.get(entry.clip_id, "")
         decision, revision = decisions.get(identity, (PENDING, 0))
         tiles.append(tile_html(entry, decision, revision, session_id, page_token,
-                               bool(poster_exists(entry))))
+                               bool(poster_exists(entry)),
+                               (durations or {}).get(entry.clip_id)))
     if not tiles:
         return '<div class="r5-empty">Nothing to review on this page.</div>'
     nonce = secrets.token_hex(4)

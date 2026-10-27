@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from beatsync_fork import raw_cutter as cutter
+# [FORK] R6: output video profiles -- pure definitions, no FFmpeg.
+from beatsync_fork import raw_cutter_profiles as profiles
 
 # ---------------------------------------------------------------------------------------------
 # Outcome vocabulary
@@ -344,6 +346,11 @@ class BatchSettings:
     #: submission. Two representations of the same choice, each at the layer that needs it, and
     #: `gui.py` derives both from the one widget value.
     rename_output_clips: bool = False
+    #: [FORK] R6: APPENDED with a default for the same reason `rename_output_clips` was -- every
+    #: existing construction and every existing reader keeps working untouched. `""` means Same
+    #: as source, which is also what an unknown value resolves to, so an old manifest or a stale
+    #: session can only ever mean "leave the export alone".
+    output_video_profile: str = profiles.SAME_AS_SOURCE
 
     def describe(self) -> str:
         # [FORK] R4-C: the renaming clause is appended ONLY when the mode is on, so a default
@@ -355,6 +362,11 @@ class BatchSettings:
                 f"{self.encoder or 'unknown'}")
         if self.rename_output_clips:
             text += ", output clips renamed"
+        # [FORK] R6: appended ONLY for a real profile, so a Same-as-source batch's settings line
+        # is byte-for-byte what it was before this feature existed -- the report, the panel and
+        # several assertions read this string.
+        if profiles.resolve(self.output_video_profile) is not None:
+            text += f", output profile {profiles.label_for(self.output_video_profile)}"
         return text
 
 
@@ -606,6 +618,8 @@ def manifest_payload(items: Sequence[BatchItem], discovered: int, settings: Batc
             "remove_audio": bool(settings.remove_audio),
             "encoder": str(settings.encoder),
             "rename_output_clips": bool(settings.rename_output_clips),
+            # [FORK] R6: ADDED; nothing above is removed or redefined.
+            "output_video_profile": profiles.manifest_value(settings.output_video_profile),
         },
         "totals": {
             "discovered": totals.discovered,

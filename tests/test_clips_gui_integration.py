@@ -45,8 +45,10 @@ _UI_CONTENT = os.path.join(_SRC, "ui_content.py")
 _HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailable_outputs",
              "_clips_owner", "_clips_remember", "_clips_view",
              "_clips_failure_text", "_clips_poster_exists", "_clips_poster_resolver",
-             "_clips_identities", "_on_clips_check", "_clips_render_current", "_on_clips_scan",
-             "_clips_decide", "_clips_state", "_on_clips_refresh", "_on_clips_confirm")
+             "_clips_identities", "_clips_durations",
+             "_on_clips_check", "_clips_render_current", "_on_clips_scan",
+             "_clips_decide", "_clips_state", "_on_clips_refresh",
+             "_clips_confirm_only", "_clips_sorted_text", "_on_clips_confirm")
 
 
 class _Update(dict):
@@ -523,7 +525,7 @@ def test_putting_a_clip_back_to_pending_disables_confirm_again(world):
     assert confirm == {"interactive": False}, "Confirm must not stay usable"
     assert "Undecided 1" in counts
     assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in \
-        namespace["_on_clips_confirm"](world["request"](owner))
+        namespace["_on_clips_confirm"](world["request"](owner))[-1]
 
 
 def test_the_counters_tell_the_operator_that_refresh_enables_confirm(world):
@@ -587,19 +589,102 @@ def test_only_the_record_can_ever_ENABLE_the_confirm_button():
         "an unusable session must still fail closed")
 
 
-def test_confirm_reports_and_moves_nothing(world):
+def test_confirm_sorts_the_page_into_the_two_destinations(world):
+    """[UX V3] Confirm now does what its label says. Supersedes the P1-era
+    `test_confirm_reports_and_moves_nothing`, which asserted the opposite because no sorter
+    existed yet -- the decisions still come only from the durable record, which is the part that
+    must not change."""
     namespace = world["ns"]
     owner = "browser-session-1"
     _scan(world, owner)
     view = namespace["_clips_view"](owner)
-    before = sorted(os.listdir(world["media"]))
+    entries = list(view["entries"])
+    assert len(entries) >= 2, "this fixture needs at least two clips"
+    keep, bin_ = entries[0], entries[1]
+    payload = {entry.clip_id: open(entry.path, "rb").read() for entry in (keep, bin_)}
+
+    namespace["_clips_decide"](owner, view["session"], view["page"], keep,
+                               {"to": "SELECTED", "rev": 0})
+    namespace["_clips_decide"](owner, view["session"], view["page"], bin_,
+                               {"to": "REJECTED", "rev": 0})
+    for entry in entries[2:]:
+        namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                   {"to": "REJECTED", "rev": 0})
+
+    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+
+    kept = os.path.join(world["library"], os.path.basename(keep.path))
+    binned = os.path.join(world["rejected"], os.path.basename(bin_.path))
+    assert os.path.isfile(kept), message
+    assert os.path.isfile(binned), message
+    assert not os.path.exists(keep.path), "a sorted clip leaves its old location"
+    assert not os.path.exists(bin_.path)
+    assert open(kept, "rb").read() == payload[keep.clip_id], "content must survive the move"
+    assert open(binned, "rb").read() == payload[bin_.clip_id]
+    assert "Sorted" in message, message
+
+
+def test_confirm_never_overwrites_an_occupied_destination_name(world):
+    """A taken name leaves the clip exactly where it is, with the occupant untouched."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    victim = view["entries"][0]
+    os.makedirs(world["library"], exist_ok=True)
+    occupant = os.path.join(world["library"], os.path.basename(victim.path))
+    with open(occupant, "wb") as handle:
+        handle.write(b"i was here first")
+    original = open(victim.path, "rb").read()
+
     for entry in view["entries"]:
         namespace["_clips_decide"](owner, view["session"], view["page"], entry,
                                    {"to": "SELECTED", "rev": 0})
-    message = namespace["_on_clips_confirm"](world["request"](owner))
-    assert "NOT enabled" in message, message
-    assert sorted(os.listdir(world["media"])) == before, "no clip may move"
-    assert not os.path.exists(world["library"]), "no destination may even be created"
+    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+
+    assert open(occupant, "rb").read() == b"i was here first", "the occupant was overwritten"
+    assert os.path.isfile(victim.path), "the clip must stay put when its name is taken"
+    assert open(victim.path, "rb").read() == original
+    assert "already taken" in message, message
+    # and no invented name was used to dodge the collision
+    stem, ext = os.path.splitext(os.path.basename(victim.path))
+    assert [n for n in os.listdir(world["library"]) if n.startswith(stem)] == \
+        [os.path.basename(victim.path)], "a collision must never be renamed around"
+
+
+def test_confirm_skips_a_clip_that_changed_after_the_scan(world):
+    """A file edited during review is not sorted on a decision that may no longer describe it."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    moved_on = view["entries"][0]
+    for entry in view["entries"]:
+        namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                   {"to": "SELECTED", "rev": 0})
+    with open(moved_on.path, "ab") as handle:        # same name, different bytes
+        handle.write(b"appended after the scan")
+
+    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+
+    assert os.path.isfile(moved_on.path), "the changed clip must stay where it is"
+    assert "changed after it was scanned" in message, message
+    assert not os.path.exists(os.path.join(world["library"],
+                                           os.path.basename(moved_on.path)))
+
+
+def test_confirm_refuses_while_any_clip_is_undecided(world):
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": "SELECTED", "rev": 0})
+    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+    assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in message, message
+    for entry in view["entries"]:
+        assert os.path.isfile(entry.path), "a refused Confirm moves nothing at all"
+    assert not os.path.exists(world["library"])
     assert not os.path.exists(world["rejected"])
 
 
@@ -1193,14 +1278,16 @@ def test_n7_case17_refresh_and_confirm_refuse_rather_than_report_a_clean_page(wo
         world["request"](session_hash=owner))
     assert healthy_confirm == {"interactive": True}, "the control arm must really be positive"
     assert "Kept 3" in healthy_counts, healthy_counts
-    assert "NOT enabled" in namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    # [UX V3] The healthy arm deliberately no longer calls Confirm: Confirm now SORTS the page,
+    # so using it as a read-only control would move the very clips whose record this test is
+    # about to make unreadable. Refresh above is the positive control.
 
     before = _durable_bytes(store)
     namespace["_CLIPS_STORE"] = None
     _deny_journal_reads(monkeypatch, store.journal_path)
 
     grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
     monkeypatch.undo()
 
     assert confirm == {"interactive": False}, "Confirm must fail closed"
@@ -1264,7 +1351,7 @@ def test_n7_no_operator_visible_refusal_discloses_a_filesystem_path(world, monke
     _deny_journal_reads(monkeypatch, seed.journal_path)
     report, grid, counts, confirm = _scan(world, owner)
     refresh = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
     monkeypatch.undo()
 
     surfaces = [report, grid, counts, confirmation, refresh[0], refresh[1]]
@@ -1440,7 +1527,7 @@ def test_n7r2_refresh_and_confirm_refuse_for_a_readable_but_unaccountable_record
     namespace["_CLIPS_STORE"] = None
 
     grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))
+    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
 
     assert confirm == {"interactive": False}, "Confirm must fail closed"
     assert "r5-tile" not in grid, "a decided clip may never be repainted as undecided"

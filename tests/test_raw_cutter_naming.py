@@ -1322,8 +1322,10 @@ def test_the_checkbox_feeds_both_modes_as_one_shared_setting(gui_tree):
         inputs = _names(_kwargs(_click(gui_tree, widget))["inputs"])
         assert "cut_rename_output" in inputs, widget
         assert inputs.count("cut_rename_output") == 1, widget
-        assert inputs[-1] == "cut_rename_output", \
-            f"{widget}: APPENDED, so the reviewed order of the original inputs is untouched"
+        # [FORK] R6: cut_output_profile was appended AFTER this one, so renaming is now second
+        # from the end. The guarantee is unchanged: both shared settings were APPENDED, so the
+        # reviewed order of the ORIGINAL inputs is untouched.
+        assert inputs[-2:] == ["cut_rename_output", "cut_output_profile"], widget
 
 
 def test_the_mode_switch_still_cannot_touch_the_new_setting(gui_tree):
