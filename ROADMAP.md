@@ -416,14 +416,12 @@ pinned Windows + Gradio 6.19.0 environment, cold and warm, with zero video eleme
 rest and at most one playing. The figures are in the R5-P1 task report; the specification carries
 the method. If a page size ever fails to hold, the page size gives — not the safety rules.
 
-#### R5-UX — Clips Preview usability and local sorting · **ACCEPTED CANDIDATE, PUBLISHED IN A FEATURE PR, NOT DEPLOYED**
+#### R5-UX — Clips Preview usability and local sorting · **MERGED AND DEPLOYED**
 
-> **Read this status literally.** The work below was built as a local playtest candidate at
-> `CLIPS-UX-PLAYTEST/app`, was **accepted by the owner after a hands-on test**, and is now
-> **published for review in the FUN feature PR** `feat/fun-clips-preview-v4-raw-cutter-r6`
-> together with R6. It is **not** on `main`, **not** in PR #75, and **not** running in the
-> owner's production installation. It has been exercised in real Chrome and by the full test
-> suite; it has had **no independent review**.
+> **Shipped.** Merged in **PR #76** and **deployed** to the owner's production installation at
+> `25c4db3b` on 2026-10-27, after a hands-on owner test and a real-browser smoke of every
+> feature below. It has still had **no independent review**, and PR #75 remains a separate,
+> untouched branch.
 
 Four increments, built and browser-verified in order:
 
@@ -446,7 +444,7 @@ shipping answer or whether the reviewed engine should replace it.
 
 ---
 
-### R6 — Raw Cutter output video profiles · **ACCEPTED CANDIDATE, PUBLISHED IN A FEATURE PR, NOT DEPLOYED**
+### R6 — Raw Cutter output video profiles · **MERGED AND DEPLOYED**
 
 Today every exported clip inherits its source's dimensions and frame rate, so a folder of mixed
 recordings produces a library that is mixed in exactly the same way. The next Raw Cutter feature
@@ -490,25 +488,43 @@ Requirements for whoever built it:
 - One profile for an entire Folder Batch, recorded in `batch_manifest.json`.
 - **Same as source must leave the current code path untouched**, so the default cannot regress.
 
-### R7 — Raw Audio Cutter V1 · **PLANNED, NOT IMPLEMENTED**
+### R7 — Raw Audio Cutter V1 · **LOCAL EXPERIMENTAL CANDIDATE, NOT MERGED, NOT DEPLOYED**
 
-A new tool — its own Audio Cutter tab, or a grouped audio workspace — for building a reusable
-library of dialogue, isolated words and phrases, vocal expressions and sound effects pulled out of
-videos and recordings.
+> **Read this status literally.** R7 exists as a **local experimental candidate** on branch
+> `feat/fun-raw-audio-cutter-r7`, built and browser-verified in the `R7-RAW-AUDIO-CUTTER`
+> playtest on port 7863. It is **not** on `main`, **not** in any PR, **not** running in the
+> owner's production installation, and has had **no independent review**.
 
-**V1 is deliberately mechanical. No AI.**
+A sixth top-level **🎙️ Audio Cutter** tab, between Advanced Tools and Clips Preview, for building
+a reusable library of dialogue, phrases, vocal expressions and miscellaneous sounds pulled out of
+one recording at a time. Folder Batch is deliberately not in V1.
 
-- Accept common video and audio inputs; extract audio without touching the original.
-- Detect silence: default **minimum 0.5 s**, adjustable threshold (around **−35 dB**).
-- Cut into segments around the detected pauses, with small configurable padding either side.
-- Mark or skip segments that are too short.
-- Export **WAV or FLAC**.
-- Preview each segment; keep, discard or rename it individually.
-- Write a segment manifest recording source and timestamps.
+**V1 is mechanical. No AI, no transcription, no classifier.**
 
-**Two things it must not claim.** It will not identify every individual spoken word, and it
-**cannot remove music from an already-mixed track** — a pause detector finds quiet, not vocals.
-Output should later be consumable by Audio Layers and Smart Mix.
+| | What shipped |
+|---|---|
+| **Input** | One file. WAV/MP3/FLAC/M4A and any video whose audio track survives (MP4, MKV, MOV…). Accepted on whether **FFprobe finds an audio stream**, not on the extension. Read in place — never uploaded or copied. Native Windows **Browse file…** dialog, and a folder dialog for the output. |
+| **Detection** | FFmpeg `silencedetect`. Threshold **−35 dB**, minimum silence **0.5 s**, padding **0.10 s**, minimum clip **0.30 s** — all four exposed in the GUI. |
+| **Analyze** | Source duration, silence count, planned-clip count, and a table of every planned clip with its source start/end. **Writes nothing.** |
+| **Cut** | Re-analyzes, then writes each clip into a fresh timestamped run folder. **WAV 16-bit PCM @ 48 kHz** by default, **FLAC** optional. `audio_manifest.json` records source, settings, per-segment timings and output names. |
+| **Review** | Pick a clip, hear it in the page, edit its name, then **Keep → voice library** or **Discard → quarantine**. One same-volume `os.rename`: no overwrite, no collision renaming, **no deletion**. |
+
+**The two arithmetic properties worth stating.** Padding can never make two clips overlap — each
+side takes at most *half the gap it reaches into*, so neighbours may meet but never cross. And
+leading or trailing silence cannot produce an empty clip, because the clips are the *complement*
+of the silences rather than a list built by splitting.
+
+**What it must not claim, and does not.** It does not identify individual words, does not separate
+speech from music, and cannot remove music from an already-mixed track — a pause detector finds
+quiet, not vocals. A continuous passage stays one clip however long it is. The tab says so on
+screen.
+
+**Verified against Audio Layers:** an exported WAV was loaded into the Audio Layers voice input in
+a real browser. Audio Layers itself is unchanged by R7; the tab carries a short usage tip only.
+
+**Known limitations.** Single file per run (no Folder Batch); same-volume filing only; the in-page
+preview inlines one clip at a time and describes anything over 25 MB rather than embedding it;
+fixed export rate of 48 kHz.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -536,6 +552,31 @@ Audio Layers and Smart Mix work, and are hard to approach. This is documentation
 
 ---
 
+### Housekeeping note — `input/gradio_uploads` loses newer files on restart · **NOT IMPLEMENTED**
+
+Observed during the 2026-10-27 production deploy: starting the app ran `cleanup_on_startup()`,
+which deleted three files from `input/gradio_uploads` that existed nowhere else. The function is
+behaving as designed — it protects `audio`, `video` and `video_analysis_cache` and clears
+everything else under `input/` — and it does this on **every** launch, so the loss is not specific
+to deployment.
+
+**The smallest change that would prevent silent loss, and the one to make first:** have
+`cleanup_on_startup()` **move** the non-protected entries into a single dated folder such as
+`input/_cleared/<YYYY-MM-DD_HHMMSS>/` instead of deleting them, and print one line naming the
+folder and the count. A rename inside `input/` is same-volume, costs nothing in time or space, is
+reversible by the operator, and converts a silent delete into a visible one. Whether that folder is
+ever pruned is a separate decision nobody has to make today.
+
+R7 **avoids depending on the directory at all**: the Audio Cutter reads its source in place by
+absolute path and writes to a folder the operator chooses, so nothing it produces or consumes ever
+lives in `input/gradio_uploads`. That removes the exposure for this feature but does not fix the
+function, which still deletes for every other uploader.
+
+This is deliberately scoped as one change to one function. It is **not** a backup or retention
+project.
+
+---
+
 ## Status summary
 
 Four different things are distinguished deliberately below, because conflating them is how a
@@ -551,10 +592,10 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R4-B** — Live progress and active controls | **DONE** — merged in PR #71, **deployed** at `2044f360` |
 | **R4-C** — Synthetic output naming (opt-in, default off) | **DONE** — merged in PR #72, **deployed** at `0aed35d6`. Two QUALIFIED independent reviews; three MINOR findings accepted as non-blocking and still open (see the section above) |
 | **R5** — Clips Preview Selector (post-cut triage tab) | **P1 IMPLEMENTED** — the fifth tab reviews and classifies clips, read-only and measured; **moving files is NOT implemented**. Specification: `docs/claude/clips-preview-selector-v1.md`; contract: `.claude/rules/clips-preview.md` |
-| **R5-UX** — Clips Preview usability V1–V4 (auto-Confirm, durations, adaptive seek, same-volume sorting, native folder picker, saved defaults) | **ACCEPTED CANDIDATE, PUBLISHED** — browser-verified; owner-accepted after a hands-on test; published in the FUN feature PR with R6; whole suite 7,912 passed / 9 skipped. **Not merged, not deployed, not independently reviewed** |
-| **R6** — Raw Cutter output video profiles | **ACCEPTED CANDIDATE, PUBLISHED** — four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders; owner-accepted after a hands-on test; published in the same FUN feature PR. **Not merged, not deployed** |
-| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **PLANNED, NOT IMPLEMENTED** |
-| **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL** — not planned for implementation; gated on R7 proving useful |
+| **R5-UX** — Clips Preview usability V1–V4 (auto-Confirm, durations, adaptive seek, same-volume sorting, native folder picker, saved defaults) | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Owner-accepted after a hands-on test; whole suite 7,912 passed / 9 skipped at the merge. Not independently reviewed |
+| **R6** — Raw Cutter output video profiles | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders in production |
+| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **LOCAL EXPERIMENTAL CANDIDATE** — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review with Keep/Discard. Browser-verified on port 7863; whole suite 8,005 passed / 9 skipped. **Not merged, not deployed, not independently reviewed** |
+| **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started |
 | **R9** — Audio Layers usability and tutorial | **PLANNED, NOT IMPLEMENTED** — documentation, not a redesign |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |

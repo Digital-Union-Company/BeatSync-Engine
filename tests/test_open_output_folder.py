@@ -548,7 +548,13 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #:
 #: 6 before Raw Cutter V1; 7 since, for `cut_plan_state`, which carries the Raw Cutter's segment
 #: plan between Analyze and Cut as a plain dict of primitives. Nothing live enters it.
-_EXPECTED_STATE_COUNT = 7
+#:
+#: 8 since R7, for `audio_review_state`. It carries the Raw Audio Cutter's exported-clip list
+#: between Cut and the Keep/Discard buttons, as a list of plain dicts -- a path, a name, an index
+#: and two floats. It is a `gr.State` rather than a module-level record precisely so one browser
+#: session's review list is not reachable from another, which is the same reasoning that kept the
+#: Clips Preview registry per-session.
+_EXPECTED_STATE_COUNT = 8
 
 
 def test_the_expected_state_count_matches_the_named_states():
@@ -561,7 +567,8 @@ def test_the_expected_state_count_matches_the_named_states():
     })
     assert len(names) == _EXPECTED_STATE_COUNT, names
     for expected in ("session_state", "source_state", "prep_state", "variant_batch_state",
-                     "director_proposal_state", "render_invocation_state"):
+                     "director_proposal_state", "render_invocation_state",
+                     "audio_review_state"):
         assert expected in names, f"{expected} missing from {names}"
     assert "gr.State" in source
 

@@ -107,6 +107,13 @@ def test_fork_modules_import_only_stdlib():
         # what stops two renders sharing one mutable bundle, so it is a contract rather than a
         # convenience (`.claude/rules/l2-stage-cache.md`). Still stdlib, still no runtime dependency.
         "copy",
+        # `base64` arrived with R7: `audio_cutter.preview_markup` inlines one exported clip into
+        # an `<audio>` element as a data URI. That is deliberate rather than convenient -- Gradio
+        # will only serve a file from its own cache, the working directory or the system temp
+        # directory, and the alternative fix is widening `allowed_paths` to a media root, which
+        # this application has already refused once because it exposes that whole tree to every
+        # request. Still stdlib, still no runtime dependency.
+        "base64",
         "hashlib",
         "json",
         "os",

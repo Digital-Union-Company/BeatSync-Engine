@@ -1522,3 +1522,120 @@ INFO_CUT_OUTPUT_PROFILE = (
     "plays at normal speed either way. It changes only the exported file — never where a cut is "
     "placed. One profile applies to a whole Folder Batch."
 )
+
+# =============================================================================================
+# [FORK] Digital-Union (R7): Raw Audio Cutter V1 — split one recording on its silences.
+# =============================================================================================
+
+LABEL_TAB_AUDIO_CUTTER = "🎙️ Audio Cutter"
+
+INFO_TAB_AUDIO_CUTTER = (
+    "**Pull reusable audio clips out of one recording.** Point it at a voice memo, an interview, "
+    "a take of dialogue or any video with an audio track, press Analyze to see where it would "
+    "cut, then press Cut Audio to write the clips. The source file is read in place and is never "
+    "modified.\n\n"
+    "**It cuts on silence, and only on silence.** It does not recognise words or sentences, and "
+    "it cannot tell speech from music — a continuous passage stays one clip however long it is, "
+    "and a long enough pause splits one whether or not that is a sensible place to break. The "
+    "four settings below are how you tune that."
+)
+
+LABEL_AUDIO_SOURCE = "🎙️ Source recording (full path to one file)"
+INFO_AUDIO_SOURCE = (
+    "Read in place — nothing is uploaded or copied. WAV, MP3, FLAC, M4A and any video whose "
+    "audio track is still present (MP4, MKV, MOV…). The file is accepted on whether FFprobe "
+    "finds an audio stream in it, not on its extension."
+)
+LABEL_BROWSE_FILE = "🎙️ Browse file…"
+
+LABEL_AUDIO_OUTPUT = "📁 Output folder"
+INFO_AUDIO_OUTPUT = (
+    "Each cut creates its own fresh, timestamped subfolder here, so a second run can never "
+    "overwrite the first. Existing files are never replaced."
+)
+
+LABEL_AUDIO_THRESHOLD = "🔉 Silence threshold (dB)"
+INFO_AUDIO_THRESHOLD = (
+    "Anything quieter than this counts as silence. The number is negative and lower is stricter: "
+    "-50 keeps only near-total silence, -20 will treat ordinary room tone as a gap. -35 is a "
+    "sensible starting point for spoken recordings."
+)
+LABEL_AUDIO_MIN_SILENCE = "⏸️ Minimum silence (seconds)"
+INFO_AUDIO_MIN_SILENCE = (
+    "Quiet shorter than this is not a gap, so it will not split a clip. This is the control that "
+    "decides whether the breath between two words separates them: at 0.5s an ordinary inter-word "
+    "pause does not, a deliberate beat does."
+)
+LABEL_AUDIO_PAD = "➕ Padding (seconds)"
+INFO_AUDIO_PAD = (
+    "Kept on each side of every detected sound, so a clip does not begin on the attack of the "
+    "first syllable or cut off the tail of the last. Padding never reaches into a neighbouring "
+    "clip: each side takes at most half the gap it is growing into, so two clips can meet but "
+    "never overlap."
+)
+LABEL_AUDIO_MIN_CLIP = "✂️ Minimum clip length (seconds)"
+INFO_AUDIO_MIN_CLIP = (
+    "Results shorter than this are dropped rather than written. A 0.1s fragment is a click, not "
+    "a clip."
+)
+LABEL_AUDIO_FORMAT = "💾 Export format"
+INFO_AUDIO_FORMAT = (
+    "WAV is 16-bit PCM at 48 kHz — what Audio Layers and every editor accept without "
+    "negotiation. FLAC is the same audio losslessly compressed, for a smaller library."
+)
+
+LABEL_AUDIO_ANALYZE = "🔎 Analyze Audio"
+LABEL_AUDIO_CUT = "✂️ Cut Audio"
+LABEL_AUDIO_PLAN = "Plan summary"
+LABEL_AUDIO_TABLE = "Planned clips"
+LABEL_AUDIO_REPORT = "Cut report"
+AUDIO_PLAN_INITIAL_TEXT = (
+    "Choose a recording and press Analyze Audio to see where it would cut. Analyze writes nothing."
+)
+AUDIO_REPORT_INITIAL_TEXT = "Nothing has been cut yet."
+INFO_AUDIO_BUTTONS = (
+    "Analyze never writes anything. Cut Audio re-checks the file and your settings first and "
+    "refuses a plan that no longer matches them."
+)
+
+LABEL_AUDIO_REVIEW = "🎧 Exported clips"
+INFO_AUDIO_REVIEW = (
+    "Pick a clip to hear it. Keep files it into your voice library under the name in the box; "
+    "Discard moves it to the Discarded folder. Discarding is quarantine, never deletion, and an "
+    "existing name is refused rather than overwritten."
+)
+LABEL_AUDIO_PLAYER = "Listen"
+LABEL_AUDIO_CLIP_NAME = "✏️ Save as"
+INFO_AUDIO_CLIP_NAME = (
+    "Edit the name before you keep it if you like — the extension is always taken from the real "
+    "file. Audio Layers plays files in filename order, so a leading number keeps a sequence in "
+    "order."
+)
+LABEL_AUDIO_KEEP = "✅ Keep → voice library"
+LABEL_AUDIO_DISCARD = "🗑️ Discard → quarantine"
+LABEL_AUDIO_FILE_REPORT = "Filing report"
+AUDIO_FILE_REPORT_INITIAL_TEXT = "Nothing has been filed yet."
+
+LABEL_AUDIO_LIBRARY = "✅ Voice library folder (where KEPT clips go)"
+INFO_AUDIO_LIBRARY = (
+    "Validated when you file a clip, never written to before that. It must not be inside the "
+    "folder of clips being reviewed."
+)
+LABEL_AUDIO_DISCARDED = "🗑️ Discarded folder (quarantine, never deletion)"
+INFO_AUDIO_DISCARDED = (
+    "A discarded clip is moved here intact, for you to deal with outside this tool. There is no "
+    "retention expiry and no permanent delete."
+)
+
+LABEL_PREF_AUDIO_LIBRARY = "Default voice library"
+LABEL_PREF_AUDIO_DISCARDED = "Default Audio Cutter Discarded folder"
+LABEL_PREF_AUDIO_OUTPUT = "Default Audio Cutter output"
+
+INFO_AUDIO_LAYERS_TIP = (
+    "**Using these clips with Audio Layers.** Open **Advanced Tools → 🎤 Audio Layers (Voice & "
+    "SFX)** and choose the exported clips as the voice files. They are played **in filename "
+    "order**, which is why the clips are numbered. **Start Delay** sets how far into the track "
+    "speech may begin, **Minimum Gap** separates one clip from the next, and **Music Under "
+    "Voice** controls how far the music is ducked while a clip plays. Nothing about Audio Layers "
+    "changes in R7 — these files are ordinary WAV/FLAC and it already accepts them."
+)

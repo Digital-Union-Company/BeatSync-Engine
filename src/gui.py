@@ -226,6 +226,12 @@ from beatsync_fork import clips_review as fork_clips
 # suites pin this module's `subprocess.run` site count at exactly two.
 from beatsync_fork import desktop_folders as fork_folders
 from beatsync_fork import user_prefs as fork_prefs
+# [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
+# the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
+# live inside `audio_cutter` rather than here, because two suites pin this module's
+# `subprocess.run` site count at exactly two.
+from beatsync_fork import audio_cutter as fork_audio
+from beatsync_fork import audio_library as fork_audio_library
 # [FORK] Digital-Union (R5): the ASGI media endpoint and Starlette's middleware wrapper. The
 # wrapper is a Gradio dependency already, so this adds nothing to requirements.
 from clips_media_server import ClipMediaMiddleware
@@ -6564,8 +6570,15 @@ def _pref(key: str) -> str:
 
 
 def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw_input_folder,
-                          render_source):
-    """Persist the folder defaults. Writes a file; creates no media directory."""
+                          render_source,
+                          audio_library_folder, audio_discarded_folder, audio_output_folder,
+                          audio_source_file):
+    """Persist the folder defaults. Writes a file; creates no media directory.
+
+    [FORK] R7 appended its four fields at the END of the signature for the same reason the fork
+    appends everywhere else: Gradio passes handler arguments POSITIONALLY, so every pre-existing
+    index stays exactly where the registration already put it.
+    """
     values = {
         fork_prefs.CLIPS_LIBRARY: library,
         fork_prefs.CLIPS_REJECTED: rejected,
@@ -6573,6 +6586,10 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
         fork_prefs.CLIPS_INPUT: clips_input_folder,
         fork_prefs.RAW_CUTTER_INPUT: raw_input_folder,
         fork_prefs.QUICK_RENDER_SOURCE: render_source,
+        fork_prefs.AUDIO_LIBRARY: audio_library_folder,
+        fork_prefs.AUDIO_DISCARDED: audio_discarded_folder,
+        fork_prefs.AUDIO_CUTTER_OUTPUT: audio_output_folder,
+        fork_prefs.AUDIO_CUTTER_INPUT: audio_source_file,
     }
     failure = fork_prefs.save_preferences(PREFS_PATH, values)
     if failure:
@@ -6587,9 +6604,285 @@ def _on_reset_folder_prefs():
     """Clear the saved defaults. Removes no folder and no media -- only the remembered choices."""
     failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences())
     if failure:
-        return ('', '', '', f"❌ {failure}")
+        return ('', '', '', '', '', '', f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
-    return ('', '', '', "✅ Defaults cleared. No folder or file was deleted.")
+    return ('', '', '', '', '', '',
+            "✅ Defaults cleared. No folder or file was deleted.")
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R7): Raw Audio Cutter V1.
+#
+# The whole feature is "FFmpeg's silencedetect says where the quiet is, and the clips are what is
+# left over". Every decision -- the argv, the log parsing, the segment arithmetic, the filing rules
+# -- lives in `beatsync_fork.audio_cutter` and `beatsync_fork.audio_library`, which are stdlib-only
+# and directly testable. These handlers are a view: they read widgets, call the fork core, and turn
+# its answers into text.
+#
+# BOTH process launches are in the fork core, not here. Two suites pin this module's
+# `subprocess.run` site count at exactly two, and R7 adds none.
+#
+# The review list rides on a `gr.State`, so it is per-browser-session and this module keeps no
+# mutable record of one operator's clips that another could reach.
+# =============================================================================================
+
+def _audio_tools() -> tuple:
+    """`(ffmpeg, ffprobe)` from the runtime module, imported locally so no module-level import is
+    added to a file whose import order is load-bearing."""
+    from ffmpeg_processing import FFMPEG_PATH, FFPROBE_PATH
+    return FFMPEG_PATH, FFPROBE_PATH
+
+
+def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
+    """Widget values to the five resolved settings, total over anything Gradio can hand over.
+
+    A `gr.Number` legitimately arrives as `None` or as `''` when the operator clears it, so every
+    read falls back to the documented default rather than raising inside an event handler.
+    """
+    def number(value, default):
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if resolved != resolved:                      # NaN
+            return float(default)
+        return resolved
+
+    return {
+        'threshold_db': number(threshold, fork_audio.DEFAULT_THRESHOLD_DB),
+        'min_silence': max(0.0, number(min_silence, fork_audio.DEFAULT_MIN_SILENCE)),
+        'pad': max(0.0, number(pad, fork_audio.DEFAULT_PAD)),
+        'min_clip': max(0.0, number(min_clip, fork_audio.DEFAULT_MIN_CLIP)),
+        'format': fork_audio.FORMAT_FLAC if fmt == fork_audio.FORMAT_FLAC
+        else fork_audio.FORMAT_WAV,
+    }
+
+
+def _audio_probe(source: str):
+    """`(SourceInfo, refusal_text)`. A refusal is prose for the operator, never an exception."""
+    text = (source or '').strip().strip('"')
+    if not text:
+        return None, "❌ Choose a recording first — press Browse file… or paste a full path."
+    if not os.path.isfile(text):
+        return None, f"❌ That file does not exist:\n{text}"
+    try:
+        ffmpeg, ffprobe = _audio_tools()
+    except Exception as failure:                      # noqa: BLE001 - reported, never raised
+        return None, f"❌ FFmpeg is not available: {failure}"
+    probe = fork_audio.run_probe_command(fork_audio.build_probe_command(ffprobe, text))
+    info = fork_audio.parse_probe(probe, path=text)
+    if not info.has_audio:
+        return None, fork_audio.plan_summary(info, (), (), {})
+    return info, ""
+
+
+def _audio_plan(info, settings) -> tuple:
+    """Run the detector and plan the segments. `(silences, segments, failure_text)`."""
+    ffmpeg, _ = _audio_tools()
+    code, log = fork_audio.run_media_command(
+        fork_audio.build_silence_command(ffmpeg, info.path,
+                                         settings['threshold_db'], settings['min_silence']))
+    # A non-zero code with no parsable silence is a real failure; a non-zero code that still
+    # produced a usable log is not worth refusing over, so the log is read either way.
+    silences = fork_audio.parse_silence_log(log, info.duration)
+    segments = fork_audio.plan_segments(info.duration, silences,
+                                        settings['pad'], settings['min_clip'])
+    if code != 0 and not silences and not segments:
+        detail = (log or '').strip().splitlines()
+        return (), (), ("❌ FFmpeg could not read that file.\n"
+                        + (detail[-1] if detail else 'No further detail.'))
+    return silences, segments, ""
+
+
+def _on_audio_analyze(source, threshold, min_silence, pad, min_clip, fmt):
+    """Analyze: detect silence and show the plan. **Writes nothing at all.**"""
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    info, refusal = _audio_probe(source)
+    if refusal:
+        return refusal, []
+    try:
+        silences, segments, failure = _audio_plan(info, settings)
+    except Exception as failure:                      # noqa: BLE001 - analysis is never fatal
+        return f"❌ Analysis failed: {failure}", []
+    if failure:
+        return failure, []
+    stem = fork_audio.safe_stem(info.path)
+    return (fork_audio.plan_summary(info, silences, segments, settings),
+            fork_audio.segment_rows(segments, stem, settings['format']))
+
+
+def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt):
+    """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
+
+    Re-analyzing rather than trusting the on-screen plan is deliberate and matches the Raw Cutter:
+    the file or a setting may have changed since Analyze, and writing a stale plan would export
+    clips that do not correspond to anything the operator was shown.
+    """
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    info, refusal = _audio_probe(source)
+    if refusal:
+        return refusal, [], gr.update(choices=[], value=None), '', '', []
+
+    folder = (output_folder or '').strip().strip('"')
+    if not folder:
+        return ("❌ Choose an output folder first.", [],
+                gr.update(choices=[], value=None), '', '', [])
+    try:
+        silences, segments, failure = _audio_plan(info, settings)
+    except Exception as failure:                      # noqa: BLE001
+        return f"❌ Analysis failed: {failure}", [], gr.update(choices=[], value=None), '', '', []
+    if failure:
+        return failure, [], gr.update(choices=[], value=None), '', '', []
+
+    stem = fork_audio.safe_stem(info.path)
+    rows = fork_audio.segment_rows(segments, stem, settings['format'])
+    if not segments:
+        return (fork_audio.plan_summary(info, silences, segments, settings), rows,
+                gr.update(choices=[], value=None), '', '', [])
+
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_directory = os.path.join(folder, fork_audio.run_directory_name(stem, stamp))
+    try:
+        os.makedirs(run_directory, exist_ok=False)
+    except OSError as failure:
+        return (f"❌ Could not create the output folder:\n{run_directory}\n{failure}", rows,
+                gr.update(choices=[], value=None), '', '', [])
+
+    ffmpeg, _ = _audio_tools()
+    written, failures, review = {}, [], []
+    for segment in segments:
+        name = fork_audio.clip_filename(stem, segment.index, settings['format'])
+        destination = os.path.join(run_directory, name)
+        code, log = fork_audio.run_media_command(
+            fork_audio.build_extract_command(ffmpeg, info.path, segment, destination,
+                                             settings['format']),
+            timeout=fork_audio.EXTRACT_TIMEOUT_SECONDS)
+        if code == 0 and os.path.isfile(destination):
+            written[segment.index] = name
+            review.append({
+                'path': destination,
+                'name': name,
+                'index': segment.index,
+                'start': segment.start,
+                'end': segment.end,
+                'label': (f"{segment.index:03d}  ·  {segment.duration:.2f}s  "
+                          f"·  {fork_audio.format_timecode(segment.start)}"
+                          f"→{fork_audio.format_timecode(segment.end)}"),
+            })
+        else:
+            detail = (log or '').strip().splitlines()
+            failures.append(f"clip {segment.index}: {detail[-1] if detail else 'failed'}")
+
+    manifest = fork_audio.manifest_payload(info, segments, settings, written)
+    manifest_note = ''
+    try:
+        with open(os.path.join(run_directory, fork_audio.MANIFEST_NAME), 'w',
+                  encoding='utf-8') as handle:
+            json.dump(manifest, handle, indent=2)
+    except OSError as failure:
+        manifest_note = f"\n⚠️  The manifest could not be written: {failure}"
+
+    lines = [f"✅ Wrote {len(written)} of {len(segments)} clip(s).",
+             f"Output folder:\n{run_directory}", '',
+             f"Format: {settings['format'].upper()} "
+             f"{'16-bit PCM' if settings['format'] == fork_audio.FORMAT_WAV else 'lossless'} "
+             f"at {fork_audio.OUTPUT_SAMPLE_RATE} Hz",
+             f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
+             "Your source file was not modified."]
+    if failures:
+        lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
+    report = "\n".join(lines) + manifest_note
+
+    choices = [(entry['label'], entry['path']) for entry in review]
+    first = review[0] if review else None
+    return (report, rows,
+            gr.update(choices=choices, value=first['path'] if first else None),
+            fork_audio.preview_markup(first['path'], first['name']) if first else '',
+            first['name'] if first else '',
+            review)
+
+
+def _audio_entry(review, path):
+    for entry in review or ():
+        if entry.get('path') == path:
+            return entry
+    return None
+
+
+def _on_audio_select(path, review):
+    """Load the chosen clip into the player and offer its current name."""
+    entry = _audio_entry(review, path)
+    if entry is None:
+        return '', ''
+    return fork_audio.preview_markup(entry['path'], entry['name']), entry['name']
+
+
+def _audio_file_clip(path, preferred, destination, review, verb, folder_label):
+    """Shared body of Keep and Discard: file one clip, then advance to the next.
+
+    Both buttons do the same thing to a different folder, so they share one implementation; the
+    only asymmetry in the whole feature is the words in the report.
+    """
+    entry = _audio_entry(review, path)
+    remaining = list(review or ())
+    if entry is None:
+        return ("Pick a clip first.", gr.update(), '', '', remaining)
+
+    # Only the folder actually being written to is checked. The other may legitimately still be
+    # blank -- an operator who only ever keeps clips should not have to name a quarantine folder.
+    problem = fork_audio_library.destination_problem(
+        destination, folder_label, os.path.dirname(entry['path']))
+    if problem:
+        return (f"❌ {problem}", gr.update(),
+                fork_audio.preview_markup(entry['path'], entry['name']),
+                entry['name'], remaining)
+
+    try:
+        landed = fork_audio_library.file_clip(entry['path'], destination, preferred)
+    except fork_audio_library.FilingError as failure:
+        return (f"❌ Nothing was moved — {failure}", gr.update(),
+                fork_audio.preview_markup(entry['path'], entry['name']),
+                entry['name'], remaining)
+
+    remaining = [item for item in remaining if item['path'] != entry['path']]
+    choices = [(item['label'], item['path']) for item in remaining]
+    following = remaining[0] if remaining else None
+    done = '' if remaining else "\n\nEvery clip in this batch has been filed."
+    return (f"✅ {verb}: {os.path.basename(landed)}\n→ {destination}{done}",
+            gr.update(choices=choices, value=following['path'] if following else None),
+            fork_audio.preview_markup(following['path'], following['name']) if following else '',
+            following['name'] if following else '',
+            remaining)
+
+
+def _on_audio_keep(path, preferred, library_folder, review):
+    """KEEP: move the clip into the voice library under the name in the box."""
+    return _audio_file_clip(path, preferred, library_folder, review, 'Kept', 'voice library')
+
+
+def _on_audio_discard(path, preferred, discarded_folder, review):
+    """DISCARD: move the clip to quarantine. Nothing is ever deleted."""
+    return _audio_file_clip(path, preferred, discarded_folder, review, 'Discarded',
+                            'Discarded folder')
+
+
+def _browse_audio_source(current):
+    """The native file dialog for the one source recording.
+
+    Identical contract to `_browse_folder`: cancel, timeout and any failure to show the dialog all
+    leave the operator's existing value untouched, so Browse can only ever add a choice.
+    """
+    existing = current if isinstance(current, str) else ''
+    try:
+        status, chosen = fork_folders.pick_file(
+            existing or _pref(fork_prefs.AUDIO_CUTTER_INPUT) or None,
+            filter_text=fork_folders.file_filter('Audio and video',
+                                                 fork_audio.SOURCE_SUFFIXES))
+    except Exception:                                  # noqa: BLE001 - browsing is never fatal
+        return gr.update()
+    if status == fork_folders.PICKED and chosen:
+        return chosen
+    return gr.update()
 
 
 def _clips_durations(entries) -> dict:
@@ -8166,6 +8459,163 @@ def create_ui() -> gr.Blocks:
                         elem_id='prep-sample-report-box',
                     )
 
+            # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
+            # between Advanced Tools and Clips Preview.
+            #
+            # That position is chosen, not incidental. Placing it here keeps Advanced Tools at
+            # index 3, so every containment assertion in `test_gui_tabs.py` that counts from the
+            # front is unaffected; it keeps Clips Preview LAST, which its own suite requires; and
+            # it keeps this markup out of the Raw-Cutter-to-Advanced span that
+            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+            #
+            # Every numeric control here is a Number widget, and that is the same non-cosmetic
+            # constraint the Clips Preview tab records: a tab in this region falls inside the
+            # source span that
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+            # a substring check, so the forbidden widget type must not appear in this span even
+            # inside a comment explaining its absence -- which is why this one does not name it.
+            with gr.Tab(LABEL_TAB_AUDIO_CUTTER, id='tab-audio-cutter'):
+                gr.Markdown(INFO_TAB_AUDIO_CUTTER)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        with gr.Group():
+                            audio_source = gr.Textbox(
+                                label=LABEL_AUDIO_SOURCE,
+                                info=INFO_AUDIO_SOURCE,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_INPUT),
+                                placeholder=r"J:\Recordings\interview_take2.wav",
+                                elem_id='audio-source')
+                            audio_source_browse = gr.Button(
+                                LABEL_BROWSE_FILE, variant='secondary', scale=0,
+                                elem_id='audio-source-browse')
+                        with gr.Group():
+                            audio_output = gr.Textbox(
+                                label=LABEL_AUDIO_OUTPUT,
+                                info=INFO_AUDIO_OUTPUT,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                                placeholder=r"J:\Voice Parts",
+                                elem_id='audio-output')
+                            audio_output_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='audio-output-browse')
+                        with gr.Group():
+                            with gr.Row():
+                                audio_threshold = gr.Number(
+                                    label=LABEL_AUDIO_THRESHOLD,
+                                    info=INFO_AUDIO_THRESHOLD,
+                                    value=fork_audio.DEFAULT_THRESHOLD_DB,
+                                    elem_id='audio-threshold')
+                                audio_min_silence = gr.Number(
+                                    label=LABEL_AUDIO_MIN_SILENCE,
+                                    info=INFO_AUDIO_MIN_SILENCE,
+                                    value=fork_audio.DEFAULT_MIN_SILENCE, minimum=0,
+                                    elem_id='audio-min-silence')
+                            with gr.Row():
+                                audio_pad = gr.Number(
+                                    label=LABEL_AUDIO_PAD,
+                                    info=INFO_AUDIO_PAD,
+                                    value=fork_audio.DEFAULT_PAD, minimum=0,
+                                    elem_id='audio-pad')
+                                audio_min_clip = gr.Number(
+                                    label=LABEL_AUDIO_MIN_CLIP,
+                                    info=INFO_AUDIO_MIN_CLIP,
+                                    value=fork_audio.DEFAULT_MIN_CLIP, minimum=0,
+                                    elem_id='audio-min-clip')
+                            audio_format = gr.Radio(
+                                label=LABEL_AUDIO_FORMAT,
+                                info=INFO_AUDIO_FORMAT,
+                                choices=[("WAV · 16-bit PCM · 48 kHz", fork_audio.FORMAT_WAV),
+                                         ("FLAC · lossless · 48 kHz", fork_audio.FORMAT_FLAC)],
+                                value=fork_audio.FORMAT_WAV,
+                                elem_id='audio-format')
+                        with gr.Row():
+                            audio_analyze_btn = gr.Button(
+                                LABEL_AUDIO_ANALYZE, variant='secondary',
+                                elem_id='audio-analyze-button')
+                            audio_cut_btn = gr.Button(
+                                LABEL_AUDIO_CUT, variant='primary',
+                                elem_id='audio-cut-button')
+                        gr.Markdown(INFO_AUDIO_BUTTONS)
+                    with gr.Column(scale=2):
+                        audio_plan = gr.Textbox(
+                            label=LABEL_AUDIO_PLAN,
+                            value=AUDIO_PLAN_INITIAL_TEXT,
+                            interactive=False, lines=12, max_lines=20,
+                            elem_id='audio-plan-box')
+                        audio_table = gr.Dataframe(
+                            headers=["Clip", "Start", "End", "Length", "Output name"],
+                            datatype=["number", "str", "str", "str", "str"],
+                            value=[], interactive=False, wrap=True,
+                            label=LABEL_AUDIO_TABLE,
+                            elem_id='audio-table')
+                        audio_report = gr.Textbox(
+                            label=LABEL_AUDIO_REPORT,
+                            value=AUDIO_REPORT_INITIAL_TEXT,
+                            interactive=False, lines=8, max_lines=16,
+                            elem_id='audio-report-box')
+
+                # The review half: listen to what was actually written, then file it.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_AUDIO_REVIEW}\n\n{INFO_AUDIO_REVIEW}")
+                    with gr.Row():
+                        audio_library_folder = gr.Textbox(
+                            label=LABEL_AUDIO_LIBRARY,
+                            info=INFO_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='audio-library-folder')
+                        audio_discarded_folder = gr.Textbox(
+                            label=LABEL_AUDIO_DISCARDED,
+                            info=INFO_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='audio-discarded-folder')
+                    with gr.Row():
+                        audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-library-browse')
+                        audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-discarded-browse')
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            audio_clip_picker = gr.Dropdown(
+                                label=LABEL_AUDIO_REVIEW, choices=[], value=None,
+                                interactive=True, elem_id='audio-clip-picker')
+                            audio_clip_name = gr.Textbox(
+                                label=LABEL_AUDIO_CLIP_NAME,
+                                info=INFO_AUDIO_CLIP_NAME,
+                                value='', elem_id='audio-clip-name')
+                            with gr.Row():
+                                audio_keep_btn = gr.Button(
+                                    LABEL_AUDIO_KEEP, variant='primary',
+                                    elem_id='audio-keep-button')
+                                audio_discard_btn = gr.Button(
+                                    LABEL_AUDIO_DISCARD, variant='secondary',
+                                    elem_id='audio-discard-button')
+                        with gr.Column(scale=3):
+                            # The clip is inlined as a data URI rather than handed over as a
+                            # path. Gradio serves files only from its own cache, the working
+                            # directory or the system temp directory, so an exported clip in the
+                            # operator's chosen folder raises `InvalidPathError` -- measured. The
+                            # fix is NOT to widen `allowed_paths`: that exposes a whole tree to
+                            # every request, which this application already refused once. The
+                            # browser's own control supplies play/pause and scrubbing.
+                            gr.Markdown(f"**{LABEL_AUDIO_PLAYER}**")
+                            audio_player = gr.HTML(
+                                value='', elem_id='audio-player')
+                    audio_file_report = gr.Textbox(
+                        label=LABEL_AUDIO_FILE_REPORT,
+                        value=AUDIO_FILE_REPORT_INITIAL_TEXT,
+                        interactive=False, lines=4, max_lines=10,
+                        elem_id='audio-file-report')
+                    # Per-browser-session, so one operator's review list is not reachable from
+                    # another tab. Nothing about the clips lives in a module-level record.
+                    audio_review_state = gr.State([])
+
+                gr.Markdown(INFO_AUDIO_LAYERS_TIP)
+
             # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
             #
             # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
@@ -8309,6 +8759,34 @@ def create_ui() -> gr.Blocks:
                         pref_raw_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-raw-output-browse')
+                    # [FORK] R7: the Audio Cutter's three destinations, remembered the same way.
+                    with gr.Row():
+                        pref_audio_library = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='pref-audio-library')
+                        pref_audio_discarded = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='pref-audio-discarded')
+                    with gr.Row():
+                        pref_audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-library-browse')
+                        pref_audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-discarded-browse')
+                    with gr.Row():
+                        pref_audio_output = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_OUTPUT,
+                            value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                            placeholder=r"J:\Voice Parts",
+                            elem_id='pref-audio-output')
+                        pref_audio_output_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-output-browse')
                     with gr.Row():
                         pref_save_btn = gr.Button(
                             LABEL_PREF_SAVE, variant='primary', elem_id='pref-save-button')
@@ -8333,20 +8811,83 @@ def create_ui() -> gr.Blocks:
                 (source_folder_browse, source_folder),
                 (pref_library_browse, pref_library),
                 (pref_rejected_browse, pref_rejected),
-                (pref_raw_output_browse, pref_raw_output)):
+                (pref_raw_output_browse, pref_raw_output),
+                # [FORK] R7: the Audio Cutter's folder fields use the same self-contained helper.
+                (audio_output_browse, audio_output),
+                (audio_library_browse, audio_library_folder),
+                (audio_discarded_browse, audio_discarded_folder),
+                (pref_audio_library_browse, pref_audio_library),
+                (pref_audio_discarded_browse, pref_audio_discarded),
+                (pref_audio_output_browse, pref_audio_output)):
             _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
                                  concurrency_limit=None)
+
+        # [FORK] R7: the one FILE field, which needs the file dialog rather than the folder one.
+        audio_source_browse.click(fn=_browse_audio_source, inputs=[audio_source],
+                                  outputs=[audio_source], concurrency_limit=None)
 
         pref_save_btn.click(
             fn=_on_save_folder_prefs,
             inputs=[pref_library, pref_rejected, pref_raw_output,
-                    clips_input, cut_batch_folder, source_folder],
+                    clips_input, cut_batch_folder, source_folder,
+                    # [FORK] R7: appended at the END so no existing positional index moves.
+                    pref_audio_library, pref_audio_discarded, pref_audio_output, audio_source],
             outputs=[pref_status],
         )
         pref_reset_btn.click(
             fn=_on_reset_folder_prefs,
             inputs=None,
-            outputs=[pref_library, pref_rejected, pref_raw_output, pref_status],
+            outputs=[pref_library, pref_rejected, pref_raw_output,
+                     pref_audio_library, pref_audio_discarded, pref_audio_output, pref_status],
+        )
+
+        # [FORK] Digital-Union (R7 Raw Audio Cutter V1): five registrations, all isolated.
+        #
+        # None of them writes `status_output`, `video_output`, `process_btn`, `source_state`, any
+        # element of `source_outputs` or `prep_outputs`, any creative widget, any Raw Cutter widget
+        # or any render state -- so cutting audio cannot clear a confirmed source set, change what
+        # a render would do, or disturb a cutter job.
+        #
+        # `concurrency_limit=None` on every one, for the same measured S2-A R3 reason the Clips
+        # Preview registrations carry: on the pinned gradio 6.19.0 a full concurrency group leaves
+        # the event QUEUED rather than delivering it. None of these takes `_RENDER_LOCK` either --
+        # cutting a voice memo is not a render.
+        audio_analyze_btn.click(
+            fn=_on_audio_analyze,
+            inputs=[audio_source, audio_threshold, audio_min_silence, audio_pad,
+                    audio_min_clip, audio_format],
+            outputs=[audio_plan, audio_table],
+            concurrency_limit=None,
+        )
+        audio_cut_btn.click(
+            fn=_on_audio_cut,
+            inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
+                    audio_pad, audio_min_clip, audio_format],
+            outputs=[audio_report, audio_table, audio_clip_picker, audio_player,
+                     audio_clip_name, audio_review_state],
+            concurrency_limit=None,
+        )
+        audio_clip_picker.change(
+            fn=_on_audio_select,
+            inputs=[audio_clip_picker, audio_review_state],
+            outputs=[audio_player, audio_clip_name],
+            concurrency_limit=None,
+        )
+        audio_keep_btn.click(
+            fn=_on_audio_keep,
+            inputs=[audio_clip_picker, audio_clip_name, audio_library_folder,
+                    audio_review_state],
+            outputs=[audio_file_report, audio_clip_picker, audio_player, audio_clip_name,
+                     audio_review_state],
+            concurrency_limit=None,
+        )
+        audio_discard_btn.click(
+            fn=_on_audio_discard,
+            inputs=[audio_clip_picker, audio_clip_name, audio_discarded_folder,
+                    audio_review_state],
+            outputs=[audio_file_report, audio_clip_picker, audio_player, audio_clip_name,
+                     audio_review_state],
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.

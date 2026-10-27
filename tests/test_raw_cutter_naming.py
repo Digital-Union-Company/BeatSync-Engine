@@ -1397,8 +1397,11 @@ def test_this_feature_added_no_fifth_top_level_tab(gui_source, gui_tree):
     test exists to catch. So the tab set is now asserted by **identity** — the four that existed
     when R4-C shipped, plus the one R5 reserved, and no sixth.
     """
+    # Amended for R7, which added the Raw Audio Cutter tab. The claim this test actually makes is
+    # unchanged and is asserted below by identity: no tab of this feature's own exists, and none of
+    # its widgets is declared in somebody else's tab.
     expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-                "LABEL_TAB_ADVANCED", "LABEL_TAB_CLIPS_PREVIEW")
+                "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_CLIPS_PREVIEW")
     assert gui_source.count("gr.Tab(") == len(expected), (
         "the top-level tab set changed: it must be exactly the four tabs R4-C shipped against "
         "plus the R5 Clips Preview Selector")
