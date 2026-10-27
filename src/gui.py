@@ -218,7 +218,14 @@ from beatsync_fork import raw_cutter as fork_cutter
 # [FORK] Digital-Union (R5 Clips Preview Selector): the stdlib-only secure core --
 # opaque ids, the authorization gates, descriptor-identity revalidation, Range
 # parsing, path-relationship refusal, the decision journal and the gallery markup.
+# [FORK] Digital-Union (R6): Raw Cutter output video profiles.
+from beatsync_fork import raw_cutter_profiles as fork_profiles
 from beatsync_fork import clips_review as fork_clips
+# [FORK] Digital-Union (UX V4): the native folder dialog and the remembered folder choices. Both
+# are stdlib-only fork modules; the dialog's subprocess lives there rather than here because two
+# suites pin this module's `subprocess.run` site count at exactly two.
+from beatsync_fork import desktop_folders as fork_folders
+from beatsync_fork import user_prefs as fork_prefs
 # [FORK] Digital-Union (R5): the ASGI media endpoint and Starlette's middleware wrapper. The
 # wrapper is a Gradio dependency already, so this adds nothing to requirements.
 from clips_media_server import ClipMediaMiddleware
@@ -537,6 +544,19 @@ CLIPS_GALLERY_JS = r"""
   const BADGE = {PENDING: '?', SELECTED: '✓', REJECTED: '✗'};
   let active = null;          // the single mounted <video>, if any
   let lastNonce = null;
+  let readyState = null;      // last observed "every clip decided" answer, or null if unknown
+  let decideSeq = 0;          // monotonic stamp so a slow reply cannot repaint newer counts
+  let syncTimer = null;
+
+  // [UX] Seconds per wheel notch, scaled to the clip. A fixed 2s crawls through a two-minute
+  // take and overshoots a ten-second one, so the step follows the length: 1s under 20s, 2s up to
+  // and including 90s, 5s beyond. Both boundaries are deliberately 2s.
+  function seekStep(duration) {
+    if (!Number.isFinite(duration) || duration <= 0) { return null; }
+    if (duration < 20) { return 1; }
+    if (duration <= 90) { return 2; }
+    return 5;
+  }
 
   const grid = () => document.querySelector('#clips-gallery .r5-grid');
   const tileOf = (el) => (el && el.closest) ? el.closest('#clips-gallery .r5-tile') : null;
@@ -571,6 +591,27 @@ CLIPS_GALLERY_JS = r"""
     // never enables anything, and the authority stays on the server.
     if (counts.TOTAL > 0 && counts.PENDING === 0) { text += '\n' + __REFRESH_HINT__; }
     box.value = text;
+    syncConfirm(counts.TOTAL > 0 && counts.PENDING === 0);
+  }
+
+  // [UX] Ask the server to re-derive the Confirm state, but only when the all-decided answer
+  // actually flips. The client still decides NOTHING here: it presses the same Refresh control
+  // the operator used to press by hand, and that handler reads `store.counts()`. So the worst a
+  // wrong guess on this side can do is cause one extra server read -- it can never turn Confirm
+  // on, because nothing in this file is permitted to touch the button at all.
+  //
+  // Only transitions trigger it, so deciding the 2nd of 40 clips sends nothing; and a 120ms
+  // coalescing window keeps a burst of fast clicks to a single read. The stamp comparison in
+  // `send` means an out-of-order reply cannot drive this with stale counts.
+  function syncConfirm(ready) {
+    if (ready === readyState) { return; }
+    readyState = ready;
+    if (syncTimer) { clearTimeout(syncTimer); }
+    syncTimer = setTimeout(() => {
+      syncTimer = null;
+      const button = document.querySelector('#clips-refresh-button');
+      if (button) { button.click(); }
+    }, 120);
   }
 
   function sayProblem(message) {
@@ -591,6 +632,11 @@ CLIPS_GALLERY_JS = r"""
   async function send(clip, to, rev) {
     const g = grid();
     if (!g) { return; }
+    // [UX] Two decisions in flight can come back in either order, and the loser used to repaint
+    // the counter with its own older totals. The tile paint below is still applied either way --
+    // it is about one clip and the server answered for that clip -- but the page-wide counts, and
+    // the Confirm sync derived from them, follow the newest reply only.
+    const stamp = ++decideSeq;
     let res, body;
     try {
       res = await fetch('/r5decide/' + g.dataset.session + '/' + g.dataset.page + '/' + clip, {
@@ -604,7 +650,7 @@ CLIPS_GALLERY_JS = r"""
       return;
     }
     window.__r5Last = Object.assign({status: res.status}, body);
-    if (body && body.counts) { paintCounts(body.counts); }
+    if (body && body.counts && stamp === decideSeq) { paintCounts(body.counts); }
     // Repaint on refusal too, so a stale tab is corrected rather than left lying.
     if (body && body.decision) { paint(clip, body.decision, body.rev); }
   }
@@ -658,11 +704,73 @@ CLIPS_GALLERY_JS = r"""
 
   window.__r5Mounted = () => document.querySelectorAll('#clips-gallery .r5-tile video').length;
 
+  // [UX V3] Let go of the clip before Confirm sorts it. A hovered tile holds an open <video> on
+  // that file, and Windows refuses to rename a file another handle still has open -- measured in
+  // the browser as winerror 32 on exactly the last tile the operator touched, every time. This
+  // runs on pointerdown in the CAPTURE phase, so the handle is released before the click reaches
+  // Gradio and the request goes out. Harmless when nothing is mounted.
+  document.addEventListener('pointerdown', (e) => {
+    const button = e.target.closest ? e.target.closest('#clips-confirm-button') : null;
+    if (button) { unmount(); }
+  }, true);
+
   document.addEventListener('mouseover', (e) => { const t = tileOf(e.target); if (t) { mount(t); } });
   document.addEventListener('mouseout', (e) => {
     const t = tileOf(e.target);
     if (t && active && active.tile === t && !t.contains(e.relatedTarget)) { unmount(); }
   });
+
+  // [UX] Shift + wheel scrubs the clip under the cursor: up seeks forward, down seeks back,
+  // SEEK_STEP seconds per notch. One notch per event rather than a multiple of the delta, so a
+  // trackpad's large deltas do not jump halfway through the clip.
+  //
+  // Three details that are easy to get wrong here:
+  //   * Chrome re-routes a shifted wheel to `deltaX` on some devices, so take whichever axis
+  //     actually moved. Reading `deltaY` alone silently does nothing on those machines.
+  //   * `duration` is NaN until metadata arrives. `preload='metadata'` makes that brief, not
+  //     impossible, so an early notch must bail rather than assign NaN to `currentTime` -- which
+  //     throws and would leave the player wedged.
+  //   * The listener must be non-passive or `preventDefault` is ignored and the page scrolls
+  //     underneath the seek.
+  function showSeek(tile, seconds) {
+    if (!tile) { return; }
+    let tag = tile.querySelector('.r5-seek');
+    if (!tag) {
+      tag = document.createElement('div');
+      tag.className = 'r5-seek';
+      tag.setAttribute('aria-hidden', 'true');
+      tag.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);' +
+        'padding:4px 10px;border-radius:999px;background:rgba(0,0,0,.72);color:#fff;' +
+        'font:600 13px/1.2 system-ui,sans-serif;pointer-events:none;z-index:5;';
+      tile.appendChild(tag);
+    }
+    tag.textContent = (seconds > 0 ? '+' : '') + seconds + 's';
+    tag.style.opacity = '1';
+    if (tag.__hide) { clearTimeout(tag.__hide); }
+    tag.__hide = setTimeout(() => { tag.style.opacity = '0'; }, 420);
+  }
+
+  document.addEventListener('wheel', (e) => {
+    if (!e.shiftKey) { return; }                      // plain wheel keeps scrolling the page
+    const tile = tileOf(e.target);
+    if (!tile || !active || active.tile !== tile) { return; }   // elsewhere: normal browser behaviour
+    e.preventDefault();                               // we own this gesture over a playing tile
+    const raw = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+    if (!raw) { return; }
+    const video = active.el;
+    if (!video) { return; }
+    // The element's own duration, never the rounded text in the tile label: the label truncates
+    // to whole seconds, so a 20.4s clip reads "00:20" and a threshold taken from that would pick
+    // the wrong step for the clip actually loaded.
+    const span = video.duration;
+    const unit = seekStep(span);
+    if (unit === null) { return; }                              // metadata not in yet: do nothing
+    const step = raw < 0 ? unit : -unit;                        // wheel up = forward
+    const at = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const target = Math.min(Math.max(at + step, 0), span);
+    try { video.currentTime = target; } catch (err) { return; }
+    showSeek(tile, step);
+  }, {passive: false});
   document.addEventListener('click', (e) => {
     const reset = e.target.closest ? e.target.closest('#clips-gallery .r5-reset') : null;
     if (reset) {
@@ -5350,7 +5458,7 @@ def _restore_plan(state):
 
 
 def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds, max_seconds,
-                remove_audio, rename_output):
+                remove_audio, rename_output, output_profile):
     """Cut Video. A generator, so clip X / total is visible while FFmpeg works.
 
     The staleness gate is the first real step and it is deliberately strict: the plan is refused
@@ -5474,7 +5582,8 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 outcome['results'] = cutter_export.export_segments(
                     source=source, plan=plan, run_directory=run_directory,
                     remove_audio=bool(remove_audio), encoder=encoder, job=job,
-                    on_progress=started, on_complete=finished, naming=naming)
+                    on_progress=started, on_complete=finished, naming=naming,
+                    output_profile=output_profile)
             except BaseException as exc:   # noqa: BLE001 - re-raised on the generator's thread
                 outcome['error'] = exc
             finally:
@@ -5522,6 +5631,7 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             f"Output folder:\n{run_directory}",
             "",
             f"Encoder: {encoder}   Audio: {'removed (-an)' if remove_audio else 'kept (AAC)'}",
+            f"Output profile: {fork_profiles.label_for(output_profile)}",
         ]
         if done:
             total_bytes = sum(r.size_bytes for r in done)
@@ -5664,7 +5774,8 @@ def _on_cut_batch_count(input_folder, recursive) -> str:
 
 
 def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                      max_seconds, remove_audio, rename_output, sink=None):
+                      max_seconds, remove_audio, rename_output, output_profile,
+                      sink=None):
     """Start Batch. A generator, so the current file and phase stay visible for a long job.
 
     Yields `(live_status, final_summary)`. The summary stays empty until the end, so the operator
@@ -5750,7 +5861,10 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
     settings = fork_cutter_batch.BatchSettings(
         sensitivity=level, threshold=threshold, min_seconds=low, max_seconds=high,
         remove_audio=bool(remove_audio), encoder=encoder, recursive=bool(recursive),
-        rename_output_clips=bool(rename_output))
+        rename_output_clips=bool(rename_output),
+        # [FORK] R6: FROZEN here, once, at submission. Every source and every segment in this
+        # batch uses this value; changing the widget mid-run cannot reach the running job.
+        output_video_profile=fork_profiles.manifest_value(output_profile))
 
     items: List[Any] = []
     batch_directory = ''
@@ -5957,6 +6071,8 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
                         source=source, plan=plan, run_directory=item_directory,
                         remove_audio=bool(remove_audio), encoder=encoder, job=job,
                         on_complete=written.append,
+                        # [FORK] R6: read from the FROZEN settings, never from the widget.
+                        output_profile=settings.output_video_profile,
                         # [FORK] R4-C: the job's naming aimed at THIS source's frozen position.
                         # `for_source` returns a new frozen record, so the batch-level one is
                         # never mutated and the index cannot drift between sources.
@@ -6086,7 +6202,7 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
 
 
 def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
-                         max_seconds, remove_audio, rename_output):
+                         max_seconds, remove_audio, rename_output, output_profile):
     """[FORK] Digital-Union (Raw Cutter progress P1): the batch, with a visible bar and controls.
 
     A thin presentation wrapper, on purpose. `_on_cut_batch_run` above keeps every reviewed
@@ -6105,7 +6221,7 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     status, summary = '', ''
     for status, summary in _on_cut_batch_run(
             input_folder, recursive, output_folder, sensitivity, min_seconds,
-            max_seconds, remove_audio, rename_output, sink=sink):
+            max_seconds, remove_audio, rename_output, output_profile, sink=sink):
         total = sink.get('total')
         detail = (f"Source {sink.get('position')} of {total}: "
                   f"{sink.get('name', '')} — {sink.get('phase', '')}") if total else ''
@@ -6403,6 +6519,99 @@ def _clips_identities(view: dict) -> list:
     return [view['identity'][entry.clip_id] for entry in view.get('entries', ())]
 
 
+#: Remembered folder choices, under the same gitignored `state/` tree as the decision journal.
+PREFS_DIR = os.path.join(ROOT_DIR, 'state')
+PREFS_PATH = fork_prefs.preferences_path(PREFS_DIR)
+PREFS_LABELS = {
+    fork_prefs.CLIPS_LIBRARY: LABEL_CLIPS_LIBRARY,
+    fork_prefs.CLIPS_REJECTED: LABEL_CLIPS_REJECTED,
+    fork_prefs.RAW_CUTTER_OUTPUT: LABEL_PREF_RAW_OUTPUT,
+}
+
+
+def _browse_folder(current):
+    """Open the native Windows folder dialog and answer with a path for the textbox.
+
+    Returns the operator's existing value on cancel, on timeout and on any failure to show the
+    dialog, so pressing Browse can only ever *add* a choice -- it can never clear a path the
+    operator already typed. The dialog starts at the current value when that is a real folder.
+
+    Choosing a folder does nothing else: no scan, no validation, no move. The existing Scan and
+    Confirm checks still run on whatever ends up in the box, whether it was picked or pasted.
+    """
+    existing = current if isinstance(current, str) else ''
+    try:
+        status, chosen = fork_folders.pick_folder(existing or None)
+    except Exception:                                  # noqa: BLE001 - browsing is never fatal
+        return gr.update()
+    if status == fork_folders.PICKED and chosen:
+        return chosen
+    return gr.update()                                  # cancel/timeout/unavailable: unchanged
+
+
+def _load_folder_prefs():
+    """Read saved defaults once at import. Creates nothing and validates nothing."""
+    preferences, notice = fork_prefs.load_preferences(PREFS_PATH)
+    missing = fork_prefs.unavailable_notice(preferences, PREFS_LABELS)
+    return preferences, "\n".join(part for part in (notice, missing) if part)
+
+
+_FOLDER_PREFS, _FOLDER_PREFS_NOTICE = _load_folder_prefs()
+
+
+def _pref(key: str) -> str:
+    return _FOLDER_PREFS.get(key, '')
+
+
+def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw_input_folder,
+                          render_source):
+    """Persist the folder defaults. Writes a file; creates no media directory."""
+    values = {
+        fork_prefs.CLIPS_LIBRARY: library,
+        fork_prefs.CLIPS_REJECTED: rejected,
+        fork_prefs.RAW_CUTTER_OUTPUT: raw_output,
+        fork_prefs.CLIPS_INPUT: clips_input_folder,
+        fork_prefs.RAW_CUTTER_INPUT: raw_input_folder,
+        fork_prefs.QUICK_RENDER_SOURCE: render_source,
+    }
+    failure = fork_prefs.save_preferences(PREFS_PATH, values)
+    if failure:
+        return f"❌ {failure}"
+    _FOLDER_PREFS.update({key: (values.get(key) or '').strip() for key in fork_prefs.KEYS})
+    missing = fork_prefs.unavailable_notice(_FOLDER_PREFS, PREFS_LABELS)
+    saved = f"✅ Saved. These folders will be filled in next time you start BeatSync."
+    return f"{saved}\n{missing}" if missing else saved
+
+
+def _on_reset_folder_prefs():
+    """Clear the saved defaults. Removes no folder and no media -- only the remembered choices."""
+    failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences())
+    if failure:
+        return ('', '', '', f"❌ {failure}")
+    _FOLDER_PREFS.update(fork_prefs.empty_preferences())
+    return ('', '', '', "✅ Defaults cleared. No folder or file was deleted.")
+
+
+def _clips_durations(entries) -> dict:
+    """Real clip lengths for the tile labels, from the portable FFprobe.
+
+    Cached inside `ensure_durations` on the clip's identity, so a Scan pays for the page once and
+    every later Refresh is answered from memory. The command and the process launch both live in
+    the fork core, exactly like the poster pass, because two suites pin this module's
+    `subprocess.run` site count at two.
+
+    A probe that cannot answer yields `None`, which renders `(–:–)`. Deliberately **not**
+    `ffmpeg_processing.get_video_duration`, whose 10.0-second fallback would print a confident
+    `(00:10)` over a clip nobody measured.
+    """
+    try:
+        from ffmpeg_processing import FFPROBE_PATH    # local: no module-level import is added
+        return fork_clips.ensure_durations(entries, FFPROBE_PATH,
+                                           fork_clips.run_duration_command)
+    except Exception:                                 # noqa: BLE001 - labels are never fatal
+        return {}
+
+
 def _on_clips_check(input_folder, library_folder, rejected_folder):
     """Read-only validation of the three roots. Creates no directory and reads no media."""
     verdict, roots = fork_clips.validate_roots(input_folder, library_folder, rejected_folder,
@@ -6442,7 +6651,7 @@ def _clips_render_current(owner: str, report: str):
     counts = store.counts(identities)
     grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
                                    view['identity'], view['session'], view['page'],
-                                   _clips_poster_exists)
+                                   _clips_poster_exists, _clips_durations(view['entries']))
     return (report, grid, fork_clips.counts_text(counts),
             gr.update(interactive=counts[fork_clips.PENDING] == 0))
 
@@ -6481,8 +6690,8 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
         return (f"❌ No browser session identity ({refusal.reason}). Reload the page.",
                 empty[0], empty[1], gr.update(interactive=False))
 
-    verdict, _ = fork_clips.validate_roots(input_folder, library_folder, rejected_folder,
-                                           app_root=ROOT_DIR)
+    verdict, roots = fork_clips.validate_roots(input_folder, library_folder, rejected_folder,
+                                               app_root=ROOT_DIR)
     if not verdict.ok:
         return (f"❌ REFUSED before reading anything: {verdict.code}\n{verdict.detail}",
                 empty[0], empty[1], gr.update(interactive=False))
@@ -6532,7 +6741,13 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
                     for entry in entries}
         view = {'session': session_id, 'page': page_token, 'scan_id': scan_id,
                 'entries': entries, 'identity': identity, 'total': len(found.files),
-                'root': found.root, 'page_size': size}
+                'root': found.root, 'page_size': size,
+                # [UX V3] Confirm sorts into these, and re-validates them before it moves
+                # anything -- it never trusts a folder the browser re-sends. `recursive` is kept
+                # so a completed batch can enumerate the next one exactly as this scan did.
+                'recursive': bool(recursive),
+                'library': roots[fork_clips.ROLE_LIBRARY].real,
+                'rejected': roots[fork_clips.ROLE_REJECTED].real}
         if not _clips_remember(owner, generation, view):
             raise fork_clips.SupersededScan(generation, _CLIPS_SCANS.newest(owner))
     except fork_clips.SupersededScan:
@@ -6584,7 +6799,7 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
     counts = store.counts(identities)
     grid = fork_clips.gallery_html(current['entries'], store.snapshot_of(identities),
                                    current['identity'], current['session'], current['page'],
-                                   _clips_poster_exists)
+                                   _clips_poster_exists, _clips_durations(current['entries']))
     report = (
         f"Enumerated {len(found.files)} clip(s) under:\n{found.root}\n"
         f"Subfolders: {'included' if recursive else 'excluded'}\n"
@@ -6697,34 +6912,109 @@ def _on_clips_refresh(request: gr.Request = None):
     return _clips_render_current(owner, '')[1:]
 
 
-def _on_clips_confirm(request: gr.Request = None):
-    """Report readiness. **Moves nothing.**
+def _clips_confirm_only(message: str):
+    """A Confirm answer that changes no page state: repaint nothing, say this."""
+    return (gr.update(), gr.update(), gr.update(), gr.update(), message)
 
-    There is no transfer code behind this -- not disabled, not feature-flagged, not present. It
-    reads the server's durable record and says what a later, separately authorized phase would
-    do with it.
+
+def _on_clips_confirm(request: gr.Request = None):
+    """Sort this page: SELECTED to the Media Library, REJECTED to the Discarded folder.
+
+    [UX V3] Confirm now does the thing its label promises. What it moves comes entirely from the
+    server: the entries are the registry's frozen page and each decision is read from the durable
+    store, so a repainted tile, an edited class or anything else the browser could send has no
+    say in where a file goes.
+
+    The destinations are the ones the operator typed at Scan time, carried on the view and
+    **re-validated here** rather than re-read from the widgets -- otherwise the folder that was
+    checked and the folder that is written could differ.
+
+    Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
+    page with undecided clips, or destinations that no longer validate.
+
+    Every move is a single same-volume ``os.rename`` (see `sort_decided_clips`): no overwrite, no
+    collision renaming, no deletion, and a cross-volume request is refused in words rather than
+    turned into a copy. One clip failing leaves the rest moved and is reported as a partial
+    result. The page only advances to the next batch when every clip on this one actually moved.
     """
     try:
         owner = _clips_owner(request)
     except fork_clips.Refusal:
-        return "Reload the page: this browser session has no identity."
+        return _clips_confirm_only("Reload the page: this browser session has no identity.")
     view = _clips_view(owner)
     if not view.get('entries'):
-        return "Nothing has been scanned on this page."
+        return _clips_confirm_only("Nothing has been scanned on this page.")
     # [R5-P11 / N7] A readiness report derived from a record that could not be read would be a
     # false negative with the authority of a positive statement -- "0 kept, 0 discarded" reads as
     # a reviewed page rather than an unreadable one. Refuse to report instead.
     try:
         store = _clips_store()
     except (fork_clips.PersistenceError, OSError) as failure:
-        return _clips_state_unavailable_text(failure)
-    counts = store.counts(_clips_identities(view))
+        return _clips_confirm_only(_clips_state_unavailable_text(failure))
+    identities = _clips_identities(view)
+    counts = store.counts(identities)
     if counts[fork_clips.PENDING]:
-        return (f"{CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
-                f"{counts[fork_clips.PENDING]} of {counts['TOTAL']} clip(s) are still undecided.")
-    return (f"{CLIPS_CONFIRM_READY_TEXT}\n\n"
-            f"Recorded: {counts[fork_clips.SELECTED]} kept, "
-            f"{counts[fork_clips.REJECTED]} discarded, {counts['TOTAL']} total.")
+        return _clips_confirm_only(
+            f"{CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
+            f"{counts[fork_clips.PENDING]} of {counts['TOTAL']} clip(s) are still undecided.")
+
+    verdict, roots = fork_clips.validate_roots(
+        view['root'], view.get('library', ''), view.get('rejected', ''), app_root=ROOT_DIR)
+    if not verdict.ok:
+        return _clips_confirm_only(
+            f"❌ Nothing was moved: the destination folders no longer validate.\n"
+            f"{verdict.code}\n{verdict.detail}")
+
+    snapshot = store.snapshot_of(identities)
+
+    def decision_of(entry):
+        return snapshot.get(view['identity'][entry.clip_id], (fork_clips.PENDING, 0))[0]
+
+    outcomes = fork_clips.sort_decided_clips(
+        view['entries'], decision_of,
+        {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
+         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real})
+    message = _clips_sorted_text(outcomes, roots)
+
+    # Re-enumerate whichever way it went. On a clean batch that publishes the next one; on a
+    # partial batch it republishes what is genuinely still on disk, which is the only honest
+    # page to show -- repainting the old one would leave already-moved clips on screen, and
+    # pressing Confirm again would then report them as missing. Clips that stayed keep their
+    # decisions, because a decision is keyed on the file's identity and that has not changed.
+    report, grid, counts_text, confirm = _on_clips_scan(
+        view['root'], view.get('recursive', True), view.get('library', ''),
+        view.get('rejected', ''), view.get('page_size', 100), request)
+    return (report, grid, counts_text, confirm, message)
+
+
+def _clips_sorted_text(outcomes, roots) -> str:
+    """What actually happened, per clip, in the operator's words rather than status codes."""
+    moved = [o for o in outcomes if o.ok]
+    kept = [o for o in moved if o.decision == fork_clips.SELECTED]
+    binned = [o for o in moved if o.decision == fork_clips.REJECTED]
+    stayed = [o for o in outcomes if not o.ok]
+
+    lines = []
+    if moved and not stayed:
+        lines.append(f"✅ Sorted all {len(moved)} clip(s).")
+    elif moved:
+        lines.append(f"⚠️ Sorted {len(moved)} of {len(outcomes)} clip(s). "
+                     f"{len(stayed)} stayed where they were.")
+    else:
+        lines.append("❌ Nothing was moved.")
+    lines.append("")
+    lines.append(f"Media Library ({roots[fork_clips.ROLE_LIBRARY].real}): {len(kept)} kept")
+    lines.append(f"Discarded ({roots[fork_clips.ROLE_REJECTED].real}): {len(binned)} discarded")
+    if stayed:
+        lines.append("")
+        lines.append("Left in place:")
+        for outcome in stayed:
+            lines.append(f"  {outcome.label} — {CLIPS_MOVE_REASONS.get(outcome.status, outcome.status)}"
+                         f"{(': ' + outcome.detail) if outcome.detail else ''}")
+        lines.append("")
+        lines.append("Nothing was overwritten, renamed or deleted. Fix the listed clips and "
+                     "press Confirm again.")
+    return "\n".join(lines)
 
 
 def create_ui() -> gr.Blocks:
@@ -6828,8 +7118,12 @@ def create_ui() -> gr.Blocks:
                                             label=LABEL_SOURCE_FOLDER,
                                             placeholder=PLACEHOLDER_SOURCE_FOLDER,
                                             info=INFO_SOURCE_FOLDER,
+                                            value=_pref(fork_prefs.QUICK_RENDER_SOURCE),
                                             elem_id='source-folder-input',
                                         )
+                                        source_folder_browse = gr.Button(
+                                            LABEL_BROWSE_FOLDER, variant='secondary', size='sm',
+                                            elem_id='source-folder-browse')
                                         source_recursive = gr.Checkbox(
                                             value=True, label=LABEL_SOURCE_RECURSIVE, elem_id='source-recursive'
                                         )
@@ -7427,8 +7721,12 @@ def create_ui() -> gr.Blocks:
                                 label=LABEL_CUT_BATCH_FOLDER,
                                 placeholder=PLACEHOLDER_CUT_BATCH_FOLDER,
                                 info=INFO_CUT_BATCH_FOLDER,
+                                value=_pref(fork_prefs.RAW_CUTTER_INPUT),
                                 elem_id='cut-batch-folder-input',
                             )
+                            cut_batch_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', size='sm',
+                                elem_id='cut-batch-browse')
                             cut_batch_recursive = gr.Checkbox(
                                 value=True,
                                 label=LABEL_CUT_BATCH_RECURSIVE,
@@ -7453,8 +7751,12 @@ def create_ui() -> gr.Blocks:
                                 label=LABEL_CUT_OUTPUT,
                                 placeholder=PLACEHOLDER_CUT_OUTPUT,
                                 info=INFO_CUT_OUTPUT,
+                                value=_pref(fork_prefs.RAW_CUTTER_OUTPUT),
                                 elem_id='cut-output-input',
                             )
+                            cut_output_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', size='sm',
+                                elem_id='cut-output-browse')
                         with gr.Group():
                             cut_sensitivity = gr.Slider(
                                 minimum=fork_cutter.SENSITIVITY_MIN,
@@ -7506,6 +7808,21 @@ def create_ui() -> gr.Blocks:
                                 label=LABEL_CUT_RENAME_OUTPUT,
                                 info=INFO_CUT_RENAME_OUTPUT,
                                 elem_id='cut-rename-output',
+                            )
+                            # [FORK] R6: ONE selector, shared by Single Video and Folder Batch,
+                            # in the same shared settings area as Remove Audio and Rename.
+                            #
+                            # Deliberately NOT a planning input, for exactly the reason the two
+                            # above are not: it changes how an exported clip is ENCODED, never
+                            # where a cut is placed. So it is absent from `plan_signature` and
+                            # from the staleness listeners, and switching it cannot invalidate
+                            # an analysis of a long source.
+                            cut_output_profile = gr.Radio(
+                                choices=fork_profiles.profile_choices(),
+                                value=fork_profiles.SAME_AS_SOURCE,
+                                label=LABEL_CUT_OUTPUT_PROFILE,
+                                info=INFO_CUT_OUTPUT_PROFILE,
+                                elem_id='cut-output-profile',
                             )
                         with gr.Column(visible=True) as cut_single_actions:
                             with gr.Row():
@@ -7873,6 +8190,7 @@ def create_ui() -> gr.Blocks:
                     clips_input = gr.Textbox(
                         label=LABEL_CLIPS_INPUT,
                         info=INFO_CLIPS_INPUT,
+                        value=_pref(fork_prefs.CLIPS_INPUT),
                         placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
                         elem_id='clips-input-folder',
                     )
@@ -7883,18 +8201,31 @@ def create_ui() -> gr.Blocks:
                         elem_id='clips-recursive',
                     )
                 with gr.Row():
+                    clips_input_browse = gr.Button(
+                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                        elem_id='clips-input-browse')
+                with gr.Row():
                     clips_library = gr.Textbox(
                         label=LABEL_CLIPS_LIBRARY,
                         info=INFO_CLIPS_LIBRARY,
+                        value=_pref(fork_prefs.CLIPS_LIBRARY),
                         placeholder=r"J:\Media Library",
                         elem_id='clips-library-folder',
                     )
                     clips_rejected = gr.Textbox(
                         label=LABEL_CLIPS_REJECTED,
                         info=INFO_CLIPS_REJECTED,
+                        value=_pref(fork_prefs.CLIPS_REJECTED),
                         placeholder=r"J:\Discarded",
                         elem_id='clips-rejected-folder',
                     )
+                with gr.Row():
+                    clips_library_browse = gr.Button(
+                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                        elem_id='clips-library-browse')
+                    clips_rejected_browse = gr.Button(
+                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                        elem_id='clips-rejected-browse')
                 with gr.Row():
                     clips_page_size = gr.Number(
                         value=100,
@@ -7942,6 +8273,82 @@ def create_ui() -> gr.Blocks:
                     elem_id='clips-confirm-box',
                 )
 
+                # [UX V4] Remembered folders. Deliberately placed here rather than in a settings
+                # tab of its own: these are the folders this tab asks for, so the operator sets
+                # them where they already are. Saving writes `state/preferences.json` and nothing
+                # else -- no directory is created, nothing is scanned and nothing is moved.
+                # Deliberately a plain Group, not a collapsible panel: a test asserts this tab
+                # hides none of its controls, and that rule is right -- an operator should be
+                # able to see what their destinations are set to without opening anything.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_PREF_SECTION}\n\n{INFO_PREF_SECTION}")
+                    with gr.Row():
+                        pref_library = gr.Textbox(
+                            label=LABEL_CLIPS_LIBRARY,
+                            value=_pref(fork_prefs.CLIPS_LIBRARY),
+                            placeholder=r"J:\Media Library",
+                            elem_id='pref-library')
+                        pref_rejected = gr.Textbox(
+                            label=LABEL_CLIPS_REJECTED,
+                            value=_pref(fork_prefs.CLIPS_REJECTED),
+                            placeholder=r"J:\Discarded",
+                            elem_id='pref-rejected')
+                    with gr.Row():
+                        pref_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-library-browse')
+                        pref_rejected_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-rejected-browse')
+                    with gr.Row():
+                        pref_raw_output = gr.Textbox(
+                            label=LABEL_PREF_RAW_OUTPUT,
+                            value=_pref(fork_prefs.RAW_CUTTER_OUTPUT),
+                            placeholder=r"J:\Raw Parts",
+                            elem_id='pref-raw-output')
+                        pref_raw_output_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-raw-output-browse')
+                    with gr.Row():
+                        pref_save_btn = gr.Button(
+                            LABEL_PREF_SAVE, variant='primary', elem_id='pref-save-button')
+                        pref_reset_btn = gr.Button(
+                            LABEL_PREF_RESET, variant='secondary', elem_id='pref-reset-button')
+                    pref_status = gr.Textbox(
+                        label=LABEL_PREF_STATUS,
+                        value=_FOLDER_PREFS_NOTICE or PREF_STATUS_INITIAL,
+                        interactive=False, lines=3, max_lines=6,
+                        elem_id='pref-status-box')
+
+        # [UX V4] One helper, six folder fields plus the three saved defaults. Each button sends
+        # its own textbox in and writes the same textbox back, so Browse is self-contained: it
+        # starts where the field already points and cannot touch anything else. Cancel returns
+        # `gr.update()`, which leaves the value exactly as it was.
+        for _browse_button, _target in (
+                (clips_input_browse, clips_input),
+                (clips_library_browse, clips_library),
+                (clips_rejected_browse, clips_rejected),
+                (cut_batch_browse, cut_batch_folder),
+                (cut_output_browse, cut_output),
+                (source_folder_browse, source_folder),
+                (pref_library_browse, pref_library),
+                (pref_rejected_browse, pref_rejected),
+                (pref_raw_output_browse, pref_raw_output)):
+            _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
+                                 concurrency_limit=None)
+
+        pref_save_btn.click(
+            fn=_on_save_folder_prefs,
+            inputs=[pref_library, pref_rejected, pref_raw_output,
+                    clips_input, cut_batch_folder, source_folder],
+            outputs=[pref_status],
+        )
+        pref_reset_btn.click(
+            fn=_on_reset_folder_prefs,
+            inputs=None,
+            outputs=[pref_library, pref_rejected, pref_raw_output, pref_status],
+        )
+
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.
         #
         # Every one of these events routes through beatsync_fork.input_session, so any source change
@@ -7980,7 +8387,8 @@ def create_ui() -> gr.Blocks:
         cut_run_btn.click(
             fn=_on_cut_run,
             inputs=[cut_plan_state, cut_source, cut_output, cut_sensitivity,
-                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output],
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output,
+                    cut_output_profile],
             outputs=[cut_report, cut_progress,
                      cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
@@ -8040,7 +8448,8 @@ def create_ui() -> gr.Blocks:
         cut_batch_start_btn.click(
             fn=_on_cut_batch_run_ui,
             inputs=[cut_batch_folder, cut_batch_recursive, cut_output, cut_sensitivity,
-                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output],
+                    cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output,
+                    cut_output_profile],
             outputs=[cut_batch_status, cut_batch_summary, cut_batch_progress,
                      cut_batch_count_btn, cut_batch_start_btn, cut_batch_cancel_btn],
             concurrency_limit=None,
@@ -8669,10 +9078,15 @@ def create_ui() -> gr.Blocks:
             outputs=[clips_gallery, clips_counts, clips_confirm_btn],
             concurrency_limit=None,
         )
+        # [UX V3] Confirm now sorts the page, so it repaints what it changed: the report, the
+        # grid (the next batch, or this one again if anything stayed), the counts and the button.
+        # The sources are the registry page and the durable record -- this click sends no inputs
+        # at all, which is what keeps the browser out of the decision about where a file goes.
         clips_confirm_btn.click(
             fn=_on_clips_confirm,
             inputs=[],
-            outputs=[clips_confirm_out],
+            outputs=[clips_report, clips_gallery, clips_counts, clips_confirm_btn,
+                     clips_confirm_out],
             concurrency_limit=None,
         )
 

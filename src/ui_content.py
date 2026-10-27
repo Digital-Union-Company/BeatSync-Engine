@@ -693,7 +693,11 @@ INFO_CLIPS_PAGE_SIZE = (
 LABEL_CLIPS_CHECK = "🔎 Check folders"
 LABEL_CLIPS_SCAN = "📂 Scan and build page"
 LABEL_CLIPS_REFRESH = "🔁 Re-read the server's record"
-LABEL_CLIPS_CONFIRM = "✅ Confirm (moving is not enabled yet)"
+# [FORK] UX V4: the label was left over from the phase when Confirm genuinely moved nothing. It
+# now sorts, so a button that still said "moving is not enabled yet" told the operator the exact
+# opposite of what pressing it does to their files -- the one place a stale label is dangerous
+# rather than untidy.
+LABEL_CLIPS_CONFIRM = "✅ Confirm — sort the decided clips into their folders"
 LABEL_CLIPS_REPORT = "Scan report"
 LABEL_CLIPS_COUNTS = "Decisions (server record)"
 LABEL_CLIPS_CONFIRM_OUT = "Confirm"
@@ -711,9 +715,44 @@ CLIPS_CONFIRM_DISABLED_TEXT = (
 # this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
 # It is display text: it enables nothing, and only Refresh moves the button, from the durable
 # record.
-CLIPS_REFRESH_TO_ENABLE_HINT = (
-    'All clips decided — press "Re-read the server\'s record" to enable Confirm.'
+# [UX] The client now asks Refresh to run itself the moment the all-decided state changes, so the
+# operator no longer has to press anything. The wording says what just happened rather than giving
+# an instruction, because the old text told the operator to do a job the page already does. The
+# mechanism is unchanged: this string is still display text, it still enables nothing, and the
+# button is still moved only by the server reading the durable record.
+# [UX V4] The native folder dialog and the remembered folder choices.
+LABEL_BROWSE_FOLDER = "📁 Browse…"
+INFO_BROWSE_FOLDER = (
+    "Opens the normal Windows folder dialog on this computer. Cancelling leaves the path alone, "
+    "and you can still type or paste a path yourself."
 )
+LABEL_PREF_SECTION = "⭐ Default folders"
+INFO_PREF_SECTION = (
+    "Filled in automatically each time BeatSync starts. Saving only remembers the paths — it "
+    "never creates a folder, moves anything, or scans."
+)
+LABEL_PREF_RAW_OUTPUT = "Default Raw Cutter output"
+LABEL_PREF_SAVE = "💾 Save defaults"
+LABEL_PREF_RESET = "↺ Reset defaults"
+LABEL_PREF_STATUS = "Default folders"
+PREF_STATUS_INITIAL = (
+    "Set the folders you use every session, then press Save defaults. Nothing is created or "
+    "moved by saving."
+)
+
+CLIPS_REFRESH_TO_ENABLE_HINT = (
+    "All clips decided — Confirm is being enabled from the server's record."
+)
+# [UX V3] Why a clip stayed where it was. Each of these means the original is untouched: the
+# sorter only ever renames, so anything short of success leaves the file exactly as it was.
+CLIPS_MOVE_REASONS = {
+    "missing": "it is no longer where the scan found it",
+    "changed": "it changed after it was scanned",
+    "occupied": "that name is already taken in the destination",
+    "cross_volume": "the destination is on a different drive (V1 moves within one drive only)",
+    "in_use": "something still has the file open — close it and press Confirm again",
+    "failed": "the move failed",
+}
 # [R5-P3 / F1] A scan that was overtaken by a newer scan of the same browser session. It changed
 # nothing, and the gallery it is replacing shows the newest page rather than its own, whose
 # session the newer scan already revoked.
@@ -1472,3 +1511,14 @@ def get_parallel_workers_label(recommended_workers):
 def get_parallel_workers_info():
     """Parallel workers info."""
     return 'Clips processed simultaneously. More workers with GPU.'
+
+# [FORK] Digital-Union (R6): Raw Cutter output video profiles.
+LABEL_CUT_OUTPUT_PROFILE = "Output video profile"
+INFO_CUT_OUTPUT_PROFILE = (
+    "Same as source exports every clip exactly as the Raw Cutter always has — the source's own "
+    "resolution and frame timing, untouched. A fixed profile re-encodes each exported clip to "
+    "one size and one constant frame rate, padding rather than stretching so nothing is "
+    "distorted. Converting to a fixed rate duplicates or drops frames to reach it; the clip "
+    "plays at normal speed either way. It changes only the exported file — never where a cut is "
+    "placed. One profile applies to a whole Folder Batch."
+)
