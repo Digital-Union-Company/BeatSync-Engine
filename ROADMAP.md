@@ -522,9 +522,39 @@ screen.
 **Verified against Audio Layers:** an exported WAV was loaded into the Audio Layers voice input in
 a real browser. Audio Layers itself is unchanged by R7; the tab carries a short usage tip only.
 
-**Known limitations.** Single file per run (no Folder Batch); same-volume filing only; the in-page
-preview inlines one clip at a time and describes anything over 25 MB rather than embedding it;
-fixed export rate of 48 kHz.
+**Known limitations.** Single file per run (no Folder Batch); same-volume filing only; fixed
+export rate of 48 kHz.
+
+#### R7.1 — hover gallery and Comfort Mix · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+
+Two owner-requested improvements on top of R7, after a hands-on test that accepted the silence
+cutting as-is. **The cutter itself is unchanged.**
+
+**The review surface is now a gallery, not a dropdown.** Tiles carry the clip number, its length,
+its source window, a Keep/Discard/Pending badge and an editable filename. **Hovering plays the
+clip with sound and loops it; leaving stops and resets it; only one ever sounds at a time.**
+Left-click keeps, right-click discards, middle-click or **P** returns a clip to undecided, **S/R/P**
+and the arrow keys do the same from the keyboard, and **Shift+wheel** scrubs using the same
+1 s / 2 s / 5 s convention the Clips Preview uses.
+
+**Nothing moves until Confirm and Sort**, which refuses while any clip is still undecided. The
+page releases every audio element on `pointerdown` of that button — on Windows a file a player
+still holds open simply will not move, and the clip the operator just listened to is exactly the
+one that would refuse.
+
+Audio is embedded but **bounded** by a byte budget; past it a tile says so and remains playable
+from the output folder. Widening Gradio's `allowed_paths` was refused again, for the reason it was
+refused before. Chrome blocks audible autoplay before a gesture, so a blocked `play()` is caught
+and an **Enable hover audio** button offers the one click that fixes it — deliberately *not*
+falling back to muted playback, which would look like it worked while nothing was heard.
+
+**Audio Layers gained an optional Comfort Mix**, described in R9's section below.
+
+**Known R7.1 limitations.** Decisions live in the page until Confirm, so a reload loses them
+(the Clips Preview's durable journal is deliberately not duplicated here); the gallery is one page
+per cut; Comfort Mix measures the **longest** voice clip as the representative of the set rather
+than every clip; and the Variant Lab batch render keeps the legacy mix, because Comfort Mix is
+wired to the single-render click only.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -539,10 +569,43 @@ Only once R7 has proven useful in practice:
 
 No new model, dependency or inference pipeline is to be added for this now.
 
-### R9 — Audio Layers usability · **PLANNED, NOT IMPLEMENTED**
+### R9 — Audio Layers usability · **PARTLY IMPLEMENTED (R7.1 Comfort Mix), REST STILL PLANNED**
 
-Audio Layers and Smart Mix work, and are hard to approach. This is documentation and explanation,
-**not a redesign**:
+#### Comfort Mix — optional, OFF by default · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+
+The owner made a music video with voice layers and reported a real problem: the music is far
+louder than the speech, so heavy ducking is the only way to hear the voice — and then the music
+comes back abruptly. Two optional controls address the cause rather than the symptom.
+
+* **Auto Balance Voice & Music** (checkbox, **OFF by default**). On, BeatSync measures the
+  integrated loudness of the music and of the voice with FFmpeg's own EBU R128 `loudnorm` analysis
+  and applies two **bounded** gains *before* mixing, towards −18 LUFS for music and −16 LUFS for
+  voice. Corrections are capped at ±12 dB, a positive gain is reduced so it cannot push the
+  measured true peak above −1 dBTP, and a clip measuring below −60 LUFS is **left alone rather
+  than amplified** — lifting something that is mostly room tone is the worst thing an automatic
+  balancer can do. If either side cannot be measured, **nothing is applied and the report says
+  so**; it never claims a normalisation that did not happen.
+* **Music return / fade back** (seconds). This is the duck *release*. It stays at the historical
+  **0.4 s** with Comfort Mix off; with it on the suggested starting value is **2.0 s**, adjustable
+  0.5–5 s. The duck *attack* is deliberately unchanged — the complaint was about the music coming
+  back, and a longer attack would simply bury the lead-in.
+
+**With Auto Balance off the FFmpeg command is byte-identical to what it was**, which is asserted
+against the committed historical builder rather than merely claimed. No measurement pass runs at
+all, so an ordinary render costs exactly what it cost before.
+
+Measured A/B on a loud compressed bed and a deliberately quiet voice, with identical placements in
+both: music −2.1 dB, voice +12.0 dB (bounded, and reported as bounded). Played back through the
+browser's own audio pipeline, the music's recovery after a voice clip went from **+8.6 dB in
+0.4 s** to **+2.1 dB in 0.4 s** — roughly 21 dB/s down to 5 dB/s. Neither mix clipped
+(−10.0 and −12.1 dBTP).
+
+This is **not** a compressor or a mastering suite, and it does not normalise the finished master:
+the limiter settings and the duck depth are untouched.
+
+#### Still planned
+
+The documentation half of R9 is unchanged and unstarted. This is explanation, **not a redesign**:
 
 - What each input actually does.
 - How voices are positioned relative to the music.
@@ -594,9 +657,10 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R5** — Clips Preview Selector (post-cut triage tab) | **P1 IMPLEMENTED** — the fifth tab reviews and classifies clips, read-only and measured; **moving files is NOT implemented**. Specification: `docs/claude/clips-preview-selector-v1.md`; contract: `.claude/rules/clips-preview.md` |
 | **R5-UX** — Clips Preview usability V1–V4 (auto-Confirm, durations, adaptive seek, same-volume sorting, native folder picker, saved defaults) | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Owner-accepted after a hands-on test; whole suite 7,912 passed / 9 skipped at the merge. Not independently reviewed |
 | **R6** — Raw Cutter output video profiles | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders in production |
-| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **LOCAL EXPERIMENTAL CANDIDATE** — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review with Keep/Discard. Browser-verified on port 7863; whole suite 8,005 passed / 9 skipped. **Not merged, not deployed, not independently reviewed** |
+| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **IN DRAFT PR #77** — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not merged, not deployed, not independently reviewed** |
+| **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **LOCAL CANDIDATE, IN DRAFT PR #77** — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. **Not merged, not deployed** |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started |
-| **R9** — Audio Layers usability and tutorial | **PLANNED, NOT IMPLEMENTED** — documentation, not a redesign |
+| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is a local candidate in PR #77; the documentation half is unstarted |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |

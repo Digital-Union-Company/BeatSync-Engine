@@ -571,7 +571,9 @@ def test_the_audio_tab_hides_none_of_its_controls(gui_tree: ast.Module):
     for widget in ("audio_source", "audio_output", "audio_threshold", "audio_min_silence",
                    "audio_pad", "audio_min_clip", "audio_format", "audio_analyze_btn",
                    "audio_cut_btn", "audio_plan", "audio_table", "audio_report",
-                   "audio_clip_picker", "audio_player", "audio_keep_btn", "audio_discard_btn",
+                   # [R7.1] the review surface is a gallery, not a dropdown and two buttons
+                   "audio_gallery", "audio_counts", "audio_decisions", "audio_confirm_btn",
+                   "audio_enable_hover",
                    "audio_library_folder", "audio_discarded_folder"):
         assert f"{widget} = gr." in block, f"{widget} is not in the Audio Cutter tab"
 
@@ -607,7 +609,7 @@ def test_the_cut_handler_creates_its_run_directory_exclusively(gui_tree: ast.Mod
     assert keywords.get("exist_ok") == "False", "the run directory must not be reused"
 
 
-_AUDIO_BUTTONS = ("audio_analyze_btn", "audio_cut_btn", "audio_keep_btn", "audio_discard_btn")
+_AUDIO_BUTTONS = ("audio_analyze_btn", "audio_cut_btn", "audio_confirm_btn")
 
 
 def _registration(tree: ast.Module, widget: str, event: str = "click") -> ast.Call:
@@ -630,8 +632,8 @@ def test_no_audio_handler_touches_a_render_or_source_widget(gui_tree: ast.Module
                  "source_outputs", "prep_outputs", "session_state", "cut_run_btn",
                  "cut_report", "render_invocation_state", "variation_seed",
                  "creative_preset", "_RENDER_LOCK", "RENDER_CONCURRENCY_ID")
-    for widget in _AUDIO_BUTTONS + ("audio_clip_picker",):
-        event = "change" if widget == "audio_clip_picker" else "click"
+    for widget in _AUDIO_BUTTONS:
+        event = "click"
         call = _registration(gui_tree, widget, event)
         rendered = " ".join(ast.unparse(kw.value) for kw in call.keywords
                             if kw.arg in {"inputs", "outputs"})
@@ -639,10 +641,11 @@ def test_no_audio_handler_touches_a_render_or_source_widget(gui_tree: ast.Module
             assert name not in rendered, f"{widget}.{event} reads or writes {name}"
 
 
-def test_the_audio_cutter_registers_exactly_its_own_five_events(gui_tree: ast.Module):
+def test_the_audio_cutter_registers_exactly_its_own_three_events(gui_tree: ast.Module):
+    """[R7.1] Analyze, Cut and Confirm. Classification needs no server event at all -- it happens
+    in the page and rides to the server inside one hidden field with the Confirm click."""
     for widget in _AUDIO_BUTTONS:
         _registration(gui_tree, widget, "click")
-    _registration(gui_tree, "audio_clip_picker", "change")
 
 
 def test_no_audio_event_joins_the_render_concurrency_lane(gui_tree: ast.Module):
@@ -673,14 +676,47 @@ def test_the_review_list_is_per_session_state_not_a_module_record(gui_tree: ast.
     assert holders == set(), f"module-level Audio Cutter record(s): {sorted(holders)}"
 
 
-def test_the_keep_and_discard_registrations_write_the_same_five_outputs(gui_source: str):
-    """They are one operation to two folders, so a divergence here would mean one of them leaves
-    the screen describing a clip that has already moved."""
-    for button in ("audio_keep_btn", "audio_discard_btn"):
-        start = gui_source.index(f"{button}.click(")
-        block = gui_source[start:gui_source.index("concurrency_limit", start)]
-        assert "audio_file_report" in block and "audio_review_state" in block
-        assert "audio_clip_picker" in block and "audio_player" in block
+def test_confirm_repaints_everything_it_changed(gui_source: str):
+    """[R7.1] One filing action. It must rewrite the report, the grid, the counters AND the
+    server-side review list -- repainting the old page would leave already-moved clips on screen,
+    and a second Confirm would then report them as missing."""
+    start = gui_source.index("audio_confirm_btn.click(")
+    block = gui_source[start:gui_source.index("concurrency_limit", start)]
+    for widget in ("audio_file_report", "audio_gallery", "audio_counts", "audio_review_state"):
+        assert widget in block, widget
+
+
+def test_confirm_takes_the_decisions_only_through_the_hidden_field(gui_tree: ast.Module):
+    """The browser supplies a decision and a name per clip id. It never supplies a PATH -- every
+    file that moves is named by the server's own review list."""
+    call = _registration(gui_tree, "audio_confirm_btn", "click")
+    inputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "inputs").value)
+    assert "audio_decisions" in inputs
+    assert "audio_review_state" in inputs
+
+    handler = _func(gui_tree, "_on_audio_confirm")
+    body = ast.unparse(handler)
+    assert "entry['path']" in body or 'entry["path"]' in body, \
+        "the path filed must come from the server's entry, not from the payload"
+
+
+def test_confirm_refuses_while_anything_is_undecided(gui_tree: ast.Module):
+    """Undecided is not a decision, and a clip nobody looked at is not a clip nobody wants."""
+    body = ast.unparse(_func(gui_tree, "_on_audio_confirm"))
+    assert "fork_audio.PENDING" in body
+    assert "AUDIO_CONFIRM_DISABLED_TEXT" in body
+    refusal = body[:body.index("file_clip")]
+    assert "PENDING" in refusal, "the refusal must come before anything is filed"
+
+
+def test_the_gallery_releases_its_players_before_confirm_moves_anything(gui_source: str):
+    """Windows will not rename a file a player still holds open, and the clip the operator just
+    listened to is exactly the one that would refuse to move. The listener is on `pointerdown` in
+    the CAPTURE phase, so it runs before Gradio sends the click."""
+    block = _gallery_block(gui_source)
+    assert "pointerdown" in block
+    assert "audio-confirm-button" in block
+    assert "stop()" in block
 
 
 def test_the_audio_layers_tip_is_present_and_names_the_real_controls(gui_source: str):
@@ -757,3 +793,181 @@ def test_the_player_is_html_not_a_file_component(gui_tree: ast.Module):
     block = _audio_tab_body(gui_tree)
     assert "audio_player = gr.HTML(" in block
     assert "gr.Audio(" not in block
+
+
+# =============================================================================================
+# [R7.1] The review gallery
+# =============================================================================================
+
+def _entry(index, name="a_part_001.wav", path="", start=1.0, end=3.5):
+    return {"index": index, "name": name, "path": path, "start": start, "end": end,
+            "label": f"{index:03d}"}
+
+
+def test_a_tile_carries_its_number_duration_and_source_window(tmp_path):
+    clip = tmp_path / "a_part_001.wav"
+    clip.write_bytes(b"RIFF0000WAVE")
+    markup = cutter.gallery_markup([_entry(1, path=str(clip))])
+    assert 'data-idx="1"' in markup
+    assert 'data-dur="2.500"' in markup
+    assert "0:02.5" in markup          # duration
+    assert "0:01.0" in markup and "0:03.5" in markup   # source window
+
+
+def test_every_tile_starts_pending():
+    markup = cutter.gallery_markup([_entry(1), _entry(2)])
+    assert markup.count("r7-pending") == 2
+    assert "r7-selected" not in markup and "r7-rejected" not in markup
+
+
+def test_existing_decisions_and_edited_names_survive_a_repaint():
+    markup = cutter.gallery_markup([_entry(1), _entry(2)],
+                                   decisions={"1": cutter.SELECTED, "2": cutter.REJECTED},
+                                   names={"1": "01 greeting"})
+    assert "r7-selected" in markup and "r7-rejected" in markup
+    assert 'value="01 greeting"' in markup
+
+
+def test_an_unknown_decision_is_read_as_pending():
+    assert "r7-pending" in cutter.gallery_markup([_entry(1)], decisions={"1": "NONSENSE"})
+
+
+def test_audio_is_embedded_but_bounded(tmp_path):
+    """A byte budget, not an unlimited blob: everything inside it is instant, everything past it
+    says so and is still playable from the output folder."""
+    entries = []
+    for n in range(1, 6):
+        clip = tmp_path / f"a_part_{n:03d}.wav"
+        clip.write_bytes(b"x" * 1000)
+        entries.append(_entry(n, path=str(clip)))
+
+    generous = cutter.gallery_markup(entries, budget=cutter.MAX_EMBEDDED_BYTES)
+    assert generous.count("<audio") == 5
+
+    tight = cutter.gallery_markup(entries, budget=2500)      # room for two
+    assert tight.count("<audio") == 2
+    assert tight.count("not loaded for preview") == 3
+    assert "was still exported" in tight, "an unloaded tile must not read as a failure"
+
+
+def test_every_tile_is_focusable_so_the_keyboard_works():
+    markup = cutter.gallery_markup([_entry(1)])
+    assert 'tabindex="0"' in markup
+
+
+def test_a_filename_cannot_carry_markup_into_the_gallery():
+    markup = cutter.gallery_markup([_entry(1, name='<img src=x onerror="alert(1)">')])
+    assert "<img" not in markup
+    assert "&lt;img" in markup
+
+
+def test_an_empty_page_says_so():
+    assert "No clips to review" in cutter.gallery_markup([])
+
+
+def test_counts_are_taken_from_the_server_entries_not_the_payload():
+    """A decision for a clip that is not on this page must not inflate the totals, and a clip with
+    no decision must count as pending rather than vanish."""
+    entries = [_entry(1), _entry(2)]
+    counts = cutter.decision_counts(entries, {"1": cutter.SELECTED, "99": cutter.REJECTED})
+    assert counts == {cutter.SELECTED: 1, cutter.REJECTED: 0, cutter.PENDING: 1, "TOTAL": 2}
+
+
+def test_the_counts_line_reads_like_the_clips_preview_one():
+    line = cutter.counts_line(cutter.decision_counts([_entry(1)], {}))
+    assert "Keep 0" in line and "Discard 0" in line and "Undecided 1" in line and "Total 1" in line
+
+
+# --- the interaction layer -------------------------------------------------------------------
+
+def _gallery_block(gui_source: str) -> str:
+    """The AUDIO_GALLERY_JS literal.
+
+    Sliced from the ASSIGNMENT to the next `CLIPS_GALLERY_JS` **after** it. Searching from the
+    start of the file was the first attempt and silently produced an empty string: this block's own
+    comment mentions `CLIPS_GALLERY_JS` while explaining why the two scripts are separate, and that
+    mention sorts earlier than the assignment.
+    """
+    start = gui_source.index("AUDIO_GALLERY_JS = ")
+    return gui_source[start:gui_source.index("CLIPS_GALLERY_JS = ", start)]
+
+
+@pytest.fixture(scope="module")
+def gallery_js(gui_source: str) -> str:
+    return _gallery_block(gui_source)
+
+
+def test_only_one_clip_can_sound_at_a_time(gallery_js: str):
+    assert "stop();" in gallery_js
+    assert "playing = null" in gallery_js
+
+
+def test_hover_plays_and_loops_and_leaving_resets(gallery_js: str):
+    assert "mouseover" in gallery_js and "mouseout" in gallery_js
+    assert "audio.loop = true" in gallery_js
+    assert "currentTime = 0" in gallery_js
+
+
+def test_the_three_mouse_gestures_are_bound(gallery_js: str):
+    assert "contextmenu" in gallery_js and "preventDefault" in gallery_js
+    assert "auxclick" in gallery_js
+    assert "SELECTED" in gallery_js and "REJECTED" in gallery_js and "PENDING" in gallery_js
+
+
+def test_the_keyboard_shortcuts_and_arrows_are_bound(gallery_js: str):
+    for key in ("'s'", "'r'", "'p'", "arrowright", "arrowleft", "arrowdown", "arrowup"):
+        assert key in gallery_js, key
+
+
+def test_shift_wheel_uses_the_established_one_two_five_convention(gallery_js: str):
+    """The same steps the Clips Preview uses, so the two galleries do not behave differently under
+    the same gesture."""
+    assert "seekStep" in gallery_js
+    assert "duration < 20" in gallery_js and "duration <= 90" in gallery_js
+    assert "passive: false" in gallery_js, "preventDefault is ignored on a passive wheel listener"
+    assert "deltaX" in gallery_js, "Chrome re-routes a shifted wheel to deltaX on some devices"
+
+
+def test_blocked_autoplay_is_handled_and_never_faked_with_muted_audio(gallery_js: str):
+    """The owner needs to HEAR the clips. Falling back to muted playback would look like it worked
+    while nothing came out."""
+    assert "catch" in gallery_js
+    assert "audio.muted = false" in gallery_js
+    assert "muted = true" not in gallery_js
+    assert "audio-enable-hover" in gallery_js
+
+
+def test_the_name_box_never_classifies(gallery_js: str):
+    """Typing in a filename must not keep or discard the clip under the cursor."""
+    assert gallery_js.count("r7-name") >= 3
+
+
+def test_the_script_installs_itself_once(gallery_js: str):
+    assert "__r7Installed" in gallery_js
+
+
+def test_the_gallery_script_is_separate_from_the_clips_one(gui_source: str):
+    """Two registrations, not one merged blob: the galleries share no behaviour beyond being
+    grids of tiles."""
+    assert gui_source.count("js=AUDIO_GALLERY_JS") == 1
+    assert gui_source.count("js=CLIPS_GALLERY_JS") == 1
+
+
+# --- the payload ------------------------------------------------------------------------------
+
+def test_a_malformed_payload_leaves_everything_undecided(gui_tree: ast.Module):
+    """An unreadable payload must not guess. Confirm then refuses, which is the safe direction."""
+    namespace = {"json": __import__("json")}
+    exec(ast.unparse(_func(gui_tree, "_audio_decisions")), namespace)
+    read = namespace["_audio_decisions"]
+    for junk in ("", None, "not json", "[]", '{"decisions": 5}', "null"):
+        assert read(junk) == ({}, {})
+
+
+def test_a_well_formed_payload_is_read(gui_tree: ast.Module):
+    namespace = {"json": __import__("json")}
+    exec(ast.unparse(_func(gui_tree, "_audio_decisions")), namespace)
+    decisions, names = namespace["_audio_decisions"](
+        '{"decisions": {"1": "SELECTED"}, "names": {"1": "hello"}}')
+    assert decisions == {"1": "SELECTED"}
+    assert names == {"1": "hello"}

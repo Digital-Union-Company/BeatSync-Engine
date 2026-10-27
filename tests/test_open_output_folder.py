@@ -699,6 +699,10 @@ def test_no_browser_side_file_navigation_or_javascript_was_added():
 #: on a different event, both show up as a new pair rather than slipping through a text match.
 AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
     ("app.load", "CLIPS_GALLERY_JS"),
+    # [R7.1] The Audio Cutter gallery's own installer. A SECOND authorised entry, not a relaxation:
+    # the allowlist is still asserted by identity, so any other JavaScript registration -- or
+    # either of these two growing a server call -- still fails.
+    ("app.load", "AUDIO_GALLERY_JS"),
 )
 
 
@@ -763,18 +767,30 @@ def test_only_the_authorized_registration_carries_client_side_javascript():
         f"{registrations!r} != {sorted(AUTHORIZED_JAVASCRIPT_REGISTRATIONS)!r}")
 
 
+#: Every JavaScript installer `gui.py` is allowed to register, by the NAME of the script it
+#: carries. Amended by R7.1, which added the Audio Cutter gallery's listeners; the claim is
+#: unchanged and is still identity-based, so a third registration, or a different script in either
+#: slot, still fails.
+_AUTHORIZED_JS_SCRIPTS = ("CLIPS_GALLERY_JS", "AUDIO_GALLERY_JS")
+
+
 def test_the_authorized_registration_is_the_gallery_installer_and_nothing_else():
-    """The one permitted entry is pinned to what it actually is: a listener installer that
-    registers no server call (`fn=None`), not a hidden channel for decisions."""
+    """Each permitted entry is pinned to what it actually is: a listener installer that registers
+    no server call (`fn=None`), not a hidden channel for decisions."""
     tree = _tree(_GUI)
     loads = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and ast.unparse(node.func) == "app.load"
              and any(keyword.arg == "js" for keyword in node.keywords)]
-    assert len(loads) == 1, f"expected exactly one JavaScript app.load, found {len(loads)}"
-    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in loads[0].keywords}
-    assert keywords.get("js") == "CLIPS_GALLERY_JS"
-    assert keywords.get("fn") == "None", "the installer must register no server call"
-    assert keywords.get("inputs") == "None" and keywords.get("outputs") == "None"
+    assert len(loads) == len(_AUTHORIZED_JS_SCRIPTS), (
+        f"expected {len(_AUTHORIZED_JS_SCRIPTS)} JavaScript app.load registrations, "
+        f"found {len(loads)}")
+    seen = []
+    for load in loads:
+        keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in load.keywords}
+        seen.append(keywords.get("js"))
+        assert keywords.get("fn") == "None", "an installer must register no server call"
+        assert keywords.get("inputs") == "None" and keywords.get("outputs") == "None"
+    assert sorted(seen) == sorted(_AUTHORIZED_JS_SCRIPTS), seen
 
 
 def test_the_allowlist_itself_rejects_a_planted_registration():

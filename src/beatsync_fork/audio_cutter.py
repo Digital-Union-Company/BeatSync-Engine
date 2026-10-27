@@ -563,5 +563,135 @@ __all__ = [
     "MANIFEST_NAME", "MANIFEST_SCHEMA", "manifest_payload",
     "format_timecode", "segment_rows", "plan_summary",
     "MAX_PREVIEW_BYTES", "preview_markup",
+    "PENDING", "SELECTED", "REJECTED", "DECISIONS",
+    "MAX_EMBEDDED_BYTES", "DEFAULT_PAGE_SIZE",
+    "gallery_markup", "decision_counts", "counts_line",
     "run_probe_command", "run_media_command",
 ]
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] R7.1 -- the review gallery
+#
+# Tiles instead of a dropdown, with hover-to-play. Two decisions shape everything below.
+#
+# **Audio is embedded, but BOUNDED.** A tile plays instantly on hover only if its bytes are already
+# in the page, and the alternative -- fetching on hover -- needs an HTTP route, which would mean
+# either widening Gradio's `allowed_paths` (refused: it exposes a whole tree to every request) or
+# standing up a second authorised media endpoint. For a V1 reviewing one recording's clips, a byte
+# budget is the honest trade: everything inside it is instant, everything past it says so plainly
+# and is still playable from the output folder.
+#
+# **Classification is client-side until Confirm**, which is the requirement -- nothing moves until
+# the operator says so. The page keeps the decisions and writes them into one hidden field that the
+# Confirm handler reads.
+# ---------------------------------------------------------------------------------------------
+
+PENDING = "PENDING"
+SELECTED = "SELECTED"
+REJECTED = "REJECTED"
+DECISIONS = (PENDING, SELECTED, REJECTED)
+
+#: Total embedded audio allowed in one page. ~40 MB of base64 is roughly 30 MB of WAV, which is
+#: about two minutes of 48 kHz mono -- comfortably more than a review page of spoken clips, and far
+#: short of what makes a page sluggish.
+MAX_EMBEDDED_BYTES = 40 * 1024 * 1024
+
+#: Hard cap on tiles per page, so an enormous run is paged rather than rendered in one go.
+DEFAULT_PAGE_SIZE = 60
+
+_DECISION_CLASS = {PENDING: "r7-pending", SELECTED: "r7-selected", REJECTED: "r7-rejected"}
+_DECISION_BADGE = {PENDING: "?", SELECTED: "\u2713", REJECTED: "\u2717"}
+
+
+def gallery_markup(entries, decisions=None, names=None,
+                   budget: int = MAX_EMBEDDED_BYTES) -> str:
+    """The review grid.
+
+    `entries` are the dicts the cut handler produced. `decisions` and `names` are the operator's
+    current state, so a repaint preserves them.
+
+    Every interpolated value goes through :func:`_escape`, so a filename can carry no markup into
+    the page.
+    """
+    if not entries:
+        return ('<div class="r7-empty">No clips to review. Cut a recording first.</div>')
+
+    decisions = dict(decisions or {})
+    names = dict(names or {})
+    spent = 0
+    tiles = []
+
+    for entry in entries:
+        key = str(entry.get("index"))
+        decision = decisions.get(key, PENDING)
+        if decision not in DECISIONS:
+            decision = PENDING
+        label = names.get(key) or entry.get("name") or ""
+        path = entry.get("path") or ""
+
+        size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+        if size and spent + size <= budget:
+            media = _audio_element(path)
+            spent += size
+            note = ""
+        else:
+            media = ""
+            note = ('<div class="r7-note">not loaded for preview on this page '
+                    '\u2014 it was still exported</div>')
+
+        duration = float(entry.get("end", 0.0)) - float(entry.get("start", 0.0))
+        tiles.append(
+            f'<div class="r7-tile {_DECISION_CLASS[decision]}" tabindex="0" role="button"'
+            f' data-idx="{_escape(key)}" data-dur="{duration:.3f}"'
+            f' data-name="{_escape(entry.get("name") or "")}">'
+            f'<div class="r7-head">'
+            f'<span class="r7-num">{_escape(f"{entry.get('index')}")}</span>'
+            f'<span class="r7-badge">{_DECISION_BADGE[decision]}</span>'
+            f'</div>'
+            f'<div class="r7-time">{format_timecode(duration)}'
+            f' <span class="r7-src">{format_timecode(float(entry.get("start", 0.0)))}'
+            f'\u2192{format_timecode(float(entry.get("end", 0.0)))}</span></div>'
+            f'<div class="r7-wave"><span class="r7-state">hover to play</span></div>'
+            f'{media}{note}'
+            f'<input class="r7-name" type="text" value="{_escape(label)}"'
+            f' aria-label="file name" spellcheck="false">'
+            f'</div>')
+
+    return (f'<div class="r7-grid" id="r7-grid" data-count="{len(entries)}">'
+            + "".join(tiles) + "</div>")
+
+
+def _audio_element(path: str) -> str:
+    """One tile's audio, inlined. `preload="none"` is pointless for a data URI, so it is absent."""
+    import base64
+
+    extension = os.path.splitext(path)[1].lstrip(".").lower()
+    media_type = _MEDIA_TYPES.get(extension, "audio/wav")
+    try:
+        with open(path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+    except OSError:
+        return ""
+    return f'<audio class="r7-audio" loop src="data:{media_type};base64,{encoded}"></audio>'
+
+
+def decision_counts(entries, decisions) -> dict:
+    """`{SELECTED, REJECTED, PENDING, TOTAL}` for the page, read from the server's own entry list.
+
+    Counting from `entries` rather than from the decisions dict is deliberate: a decision for a
+    clip that is not on this page must not be able to inflate the totals, and a clip with no
+    decision at all must count as pending rather than vanish.
+    """
+    decisions = dict(decisions or {})
+    counts = {SELECTED: 0, REJECTED: 0, PENDING: 0}
+    for entry in entries:
+        decision = decisions.get(str(entry.get("index")), PENDING)
+        counts[decision if decision in counts else PENDING] += 1
+    counts["TOTAL"] = len(entries)
+    return counts
+
+
+def counts_line(counts: dict) -> str:
+    return (f"Keep {counts[SELECTED]}   \u00b7   Discard {counts[REJECTED]}   \u00b7   "
+            f"Undecided {counts[PENDING]}   \u00b7   Total {counts['TOTAL']}")

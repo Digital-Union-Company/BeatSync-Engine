@@ -542,6 +542,253 @@ CLIPS_GALLERY_CSS = """
 #
 # A tile is repainted ONLY from a server response. The DOM is a rendering of the decision record,
 # never the record itself.
+# [FORK] Digital-Union (R7.1): the Audio Cutter gallery's interaction layer.
+#
+# Deliberately independent of CLIPS_GALLERY_JS rather than a generalisation of it. That one talks
+# to an authorised media middleware and a durable decision journal; this one reviews the clips this
+# session just produced, keeps its decisions in the page until Confirm, and plays audio that is
+# already embedded. Merging them would make both harder to reason about for no shared behaviour
+# beyond "a grid of tiles".
+#
+# The single hidden field is the whole server contract: every decision and every edited name lives
+# in it as JSON, and Confirm reads nothing else from the browser.
+AUDIO_GALLERY_JS = r"""
+() => {
+  if (window.__r7Installed) { return; }
+  window.__r7Installed = true;
+
+  const PENDING = 'PENDING', SELECTED = 'SELECTED', REJECTED = 'REJECTED';
+  const CLS = {PENDING: 'r7-pending', SELECTED: 'r7-selected', REJECTED: 'r7-rejected'};
+  const BADGE = {PENDING: '?', SELECTED: '\u2713', REJECTED: '\u2717'};
+
+  let playing = null;        // the ONE audio element currently sounding, if any
+  let armed = true;          // false once the browser has refused an audible play()
+
+  // Seconds per wheel notch, scaled to the clip -- the same convention the Clips Preview uses, so
+  // the two galleries do not behave differently under the same gesture. 1s under 20s, 2s up to and
+  // including 90s, 5s beyond.
+  function seekStep(duration) {
+    if (!isFinite(duration) || duration <= 0) { return 2; }
+    if (duration < 20) { return 1; }
+    if (duration <= 90) { return 2; }
+    return 5;
+  }
+
+  function tiles() { return Array.from(document.querySelectorAll('#r7-grid .r7-tile')); }
+  function audioOf(tile) { return tile ? tile.querySelector('audio.r7-audio') : null; }
+  function stateOf(tile) { return tile ? tile.querySelector('.r7-state') : null; }
+
+  // ---- the hidden field is the only thing the server reads -----------------------------------
+  function store() {
+    const host = document.querySelector('#audio-decisions');
+    return host ? (host.querySelector('textarea') || host.querySelector('input')) : null;
+  }
+
+  function publish() {
+    const field = store();
+    if (!field) { return; }
+    const decisions = {}, names = {};
+    tiles().forEach(tile => {
+      const key = tile.dataset.idx;
+      decisions[key] = tile.dataset.decision || PENDING;
+      const box = tile.querySelector('input.r7-name');
+      if (box) { names[key] = box.value; }
+    });
+    const payload = JSON.stringify({decisions: decisions, names: names});
+    if (field.value === payload) { return; }
+    const proto = field.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(field, payload);
+    field.dispatchEvent(new Event('input', {bubbles: true}));
+    paintCounts();
+  }
+
+  function paintCounts() {
+    const host = document.querySelector('#audio-counts');
+    if (!host) { return; }
+    const box = host.querySelector('textarea') || host.querySelector('input');
+    if (!box) { return; }
+    let keep = 0, drop = 0, pend = 0;
+    tiles().forEach(tile => {
+      const d = tile.dataset.decision || PENDING;
+      if (d === SELECTED) { keep++; } else if (d === REJECTED) { drop++; } else { pend++; }
+    });
+    const text = 'Keep ' + keep + '   \u00b7   Discard ' + drop
+               + '   \u00b7   Undecided ' + pend + '   \u00b7   Total ' + tiles().length;
+    if (box.value !== text) {
+      const proto = box.tagName === 'TEXTAREA'
+        ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(box, text);
+      box.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+  }
+
+  function classify(tile, decision) {
+    if (!tile) { return; }
+    tile.dataset.decision = decision;
+    Object.keys(CLS).forEach(key => tile.classList.remove(CLS[key]));
+    tile.classList.add(CLS[decision]);
+    const badge = tile.querySelector('.r7-badge');
+    if (badge) { badge.textContent = BADGE[decision]; }
+    publish();
+  }
+
+  // ---- playback: exactly one at a time --------------------------------------------------------
+  function stop() {
+    if (!playing) { return; }
+    try { playing.pause(); playing.currentTime = 0; } catch (e) {}
+    const tile = playing.closest ? playing.closest('.r7-tile') : null;
+    if (tile) { tile.classList.remove('r7-playing'); }
+    const label = stateOf(tile);
+    if (label) { label.textContent = armed ? 'hover to play' : 'click Enable hover audio'; }
+    playing = null;
+  }
+
+  function play(tile) {
+    const audio = audioOf(tile);
+    if (!audio) { return; }
+    stop();                                   // never two at once
+    playing = audio;
+    tile.classList.add('r7-playing');
+    audio.loop = true;
+    audio.muted = false;                      // the operator needs to HEAR it; never a silent fake
+    audio.volume = 1.0;
+    try { audio.currentTime = 0; } catch (e) {}
+    const label = stateOf(tile);
+    if (label) { label.textContent = 'playing\u2026'; }
+    const started = audio.play();
+    if (started && typeof started.catch === 'function') {
+      started.catch(() => {
+        // Chrome refuses audible autoplay before a user gesture. Say so and offer the one click
+        // that fixes it -- deliberately NOT falling back to muted playback, which would look like
+        // it worked while the operator heard nothing.
+        armed = false;
+        tile.classList.remove('r7-playing');
+        if (playing === audio) { playing = null; }
+        if (label) { label.textContent = 'click Enable hover audio'; }
+        const banner = document.querySelector('#audio-enable-hover');
+        if (banner) { banner.classList.add('r7-needed'); }
+      });
+    }
+  }
+
+  // ---- events ---------------------------------------------------------------------------------
+  document.addEventListener('mouseover', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile || !document.querySelector('#r7-grid')) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    if (playing && playing.closest('.r7-tile') === tile) { return; }
+    play(tile);
+  }, true);
+
+  document.addEventListener('mouseout', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    const to = event.relatedTarget;
+    if (to && to.closest && to.closest('.r7-tile') === tile) { return; }   // still inside
+    if (playing && playing.closest('.r7-tile') === tile) { stop(); }
+  }, true);
+
+  document.addEventListener('click', event => {
+    const banner = event.target.closest ? event.target.closest('#audio-enable-hover') : null;
+    if (banner) {
+      // This click IS the gesture Chrome wanted.
+      armed = true;
+      banner.classList.remove('r7-needed');
+      const first = tiles()[0];
+      if (first) { play(first); setTimeout(stop, 250); }
+      return;
+    }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    classify(tile, SELECTED);
+  }, true);
+
+  document.addEventListener('contextmenu', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    event.preventDefault();
+    classify(tile, REJECTED);
+  }, true);
+
+  document.addEventListener('auxclick', event => {
+    if (event.button !== 1) { return; }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    event.preventDefault();
+    classify(tile, PENDING);
+  }, true);
+
+  document.addEventListener('keydown', event => {
+    const tile = document.activeElement && document.activeElement.closest
+      ? document.activeElement.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (document.activeElement.classList
+        && document.activeElement.classList.contains('r7-name')) { return; }
+    const key = event.key.toLowerCase();
+    if (key === 's') { event.preventDefault(); classify(tile, SELECTED); }
+    else if (key === 'r') { event.preventDefault(); classify(tile, REJECTED); }
+    else if (key === 'p') { event.preventDefault(); classify(tile, PENDING); }
+    else if (key === 'arrowright' || key === 'arrowleft'
+             || key === 'arrowdown' || key === 'arrowup') {
+      const all = tiles();
+      const at = all.indexOf(tile);
+      if (at < 0) { return; }
+      event.preventDefault();
+      const step = (key === 'arrowright' || key === 'arrowdown') ? 1 : -1;
+      const next = all[Math.min(all.length - 1, Math.max(0, at + step))];
+      if (next) { next.focus(); play(next); }
+    }
+  }, true);
+
+  // Shift+wheel seeks. `{passive:false}` or preventDefault is ignored; Chrome re-routes a shifted
+  // wheel to deltaX on some devices, so whichever axis moved is read.
+  document.addEventListener('wheel', event => {
+    if (!event.shiftKey) { return; }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    const audio = audioOf(tile);
+    if (!audio) { return; }
+    const moved = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (!moved) { return; }
+    event.preventDefault();
+    const duration = audio.duration;
+    if (!isFinite(duration) || duration <= 0) { return; }   // NaN until metadata lands
+    const step = seekStep(duration) * (moved > 0 ? 1 : -1);
+    audio.currentTime = Math.min(duration, Math.max(0, audio.currentTime + step));
+  }, {passive: false, capture: true});
+
+  document.addEventListener('input', event => {
+    if (event.target.classList && event.target.classList.contains('r7-name')) { publish(); }
+  }, true);
+
+  // A repaint replaces the grid, so the hidden field is re-published from whatever the server
+  // rendered. Confirm releases every player first -- see `_on_audio_confirm` for why that matters
+  // on Windows.
+  const observer = new MutationObserver(() => {
+    const grid = document.querySelector('#r7-grid');
+    if (!grid) { stop(); return; }
+    if (grid.dataset.r7Seen === '1') { return; }
+    grid.dataset.r7Seen = '1';
+    stop();
+    tiles().forEach(tile => {
+      if (!tile.dataset.decision) { tile.dataset.decision = PENDING; }
+    });
+    publish();
+  });
+  observer.observe(document.body, {childList: true, subtree: true});
+
+  // Releasing every <audio> before a move is the difference between a clip filing and a
+  // winerror 32. Capture phase, so it runs before Gradio sends the click.
+  document.addEventListener('pointerdown', event => {
+    const button = event.target.closest ? event.target.closest('#audio-confirm-button') : null;
+    if (button) { stop(); }
+  }, true);
+}
+"""
+
 CLIPS_GALLERY_JS = r"""
 () => {
   if (window.__r5Installed) { return; }
@@ -6742,24 +6989,25 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
     info, refusal = _audio_probe(source)
     if refusal:
-        return refusal, [], gr.update(choices=[], value=None), '', '', []
+        return refusal, [], '', AUDIO_COUNTS_INITIAL_TEXT, '', []
 
     folder = (output_folder or '').strip().strip('"')
     if not folder:
         return ("❌ Choose an output folder first.", [],
-                gr.update(choices=[], value=None), '', '', [])
+                '', AUDIO_COUNTS_INITIAL_TEXT, '', [])
     try:
         silences, segments, failure = _audio_plan(info, settings)
     except Exception as failure:                      # noqa: BLE001
-        return f"❌ Analysis failed: {failure}", [], gr.update(choices=[], value=None), '', '', []
+        return (f"❌ Analysis failed: {failure}", [],
+                '', AUDIO_COUNTS_INITIAL_TEXT, '', [])
     if failure:
-        return failure, [], gr.update(choices=[], value=None), '', '', []
+        return failure, [], '', AUDIO_COUNTS_INITIAL_TEXT, '', []
 
     stem = fork_audio.safe_stem(info.path)
     rows = fork_audio.segment_rows(segments, stem, settings['format'])
     if not segments:
         return (fork_audio.plan_summary(info, silences, segments, settings), rows,
-                gr.update(choices=[], value=None), '', '', [])
+                '', AUDIO_COUNTS_INITIAL_TEXT, '', [])
 
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     run_directory = os.path.join(folder, fork_audio.run_directory_name(stem, stamp))
@@ -6767,7 +7015,7 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
         os.makedirs(run_directory, exist_ok=False)
     except OSError as failure:
         return (f"❌ Could not create the output folder:\n{run_directory}\n{failure}", rows,
-                gr.update(choices=[], value=None), '', '', [])
+                '', AUDIO_COUNTS_INITIAL_TEXT, '', [])
 
     ffmpeg, _ = _audio_tools()
     written, failures, review = {}, [], []
@@ -6814,77 +7062,114 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
         lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
     report = "\n".join(lines) + manifest_note
 
-    choices = [(entry['label'], entry['path']) for entry in review]
-    first = review[0] if review else None
+    # [R7.1] The review surface is the gallery. Decisions start empty -- every clip is PENDING
+    # until the operator says otherwise, and Confirm refuses while any of them still is.
+    counts = fork_audio.decision_counts(review, {})
     return (report, rows,
-            gr.update(choices=choices, value=first['path'] if first else None),
-            fork_audio.preview_markup(first['path'], first['name']) if first else '',
-            first['name'] if first else '',
+            fork_audio.gallery_markup(review),
+            fork_audio.counts_line(counts),
+            '',
             review)
 
 
-def _audio_entry(review, path):
-    for entry in review or ():
-        if entry.get('path') == path:
-            return entry
-    return None
+def _audio_decisions(payload) -> tuple:
+    """`(decisions, names)` from the hidden field. Anything malformed is simply no decisions.
 
-
-def _on_audio_select(path, review):
-    """Load the chosen clip into the player and offer its current name."""
-    entry = _audio_entry(review, path)
-    if entry is None:
-        return '', ''
-    return fork_audio.preview_markup(entry['path'], entry['name']), entry['name']
-
-
-def _audio_file_clip(path, preferred, destination, review, verb, folder_label):
-    """Shared body of Keep and Discard: file one clip, then advance to the next.
-
-    Both buttons do the same thing to a different folder, so they share one implementation; the
-    only asymmetry in the whole feature is the words in the report.
+    The browser is not trusted to be well-formed, only to be the operator's own page: an
+    unreadable payload leaves every clip PENDING, and Confirm then refuses rather than guessing.
     """
-    entry = _audio_entry(review, path)
-    remaining = list(review or ())
-    if entry is None:
-        return ("Pick a clip first.", gr.update(), '', '', remaining)
-
-    # Only the folder actually being written to is checked. The other may legitimately still be
-    # blank -- an operator who only ever keeps clips should not have to name a quarantine folder.
-    problem = fork_audio_library.destination_problem(
-        destination, folder_label, os.path.dirname(entry['path']))
-    if problem:
-        return (f"❌ {problem}", gr.update(),
-                fork_audio.preview_markup(entry['path'], entry['name']),
-                entry['name'], remaining)
-
     try:
-        landed = fork_audio_library.file_clip(entry['path'], destination, preferred)
-    except fork_audio_library.FilingError as failure:
-        return (f"❌ Nothing was moved — {failure}", gr.update(),
-                fork_audio.preview_markup(entry['path'], entry['name']),
-                entry['name'], remaining)
+        parsed = json.loads(payload or '{}')
+    except (ValueError, TypeError):
+        return {}, {}
+    if not isinstance(parsed, dict):
+        return {}, {}
+    decisions = parsed.get('decisions')
+    names = parsed.get('names')
+    decisions = {str(k): str(v) for k, v in decisions.items()} \
+        if isinstance(decisions, dict) else {}
+    names = {str(k): str(v) for k, v in names.items()} if isinstance(names, dict) else {}
+    return decisions, names
 
-    remaining = [item for item in remaining if item['path'] != entry['path']]
-    choices = [(item['label'], item['path']) for item in remaining]
-    following = remaining[0] if remaining else None
-    done = '' if remaining else "\n\nEvery clip in this batch has been filed."
-    return (f"✅ {verb}: {os.path.basename(landed)}\n→ {destination}{done}",
-            gr.update(choices=choices, value=following['path'] if following else None),
-            fork_audio.preview_markup(following['path'], following['name']) if following else '',
-            following['name'] if following else '',
+
+def _on_audio_confirm(payload, library_folder, discarded_folder, review):
+    """Sort the page: SELECTED into the voice library, REJECTED into quarantine.
+
+    **Refuses while any clip is undecided**, which is the requirement and also the only safe
+    reading: a clip nobody looked at is not a clip nobody wants.
+
+    What moves comes from the SERVER's own `review` list; the browser supplies only a decision and
+    a name per clip id. A payload naming a clip that is not on this page cannot move anything,
+    because nothing is ever filed by a path that came from the page.
+
+    The gallery releases every `<audio>` on `pointerdown` of this button, before Gradio sends the
+    click. That is not decoration: Windows will not rename a file a player still holds open, and
+    the clip the operator just listened to is exactly the one that would refuse to move.
+    """
+    entries = list(review or ())
+    if not entries:
+        return ("Nothing has been cut yet.", '', AUDIO_COUNTS_INITIAL_TEXT, entries)
+
+    decisions, names = _audio_decisions(payload)
+    counts = fork_audio.decision_counts(entries, decisions)
+    if counts[fork_audio.PENDING]:
+        return (f"\u274c {AUDIO_CONFIRM_DISABLED_TEXT}\n\n"
+                f"{counts[fork_audio.PENDING]} of {counts['TOTAL']} clip(s) are still undecided.",
+                fork_audio.gallery_markup(entries, decisions, names),
+                fork_audio.counts_line(counts), entries)
+
+    # Validate only the destinations this page will actually use, so an operator who kept
+    # everything never has to name a quarantine folder.
+    wanted = {decisions.get(str(e.get('index'))) for e in entries}
+    for decision, folder, label in (
+            (fork_audio.SELECTED, library_folder, 'voice library'),
+            (fork_audio.REJECTED, discarded_folder, 'Discarded folder')):
+        if decision in wanted:
+            problem = fork_audio_library.destination_problem(
+                folder, label, os.path.dirname(entries[0].get('path') or ''))
+            if problem:
+                return (f"\u274c Nothing was moved \u2014 {problem}",
+                        fork_audio.gallery_markup(entries, decisions, names),
+                        fork_audio.counts_line(counts), entries)
+
+    kept, discarded, failures, remaining = 0, 0, [], []
+    for entry in entries:
+        key = str(entry.get('index'))
+        decision = decisions.get(key, fork_audio.PENDING)
+        folder = library_folder if decision == fork_audio.SELECTED else discarded_folder
+        try:
+            fork_audio_library.file_clip(entry['path'], folder, names.get(key, ''))
+        except fork_audio_library.FilingError as failure:
+            failures.append(str(failure))
+            remaining.append(entry)
+            continue
+        if decision == fork_audio.SELECTED:
+            kept += 1
+        else:
+            discarded += 1
+
+    lines = [f"\u2705 Sorted {kept + discarded} of {len(entries)} clip(s)."]
+    if kept:
+        lines.append(f"Voice library ({library_folder}): {kept} kept")
+    if discarded:
+        lines.append(f"Discarded ({discarded_folder}): {discarded} discarded")
+    if failures:
+        lines += ["", "Not moved:"] + [f"  \u2022 {line}" for line in failures]
+        lines.append("")
+        lines.append("The clips that did not move are still on screen.")
+    elif not remaining:
+        lines.append("")
+        lines.append("Every clip in this batch has been filed.")
+
+    # Repaint from what is genuinely left on disk. Showing the old page would leave already-moved
+    # clips on screen, and a second Confirm would then report them as missing.
+    leftover = {str(e.get('index')) for e in remaining}
+    return ("\n".join(lines),
+            fork_audio.gallery_markup(remaining,
+                                      {k: v for k, v in decisions.items() if k in leftover},
+                                      {k: v for k, v in names.items() if k in leftover}),
+            fork_audio.counts_line(fork_audio.decision_counts(remaining, decisions)),
             remaining)
-
-
-def _on_audio_keep(path, preferred, library_folder, review):
-    """KEEP: move the clip into the voice library under the name in the box."""
-    return _audio_file_clip(path, preferred, library_folder, review, 'Kept', 'voice library')
-
-
-def _on_audio_discard(path, preferred, discarded_folder, review):
-    """DISCARD: move the clip to quarantine. Nothing is ever deleted."""
-    return _audio_file_clip(path, preferred, discarded_folder, review, 'Discarded',
-                            'Discarded folder')
 
 
 def _browse_audio_source(current):
@@ -8615,33 +8900,38 @@ def create_ui() -> gr.Blocks:
                         audio_discarded_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='audio-discarded-browse')
+                    gr.Markdown(INFO_AUDIO_GALLERY)
+                    gr.HTML(AUDIO_GALLERY_CSS)
+                    with gr.Row():
+                        audio_enable_hover = gr.Button(
+                            LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                            elem_id='audio-enable-hover')
+                        audio_counts = gr.Textbox(
+                            label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                            interactive=False, elem_id='audio-counts')
+                    audio_gallery = gr.HTML(value='', elem_id='audio-gallery')
+                    # The ONE server contract with the page: every decision and every edited name
+                    # as JSON. Hidden because it is machinery, not a control -- but a real widget,
+                    # so Gradio carries it with the click like any other input.
+                    # NOT `visible=False`: Gradio drops an invisible component from the DOM
+                    # entirely, and the page has to be able to write into this one. It is hidden
+                    # with CSS instead -- present, carried with the click, and off screen.
+                    audio_decisions = gr.Textbox(
+                        value='', label=' ', elem_id='audio-decisions')
+                    audio_confirm_btn = gr.Button(
+                        LABEL_AUDIO_CONFIRM, variant='primary',
+                        elem_id='audio-confirm-button')
                     with gr.Row():
                         with gr.Column(scale=2):
-                            audio_clip_picker = gr.Dropdown(
-                                label=LABEL_AUDIO_REVIEW, choices=[], value=None,
-                                interactive=True, elem_id='audio-clip-picker')
                             audio_clip_name = gr.Textbox(
                                 label=LABEL_AUDIO_CLIP_NAME,
                                 info=INFO_AUDIO_CLIP_NAME,
-                                value='', elem_id='audio-clip-name')
-                            with gr.Row():
-                                audio_keep_btn = gr.Button(
-                                    LABEL_AUDIO_KEEP, variant='primary',
-                                    elem_id='audio-keep-button')
-                                audio_discard_btn = gr.Button(
-                                    LABEL_AUDIO_DISCARD, variant='secondary',
-                                    elem_id='audio-discard-button')
+                                value='', visible=False, elem_id='audio-clip-name')
                         with gr.Column(scale=3):
-                            # The clip is inlined as a data URI rather than handed over as a
-                            # path. Gradio serves files only from its own cache, the working
-                            # directory or the system temp directory, so an exported clip in the
-                            # operator's chosen folder raises `InvalidPathError` -- measured. The
-                            # fix is NOT to widen `allowed_paths`: that exposes a whole tree to
-                            # every request, which this application already refused once. The
-                            # browser's own control supplies play/pause and scrubbing.
-                            gr.Markdown(f"**{LABEL_AUDIO_PLAYER}**")
+                            # [R7.1] Kept as a fallback player for a single clip, hidden by
+                            # default: the gallery's hover playback is the review surface now.
                             audio_player = gr.HTML(
-                                value='', elem_id='audio-player')
+                                value='', visible=False, elem_id='audio-player')
                     audio_file_report = gr.Textbox(
                         label=LABEL_AUDIO_FILE_REPORT,
                         value=AUDIO_FILE_REPORT_INITIAL_TEXT,
@@ -8900,30 +9190,18 @@ def create_ui() -> gr.Blocks:
             fn=_on_audio_cut,
             inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
                     audio_pad, audio_min_clip, audio_format],
-            outputs=[audio_report, audio_table, audio_clip_picker, audio_player,
-                     audio_clip_name, audio_review_state],
+            outputs=[audio_report, audio_table, audio_gallery, audio_counts,
+                     audio_decisions, audio_review_state],
             concurrency_limit=None,
         )
-        audio_clip_picker.change(
-            fn=_on_audio_select,
-            inputs=[audio_clip_picker, audio_review_state],
-            outputs=[audio_player, audio_clip_name],
-            concurrency_limit=None,
-        )
-        audio_keep_btn.click(
-            fn=_on_audio_keep,
-            inputs=[audio_clip_picker, audio_clip_name, audio_library_folder,
+        # [R7.1] ONE filing action, as the Clips Preview has. The browser contributes a decision
+        # and a name per clip id through `audio_decisions`; every path comes from the server's own
+        # review list, so the page cannot name a file to move.
+        audio_confirm_btn.click(
+            fn=_on_audio_confirm,
+            inputs=[audio_decisions, audio_library_folder, audio_discarded_folder,
                     audio_review_state],
-            outputs=[audio_file_report, audio_clip_picker, audio_player, audio_clip_name,
-                     audio_review_state],
-            concurrency_limit=None,
-        )
-        audio_discard_btn.click(
-            fn=_on_audio_discard,
-            inputs=[audio_clip_picker, audio_clip_name, audio_discarded_folder,
-                    audio_review_state],
-            outputs=[audio_file_report, audio_clip_picker, audio_player, audio_clip_name,
-                     audio_review_state],
+            outputs=[audio_file_report, audio_gallery, audio_counts, audio_review_state],
             concurrency_limit=None,
         )
 
@@ -9676,6 +9954,10 @@ def create_ui() -> gr.Blocks:
         # The gallery's interaction layer. `fn=None` means this registers no server call: it only
         # installs the listeners once per page load.
         app.load(fn=None, inputs=None, outputs=None, js=CLIPS_GALLERY_JS)
+        # [R7.1] The Audio Cutter gallery's own listeners. A separate registration rather than a
+        # merged script: the two galleries share no behaviour beyond being grids of tiles, and one
+        # combined blob would make either harder to change safely.
+        app.load(fn=None, inputs=None, outputs=None, js=AUDIO_GALLERY_JS)
 
     return app
 
