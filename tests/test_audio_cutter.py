@@ -295,6 +295,84 @@ def test_flac_is_offered_and_is_lossless_at_the_same_rate():
 
 
 # =============================================================================================
+# [R7.2 Phase 5] MP3 output
+# =============================================================================================
+
+def test_mp3_is_offered_as_a_third_format_and_nothing_was_reordered():
+    """Appended, never inserted. WAV stays the default, which several callers rely on."""
+    assert cutter.FORMATS == (cutter.FORMAT_WAV, cutter.FORMAT_FLAC, cutter.FORMAT_MP3)
+    assert cutter.FORMAT_MP3 == "mp3"
+
+
+def test_mp3_uses_libmp3lame_at_the_suggested_bitrate():
+    segment = cutter.Segment(index=1, start=0.0, end=1.0)
+    argv = cutter.build_extract_command("ffmpeg.exe", "in.mp3", segment, "o.mp3",
+                                        cutter.FORMAT_MP3)
+    assert argv[argv.index("-c:a") + 1] == "libmp3lame" == cutter.MP3_ENCODER
+    assert argv[argv.index("-b:a") + 1] == "192k"
+    assert cutter.DEFAULT_MP3_BITRATE_KBPS == 192
+    assert argv[argv.index("-ar") + 1] == "48000", "a valid MPEG-1 Layer III rate"
+
+
+def test_mp3_asks_for_the_gapless_header_so_timings_are_as_close_as_mp3_permits():
+    """An MP3 frame is 1152 samples, so the encoder cannot end on an arbitrary sample. LAME
+    records the delay and padding in the Xing/LAME header and a decoder that honours it reproduces
+    the clip's original length; `-write_xing 1` makes that explicit rather than leaving it to the
+    muxer's default. This is **not** sample-exactness and must not be described as such."""
+    argv = cutter.build_extract_command("ffmpeg.exe", "in.mp3",
+                                        cutter.Segment(1, 0.0, 1.0), "o.mp3", cutter.FORMAT_MP3)
+    assert argv[argv.index("-write_xing") + 1] == "1"
+
+
+@pytest.mark.parametrize("fmt", ["wav", "flac", "mp3"])
+def test_no_format_ever_forces_a_channel_count(fmt):
+    """Mono stays mono and stereo stays stereo, by omission. Forcing stereo on a mono voice clip
+    would double the bitrate MP3 needs for the same quality."""
+    argv = cutter.build_extract_command("ffmpeg.exe", "in.wav",
+                                        cutter.Segment(1, 0.0, 1.0), f"o.{fmt}", fmt)
+    assert "-ac" not in argv
+
+
+def test_mp3_keeps_the_no_overwrite_and_first_audio_stream_rules():
+    """Phase 5 must not change anything but the encoder."""
+    argv = cutter.build_extract_command("ffmpeg.exe", "in.mkv",
+                                        cutter.Segment(1, 2.0, 3.0), "o.mp3", cutter.FORMAT_MP3)
+    assert "-n" in argv and "-y" not in argv
+    assert argv[argv.index("-map") + 1] == "0:a:0"
+    assert "-vn" in argv
+    assert argv.index("-ss") < argv.index("-i"), "the fast accurate seek"
+
+
+def test_an_unknown_or_missing_format_falls_back_to_wav():
+    """A `gr.Radio` can hand over `None`. Reaching an argv builder with an unknown format would
+    write a file with an extension nothing can open."""
+    for junk in (None, "", "ogg", "MP4", 7, object()):
+        assert cutter.normalize_format(junk) == cutter.FORMAT_WAV
+    # Case and whitespace are tolerated, because a stored preference may carry either.
+    assert cutter.normalize_format(" MP3 ") == cutter.FORMAT_MP3
+    assert cutter.normalize_format("FLAC") == cutter.FORMAT_FLAC
+
+
+def test_the_encoder_probe_matches_a_whole_token_and_fails_closed():
+    """An empty or failed probe must answer False. Matching a substring would make a missing
+    encoder look present, and every clip would then fail with an FFmpeg error instead."""
+    real = (" A....D flac                 FLAC (Free Lossless Audio Codec)\n"
+            " A....D libmp3lame           libmp3lame MP3 (MPEG audio layer 3) (codec mp3)\n")
+    assert cutter.encoder_available(real) is True
+    assert cutter.encoder_available("") is False
+    assert cutter.encoder_available(None) is False
+    assert cutter.encoder_available(" A....D libmp3lame_ng  something ") is False
+    assert cutter.encoder_available(real, "") is False
+
+
+def test_the_encoder_probe_argv_is_a_plain_listing():
+    argv = cutter.build_encoders_command("ffmpeg.exe")
+    assert argv[0] == "ffmpeg.exe"
+    assert "-encoders" in argv
+    assert "-hide_banner" in argv
+
+
+# =============================================================================================
 # Names and the manifest
 # =============================================================================================
 
@@ -318,6 +396,32 @@ def test_the_flac_choice_changes_the_extension():
     assert cutter.clip_filename("t", 1, cutter.FORMAT_FLAC).endswith(".flac")
 
 
+def test_the_mp3_choice_changes_the_extension_and_keeps_the_padding():
+    """[R7.2] A wrong extension here would hand Audio Layers a file it cannot open -- and the
+    zero-padding still has to survive, because Audio Layers plays files in filename order."""
+    assert cutter.clip_filename("t", 1, cutter.FORMAT_MP3) == "t_part_001.mp3"
+    names = [cutter.clip_filename("take", n, cutter.FORMAT_MP3) for n in (1, 2, 10, 100)]
+    assert names == sorted(names)
+
+
+def test_an_unknown_format_still_produces_an_openable_name():
+    assert cutter.clip_filename("t", 1, "ogg").endswith(".wav")
+    assert cutter.clip_filename("t", 1, None).endswith(".wav")
+
+
+def test_mp3_is_accepted_by_audio_layers_so_exported_clips_are_usable_there():
+    """[R7.2 Phase 5] "MP3 must work in Audio Layers" -- asserted against the real voice-input
+    allowlist rather than assumed, because advertising a format the mixdown refuses would make the
+    UI and the executor disagree about the contract."""
+    from beatsync_fork import audio_mix
+
+    assert f".{cutter.FORMAT_MP3}" in audio_mix.SUPPORTED_VOICE_EXTENSIONS
+    for fmt in cutter.FORMATS:
+        extension = os.path.splitext(cutter.clip_filename("t", 1, fmt))[1]
+        assert extension in audio_mix.SUPPORTED_VOICE_EXTENSIONS, (
+            f"the cutter can export {extension} but Audio Layers will not accept it")
+
+
 def test_the_manifest_records_the_source_the_timings_and_the_outputs():
     info = cutter.SourceInfo(path="in.wav", duration=10.0, has_audio=True,
                             codec="pcm_s16le", sample_rate=48000, channels=1)
@@ -331,6 +435,36 @@ def test_the_manifest_records_the_source_the_timings_and_the_outputs():
                                       "output": "in_part_001.wav", "written": True}
     assert payload["segments"][1]["written"] is False, "an unwritten clip must be visibly absent"
     assert json.loads(json.dumps(payload)) == payload, "the manifest must be JSON-serialisable"
+
+
+def test_the_manifest_records_the_codec_format_and_bitrate():
+    """[R7.2 Phase 5] "Which format is this folder in" is a question an operator asks about a
+    library months later, and a `.wav` extension does not answer it -- it says nothing about the
+    bit depth, and for MP3 nothing about the bitrate."""
+    info = cutter.SourceInfo(path="in.mp3", duration=10.0, has_audio=True)
+    segments = [cutter.Segment(1, 1.0, 2.0)]
+
+    mp3 = cutter.manifest_payload(info, segments, {"format": "mp3"}, {1: "in_part_001.mp3"},
+                                  cutter.encoding_record("mp3"))
+    assert mp3["encoding"] == {
+        "format": "mp3", "extension": "mp3", "sample_rate": 48000, "lossy": True,
+        "codec": "libmp3lame", "bitrate_kbps": 192, "bitrate_mode": "cbr"}
+    assert json.loads(json.dumps(mp3)) == mp3
+
+    wav = cutter.encoding_record("wav")
+    assert wav["codec"] == "pcm_s16le" and wav["lossy"] is False
+    flac = cutter.encoding_record("flac")
+    assert flac["codec"] == "flac" and flac["lossy"] is False
+
+
+def test_the_encoding_block_is_derived_when_a_caller_does_not_supply_one():
+    """A defaulted trailing parameter, so every existing caller and every existing reader is
+    unaffected. The format already lived in `settings`, so nothing is guessed."""
+    info = cutter.SourceInfo(path="in.wav", duration=1.0, has_audio=True)
+    payload = cutter.manifest_payload(info, [], {"format": "flac"}, {})
+    assert payload["encoding"]["codec"] == "flac"
+    # And with no format at all it falls back to the documented default rather than raising.
+    assert cutter.manifest_payload(info, [], {}, {})["encoding"]["format"] == "wav"
 
 
 # =============================================================================================
@@ -667,56 +801,276 @@ def test_the_review_list_is_per_session_state_not_a_module_record(gui_tree: ast.
     tried first and was wrong: `_AUDIO_REVIEW` is a substring of the perfectly legitimate UI label
     `LABEL_AUDIO_REVIEW`, so the ban fired on a piece of prose.
     """
-    assert "audio_review_state = gr.State([])" in gui_source
+    assert "audio_review_state = gr.State({})" in gui_source
     module_level = {target.id for node in gui_tree.body
                     if isinstance(node, ast.Assign)
                     for target in node.targets if isinstance(target, ast.Name)}
     holders = {name for name in module_level
                if name.upper().startswith("_AUDIO") and not name.startswith("LABEL")}
-    assert holders == set(), f"module-level Audio Cutter record(s): {sorted(holders)}"
+    # [R7.2] Four module-level `_AUDIO*` names now exist and none of them is an operator's review
+    # list. They are allowed BY NAME rather than by a prefix pattern, so a future module-level
+    # record cannot join them by being spelled similarly.
+    allowed = {"_AUDIO_CUT_REGISTRY", "_AUDIO_PREVIEW_REGISTRY",
+               "_AUDIO_SURFACE_CUT", "_AUDIO_SURFACE_PREVIEW",
+               "_AUDIO_PREVIEW_OUTPUT_ORDER"}
+    assert holders <= allowed, (
+        f"unreviewed module-level Audio record(s): {sorted(holders - allowed)}")
 
 
-def test_confirm_repaints_everything_it_changed(gui_source: str):
+def test_the_module_level_audio_registries_hold_no_decisions_and_are_owner_scoped(gui_tree,
+                                                                                 gui_source):
+    """[R7.2] The two registries are process-global, so the claim above needs a positive half.
+
+    A `ClipRegistry` maps opaque ids to file identities and is scoped per owner internally -- the
+    same object the Clips Preview has used since R5-P1. **No decision, no edited name and no path
+    list is module-level**: those live in each tab's own `gr.State`, which is what keeps one
+    browser session's review unreachable from another.
+    """
+    for registry in ("_AUDIO_CUT_REGISTRY", "_AUDIO_PREVIEW_REGISTRY"):
+        assert f"{registry} = fork_clips.ClipRegistry()" in gui_source, registry
+    assert "_AUDIO_CUT_REGISTRY" != "_AUDIO_PREVIEW_REGISTRY"
+
+    # The two surfaces must not share a registry: `new_session` revokes an owner's previous
+    # sessions, so a shared one would let an Audio Preview scan kill the cutter's live gallery.
+    cut = ast.unparse(_func(gui_tree, "_on_audio_confirm"))
+    preview = ast.unparse(_func(gui_tree, "_on_audio_preview_confirm"))
+    assert "_AUDIO_SURFACE_CUT" in cut and "_AUDIO_SURFACE_PREVIEW" not in cut
+    assert "_AUDIO_SURFACE_PREVIEW" in preview and "_AUDIO_SURFACE_CUT" not in preview
+
+
+def _wired(gui_tree: ast.Module, button: str, which: str, event: str = "click") -> set:
+    """The widget names an event reads or writes, resolving ONE level of list-variable indirection.
+
+    [R7.2] Confirm, Proceed and Cancel share their `inputs=` and `outputs=` lists on purpose -- it
+    is what makes "all three read and write the same things" structural rather than three lists
+    kept in step by hand. A plain substring check would see only the variable name and pass
+    **vacuously**, which is exactly the trap `expanded_names_in` exists for in the Variant Lab
+    suites; this suite hit it on its first run against the new wiring.
+    """
+    call = _registration(gui_tree, button, event)
+    node = next(kw for kw in call.keywords if kw.arg == which).value
+    if isinstance(node, ast.Name):
+        for assign in ast.walk(gui_tree):
+            if (isinstance(assign, ast.Assign) and len(assign.targets) == 1
+                    and isinstance(assign.targets[0], ast.Name)
+                    and assign.targets[0].id == node.id):
+                node = assign.value
+                break
+        else:
+            raise AssertionError(f"{button} {which}={node.id} was never assigned")
+    assert isinstance(node, (ast.List, ast.Tuple)), ast.unparse(node)
+    return {n.id for n in node.elts if isinstance(n, ast.Name)}
+
+
+def _outputs_of(gui_tree: ast.Module, gui_source: str, button: str) -> set:
+    return _wired(gui_tree, button, "outputs")
+
+
+def test_confirm_repaints_everything_it_changed(gui_tree: ast.Module, gui_source: str):
     """[R7.1] One filing action. It must rewrite the report, the grid, the counters AND the
     server-side review list -- repainting the old page would leave already-moved clips on screen,
-    and a second Confirm would then report them as missing."""
-    start = gui_source.index("audio_confirm_btn.click(")
-    block = gui_source[start:gui_source.index("concurrency_limit", start)]
-    for widget in ("audio_file_report", "audio_gallery", "audio_counts", "audio_review_state"):
-        assert widget in block, widget
+    and a second Confirm would then report them as missing.
+
+    [R7.2] Plus the sweep gate's own two buttons and its signature, so a resolved batch cannot
+    leave a Proceed on screen that is no longer attached to any counts.
+    """
+    written = _outputs_of(gui_tree, gui_source, "audio_confirm_btn")
+    for widget in ("audio_file_report", "audio_gallery", "audio_counts", "audio_review_state",
+                   "audio_armed_state", "audio_proceed_btn", "audio_sweep_cancel_btn"):
+        assert widget in written, widget
+
+
+def test_proceed_and_cancel_write_exactly_what_confirm_writes(gui_tree: ast.Module,
+                                                              gui_source: str):
+    """[R7.2 Phase 3] There must be no path on which Proceed moves a file Confirm would not have
+    moved. Sharing the output set is half of that; `_on_audio_proceed` delegating to
+    `_on_audio_confirm` is the other half, so the sweep cannot acquire its own policy."""
+    confirm = _outputs_of(gui_tree, gui_source, "audio_confirm_btn")
+    assert _outputs_of(gui_tree, gui_source, "audio_proceed_btn") == confirm
+    assert _outputs_of(gui_tree, gui_source, "audio_sweep_cancel_btn") == confirm
+    body = ast.unparse(_func(gui_tree, "_on_audio_proceed"))
+    assert "_on_audio_confirm(" in body, "Proceed must BE Confirm, with the signature supplied"
 
 
 def test_confirm_takes_the_decisions_only_through_the_hidden_field(gui_tree: ast.Module):
     """The browser supplies a decision and a name per clip id. It never supplies a PATH -- every
-    file that moves is named by the server's own review list."""
-    call = _registration(gui_tree, "audio_confirm_btn", "click")
-    inputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "inputs").value)
-    assert "audio_decisions" in inputs
-    assert "audio_review_state" in inputs
+    file that moves is named by the server's own frozen page."""
+    read = _wired(gui_tree, "audio_confirm_btn", "inputs")
+    assert "audio_decisions" in read
+    assert "audio_review_state" in read
 
-    handler = _func(gui_tree, "_on_audio_confirm")
-    body = ast.unparse(handler)
-    assert "entry['path']" in body or 'entry["path"]' in body, \
-        "the path filed must come from the server's entry, not from the payload"
+    # [R7.2] The file that moves is `entry.path` off the registry's frozen ClipEntry, and the
+    # decision is looked up BY that entry. Nothing is indexed out of the payload.
+    body = ast.unparse(_func(gui_tree, "_audio_sort"))
+    assert "entry.clip_id" in body
+    assert "view.get('entries')" in body
+    assert "payload" not in body, "the sort must not see the browser's payload at all"
 
 
-def test_confirm_refuses_while_anything_is_undecided(gui_tree: ast.Module):
-    """Undecided is not a decision, and a clip nobody looked at is not a clip nobody wants."""
-    body = ast.unparse(_func(gui_tree, "_on_audio_confirm"))
-    assert "fork_audio.PENDING" in body
+def test_confirm_needs_one_kept_clip_and_never_sweeps_without_being_told(gui_tree: ast.Module):
+    """[R7.2 Phase 3] The admission rule the owner asked for, and the gate that keeps it safe.
+
+    R7.1 refused Confirm while anything was undecided, which made the operator click Reject on
+    every clip they did not want. Confirm now needs one KEPT clip. The unmarked remainder is
+    treated as discarded -- but only after an explicit, batch-specific confirmation, and the
+    sweep is an explicit parameter so it cannot happen by omission.
+    """
+    body = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
+
+    # The admission rule is "something is kept", not "nothing is undecided".
+    assert "plan.can_sort" in body
     assert "AUDIO_CONFIRM_DISABLED_TEXT" in body
-    refusal = body[:body.index("file_clip")]
-    assert "PENDING" in refusal, "the refusal must come before anything is filed"
+    refusal = body[:body.index("_audio_sort")]
+    assert "can_sort" in refusal, "the refusal must come before anything is filed"
+
+    # The sweep is gated on a signature that matches THIS batch, and the gate returns before the
+    # sort rather than falling through to it.
+    assert "plan.has_unmarked" in body
+    assert "plan.signature" in body
+    assert "AUDIO_SWEEP_GATE_PROMPT" in body
+    gate = body.index("plan.has_unmarked")
+    assert gate < body.index("_audio_sort"), "the gate must precede the sort"
+
+    # Sweeping is passed explicitly, so an unmarked clip can never be discarded by default.
+    assert "sweep_unmarked=" in body
+    sort_body = ast.unparse(_func(gui_tree, "_audio_sort"))
+    assert "unmarked_as=" in sort_body
+    assert "fork_audio_review.PENDING" in sort_body, (
+        "a caller without confirmation must pass PENDING, which leaves unmarked clips alone")
 
 
 def test_the_gallery_releases_its_players_before_confirm_moves_anything(gui_source: str):
     """Windows will not rename a file a player still holds open, and the clip the operator just
     listened to is exactly the one that would refuse to move. The listener is on `pointerdown` in
-    the CAPTURE phase, so it runs before Gradio sends the click."""
+    the CAPTURE phase, so it runs before Gradio sends the click.
+
+    [R7.2] Matched by CLASS rather than by one button id, because there are now four buttons that
+    can cause a move -- both tabs' Confirm and both tabs' Proceed. A hard-coded id list would have
+    to be kept in step with the markup by hand, and the one that got forgotten would be the one
+    that failed with a sharing violation.
+    """
     block = _gallery_block(gui_source)
     assert "pointerdown" in block
-    assert "audio-confirm-button" in block
+    assert ".r7-release-audio" in block
     assert "stop()" in block
+    # Every button that can move a file carries the class.
+    for button in ("audio_confirm_btn", "audio_proceed_btn",
+                   "audio_preview_confirm_btn", "audio_preview_proceed_btn"):
+        start = gui_source.index(f"{button} = gr.Button(")
+        declaration = gui_source[start:gui_source.index(")", gui_source.index(
+            "elem_id", start))]
+        assert "r7-release-audio" in declaration, f"{button} does not release the player"
+
+
+def test_the_cutters_destination_fields_validate_immediately_too(gui_tree: ast.Module):
+    """[R7.2 Phase 4] The owner's reported defect was on this surface as well: both destination
+    boxes set to the same folder, and sorting proceeding anyway. Each field gets its own binding,
+    registered explicitly rather than in a loop so these per-widget assertions can find it."""
+    for field in ("audio_library_folder", "audio_discarded_folder"):
+        written = _wired(gui_tree, field, "outputs", "change")
+        assert written == {"audio_destination_status"}, field
+        read = _wired(gui_tree, field, "inputs", "change")
+        assert read == {"audio_library_folder", "audio_discarded_folder", "audio_review_state"}
+
+    handler = ast.unparse(_func(gui_tree, "_on_audio_destinations_change"))
+    assert "destination_feedback" in handler
+    # It reports; it never sorts, writes a folder or repaints the gallery.
+    for forbidden in ("sort_clips", "file_entry", "os.makedirs", "_audio_render", "os.rename"):
+        assert forbidden not in handler, f"the change handler reaches {forbidden}"
+
+
+def test_the_cutter_no_longer_uses_the_single_destination_helper(gui_tree: ast.Module):
+    """`audio_library.destination_problem` checks ONE folder, so it cannot express "these two are
+    the same folder" at all -- which is exactly the check that was missing."""
+    core_fn = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
+    assert "destination_problem" not in core_fn
+    assert "fork_audio_review.validate_destinations" in core_fn
+
+
+def test_the_sweep_gate_buttons_are_hidden_until_confirm_finds_unmarked_clips(gui_source: str):
+    for button in ("audio_proceed_btn", "audio_sweep_cancel_btn"):
+        start = gui_source.index(f"{button} = gr.Button(")
+        declaration = gui_source[start:gui_source.index("elem_id", start)]
+        assert "visible=False" in declaration, button
+
+
+def test_the_gate_is_revealed_and_hidden_by_the_server_not_the_page(gui_tree: ast.Module):
+    """A Proceed the browser could reveal would be a Proceed with no counts behind it."""
+    for name in ("_on_audio_confirm", "_on_audio_cancel"):
+        body = ast.unparse(_func(gui_tree, name))
+        assert "gr.update(visible=" in body, name
+    gallery_js_free = ast.unparse(_func(gui_tree, "_audio_confirm_core"))
+    assert "visible" not in gallery_js_free, (
+        "the core decides WHETHER to gate; the handler owns the widget update")
+
+
+def test_the_cut_records_its_run_directory_so_the_results_can_be_opened_later(gui_tree: ast.Module):
+    """"Open results in Audio Preview" needs the folder the cut actually wrote to, not a widget the
+    operator may have edited since."""
+    written = _wired(gui_tree, "audio_cut_btn", "outputs")
+    assert "audio_run_dir_state" in written
+    cut = _func(gui_tree, "_on_audio_cut")
+    final = [node for node in ast.walk(cut) if isinstance(node, ast.Return)][-1]
+    assert "run_directory" in ast.unparse(final)
+
+
+def test_the_cut_refuses_mp3_up_front_when_the_encoder_is_missing(gui_tree: ast.Module):
+    """Writing a folder of unplayable files and reporting success would be worse than refusing.
+    The probe runs BEFORE anything is created."""
+    cut = ast.unparse(_func(gui_tree, "_on_audio_cut"))
+    assert "_audio_mp3_problem" in cut
+    assert cut.index("_audio_mp3_problem") < cut.index("os.makedirs")
+
+    problem = ast.unparse(_func(gui_tree, "_audio_mp3_problem"))
+    assert "build_encoders_command" in problem
+    assert "encoder_available" in problem
+    # A probe that cannot be RUN must refuse, not pass.
+    assert "FFmpeg is not available" in problem
+
+
+def test_the_export_format_selector_offers_every_format_the_cutter_can_write(gui_tree: ast.Module):
+    """[R7.2 Phase 5] The gap the first browser smoke test found.
+
+    The core, the handler, the argv builder, the manifest and the encoder probe all supported MP3
+    while the `gr.Radio` still listed two choices — so every unit test passed and the operator had
+    no way to select it. The selector is now pinned against `FORMATS` **by value**, so adding a
+    format to the core without offering it fails here rather than in somebody's hands.
+    """
+    body = _audio_tab_body(gui_tree)
+    tree = ast.parse(body)
+    radio = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and ast.unparse(node.func) == "gr.Radio"
+                 and any(kw.arg == "elem_id" and "audio-format" in ast.unparse(kw.value)
+                         for kw in node.keywords))
+    choices = next(kw for kw in radio.keywords if kw.arg == "choices").value
+    values = [ast.unparse(pair.elts[1]) for pair in choices.elts]
+    assert values == [f"fork_audio.FORMAT_{name.upper()}" for name in cutter.FORMATS], values
+
+    # WAV stays the default, and stays FIRST, because several callers rely on it.
+    default = next(kw for kw in radio.keywords if kw.arg == "value")
+    assert ast.unparse(default.value) == "fork_audio.FORMAT_WAV"
+    assert values[0] == "fork_audio.FORMAT_WAV"
+
+    # The MP3 label names the bitrate and says plainly that it is the lossy one.
+    labels = [ast.unparse(pair.elts[0]) for pair in choices.elts]
+    assert "lossy" in labels[-1].lower()
+    assert "DEFAULT_MP3_BITRATE_KBPS" in labels[-1]
+
+
+def test_the_cut_report_is_honest_about_mp3_being_a_lossy_re_encode(gui_tree: ast.Module):
+    """The owner asked for this explicitly: the advantage is smaller files, not better audio, and
+    MP3-to-MP3 is a re-encode rather than a stream copy."""
+    line = ast.unparse(_func(gui_tree, "_audio_format_line"))
+    assert "LOSSY" in line
+    assert "including from an MP3 source" in line
+    assert "not better audio" in line
+    assert "no stream copy" in line
+
+
+def test_the_manifest_written_by_a_cut_carries_the_encoding_block(gui_tree: ast.Module):
+    cut = ast.unparse(_func(gui_tree, "_on_audio_cut"))
+    assert "fork_audio.encoding_record(settings['format'])" in cut
+    assert "manifest_payload(info, segments, settings, written, encoding)" in cut
 
 
 def test_the_audio_layers_tip_is_present_and_names_the_real_controls(gui_source: str):
@@ -796,86 +1150,52 @@ def test_the_player_is_html_not_a_file_component(gui_tree: ast.Module):
 
 
 # =============================================================================================
-# [R7.1] The review gallery
+# [R7.2] The review gallery LEFT this module, and the byte budget went with it
+#
+# R7.1 built the tile grid in `audio_cutter` and embedded each clip as a base64 data URI under a
+# cumulative budget. The budget failed in real use exactly as a budget must -- a valid clip became
+# unplayable because EARLIER clips had spent the page's allowance -- so R7.2 replaced it with lazy
+# playback through an authorized endpoint and moved the gallery to `beatsync_fork.audio_review`,
+# which now has two callers.
+#
+# The gallery's own behaviour is covered in `tests/test_audio_review.py`. What belongs HERE is the
+# removal: this module must not keep a second, divergent implementation, and the cap must be gone
+# rather than merely raised.
 # =============================================================================================
 
-def _entry(index, name="a_part_001.wav", path="", start=1.0, end=3.5):
-    return {"index": index, "name": name, "path": path, "start": start, "end": end,
-            "label": f"{index:03d}"}
+@pytest.mark.parametrize("gone", ["gallery_markup", "decision_counts", "counts_line",
+                                  "MAX_EMBEDDED_BYTES", "DEFAULT_PAGE_SIZE", "_audio_element",
+                                  "PENDING", "SELECTED", "REJECTED", "DECISIONS"])
+def test_the_cutter_keeps_no_second_gallery_or_decision_vocabulary(gone):
+    """The whole point of Phase 1, plus the reason it is a move rather than a copy.
+
+    `MAX_EMBEDDED_BYTES` must be **absent**, not raised: a bigger number is the same defect with a
+    later threshold. And the decision words must live in exactly one module, because two copies of
+    PENDING/SELECTED/REJECTED is how the two review surfaces come to disagree about what a tile
+    means.
+    """
+    assert not hasattr(cutter, gone), (
+        f"audio_cutter still defines {gone}; the gallery moved to audio_review and a "
+        f"compatibility alias would leave two names for one concept")
+    assert gone not in cutter.__all__, f"{gone} is still exported"
 
 
-def test_a_tile_carries_its_number_duration_and_source_window(tmp_path):
-    clip = tmp_path / "a_part_001.wav"
-    clip.write_bytes(b"RIFF0000WAVE")
-    markup = cutter.gallery_markup([_entry(1, path=str(clip))])
-    assert 'data-idx="1"' in markup
-    assert 'data-dur="2.500"' in markup
-    assert "0:02.5" in markup          # duration
-    assert "0:01.0" in markup and "0:03.5" in markup   # source window
+def test_the_grid_the_gui_renders_carries_urls_and_never_bytes(gui_source: str):
+    """`preview_markup` survives as the single-clip fallback and keeps its own small cap. What must
+    not survive is a *grid* of inlined clips, so no handler on the cut-and-review path may reach
+    base64 at all."""
+    tree = ast.parse(gui_source)
+    for name in ("_on_audio_cut", "_audio_render", "_audio_load_view", "_audio_tiles"):
+        body = ast.unparse(_func(tree, name))
+        assert "base64" not in body, f"{name} reaches base64"
+        assert "b64encode" not in body, f"{name} reaches b64encode"
+    # And the markup builder itself hands out an opaque URL.
+    from beatsync_fork import audio_review as review
 
-
-def test_every_tile_starts_pending():
-    markup = cutter.gallery_markup([_entry(1), _entry(2)])
-    assert markup.count("r7-pending") == 2
-    assert "r7-selected" not in markup and "r7-rejected" not in markup
-
-
-def test_existing_decisions_and_edited_names_survive_a_repaint():
-    markup = cutter.gallery_markup([_entry(1), _entry(2)],
-                                   decisions={"1": cutter.SELECTED, "2": cutter.REJECTED},
-                                   names={"1": "01 greeting"})
-    assert "r7-selected" in markup and "r7-rejected" in markup
-    assert 'value="01 greeting"' in markup
-
-
-def test_an_unknown_decision_is_read_as_pending():
-    assert "r7-pending" in cutter.gallery_markup([_entry(1)], decisions={"1": "NONSENSE"})
-
-
-def test_audio_is_embedded_but_bounded(tmp_path):
-    """A byte budget, not an unlimited blob: everything inside it is instant, everything past it
-    says so and is still playable from the output folder."""
-    entries = []
-    for n in range(1, 6):
-        clip = tmp_path / f"a_part_{n:03d}.wav"
-        clip.write_bytes(b"x" * 1000)
-        entries.append(_entry(n, path=str(clip)))
-
-    generous = cutter.gallery_markup(entries, budget=cutter.MAX_EMBEDDED_BYTES)
-    assert generous.count("<audio") == 5
-
-    tight = cutter.gallery_markup(entries, budget=2500)      # room for two
-    assert tight.count("<audio") == 2
-    assert tight.count("not loaded for preview") == 3
-    assert "was still exported" in tight, "an unloaded tile must not read as a failure"
-
-
-def test_every_tile_is_focusable_so_the_keyboard_works():
-    markup = cutter.gallery_markup([_entry(1)])
-    assert 'tabindex="0"' in markup
-
-
-def test_a_filename_cannot_carry_markup_into_the_gallery():
-    markup = cutter.gallery_markup([_entry(1, name='<img src=x onerror="alert(1)">')])
-    assert "<img" not in markup
-    assert "&lt;img" in markup
-
-
-def test_an_empty_page_says_so():
-    assert "No clips to review" in cutter.gallery_markup([])
-
-
-def test_counts_are_taken_from_the_server_entries_not_the_payload():
-    """A decision for a clip that is not on this page must not inflate the totals, and a clip with
-    no decision must count as pending rather than vanish."""
-    entries = [_entry(1), _entry(2)]
-    counts = cutter.decision_counts(entries, {"1": cutter.SELECTED, "99": cutter.REJECTED})
-    assert counts == {cutter.SELECTED: 1, cutter.REJECTED: 0, cutter.PENDING: 1, "TOTAL": 2}
-
-
-def test_the_counts_line_reads_like_the_clips_preview_one():
-    line = cutter.counts_line(cutter.decision_counts([_entry(1)], {}))
-    assert "Keep 0" in line and "Discard 0" in line and "Undecided 1" in line and "Total 1" in line
+    assert review.media_url("S", "P", "C").startswith("/r7")
+    assert "base64" not in review.gallery_html(
+        [review.AudioTile(clip_id="C", number=1, name="a.wav", duration=1.0)],
+        {}, "S", "P")
 
 
 # --- the interaction layer -------------------------------------------------------------------
@@ -898,14 +1218,51 @@ def gallery_js(gui_source: str) -> str:
 
 
 def test_only_one_clip_can_sound_at_a_time(gallery_js: str):
+    """[R7.2] Now structural rather than bookkept: there is **one** `<audio>` in the document,
+    created on first hover and re-pointed at whichever tile the pointer is over. R7.1 had one
+    element per tile and tracked which was sounding; a single element cannot play two clips."""
     assert "stop();" in gallery_js
-    assert "playing = null" in gallery_js
+    assert "holder = null" in gallery_js
+    assert gallery_js.count("document.createElement('audio')") == 1
+    assert "if (player) { return player; }" in gallery_js, (
+        "the player must be created once and reused, not per tile")
 
 
 def test_hover_plays_and_loops_and_leaving_resets(gallery_js: str):
     assert "mouseover" in gallery_js and "mouseout" in gallery_js
-    assert "audio.loop = true" in gallery_js
+    assert "player.loop = true" in gallery_js
     assert "currentTime = 0" in gallery_js
+
+
+def test_leaving_a_tile_releases_the_source_not_just_the_playback(gallery_js: str):
+    """[R7.2] Two things depend on the source actually being dropped: the HTTP fetch ends, and
+    Windows releases the handle the server opened -- `os.rename` will not move a file another
+    handle still has open, so the clip just listened to is the one that would refuse to sort.
+
+    `src=''` is deliberately NOT the mechanism: in Chrome that re-requests the page URL.
+    """
+    assert "removeAttribute('src')" in gallery_js
+    assert "player.load()" in gallery_js
+    assert "player.src = ''" not in gallery_js
+
+
+def test_the_player_is_lazy_and_range_capable(gallery_js: str):
+    """`preload='metadata'` is what makes `duration` answerable for Shift+wheel without pulling
+    the whole clip; the endpoint serves byte ranges, so a seek fetches only what it needs."""
+    assert "preload = 'metadata'" in gallery_js
+    assert "dataset.audio" in gallery_js, "a tile carries a URL, not bytes"
+
+
+def test_a_real_playback_failure_is_reported_as_one(gallery_js: str):
+    """[R7.2] There is no loading limit any more, so the only failures left are genuine ones. They
+    must read as what they are, and the tile must stay classifiable -- an unplayable clip is still
+    one the operator may want to keep."""
+    assert "MediaError" in gallery_js or "player.error" in gallery_js
+    assert "could not be decoded" in gallery_js
+    assert "not playable here" in gallery_js
+    assert "r7-failed" in gallery_js
+    assert "not loaded for preview" not in gallery_js, (
+        "the page-budget message must be gone, not reworded")
 
 
 def test_the_three_mouse_gestures_are_bound(gallery_js: str):
@@ -930,11 +1287,18 @@ def test_shift_wheel_uses_the_established_one_two_five_convention(gallery_js: st
 
 def test_blocked_autoplay_is_handled_and_never_faked_with_muted_audio(gallery_js: str):
     """The owner needs to HEAR the clips. Falling back to muted playback would look like it worked
-    while nothing came out."""
-    assert "catch" in gallery_js
+    while nothing came out.
+
+    [R7.2] The banner is matched by CLASS now, because there are two of them -- one per review tab
+    -- and a blocked autoplay in either must light up both: the browser's gesture requirement is
+    per page, not per tab.
+    """
+    assert "NotAllowedError" in gallery_js, "the autoplay refusal must be told from a load failure"
     assert "audio.muted = false" in gallery_js
     assert "muted = true" not in gallery_js
-    assert "audio-enable-hover" in gallery_js
+    assert ".r7-enable-hover" in gallery_js
+    assert gallery_js.count("querySelectorAll('.r7-enable-hover')") >= 2, (
+        "both banners are lit on refusal and cleared on the gesture")
 
 
 def test_the_name_box_never_classifies(gallery_js: str):
@@ -955,19 +1319,58 @@ def test_the_gallery_script_is_separate_from_the_clips_one(gui_source: str):
 
 # --- the payload ------------------------------------------------------------------------------
 
-def test_a_malformed_payload_leaves_everything_undecided(gui_tree: ast.Module):
-    """An unreadable payload must not guess. Confirm then refuses, which is the safe direction."""
-    namespace = {"json": __import__("json")}
-    exec(ast.unparse(_func(gui_tree, "_audio_decisions")), namespace)
-    read = namespace["_audio_decisions"]
-    for junk in ("", None, "not json", "[]", '{"decisions": 5}', "null"):
-        assert read(junk) == ({}, {})
+def _merge(gui_tree: ast.Module):
+    """The real `_audio_merge_payload`, AST-extracted and executed against a stub namespace.
+
+    `gui.py` cannot be imported on a bare interpreter, so the body is run against a synthesised
+    `fork_audio_review` carrying only the decision vocabulary it reads. That is the real function,
+    not a reimplementation of it.
+    """
+    from beatsync_fork import audio_review as review
+
+    namespace = {"json": __import__("json"), "fork_audio_review": review}
+    exec(ast.unparse(_func(gui_tree, "_audio_merge_payload")), namespace)
+    return namespace["_audio_merge_payload"]
 
 
-def test_a_well_formed_payload_is_read(gui_tree: ast.Module):
-    namespace = {"json": __import__("json")}
-    exec(ast.unparse(_func(gui_tree, "_audio_decisions")), namespace)
-    decisions, names = namespace["_audio_decisions"](
-        '{"decisions": {"1": "SELECTED"}, "names": {"1": "hello"}}')
-    assert decisions == {"1": "SELECTED"}
-    assert names == {"1": "hello"}
+#: A view with two clips on the page, mapping the browser's per-page ids to stable identities.
+_VIEW = {"identity": {"cA": "idA", "cB": "idB"}, "decisions": {}, "names": {}}
+
+
+@pytest.mark.parametrize("junk", ["", None, "not json", "[]", '{"decisions": 5}', "null",
+                                  '{"decisions": "SELECTED"}', '{"names": [1, 2]}'])
+def test_a_malformed_payload_merges_nothing_and_discards_nothing(gui_tree: ast.Module, junk):
+    """An unreadable payload must not guess -- and, [R7.2], must not CLEAR either.
+
+    Merging nothing leaves the server's existing state standing. The opposite choice would let one
+    malformed update silently discard a page of real decisions, which matters much more now that
+    the record spans pages.
+    """
+    merge = _merge(gui_tree)
+    standing = dict(_VIEW, decisions={"idA": "SELECTED"}, names={"idA": "keep me"})
+    merged = merge(standing, junk)
+    assert merged["decisions"] == {"idA": "SELECTED"}
+    assert merged["names"] == {"idA": "keep me"}
+
+
+def test_a_well_formed_payload_is_read_and_keyed_by_identity(gui_tree: ast.Module):
+    """The browser sends per-page clip ids; the server stores by FILE identity. That translation
+    is what makes a decision survive paging and stop applying when the bytes change."""
+    merge = _merge(gui_tree)
+    merged = merge(_VIEW, '{"decisions": {"cA": "SELECTED"}, "names": {"cA": "hello"}}')
+    assert merged["decisions"] == {"idA": "SELECTED"}
+    assert merged["names"] == {"idA": "hello"}
+
+
+def test_a_clip_id_not_on_this_page_cannot_reach_the_record(gui_tree: ast.Module):
+    """A payload must not be able to decide for a clip the operator is not looking at."""
+    merge = _merge(gui_tree)
+    merged = merge(_VIEW, '{"decisions": {"cZZZ": "SELECTED"}, "names": {"cZZZ": "x"}}')
+    assert merged["decisions"] == {}
+    assert merged["names"] == {}
+
+
+def test_an_unknown_decision_word_is_stored_as_pending(gui_tree: ast.Module):
+    merge = _merge(gui_tree)
+    merged = merge(_VIEW, '{"decisions": {"cA": "NONSENSE"}}')
+    assert merged["decisions"] == {"idA": "PENDING"}

@@ -554,7 +554,25 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #: and two floats. It is a `gr.State` rather than a module-level record precisely so one browser
 #: session's review list is not reachable from another, which is the same reasoning that kept the
 #: Clips Preview registry per-session.
-_EXPECTED_STATE_COUNT = 8
+#:
+#: 12 since R7.2, which added four for the same per-session reason and nothing else:
+#:
+#:   `audio_armed_state`          the sweep signature of the batch the operator confirmed -- a
+#:                                plain sha256 string, never a live object. It exists so that
+#:                                agreeing to discard unmarked clips authorises ONE specific set of
+#:                                counts: change a decision or a folder and the signature no longer
+#:                                matches, so the operator is asked again.
+#:   `audio_run_dir_state`        the last cut's output folder, so "Open results in Audio Preview"
+#:                                can fill the other tab's box. A plain path string.
+#:   `audio_preview_state`        the Audio Preview tab's whole view -- session and page tokens,
+#:                                the frozen entries, and the decision/name records keyed by file
+#:                                identity, which is what makes paging lossless.
+#:   `audio_preview_armed_state`  that tab's own sweep signature, separate from the cutter's
+#:                                because the two review different clips.
+#:
+#: `audio_review_state` also changed shape, from a list of dicts to the same view dict. Nothing
+#: live -- no lock, thread, handle, descriptor or lifecycle -- enters any of them.
+_EXPECTED_STATE_COUNT = 12
 
 
 def test_the_expected_state_count_matches_the_named_states():
@@ -568,7 +586,11 @@ def test_the_expected_state_count_matches_the_named_states():
     assert len(names) == _EXPECTED_STATE_COUNT, names
     for expected in ("session_state", "source_state", "prep_state", "variant_batch_state",
                      "director_proposal_state", "render_invocation_state",
-                     "audio_review_state"):
+                     "audio_review_state",
+                     # [R7.2] Named individually rather than counted, so a future state cannot
+                     # satisfy the count by displacing one of these.
+                     "audio_armed_state", "audio_run_dir_state",
+                     "audio_preview_state", "audio_preview_armed_state"):
         assert expected in names, f"{expected} missing from {names}"
     assert "gr.State" in source
 

@@ -117,8 +117,12 @@ def _registrations(tree: ast.Module, suffix: str) -> list[ast.Call]:
 #: Clips Preview. That slot keeps Advanced Tools at index 3 -- so every containment assertion here
 #: that counts from the front is unaffected -- and keeps Clips Preview LAST, which its own
 #: assertion below requires.
+#: Amended by R7.2: a SEVENTH, the standalone Audio Preview review tab, in the same slot and for
+#: exactly the same two reasons -- between Audio Cutter and Clips Preview, so Advanced Tools stays
+#: at index 3 and Clips Preview stays last.
 _TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-         "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_CLIPS_PREVIEW")
+         "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
+         "LABEL_TAB_CLIPS_PREVIEW")
 
 
 def test_the_tab_set_is_exactly_the_documented_one(tree: ast.Module):

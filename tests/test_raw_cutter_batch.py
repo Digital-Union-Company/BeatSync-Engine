@@ -678,11 +678,13 @@ def test_batch_mode_is_not_a_top_level_tab_of_its_own(gui_source):
     The claim is therefore asserted directly: batch mode's widgets live **inside** the Raw Cutter
     tab, there is no tab label of its own, and the whole tab set is the documented five.
     """
-    # Amended for R7, which added the Raw Audio Cutter tab. The claim this test actually makes is
-    # unchanged and is asserted below by identity: no tab of this feature's own exists, and none of
-    # its widgets is declared in somebody else's tab.
+    # Amended for R7, which added the Raw Audio Cutter tab, and again for R7.2, which added the
+    # standalone Audio Preview tab. The claim this test actually makes is unchanged and is asserted
+    # below by identity: no tab of this feature's own exists, and none of its widgets is declared
+    # in somebody else's tab.
     expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-                "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_CLIPS_PREVIEW")
+                "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
+                "LABEL_TAB_CLIPS_PREVIEW")
     assert gui_source.count("gr.Tab(") == len(expected), "the top-level tab set changed"
     for label in expected:
         assert f"gr.Tab({label}" in gui_source, f"{label} is not a top-level tab"

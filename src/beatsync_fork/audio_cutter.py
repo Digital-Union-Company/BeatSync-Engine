@@ -49,10 +49,41 @@ DEFAULT_MIN_CLIP = 0.30
 #: Layers voice input accept without negotiation.
 FORMAT_WAV = "wav"
 FORMAT_FLAC = "flac"
-FORMATS = (FORMAT_WAV, FORMAT_FLAC)
+#: [R7.2] MP3 exists for one reason the owner stated plainly: output size. It is a **lossy
+#: re-encode**, including -- especially -- when the source was already an MP3, because this tool
+#: decodes to PCM to find the silences and there is no stream-copy path that could preserve the
+#: original frames across an arbitrary cut point. So the honest advantage is smaller files, never
+#: better audio, and the UI says exactly that.
+FORMAT_MP3 = "mp3"
+FORMATS = (FORMAT_WAV, FORMAT_FLAC, FORMAT_MP3)
+
+#: The FFmpeg encoder MP3 output needs. Checked for before an MP3 cut rather than discovered as a
+#: cryptic per-clip failure -- see :func:`build_encoders_command`.
+MP3_ENCODER = "libmp3lame"
+
+#: 192 kbps, the owner's suggestion: transparent enough for speech at roughly an eighth of the WAV
+#: size. Constant-bitrate rather than VBR so the file size is predictable from the duration, which
+#: is the property being bought.
+DEFAULT_MP3_BITRATE_KBPS = 192
 
 #: 16-bit, 48 kHz: the requested default, and the rate the rest of the app already mixes at.
+#: 48 kHz is also a valid MPEG-1 Layer III rate, so MP3 output needs no resampling exception.
 OUTPUT_SAMPLE_RATE = 48000
+
+#: The file extension each format lands as. One table, so a filename, a media type and an argv can
+#: never disagree about what was written.
+_EXTENSIONS = {FORMAT_WAV: "wav", FORMAT_FLAC: "flac", FORMAT_MP3: "mp3"}
+
+
+def normalize_format(fmt) -> str:
+    """Any widget value to one of :data:`FORMATS`, defaulting to WAV.
+
+    Total on purpose: a `gr.Radio` can hand over `None`, and an unknown value must fall back to
+    the documented default rather than reaching an argv builder that would then write a file with
+    an extension nothing can open.
+    """
+    text = str(fmt or "").strip().casefold()
+    return text if text in FORMATS else FORMAT_WAV
 
 PROBE_TIMEOUT_SECONDS = 60
 DETECT_TIMEOUT_SECONDS = 900
@@ -305,13 +336,13 @@ def safe_stem(source: str, fallback: str = "audio") -> str:
 def clip_filename(stem: str, index: int, fmt: str = FORMAT_WAV) -> str:
     """`stem_part_001.wav`. Zero-padded because **Audio Layers plays files in filename order**, and
     `part_10` sorting before `part_2` would silently reorder someone's voice-over."""
-    extension = FORMAT_FLAC if str(fmt) == FORMAT_FLAC else FORMAT_WAV
-    return f"{stem}_part_{int(index):03d}.{extension}"
+    return f"{stem}_part_{int(index):03d}.{_EXTENSIONS[normalize_format(fmt)]}"
 
 
 def build_extract_command(ffmpeg: str, source: str, segment: Segment, destination: str,
                           fmt: str = FORMAT_WAV,
-                          sample_rate: int = OUTPUT_SAMPLE_RATE) -> list[str]:
+                          sample_rate: int = OUTPUT_SAMPLE_RATE,
+                          mp3_bitrate_kbps: int = DEFAULT_MP3_BITRATE_KBPS) -> list[str]:
     """One clip's argv.
 
     ``-n`` rather than ``-y``: if the destination somehow exists, FFmpeg must refuse and say so.
@@ -320,19 +351,60 @@ def build_extract_command(ffmpeg: str, source: str, segment: Segment, destinatio
 
     ``-ss`` before ``-i`` is the fast accurate seek; ``-map 0:a:0`` with ``-vn`` takes exactly the
     first audio stream, so a video source contributes its sound and nothing else.
+
+    **Channel layout is preserved by omission in every branch.** There is no ``-ac`` anywhere here,
+    so a mono recording stays mono and a stereo one stays stereo -- which matters for MP3, where
+    forcing stereo on a mono voice clip would double the bitrate it needs for the same quality.
+
+    [R7.2] **MP3 timing, stated exactly rather than promised.** An MP3 frame is 1152 samples, so an
+    encoder cannot end a file on an arbitrary sample boundary; LAME pads the final frame and records
+    the delay and padding in the Xing/LAME header, which ``-write_xing 1`` makes explicit rather
+    than leaving to the muxer's default. A decoder that honours that header reproduces the clip's
+    original length; one that ignores it may hand back up to a frame -- about 24 ms at 48 kHz -- of
+    silence at each end. That is as close as MP3 permits, it is why WAV remains the default, and it
+    must not be described as sample-exact.
     """
     duration = max(0.0, float(segment.end) - float(segment.start))
+    resolved = normalize_format(fmt)
     command = [str(ffmpeg), "-hide_banner", "-nostdin", "-v", "error", "-n",
                "-ss", f"{float(segment.start):.6f}",
                "-i", str(source),
                "-t", f"{duration:.6f}",
                "-vn", "-map", "0:a:0", "-map_metadata", "-1"]
-    if str(fmt) == FORMAT_FLAC:
+    if resolved == FORMAT_FLAC:
         command += ["-c:a", "flac", "-sample_fmt", "s16"]
+    elif resolved == FORMAT_MP3:
+        command += ["-c:a", MP3_ENCODER,
+                    "-b:a", f"{int(mp3_bitrate_kbps)}k",
+                    "-write_xing", "1"]
     else:
         command += ["-c:a", "pcm_s16le"]
     command += ["-ar", str(int(sample_rate)), str(destination)]
     return command
+
+
+def build_encoders_command(ffmpeg: str) -> list[str]:
+    """The argv that lists what the installed FFmpeg can actually encode.
+
+    Asking is cheaper than finding out per clip. The portable build this app ships is a full one
+    and does carry ``libmp3lame``, but the installer can be pointed at another, and a missing
+    encoder would otherwise surface as every clip failing with an FFmpeg error the operator has no
+    way to read.
+    """
+    return [str(ffmpeg), "-hide_banner", "-v", "error", "-encoders"]
+
+
+def encoder_available(text: str, encoder: str = MP3_ENCODER) -> bool:
+    """Is ``encoder`` listed in ``ffmpeg -encoders`` output?
+
+    Matched as a whole whitespace-delimited token, never as a substring: ``libmp3lame`` must not be
+    satisfied by a hypothetical ``libmp3lame_something``, and more importantly an **empty or failed**
+    probe must answer `False` rather than matching nothing and being read as a pass.
+    """
+    needle = str(encoder or "").strip()
+    if not needle:
+        return False
+    return any(needle == token for token in str(text or "").split())
 
 
 def run_directory_name(stem: str, stamp: str) -> str:
@@ -349,11 +421,45 @@ MANIFEST_NAME = "audio_manifest.json"
 MANIFEST_SCHEMA = "beatsync-raw-audio-cutter-1"
 
 
-def manifest_payload(source: SourceInfo, segments, settings: dict, written) -> dict:
+def encoding_record(fmt, sample_rate: int = OUTPUT_SAMPLE_RATE,
+                    mp3_bitrate_kbps: int = DEFAULT_MP3_BITRATE_KBPS) -> dict:
+    """What was actually used to encode, as data rather than as prose in a report.
+
+    [R7.2] Recorded in the manifest because "which format is this folder in" is a question the
+    operator will ask about a library months later, and a `.wav` extension does not answer it on
+    its own -- it says nothing about the bit depth, and for MP3 it says nothing about the bitrate.
+    ``lossy`` is stated explicitly rather than inferred from the codec name by whatever reads this.
+    """
+    resolved = normalize_format(fmt)
+    record = {
+        "format": resolved,
+        "extension": _EXTENSIONS[resolved],
+        "sample_rate": int(sample_rate),
+        "lossy": resolved == FORMAT_MP3,
+    }
+    if resolved == FORMAT_MP3:
+        record["codec"] = MP3_ENCODER
+        record["bitrate_kbps"] = int(mp3_bitrate_kbps)
+        record["bitrate_mode"] = "cbr"
+    elif resolved == FORMAT_FLAC:
+        record["codec"] = "flac"
+        record["sample_format"] = "s16"
+    else:
+        record["codec"] = "pcm_s16le"
+        record["sample_format"] = "s16"
+    return record
+
+
+def manifest_payload(source: SourceInfo, segments, settings: dict, written,
+                     encoding: dict | None = None) -> dict:
     """The record of one cut. Source path, every segment's source timing, and the output names.
 
     `written` maps a segment index to the filename that actually landed, so a clip that failed is
     visibly absent rather than silently implied by the plan.
+
+    ``encoding`` is the :func:`encoding_record` block. It is a defaulted trailing parameter so
+    every existing caller and every existing manifest reader is unaffected; when absent it is
+    derived from ``settings['format']``, which is where the format already lived.
     """
     rows = []
     for segment in segments:
@@ -376,6 +482,8 @@ def manifest_payload(source: SourceInfo, segments, settings: dict, written) -> d
             "channels": int(source.channels),
         },
         "settings": dict(settings or {}),
+        "encoding": dict(encoding) if encoding else
+        encoding_record((settings or {}).get("format")),
         "totals": {
             "planned": len(rows),
             "written": sum(1 for row in rows if row["written"]),
@@ -404,7 +512,7 @@ def format_timecode(seconds: float) -> str:
 #: at an hour-long take and pressing a tile cannot try to inline a 300 MB player.
 MAX_PREVIEW_BYTES = 25 * 1024 * 1024
 
-_MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_FLAC: "audio/flac"}
+_MEDIA_TYPES = {FORMAT_WAV: "audio/wav", FORMAT_FLAC: "audio/flac", FORMAT_MP3: "audio/mpeg"}
 
 
 def preview_markup(path: str, label: str = "") -> str:
@@ -553,145 +661,37 @@ def run_media_command(argv, timeout: int = DETECT_TIMEOUT_SECONDS) -> tuple[int,
 
 __all__ = [
     "DEFAULT_THRESHOLD_DB", "DEFAULT_MIN_SILENCE", "DEFAULT_PAD", "DEFAULT_MIN_CLIP",
-    "FORMAT_WAV", "FORMAT_FLAC", "FORMATS", "OUTPUT_SAMPLE_RATE",
+    "FORMAT_WAV", "FORMAT_FLAC", "FORMAT_MP3", "FORMATS", "normalize_format",
+    "MP3_ENCODER", "DEFAULT_MP3_BITRATE_KBPS", "OUTPUT_SAMPLE_RATE",
     "AUDIO_SUFFIXES", "VIDEO_SUFFIXES", "SOURCE_SUFFIXES",
     "PROBE_TIMEOUT_SECONDS", "DETECT_TIMEOUT_SECONDS", "EXTRACT_TIMEOUT_SECONDS",
     "SourceInfo", "Segment",
     "build_probe_command", "parse_probe",
     "build_silence_command", "parse_silence_log", "sound_intervals", "plan_segments",
     "safe_stem", "clip_filename", "build_extract_command", "run_directory_name",
-    "MANIFEST_NAME", "MANIFEST_SCHEMA", "manifest_payload",
+    "build_encoders_command", "encoder_available",
+    "MANIFEST_NAME", "MANIFEST_SCHEMA", "manifest_payload", "encoding_record",
     "format_timecode", "segment_rows", "plan_summary",
     "MAX_PREVIEW_BYTES", "preview_markup",
-    "PENDING", "SELECTED", "REJECTED", "DECISIONS",
-    "MAX_EMBEDDED_BYTES", "DEFAULT_PAGE_SIZE",
-    "gallery_markup", "decision_counts", "counts_line",
     "run_probe_command", "run_media_command",
 ]
 
 
 # ---------------------------------------------------------------------------------------------
-# [FORK] R7.1 -- the review gallery
+# [FORK] R7.2 -- the review gallery moved out of this module
 #
-# Tiles instead of a dropdown, with hover-to-play. Two decisions shape everything below.
+# R7.1 built the tile grid here and embedded each clip as a base64 data URI under a cumulative byte
+# budget. The budget was the honest trade for a V1, and it failed in use exactly as a budget must:
+# a perfectly valid clip became unplayable because EARLIER clips had spent the page's allowance, and
+# the tile then said "not loaded for preview on this page", which describes a page limit rather than
+# anything about that clip.
 #
-# **Audio is embedded, but BOUNDED.** A tile plays instantly on hover only if its bytes are already
-# in the page, and the alternative -- fetching on hover -- needs an HTTP route, which would mean
-# either widening Gradio's `allowed_paths` (refused: it exposes a whole tree to every request) or
-# standing up a second authorised media endpoint. For a V1 reviewing one recording's clips, a byte
-# budget is the honest trade: everything inside it is instant, everything past it says so plainly
-# and is still playable from the output folder.
+# R7.2 replaced it with lazy, range-capable playback through an authorized media endpoint, and the
+# gallery now has two callers -- this cutter's review half and the standalone Audio Preview tab --
+# so it lives in `beatsync_fork.audio_review` where both reach the same implementation. The
+# decision vocabulary (`PENDING` / `SELECTED` / `REJECTED`), the counts, the tile markup and the
+# sorting policy are all there.
 #
-# **Classification is client-side until Confirm**, which is the requirement -- nothing moves until
-# the operator says so. The page keeps the decisions and writes them into one hidden field that the
-# Confirm handler reads.
+# Nothing re-exports them from here. A compatibility alias would leave two names for one concept
+# and the next reader would have to discover which is live.
 # ---------------------------------------------------------------------------------------------
-
-PENDING = "PENDING"
-SELECTED = "SELECTED"
-REJECTED = "REJECTED"
-DECISIONS = (PENDING, SELECTED, REJECTED)
-
-#: Total embedded audio allowed in one page. ~40 MB of base64 is roughly 30 MB of WAV, which is
-#: about two minutes of 48 kHz mono -- comfortably more than a review page of spoken clips, and far
-#: short of what makes a page sluggish.
-MAX_EMBEDDED_BYTES = 40 * 1024 * 1024
-
-#: Hard cap on tiles per page, so an enormous run is paged rather than rendered in one go.
-DEFAULT_PAGE_SIZE = 60
-
-_DECISION_CLASS = {PENDING: "r7-pending", SELECTED: "r7-selected", REJECTED: "r7-rejected"}
-_DECISION_BADGE = {PENDING: "?", SELECTED: "\u2713", REJECTED: "\u2717"}
-
-
-def gallery_markup(entries, decisions=None, names=None,
-                   budget: int = MAX_EMBEDDED_BYTES) -> str:
-    """The review grid.
-
-    `entries` are the dicts the cut handler produced. `decisions` and `names` are the operator's
-    current state, so a repaint preserves them.
-
-    Every interpolated value goes through :func:`_escape`, so a filename can carry no markup into
-    the page.
-    """
-    if not entries:
-        return ('<div class="r7-empty">No clips to review. Cut a recording first.</div>')
-
-    decisions = dict(decisions or {})
-    names = dict(names or {})
-    spent = 0
-    tiles = []
-
-    for entry in entries:
-        key = str(entry.get("index"))
-        decision = decisions.get(key, PENDING)
-        if decision not in DECISIONS:
-            decision = PENDING
-        label = names.get(key) or entry.get("name") or ""
-        path = entry.get("path") or ""
-
-        size = os.path.getsize(path) if path and os.path.isfile(path) else 0
-        if size and spent + size <= budget:
-            media = _audio_element(path)
-            spent += size
-            note = ""
-        else:
-            media = ""
-            note = ('<div class="r7-note">not loaded for preview on this page '
-                    '\u2014 it was still exported</div>')
-
-        duration = float(entry.get("end", 0.0)) - float(entry.get("start", 0.0))
-        tiles.append(
-            f'<div class="r7-tile {_DECISION_CLASS[decision]}" tabindex="0" role="button"'
-            f' data-idx="{_escape(key)}" data-dur="{duration:.3f}"'
-            f' data-name="{_escape(entry.get("name") or "")}">'
-            f'<div class="r7-head">'
-            f'<span class="r7-num">{_escape(f"{entry.get('index')}")}</span>'
-            f'<span class="r7-badge">{_DECISION_BADGE[decision]}</span>'
-            f'</div>'
-            f'<div class="r7-time">{format_timecode(duration)}'
-            f' <span class="r7-src">{format_timecode(float(entry.get("start", 0.0)))}'
-            f'\u2192{format_timecode(float(entry.get("end", 0.0)))}</span></div>'
-            f'<div class="r7-wave"><span class="r7-state">hover to play</span></div>'
-            f'{media}{note}'
-            f'<input class="r7-name" type="text" value="{_escape(label)}"'
-            f' aria-label="file name" spellcheck="false">'
-            f'</div>')
-
-    return (f'<div class="r7-grid" id="r7-grid" data-count="{len(entries)}">'
-            + "".join(tiles) + "</div>")
-
-
-def _audio_element(path: str) -> str:
-    """One tile's audio, inlined. `preload="none"` is pointless for a data URI, so it is absent."""
-    import base64
-
-    extension = os.path.splitext(path)[1].lstrip(".").lower()
-    media_type = _MEDIA_TYPES.get(extension, "audio/wav")
-    try:
-        with open(path, "rb") as handle:
-            encoded = base64.b64encode(handle.read()).decode("ascii")
-    except OSError:
-        return ""
-    return f'<audio class="r7-audio" loop src="data:{media_type};base64,{encoded}"></audio>'
-
-
-def decision_counts(entries, decisions) -> dict:
-    """`{SELECTED, REJECTED, PENDING, TOTAL}` for the page, read from the server's own entry list.
-
-    Counting from `entries` rather than from the decisions dict is deliberate: a decision for a
-    clip that is not on this page must not be able to inflate the totals, and a clip with no
-    decision at all must count as pending rather than vanish.
-    """
-    decisions = dict(decisions or {})
-    counts = {SELECTED: 0, REJECTED: 0, PENDING: 0}
-    for entry in entries:
-        decision = decisions.get(str(entry.get("index")), PENDING)
-        counts[decision if decision in counts else PENDING] += 1
-    counts["TOTAL"] = len(entries)
-    return counts
-
-
-def counts_line(counts: dict) -> str:
-    return (f"Keep {counts[SELECTED]}   \u00b7   Discard {counts[REJECTED]}   \u00b7   "
-            f"Undecided {counts[PENDING]}   \u00b7   Total {counts['TOTAL']}")
