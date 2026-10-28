@@ -20,6 +20,528 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-25 (Clips Preview P2: R5-P58 returned QUALIFIED; its six MINOR findings dispositioned — R5-P59)
+
+Independent review **R5-P58** of the immutable authority topology returned
+`R5_P58_PR75_IMMUTABLE_AUTHORITY_TOPOLOGY_QUALIFIED`. All three R5-P56 MAJORs (F56-1, F56-2, F56-3)
+are independently **closed**: each was reproduced on the frozen `6532bf81` control to a measured
+unsafe outcome and each flips to safe on the candidate. Across 16 Rule C combinations, 12
+coordinator write-once cases, 11 `_bound` cases, 8 threaded concurrency experiments (up to 24
+concurrent binders), 12 lock/exception cases and 16 independent mutations, **no API-reachable
+authority-bypass path was found** and **no new destructive transfer vulnerability was observed**.
+
+**QUALIFIED is not an unconditional pass.** Product readiness remains incomplete, the transfer
+engine is still **unwired**, `src/gui.py` is **not modified by this change at all** (zero lines),
+and no merge, GUI/HTTP wiring or deployment is authorized. This entry is documentation and test
+coverage only — **no runtime implementation file changed**.
+
+Six MINOR findings, dispositioned:
+
+- **F58-1 — the `_bound` guarantee is conditional, and is now stated that way.** "Both layers fail
+  closed" holds **when the supported binding API established the topology**. `_bound` tracks binder
+  use only, so a graph attached entirely by direct assignment has `_bound=false` and leaves the
+  `acquire`-site half uncovered (measured: `acquire_direct=GRANTED`,
+  `store_begin_transfer=GRANTED`). The execution-site `lifecycle_topology_fault` still refuses, so
+  nothing moves, and `gui.py:6297` binds through the API at import. Documentation corrected; the
+  binding precondition is recorded as a requirement on any future production transfer integration.
+- **F58-2 — a raising assignment does not always leave a detectable partial state.** A failure at
+  the **first** write leaves the graph completely unchanged: nothing assigned, `_bound=false`, and
+  the unbound/unbound legacy carve-out returns `""`. The exception does reach the caller and the
+  lock is free, but this is **not** a partial-state refusal. The three outcomes — no state change,
+  detectable partially bound state, fully bound coherent state — are now tabulated and
+  distinguished.
+- **F58-3 — "catches the consequence of *any* such bypass" was too strong.**
+  `lifecycle_topology_fault` checks the topology **at the point it runs**, once, before the lease.
+  It catches incoherence already present at that boundary; it cannot by itself guarantee safety
+  against a *subsequent* unsupported direct attribute mutation, which R5-P58 measured reaching a
+  completed move. No production caller performs one. **Deliberately no extra pre-rename check and
+  no new synchronization was added** — the obligation is stated instead: runtime use must preserve
+  the immutable authority bindings established by the supported API.
+- **F58-4 — the topology check does not validate the coordinator's own authority pointer.** It
+  proves registry and store share one authority and that the authority has *a* coordinator, not
+  that the coordinator agrees. The mismatch was constructible **only** by unsupported direct
+  mutation; **no supported binding-API path and no production caller created it**
+  (`API_REACHABLE: false`). Recorded as a depth-of-check observation, together with a mandatory
+  **GUI/HTTP integration acceptance gate**: a runtime about to expose destructive transfer must
+  prove registry, store, coordinator and the authority's coordinator reference form one coherent
+  bound topology. That gate is **not implemented here**.
+- **F58-5 — a provenance statement was inaccurate.** It claimed both superseded suites were
+  "preserved verbatim in the R5-P53 and R5-P55 evidence packages". They are in two different
+  places, measured here: the `test_clips_review_atomic_lifecycle.py` original is in the **R5-P53**
+  package, byte-identical; the **32-case rebinding suite is in Git only**, at
+  `6532bf81c08519410775cfc6addb95c578de1813` (916 lines, 32 cases) — the R5-P55 commit that
+  *created* it, confirmed absent in that commit's parent. R5-P55's package holds 29 manifested
+  files and **no copy of it**; its `artifacts/source.diff` covers only `clips_review.py`. **The
+  suite was never lost**; this is a corrected claim, not a recovered file and not a retention
+  failure. The matrix size was also misstated as 36 and collects **39**. No historical evidence
+  package was edited, repaired or regenerated, and no Git history was rewritten.
+- **F58-6 — Rule C's identity comparison is now pinned by test.** R5-P58's mutation M1 relaxed the
+  binder's `current is not shared` to `current != shared` and survived the whole 8237-case suite;
+  the equivalent pin existed for `lifecycle_topology_fault` but not for the binder. Three new tests
+  in `tests/test_clips_review_authority_rebind_safety.py` close it: `test_34` (behavioural, four
+  equality shapes, with a live lease held across the refusal), `test_35` (the R5-P54 reservation
+  ordering with an equality-claiming impostor) and `test_36` (the source contract). M1 is an
+  **equivalent mutant for every authority this repository can construct** — a mutation-coverage
+  gap, **not** a reachable vulnerability and not a destructive MAJOR: under the mutant the binder
+  returns a false `ACCEPTED`, but phase 2's write-once `is None` re-read still blocks the
+  replacement, so no clip moves. The new tests therefore assert **the refusal**, because a test
+  scored on the filesystem alone passes against the mutant and pins nothing. Re-measured here: the
+  mutation is detected by 5 of the 6 new cases with `DID NOT RAISE Refusal` at the Rule C
+  assertion, the pre-R5-P59 39 cases still pass under it, and the suite is restored byte-exact.
+
+The immutable-authority implementation is **not** reopened: no guard was added against direct
+Python attribute writes, which are explicitly outside the supported API. Still open and unchanged:
+**F5**; the **cross-volume source removal** (`SOURCE_REMOVAL_BLOCKED` remains the terminal
+cross-volume result, and the engine still deletes no source by any path — an owner decision
+memorandum comparing the three candidate routes is recorded in the R5-P59 evidence package, with no
+route implemented or authorized); **decision-time content fingerprints**, so no decision made
+through today's UI is transferable; **cross-process locking** (process-local, and never to be
+described otherwise); and **GUI/HTTP integration**.
+
+### Changed — 2026-10-25 (Clips Preview P2: the authority topology is immutable — R5-P56 F56-1/2/3)
+
+Independent review **R5-P56** confirmed R5-P54's F54-1 closed (3/3 refused, filesystem unchanged)
+and the acquisition-in-flight accounting clean on all fourteen fault paths — then reproduced **three
+new MAJOR authority-rebinding bypasses** in the two-phase quiescence barrier the previous entry
+added, and returned `R5_P56_PR75_CHANGES_REQUIRED`. Each reached a completed, irreversible move:
+clip published, `batch=COMPLETE`, `advance_page=True`, no refusal in the journal, session and page
+already revoked.
+
+The owner's decision for this entry is **not** a fourth rebinding protocol. Runtime replacement of a
+bound lifecycle authority is **removed**. The transfer engine remains **unwired**, Confirm still
+moves nothing, and `src/gui.py` is **not modified by this change at all**.
+
+- **F56-1 — a stale outgoing-authority snapshot.** `bind_lifecycle_authority()` enumerated the
+  authorities it was about to detach *without synchronisation*, barriered that snapshot, and then
+  assigned while re-reading nothing. Of two concurrent binders the first could therefore detach an
+  authority the second had installed and the first had never seen. Reproduced with a pending
+  mutation reservation on the detached authority and, separately, with a live transfer lease on it.
+  The barrier was correct; the set of authorities it was applied to was stale.
+- **F56-2 — a partial replacement of an idle authority split the gate.** `bind(registry=…,
+  authority=B)` against a quiescent graph was accepted and left `registry=B, store=A,
+  coordinator=A`. A transfer then leased A, a session revocation passed through B and was
+  **accepted**, and the clip published against `<revoked:unknown_session>`. **No concurrency at
+  all** — fully deterministic.
+- **F56-3 — the coordinator pointer escaped the barrier.** The no-barrier fast path could retarget
+  `authority._coordinator` with an acquisition inside its lock-free probe, and a rebind that omitted
+  `coordinator=` left the incoming authority with no coordinator at all — which makes `acquire()`
+  **skip** the scan-in-flight arbitration rather than perform it. A lease was granted in exactly the
+  mid-scan state that arbitration exists to refuse.
+
+**The correction is a write-once binding contract.** `bind_lifecycle_authority()` now supports
+initial attachment of an unbound component, and idempotent re-attachment to the *same* object
+(`is`, never equality). Replacing a bound component with a different authority is **refused
+unconditionally** — including when every authority involved is completely idle, which is the
+permission R5-P51, R5-P53 and R5-P55 all granted and all three were broken through. An idle
+authority is not a safe one to detach; it is merely one whose next operation has not started yet.
+
+- Decision and writes happen in one critical section under a new `_BINDING_LOCK`, decision first,
+  both re-reading the live attributes. The lock is used **only** by the binding API, adds no edge to
+  `ScanCoordinator → ClipRegistry → ReviewStore → LifecycleAuthority`, and is never held across
+  hashing, copying, journalling, fsync or transfer execution. An AST test pins that.
+- A second binder cannot overwrite a completed binding: the write loop assigns only where the live
+  value is `None`. Last-writer-wins is not expressible.
+- `authority._coordinator` is write-once as well — `None` → one object, never object → object — so
+  F56-3's retarget is impossible rather than merely detected.
+- **An absent coordinator is not an idle one.** Both layers fail closed **when the supported
+  binding API established the topology**: the new `lifecycle_topology_fault(registry, store)`
+  refuses a plan with `lifecycle_authority_incoherent` or `lifecycle_coordinator_unavailable`
+  before any lease is taken, and `acquire()` refuses with the same reason because
+  `ReviewStore.begin_transfer` reaches it directly. The discriminator is a write-once `_bound` flag,
+  which separates a live gate that owes its callers arbitration from a bare instance a unit test
+  constructed — so the pre-R5-P51 P1 suites stay valid without weakening the runtime contract.
+  (**Corrected by R5-P59 / F58-1**: `_bound` tracks binder use only, so a graph attached entirely
+  by direct assignment leaves the `acquire`-site half uncovered. The execution-site layer still
+  refuses and nothing moves, and production binds through the API at import. This is **not**
+  unconditional protection for arbitrary direct attribute assignment.)
+- Partial binding stays supported, because production depends on it (`gui.py` binds registry and
+  coordinator at import; the store joins in `_clips_store()`). What it can no longer do is replace
+  anything, so it can no longer manufacture a split.
+
+**The retired API is deleted, not deprecated.** `begin_rebind`, `end_rebind`, `is_rebinding`,
+`acquiring_count`, `_rebinding`, `_acquiring`, `rebind_barriers` and `LIFECYCLE_REBINDING` are gone,
+and a test asserts they stay gone. That is how R5-P56's **F56-4** (the barrier-spans-the-assignments
+property was unasserted — a mutation removing it survived the entire suite) and **F56-5** (barrier
+ownership was call discipline, not code) are dispositioned: the vulnerable operation was removed
+rather than re-documented. **F56-6** (a raise mid-assignment left a partial binding) goes with them,
+because the decision phase now precedes every write.
+
+**Superseded test assumptions, named rather than quietly dropped.** Two places asserted that an idle
+authority could be replaced, and both are now their own negation:
+`test_clips_review_atomic_lifecycle.py::test_24`'s tail, and R5-P55's 32-case hot-rebinding suite in
+`tests/test_clips_review_authority_rebind_safety.py`, replaced by the **39-case** immutable-topology
+matrix. (**Corrected by R5-P59 / F58-5**, because the two superseded suites do not live in the same
+place: the `test_clips_review_atomic_lifecycle.py` original is in the **R5-P53** evidence package,
+byte-identical; the 32-case rebinding suite is in **Git only**, at
+`6532bf81c08519410775cfc6addb95c578de1813` — the R5-P55 commit that created it, confirmed absent in
+that commit's parent. R5-P55's package holds no copy of it; its `artifacts/source.diff` covers only
+`src/beatsync_fork/clips_review.py`. The matrix size was also misstated as 36 and collects 39.
+Nothing was lost; this is a corrected provenance statement, not a recovered file, and no historical
+evidence package was edited and no Git history rewritten.) No test of initial binding,
+same-authority idempotence, leases, reservations,
+epochs or scan generations was weakened, removed or adjusted.
+
+Still open, so no reader infers clearance: a direct `target.lifecycle_authority = other` assignment
+bypasses the binding API (not reachable — the application's one direct assignment is an initial
+attachment, pinned by AST test, and `lifecycle_topology_fault` catches a bypass that **precedes**
+the check — **corrected by R5-P59 / F58-3**, which measured that a direct assignment performed
+*after* the check and before publish reaches a completed move, so "catches the consequence anyway"
+was too strong);
+**F5**; the **cross-volume source removal**; **decision-time content fingerprints**;
+**cross-process locking** (process-local, and never to be described otherwise); and **GUI/HTTP
+integration**. This is the author's own remediation evidence and is not a security clearance.
+Independent review **R5-P58** is required.
+
+
+### Fixed — 2026-10-25 (Clips Preview P2: authority rebinding is linearizable — R5-P54 F54-1)
+
+Independent review **R5-P54** independently confirmed both R5-P52 MAJOR races closed and returned
+`R5_P54_PR75_CHANGES_REQUIRED` on one new MAJOR in the rebinding gate the previous entry added.
+It is closed here. The transfer engine remains **unwired**, Confirm still moves nothing, and
+`src/gui.py` is **not modified by this change at all**.
+
+- **F54-1 — rebinding while a mutation reservation is pending.** `bind_lifecycle_authority()`
+  refused a rebind that would orphan a live *lease* but asked nothing about a pending mutation
+  *reservation*: `_pending` was never consulted and `LifecycleAuthority` exposed no whole-object
+  pending query. R5-P54 reproduced the consequence 3/3 on real files, for `session_revoke`,
+  `scan_begin` and `session_new` alike — the reservation was orphaned, the transfer acquired on the
+  newly bound authority, and the clip **moved** with `batch=COMPLETE`, `advance_page=True` and no
+  refusal record in the journal, while the session and page the operation had been planned against
+  were already revoked. Bit-for-bit the F53-A outcome the reservation protocol exists to prevent,
+  one layer up.
+- **The naive repair was rejected, on R5-P54's own advice.** Adding `has_any_pending()` to the old
+  predicate and then assigning is check-then-act: a reservation granted between the question and
+  the assignment is orphaned just as completely. That is precisely the defect class R5-P52 proved
+  fatal. `has_any_pending()` exists now, but as a **diagnostic probe** documented never to be used
+  as the gate — the same status `guard()`/`guarded()` have carried since R5-P53.
+- **The gate is a two-phase quiescence barrier.** `LifecycleAuthority.begin_rebind()` observes an
+  authority quiescent **and** closes it to further acquisition in one critical section;
+  `bind_lifecycle_authority()` barriers every distinct authority whose live state is at stake — each
+  outgoing one **and** the incoming one — then performs the three attribute assignments, then
+  releases every barrier in a `finally`. While a barrier is held, `reserve_mutation`,
+  `try_reserve_mutation` and `acquire` all refuse with the new `lifecycle_authority_rebinding`.
+  **Linearization point: the last successful `begin_rebind()`.** A concurrent reservation or
+  acquisition therefore either completed before it — in which case the rebinding fails closed — or
+  is ordered after it and refused. There is no interleaving in which one is accepted and then
+  detached.
+- **Quiescent means three things, and the third was not in the reviewer's proposed patch.** No
+  lease, no pending reservation, **and no acquisition in flight**. `acquire()` deliberately drops
+  the lock to probe the coordinator, so between its two arbitrations no lease is installed yet and
+  the lease map alone reports the authority idle; a rebinding that began *and finished* inside that
+  interval would have been accepted and the lease installed on an authority nothing consults —
+  F54-1 with the lease and the reservation exchanged. `_acquiring` is taken before the first
+  arbitration and cleared in a `finally`, so the barrier spans the whole acquisition.
+- **Initial attachment and idempotent rebinding take no barrier at all.** Neither detaches
+  anything, so neither can orphan anything, and making `gui.py`'s import-time bind or the lazy
+  `_clips_store()` attachment refusable would be an outage rather than a safeguard. All seven
+  partial target sets refuse a *replacement* while the outgoing authority is non-quiescent, and
+  accept it once it is quiescent again; partial **attachment** is the production arrangement and is
+  unchanged.
+- **No new lock edge and no new deadlock.** Barriers are taken one authority at a time, never two
+  locks at once; `begin_rebind()` never waits — it refuses, because blocking on a live reservation
+  would invert the documented order — and it never blocks `release_mutation` or `release`, so a
+  live operation can always drain. Nothing hashes, copies, journals or calls FFmpeg under the
+  barrier. The order `ScanCoordinator → ClipRegistry → ReviewStore → LifecycleAuthority (leaf)`
+  is unchanged.
+- **A release frees by identity, never by equality — now with a test that can tell.**
+  `MutationReservation` is a frozen dataclass, so two reservations with the same four field values
+  compare *equal* while being different objects. `release_mutation` matches with `is not`. Measured
+  for R5-P55: relaxing that to `!=` survives the entire R5-P53 atomic-lifecycle suite untouched,
+  because that suite's forged-token case differs in `operation` and so fails an equality test too.
+  The field-for-field forgery is the only shape that distinguishes the two.
+- `tests/test_clips_review_authority_rebind_safety.py` — new. 32 cases over the five mandated
+  orderings: a reservation taken first (all five lifecycle operations), the binder taken first with
+  the pause driven at **both** positions in the barrier phase, acquisition racing the rebind from
+  inside the real coordinator probe and on an epoch retry, initial/lazy/idempotent binding under a
+  live reservation and under a live lease, and all seven partial target sets. Every race test
+  asserts it **reached** its program point, because a test that never reaches its pause proves
+  nothing. Two AST pins carry the rest: the barrier must be honoured inside the primitives rather
+  than at the mutation sites, and `gui.py`'s single direct attribute assignment must stay an
+  *initial* attachment.
+
+Still open after this change, so no reader infers clearance: **a direct
+`target.lifecycle_authority = other` assignment bypasses the binding API entirely** — not reachable
+in the shipped application today, because `gui.py`'s one direct assignment is an initial attachment
+on a freshly constructed store, and that fact is now pinned by test rather than assumed; **F54-5**
+(the `current is None` carve-out, which preserving lazy attachment requires); **F54-2**, not patched
+and no longer reachable by construction; **F54-3** and **F54-4**, untouched, with F54-4 to be
+re-opened when the GUI transfer handler is written. Everything R5-P53 left open stays open: **F5**,
+the **cross-volume source removal**, **decision-time content fingerprints**, **cross-process
+locking** (process-local, and never to be described otherwise) and **GUI/HTTP integration**.
+Independent review **R5-P56** is required.
+
+### Fixed — 2026-10-24 (Clips Preview P2: atomic lifecycle reservations — R5-P52 F53-A/F53-B)
+
+Independent review **R5-P52** reproduced two MAJOR race conditions against the previous commit and
+returned `R5_P52_PR75_CHANGES_REQUIRED`. Both are closed here. The transfer engine remains
+**unwired**, Confirm still moves nothing, and `src/gui.py` is **not modified by this change at all**.
+
+- **F53-A — the reverse-order lifecycle guard race.** The previous design gated each lifecycle
+  mutation with a *check*: `guard()` took the authority lock, read the lease map and released it,
+  and the mutation then ran under a different lock. `acquire()` took no subsystem lock at all. So
+  the ordering *guard succeeds → transfer acquires → transfer revalidates → mutation executes →
+  transfer publishes* was accepted on **all five** operations (`ScanCoordinator.begin`,
+  `ReviewStore.begin_scan`, `ClipRegistry.new_session`, `ClipRegistry.publish_page`,
+  `ClipRegistry.revoke_owner`): the clip moved, the batch reported `COMPLETE` with
+  `advance_page=True`, and the authority was already gone — gallery blank, session revoked, page
+  revoked, or `current_scan` replaced. A **reservation** replaces the check. `reserve_mutation()`
+  refuses while a lease is held and otherwise grants a token *and* bumps a per-owner monotonic
+  epoch, both inside one critical section; the token is held across the mutation and released in a
+  `finally`; and `acquire()` refuses while any reservation is pending. Both directions are now
+  arbitrated by the same lock instead of by two moments in time.
+- **F53-B — the coordinator probe/acquire race.** `acquire()` probed `ScanCoordinator` outside its
+  own lock and then recorded the lease, so a scan taking a generation in between was not seen and
+  the transfer committed while holding a lease in exactly the state the `scan_in_flight` probe
+  exists to refuse. Acquisition is now a versioned protocol: capture the epoch under the lock,
+  probe with no lock held, re-enter and require the epoch to be unchanged before installing the
+  lease. A moved epoch retries a bounded three times and then **fails closed**
+  (`lifecycle_epoch_moved`). A stale probe result is never silently accepted. The original R5-P52
+  reproduction for this finding now passes **unchanged**.
+- **The reservation is a logical token, never a mutex.** The authority lock is taken only to grant
+  and release it, so no SHA-256 hashing, journal `fsync`, media copy or FFmpeg call runs under it.
+- **Reservations deliberately do not exclude each other.** Two same-owner lifecycle mutations are
+  legitimate — two tabs rescanning — and the per-owner scan-generation contract exists so the newer
+  supersedes the older. Serialising them would have broken that contract to fix a transfer bug; a
+  test pins that two concurrent same-owner scans still both complete.
+- **Eviction now decides and licenses in one act.** `ScanCoordinator._prune` and the registry's
+  owner-cap eviction chose a victim with a `guarded()` probe whose answer expired with the lock.
+  They call `try_reserve_mutation(victim)` instead, which returns `None` when the victim is leased
+  or already being mutated. If no owner is available the cap is allowed to exceed: a cap bounds
+  memory, a lease protects an irreversible operation in flight.
+- **`ScanCoordinator.forget()` is reserved.** R5-P52 recorded it as the one coordinator mutator
+  with neither a lease check nor a caller; "unreachable today" is not a safety property.
+  `publish` and `discard` stay deliberately unreserved — they write only `_views`, which
+  revalidation never reads — and that conclusion carries a test rather than only prose.
+- **Rebinding can no longer orphan a lease.** `bind_lifecycle_authority()` refuses to point a
+  subsystem at a *different* authority while any lease is live, all-or-nothing across the three
+  targets. Rebinding the same instance stays idempotent, and attaching a subsystem whose authority
+  is still unset is always permitted — the lazy store path and P1 startup are unchanged.
+- `guard()` and `guarded()` survive as **diagnostic probes only**, and a test walks every mutation
+  site's AST and fails if any of them calls either.
+- `tests/test_clips_review_atomic_lifecycle.py` — new. 36 cases covering all thirty mandated race
+  scenarios plus a 60-round barrier-directed stress matrix that exercises both boundaries (30
+  rounds each) and asserts the real filesystem outcome, not an exception string.
+
+Unchanged and still open, so no reader infers clearance: **F5** (the rollback target is still never
+no-replace-probed), the **cross-volume source removal** (withheld; an owner decision; no `ctypes`,
+no native helper, no pathname source delete), **decision-time content fingerprints** (no existing
+P1 decision is transferable), **cross-process locking** (the model is process-local), and
+**GUI/HTTP integration**. Independent review **R5-P54** is required.
+
+### Changed — 2026-10-24 (Clips Preview: a binding lifecycle authority for in-flight transfers)
+
+The last of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The transfer engine remains unwired and Confirm still moves nothing.
+
+- **A transfer now holds the authority it depends on, and conflicting lifecycle work is refused.**
+  Execution revalidated the decision, its revision, the scan generation and the session *per item*,
+  and the R5-P47 lease stopped a decision moving across the commit point — but nothing else was
+  held. Measured: `revoke_owner`, `new_session`, `begin_scan`, `publish_page`,
+  `ScanCoordinator.begin` and a whole new scan were all **accepted** after revalidation and before
+  `os.rename`, and the clip published anyway and reported `COMPLETE`; in two cases the session was
+  already revoked at the commit point, and in another the gallery had already blanked. The window
+  is O(file size), because the source is hashed in between. `LifecycleAuthority` is an owner-scoped
+  gate that every authority-changing operation consults **before** mutating anything, refusing a
+  conflicting same-owner operation **fail-fast** with the existing `transfer_in_progress` token —
+  no queue, no wait, no silent invalidation, no implicit cancellation — retryable once released.
+- **The guard sits in `ScanCoordinator.begin`, which a `begin_scan`-only fix would miss.** `begin`
+  makes a new generation the newest *before* the session and page are replaced, and a stored view
+  stops being current the moment it is not the newest — so `begin` **alone** blanks the gallery.
+  Guarding only `ReviewStore.begin_scan` would have refused the scan after the damage. A refused
+  scan now changes nothing at all, and tests assert the authoritative view is byte-identical
+  across it.
+- **Eviction is not an exemption.** The owner, session and page caps and `ScanCoordinator._prune`
+  all revoke authority, so a leased owner is skipped rather than evicted; if every tracked owner is
+  leased the cap is allowed to exceed, because a cap bounds memory while a lease protects an
+  irreversible operation in flight.
+- **"Generation changed but the store still shows the old scan" is not valid authority.** A
+  transfer cannot acquire while a newer generation has not yet published its view (`scan_in_flight`),
+  and becomes acquirable again as soon as the transition completes.
+- **One lock order, documented and asserted:** scan coordinator → registry → store →
+  lifecycle authority (leaf, never held while taking another). The one method that must read the
+  coordinator does so before taking its own lock, and a test pins that ordering on the source
+  because a cycle would deadlock rather than fail. No subsystem lock is held across hashing,
+  copying, FFmpeg work or `fsync`.
+- **Release discipline:** released on every terminal state and on an unexpected exception; one plan
+  cannot release another's; an owner mismatch releases nothing; a failed acquisition rolls back only
+  what that caller took.
+
+Binding is explicit, so every existing P1 construction keeps working unguarded and production binds
+in one call. The only `gui.py` changes are that call, the lazy store joining it, and a typed handler
+so a refused scan repaints the operator's existing page instead of an empty one — no import of the
+transfer engine, no route, no media movement, no Confirm change. Process-local scope only; a second
+process on the same state directory is explicitly not claimed to be protected.
+
+**Still open:** the same-volume rollback target is still not no-replace-probed (R5-P48 / F5,
+advisory); cross-volume source removal remains withheld, so the accepted `… → REMOVE SOURCE`
+contract is still unmet and an owner decision; decisions written by today's P1 path still carry no
+content fingerprint; there is no transfer GUI/HTTP integration; and OD-A off-machine retention is
+unresolved. No `ctypes`, no native helper, no pathname source deletion, no new dependency.
+
+### Changed — 2026-10-24 (Clips Preview P2: recovery completion semantics)
+
+The third of the three MAJOR defects an independent review (R5-P48) found in the P2 transfer core.
+The engine remains unwired and Confirm still moves nothing.
+
+- **Recovery no longer reports an unfinished plan as complete.** `recover()` aggregated as
+  `RECOVERY_REQUIRED if needs_operator else COMPLETE`, so `COMPLETE` meant *"nothing needs a
+  human"* while reusing a constant that means *"done"* everywhere else in the engine. Measured on
+  two real volumes: a cross-volume copy-only transfer returned `SOURCE_REMOVAL_BLOCKED`, the batch
+  correctly reported `PARTIAL` with `advance_page=False`, and `recover()` on the identical
+  filesystem answered `COMPLETE` / `needs_operator=False` — while its own finding read
+  `operator_may_remove_duplicate`. The same aggregation called a three-clip batch COMPLETE with two
+  clips still in the review folder, and a mutation control proved no test pinned either behaviour.
+  There are now three independent signals: `RecoveryReport.plan_finished` (the only completion
+  signal, defaulting to `False`), `needs_operator`, and a `state` drawn from `RECOVERY_STATES` —
+  `COMPLETE`, the new `RECOVERY_INCOMPLETE`, or `RECOVERY_REQUIRED`. `needs_operator=False` is
+  never a synonym for `plan_finished=True`.
+- **Completion requires durable evidence, not just matching bytes.** Matching content at the
+  destination with an empty source path is necessary and not sufficient — an unjournalled
+  publication looks identical on disk — so an item is reported finished only when the journal's
+  last record for it is `COMPLETE`. `SOURCE_REMOVAL_BLOCKED` and `PUBLISHED_UNJOURNALLED` are
+  terminal but never completion. An absent *batch* summary is reported as a qualification where
+  every item is individually proven, rather than escalated.
+- **`operator_may_remove_duplicate` now counts as both unfinished work and an operator action**, so
+  a report can no longer recommend that the operator remove an original while claiming no human is
+  involved. `retry_safe` is unfinished work that needs no operator decision. The per-item action
+  vocabulary is deliberately unchanged at four values.
+- **Recovery remains strictly non-destructive** — a test spies on every destructive `os` primitive
+  and requires zero calls. A recommended action is never permission to perform it.
+
+Four pre-existing assertions encoded the old semantics and were corrected with the reason recorded
+in place; three of them were added by the R5-P49 commit below. `ItemOutcome`, `TransferResult`,
+`RecoveryFinding` and `advance_page` are unchanged, `RecoveryReport` gains one trailing field with a
+safe default, and older journal records remain readable.
+
+**Still open, so this is not clearance:** session, scan and page revocation still take effect only
+between items (R5-P48 / F3), whose lifecycle and lease logic is deliberately untouched; the
+rollback target directory is still unprobed (F5); cross-volume source removal remains withheld, so
+the accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and
+decisions written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper,
+no new dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
+### Changed — 2026-10-24 (Clips Preview P2: post-commit outcome truthfulness and journal-tail safety)
+
+A **second** independent adversarial review (R5-P48) of the engine below confirmed all eight
+corrections in the entry that follows and reproduced **three new MAJOR** defects. Two are corrected
+here. The engine is still unwired, Confirm still moves nothing, and three tests pin that.
+
+- **A reporting failure can no longer retract a completed filesystem operation.** Every journal
+  append after the commit point was unguarded. `TransferJournal.append` converts any `OSError` into
+  `TransferRefused`, and `execute_transfer`'s broad handler turned that into `ItemOutcome(REFUSED)`
+  — whose defaults assert `source_removed=False` and `published_path=""` — reported about a clip
+  that was already in the operator's Media Library with its source path empty. Reproduced with a
+  real Windows sharing violation on the journal file. A persistent failure was worse: the
+  batch-summary append sat outside the per-item `try`, so `execute_transfer` **raised** and the
+  caller received no `TransferResult` at all — no outcomes, no counts, no sign a file had moved.
+  There is now a `PUBLISHED_UNJOURNALLED` state carrying the real published path, byte count and
+  SHA-256, reporting `source_removed` according to what actually happened to the source; it is
+  never `COMPLETE`, keeps `advance_page` false and stops the batch, because the durability
+  guarantee the page depends on is gone. A batch whose summary cannot be journalled is downgraded
+  to `PARTIAL` without rewriting any item outcome. No rollback, retry or deletion is attempted to
+  compensate — a test counts the renames and requires exactly one.
+- **An appended journal record can no longer vanish behind a torn tail.** `O_APPEND` writes at the
+  end of the *file*, not the end of the last *record*, so with an unterminated fragment on disk the
+  next append was concatenated onto it, the two became one unparseable line, and the newly
+  committed event was **silently lost** — absent after a cold reopen, with the write having
+  reported success. The final bytes are now classified before every append: a terminated file is
+  untouched; a complete record that merely lost its newline is **preserved as real history** (not
+  treated as damage); a provably torn fragment is preserved and closed off with a self-describing
+  separator record that carries no `clip_id` or `state` and so can never be read as an outcome; a
+  malformed complete record is surfaced rather than discarded; and an uninspectable tail **refuses
+  the write**. Nothing is truncated or rewritten, repair is idempotent, and a crash part-way
+  through a separator leaves a boundary the next append repairs. `records()` marks damaged lines,
+  `damage()` reports them, and `recover()` escalates on them, since a damaged record has no
+  `clip_id` and a per-clip reading would ignore it. Appends are serialised by a process-local lock;
+  cross-process concurrency is explicitly not claimed.
+
+**Deliberately still open after this change**, and recorded so the entry is not read as clearance:
+`recover()` still aggregates intentionally-unfinished work into `COMPLETE` (R5-P48 / F2); session,
+scan and page revocation still take effect only between items, not within one (F3); the rollback's
+target directory is still unprobed (F5); cross-volume source removal remains withheld, so the
+accepted `… → REMOVE SOURCE` contract is still unmet and remains an owner decision; and decisions
+written by today's P1 HTTP path remain non-transferable. No `ctypes`, no native helper, no new
+dependency, and no change to `gui.py`, `clips_review.py` or any HTTP route.
+
+### Changed — 2026-10-24 (Clips Preview P2: security remediation after an independent review)
+
+An independent adversarial review of the engine below reproduced **four MAJOR** defects and four
+MINOR ones. All eight are addressed here. The engine is still unwired and still moves nothing
+through the UI; what changed is what it would do if it ever were called.
+
+- **A failure after an irreversible step is no longer reported as "nothing moved."** The
+  same-volume path verified the published object *after* the rename and reported `REFUSED` when it
+  did not match — about a source path that was by then empty, with unapproved content in the Media
+  Library. Content is now checked against the approved fingerprint **before** the rename, and a
+  post-rename verification failure is **rolled back** by renaming the object back onto the vacated
+  source path (`ROLLED_BACK`), or escalated (`RECOVERY_REQUIRED`) if that is refused.
+- **The engine no longer deletes a source at all.** The cross-volume path deleted by *pathname*
+  after proving identity on a descriptor and closing it; a file substituted into that gap was
+  destroyed while the engine reported success. On Windows, within this package's dependency rules,
+  there is no way to delete the object whose identity was proven — measured: no `os.unlinkat` or
+  `dir_fd`, a held handle makes the path undeletable, and `O_TEMPORARY`'s delete-on-close cannot be
+  cancelled without `ctypes`. The copy is therefore published and verified and the deletion is
+  **withheld** (`SOURCE_REMOVAL_BLOCKED`), leaving both copies and a recorded obligation.
+- **A frozen plan is no longer authority at execution time.** `execute_transfer` requires the live
+  store and registry and revalidates the decision, revision, scan generation and session per item,
+  under an exclusive **transfer lease** that makes `ReviewStore.decide` refuse the leased identity —
+  so the decision cannot change across the commit point and one plan cannot execute twice.
+  `expected_revisions` is now **mandatory** rather than an opt-in that defaulted to off.
+- **Approval is a content fingerprint.** `ReviewStore.decide` accepts an optional
+  `content_sha256`, persisted through the journal and the snapshot; `plan_transfer` refuses any
+  decision without one. Metadata identity cannot distinguish a same-length edit with a restored
+  timestamp from the reviewed file, and the existing contract accepts that limitation only because
+  P1 mutates nothing. Decisions written by today's P1 HTTP path carry no fingerprint and are
+  therefore **not transferable** — the intended fail-closed state, not an oversight.
+- Four MINOR corrections: the no-replace probe must observe a *collision-specific* refusal plus a
+  successful free-name rename plus unaltered payloads (any `OSError` used to count as proof);
+  reparse inspection is tri-state and `UNKNOWN` **refuses**; the staging descriptor is closed on
+  every failure path (a failed source open used to leak it and orphan a `.part` file in the Media
+  Library); and `recover()` takes its expected digest from the plan's approved fingerprint rather
+  than from whichever hash field the journal last carried, and never deletes.
+- `src/beatsync_fork/clips_review.py` — the one P1 file touched, in a backward-compatible way:
+  an optional `Record.content_sha256`, its strict optional validator on both persistence paths,
+  `fingerprints_of()`, and the `begin_transfer`/`end_transfer`/`active_transfer` lease. Every
+  existing caller and signature is unchanged; the P1 suite passes unmodified.
+- `tests/test_clips_review_transfer_security.py` — new. One regression per finding, each asserting
+  the final filesystem state, the journal **and** the returned result, plus the properties the
+  review confirmed were already holding. 19 negative mutation controls, 18 caught, the one
+  survivor recorded as an equivalent mutant with the reason it cannot be distinguished.
+
+### Added — 2026-10-24 (Clips Preview P2: the safe-transfer core, written and unwired)
+
+The engine that will move reviewed clips to the Media Library or to quarantine. It is **isolated on
+purpose**: nothing calls it. Confirm still reports readiness and moves nothing, `src/gui.py` does
+not import it, and no HTTP route exposes it — three tests pin exactly that, alongside the unchanged
+guard that the media layer contains no mutating filesystem call at all. Enabling it is a further
+phase with its own authorization after independent review.
+
+The product decision behind it: rejection is **quarantine, not deletion**, and no existing
+destination file is ever overwritten. Those two rules shape every path below.
+
+- `src/beatsync_fork/clips_review_transfer.py` — new, pure, stdlib-only. The server-authoritative
+  immutable plan (one entry per clip; `plan_transfer` has **no** source-path parameter, so the
+  sources can only come from `ClipRegistry.page_entries`), the ten-state append-only intent/outcome
+  journal, the same-volume **atomic no-replace move**, the cross-volume
+  **stage → verify → publish → remove source** sequence, and identity-based recovery that compares
+  recorded intent against the real filesystem rather than replaying a historical status.
+- `tests/test_clips_review_transfer.py` — new. 66 cases against **real files on the real
+  filesystem** through the real `ClipRegistry` and `ReviewStore`, including a genuinely
+  cross-volume arm gated on `BEATSYNC_TEST_CROSSVOL` (the convention `test_audio_mixdown.py`
+  already uses for real FFmpeg).
+
+It reuses rather than reinvents: `decision_identity` for source identity, `validate_roots` for every
+path-relationship refusal, and `ReviewStore` for the durable decisions. The no-replace primitive is
+`os.rename`, which on Windows *is* `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`; because that
+is a behavioural claim it is **measured** per destination directory by
+`probe_no_replace_rename`, and the engine refuses when it cannot be demonstrated. `os.replace` is
+never aimed at a destination — a test fails the build if it ever is.
+
+Known and disclosed: a narrow window remains between the final `fstat` on the source descriptor and
+the rename that names its path, which the package's stdlib allowlist cannot close; the no-replace
+rename, the post-publication re-read and source removal ordering are what make it safe rather than
+the window being eliminated.
+
 ### Added — 2026-10-17 (Raw Cutter Batch V1: a whole folder, one press)
 
 A second input mode inside the existing **✂️ Raw Cutter** tab — not a fifth tab. **Single Video**
