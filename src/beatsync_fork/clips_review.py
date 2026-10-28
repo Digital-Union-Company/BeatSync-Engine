@@ -1441,6 +1441,116 @@ IN_USE = "in_use"
 FAILED = "failed"
 
 
+# ---------------------------------------------------------------------------------------------
+# The sort plan: what a Confirm would do, decided before anything moves.
+#
+# [FORK] R8 Final Polish: MOVED HERE from `audio_review.py`, unchanged, because both review
+# surfaces now need it and it was never audio-specific -- it reads a `clip_id` and a decision and
+# nothing else. `audio_review` re-exports these names, so every existing caller and test is
+# unaffected; what changed is that Video Review can now use the same admission rule instead of
+# growing a second one.
+#
+# Keeping it in this module rather than duplicating it is the whole point: "at least one clip is
+# kept" and "the signature covers the batch" are safety rules, and two copies of a safety rule is
+# one copy too many.
+# ---------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SortPlan:
+    """What a Confirm would do, decided before anything moves.
+
+    Three disjoint groups, deliberately kept apart all the way into the report rather than merged
+    into one "discarded" number: an operator who is told "14 discarded" cannot tell whether they
+    rejected 14 clips or forgot to look at 12 of them.
+    """
+
+    keep: tuple = ()
+    rejected: tuple = ()
+    unmarked: tuple = ()
+    signature: str = ""
+
+    @property
+    def total(self) -> int:
+        return len(self.keep) + len(self.rejected) + len(self.unmarked)
+
+    @property
+    def discarded(self) -> tuple:
+        """Everything that would move to the Discarded folder, explicit and unmarked alike."""
+        return tuple(self.rejected) + tuple(self.unmarked)
+
+    @property
+    def has_unmarked(self) -> bool:
+        return bool(self.unmarked)
+
+    @property
+    def needs_library(self) -> bool:
+        return bool(self.keep)
+
+    @property
+    def needs_discarded(self) -> bool:
+        return bool(self.rejected) or bool(self.unmarked)
+
+    @property
+    def can_sort(self) -> bool:
+        """At least one clip is kept. This is the whole admission rule."""
+        return bool(self.keep)
+
+
+def plan_sort(items: Iterable[Any], decisions: Any,
+              library: Any = "", discarded: Any = "") -> SortPlan:
+    """Classify a page into keep / explicitly rejected / unmarked, and sign the result.
+
+    `items` is anything carrying a ``clip_id`` -- an `AudioTile` on the audio surface, a
+    `ClipEntry` on the video one. Nothing else about them is read, which is why one function
+    serves both.
+
+    The signature covers every clip id, its decision, and **both destinations**, so a one-time
+    confirmation authorises exactly the batch the operator was shown. Change a decision, edit a
+    destination, re-scan onto a different page: the signature moves and the confirmation is void.
+    It is a change detector, not a credential -- nothing is authorised by presenting it, and the
+    caller still re-derives the plan and re-validates the folders before moving a byte.
+    """
+    current = dict(decisions or {})
+    keep, rejected, unmarked = [], [], []
+    for item in items:
+        decision = current.get(item.clip_id, PENDING)
+        if decision == SELECTED:
+            keep.append(item.clip_id)
+        elif decision == REJECTED:
+            rejected.append(item.clip_id)
+        else:
+            unmarked.append(item.clip_id)
+
+    material = "\n".join([
+        f"library={os.path.normcase(str(library or ''))}",
+        f"discarded={os.path.normcase(str(discarded or ''))}",
+        *(f"{SELECTED}:{clip}" for clip in sorted(keep)),
+        *(f"{REJECTED}:{clip}" for clip in sorted(rejected)),
+        *(f"{PENDING}:{clip}" for clip in sorted(unmarked)),
+    ])
+    return SortPlan(keep=tuple(keep), rejected=tuple(rejected), unmarked=tuple(unmarked),
+                    signature=hashlib.sha256(material.encode("utf-8")).hexdigest())
+
+
+def plan_preview_lines(plan: SortPlan, library: Any = "", discarded: Any = "") -> list:
+    """What is about to happen, in the operator's words, before it happens.
+
+    The last line is not reassurance padding: the whole reason an unmarked clip may be swept into
+    the Discarded folder is that doing so destroys nothing, and the operator has to be able to see
+    that stated at the moment they are asked to agree to it.
+    """
+    lines = [f"{len(plan.keep)} clip(s) selected to KEEP."]
+    if library:
+        lines.append(f"    → {library}")
+    lines.append(f"{len(plan.rejected)} clip(s) explicitly rejected.")
+    if plan.unmarked:
+        lines.append(f"{len(plan.unmarked)} unmarked clip(s) will ALSO be moved to Discarded.")
+    if plan.needs_discarded and discarded:
+        lines.append(f"    → {discarded}")
+    lines.append("Nothing will be permanently deleted.")
+    return lines
+
+
 @dataclass
 class MoveOutcome:
     clip_id: str

@@ -264,7 +264,10 @@ def test_the_clips_tab_writes_no_render_or_source_widget(source: str):
                       "cut_report", "render_invocation_state", "variation_seed",
                       "creative_preset", "_RENDER_LOCK", "RENDER_CONCURRENCY_ID"):
         assert forbidden not in block, f"a Clips Preview event writes or reads {forbidden}"
-    assert block.count(".click(") == 4, "expected exactly four Clips Preview registrations"
+    # [FORK] R8 Final Polish: SIX, not four. Keep-only classification adds the sweep gate's
+    # Proceed and Cancel, mirroring Audio Review. Still an exact count rather than a
+    # minimum, so a seventh registration has to be reviewed deliberately.
+    assert block.count(".click(") == 6, "expected exactly six Video Review registrations"
 
 
 def test_the_clips_handlers_take_an_injected_request_not_a_widget(tree: ast.Module, source: str):
@@ -556,17 +559,129 @@ def test_the_settings_tab_holds_the_remembered_folders(source: str):
 
 
 # ---------------------------------------------------------------------------------------------
+# [FORK] R8 Final Polish: the Settings layout.
+#
+# A pure re-layout again, and the assertions say so: the same nine fields, the same nine Browse
+# buttons, the same preference keys, the same two save/reset event registrations. What changed is
+# which Row each widget sits in and which heading precedes it. These tests pin the two properties
+# the re-layout was performed to obtain, because both are the kind a later tidy-up undoes without
+# noticing.
+# ---------------------------------------------------------------------------------------------
+
+#: Every folder field on the Settings tab, paired with the Browse button that fills it. Both
+#: halves of each pair are named, so a renamed widget fails loudly rather than being skipped.
+_SETTINGS_BROWSE_PAIRS = (
+    ("pref_render_output", "pref_render_output_browse"),
+    ("pref_raw_output", "pref_raw_output_browse"),
+    ("pref_audio_output", "pref_audio_output_browse"),
+    ("pref_library", "pref_library_browse"),
+    ("pref_rejected", "pref_rejected_browse"),
+    ("pref_audio_library", "pref_audio_library_browse"),
+    ("pref_audio_discarded", "pref_audio_discarded_browse"),
+    ("pref_audio_preview_library", "pref_audio_preview_library_browse"),
+    ("pref_audio_preview_discarded", "pref_audio_preview_discarded_browse"),
+)
+
+
+@pytest.mark.parametrize("field,browse", _SETTINGS_BROWSE_PAIRS)
+def test_each_browse_button_sits_in_its_own_fields_row(source: str, field: str, browse: str):
+    """Measured on the shipped page: Browse buttons were collected into a Row of their own BELOW
+    a Row holding two text fields, so a button landed under the gap between two boxes and read as
+    belonging to neither.
+
+    The fix is structural rather than cosmetic -- one field per Row, its own Browse beside it --
+    so the assertion is structural too: between a field's definition and its Browse button there
+    must be no second `gr.Textbox`, and no `with gr.Row(` may open between them. Either would mean
+    the button had drifted away from the field it fills.
+    """
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    opening = f"{field} = gr.Textbox("
+    field_at = source.index(opening, start, end)
+    browse_at = source.index(f"{browse} = gr.Button(", start, end)
+    assert field_at < browse_at, f"{browse} comes before the field it fills"
+    # Skip past the field's OWN opening call before looking for a second one.
+    between = source[field_at + len(opening):browse_at]
+    assert "gr.Textbox(" not in between, f"another field sits between {field} and {browse}"
+    assert "with gr.Row(" not in between, f"{browse} is in a different Row from {field}"
+
+
+def test_the_folder_defaults_are_grouped_by_purpose(source: str):
+    """Nine paths as one undifferentiated list is the other half of why this panel was hard to
+    scan. The headings are Markdown, so they carry no state and nothing can read them -- the only
+    thing pinned is that each group precedes the fields it introduces."""
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    order = [source.index(token, start, end) for token in (
+        "LABEL_PREF_GROUP_VIDEO",
+        "pref_render_output = gr.Textbox(",
+        "LABEL_PREF_GROUP_AUDIO",
+        "pref_audio_output = gr.Textbox(",
+        "LABEL_PREF_GROUP_REVIEW",
+        "pref_library = gr.Textbox(")]
+    assert order == sorted(order), (
+        "expected: render/video heading, render field, audio heading, audio field, "
+        "review heading, review field")
+
+
+def test_cache_management_is_the_one_collapsed_block_on_settings(source: str):
+    """It is occasional maintenance with a destructive button in it, not setup -- so it opens on
+    request. The folder defaults and the collision policy stay visible, because an operator should
+    be able to read their destinations without opening anything.
+    """
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    block = source[start:end]
+    assert "gr.Accordion(label=LABEL_CACHE_SECTION, open=False)" in block
+    assert "gr.Accordion(label=LABEL_CACHE_SECTION, open=True)" not in block
+    assert block.count("gr.Accordion(") == 1, \
+        "Settings hides exactly one block; the folder defaults and the policy stay visible"
+
+
+def test_the_cache_deletion_wiring_was_not_touched_by_the_re_layout(source: str):
+    """The brief that moved this block said not to change the deletion logic, and no defect was
+    found in it. So the selection, the confirmation gate and the destructive button must still be
+    the same three widgets, inside the span that moved."""
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    block = source[start:end]
+    for widget in ("cache_inspect_btn = gr.Button(", "cache_select = gr.CheckboxGroup(",
+                   "cache_confirm = gr.Checkbox(", "cache_clear_btn = gr.Button(",
+                   "cache_report = gr.Textbox("):
+        assert widget in block, widget
+    assert "variant='stop'" in block[block.index("cache_clear_btn = gr.Button("):], \
+        "the clear button lost its destructive styling"
+
+
+# ---------------------------------------------------------------------------------------------
 # Discoverability: which accordions open
 # ---------------------------------------------------------------------------------------------
 
-def test_the_ai_director_and_freestyle_are_no_longer_collapsed(source: str):
-    """The task's actual complaint: these two were easy to overlook. Both are now open on arrival
-    in Creative Studio.
+def test_all_three_creative_panels_are_collapsed(source: str):
+    """[FORK] R8 Final Polish -- replaces `test_the_ai_director_and_freestyle_are_no_longer_collapsed`.
+
+    GUI Refresh A opened the Director and Freestyle because they were easy to overlook, and that
+    was the right call when they shared one long scrolling column with everything else. Measured
+    afterwards, this tab was **3,516 px tall** and the controls an operator reaches for on every
+    render -- the preset, the seed, the six sliders -- were below three open panels.
+
+    Discoverability costs one tab visit; scrolling costs every visit. So the panels are collapsed
+    and the frequently-used controls are first. The ORDER still carries the old explanation
+    (describe the edit, then the controls, then the lab) -- it is now the order of the collapsed
+    headings rather than of three open blocks.
     """
-    assert "gr.Accordion(label=LABEL_AI_DIRECTOR, open=True)" in source
-    assert "gr.Accordion(label=LABEL_FREESTYLE, open=True)" in source
-    assert "gr.Accordion(label=LABEL_AI_DIRECTOR, open=False)" not in source
-    assert "gr.Accordion(label=LABEL_FREESTYLE, open=False)" not in source
+    for label in ("LABEL_AI_DIRECTOR", "LABEL_FREESTYLE", "LABEL_VARIANT_LAB"):
+        assert f"gr.Accordion(label={label}, open=False)" in source, label
+        assert f"gr.Accordion(label={label}, open=True)" not in source, label
+
+
+def test_the_frequently_used_creative_controls_come_first(source: str):
+    """The ordering the height fix rests on, pinned so a later edit cannot quietly undo it."""
+    order = [source.index(token) for token in (
+        "creative_preset = gr.Radio(",
+        "variation_seed = gr.Number(",
+        "cut_density = gr.Slider(",
+        "gr.Accordion(label=LABEL_AI_DIRECTOR",
+        "gr.Accordion(label=LABEL_FREESTYLE",
+        "gr.Accordion(label=LABEL_VARIANT_LAB")]
+    assert order == sorted(order), (
+        "expected preset, seed, sliders, then Director, Freestyle, Variant Lab")
 
 
 def test_the_bulky_blocks_stay_collapsed(source: str):

@@ -726,7 +726,7 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
             f"{generator} must write no execution widget — generating is not applying")
 
 
-def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
+def test_the_variation_seed_writer_matrix_is_exactly_seven_registrations():
     """**Measured from main and extended by exactly one, twice.**
 
     Before the Director the seed had four writers: Randomize, and the three Variant Lab
@@ -748,6 +748,7 @@ def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
 
     assert sorted(writers) == ["apply_director_btn.click",
                                "apply_variant_btn.click",
+                               "clear_variations_btn.click",
                                "generate_variant_btn.click",
                                "new_variant_btn.click",
                                "randomize_btn.click",
@@ -756,6 +757,52 @@ def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
         "generating a proposal must not move the Variation Seed")
     assert "generate_variants_btn.click" not in writers
     assert "creative_preset.input" not in writers, "no preset may move the seed"
+
+    # [FORK] R8 Final Polish adds the SEVENTH, `clear_variations_btn.click`, and it is legitimate
+    # for the same reason Randomize is: "no variation" is a seed VALUE, and 0 is the documented
+    # precision baseline rather than a magic number.
+    #
+    # It exists because the obvious alternative is a false statement. Selecting `Balanced` resets
+    # the six sliders and NOTHING else -- not the seed, not Freestyle, not Audio Mix -- so it
+    # cannot be described as "start again", and an earlier draft of this refresh did describe it
+    # that way. The two actions are disjoint by construction, which is what the next test pins.
+    assert "clear_variations_btn.click" in writers
+
+
+def test_clear_creative_variations_is_disjoint_from_the_preset():
+    """[FORK] R8 Final Polish. Neither action is a superset of the other, and that is what stops
+    either being mistaken for "reset everything":
+
+        Balanced preset           ->  the six sliders, and only those
+        Clear Creative Variations ->  the seed and Freestyle, and only those
+
+    Asserted as two absences, because an absence is what keeps them disjoint: this button writes
+    no slider (or it would be a second preset authority) and no Audio Mix widget (which is a
+    different tab and a different decision).
+    """
+    tree = _gui_tree()
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "clear_variations_btn.click")
+    outputs = _names(next(kw for kw in call.keywords if kw.arg == "outputs").value)
+
+    assert sorted(outputs) == ["freestyle_enabled", "freestyle_summary", "variation_seed"], outputs
+    for forbidden in _NEW_CONTROLS_IN_FIELD_ORDER:
+        assert forbidden not in outputs, f"it writes the slider {forbidden}"
+    for forbidden in ("creative_preset", "music_under_voice", "sfx_amount", "sfx_level",
+                      "sfx_folder", "sfx_roles", "voice_files"):
+        assert forbidden not in outputs, f"it writes {forbidden}"
+
+    # and it cannot reach the source gate or preparation either
+    for forbidden in _GATE_AND_PREP_OUTPUTS:
+        assert forbidden not in outputs, f"it writes {forbidden}"
+
+    # The section dropdowns are READ, not written: turning Freestyle off must leave the rules the
+    # operator built intact, so ticking the box again restores exactly what was there.
+    inputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "inputs").value)
+    assert "freestyle_section_dropdowns" in inputs
+    handler = _func(_gui_tree(), "_on_clear_creative_variations")
+    returns = [n for n in ast.walk(handler) if isinstance(n, ast.Return)]
+    assert len(returns) == 1 and len(returns[0].value.elts) == 3, ast.unparse(handler)
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():

@@ -616,7 +616,16 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #:
 #: `audio_review_state` also changed shape, from a list of dicts to the same view dict. Nothing
 #: live -- no lock, thread, handle, descriptor or lifecycle -- enters any of them.
-_EXPECTED_STATE_COUNT = 12
+#:
+#: 13 since R8 Final Polish, for `clips_armed_state` -- the thirteenth is the reviewed decision
+#: this pin exists to force, and it is the exact sibling of `audio_armed_state` rather than a new
+#: kind of state. Video Review gained the same keep-only confirmation Audio Review already had, so
+#: it needs the same thing: the sha256 sweep signature of the batch the operator actually agreed
+#: to discard unmarked clips from. A plain string, never a live object, and per-session for the
+#: same reason every state above is. Separate from `audio_armed_state` because the two tabs review
+#: different clips, and a signature minted for one batch must not authorise a sweep of another --
+#: `test_a_signature_from_a_different_batch_cannot_authorise_a_sweep` pins that directly.
+_EXPECTED_STATE_COUNT = 13
 
 
 def test_the_expected_state_count_matches_the_named_states():
@@ -634,7 +643,10 @@ def test_the_expected_state_count_matches_the_named_states():
                      # [R7.2] Named individually rather than counted, so a future state cannot
                      # satisfy the count by displacing one of these.
                      "audio_armed_state", "audio_run_dir_state",
-                     "audio_preview_state", "audio_preview_armed_state"):
+                     "audio_preview_state", "audio_preview_armed_state",
+                     # [R8 Final Polish] Video Review's own sweep signature, named for the same
+                     # reason: a later state must not satisfy the count by displacing it.
+                     "clips_armed_state"):
         assert expected in names, f"{expected} missing from {names}"
     assert "gr.State" in source
 

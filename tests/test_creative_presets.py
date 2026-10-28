@@ -748,9 +748,12 @@ def test_the_selector_lives_directly_above_the_sliders_it_writes():
     position = source.index("creative_preset = gr.")
 
     assert tab < position < following, "the selector is outside the Creative Settings tab"
-    # below the seed, which it never writes...
-    assert source.index("variation_seed = gr.") < position
-    # ...and directly above the six sliders it does write.
+    # [FORK] R8 Final Polish: the preset is now the FIRST control on the tab, above the seed.
+    # The owner's ordering is frequency of use -- preset, seed, sliders -- and the property this
+    # test actually protects is unchanged and asserted below: the selector sits immediately above
+    # the six sliders it writes, with nothing between them but the seed it never writes.
+    assert position < source.index("variation_seed = gr.")
+    # ...and still above the six sliders it does write.
     assert position < source.index("cut_density = gr.", tab)
 
 

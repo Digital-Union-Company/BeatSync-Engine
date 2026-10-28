@@ -843,16 +843,54 @@ Built on top of the R7.2 candidate, in five separately testable commits:
 Full record, including the measurements and the two deliberate deviations from the brief:
 [`docs/claude/r8-ux-refresh.md`](docs/claude/r8-ux-refresh.md).
 
-**Two things the brief asked for that were deliberately NOT built**, both because an existing
-contract forbids them and the contract is right:
+**One thing the brief asked for that is deliberately NOT built**, because an existing contract
+forbids it and the contract is right:
 
 - **`Custom — based on Balanced`** as a profile label. It needs a remembered "last selected
   preset", which `.claude/rules/creative-presets.md` forbids and a test pins — six integers
   describe a render completely, and a remembered base would be a second source of truth able to
   disagree with the sliders. A base is named only when the live values prove it.
-- **A "Reset Creative Overrides" button** (offered in the brief as optional). There is a standing
-  prohibition on a reset for the six global controls; selecting the `Balanced` preset already does
-  it, under a name that cannot be mistaken for a second authority.
+
+**A correction to an earlier entry here.** This section previously also listed a reset action as
+not-built, on the grounds that "selecting the `Balanced` preset already does it". **That was
+false.** A preset writes the six base sliders and nothing else — it does not clear the Variation
+Seed, does not disable Freestyle and does not touch Audio Mix. The standing prohibition is also
+narrower than that entry implied: it forbids a reset *for the six global controls*, which an
+action that deliberately leaves the sliders alone is not.
+
+R8 Final Polish therefore **builds it**, as `🧹 Clear creative variations`. The two actions are
+disjoint by construction — `Balanced` → the six sliders only; Clear → the seed and Freestyle only
+— so neither is "reset everything" and neither becomes a second source of truth.
+
+#### Final Polish — the finishing pass after the owner reviewed the screenshots
+
+A sixth commit on the same branch, scoped to practical issues rather than another audit:
+
+- **Video Review keep-only classification**, matching Audio Review. Confirm enables at **one clip
+  kept**; anything still unmarked gets a second step with exact counts, both destinations and
+  Proceed / Cancel. Proceed files the unmarked clips as Discarded **for this batch only** and
+  writes nothing to the durable record; Cancel changes nothing. No second transfer engine was
+  written — Audio Review's `SortPlan` / `plan_sort` / `plan_preview_lines` moved into the shared
+  `clips_review` core and are re-exported, so the two tabs now run the *same objects*.
+- **Creative Settings 3516 px → 1375 px**, by ordering rather than deletion: preset, seed and the
+  six sliders first; AI Director, Freestyle and Variant Lab collapsed below them.
+- **Settings laid out by purpose** — one path per row with its own Browse beside it (all nine
+  verified on-page), grouped into render/video, audio/voice and review destinations, with Cache
+  Management as the single collapsed block. Preference keys, values and handlers unchanged;
+  defaults verified to survive a restart. **Cache deletion logic untouched** — no defect found.
+- **Render input compacted** — drop zone bounded to 113 px, two headings that named the single
+  control beneath them removed, profile help cut to one line. `Create Music Video` moved from
+  y=903 to **y=826** at 1440 CSS px, i.e. from below a 900 px fold to above it.
+
+**One brief item measured and deliberately NOT shipped:** a native Browse button for the music
+track. It was built and reverted — a `gr.File` raises `InvalidPathError` for any path outside
+Gradio's allowed roots, and the three workarounds each cost more than the button is worth
+(widening `allowed_paths` exposes a tree to the browser; copying the file is the duplication the
+brief ruled out; a path textbox rewrites the render source pipeline and loses drag-and-drop).
+The measurement and the exact exception are pinned in `tests/test_render_music_input.py`.
+
+End to end after all four: 720p · 30 fps chosen in the UI over four 320×240 sources rendered
+`width=1280 height=720 r_frame_rate=30/1`.
 
 ---
 

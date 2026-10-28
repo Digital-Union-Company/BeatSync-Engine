@@ -289,14 +289,38 @@ hole is closed by the move, not by the omission — and the omission was what le
 plain `Balanced` render while Freestyle was armed. No creative widget gained a second
 registration, which is the guard R1 refused to relax and this commit also does not.
 
-### "Reset Creative Overrides" was deliberately NOT added
+### "Reset Creative Overrides" was deferred here — and the reason I gave was WRONG
 
-Phase 5 offered it as optional ("if useful"). It is **forbidden**:
-`.claude/rules/creative-presets.md` carries a standing prohibition on "a preset *button*,
-randomiser or reset for the six global controls", unchanged through four features. Selecting the
-`Balanced` preset already resets the six to neutral, which is the same action under a name that
-cannot be mistaken for a second authority. Adding a reset would have extended three writer
-matrices to duplicate an existing control.
+Phase 5 offered it as optional ("if useful"), and Commit C did not build it. That decision was
+defensible; **the justification written for it was not, and it is corrected here rather than
+quietly edited away.**
+
+What this document and `ROADMAP.md` originally said was that selecting the `Balanced` preset
+"already does it". That is false. A preset writes **the six base sliders and nothing else** — by
+rule, by test, and by the design note in `.claude/rules/creative-presets.md` that a preset is a
+name for six numbers. It does **not** clear the Variation Seed, it does **not** disable Freestyle,
+and it does **not** touch anything in Audio Mix. So the thing the operator was told already
+existed did not exist, and the half of the state they most likely wanted to clear was exactly the
+half `Balanced` leaves alone.
+
+The standing prohibition is also narrower than I implied: it forbids a reset **for the six global
+controls**. An action that resets the seed and Freestyle and deliberately *leaves the sliders
+alone* is not that reset, and never was.
+
+**R8 Final Polish therefore builds it**, as `🧹 Clear creative variations`, with the two actions
+disjoint by construction:
+
+```
+Balanced preset            ->  the six sliders, and only those
+Clear creative variations  ->  the Variation Seed and Freestyle, and only those
+```
+
+Neither is a superset of the other, so neither can honestly be called "reset everything" — which
+is the property that keeps a second source of truth from appearing. It writes no slider (pinned by
+test), no preset, and no Audio Mix widget, and it **reads** the ten section dropdowns rather than
+clearing them, so turning Freestyle off leaves the rules intact and ticking the box again restores
+them. It is the seventh writer of `variation_seed`; that matrix was extended by exactly one, with
+the reason recorded beside it.
 
 ### "Use Media Library" is not a third source mode
 
@@ -497,3 +521,119 @@ correctly.
 existence.** Poll for the property itself (`getComputedStyle(el).display !== 'none'`), or wait on
 the network response. An element that exists in both states makes existence a constant, and a
 probe whose condition is already true measures nothing.
+
+---
+
+## Commit F — the final polish pass
+
+A separate brief, after the owner reviewed the shipped screenshots. Four items, all practical:
+keep-only classification for Video Review, a shorter Creative Settings tab, a readable Settings
+layout, and a compact Render input area. No new audit, no architecture change.
+
+### Video Review now matches Audio Review — and the plan model is now written once
+
+Confirm used to require *every* clip decided. It now enables as soon as **one clip is marked
+Keep**, and if anything is still unmarked it shows a second step with exact counts, both
+destinations and Proceed / Cancel. Proceed treats the unmarked clips as Discarded **for this
+batch only**; Cancel changes nothing.
+
+The important part is what was *not* written. Audio Review already had this exact mechanism —
+`SortPlan`, `plan_sort`, `plan_preview_lines` — so rather than build a second one, those three
+were **moved verbatim into `beatsync_fork/clips_review.py`** and re-exported from
+`audio_review.py` as plain aliases. `audio_review.SortPlan is clips_review.SortPlan` is literally
+true. Two copies of a safety rule is one copy too many, and the brief said not to introduce
+another transfer engine.
+
+Three properties are pinned by tests because each is a way this could go wrong quietly:
+
+* **Proceed is the same handler as Confirm.** It re-derives the plan, re-validates the
+  destinations and re-checks the signature; the only difference is that by then the arming state
+  matches. A second entry point could have skipped one of those.
+* **The sweep writes no decision to the durable record.** PENDING→REJECTED happens in a local
+  `decision_of`, so "for this batch only" is structural rather than remembered.
+* **A signature from a different batch cannot authorise a sweep.** Change a decision or a folder
+  and the operator is asked again.
+
+Runtime, four real clips, one marked Keep: Confirm enabled at `Kept 1 · Undecided 3`; the gate
+listed `1 keep → library`, `3 unmarked will ALSO be moved to Discarded`; **Cancel left all four
+files in the source folder**; Proceed produced `library: 1`, `discarded: 3`, **4 files still on
+disk**, original filenames intact.
+
+### Creative Settings: 3516 px → 1375 px
+
+The previous pass listed this tab as the next candidate. Measured again after: **1375 px**, a 61%
+cut, achieved almost entirely by ordering rather than deletion. The controls reached on every
+render come first (preset → seed → six sliders) and the three large panels — AI Director,
+Freestyle, Variant Lab — are collapsed below them. All three were verified to still expand.
+
+`test_all_three_creative_panels_are_collapsed` **replaces**
+`test_the_ai_director_and_freestyle_are_no_longer_collapsed`, and the reversal is deliberate:
+GUI Refresh A opened those panels because they were easy to miss in a single long column. That
+was right then. Discoverability costs one tab visit; scrolling costs every visit.
+
+### "Clear creative variations" — and the claim it replaces
+
+The previous pass deferred a reset action with the justification that *selecting Balanced already
+does it*. **That was wrong, and the owner corrected it.** Selecting Balanced writes the six base
+sliders and nothing else — not the Variation Seed, not Freestyle, not Audio Mix. The false claim
+has been removed from this document and from `ROADMAP.md`.
+
+The action that now exists is the disjoint half: **Variation Seed → 0 and Freestyle → off, with
+the six base sliders and Audio Mix untouched.** Two actions that write disjoint sets of widgets
+are not two sources of truth for one state — `test_clear_creative_variations_is_disjoint_from_the_preset`
+pins exactly that, and the seed-writer matrix went 6 → 7.
+
+Runtime: seed 42 + Freestyle on → press → seed 0, Freestyle off, `cut_density` and `micro_cuts`
+unchanged at 50.
+
+### Settings: nine Browse buttons that now belong to a field
+
+The previous pass flagged this as "works; it is not pretty". The cause was structural: Browse
+buttons were collected into their **own Row below** a Row of two text fields, so each button sat
+under the gap between two boxes. Now one field per Row with its own Browse beside it — measured
+on the page, all nine at `sameRow=true`, 1 px to the right of their field.
+
+The nine paths are also grouped by purpose (render/video, audio/voice, review destinations), and
+**Cache Management is the one collapsed block** on the tab: it is occasional maintenance with a
+destructive button in it, not setup. The deletion logic is untouched — no defect was found and
+the brief said not to change it without one. Preference keys, values and the save/reset handlers
+are unchanged; a `preferences.json` written by an earlier build still loads, and the defaults
+were verified to survive a restart.
+
+### Render: the drop zone is bounded, and the native picker is NOT available here
+
+The music drop zone claimed roughly 190 px for a single-file control; it is now 113. With two
+redundant wrapper headings removed (`Video Settings` and `Output Settings` each named the single
+control beneath them) and the profile help cut from three lines to one, **Create Music Video
+moved from y=903 to y=826 at 1440 CSS px** — from just below a 900 px fold to above it.
+
+The brief also asked whether the native Browse used by every other path field could be offered
+here. It was built, measured and **reverted**. A `gr.File` refuses to display a path outside
+Gradio's allowed roots:
+
+```
+gradio.exceptions.InvalidPathError: Cannot move <chosen path> to the gradio cache dir because it
+was not created by the application or it is not located in either the current working directory
+or your system's temp directory.
+```
+
+The dialog opened and returned the operator's choice correctly — the refusal is downstream, in
+`processing_utils._check_allowed`, and the component renders "Error". The three ways around it
+are all worse than the button: widening `launch(allowed_paths=…)` exposes a whole tree to any
+request the browser can make (the exact thing R5's authorized middleware exists to avoid);
+copying the file into an accepted directory is the duplication of large local files the brief
+ruled out; replacing `gr.File` with a path textbox rewrites the render source pipeline and loses
+drag-and-drop. `tests/test_render_music_input.py` carries the measurement and pins the revert.
+
+### End-to-end, after all four items
+
+720p · 30 fps selected in the UI, four 320×240 sources, real render through the running app:
+`width=1280 height=720 r_frame_rate=30/1`. Fixed profiles still produce exactly their dimensions.
+
+### A defect found in the playtest harness, not the app
+
+`launch_playtest.py` called `app.launch()` without `app_kwargs`, so none of the three media
+middlewares were attached. Posters still drew, but every clip decision POSTed to a route that did
+not exist and came back **404**, surfaced only in `window.__r5Last`. A silent dead click in a
+harness is indistinguishable from a broken feature. The launcher now mirrors `gui.main()`'s
+launch arguments exactly.

@@ -453,10 +453,13 @@ INFO_AUDIO_FADE_EDGES = (
 )
 
 LABEL_OUTPUT_PROFILE = "🎞️ Output Video Profile"
+#: [FORK] R8 Final Polish: three lines to one. The sentence that was cut said a fixed profile
+#: letterboxes rather than stretching — true, and it is the reassuring half, but it described
+#: behaviour an operator sees in the result rather than a choice they have to make here. It sat
+#: in the one column that decides whether Create Music Video is above the fold at 1440x900.
 INFO_OUTPUT_PROFILE = (
-    "The size and frame rate of the finished video. **Auto** keeps today's behaviour: the first "
-    "source video decides. A fixed profile gives you exactly those dimensions and adds black bars "
-    "where a clip's shape does not match — it never stretches the picture."
+    "Size and frame rate of the finished video. **Auto** follows the first source; a fixed "
+    "profile letterboxes instead of stretching."
 )
 
 # GPU & Processing
@@ -756,9 +759,38 @@ CLIPS_COUNTS_INITIAL_TEXT = "Kept 0   ·   Discarded 0   ·   Undecided 0   ·  
 CLIPS_GALLERY_INITIAL_HTML = (
     '<div class="r5-empty">Nothing scanned yet. Choose a clips folder and press Scan.</div>'
 )
+# [FORK] R8 Final Polish: the old text described the pre-keep-only rule ("every clip on the page
+# is decided"), which is no longer how Confirm is admitted. Video Review now matches Audio Review:
+# mark the good clips, and the rest are handled through an explicit, batch-specific gate.
 CLIPS_CONFIRM_DISABLED_TEXT = (
-    "Confirm is disabled until every clip on the page is decided. Undecided is not a decision."
+    "Mark at least one clip to Keep. Anything you leave undecided is offered for the Discarded "
+    "folder in a second step that you confirm separately — nothing moves until then."
 )
+
+CLIPS_SWEEP_GATE_HEADING = (
+    "⚠️  Some clips are still unmarked. Nothing has moved yet — here is what Confirm would do:"
+)
+CLIPS_SWEEP_GATE_PROMPT = (
+    "Press Proceed to sort it exactly as listed, or Cancel to go back and mark more clips."
+)
+CLIPS_SWEEP_CANCELLED_TEXT = (
+    "Cancelled. Nothing was moved and every decision is exactly as you left it."
+)
+# [FORK] R8 Final Polish: the honest counterpart to selecting a preset.
+#
+# Selecting `Balanced` resets the six base sliders and NOTHING else. It does not clear the
+# Variation Seed, it does not disable Freestyle, and it does not touch Audio Mix. This action
+# covers the other half, and equally does not touch the sliders -- the two are disjoint on
+# purpose, so neither can be mistaken for "reset everything".
+LABEL_CLEAR_VARIATIONS = "🧹 Clear creative variations"
+INFO_CLEAR_VARIATIONS = (
+    "Sets the Variation Seed back to 0 and turns Freestyle off. **Your six sliders and the "
+    "preset are left alone**, and so is everything in Audio Mix — to reset the sliders, pick a "
+    "preset above."
+)
+
+LABEL_CLIPS_PROCEED = "➡️ Proceed — sort it as listed"
+LABEL_CLIPS_SWEEP_CANCEL = "↩️ Cancel — go back and mark more clips"
 # [R5-P3 / F8] Classifying posts straight to the server rather than through a Gradio event, which
 # is deliberate -- but it means a decision cannot re-enable the Confirm button by itself. Without
 # this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
@@ -798,6 +830,17 @@ INFO_PREF_RENDER_OUTPUT = (
     "Where finished music videos are published. Leave blank to use the `output` folder inside "
     "BeatSync itself. Only affects the final video — temporary working files and caches stay "
     "where they are."
+)
+
+# [FORK] R8 Final Polish: the three purpose groups the folder defaults are read in. Nine paths in
+# one undifferentiated list is why this panel was hard to scan; the paths themselves, their keys
+# and their saved values are unchanged.
+LABEL_PREF_GROUP_VIDEO = "🎬 Render and video folders"
+LABEL_PREF_GROUP_AUDIO = "🎙️ Audio and voice folders"
+LABEL_PREF_GROUP_REVIEW = "📂 Review destinations"
+INFO_PREF_GROUP_REVIEW = (
+    "Where a review files what you decide. Keeping and discarding are both *moves* — nothing is "
+    "ever deleted, and the original filename is preserved."
 )
 
 # [FORK] R8 UX Refresh (Commit C): the Media Library as a video source.
@@ -875,7 +918,7 @@ PLACEHOLDER_CACHE_REPORT = (
 )
 
 CLIPS_REFRESH_TO_ENABLE_HINT = (
-    "All clips decided — Confirm is being enabled from the server's record."
+    "At least one clip kept — Confirm is being enabled from the server's record."
 )
 # [UX V3] Why a clip stayed where it was. Each of these means the original is untouched: the
 # sorter only ever renames, so anything short of success leaves the file exactly as it was.
