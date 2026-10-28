@@ -50,17 +50,51 @@ AUDIO_CUTTER_INPUT = "audio_cutter_input"
 AUDIO_PREVIEW_INPUT = "audio_preview_input"
 AUDIO_PREVIEW_LIBRARY = "audio_preview_library"
 AUDIO_PREVIEW_DISCARDED = "audio_preview_discarded"
+# [FORK] R8 UX Refresh. APPENDED for the third time and for the same reason: `load_preferences`
+# fills a missing key with "", so every `preferences.json` written before R8 still loads and simply
+# has this blank. Where finished renders go was the one destination the operator could not set --
+# it was a fixed property of the installation -- so it is a *new* key rather than a reuse of one.
+RENDER_OUTPUT = "render_output"
 
 #: Destinations the operator deliberately configures, versus the merely-convenient last-used
 #: inputs. Both are remembered; only the first group is presented as "defaults" in the UI.
 DESTINATION_KEYS = (CLIPS_LIBRARY, CLIPS_REJECTED, RAW_CUTTER_OUTPUT,
                     AUDIO_LIBRARY, AUDIO_DISCARDED, AUDIO_CUTTER_OUTPUT,
-                    AUDIO_PREVIEW_LIBRARY, AUDIO_PREVIEW_DISCARDED)
+                    AUDIO_PREVIEW_LIBRARY, AUDIO_PREVIEW_DISCARDED, RENDER_OUTPUT)
 LAST_USED_KEYS = (CLIPS_INPUT, RAW_CUTTER_INPUT, QUICK_RENDER_SOURCE, AUDIO_CUTTER_INPUT,
                   AUDIO_PREVIEW_INPUT)
 KEYS = DESTINATION_KEYS + LAST_USED_KEYS
 
 SCHEMA = "beatsync-folder-preferences-1"
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 UX Refresh: non-folder options, in the same file and deliberately in a SEPARATE
+# section.
+#
+# The schema string is unchanged, and that is a decision rather than an oversight. `folders` keeps
+# exactly the shape and meaning it already had, so a `preferences.json` written by any previous
+# version loads here with no migration step, and one written by this version loads in an older
+# build with the options silently ignored -- which is the correct outcome, because an older build
+# has no feature to apply them to. Bumping the schema would have bought nothing and would have
+# meant teaching every reader a version rule.
+#
+# The practical consequence is a rule for writers: `save_preferences` must PRESERVE a section it
+# does not own. Writing only `folders` would silently discard the options, and the operator would
+# watch a setting reset itself every time they pressed Save defaults.
+# ---------------------------------------------------------------------------------------------
+
+#: What to do when a destination filename is already taken. The values are
+#: `beatsync_fork.collision.SKIP` / `.SUFFIX`; this module deliberately does not import that one,
+#: because preferences are inert storage and must not acquire a dependency on the policy that
+#: happens to read them. `collision.resolve_policy` is total, so an unknown value read from here
+#: resolves to the safe default rather than raising.
+COLLISION_POLICY = "collision_policy"
+
+OPTION_KEYS = (COLLISION_POLICY,)
+
+#: The built-in defaults. Every one must reproduce the behaviour the app had before the option
+#: existed, so that an operator who never opens Settings sees no change at all.
+OPTION_DEFAULTS = {COLLISION_POLICY: "skip"}
 
 
 def empty_preferences() -> dict:
@@ -104,14 +138,56 @@ def load_preferences(path: str) -> tuple[dict, str]:
     return preferences, ""
 
 
-def save_preferences(path: str, preferences: dict) -> str:
+def empty_options() -> dict:
+    return dict(OPTION_DEFAULTS)
+
+
+def load_options(path: str) -> dict:
+    """The non-folder options, with every missing or unreadable value defaulted.
+
+    Deliberately total and deliberately silent: unlike the folder store there is nothing here an
+    operator loses by a default being applied, so an unreadable file reports through
+    :func:`load_preferences` (which the caller always invokes too) rather than twice.
+    """
+    options = empty_options()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return options
+    if not isinstance(stored, dict):
+        return options
+    values = stored.get("options")
+    if not isinstance(values, dict):
+        return options
+    for key in OPTION_KEYS:
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            options[key] = value.strip()
+    return options
+
+
+def _existing_options(path: str) -> dict:
+    """What is already on disk, so a writer cannot drop a section it does not own."""
+    return load_options(path)
+
+
+def save_preferences(path: str, preferences: dict, options: dict | None = None) -> str:
     """Write atomically. Returns `""` on success or an operator-readable reason.
 
     Only the known keys are stored, so a stray value in the caller's dictionary cannot be
     persisted, and the file stays something a human can read and edit.
+
+    `options=None` means "leave the options exactly as they are", which is what every pre-R8
+    caller wants and gets without being changed. The options are read back from disk and written
+    out again rather than omitted, because omitting them would delete them -- this function
+    replaces the whole file.
     """
+    resolved = _existing_options(path) if options is None else {
+        key: _clean(options.get(key)) or OPTION_DEFAULTS[key] for key in OPTION_KEYS}
     payload = {"schema": SCHEMA,
-               "folders": {key: _clean(preferences.get(key)) for key in KEYS}}
+               "folders": {key: _clean(preferences.get(key)) for key in KEYS},
+               "options": resolved}
     directory = os.path.dirname(path) or "."
     try:
         os.makedirs(directory, exist_ok=True)
@@ -158,10 +234,73 @@ def unavailable_notice(preferences: dict, labels: dict) -> str:
             f"{named}. Pick them again or edit the path.")
 
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 Owner Fixes (P1): work folders that are also finished libraries.
+#
+# The owner's screenshot had the Audio Cutter's OUTPUT folder and the Audio Preview MEDIA LIBRARY
+# both pointing at `Raw_Cutts`. Nothing is broken by that -- every move still validates, nothing
+# is overwritten -- but it quietly defeats the point of reviewing: fresh unreviewed cuts land in
+# the same directory that "keep" files into, so the two become indistinguishable on disk and the
+# next scan re-offers clips that were already accepted.
+#
+# This reports; it never relocates, never rewrites a preference and never refuses a save. The
+# operator may well mean it.
+# ---------------------------------------------------------------------------------------------
+
+#: Keys that receive freshly produced, not-yet-reviewed material.
+WORK_OUTPUT_KEYS = (RAW_CUTTER_OUTPUT, AUDIO_CUTTER_OUTPUT)
+
+#: Keys that receive material an operator has decided to KEEP.
+FINISHED_LIBRARY_KEYS = (CLIPS_LIBRARY, AUDIO_LIBRARY, AUDIO_PREVIEW_LIBRARY)
+
+
+def _comparable(path) -> str:
+    """A path in a form two settings can be compared by, or `""` when there is nothing to compare.
+
+    `normcase` so `J:\\Raw_Cutts` and `j:/raw_cutts` are recognised as the same place on Windows,
+    and a trailing separator is dropped for the same reason. This is deliberately NOT `realpath`:
+    a read-out must not touch the filesystem, and a folder that does not exist yet should still
+    be comparable with one that does.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.normpath(text))
+
+
+def overlapping_destinations(preferences: dict, labels: dict) -> str:
+    """One sentence naming each work folder that is also configured as a finished library, or `""`.
+
+    Pairs are reported in a fixed order so the same configuration always produces the same
+    sentence -- an operator comparing two screens must not see a difference that is not there.
+    """
+    pairs = []
+    for work_key in WORK_OUTPUT_KEYS:
+        work = _comparable(preferences.get(work_key))
+        if not work:
+            continue
+        for library_key in FINISHED_LIBRARY_KEYS:
+            if _comparable(preferences.get(library_key)) == work:
+                pairs.append((work_key, library_key))
+    if not pairs:
+        return ""
+    named = "; ".join(
+        f"{labels.get(work, work)} and {labels.get(library, library)} "
+        f"are both {preferences.get(work, '')}"
+        for work, library in pairs)
+    return ("Heads up — a work folder is also set as a finished library: "
+            f"{named}. Reviewed and unreviewed clips will be mixed together in it. "
+            "Nothing was moved or changed; set different folders if that was not intended.")
+
+
 __all__ = ["CLIPS_LIBRARY", "CLIPS_REJECTED", "CLIPS_INPUT", "RAW_CUTTER_OUTPUT",
            "RAW_CUTTER_INPUT", "QUICK_RENDER_SOURCE",
            "AUDIO_LIBRARY", "AUDIO_DISCARDED", "AUDIO_CUTTER_OUTPUT", "AUDIO_CUTTER_INPUT",
            "AUDIO_PREVIEW_INPUT", "AUDIO_PREVIEW_LIBRARY", "AUDIO_PREVIEW_DISCARDED",
+           "RENDER_OUTPUT",
            "DESTINATION_KEYS", "LAST_USED_KEYS",
            "KEYS", "SCHEMA", "empty_preferences", "preferences_path", "load_preferences",
-           "save_preferences", "missing_folders", "unavailable_notice"]
+           "save_preferences", "missing_folders", "unavailable_notice",
+           "WORK_OUTPUT_KEYS", "FINISHED_LIBRARY_KEYS", "overlapping_destinations",
+           "COLLISION_POLICY", "OPTION_KEYS", "OPTION_DEFAULTS", "empty_options",
+           "load_options"]

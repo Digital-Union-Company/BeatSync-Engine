@@ -47,6 +47,7 @@ from typing import Any, Iterable
 
 from beatsync_fork import audio_library
 from beatsync_fork import clips_review as core
+from beatsync_fork import collision
 
 # ---------------------------------------------------------------------------------------------
 # Vocabulary -- deliberately the SAME three words the Clips Preview uses
@@ -387,96 +388,16 @@ def counts_line(counts: dict) -> str:
 # changed afterwards needs confirming again. `signature` is what makes "that batch" mean something.
 # ---------------------------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class SortPlan:
-    """What a Confirm would do, decided before anything moves.
-
-    Three disjoint groups, deliberately kept apart all the way into the report rather than merged
-    into one "discarded" number: an operator who is told "14 discarded" cannot tell whether they
-    rejected 14 clips or forgot to look at 12 of them.
-    """
-
-    keep: tuple[str, ...] = ()
-    rejected: tuple[str, ...] = ()
-    unmarked: tuple[str, ...] = ()
-    signature: str = ""
-
-    @property
-    def total(self) -> int:
-        return len(self.keep) + len(self.rejected) + len(self.unmarked)
-
-    @property
-    def discarded(self) -> tuple[str, ...]:
-        """Everything that would move to the Discarded folder, explicit and unmarked alike."""
-        return tuple(self.rejected) + tuple(self.unmarked)
-
-    @property
-    def has_unmarked(self) -> bool:
-        return bool(self.unmarked)
-
-    @property
-    def needs_library(self) -> bool:
-        return bool(self.keep)
-
-    @property
-    def needs_discarded(self) -> bool:
-        return bool(self.rejected) or bool(self.unmarked)
-
-    @property
-    def can_sort(self) -> bool:
-        """At least one clip is kept. This is the whole admission rule -- see the module note."""
-        return bool(self.keep)
-
-
-def plan_sort(tiles: Iterable[AudioTile], decisions: Any,
-              library: Any = "", discarded: Any = "") -> SortPlan:
-    """Classify a page into keep / explicitly rejected / unmarked, and sign the result.
-
-    The signature covers every clip id, its decision, and **both destinations**, so a one-time
-    confirmation authorises exactly the batch the operator was shown. Change a decision, edit a
-    destination, re-scan onto a different page: the signature moves and the confirmation is void.
-    It is a change detector, not a credential -- nothing is authorised by presenting it, and the
-    caller still re-derives the plan and re-validates the folders before moving a byte.
-    """
-    current = dict(decisions or {})
-    keep, rejected, unmarked = [], [], []
-    for tile in tiles:
-        decision = current.get(tile.clip_id, PENDING)
-        if decision == SELECTED:
-            keep.append(tile.clip_id)
-        elif decision == REJECTED:
-            rejected.append(tile.clip_id)
-        else:
-            unmarked.append(tile.clip_id)
-
-    material = "\n".join([
-        f"library={os.path.normcase(str(library or ''))}",
-        f"discarded={os.path.normcase(str(discarded or ''))}",
-        *(f"{SELECTED}:{clip}" for clip in sorted(keep)),
-        *(f"{REJECTED}:{clip}" for clip in sorted(rejected)),
-        *(f"{PENDING}:{clip}" for clip in sorted(unmarked)),
-    ])
-    return SortPlan(keep=tuple(keep), rejected=tuple(rejected), unmarked=tuple(unmarked),
-                    signature=hashlib.sha256(material.encode("utf-8")).hexdigest())
-
-
-def plan_preview_lines(plan: SortPlan, library: Any = "", discarded: Any = "") -> list[str]:
-    """What is about to happen, in the operator's words, before it happens.
-
-    The last line is not reassurance padding: the whole reason an unmarked clip may be swept into
-    the Discarded folder is that doing so destroys nothing, and the operator has to be able to see
-    that stated at the moment they are asked to agree to it.
-    """
-    lines = [f"{len(plan.keep)} clip(s) selected to KEEP."]
-    if library:
-        lines.append(f"    → {library}")
-    lines.append(f"{len(plan.rejected)} clip(s) explicitly rejected.")
-    if plan.unmarked:
-        lines.append(f"{len(plan.unmarked)} unmarked clip(s) will ALSO be moved to Discarded.")
-    if plan.needs_discarded and discarded:
-        lines.append(f"    → {discarded}")
-    lines.append("Nothing will be permanently deleted.")
-    return lines
+# [FORK] R8 Final Polish: the sort plan MOVED to `clips_review` (the shared core) so Video Review
+# can use the identical admission rule instead of growing a second one. Re-exported here under the
+# same names, so every existing caller, test and import of `audio_review.SortPlan` / `.plan_sort`
+# / `.plan_preview_lines` keeps working and keeps meaning exactly what it did.
+#
+# It was never audio-specific: it reads a `clip_id` and a decision and nothing else. Two copies of
+# "at least one clip must be kept" would have been one copy too many -- that is a safety rule.
+SortPlan = core.SortPlan
+plan_sort = core.plan_sort
+plan_preview_lines = core.plan_preview_lines
 
 
 # ---------------------------------------------------------------------------------------------
@@ -634,7 +555,8 @@ class FilingOutcome:
 
 
 def file_entry(entry: core.ClipEntry, destination_folder: str,
-               preferred_name: str = "") -> FilingOutcome:
+               preferred_name: str = "",
+               policy: str = collision.DEFAULT_POLICY) -> FilingOutcome:
     """Move one enumerated clip, revalidating its identity first.
 
     Identity is re-checked against what the scan recorded immediately before the move, so a file
@@ -664,18 +586,27 @@ def file_entry(entry: core.ClipEntry, destination_folder: str,
                           "Nothing was changed.")
         return outcome
 
+    requested = audio_library.target_name(preferred_name, entry.path)
     try:
-        destination = audio_library.file_clip(entry.path, destination_folder, preferred_name)
+        destination = audio_library.file_clip(entry.path, destination_folder, preferred_name,
+                                              policy)
     except audio_library.FilingError as failure:
         outcome.detail = str(failure)
         return outcome
     outcome.status = MOVED
     outcome.destination = destination
+    # [FORK] R8: say so when the written name is not the requested one. Derived by comparing the
+    # two names rather than by trusting the policy, so the note describes what actually happened
+    # on disk -- under SUFFIX most clips still keep their own name and must not be annotated.
+    if os.path.basename(destination) != requested:
+        outcome.detail = (f"renamed to {os.path.basename(destination)} — "
+                          f"{requested} was already there")
     return outcome
 
 
 def sort_clips(entries: Iterable[core.ClipEntry], decision_of, name_of,
-               destinations: dict, unmarked_as: str = REJECTED) -> list[FilingOutcome]:
+               destinations: dict, unmarked_as: str = REJECTED,
+               policy: str = collision.DEFAULT_POLICY) -> list[FilingOutcome]:
     """File every clip the plan accounts for. Returns one outcome per clip, in order.
 
     ``decision_of(entry) -> str`` and ``name_of(entry) -> str`` read the **server's** state;
@@ -718,7 +649,7 @@ def sort_clips(entries: Iterable[core.ClipEntry], decision_of, name_of,
                     detail=f"{core.io_detail(exc)}. Nothing was changed.", automatic=automatic))
                 continue
             made.add(folder)
-        outcome = file_entry(entry, folder, name_of(entry))
+        outcome = file_entry(entry, folder, name_of(entry), policy)
         outcome.decision = decision
         outcome.automatic = automatic
         outcomes.append(outcome)

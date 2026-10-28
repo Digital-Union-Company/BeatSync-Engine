@@ -1041,7 +1041,7 @@ _RENDER_CLICK_INPUTS = [
     "music_under_voice",
     "sfx_folder", "sfx_roles", "sfx_amount", "sfx_level",
     "source_mode", "source_folder", "source_recursive", "video_input",
-    "output_filename", "processing_mode", "custom_fps", "variation_seed",
+    "output_filename", "processing_mode", "output_profile", "variation_seed",
     "cut_density", "energy_response", "motion_bias", "source_diversity", "micro_cuts",
     "semantic_emphasis",
     "session_state", "source_state",

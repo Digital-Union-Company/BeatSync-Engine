@@ -98,11 +98,19 @@ def test_detailed_function_returns_success_and_reason(ffmpeg_tree):
     fn = _func(ffmpeg_tree, "extract_clip_segment_ffmpeg_detailed")
 
     assert ast.unparse(fn.returns) == "Tuple[bool, str]"
-    # [C3-R1A] `lifecycle` was appended LAST with a default, so no existing positional argument
-    # moved and the `(bool, str)` return contract is untouched. Pinned as an exact list, in order.
+    # [C3-R1A] `lifecycle` was appended with a default, so no existing positional argument moved
+    # and the `(bool, str)` return contract is untouched. Pinned as an exact list, in order.
+    #
+    # [R8 Phase 6] `geometry` was appended with a default too, and it goes IN FRONT of
+    # `lifecycle` -- `test_render_cancellation.py::test_every_seam_takes_lifecycle_last_and_
+    # defaulted` requires the cancellation token to remain the final parameter of every
+    # cancellable entry point. Both are keyword-only in practice (every call site names them), so
+    # again no existing positional argument moved.
     assert [a.arg for a in fn.args.args] == [
         "video_file", "start_time", "duration", "output_file", "fps",
-        "target_size", "use_nvenc", "gpu_encoder", "lifecycle"]
+        "target_size", "use_nvenc", "gpu_encoder", "geometry", "lifecycle"]
+    # and both additions are defaulted, which is what keeps every pre-existing caller valid
+    assert len(fn.args.defaults) >= 3, "gpu_encoder, geometry and lifecycle must all be defaulted"
     returns = {ast.unparse(n.value) for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value}
     # Every exit carries a reason, and success carries an empty one.
     assert "(True, '')" in returns
@@ -232,13 +240,22 @@ def test_the_failure_tuple_carries_the_reason(processor_tree):
 
 def test_the_extract_kwargs_bundle_carries_only_the_command_plus_the_cancellation_token(
         processor_tree):
-    """**Amended by C3-R1A.** The eight command-shaping keys are frozen, in order.
+    """**Amended by C3-R1A, and again by R8 Phase 6.** The command-shaping keys are frozen, in
+    order.
 
-    Phase 3B's reason for pinning this list stands: any change to those eight would change the
-    FFmpeg command, and the diagnostics work was explicitly not allowed to. R1A appends exactly one
-    key, and it is deliberately **not** command-shaping — `lifecycle` reaches
-    `_run_media_command`'s poll loop and never the argv. Pinned by exact list and position so a
-    ninth *command* key cannot arrive disguised as a token.
+    Phase 3B's reason for pinning this list stands: any change to those keys changes the FFmpeg
+    command, and the diagnostics work was explicitly not allowed to. R1A appended exactly one key
+    that is deliberately **not** command-shaping — `lifecycle` reaches `_run_media_command`'s poll
+    loop and never the argv.
+
+    R8 Phase 6 appends `geometry`, and that one **is** command-shaping: it is the scale-and-pad
+    filter chain for a fixed Output Video Profile. So it joins the command-shaping prefix rather
+    than sitting beside `lifecycle`, and the prefix assertion grows from eight to nine. Its
+    default is `''`, which means Auto and produces the historical bare `scale=w:h` — so every
+    existing caller still describes exactly the command it always did.
+
+    The structure of the assertion is unchanged and is the point: an exact list and an explicit
+    prefix, so a *further* command key cannot arrive disguised as a token.
     """
     fn = _func(processor_tree, "create_clip_parallel")
 
@@ -248,10 +265,14 @@ def test_the_extract_kwargs_bundle_carries_only_the_command_plus_the_cancellatio
     assert len(bundles) == 1
     keys = [k.value for k in bundles[0].value.keys if isinstance(k, ast.Constant)]
     assert keys == ["video_file", "start_time", "duration", "output_file", "fps",
-                   "target_size", "use_nvenc", "gpu_encoder", "lifecycle"]
+                   "target_size", "use_nvenc", "gpu_encoder", "lifecycle", "geometry"]
+    assert sorted(keys[:8] + [keys[9]]) == sorted(
+        ["video_file", "start_time", "duration", "output_file", "fps",
+         "target_size", "use_nvenc", "gpu_encoder", "geometry"]), \
+        "the command-shaping keys must keep their exact identity"
     assert keys[:8] == ["video_file", "start_time", "duration", "output_file", "fps",
                         "target_size", "use_nvenc", "gpu_encoder"], \
-        "the command-shaping keys must keep their exact identity and order"
+        "the original command-shaping keys must keep their exact order"
 
 
 # ---------------------------------------------------------------------------

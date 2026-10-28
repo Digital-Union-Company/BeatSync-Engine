@@ -529,42 +529,57 @@ def test_the_declared_defaults_really_are_the_neutral_values():
     assert fork_creative.NEUTRAL_PROFILE.is_neutral()
 
 
-def test_the_controls_live_in_the_creative_studio_tab():
+def test_the_controls_live_in_the_creative_settings_tab():
     """Grouped with the seed, not inside Video Source: their placement is what tells the user they
     are render-request creative state rather than part of the source declaration.
 
     Amended by GUI Refresh A. The anchor used to be the `### 🎨 Creative Direction` group heading,
-    bounded by the next heading (`Processing Mode`). That group became the Creative Studio tab, so
-    the same containment is now measured between the Creative Studio and Advanced Tools tabs — a
-    strictly tighter span than the old one, since the tab contains nothing else.
+    bounded by the next heading (`Processing Mode`). That group became a tab of its own, so the
+    same containment is now measured between that tab and the one that follows it — a strictly
+    tighter span than the old one, since the tab contains nothing else.
+
+    R8 renamed the tab to Creative Settings and re-ordered the tab set, so the following tab is
+    now Raw Cutter rather than Advanced Tools. The bound is computed from whichever tab actually
+    comes next, so a further re-order cannot leave this pointing at the wrong span.
 
     `creative_preset` is deliberately NOT in this list: GUI Refresh A moved the preset radio to
-    Quick Render because selecting a preset is the one creative act that needs no studio, and it
-    writes these six sliders from there. See `test_the_preset_radio_sits_in_the_quick_render_tab`.
+    the render tab because selecting a preset is the one creative act that needs no studio, and it
+    writes these six sliders from there. See `test_the_preset_radio_sits_on_the_render_tab`.
     """
     source = open(_GUI, encoding="utf-8").read()
-    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
-    following = source.index("gr.Tab(LABEL_TAB_ADVANCED", studio)
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
+    following = min(p for p in (source.index(f"gr.Tab({label}")
+                                for label in ("LABEL_TAB_RAW_CUTTER", "LABEL_TAB_AUDIO_CUTTER",
+                                              "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                                              "LABEL_TAB_SETTINGS"))
+                    if p > studio)
 
     for widget in _ALL_CREATIVE_WIDGETS:
         if widget == "creative_preset":
             continue
         position = source.index(f"{widget} = gr.")
-        assert studio < position < following, f"{widget} is outside the Creative Studio tab"
+        assert studio < position < following, f"{widget} is outside the Creative Settings tab"
 
 
-def test_the_preset_radio_sits_in_the_quick_render_tab():
-    """GUI Refresh A. The preset is the only creative control on the render tab, and that is the
-    point of it: one click sets all six sliders, so a user who never opens Creative Studio can
-    still change the edit style. It is also the one creative widget the summary read-out must NOT
-    report, because its radio is on the same screen.
+def test_the_preset_radio_sits_with_the_sliders_it_writes():
+    """[FORK] R8 UX Refresh (Commit C) — this reverses GUI Refresh A's placement.
 
-    There is still exactly ONE preset radio — moving it is not duplicating it.
+    Refresh A put the selector on the render tab, arguing it is the one creative choice a user who
+    never opens the studio still wants. That argument did not survive contact. The selector is a
+    read-out of six values living on *another* tab, so a user who moved a slider saw a preset name
+    change on a screen they were not looking at, and a user on the render tab saw a name with no
+    way to see or adjust what it stood for. Worse, it was the half of a misleading pair: it could
+    read `Balanced` while Freestyle and a Variation Seed were armed.
+
+    So it now sits with its six sliders, and the render tab carries a resolved *summary* instead
+    (`creative_profile_summary`, see `test_gui_tabs.py`). There is still exactly ONE preset radio —
+    moving it is not duplicating it.
     """
     source = open(_GUI, encoding="utf-8").read()
-    quick = source.index("gr.Tab(LABEL_TAB_QUICK_RENDER")
-    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
-    assert quick < source.index("creative_preset = gr.") < studio
+    render = source.index("gr.Tab(LABEL_TAB_RENDER")
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
+    position = source.index("creative_preset = gr.")
+    assert render < studio < position, "the preset radio is not in Creative Settings"
     assert source.count("creative_preset = gr.") == 1, "the preset radio was duplicated"
 
 
@@ -711,7 +726,7 @@ def test_only_the_preset_selector_writes_a_creative_control(widget):
             f"{generator} must write no execution widget — generating is not applying")
 
 
-def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
+def test_the_variation_seed_writer_matrix_is_exactly_seven_registrations():
     """**Measured from main and extended by exactly one, twice.**
 
     Before the Director the seed had four writers: Randomize, and the three Variant Lab
@@ -733,6 +748,7 @@ def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
 
     assert sorted(writers) == ["apply_director_btn.click",
                                "apply_variant_btn.click",
+                               "clear_variations_btn.click",
                                "generate_variant_btn.click",
                                "new_variant_btn.click",
                                "randomize_btn.click",
@@ -741,6 +757,66 @@ def test_the_variation_seed_writer_matrix_is_exactly_six_registrations():
         "generating a proposal must not move the Variation Seed")
     assert "generate_variants_btn.click" not in writers
     assert "creative_preset.input" not in writers, "no preset may move the seed"
+
+    # [FORK] R8 Final Polish adds the SEVENTH, `clear_variations_btn.click`, and it is legitimate
+    # for the same reason Randomize is: "no variation" is a seed VALUE, and 0 is the documented
+    # precision baseline rather than a magic number.
+    #
+    # It exists because the obvious alternative is a false statement. Selecting `Balanced` resets
+    # the six sliders and NOTHING else -- not the seed, not Freestyle, not Audio Mix -- so it
+    # cannot be described as "start again", and an earlier draft of this refresh did describe it
+    # that way. The two actions are disjoint by construction, which is what the next test pins.
+    assert "clear_variations_btn.click" in writers
+
+
+def test_clear_creative_variations_is_disjoint_from_the_preset():
+    """[FORK] R8 Final Polish. Neither action is a superset of the other, and that is what stops
+    either being mistaken for "reset everything":
+
+        Balanced preset           ->  the six sliders, and only those
+        Clear Creative Variations ->  the seed and Freestyle, and only those
+
+    Asserted as two absences, because an absence is what keeps them disjoint: this button writes
+    no slider (or it would be a second preset authority) and no Audio Mix widget (which is a
+    different tab and a different decision).
+
+    [FORK] R8 Owner Fixes (P1): the exact set gained `freestyle_state_badge` and
+    `freestyle_sections_group`, and the reviewed reason is that both are READ-OUTS OF
+    `freestyle_enabled`, which this action already wrote. The badge states in words whether
+    Freestyle is on and the group holds the ten section dropdowns; clearing the checkbox without
+    them would leave a panel reading "Freestyle is ON" beside an unticked box. Neither carries a
+    value a render reads, and the disjointness this test exists for is untouched -- the two
+    absence checks below are the real contract and are unchanged.
+    """
+    tree = _gui_tree()
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "clear_variations_btn.click")
+    outputs = _names(next(kw for kw in call.keywords if kw.arg == "outputs").value)
+
+    assert sorted(outputs) == ["freestyle_enabled", "freestyle_sections_group",
+                               "freestyle_state_badge", "freestyle_summary",
+                               "variation_seed"], outputs
+    for forbidden in _NEW_CONTROLS_IN_FIELD_ORDER:
+        assert forbidden not in outputs, f"it writes the slider {forbidden}"
+    for forbidden in ("creative_preset", "music_under_voice", "sfx_amount", "sfx_level",
+                      "sfx_folder", "sfx_roles", "voice_files"):
+        assert forbidden not in outputs, f"it writes {forbidden}"
+
+    # and it cannot reach the source gate or preparation either
+    for forbidden in _GATE_AND_PREP_OUTPUTS:
+        assert forbidden not in outputs, f"it writes {forbidden}"
+
+    # The section dropdowns are READ, not written: turning Freestyle off must leave the rules the
+    # operator built intact, so ticking the box again restores exactly what was there.
+    inputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "inputs").value)
+    assert "freestyle_section_dropdowns" in inputs
+    handler = _func(_gui_tree(), "_on_clear_creative_variations")
+    returns = [n for n in ast.walk(handler) if isinstance(n, ast.Return)]
+    # [FORK] R8 Owner Fixes (P1): five, matching the five outputs above -- the two added ones are
+    # the state badge and the section panel's visibility. The arity is pinned rather than the
+    # contents because a positional mismatch between this tuple and that list is the failure this
+    # assertion exists to catch.
+    assert len(returns) == 1 and len(returns[0].value.elts) == len(outputs), ast.unparse(handler)
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():
@@ -1012,7 +1088,7 @@ def test_apply_proposal_writes_nothing_else():
                             "sfx_level", "voice_files", "voice_start_delay", "voice_min_gap",
                             "voice_avoid_drops", "sfx_folder", "sfx_roles",
                             "audio_layers_report", "smart_mix_report", "video_output",
-                            "status_output", "output_filename", "processing_mode", "custom_fps",
+                            "status_output", "output_filename", "processing_mode", "output_profile",
                             "director_instruction", "director_proposal",
                             "director_proposal_state"))
     assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)

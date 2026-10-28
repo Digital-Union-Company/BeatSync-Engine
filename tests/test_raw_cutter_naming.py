@@ -1304,8 +1304,8 @@ def test_the_checkbox_is_declared_exactly_once_and_sits_in_the_raw_cutter_tab(gu
                                                                               gui_tree):
     assert gui_source.count("cut_rename_output = gr.") == 1
     cutter = gui_source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
-    advanced = gui_source.index("gr.Tab(LABEL_TAB_ADVANCED")
-    assert "cut_rename_output = gr." in gui_source[cutter:advanced]
+    following = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
+    assert "cut_rename_output = gr." in gui_source[cutter:following]
     # Beside the other shared execution settings, not inside either mode's own group.
     assigns = [n for n in ast.walk(gui_tree)
                if isinstance(n, ast.Assign) and len(n.targets) == 1
@@ -1401,9 +1401,10 @@ def test_this_feature_added_no_fifth_top_level_tab(gui_source, gui_tree):
     # standalone Audio Preview tab. The claim this test actually makes is unchanged and is asserted
     # below by identity: no tab of this feature's own exists, and none of its widgets is declared
     # in somebody else's tab.
-    expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-                "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
-                "LABEL_TAB_CLIPS_PREVIEW")
+    expected = ("LABEL_TAB_RENDER", "LABEL_TAB_CREATIVE_SETTINGS", "LABEL_TAB_RAW_CUTTER",
+                "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                "LABEL_TAB_SETTINGS", "LABEL_SECTION_VIDEO_REVIEW",
+                "LABEL_SECTION_AUDIO_REVIEW", "LABEL_SECTION_PREPARE_VERIFY")
     assert gui_source.count("gr.Tab(") == len(expected), (
         "the top-level tab set changed: it must be exactly the four tabs R4-C shipped against "
         "plus the R5 Clips Preview Selector and the two R7 audio tabs")
@@ -1419,14 +1420,14 @@ def test_this_feature_added_no_fifth_top_level_tab(gui_source, gui_tree):
     clips_tab = next(
         (node for node in ast.walk(gui_tree)
          if isinstance(node, ast.With)
-         and any("gr.Tab(LABEL_TAB_CLIPS_PREVIEW" in ast.unparse(item.context_expr)
+         and any("gr.Tab(LABEL_SECTION_VIDEO_REVIEW" in ast.unparse(item.context_expr)
                  for item in node.items)),
         None)
-    assert clips_tab is not None, "the Clips Preview tab is not a `with gr.Tab(...)` block"
+    assert clips_tab is not None, "the Video Review section is not a `with gr.Tab(...)` block"
     body = "\n".join(ast.unparse(statement) for statement in clips_tab.body)
     for widget in ("cut_rename_output", "cut_source", "cut_batch_folder", "cut_run_btn"):
         assert f"{widget} = gr." not in body, (
-            f"{widget} is declared inside the Clips Preview tab; R4-C's widgets belong to "
+            f"{widget} is declared inside Video Review; R4-C's widgets belong to "
             "Raw Cutter")
 
 

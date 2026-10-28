@@ -439,8 +439,28 @@ PLACEHOLDER_SMART_MIX_REPORT = (
 
 LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV)"
 
-LABEL_CUSTOM_FPS = "🎞️ Custom FPS (Frame Rate)"
-INFO_CUSTOM_FPS = "Leave empty for auto-detect, or enter value (24/30/60)"
+# [FORK] R8 UX Refresh (Phase 6): the Output Video Profile replaces the free-text FPS box.
+# `LABEL_CUSTOM_FPS` / `INFO_CUSTOM_FPS` are deleted rather than kept: a frame rate with no
+# resolution beside it was half a setting, and the half that was missing is where the real defect
+# lived -- the render took its resolution from the first source and stretched everything else
+# to match.
+# [FORK] R8 UX Refresh (Phase 9): optional soft edges on exported audio clips.
+LABEL_AUDIO_FADE_EDGES = "🌊 Smooth clip edges (fade in/out)"
+INFO_AUDIO_FADE_EDGES = (
+    "Softens the very start and end of each clip so it blends under music instead of clicking "
+    "in. The fade uses **only the Padding** around each clip, never the speech itself — so a clip "
+    "with little room gets a short fade, and one with none gets a sharp edge. Off by default."
+)
+
+LABEL_OUTPUT_PROFILE = "🎞️ Output Video Profile"
+#: [FORK] R8 Final Polish: three lines to one. The sentence that was cut said a fixed profile
+#: letterboxes rather than stretching — true, and it is the reassuring half, but it described
+#: behaviour an operator sees in the result rather than a choice they have to make here. It sat
+#: in the one column that decides whether Create Music Video is above the fold at 1440x900.
+INFO_OUTPUT_PROFILE = (
+    "Size and frame rate of the finished video. **Auto** follows the first source; a fixed "
+    "profile letterboxes instead of stretching."
+)
 
 # GPU & Processing
 LABEL_GPU_STATUS = "⚡ GPU Acceleration Status"
@@ -624,21 +644,70 @@ INFO_FREESTYLE_ENABLED = (
     "what it would be without Freestyle at all."
 )
 
+# [FORK] R8 Owner Fixes (P1): the state badge. The owner's complaint was that a small checkbox is
+# easy to miss, so the panel now SAYS which mode it is in rather than leaving the operator to
+# read a tick box. Two states, two sentences, and the off state names what is used instead --
+# "nothing happens" is not an explanation.
+#
+# These are display text written by `_on_freestyle_change` from the live checkbox value. They
+# carry no authority: the checkbox is still the only gate, exactly as it was.
+FREESTYLE_BADGE_OFF = (
+    "### ⚪ Freestyle is OFF\n\n"
+    "Every section of the song is edited with the six global **Creative Controls** above."
+)
+FREESTYLE_BADGE_ON = (
+    "### 🟢 Freestyle is ON\n\n"
+    "The per-section rules below replace the global Creative Controls for the section types you "
+    "set. Micro Cuts and the Variation Seed stay global."
+)
+
 # ============================================================================
-# [FORK] Digital-Union: GUI Refresh A — three tabs
+# [FORK] Digital-Union: GUI Refresh A — tabs
 # Layout only. No execution setting is duplicated and no new authority exists.
+#
+# [FORK] R8 UX Refresh (Commit A): seven top-level tabs, named for what the operator is
+# trying to do rather than for how the feature arrived. Four renames and two new tabs:
+#
+#   Quick Render     -> Render            (there is only one render workflow; "Quick" implied
+#                                          a second, faster one that never existed)
+#   Creative Studio  -> Creative Settings (it is where creative configuration lives, and the
+#                                          preset selector moved here to join its six sliders)
+#   Advanced Tools   -> Audio Mix         ("Advanced Tools" named a drawer, not a job; the
+#                                          non-audio tenant moved to Media Library)
+#   Clips Preview  \
+#   Audio Preview   >-> Media Library     (three views of one library, now sections of one tab)
+#   Library Prep   /
+#   (new)            -> Settings          (preferences were buried at the foot of Clips Preview)
+#
+# The old constant names are deliberately NOT kept as aliases: a stale alias is how a label
+# and the thing it names drift apart, and every reference is in this repository.
 # ============================================================================
 
-LABEL_TAB_QUICK_RENDER = "⚡ Quick Render"
-LABEL_TAB_CREATIVE_STUDIO = "🎨 Creative Studio"
+LABEL_TAB_RENDER = "⚡ Render"
+LABEL_TAB_CREATIVE_SETTINGS = "🎨 Creative Settings"
 LABEL_TAB_RAW_CUTTER = "✂️ Raw Cutter"
-LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
+LABEL_TAB_AUDIO_MIX = "🎚️ Audio Mix"
+LABEL_TAB_MEDIA_LIBRARY = "📚 Media Library"
+LABEL_TAB_SETTINGS = "⚙️ Settings"
 
-# [FORK] Digital-Union: R5 Clips Preview Selector — a FIFTH top-level tab, placed LAST.
-# Placed after Advanced Tools deliberately: it keeps Advanced at tab index 3 so the existing
-# containment assertions need no index change, and it keeps this tab's markup out of the
-# Raw-Cutter-to-Advanced source span that `test_gui_tabs.py` scans for `gr.Accordion`.
-LABEL_TAB_CLIPS_PREVIEW = "🖼️ Clips Preview"
+# The three Media Library sections. These are `gr.Tab`s nested inside the Media Library tab,
+# so they are sections of a workflow rather than top-level destinations.
+LABEL_SECTION_VIDEO_REVIEW = "🖼️ Video Review"
+LABEL_SECTION_AUDIO_REVIEW = "🎧 Audio Review"
+LABEL_SECTION_PREPARE_VERIFY = "📚 Prepare & Verify"
+
+INFO_TAB_MEDIA_LIBRARY = (
+    "**Everything about the footage and audio you already have.** Review what a cutter "
+    "produced, file it into your library or your discard folder, and prepare or verify a "
+    "library before a render reads it.\n\n"
+    "Each section works on its own folder, so you can review a folder here without running "
+    "a cutter first — and reviewing never moves a file until you confirm."
+)
+
+INFO_TAB_SETTINGS = (
+    "**Preferences and maintenance.** Default folders are remembered between sessions and are "
+    "only ever suggestions: nothing here is created, scanned or moved when settings load."
+)
 
 # ============================================================================
 # [FORK] Digital-Union: R5 Clips Preview Selector (P1 — read-only review)
@@ -646,14 +715,14 @@ LABEL_TAB_CLIPS_PREVIEW = "🖼️ Clips Preview"
 # Cutter produced. P1 moves nothing; transfer is a separate authorized phase.
 # ============================================================================
 
+# [FORK] R8 UX Refresh (Phase 10): shortened from 606 characters. The Media Library tab's own
+# intro already says what the three sections are for, so this no longer repeats it — and the
+# "nothing moves until you confirm" promise, which is the one an operator needs before clicking,
+# is kept.
 INFO_TAB_CLIPS_PREVIEW = (
-    "**Review the clips you just cut, and mark each one keep or discard.** Point it at a folder of "
-    "clips, press Scan, then classify: left click keeps, right click discards, and the ↺ button "
-    "puts a clip back to undecided. Every decision is recorded on the server, so a reload, a second "
-    "browser tab or a restart cannot change what you decided.\n\n"
-    "**This phase does not move any file.** Classifying is read-only — the clips stay exactly where "
-    "they are, and the destination folders below are validated but never written to. Actually "
-    "moving the selected and discarded clips is a separate, separately reviewed step."
+    "**Mark each clip keep or discard.** Left click keeps, right click discards, ↺ undoes. "
+    "Decisions are recorded on the server, so a reload or a restart cannot change them — and "
+    "**nothing moves until you press Confirm**."
 )
 
 LABEL_CLIPS_INPUT = "📂 Clips folder (the clips to review)"
@@ -669,17 +738,22 @@ INFO_CLIPS_RECURSIVE = (
     "leaving this on is what finds the clips inside them."
 )
 
-LABEL_CLIPS_LIBRARY = "✅ Media Library folder (where KEPT clips would go)"
+# [FORK] R8 Owner Fixes (P2): "would go" is left over from when Confirm only reported a plan.
+# It has moved files since UX V3, and a label in the conditional is the one place an operator
+# looks to find out whether anything is at stake.
+LABEL_CLIPS_LIBRARY = "✅ Media Library folder — kept clips are MOVED here"
 INFO_CLIPS_LIBRARY = (
-    "Validated now, written to later. It must not be inside the clips folder, must not contain it, "
+    "Validated when you scan, written when you confirm — keeping a clip moves the file, it does "
+    "not copy it. It must not be inside the clips folder, must not contain it, "
     "and must not be the discard folder or a protected runtime directory — those are refused before "
     "anything is read, and the check follows junctions and symlinks rather than comparing the text "
     "you typed."
 )
 
-LABEL_CLIPS_REJECTED = "🗑️ Discarded folder (quarantine, never deletion)"
+LABEL_CLIPS_REJECTED = "🗑️ Discarded folder — clips are MOVED here, never deleted"
 INFO_CLIPS_REJECTED = (
-    "Discarding is quarantine, not deletion: a discarded clip would be moved here, intact, for you "
+    "Discarding is quarantine, not deletion: a discarded clip is moved here, intact and under its "
+    "original name, for you "
     "to deal with outside this tool. There is no retention expiry and no permanent delete."
 )
 
@@ -697,7 +771,7 @@ LABEL_CLIPS_REFRESH = "🔁 Re-read the server's record"
 # now sorts, so a button that still said "moving is not enabled yet" told the operator the exact
 # opposite of what pressing it does to their files -- the one place a stale label is dangerous
 # rather than untidy.
-LABEL_CLIPS_CONFIRM = "✅ Confirm — sort the decided clips into their folders"
+LABEL_CLIPS_CONFIRM = "✅ Confirm — file this page into its folders"
 LABEL_CLIPS_REPORT = "Scan report"
 LABEL_CLIPS_COUNTS = "Decisions (server record)"
 LABEL_CLIPS_CONFIRM_OUT = "Confirm"
@@ -707,9 +781,38 @@ CLIPS_COUNTS_INITIAL_TEXT = "Kept 0   ·   Discarded 0   ·   Undecided 0   ·  
 CLIPS_GALLERY_INITIAL_HTML = (
     '<div class="r5-empty">Nothing scanned yet. Choose a clips folder and press Scan.</div>'
 )
+# [FORK] R8 Final Polish: the old text described the pre-keep-only rule ("every clip on the page
+# is decided"), which is no longer how Confirm is admitted. Video Review now matches Audio Review:
+# mark the good clips, and the rest are handled through an explicit, batch-specific gate.
 CLIPS_CONFIRM_DISABLED_TEXT = (
-    "Confirm is disabled until every clip on the page is decided. Undecided is not a decision."
+    "Mark at least one clip to Keep. Anything you leave undecided is offered for the Discarded "
+    "folder in a second step that you confirm separately — nothing moves until then."
 )
+
+CLIPS_SWEEP_GATE_HEADING = (
+    "⚠️  Some clips are still unmarked. Nothing has moved yet — here is what Confirm would do:"
+)
+CLIPS_SWEEP_GATE_PROMPT = (
+    "Press Proceed to sort it exactly as listed, or Cancel to go back and mark more clips."
+)
+CLIPS_SWEEP_CANCELLED_TEXT = (
+    "Cancelled. Nothing was moved and every decision is exactly as you left it."
+)
+# [FORK] R8 Final Polish: the honest counterpart to selecting a preset.
+#
+# Selecting `Balanced` resets the six base sliders and NOTHING else. It does not clear the
+# Variation Seed, it does not disable Freestyle, and it does not touch Audio Mix. This action
+# covers the other half, and equally does not touch the sliders -- the two are disjoint on
+# purpose, so neither can be mistaken for "reset everything".
+LABEL_CLEAR_VARIATIONS = "🧹 Clear creative variations"
+INFO_CLEAR_VARIATIONS = (
+    "Sets the Variation Seed back to 0 and turns Freestyle off. **Your six sliders and the "
+    "preset are left alone**, and so is everything in Audio Mix — to reset the sliders, pick a "
+    "preset above."
+)
+
+LABEL_CLIPS_PROCEED = "➡️ Proceed — sort it as listed"
+LABEL_CLIPS_SWEEP_CANCEL = "↩️ Cancel — go back and mark more clips"
 # [R5-P3 / F8] Classifying posts straight to the server rather than through a Gradio event, which
 # is deliberate -- but it means a decision cannot re-enable the Confirm button by itself. Without
 # this line the operator would see "Undecided 0" beside a greyed-out Confirm and no explanation.
@@ -740,8 +843,137 @@ PREF_STATUS_INITIAL = (
     "moved by saving."
 )
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 UX Refresh: the Settings tab's new content.
+# ---------------------------------------------------------------------------------------------
+
+LABEL_PREF_RENDER_OUTPUT = "Render output"
+INFO_PREF_RENDER_OUTPUT = (
+    "Where finished music videos are published. Leave blank to use the `output` folder inside "
+    "BeatSync itself. Only affects the final video — temporary working files and caches stay "
+    "where they are."
+)
+
+# [FORK] R8 Final Polish: the three purpose groups the folder defaults are read in. Nine paths in
+# one undifferentiated list is why this panel was hard to scan; the paths themselves, their keys
+# and their saved values are unchanged.
+LABEL_PREF_GROUP_VIDEO = "🎬 Render and video folders"
+LABEL_PREF_GROUP_AUDIO = "🎙️ Audio and voice folders"
+LABEL_PREF_GROUP_REVIEW = "📂 Review destinations"
+INFO_PREF_GROUP_REVIEW = (
+    "Where a review files what you decide. Keeping and discarding are both *moves* — nothing is "
+    "ever deleted, and the original filename is preserved."
+)
+
+# [FORK] R8 Owner Fixes (P1): the four audio destinations, explained rather than renamed.
+#
+# The owner read them as duplicated. They are not duplicates -- the Audio Cutter files a fresh
+# cut, Audio Review files a clip reviewed later, and those are genuinely different decisions --
+# but four entries with near-identical names is a fair complaint. So the Cutter's pair is now
+# presented as the ordinary Voice library / Discarded pair, Audio Review's pair is an OPTIONAL
+# override in a collapsed panel, and Audio Review falls back to the Cutter's pair when its own
+# is left blank.
+#
+# Nothing is consolidated: a stored Audio Review folder that differs keeps winning, and no save
+# ever copies one key's value into another.
+LABEL_PREF_VOICE_PAIR = "🎙️ Voice library and Discarded (used by both audio tabs)"
+INFO_PREF_VOICE_PAIR = (
+    "The two folders audio reviewing files into. **Audio Review uses these as well** unless you "
+    "set it its own pair below."
+)
+LABEL_PREF_AUDIO_OVERRIDES = "Separate folders for Audio Review (optional)"
+INFO_PREF_AUDIO_OVERRIDES = (
+    "Leave both blank and Audio Review files into the Voice library and Discarded folders above "
+    "— that is the usual setup. Fill one in only if reviewing a clip *later* should send it "
+    "somewhere different from a fresh cut.\n\n"
+    "Anything already saved here is kept exactly as it is: filling these in never changes the "
+    "folders above, and the folders above never overwrite these."
+)
+
+#: [FORK] R8 Owner Fixes (P2): what the status box is actually describing. The owner saw it
+#: naming old paths while new ones were visible in the fields, which is correct behaviour --
+#: the box reports SAVED settings and the fields were edited but not yet saved -- and reads as a
+#: contradiction unless it says so.
+PREF_STATUS_SCOPE = (
+    "(This describes your saved settings. Edits above take effect when you press Save defaults.)"
+)
+
+# [FORK] R8 UX Refresh (Commit C): the Media Library as a video source.
+CHOICE_SOURCE_MEDIA_LIBRARY = "Use Media Library — the folder set in Settings"
+STATUS_LIBRARY_SOURCE_UNSET = (
+    "No default video Media Library is set yet. Open Settings → Default folders, set "
+    "\"Media Library folder\", then pick this option again. Your current source folder was left "
+    "as it was."
+)
+STATUS_LIBRARY_SOURCE_MISSING = (
+    "The saved Media Library folder is not there any more: {path}. It was filled in anyway so "
+    "you can correct it — nothing was created."
+)
+
+# [FORK] R8 UX Refresh (Commit C): the one truthful creative read-out on the Render tab.
+LABEL_CREATIVE_PROFILE = "🎨 Current Creative Profile"
+CREATIVE_PROFILE_PLACEHOLDER = (
+    "The creative settings this render will use appear here."
+)
+CREATIVE_PROFILE_PLAIN_HINT = (
+    "A plain preset render — nothing else is active."
+)
+CREATIVE_PROFILE_MODIFIED_HINT = (
+    "Change any of this in Creative Settings."
+)
+LABEL_OPEN_CREATIVE_SETTINGS = "🎨 Open Creative Settings"
+
+LABEL_COLLISION_SECTION = "📄 When a destination filename already exists"
+CHOICE_COLLISION_SKIP = "Skip and report it"
+CHOICE_COLLISION_SUFFIX = "Rename automatically (clip_01, clip_02, …)"
+INFO_COLLISION_POLICY = (
+    "Applies when filing reviewed clips into a Media Library or Discarded folder. An existing "
+    "file is **never** overwritten under either setting."
+)
+
+STATUS_COLLISION_SAVED_SKIP = (
+    "Saved: a clip whose name is already taken will be skipped and reported."
+)
+STATUS_COLLISION_SAVED_SUFFIX = (
+    "Saved: a clip whose name is already taken will be renamed clip_01, clip_02, and so on. "
+    "Nothing is ever overwritten."
+)
+
+LABEL_CACHE_SECTION = "🧹 Cache management"
+INFO_CACHE_SECTION = (
+    "Disposable files BeatSync creates while it works. Press Inspect to see what is there, then "
+    "tick what you want removed.\n\n"
+    "Only these four folders can be cleared. Your source media, finished videos, Media "
+    "Libraries, Discarded folders, saved settings and review decisions are never touched."
+)
+LABEL_CACHE_POSTERS = "Preview thumbnails"
+INFO_CACHE_POSTERS = "Video Review poster images. Rebuilt automatically on the next scan."
+LABEL_CACHE_PROCESSING = "Temporary processing files"
+INFO_CACHE_PROCESSING = "Clip fragments left over from finished renders."
+LABEL_CACHE_UPLOADS = "Retired browser uploads"
+INFO_CACHE_UPLOADS = (
+    "Files earlier sessions copied in through the browser, set aside at startup instead of "
+    "being deleted. Check these before clearing — for a file you dragged in, this copy may be "
+    "the only one you still have a path to."
+)
+LABEL_CACHE_ANALYSIS = "Video analysis cache (Stage 5)"
+INFO_CACHE_ANALYSIS = (
+    "⚠️ Expensive to rebuild. Clearing this makes BeatSync re-run the full video and Qwen "
+    "analysis the next time it reads those sources, which can take many minutes."
+)
+LABEL_CACHE_INSPECT = "🔍 Inspect cache"
+LABEL_CACHE_SELECT = "Clear which caches?"
+LABEL_CACHE_CONFIRM = "Yes, delete the selected caches"
+INFO_CACHE_CONFIRM = "Clearing cannot be undone."
+LABEL_CACHE_CLEAR = "🧹 Clear selected cache"
+LABEL_CACHE_REPORT = "Cache"
+PLACEHOLDER_CACHE_REPORT = (
+    "Press Inspect cache to see how much space each category is using. Nothing is deleted until "
+    "you select categories, tick the confirmation and press Clear."
+)
+
 CLIPS_REFRESH_TO_ENABLE_HINT = (
-    "All clips decided — Confirm is being enabled from the server's record."
+    "At least one clip kept — Confirm is being enabled from the server's record."
 )
 # [UX V3] Why a clip stayed where it was. Each of these means the original is untouched: the
 # sorter only ever renames, so anything short of success leaves the file exactly as it was.
@@ -1009,24 +1241,25 @@ CUT_SETTINGS_CHANGED_TEXT = (
     "Press Analyze / Preview again before cutting."
 )
 
-INFO_TAB_CREATIVE_STUDIO = (
-    "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
-    "alone is exactly the render Quick Render describes. The Creative Preset lives on Quick "
-    "Render because it is the one choice that sets all six sliders at once; change it there and "
-    "the sliders below follow."
+INFO_TAB_CREATIVE_SETTINGS = (
+    "**Shape how the edit feels.** Everything here is optional — leave it all alone and you get "
+    "the straightforward render the Render tab describes. Start with a Creative Preset, then "
+    "adjust the six sliders if you want to; the preset is just a name for those six numbers, so "
+    "moving any slider reads back as *Custom*."
 )
 
-INFO_TAB_ADVANCED = (
-    "**Occasional maintenance and diagnostics.** Prepare a media library ahead of time, check "
-    "that sources are readable, or layer voice and SFX over the music. None of this is needed "
-    "for an ordinary render."
+INFO_TAB_AUDIO_MIX = (
+    "**Layer voice and sound effects over the music.** Optional — a render with none of this set "
+    "uses the music track alone.\n\n"
+    "*Library preparation and source checks moved to Media Library → Prepare & Verify.*"
 )
 
-LABEL_ACTIVE_SETTINGS = "Active optional settings"
-ACTIVE_SETTINGS_PLACEHOLDER = (
-    "Open this tab again after changing anything in Creative Studio or Advanced Tools and this "
-    "will list what is active."
-)
+# [FORK] R8 UX Refresh (Commit C): `LABEL_ACTIVE_SETTINGS` / `ACTIVE_SETTINGS_PLACEHOLDER` are
+# deleted rather than renamed. The box they titled listed optional extras but said nothing about
+# the six creative controls, because the Creative Preset radio sat on the same tab and stated that
+# part itself -- and the pair was misleading together, since the selector could read `Balanced`
+# while Freestyle, a Variation Seed and SFX were all armed. One resolved line replaces both; see
+# `LABEL_CREATIVE_PROFILE` above and `beatsync_fork/effective_profile.py`.
 
 LABEL_FREESTYLE_SECTION_PREFIX = "🎵"
 
@@ -1057,6 +1290,22 @@ INFO_SURPRISE_ME = (
 # ============================================================================
 
 LABEL_VARIANT_LAB = "🧪 Variant Lab"
+# [FORK] R8 Owner Fixes (P2): the lead sentence and the help panel.
+#
+# The lab carried roughly 3.9 KB of permanently visible explanation -- six Markdown blocks plus
+# two long `info=` strings -- above controls that are themselves advanced. Every word of it is
+# still available; it is now one click away instead of always on screen, and `INFO_VARIANT_LAB`
+# and friends are reused verbatim inside the panel rather than rewritten, so there is no second
+# version of the explanation to drift.
+LABEL_VARIANT_HELP = "ℹ️ How Variant Lab works"
+INFO_VARIANT_LAB_LEAD = (
+    "Generate recipes near your current six sliders, compare them, and apply one. "
+    "**Nothing renders and no setting changes until you press Apply.**"
+)
+#: A short `info=` for the Master Seed. The full explanation -- what makes a draw repeat, and why
+#: it is not the Variation Seed -- moved into the help panel.
+INFO_MASTER_SEED_SHORT = "Repeats a draw. 0 means a fresh random one each time."
+
 INFO_VARIANT_LAB = (
     "Explore beyond the seed. Tick the controls that may vary, give each one an allowed range, "
     "choose how far from your current settings to wander, and generate one recipe. "
@@ -1223,13 +1472,16 @@ INFO_RENDER_SELECTED = (
 )
 
 LABEL_CANCEL_RENDER = "⏹️ Cancel Active Render"
+# [FORK] R8 UX Refresh (Phase 10): shortened from 530 characters.
+#
+# The original was accurate and sat permanently on the Render tab, where it was the single
+# largest block of text on the screen -- taller than the Create Music Video button it sat under.
+# Everything it said is still true and still worth saying; it is said in one line, with the
+# qualifications that only matter once Cancel has been pressed moved into the status panel's own
+# wording, which is where someone actually reads them.
 INFO_CANCEL_RENDER = (
-    "Stops whichever render is currently running — Create Music Video or Render Selected "
-    "Variants. **Not instant.** Video encoding (clip extraction, assembly, audio mixdown) stops "
-    "within moments. An in-progress AI scene-analysis step is never interrupted mid-call — it is "
-    "never force-killed — and the render stops only once that call returns naturally. A candidate "
-    "already durably rendered before you pressed Cancel is kept; nothing already written to your "
-    "output folder is deleted. Pressing this with no render running does nothing."
+    "Stops the render in progress. Not instant: encoding stops within moments, and an "
+    "AI scene-analysis step finishes its current call first. Anything already finished is kept."
 )
 STATUS_CANCEL_REQUESTED = (
     "⏹️ Cancel requested — stopping at the next safe point. This is not instant: an in-progress "
@@ -1244,13 +1496,13 @@ STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
 # loopback-only app is the same machine the browser is on — but saying "your" folder without
 # qualification would be a lie if the page were ever opened from another device.
 LABEL_OPEN_OUTPUT_FOLDER = "📂 Open Output Folder"
+# [FORK] R8 UX Refresh (Phase 10): shortened from 501 characters, keeping every claim a test
+# pins -- it still says WHOSE machine opens ("running BeatSync"), still names Explorer, and still
+# promises no download. The master/share distinction it used to explain here is stated by the
+# render's own status panel, which names whichever files it actually wrote.
 INFO_OPEN_OUTPUT_FOLDER = (
-    "Opens this BeatSync installation's `output` folder in Windows File Explorer, on the computer "
-    "running BeatSync. It holds the completed high-quality masters and any shareable MP4 files "
-    "that were successfully saved: the master of a finished render is guaranteed, the shareable "
-    "copy beside it is best-effort, and that render's own status panel names whichever of the two "
-    "it actually wrote. The folder opens whether or not you have rendered anything yet, and this "
-    "never starts, stops or changes a render."
+    "Opens the folder your finished videos go to, in Windows File Explorer on the computer "
+    "running BeatSync. Works before your first render."
 )
 #: Deliberately **not** "Explorer opened". `os.startfile` hands the path to the Windows shell and
 #: returns immediately; it reports that the request was accepted, not that a window appeared. Only
@@ -1314,9 +1566,18 @@ LABEL_SCAN_FOLDER = "🔍 Scan Folder"
 LABEL_SOURCE_REPORT = "📋 Source Status"
 LABEL_CONFIRM_SOURCES = "✅ Confirm source files"
 
+# [FORK] R8 Owner Fixes (P2): the permanent instruction is gone.
+#
+# It read "Create Music Video stays disabled until you confirm the source list" and was printed
+# unconditionally -- including while the list WAS confirmed and Stage 6 was actively rendering,
+# where it is simply false. The fact it carried is still worth stating, so it is stated as a
+# property of the gate rather than as an instruction about the button's current state, and the
+# live, changing half is `confirm_status`, which already tracks the real source state.
+#
+# The gate itself is untouched: confirmation authority and render admission are unchanged.
 INFO_CONFIRMATION_GATE = (
-    "Create Music Video stays disabled until you confirm the source list. "
-    "Confirmation covers the actual files, not just the count, and is re-checked before rendering."
+    "Source confirmation covers the actual files, not just the count, and is re-checked before "
+    "rendering."
 )
 
 # ============================================================================
@@ -1733,25 +1994,36 @@ AUDIO_DESTINATION_STATUS_INITIAL = (
 )
 
 # ---------------------------------------------------------------------------------------------
-# [FORK] Digital-Union (R7.2 Phase 2): the standalone Audio Preview tab.
+# [FORK] Digital-Union (R7.2 Phase 2): the Audio Review section.
+#
+# [FORK] R8 UX Refresh (Commit A): this was `LABEL_TAB_AUDIO_PREVIEW`, a top-level tab. It is now
+# a section of Media Library, and its label is `LABEL_SECTION_AUDIO_REVIEW`, declared beside the
+# other tab labels. The old constant is deleted rather than aliased -- the engine, the widgets and
+# every handler are unchanged, only the container is.
 # ---------------------------------------------------------------------------------------------
 
-LABEL_TAB_AUDIO_PREVIEW = "\U0001f3a7 Audio Preview"
+# [FORK] R8 UX Refresh (Phase 10): shortened from 678 characters, and the heading is gone --
+# this is now a SECTION inside Media Library, so the section tab already names it and a `###`
+# here repeated the label immediately above it.
+#
+# Two claims were kept because they are the ones that change what an operator does: that it works
+# on any folder without the cutter having run (otherwise they will not try it), and that nothing
+# is deleted (otherwise they will not press Confirm). The supported-format list moved to the
+# folder field's own hint, where it is relevant at the moment of choosing a folder.
 INFO_TAB_AUDIO_PREVIEW = (
-    "### \U0001f3a7 Audio Preview \u2014 review and sort a folder of audio clips\n\n"
-    "Point this at **any folder of audio clips** and classify them: the ones the Raw Audio Cutter "
-    "made earlier, or clips from anywhere else. It does **not** need the Audio Cutter to have run "
-    "in this browser session, so you can cut today and sort next week.\n\n"
-    "Supported: **WAV**, **FLAC**, **MP3**, M4A, AAC, OGG and Opus. Large folders are paged, and "
-    "**your decisions are remembered as you move between pages**.\n\n"
+    "**Review and sort any folder of audio clips** \u2014 the Audio Cutter does not need to have run "
+    "in this session, so you can cut today and sort next week.\n\n"
     "Nothing is scanned until you press **Scan Folder**, nothing moves until you press "
-    "**Confirm and Sort**, and discarding always means *moved to your Discarded folder* \u2014 "
-    "never deleted."
+    "**Confirm and Sort**, and discarding means *moved to your Discarded folder* \u2014 never "
+    "deleted."
 )
 LABEL_AUDIO_PREVIEW_FOLDER = "\U0001f4c2 Folder of audio clips to review"
 INFO_AUDIO_PREVIEW_FOLDER = (
     "The folder holding the clips. An Audio Cutter output folder "
-    "(\u201cAudioCutter_\u2026\u201d) is the usual one, but any folder of audio works."
+    "(\u201cAudioCutter_\u2026\u201d) is the usual one, but any folder of audio works.\n\n"
+    # [FORK] R8 Phase 10: moved here from the section intro. The format list matters at the
+    # moment an operator chooses a folder, not as a permanent paragraph above the whole section.
+    "Reads **WAV**, **FLAC**, **MP3**, M4A, AAC, OGG and Opus."
 )
 LABEL_AUDIO_PREVIEW_RECURSIVE = "Include subfolders"
 INFO_AUDIO_PREVIEW_RECURSIVE = (
@@ -1775,10 +2047,20 @@ AUDIO_PREVIEW_REPORT_INITIAL = (
 )
 LABEL_AUDIO_PREVIEW_LIBRARY = "\u2705 Media Library folder (where KEPT clips go)"
 LABEL_AUDIO_PREVIEW_DISCARDED = "\U0001f5d1\ufe0f Discarded folder (quarantine, never deletion)"
-LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f3a7 Open results in Audio Preview"
+# [FORK] R8 UX Refresh (Commit A): both cutters now offer the same action, worded the same way,
+# because they do the same thing into the same place -- Media Library. The Audio Cutter's goes to
+# Audio Review and the Raw Cutter's to Video Review.
+LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f4da Open results in Media Library"
 INFO_AUDIO_OPEN_IN_PREVIEW = (
-    "Loads this cut's output folder into the Audio Preview tab so you can classify it later. It "
-    "fills the folder in for you; you still press Scan Folder there."
+    "Loads this cut's output folder into **Media Library → Audio Review** so you can classify it "
+    "later. It fills the folder in for you; you still press Scan Folder there."
+)
+
+LABEL_CUT_OPEN_LIBRARY = "\U0001f4da Open results in Media Library"
+INFO_CUT_OPEN_LIBRARY = (
+    "Loads your Raw Cutter output folder into **Media Library → Video Review**, with subfolders "
+    "included — each cut writes its own timestamped subfolder. It fills the folder in for you; "
+    "you still press Scan Folder there."
 )
 
 # [R7.2] Every selector here is a CLASS, and that is a requirement rather than a tidy-up. R7.1 had

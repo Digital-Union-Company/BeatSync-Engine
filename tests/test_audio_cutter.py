@@ -582,13 +582,58 @@ def test_the_module_contains_no_deletion_primitive_at_all():
 
 
 def test_os_replace_is_never_used_because_it_would_overwrite():
-    path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "audio_library.py")
-    with open(path, encoding="utf-8") as handle:
-        source = handle.read()
-    tree = ast.parse(source)
-    renames = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-               and ast.unparse(n.func) == "os.rename"]
-    assert len(renames) == 1, "the move must be exactly one os.rename"
+    """The move is a no-replace rename, and `os.replace` appears nowhere on the path.
+
+    [FORK] R8 UX Refresh. This used to count `os.rename` CALLS in `audio_library.py` and require
+    exactly one. R8 moved the rename loop into `beatsync_fork.collision`, which both review
+    workflows now share, so `audio_library` *passes* `os.rename` rather than calling it -- and the
+    old assertion would read zero and fail while the property it protects is intact.
+
+    The property is therefore asserted where it now lives, in two halves, which is strictly
+    stronger than the single count it replaces:
+
+    1. `audio_library` hands over `os.rename` and nothing else -- never `os.replace`, never a
+       `shutil` move, and never a second rename of its own.
+    2. `collision.publish` performs exactly one call to the rename it was given, and `collision`
+       contains no overwriting or deleting primitive at all.
+    """
+    library_path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "audio_library.py")
+    with open(library_path, encoding="utf-8") as handle:
+        library_tree = ast.parse(handle.read())
+
+    # 1. The primitive audio_library hands to the publisher is os.rename, passed not called.
+    publishes = [n for n in ast.walk(library_tree) if isinstance(n, ast.Call)
+                 and ast.unparse(n.func).endswith("collision.publish")]
+    assert len(publishes) == 1, "there must be exactly one publication site"
+    handed = {ast.unparse(a) for a in publishes[0].args}
+    assert "os.rename" in handed, f"os.rename is not the primitive handed over: {handed}"
+    assert "os.replace" not in handed, "os.replace would overwrite"
+
+    # Asserted over CALLS, not over the rendered source. The module docstring legitimately names
+    # `os.replace` in the sentence explaining why it is never used, and a ban that the
+    # explanation of the ban cannot survive forces documentation to be written around a test.
+    # This repository has paid for that mistake several times.
+    library_calls = {ast.unparse(n.func) for n in ast.walk(library_tree)
+                     if isinstance(n, ast.Call)}
+    for forbidden in ("os.replace", "shutil.move", "shutil.copy", "shutil.copy2"):
+        assert forbidden not in library_calls, \
+            f"{forbidden} is reachable from the filing module"
+
+    # 2. The publisher calls the injected rename exactly once, and owns no destructive primitive.
+    collision_path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "collision.py")
+    with open(collision_path, encoding="utf-8") as handle:
+        collision_tree = ast.parse(handle.read())
+    publish = next(n for n in ast.walk(collision_tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "publish")
+    renames = [n for n in ast.walk(publish) if isinstance(n, ast.Call)
+               and ast.unparse(n.func) == "rename"]
+    assert len(renames) == 1, "the move must be exactly one call to the injected rename"
+
+    collision_calls = {ast.unparse(n.func) for n in ast.walk(collision_tree)
+                       if isinstance(n, ast.Call)}
+    for forbidden in ("os.remove", "os.unlink", "os.rmdir", "os.replace", "shutil.rmtree",
+                      "shutil.move", "shutil.copy", "shutil.copy2"):
+        assert forbidden not in collision_calls, f"{forbidden} is reachable from the publisher"
 
 
 def test_a_missing_destination_folder_is_refused_without_creating_it(tmp_path):
@@ -675,12 +720,21 @@ def test_a_picked_file_comes_back_absolute():
 # The GUI seam
 # =============================================================================================
 
-def test_the_audio_cutter_is_the_sixth_top_level_tab_before_clips_preview(gui_source: str):
+def test_the_audio_cutter_is_a_top_level_tab_beside_the_other_cutter(gui_source: str):
+    """R8 UX Refresh (Commit A). It used to be "the sixth tab, after Advanced Tools and before
+    Clips Preview" -- a position chosen to keep two other suites' index arithmetic valid rather
+    than for any reason an operator would recognise.
+
+    The claim that survives, and the one the re-order was for: the Audio Cutter is a top-level
+    destination of its own, and it sits directly beside the Raw Cutter, because the two are the
+    same job on different media and an operator looking for one will look for the other.
+    """
     assert "gr.Tab(LABEL_TAB_AUDIO_CUTTER" in gui_source
     audio = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
-    assert gui_source.index("gr.Tab(LABEL_TAB_ADVANCED") < audio, "it must follow Advanced Tools"
-    assert audio < gui_source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW"), \
-        "Clips Preview must stay LAST"
+    raw = gui_source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
+    assert raw < audio, "the two cutters must stay adjacent, Raw then Audio"
+    mix = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_MIX")
+    assert audio < mix, "the Audio Cutter must come before Audio Mix"
 
 
 def _audio_tab_body(tree: ast.Module) -> str:
@@ -1085,9 +1139,15 @@ def test_the_audio_layers_tip_is_present_and_names_the_real_controls(gui_source:
 
 
 def test_the_feature_claims_no_transcription_or_classifier(gui_source: str):
-    """R8 is where that would live, and R7 is deliberately not it."""
+    """A later phase is where that would live, and R7 is deliberately not it.
+
+    R8 note: the span is now the Audio Cutter tab up to the tab that follows it, which the
+    re-order changed from Clips Preview to Audio Mix. Scoping it to this tab is the point -- the
+    old bound happened to sweep two unrelated tabs as well, which would have made an unrelated
+    tab's wording fail this assertion.
+    """
     audio = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
-    block = gui_source[audio:gui_source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")]
+    block = gui_source[audio:gui_source.index("gr.Tab(LABEL_TAB_AUDIO_MIX")]
     for forbidden in ("whisper", "Whisper", "transcri", "qwen", "Qwen", "classif"):
         assert forbidden not in block, f"the Audio Cutter tab mentions {forbidden}"
 

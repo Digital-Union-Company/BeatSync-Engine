@@ -11,8 +11,13 @@ this is a second caller and not a second policy:
   here.
 * **Discard is quarantine, not deletion.** Nothing in this module deletes anything. There is no
   retention expiry and no cleanup pass; a discarded clip is a file that moved.
-* **A taken name is reported, never worked around.** No `_1` suffixing: if the library already has
-  that name the operator gets told, and the clip stays where it is.
+* **A taken name is reported, never worked around — unless the operator asked otherwise.** That
+  was unconditional until R8, and it is still the DEFAULT. Settings now offers an opt-in
+  `collision.SUFFIX` policy, under which a taken name advances to `clip_01`, `clip_02`, … The two
+  guarantees that made the original rule safe are unchanged by it: the rename is still no-replace,
+  so an existing file is never overwritten under either policy, and the retry is driven by the
+  rename *failing* rather than by an `exists()` check, so there is no window for a racing writer.
+  See `beatsync_fork.collision`.
 
 This is deliberately **not** the P2 transfer engine. There is no journal, no content fingerprint,
 no staging and no recovery report — it is one rename inside one volume, which is all a V1 needs and
@@ -24,6 +29,8 @@ Stdlib only (`os`), so the fork package's no-runtime-import rule still holds.
 from __future__ import annotations
 
 import os
+
+from . import collision
 
 KEPT = "kept"
 DISCARDED = "discarded"
@@ -75,11 +82,22 @@ def target_name(preferred: str, source_path: str) -> str:
     return f"{cleaned}{extension}"
 
 
-def file_clip(source_path: str, destination_folder: str, preferred_name: str = "") -> str:
+def file_clip(source_path: str, destination_folder: str, preferred_name: str = "",
+              policy: str = collision.DEFAULT_POLICY) -> str:
     """Move one clip into `destination_folder`. Returns the destination path.
 
     Raises :class:`FilingError` with operator-readable prose on every refusal. The source is never
     deleted on a failure, and never overwritten at the destination on success.
+
+    [FORK] R8: `policy` selects what happens when the name is taken. The **return type is
+    deliberately unchanged** -- still the destination path, not a `(path, tries)` pair. The caller
+    needs to know whether a different name was written, and it can already see that by comparing
+    the returned basename with the one it asked for; widening the contract would have broken every
+    existing caller and assertion to convey something the return value already carries.
+
+    Under the default :data:`collision.SKIP` the behaviour is unchanged down to the wording:
+    exactly one no-replace rename, and `FileExistsError` becomes the same "a file called X is
+    already there" sentence it always did.
     """
     source_path = str(source_path or "")
     folder = str(destination_folder or "").strip()
@@ -97,10 +115,18 @@ def file_clip(source_path: str, destination_folder: str, preferred_name: str = "
         return destination                     # already exactly where it was asked to go
 
     try:
-        os.rename(source_path, destination)
+        written, _tries = collision.publish(source_path, folder, name, os.rename, policy=policy)
+    except collision.NoFreeName as failure:
+        # One attempt means the plain "that name is taken" case, which is the ONLY case the
+        # default policy can produce -- so it keeps `_describe`'s exact pre-R8 sentence. Only an
+        # exhausted suffix sequence gets the new wording.
+        if failure.attempts <= 1:
+            raise FilingError(
+                f"{name}: {_describe(FileExistsError(), name)}") from failure
+        raise FilingError(str(failure)) from failure
     except OSError as failure:
         raise FilingError(f"{name}: {_describe(failure, name)}") from failure
-    return destination
+    return written
 
 
 def destination_problem(folder: str, label: str, run_directory: str = "") -> str:

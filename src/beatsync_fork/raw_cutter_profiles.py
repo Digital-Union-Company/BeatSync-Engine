@@ -73,6 +73,42 @@ def manifest_value(key) -> str:
     return profile.key if profile else SAME_AS_SOURCE
 
 
+def geometry_filter(width: int, height: int) -> str:
+    """The pixel-geometry half of a fixed profile: fit into `width`x`height` WITHOUT stretching.
+
+    Extracted from :func:`video_filter` by the R8 UX Refresh so the music-video renderer can reuse
+    the *measured* chain instead of growing a second, differently-wrong one. The renderer's
+    extraction path had only ``scale=width:height``, which distorts any source whose aspect ratio
+    differs from the target -- a portrait phone clip rendered into a 16:9 timeline came out
+    squashed rather than pillarboxed.
+
+    Nothing about this chain changed in the extraction: :func:`video_filter` composes it and
+    produces a byte-identical string to the one it produced before, which is asserted by test. The
+    two workflows stay distinct -- the cutter owns its ``trim``, the renderer owns its own -- and
+    only this pure geometry step is shared.
+
+    In order, and every step is here for a measured reason:
+
+    * ``scale=trunc(iw*sar/2)*2:ih,setsar=1`` squares the pixels **before** any aspect maths. A
+      720x576 frame with SAR 16:15 is a 4:3 picture, not a 5:4 one; fitting it by coded size would
+      letterbox it wrongly and squash the content. Measured on an anamorphic fixture: with this
+      step the result pillarboxes as 4:3; without it the picture is distorted.
+    * ``force_original_aspect_ratio=decrease`` then ``pad`` centres the picture in the target
+      frame. **Padding, never stretching** -- a 9:16 phone clip becomes a pillarboxed 16:9 frame
+      with its proportions intact.
+    * ``setsar=1`` so the output declares square pixels, and the padded frame's DAR is the
+      target's own.
+
+    ``trunc(.../2)*2`` keeps every intermediate dimension even, which yuv420p requires.
+    """
+    return (
+        f"scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+        f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=decrease,"
+        f"pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2,"
+        f"setsar=1"
+    )
+
+
 def video_filter(profile: Profile, duration: float) -> str:
     """The `-vf` chain for a fixed profile, in the one order that is correct.
 
@@ -80,29 +116,13 @@ def video_filter(profile: Profile, duration: float) -> str:
     membership is still decided by the frames' own timestamps exactly as the legacy path decides
     it, and only then is the result reshaped.
 
-    Then, in order:
-
-    * ``scale=trunc(iw*sar/2)*2:ih,setsar=1`` squares the pixels **before** any aspect maths. A
-      720x576 frame with SAR 16:15 is a 4:3 picture, not a 5:4 one; fitting it by coded size would
-      letterbox it wrongly and squash the content. Measured on an anamorphic fixture: with this
-      step the result pillarboxes as 4:3; without it the picture is distorted.
-    * ``force_original_aspect_ratio=decrease`` then ``pad`` centres the picture in the target
-      frame. **Padding, never stretching** — a 9:16 phone clip becomes a pillarboxed 16:9 frame
-      with its proportions intact.
-    * ``setsar=1`` so the output declares square pixels, and the padded frame's DAR is the
-      profile's own.
-    * ``fps`` last, converting to the constant target rate. It duplicates or drops frames to get
-      there; it does **not** retime, so playback speed is unchanged.
-
-    ``trunc(.../2)*2`` keeps every intermediate dimension even, which yuv420p requires.
+    Then :func:`geometry_filter` squares the pixels and pads to the target, and finally ``fps``
+    converts to the constant target rate -- last, and it duplicates or drops frames to get there;
+    it does **not** retime, so playback speed is unchanged.
     """
-    width, height = profile.width, profile.height
     return (
         f"trim=end={duration:.6f},setpts=PTS-STARTPTS,"
-        f"scale=trunc(iw*sar/2)*2:ih,setsar=1,"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        f"setsar=1,"
+        f"{geometry_filter(profile.width, profile.height)},"
         f"fps={profile.fps}"
     )
 
@@ -132,4 +152,5 @@ def timing_options(profile: Profile) -> list[str]:
 
 
 __all__ = ["SAME_AS_SOURCE", "SAME_AS_SOURCE_LABEL", "Profile", "PROFILES", "profile_choices",
-           "resolve", "label_for", "manifest_value", "video_filter", "timing_options"]
+           "resolve", "label_for", "manifest_value", "geometry_filter", "video_filter",
+           "timing_options"]

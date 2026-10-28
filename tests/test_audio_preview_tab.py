@@ -88,18 +88,23 @@ def _wired(tree: ast.Module, widget: str, event: str, which: str) -> set:
 
 
 def _tab_body(tree: ast.Module) -> str:
-    """The `with gr.Tab(LABEL_TAB_AUDIO_PREVIEW ...)` node's own body.
+    """The `with gr.Tab(LABEL_SECTION_AUDIO_REVIEW ...)` node's own body.
 
-    Taken from the AST node rather than a source slice: a slice would have to guess where the tab
-    ends and would silently include the next one.
+    Taken from the AST node rather than a source slice: a slice would have to guess where the
+    section ends and would silently include the next one.
+
+    R8 UX Refresh (Commit A): this was `LABEL_TAB_AUDIO_PREVIEW`, a top-level tab. It is now the
+    Audio Review section of Media Library. Only the container changed -- every widget, handler and
+    registration this suite checks is the pre-existing one, which is why the rest of the file
+    needed no behavioural amendment.
     """
     for node in ast.walk(tree):
         if isinstance(node, ast.With):
             for item in node.items:
                 text = ast.unparse(item.context_expr)
-                if text.startswith("gr.Tab(LABEL_TAB_AUDIO_PREVIEW"):
+                if text.startswith("gr.Tab(LABEL_SECTION_AUDIO_REVIEW"):
                     return "\n".join(ast.unparse(statement) for statement in node.body)
-    raise AssertionError("no Audio Preview tab")
+    raise AssertionError("no Audio Review section")
 
 
 _PREVIEW_HANDLERS = ("_on_audio_preview_scan", "_on_audio_preview_prev",
@@ -112,28 +117,43 @@ _PREVIEW_HANDLERS = ("_on_audio_preview_scan", "_on_audio_preview_prev",
 # The tab exists, in the right place, with the controls the owner asked for
 # =============================================================================================
 
-def test_the_tab_is_top_level_and_sits_before_clips_preview(gui_source: str):
-    """Clips Preview must stay LAST -- its own suite requires it -- and Advanced Tools must stay at
-    index 3, so this tab goes between Audio Cutter and Clips Preview."""
-    assert "gr.Tab(LABEL_TAB_AUDIO_PREVIEW" in gui_source
+def test_audio_review_is_the_middle_media_library_section(gui_source: str):
+    """R8 UX Refresh (Commit A) replaces "top-level, and before Clips Preview".
+
+    The original claim was a position among seven top-level tabs, chosen to keep two *other*
+    suites' index arithmetic valid. Both of those constraints are gone: this is now a section of
+    Media Library, and nothing counts tab indices any more. What is asserted instead is the
+    placement that is still load-bearing -- Audio Review sits between Video Review and Prepare &
+    Verify, because Prepare & Verify must stay last for the sample-policy span
+    (`test_gui_tabs.py::test_the_sample_policy_span_still_holds`).
+    """
+    assert "gr.Tab(LABEL_SECTION_AUDIO_REVIEW" in gui_source
     positions = {label: gui_source.index(f"gr.Tab({label}")
-                 for label in ("LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER",
-                               "LABEL_TAB_AUDIO_PREVIEW", "LABEL_TAB_CLIPS_PREVIEW")}
-    assert (positions["LABEL_TAB_ADVANCED"]
-            < positions["LABEL_TAB_AUDIO_CUTTER"]
-            < positions["LABEL_TAB_AUDIO_PREVIEW"]
-            < positions["LABEL_TAB_CLIPS_PREVIEW"])
+                 for label in ("LABEL_TAB_MEDIA_LIBRARY", "LABEL_SECTION_VIDEO_REVIEW",
+                               "LABEL_SECTION_AUDIO_REVIEW", "LABEL_SECTION_PREPARE_VERIFY",
+                               "LABEL_TAB_SETTINGS")}
+    assert (positions["LABEL_TAB_MEDIA_LIBRARY"]
+            < positions["LABEL_SECTION_VIDEO_REVIEW"]
+            < positions["LABEL_SECTION_AUDIO_REVIEW"]
+            < positions["LABEL_SECTION_PREPARE_VERIFY"]
+            < positions["LABEL_TAB_SETTINGS"]), \
+        "Audio Review is not between Video Review and Prepare & Verify inside Media Library"
 
 
-def test_the_tab_is_not_an_accordion_or_nested_in_another_tab(gui_tree: ast.Module):
+def test_the_section_is_not_an_accordion_and_nests_no_further_tabs(gui_tree: ast.Module):
+    """Amended by R8. "Not nested in another tab" is now deliberately false -- it is nested in
+    Media Library on purpose. The property that mattered survives: an operator reviewing audio
+    must see every control without opening anything, and this section must not grow a tab set of
+    its own, which would bury controls two levels deep.
+    """
     body = _tab_body(gui_tree)
     assert "gr.Accordion(" not in body
     assert "gr.Tab(" not in body
 
 
-def test_the_tab_label_is_defined_in_ui_content(content: str):
-    assert "LABEL_TAB_AUDIO_PREVIEW" in content
-    assert "Audio Preview" in content
+def test_the_section_label_is_defined_in_ui_content(content: str):
+    assert "LABEL_SECTION_AUDIO_REVIEW" in content
+    assert "Audio Review" in content
 
 
 @pytest.mark.parametrize("widget", [
@@ -182,11 +202,11 @@ def test_the_page_size_control_is_a_number(gui_tree: ast.Module):
     assert "gr.Slider(" not in body
 
 
-def test_the_tab_declares_no_forbidden_widget_anywhere_in_its_span(gui_source: str):
-    """The same guard, checked here directly so a failure names this tab rather than the sample
-    block 1,000 lines earlier."""
-    start = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_PREVIEW")
-    end = gui_source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")
+def test_the_section_declares_no_forbidden_widget_anywhere_in_its_span(gui_source: str):
+    """The same guard, checked here directly so a failure names this section rather than the
+    sample block 1,000 lines earlier."""
+    start = gui_source.index("gr.Tab(LABEL_SECTION_AUDIO_REVIEW")
+    end = gui_source.index("gr.Tab(LABEL_SECTION_PREPARE_VERIFY")
     span = gui_source[start:end]
     assert "gr.Slider(" not in span
 
@@ -279,11 +299,24 @@ def test_a_preferences_file_written_before_this_release_still_loads(tmp_path):
 
 def test_the_preference_handlers_carry_the_three_new_fields(gui_tree: ast.Module):
     """Appended at the END of the signature, because Gradio passes arguments positionally and
-    every pre-existing index must stay where the registration already put it."""
+    every pre-existing index must stay where the registration already put it.
+
+    [FORK] R8 appended two more fields after these three, so `names[-3:]` is no longer this
+    feature's tail. The assertion moves to the property that mattered and is unaffected by a
+    later append: the three arrived as one CONTIGUOUS run, and nothing was inserted before them
+    or between them. An insertion anywhere earlier would shift their indices and fail here, which
+    is exactly what the original `[-3:]` check was for.
+    """
     save = _func(gui_tree, "_on_save_folder_prefs")
     names = [arg.arg for arg in save.args.args]
-    assert names[-3:] == ["audio_preview_input_folder", "audio_preview_library_folder",
-                          "audio_preview_discarded_folder"]
+    expected = ["audio_preview_input_folder", "audio_preview_library_folder",
+                "audio_preview_discarded_folder"]
+    assert all(name in names for name in expected), names
+    first = names.index(expected[0])
+    assert names[first:first + 3] == expected, (
+        f"the three R7.2 fields are no longer one contiguous run: {names}")
+    # They are still the R7.2 tail: everything after them was appended later, never inserted.
+    assert first + 3 <= len(names), names
     read = _wired(gui_tree, "pref_save_btn", "click", "inputs")
     assert {"audio_preview_folder", "pref_audio_preview_library",
             "pref_audio_preview_discarded"} <= read
@@ -304,16 +337,24 @@ def test_reset_clears_the_two_new_destination_boxes_too(gui_tree: ast.Module):
             "every return must have one value per output")
 
 
-def test_open_results_in_audio_preview_fills_the_box_and_scans_nothing(gui_tree: ast.Module):
-    """"Add a convenient Open results in Audio Preview action if practical" -- and Phase 2's rule
-    that nothing scans as a side effect still applies to it."""
-    handler = ast.unparse(_func(gui_tree, "_on_audio_open_in_preview"))
+def test_open_results_in_media_library_fills_the_box_and_scans_nothing(gui_tree: ast.Module):
+    """"Add a convenient Open results action if practical" -- and Phase 2's rule that nothing
+    scans as a side effect still applies to it.
+
+    R8 UX Refresh (Commit A): the destination is now a SECTION, so reaching it takes two
+    selections rather than one. Both are asserted, because returning only one of them is a real
+    and silent defect -- the inner selection alone leaves the operator on whatever top-level tab
+    they were on, with Audio Review selected invisibly underneath.
+    """
+    handler = ast.unparse(_func(gui_tree, "_on_audio_open_in_library"))
     assert "discover_audio" not in handler
     assert "_audio_publish" not in handler
-    assert "gr.Tabs(selected='tab-audio-preview')" in handler
+    assert "gr.Tabs(selected='tab-media-library')" in handler
+    assert "gr.Tabs(selected='tab-audio-review')" in handler
     written = _wired(gui_tree, "audio_open_preview_btn", "click", "outputs")
     assert "audio_preview_folder" in written
-    assert "main_tabs" in written
+    assert "main_tabs" in written, "the outer tab is not selected"
+    assert "library_tabs" in written, "the inner section is not selected"
     # It reads the run directory the cut recorded, never a widget the operator could have edited.
     read = _wired(gui_tree, "audio_open_preview_btn", "click", "inputs")
     assert read == {"audio_run_dir_state"}
@@ -321,11 +362,14 @@ def test_open_results_in_audio_preview_fills_the_box_and_scans_nothing(gui_tree:
 
 def test_open_results_says_so_plainly_when_there_is_nothing_to_open(gui_tree: ast.Module):
     namespace = {"gr": _FakeGradio()}
-    exec(ast.unparse(_func(gui_tree, "_on_audio_open_in_preview")), namespace)
-    handler = namespace["_on_audio_open_in_preview"]
+    exec(ast.unparse(_func(gui_tree, "_on_audio_open_in_library")), namespace)
+    handler = namespace["_on_audio_open_in_library"]
     for empty in ("", None, "   "):
-        _, _, message = handler(empty)
-        assert "Cut some clips first" in message
+        returned = handler(empty)
+        # One value per output, on the failure path too -- Gradio aligns them positionally, so a
+        # short tuple here would write the message into the wrong component.
+        assert len(returned) == 4, f"expected 4 values, got {len(returned)}"
+        assert "Cut some clips first" in returned[-1]
 
 
 class _FakeGradio:

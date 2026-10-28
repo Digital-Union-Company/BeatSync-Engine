@@ -62,6 +62,11 @@ from beatsync_fork import progress as fork_progress
 # in `beatsync_fork.variation`, which this module now reaches only through `CreativeProfile` — the
 # profile delegates every seed decision there, so the seed rules stay in exactly one place.
 from beatsync_fork import creative as fork_creative
+# [FORK] Digital-Union (R8 UX Refresh, Phase 6): the Output Video Profile table and its pure
+# geometry. Stdlib-only; `resolve` answers None for Auto and every helper returns its `fallback`
+# unchanged in that case, so the historical path is not merely preserved but structurally
+# unreachable from a profile.
+from beatsync_fork import render_profiles as fork_render_profiles
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -513,7 +518,16 @@ def create_clip_parallel(args):
         except Exception:
             return str(reason)
 
-    if len(args) >= 10:
+    # [FORK] Digital-Union (R8 UX Refresh, Phase 6): an ELEVENTH element, the output-profile
+    # geometry chain. Appended at the end and defaulted to '' for the same reason every earlier
+    # element was: this tuple is built in one place and unpacked here by length, so a shorter
+    # tuple from an older caller (or a test) still unpacks and still takes the untouched Auto
+    # path.
+    geometry = ''
+    if len(args) >= 11:
+        (i, video_file, final_duration, target_size,
+         use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, lifecycle, geometry) = args
+    elif len(args) >= 10:
         (i, video_file, final_duration, target_size,
          use_nvenc, gpu_encoder, temp_dir, fps, planned_clip, lifecycle) = args
     elif len(args) >= 9:
@@ -563,6 +577,8 @@ def create_clip_parallel(args):
             'use_nvenc': use_nvenc,
             'gpu_encoder': gpu_encoder,
             'lifecycle': lifecycle,
+            # '' means Auto: the extractor then emits its historical bare scale, unchanged.
+            'geometry': geometry,
         }
 
         # [FORK] Digital-Union (Phase 3B): same extraction, but a failure now carries the bounded
@@ -606,7 +622,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                       beat_info: dict = None,
                       lossless_mode: bool = False, use_gpu: bool = False,
                       gpu_encoder: str = 'h264_nvenc', fps: float = None,
-                      event_callback=None, lifecycle=None) -> str:
+                      event_callback=None,
+                      # [FORK] R8 Phase 6: BEFORE `lifecycle`, not after it. A seam test pins
+                      # `lifecycle` as the last parameter of every cancellable entry point and
+                      # requires it to be defaulted, so a new parameter goes in front of it.
+                      # Every caller passes these by keyword, so nothing shifts.
+                      output_profile: str = None, lifecycle=None) -> str:
     """
     Creates a music video with video clips cut to detected beats.
 
@@ -653,6 +674,12 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         max_workers = PARALLEL_WORKERS
 
     # Determine FPS to use
+    #
+    # [FORK] Digital-Union (R8 UX Refresh, Phase 6): a fixed Output Video Profile states the frame
+    # rate, so it wins over auto-detection. `target_fps` returns its `fallback` UNCHANGED under
+    # Auto, so passing `fps` through it is a no-op there and the branch below is reached exactly
+    # as before.
+    fps = fork_render_profiles.target_fps(output_profile, fps)
     if fps is None:
         # Auto-detect from first video file
         try:
@@ -969,9 +996,19 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
     # STANDARD MODE - Direct parallel processing (NO BATCHES)
     else:
         # Get target resolution from first video
+        #
+        # [FORK] Digital-Union (R8 UX Refresh, Phase 6): under a fixed Output Video Profile the
+        # target is the PROFILE's, and the clips are padded into it rather than stretched to it.
+        # Under Auto (`output_profile` unset or unrecognised) `target_size` is the first source's
+        # resolution and `output_geometry` is '', which is byte-identical to the historical path.
         target_size = get_video_resolution(video_files[0])
+        target_size = fork_render_profiles.target_size(output_profile, target_size)
+        output_geometry = fork_render_profiles.geometry_filter(output_profile)
         render_info["target_resolution"] = f"{target_size[0]}x{target_size[1]}"
-        print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}")
+        render_info["output_profile"] = fork_render_profiles.label_for(output_profile)
+        print(f"🎞️ Target resolution: {target_size[0]}x{target_size[1]}"
+              + (f"  (profile: {fork_render_profiles.label_for(output_profile)})"
+                 if output_geometry else ""))
         
         print(f"\n{'='*60}")
         print(f"🎬 PROCESSING ALL CLIPS (No batch processing with FFmpeg)")
@@ -991,7 +1028,7 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
             video_file = planned_clip.get('video_file') if planned_clip else random.choice(video_files)
             clip_args.append((i, video_file, final_duration,
                             target_size, use_nvenc, gpu_encoder, session_temp_dir, fps,
-                            planned_clip, lifecycle))
+                            planned_clip, lifecycle, output_geometry))
         
         clip_files = [None] * len(clip_args)
         clip_timings: List[float] = []

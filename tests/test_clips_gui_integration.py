@@ -35,6 +35,7 @@ from collections import OrderedDict
 import pytest
 
 from beatsync_fork import clips_review as cr
+from beatsync_fork import collision
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -48,7 +49,9 @@ _HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailabl
              "_clips_identities", "_clips_durations",
              "_on_clips_check", "_clips_render_current", "_on_clips_scan",
              "_clips_decide", "_clips_state", "_on_clips_refresh",
-             "_clips_confirm_only", "_clips_sorted_text", "_on_clips_confirm")
+             "_clips_confirm_only", "_clips_sorted_text", "_on_clips_confirm",
+             # [FORK] R8 Final Polish: the sweep gate's Cancel half.
+             "_on_clips_sweep_cancel")
 
 
 class _Update(dict):
@@ -118,6 +121,13 @@ def _build(state_dir, ui_constants, poster_runner=None, poster_hook=None):
         "_CLIPS_STORE": None,
         "CLIPS_MAX_TRACKED_SESSIONS": 32,
         "_CLIPS_SCANS": cr.ScanCoordinator(max_owners=32),
+        # [FORK] R8 UX Refresh: Confirm reads the operator's saved filename-collision policy, so
+        # the handler names `gui._collision_policy`. It is stubbed to the DEFAULT here on purpose:
+        # every assertion in this suite is about the pre-R8 behaviour -- one clip per name, an
+        # occupied destination refused, nothing overwritten -- and the default is exactly that
+        # behaviour. The opt-in `suffix` policy has its own suite, `test_collision.py`, which
+        # exercises both policies against a real filesystem.
+        "_collision_policy": lambda: collision.DEFAULT_POLICY,
     }
     namespace.update(ui_constants)
     sys.modules.setdefault("ffmpeg_processing", _FfmpegProcessing)
@@ -508,7 +518,15 @@ def test_confirm_is_disabled_until_the_record_says_otherwise(world):
     assert "Undecided 0" in counts
 
 
-def test_putting_a_clip_back_to_pending_disables_confirm_again(world):
+def test_putting_every_clip_back_to_pending_disables_confirm_again(world):
+    """[FORK] R8 Final Polish: EVERY clip, not one.
+
+    The original put a single clip back to PENDING and required Confirm to go dark, because the
+    admission rule was "nothing may be undecided". Under keep-only that is no longer true and
+    should not be — one undecided clip among nine kept ones is exactly the case the gate exists
+    for. What must still hold, and is asserted here, is the fail-closed direction: when the record
+    says **nothing is kept**, Confirm goes dark again and a press refuses.
+    """
     namespace = world["ns"]
     owner = "browser-session-1"
     _scan(world, owner)
@@ -518,14 +536,24 @@ def test_putting_a_clip_back_to_pending_disables_confirm_again(world):
                                    {"to": "SELECTED", "rev": 0})
     assert namespace["_on_clips_refresh"](world["request"](owner))[2] == {"interactive": True}
 
+    # One clip back to PENDING must NOT disable it any more: the others are still kept.
     reset = namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
                                        {"to": "PENDING", "rev": 1})
     assert reset["ok"] and reset["decision"] == "PENDING"
     _, counts, confirm = namespace["_on_clips_refresh"](world["request"](owner))
-    assert confirm == {"interactive": False}, "Confirm must not stay usable"
     assert "Undecided 1" in counts
+    if len(view["entries"]) > 1:
+        assert confirm == {"interactive": True}, (
+            "one undecided clip among kept ones is the gate's case, not a refusal")
+
+    # Now clear the rest: with nothing kept, the fail-closed direction must hold.
+    for index, entry in enumerate(view["entries"][1:], start=1):
+        namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                   {"to": "PENDING", "rev": 1})
+    _, counts, confirm = namespace["_on_clips_refresh"](world["request"](owner))
+    assert confirm == {"interactive": False}, "nothing kept must leave Confirm unusable"
     assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in \
-        namespace["_on_clips_confirm"](world["request"](owner))[-1]
+        namespace["_on_clips_confirm"]("", world["request"](owner))[4]
 
 
 def test_the_counters_tell_the_operator_that_refresh_enables_confirm(world):
@@ -535,7 +563,8 @@ def test_the_counters_tell_the_operator_that_refresh_enables_confirm(world):
     source = open(_GUI, encoding="utf-8").read()
     start = source.index("CLIPS_GALLERY_JS = r\"\"\"")
     javascript = source[start:source.index('""".replace(', start)]
-    assert "counts.PENDING === 0" in javascript
+    assert "counts.SELECTED > 0" in javascript, (
+        "[R8] readiness is now at least one KEPT clip, matching the server")
     assert "__REFRESH_HINT__" in javascript
     assert "CLIPS_REFRESH_TO_ENABLE_HINT" in source, "the wording lives in ui_content.py"
     for forbidden in ("interactive", "disabled = false", "removeAttribute('disabled')",
@@ -581,7 +610,7 @@ def test_only_the_record_can_ever_ENABLE_the_confirm_button():
     for name in enablers:
         node = next(n for n in tree.body
                     if isinstance(n, ast.FunctionDef) and n.name == name)
-        assert "counts[fork_clips.PENDING] == 0" in ast.unparse(node), (
+        assert "counts[fork_clips.SELECTED] > 0" in ast.unparse(node), (
             f"{name} must derive the enabled state from the durable record")
     refresh = next(n for n in tree.body
                    if isinstance(n, ast.FunctionDef) and n.name == "_on_clips_refresh")
@@ -611,7 +640,7 @@ def test_confirm_sorts_the_page_into_the_two_destinations(world):
         namespace["_clips_decide"](owner, view["session"], view["page"], entry,
                                    {"to": "REJECTED", "rev": 0})
 
-    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+    message = namespace["_on_clips_confirm"]("", world["request"](owner))[4]
 
     kept = os.path.join(world["library"], os.path.basename(keep.path))
     binned = os.path.join(world["rejected"], os.path.basename(bin_.path))
@@ -640,7 +669,7 @@ def test_confirm_never_overwrites_an_occupied_destination_name(world):
     for entry in view["entries"]:
         namespace["_clips_decide"](owner, view["session"], view["page"], entry,
                                    {"to": "SELECTED", "rev": 0})
-    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+    message = namespace["_on_clips_confirm"]("", world["request"](owner))[4]
 
     assert open(occupant, "rb").read() == b"i was here first", "the occupant was overwritten"
     assert os.path.isfile(victim.path), "the clip must stay put when its name is taken"
@@ -665,7 +694,7 @@ def test_confirm_skips_a_clip_that_changed_after_the_scan(world):
     with open(moved_on.path, "ab") as handle:        # same name, different bytes
         handle.write(b"appended after the scan")
 
-    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
+    message = namespace["_on_clips_confirm"]("", world["request"](owner))[4]
 
     assert os.path.isfile(moved_on.path), "the changed clip must stay where it is"
     assert "changed after it was scanned" in message, message
@@ -673,15 +702,160 @@ def test_confirm_skips_a_clip_that_changed_after_the_scan(world):
                                            os.path.basename(moved_on.path)))
 
 
-def test_confirm_refuses_while_any_clip_is_undecided(world):
+def test_confirm_with_undecided_clips_shows_the_gate_and_moves_nothing(world):
+    """[FORK] R8 Final Polish -- replaces `test_confirm_refuses_while_any_clip_is_undecided`.
+
+    Undecided clips no longer REFUSE a Confirm; they open a gate. The property the old test
+    protected is unchanged and is what is asserted here: on that first press **nothing moves**.
+    What changed is that the operator is now shown the consequence and offered Proceed/Cancel,
+    instead of being told to go and click 194 more clips.
+    """
     namespace = world["ns"]
     owner = "browser-session-1"
     _scan(world, owner)
     view = namespace["_clips_view"](owner)
     namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
                                {"to": "SELECTED", "rev": 0})
-    message = namespace["_on_clips_confirm"](world["request"](owner))[-1]
-    assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in message, message
+
+    result = namespace["_on_clips_confirm"]("", world["request"](owner))
+    message, proceed, cancel, signature = result[4], result[5], result[6], result[7]
+
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in message, message
+    assert proceed == {"visible": True} and cancel == {"visible": True}, (proceed, cancel)
+    assert signature, "the gate must arm the exact batch it showed"
+
+    for entry in view["entries"]:
+        assert os.path.isfile(entry.path), "the gate must move nothing at all"
+    assert not os.path.exists(world["library"])
+    assert not os.path.exists(world["rejected"])
+
+
+def test_proceed_sweeps_the_unmarked_clips_to_discarded_and_deletes_nothing(world):
+    """[FORK] R8 Final Polish: the second half of the gate, end to end on a real filesystem.
+
+    One clip is kept and the rest are left undecided. The first Confirm shows the gate and moves
+    nothing; re-pressing with the signature it armed sweeps the unmarked clips into Discarded.
+    Every file is still on disk afterwards, just in a different folder -- "never permanently
+    delete" is the promise the gate is asking the operator to rely on.
+    """
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    entries = list(view["entries"])
+    assert len(entries) >= 2, "this fixture needs at least two clips"
+    keep = entries[0]
+    unmarked = entries[1:]
+    payload = {entry.clip_id: open(entry.path, "rb").read() for entry in entries}
+
+    namespace["_clips_decide"](owner, view["session"], view["page"], keep,
+                               {"to": "SELECTED", "rev": 0})
+
+    # First press: the gate. Nothing moves.
+    gated = namespace["_on_clips_confirm"]("", world["request"](owner))
+    signature = gated[7]
+    assert signature and gated[5] == {"visible": True}
+    for entry in entries:
+        assert os.path.isfile(entry.path), "the gate moved a file"
+
+    # Second press, carrying the signature the gate armed: the sweep proceeds.
+    swept = namespace["_on_clips_confirm"](signature, world["request"](owner))
+    message = swept[4]
+
+    kept_path = os.path.join(world["library"], os.path.basename(keep.path))
+    assert os.path.isfile(kept_path), message
+    assert open(kept_path, "rb").read() == payload[keep.clip_id]
+    for entry in unmarked:
+        binned = os.path.join(world["rejected"], os.path.basename(entry.path))
+        assert os.path.isfile(binned), f"{entry.path} was not swept: {message}"
+        assert open(binned, "rb").read() == payload[entry.clip_id], "content survived the move"
+        assert not os.path.exists(entry.path), "a swept clip leaves its old location"
+    assert "Nothing was deleted" in message, message
+    # the gate closes and the arming is spent
+    assert swept[5] == {"visible": False} and swept[7] == ""
+
+
+def test_a_signature_from_a_different_batch_cannot_authorise_a_sweep(world):
+    """The signature is a change detector, not a credential. Presenting a stale one must simply
+    fail to match a freshly derived plan, which shows the gate again rather than sweeping."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    entries = list(view["entries"])
+    namespace["_clips_decide"](owner, view["session"], view["page"], entries[0],
+                               {"to": "SELECTED", "rev": 0})
+
+    result = namespace["_on_clips_confirm"]("not-the-signature-for-this-batch",
+                                            world["request"](owner))
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in result[4], result[4]
+    for entry in entries:
+        assert os.path.isfile(entry.path), "a forged signature moved a file"
+    assert not os.path.exists(world["library"])
+    assert not os.path.exists(world["rejected"])
+
+
+def test_cancelling_the_sweep_changes_absolutely_nothing(world):
+    """Cancel closes the gate, clears the arming, and touches neither a decision nor a file."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    entries = list(view["entries"])
+    namespace["_clips_decide"](owner, view["session"], view["page"], entries[0],
+                               {"to": "SELECTED", "rev": 0})
+    before = {entry.path: open(entry.path, "rb").read() for entry in entries}
+
+    namespace["_on_clips_confirm"]("", world["request"](owner))
+    cancelled = namespace["_on_clips_sweep_cancel"](world["request"](owner))
+
+    assert world["ui"]["CLIPS_SWEEP_CANCELLED_TEXT"] in cancelled[4]
+    assert cancelled[5] == {"visible": False} and cancelled[6] == {"visible": False}
+    assert cancelled[7] == "", "Cancel must clear the arming"
+    for path, payload in before.items():
+        assert os.path.isfile(path), "Cancel moved a file"
+        assert open(path, "rb").read() == payload
+    assert not os.path.exists(world["library"])
+    assert not os.path.exists(world["rejected"])
+    # and the decision the operator had already made is untouched
+    snapshot = namespace["_clips_store"]().snapshot_of(namespace["_clips_identities"](view))
+    assert snapshot[view["identity"][entries[0].clip_id]][0] == "SELECTED"
+
+
+def test_the_sweep_never_writes_a_decision_to_the_durable_record(world):
+    """"For this batch only" is the contract. A swept clip must stay PENDING in the store, so a
+    re-scan shows it undecided rather than as a rejection the operator never made."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    entries = list(view["entries"])
+    namespace["_clips_decide"](owner, view["session"], view["page"], entries[0],
+                               {"to": "SELECTED", "rev": 0})
+    identities = namespace["_clips_identities"](view)
+    unmarked_identity = view["identity"][entries[1].clip_id]
+
+    signature = namespace["_on_clips_confirm"]("", world["request"](owner))[7]
+    namespace["_on_clips_confirm"](signature, world["request"](owner))
+
+    snapshot = namespace["_clips_store"]().snapshot_of(identities)
+    assert snapshot.get(unmarked_identity, ("PENDING", 0))[0] == "PENDING", (
+        "the sweep wrote a REJECTED decision the operator never made")
+
+
+def test_confirm_refuses_when_no_clip_is_kept(world):
+    """The admission rule that replaced "everything decided": at least one clip must be KEPT."""
+    namespace = world["ns"]
+    owner = "browser-session-1"
+    _scan(world, owner)
+    view = namespace["_clips_view"](owner)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": "REJECTED", "rev": 0})
+
+    result = namespace["_on_clips_confirm"]("", world["request"](owner))
+    assert world["ui"]["CLIPS_CONFIRM_DISABLED_TEXT"].split(".")[0] in result[4], result[4]
+    assert result[5] == {"visible": False}, "a refusal must not open the gate"
+    assert result[7] == "", "a refusal must arm nothing"
     for entry in view["entries"]:
         assert os.path.isfile(entry.path), "a refused Confirm moves nothing at all"
     assert not os.path.exists(world["library"])
@@ -1287,7 +1461,7 @@ def test_n7_case17_refresh_and_confirm_refuse_rather_than_report_a_clean_page(wo
     _deny_journal_reads(monkeypatch, store.journal_path)
 
     grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
+    confirmation = namespace["_on_clips_confirm"]("", world["request"](session_hash=owner))[4]
     monkeypatch.undo()
 
     assert confirm == {"interactive": False}, "Confirm must fail closed"
@@ -1351,7 +1525,7 @@ def test_n7_no_operator_visible_refusal_discloses_a_filesystem_path(world, monke
     _deny_journal_reads(monkeypatch, seed.journal_path)
     report, grid, counts, confirm = _scan(world, owner)
     refresh = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
+    confirmation = namespace["_on_clips_confirm"]("", world["request"](session_hash=owner))[4]
     monkeypatch.undo()
 
     surfaces = [report, grid, counts, confirmation, refresh[0], refresh[1]]
@@ -1527,7 +1701,7 @@ def test_n7r2_refresh_and_confirm_refuse_for_a_readable_but_unaccountable_record
     namespace["_CLIPS_STORE"] = None
 
     grid, counts, confirm = namespace["_on_clips_refresh"](world["request"](session_hash=owner))
-    confirmation = namespace["_on_clips_confirm"](world["request"](session_hash=owner))[-1]
+    confirmation = namespace["_on_clips_confirm"]("", world["request"](session_hash=owner))[4]
 
     assert confirm == {"interactive": False}, "Confirm must fail closed"
     assert "r5-tile" not in grid, "a decided clip may never be repainted as undecided"

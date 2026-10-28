@@ -393,12 +393,38 @@ def test_surprise_me_writes_the_seed_and_the_summary_and_no_dropdown():
     assert "freestyle_enabled" not in _names(kwargs["outputs"])
 
 
-def test_the_change_graph_still_writes_only_the_summary():
-    """V2 adds a button; it must not turn any `.change()` into a widget writer."""
+#: [FORK] R8 Owner Fixes (P1): the three read-outs every Freestyle `.change()` may write, and
+#: nothing else. The summary was alone until the owner reported the enable checkbox was easy to
+#: miss among ten dropdowns; the badge states the mode in words and the group holds the ten
+#: dropdowns so they are only shown in the mode where they do anything. Both are display, and
+#: critically the group is HIDDEN rather than cleared -- a hidden Gradio component keeps and
+#: still submits its value, so no rule is lost by switching Freestyle off.
+_FREESTYLE_CHANGE_OUTPUTS = ["freestyle_summary", "freestyle_state_badge",
+                             "freestyle_sections_group"]
+
+
+def test_the_change_graph_still_writes_only_read_outs():
+    """V2 adds a button; it must not turn any `.change()` into a widget writer.
+
+    The list is resolved through `_freestyle_readout_outputs`, the single name all eleven
+    registrations share -- one list means the badge can never disagree with the switch.
+    """
     tree = _tree(_GUI)
+    source = open(_GUI, encoding="utf-8").read()
+    declared = source[source.index("_freestyle_readout_outputs = ["):]
+    declared = declared[:declared.index("]")]
+    for name in _FREESTYLE_CHANGE_OUTPUTS:
+        assert name in declared, name
+    for forbidden in ("variation_seed", "creative_preset", "cut_density", "micro_cuts",
+                      "process_btn", "confirm_btn", "source_state"):
+        assert forbidden not in declared, f"a Freestyle change writes {forbidden}"
+
     for widget in ["freestyle_enabled"] + [f"freestyle_{t}" for t in fork_freestyle.SECTION_TYPES]:
         for call in _registration(tree, widget, "change"):
-            assert _names(_kwargs(call)["outputs"]) == ["freestyle_summary"], widget
+            outputs = _kwargs(call)["outputs"]
+            assert isinstance(outputs, ast.Name), (
+                f"{widget} no longer shares the one read-out list")
+            assert outputs.id == "_freestyle_readout_outputs", widget
 
 
 def test_the_gui_names_no_banned_speculative_freestyle_concept():

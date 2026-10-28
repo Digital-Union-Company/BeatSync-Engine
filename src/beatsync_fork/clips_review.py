@@ -53,6 +53,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from . import collision
+
 # --------------------------------------------------------------------------------------------
 # Decisions
 # --------------------------------------------------------------------------------------------
@@ -1439,6 +1441,116 @@ IN_USE = "in_use"
 FAILED = "failed"
 
 
+# ---------------------------------------------------------------------------------------------
+# The sort plan: what a Confirm would do, decided before anything moves.
+#
+# [FORK] R8 Final Polish: MOVED HERE from `audio_review.py`, unchanged, because both review
+# surfaces now need it and it was never audio-specific -- it reads a `clip_id` and a decision and
+# nothing else. `audio_review` re-exports these names, so every existing caller and test is
+# unaffected; what changed is that Video Review can now use the same admission rule instead of
+# growing a second one.
+#
+# Keeping it in this module rather than duplicating it is the whole point: "at least one clip is
+# kept" and "the signature covers the batch" are safety rules, and two copies of a safety rule is
+# one copy too many.
+# ---------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SortPlan:
+    """What a Confirm would do, decided before anything moves.
+
+    Three disjoint groups, deliberately kept apart all the way into the report rather than merged
+    into one "discarded" number: an operator who is told "14 discarded" cannot tell whether they
+    rejected 14 clips or forgot to look at 12 of them.
+    """
+
+    keep: tuple = ()
+    rejected: tuple = ()
+    unmarked: tuple = ()
+    signature: str = ""
+
+    @property
+    def total(self) -> int:
+        return len(self.keep) + len(self.rejected) + len(self.unmarked)
+
+    @property
+    def discarded(self) -> tuple:
+        """Everything that would move to the Discarded folder, explicit and unmarked alike."""
+        return tuple(self.rejected) + tuple(self.unmarked)
+
+    @property
+    def has_unmarked(self) -> bool:
+        return bool(self.unmarked)
+
+    @property
+    def needs_library(self) -> bool:
+        return bool(self.keep)
+
+    @property
+    def needs_discarded(self) -> bool:
+        return bool(self.rejected) or bool(self.unmarked)
+
+    @property
+    def can_sort(self) -> bool:
+        """At least one clip is kept. This is the whole admission rule."""
+        return bool(self.keep)
+
+
+def plan_sort(items: Iterable[Any], decisions: Any,
+              library: Any = "", discarded: Any = "") -> SortPlan:
+    """Classify a page into keep / explicitly rejected / unmarked, and sign the result.
+
+    `items` is anything carrying a ``clip_id`` -- an `AudioTile` on the audio surface, a
+    `ClipEntry` on the video one. Nothing else about them is read, which is why one function
+    serves both.
+
+    The signature covers every clip id, its decision, and **both destinations**, so a one-time
+    confirmation authorises exactly the batch the operator was shown. Change a decision, edit a
+    destination, re-scan onto a different page: the signature moves and the confirmation is void.
+    It is a change detector, not a credential -- nothing is authorised by presenting it, and the
+    caller still re-derives the plan and re-validates the folders before moving a byte.
+    """
+    current = dict(decisions or {})
+    keep, rejected, unmarked = [], [], []
+    for item in items:
+        decision = current.get(item.clip_id, PENDING)
+        if decision == SELECTED:
+            keep.append(item.clip_id)
+        elif decision == REJECTED:
+            rejected.append(item.clip_id)
+        else:
+            unmarked.append(item.clip_id)
+
+    material = "\n".join([
+        f"library={os.path.normcase(str(library or ''))}",
+        f"discarded={os.path.normcase(str(discarded or ''))}",
+        *(f"{SELECTED}:{clip}" for clip in sorted(keep)),
+        *(f"{REJECTED}:{clip}" for clip in sorted(rejected)),
+        *(f"{PENDING}:{clip}" for clip in sorted(unmarked)),
+    ])
+    return SortPlan(keep=tuple(keep), rejected=tuple(rejected), unmarked=tuple(unmarked),
+                    signature=hashlib.sha256(material.encode("utf-8")).hexdigest())
+
+
+def plan_preview_lines(plan: SortPlan, library: Any = "", discarded: Any = "") -> list:
+    """What is about to happen, in the operator's words, before it happens.
+
+    The last line is not reassurance padding: the whole reason an unmarked clip may be swept into
+    the Discarded folder is that doing so destroys nothing, and the operator has to be able to see
+    that stated at the moment they are asked to agree to it.
+    """
+    lines = [f"{len(plan.keep)} clip(s) selected to KEEP."]
+    if library:
+        lines.append(f"    → {library}")
+    lines.append(f"{len(plan.rejected)} clip(s) explicitly rejected.")
+    if plan.unmarked:
+        lines.append(f"{len(plan.unmarked)} unmarked clip(s) will ALSO be moved to Discarded.")
+    if plan.needs_discarded and discarded:
+        lines.append(f"    → {discarded}")
+    lines.append("Nothing will be permanently deleted.")
+    return lines
+
+
 @dataclass
 class MoveOutcome:
     clip_id: str
@@ -1453,8 +1565,9 @@ class MoveOutcome:
         return self.status == MOVED
 
 
-def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
-    """Relocate one clip into ``destination_dir``. Never overwrites, never deletes, never renames.
+def move_decided_clip(entry: ClipEntry, destination_dir: str,
+                      policy: str = collision.DEFAULT_POLICY) -> MoveOutcome:
+    """Relocate one clip into ``destination_dir``. Never overwrites and never deletes.
 
     The whole operation is a single ``os.rename``, and that is the design rather than an
     implementation detail:
@@ -1464,11 +1577,21 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
       could destroy an original. The device is compared up front so the operator gets a sentence
       instead of a winerror, but the syscall is the real guarantee.
     * **No overwrite.** On Windows ``os.rename`` refuses an existing destination with
-      ``FileExistsError``. The pre-check below exists for the message; the refusal is enforced by
-      the call itself, so a file that appears in the gap is still not clobbered. ``os.replace``
-      would overwrite and is deliberately never used here.
-    * **No collision renaming.** A taken name is reported as :data:`OCCUPIED` and the clip stays
-      put. Inventing ``clip (2).mp4`` would quietly produce a library the operator never approved.
+      ``FileExistsError``. The refusal is enforced by the call itself, so a file that appears
+      between any check and the move is still not clobbered. ``os.replace`` would overwrite and is
+      deliberately never used here.
+    * **Collision renaming is OPT-IN and off by default.** [FORK] R8. Until then a taken name was
+      always reported as :data:`OCCUPIED` and the clip stayed put, on the grounds that inventing
+      ``clip (2).mp4`` would produce a library the operator never approved. That reasoning stands,
+      which is why :data:`collision.SKIP` remains the default and is byte-identical in behaviour.
+      What changed is that the operator can now *approve* it in Settings, in which case the
+      sequence is the documented ``clip_01``, ``clip_02``, … and the written name is reported.
+
+      The pre-check that used to produce the :data:`OCCUPIED` message is **gone**, and that is
+      required rather than incidental: a pre-check would have short-circuited the suffix sequence
+      before the rename could advance it. The message is now derived from the rename's own
+      ``FileExistsError``, which is strictly more accurate -- it reports the state at the instant
+      of the move rather than at the instant of an earlier look.
     * **Nothing is deleted.** There is no ``unlink`` on any path through this function.
 
     The clip's identity is re-checked against what the scan recorded immediately before the move,
@@ -1501,17 +1624,22 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
         result.detail = "the destination is on a different drive"
         return result
 
-    target = os.path.join(destination_dir, os.path.basename(entry.path))
+    requested = os.path.basename(entry.path)
+    target = os.path.join(destination_dir, requested)
     result.destination = target
-    if os.path.exists(target):
-        result.status = OCCUPIED
-        result.detail = "a file of that name is already there; nothing was overwritten"
-        return result
     try:
-        os.rename(entry.path, target)
-    except FileExistsError:
+        target, tries = collision.publish(entry.path, destination_dir, requested, os.rename,
+                                          policy=policy)
+        result.destination = target
+    except collision.NoFreeName as exhausted:
         result.status = OCCUPIED
-        result.detail = "a file of that name appeared there first; nothing was overwritten"
+        # One attempt is the plain taken-name case, which is all the default policy can produce,
+        # so it keeps the exact pre-R8 sentence. Only an exhausted suffix sequence reads
+        # differently, because only then is "a file of that name" an incomplete explanation.
+        result.detail = ("a file of that name is already there; nothing was overwritten"
+                         if exhausted.attempts <= 1 else
+                         "that name and every numbered alternative are taken; nothing was "
+                         "overwritten")
         return result
     except OSError as exc:
         # Cross-volume shows up here too on some filesystems; report it as what it is.
@@ -1529,11 +1657,17 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
             result.status, result.detail = FAILED, io_detail(exc)
         return result
     result.status = MOVED
+    # [FORK] R8: name the file that was actually written, when it is not the one asked for.
+    # Derived from the returned path rather than from the policy, so a clip that kept its own name
+    # under SUFFIX carries no note.
+    if tries > 1:
+        result.detail = (f"renamed to {os.path.basename(target)} — "
+                         f"{requested} was already there")
     return result
 
 
 def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: dict[str, str],
-                       ) -> list[MoveOutcome]:
+                       policy: str = collision.DEFAULT_POLICY) -> list[MoveOutcome]:
     """Move each decided clip to the folder its decision names. Returns one outcome per clip.
 
     ``decision_of(entry) -> str`` reads the **server's durable record**; nothing here looks at
@@ -1562,7 +1696,7 @@ def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: 
                                             detail=io_detail(exc)))
                 continue
             made.add(destination_dir)
-        outcome = move_decided_clip(entry, destination_dir)
+        outcome = move_decided_clip(entry, destination_dir, policy)
         outcome.decision = decision
         outcomes.append(outcome)
     return outcomes

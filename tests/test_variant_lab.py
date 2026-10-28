@@ -835,7 +835,7 @@ def test_c3_generation_and_apply_write_no_render_or_gate_widget():
         for forbidden in ("video_output", "status_output", "session_state", "process_btn",
                           "source_outputs", "source_state", "source_report", "confirm_btn",
                           "prep_outputs", "prep_state", "prep_report", "prep_analyze_btn",
-                          "audio_input", "output_filename", "processing_mode", "custom_fps",
+                          "audio_input", "output_filename", "processing_mode", "output_profile",
                           "audio_layers_report", "smart_mix_report"):
             assert forbidden not in names, f"{forbidden} in {list_name}"
 
@@ -874,16 +874,25 @@ def test_no_cli_variant_lab_flag_was_added():
 
 def test_the_variant_lab_accordion_exists_and_is_collapsed():
     """Amended by GUI Refresh A: the bounding anchors moved from the `### 🎨 Creative Direction`
-    group heading and the `Processing Mode` heading to the Creative Studio / Advanced Tools tabs,
-    which is the same containment over a tighter span. The lab stays COLLAPSED — it is the one
-    block the refresh deliberately left shut, because it is large, detailed configuration rather
-    than an entry point someone could overlook to their cost.
+    group heading and the `Processing Mode` heading to the creative / advanced tabs, which is the
+    same containment over a tighter span. The lab stays COLLAPSED — it is the one block the
+    refresh deliberately left shut, because it is large, detailed configuration rather than an
+    entry point someone could overlook to their cost.
+
+    Amended again by R8 UX Refresh (Commit A): the tab is now `LABEL_TAB_CREATIVE_SETTINGS`, and
+    the tab that follows it is Raw Cutter rather than Advanced Tools. The upper bound is computed
+    from whichever tab actually comes next instead of being named, so the next re-order cannot
+    leave this assertion silently measuring the wrong span.
     """
     source = open(_GUI, encoding="utf-8").read()
     assert "gr.Accordion(label=LABEL_VARIANT_LAB, open=False)" in source
-    # inside Creative Studio, below the six sliders it writes
-    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
-    following = source.index("gr.Tab(LABEL_TAB_ADVANCED", studio)
+    # inside Creative Settings, below the six sliders it writes
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
+    following = min(p for p in (source.index(f"gr.Tab({label}")
+                                for label in ("LABEL_TAB_RAW_CUTTER", "LABEL_TAB_AUDIO_CUTTER",
+                                              "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                                              "LABEL_TAB_SETTINGS"))
+                    if p > studio)
     position = source.index("LABEL_VARIANT_LAB", studio)
     assert studio < position < following
     assert source.index("semantic_emphasis = gr.") < position, "the lab must follow the sliders"
@@ -1077,7 +1086,7 @@ def test_variant_lab_writes_no_gate_or_preparation_widget():
     for forbidden in ("source_outputs", "source_report", "confirm_btn", "confirm_status",
                       "process_btn", "source_state", "prep_outputs", "prep_report", "prep_status",
                       "prep_analyze_btn", "prep_state", "session_state", "video_output",
-                      "status_output", "audio_input", "custom_fps", "processing_mode",
+                      "status_output", "audio_input", "output_profile", "processing_mode",
                       "output_filename"):
         assert forbidden not in names, forbidden
 
@@ -1479,7 +1488,10 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
     here; the prose is free to change.
     """
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
-    start = source.index("INFO_MASTER_SEED")
+    # The ASSIGNMENT, not the bare name: R8 added `INFO_MASTER_SEED_SHORT` nearby, and a prefix
+    # match would slice the wrong constant. A locator that can silently select a different string
+    # makes every assertion below it meaningless.
+    start = source.index("INFO_MASTER_SEED = (")
     info = source[start:source.index("\n)", start)]
     lowered = info.lower()
 
@@ -1511,7 +1523,9 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
 
 def test_the_variant_lab_help_text_explains_the_write_back():
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
-    start = source.index("INFO_VARIANT_LAB")
+    # The ASSIGNMENT, not the bare name -- the comment introducing the R8 help panel mentions
+    # `INFO_VARIANT_LAB`, and a prefix match landed in that comment instead of the constant.
+    start = source.index("INFO_VARIANT_LAB = (")
     info = source[start:source.index("\n)", start)].lower()
     assert "starting point" in info
     assert "writes the result back" in info or "writes it back" in info

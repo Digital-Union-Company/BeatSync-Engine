@@ -769,28 +769,160 @@ The documentation half of R9 is unchanged and unstarted. This is explanation, **
 
 ---
 
-### Housekeeping note — `input/gradio_uploads` loses newer files on restart · **NOT IMPLEMENTED**
+### Housekeeping note — `input/gradio_uploads` loses newer files on restart · **IMPLEMENTED as a LOCAL CANDIDATE (UX Refresh, Phase 8)**
 
 Observed during the 2026-10-27 production deploy: starting the app ran `cleanup_on_startup()`,
-which deleted three files from `input/gradio_uploads` that existed nowhere else. The function is
+which deleted three files from `input/gradio_uploads` that existed nowhere else. The function was
 behaving as designed — it protects `audio`, `video` and `video_analysis_cache` and clears
-everything else under `input/` — and it does this on **every** launch, so the loss is not specific
+everything else under `input/` — and it did this on **every** launch, so the loss was not specific
 to deployment.
 
-**The smallest change that would prevent silent loss, and the one to make first:** have
-`cleanup_on_startup()` **move** the non-protected entries into a single dated folder such as
-`input/_cleared/<YYYY-MM-DD_HHMMSS>/` instead of deleting them, and print one line naming the
-folder and the count. A rename inside `input/` is same-volume, costs nothing in time or space, is
-reversible by the operator, and converts a silent delete into a visible one. Whether that folder is
-ever pruned is a separate decision nobody has to make today.
+**The smallest change that would prevent silent loss was: move rather than delete.** That is now
+built, as described, with one difference worth recording: the dated folder is
+`input/retired_uploads/<YYYY-MM-DD_HHMMSS>/` rather than the `input/_cleared/…` this note
+originally proposed, because the folder is also a **first-class Cache Management category** in the
+new Settings tab and needed a name an operator would recognise in that list.
+
+What shipped (local candidate, not deployed):
+
+- one `os.rename` of `input/gradio_uploads` into the dated folder, no-replace, so two starts in
+  the same second cannot merge or overwrite;
+- `retired_uploads` added to the protected set, so the **next** start does not delete it and
+  reproduce the old behaviour one run later;
+- an empty uploads folder is skipped, so no empty directories accumulate;
+- a failure leaves the old folder exactly where it is — nothing on this path deletes;
+- the folder's size and file count are visible in **Settings → Cache Management**, which is how
+  it is bounded: the operator clears it deliberately, having first seen what is in it.
+
+It remains deliberately **one change to one function**. It is still **not** a backup or retention
+project: there is no index, no manifest and no restore command — the files are simply still there.
 
 R7 **avoids depending on the directory at all**: the Audio Cutter reads its source in place by
 absolute path and writes to a folder the operator chooses, so nothing it produces or consumes ever
-lives in `input/gradio_uploads`. That removes the exposure for this feature but does not fix the
-function, which still deletes for every other uploader.
+lives in `input/gradio_uploads`.
 
-This is deliberately scoped as one change to one function. It is **not** a backup or retention
-project.
+---
+
+### UX Refresh — one coherent application rather than a pile of tools · **LOCAL CANDIDATE, NOT MERGED, NOT DEPLOYED**
+
+> **Naming, stated plainly to prevent a real confusion.** The branch and task identifier for this
+> work are `feat/fun-ux-refresh-r8` and `R8-UX-REFRESH`, and its source comments say "R8 UX
+> Refresh". That is **not** roadmap item **R8 — Smart Audio Cut**, which is unrelated, still
+> experimental and still unimplemented. The two identifiers collided by accident. Nothing in this
+> section starts, closes or reinterprets Smart Audio Cut.
+
+The owner's complaint was not about any one feature — audio cutting quality and Comfort Mix were
+explicitly accepted — but that BeatSync read as *a collection of independently added tools*. Seven
+top-level tabs had grown one at a time, each justified on its own, and the result was a drawer
+called "Advanced Tools" holding three unrelated tenants, two separate review tabs, and a settings
+panel buried at the foot of a third.
+
+Built on top of the R7.2 candidate, in five separately testable commits:
+
+- **Navigation.** Seven workflow-named tabs in the operator's own order: Render · Creative
+  Settings · Raw Cutter · Audio Cutter · Audio Mix · **Media Library** · **Settings**. Clips
+  Preview, Audio Preview and Library Preparation became the three sections of Media Library;
+  preferences got a tab of their own. Proved to be a pure re-parenting by comparing the complete
+  set of widget assignments before and after.
+- **Central paths and a Settings tab.** A configurable **Render output** folder (the one
+  destination that used to be fixed), every destination in one place, and full backward
+  compatibility with existing `state/preferences.json`.
+- **Filename collisions.** Opt-in automatic `_01`, `_02` suffixing for both review workflows.
+  Default unchanged, and an existing file is never overwritten under either setting.
+- **Cache management.** Inspect and clear four recognised application caches, with the expensive
+  Stage-5 analysis cache separated and labelled; nothing else is reachable.
+- **One truthful Creative Profile.** The preset selector could read `Balanced` while Freestyle, a
+  Variation Seed and SFX were armed. It now reads e.g. `Balanced + Freestyle (1 section rule)`.
+- **Use Media Library** as a render video source, reusing the existing scan and confirmation gate.
+- **Output Video Profiles** (Auto / 1080p / 720p at 25 or 30 fps), which also fix a real defect:
+  the render took its resolution from the first source and **stretched** every mismatched clip.
+  Fixed profiles pad instead. Auto is the untouched historical path.
+- **Audio Cutter soft edges**, bounded by each clip's actual padding so a fade can never reach
+  into speech. Off by default.
+
+Full record, including the measurements and the two deliberate deviations from the brief:
+[`docs/claude/r8-ux-refresh.md`](docs/claude/r8-ux-refresh.md).
+
+**One thing the brief asked for that is deliberately NOT built**, because an existing contract
+forbids it and the contract is right:
+
+- **`Custom — based on Balanced`** as a profile label. It needs a remembered "last selected
+  preset", which `.claude/rules/creative-presets.md` forbids and a test pins — six integers
+  describe a render completely, and a remembered base would be a second source of truth able to
+  disagree with the sliders. A base is named only when the live values prove it.
+
+**A correction to an earlier entry here.** This section previously also listed a reset action as
+not-built, on the grounds that "selecting the `Balanced` preset already does it". **That was
+false.** A preset writes the six base sliders and nothing else — it does not clear the Variation
+Seed, does not disable Freestyle and does not touch Audio Mix. The standing prohibition is also
+narrower than that entry implied: it forbids a reset *for the six global controls*, which an
+action that deliberately leaves the sliders alone is not.
+
+R8 Final Polish therefore **builds it**, as `🧹 Clear creative variations`. The two actions are
+disjoint by construction — `Balanced` → the six sliders only; Clear → the seed and Freestyle only
+— so neither is "reset everything" and neither becomes a second source of truth.
+
+#### Final Polish — the finishing pass after the owner reviewed the screenshots
+
+A sixth commit on the same branch, scoped to practical issues rather than another audit:
+
+- **Video Review keep-only classification**, matching Audio Review. Confirm enables at **one clip
+  kept**; anything still unmarked gets a second step with exact counts, both destinations and
+  Proceed / Cancel. Proceed files the unmarked clips as Discarded **for this batch only** and
+  writes nothing to the durable record; Cancel changes nothing. No second transfer engine was
+  written — Audio Review's `SortPlan` / `plan_sort` / `plan_preview_lines` moved into the shared
+  `clips_review` core and are re-exported, so the two tabs now run the *same objects*.
+- **Creative Settings 3516 px → 1375 px**, by ordering rather than deletion: preset, seed and the
+  six sliders first; AI Director, Freestyle and Variant Lab collapsed below them.
+- **Settings laid out by purpose** — one path per row with its own Browse beside it (all nine
+  verified on-page), grouped into render/video, audio/voice and review destinations, with Cache
+  Management as the single collapsed block. Preference keys, values and handlers unchanged;
+  defaults verified to survive a restart. **Cache deletion logic untouched** — no defect found.
+- **Render input compacted** — drop zone bounded to 113 px, two headings that named the single
+  control beneath them removed, profile help cut to one line. `Create Music Video` moved from
+  y=903 to **y=826** at 1440 CSS px, i.e. from below a 900 px fold to above it.
+
+**One brief item measured and deliberately NOT shipped:** a native Browse button for the music
+track. It was built and reverted — a `gr.File` raises `InvalidPathError` for any path outside
+Gradio's allowed roots, and the three workarounds each cost more than the button is worth
+(widening `allowed_paths` exposes a tree to the browser; copying the file is the duplication the
+brief ruled out; a path textbox rewrites the render source pipeline and loses drag-and-drop).
+The measurement and the exact exception are pinned in `tests/test_render_music_input.py`.
+
+End to end after all four: 720p · 30 fps chosen in the UI over four 320×240 sources rendered
+`width=1280 height=720 r_frame_rate=30/1`.
+
+#### Owner playtest fixes — what real use found
+
+A seventh commit, from the owner's own hands-on session rather than from a review:
+
+- **P0, Video Review Confirm died after the first batch.** The highest-priority defect, and it
+  stopped work entirely: batch one sorted 100/100, batch two showed a correct `Kept 18 ·
+  Discarded 82 · Undecided 0` and the button stayed greyed out. **Root cause was a client-side
+  readiness cache with no notion of which page it described** — `syncConfirm` returns early when
+  the answer equals the last one it saw, and the `true` left over from batch one swallowed batch
+  two's first genuine transition, so the server was never asked. Pressing Re-read by hand enabled
+  it instantly, which is what proved the record was right. Readiness is now keyed to
+  `session/page`, every reply is tagged with the page it was requested for, and the repaint
+  observer also watches the nonce attribute. **Verified across three real page transitions with
+  205 clips: 31 kept + 174 discarded = 205, all original names, nothing lost or duplicated.**
+- **Freestyle states its mode** and shows the ten section rules only when on — *hidden, never
+  cleared*, so a rule set survives being switched off and back on.
+- **Randomize and Clear are two equal buttons on one row**, still behaviourally disjoint, and the
+  Creative Profile reads `Base preset: …` / `Active variations: …` from the same computation as
+  before.
+- **The four audio destinations stay four settings**, but Audio Review now falls back to the
+  Voice pair when its own override is blank. The fallback is read-side only and a set override
+  always wins, so nothing is ever consolidated or overwritten. A work folder that is also a
+  finished library is now reported — and only reported.
+- **Stale text corrected**: "where KEPT clips would go" (files move), "sort the decided clips"
+  (keep-only also files the unmarked ones), and the Render tab's permanent "stays disabled until
+  you confirm" that printed while confirmed and rendering.
+- **Variant Lab**: long guidance behind a help panel, result boxes small when empty. Presentation
+  only.
+
+Encoding and the output profiles were not touched; 1080p · 25 fps still renders
+`1920×1080 @ 25/1`.
 
 ---
 
@@ -816,7 +948,8 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **LOCAL CANDIDATE, IN DRAFT PR #77** — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. **Not merged, not deployed, not independently reviewed** |
 | **R7.3** — "When voice clips do not fit" modes | **PLANNED, NOT IMPLEMENTED** — Strict (today's behaviour, retained) / Skip / Trim-then-skip / Repeat-music (blocked on R10). Must be decided by real placement feasibility, not by summing durations |
 | **R10** — Quick Render **Repeat Music 1×–30×** | **PLANNED, NOT IMPLEMENTED** — 1× must be the existing path unchanged; cuts must cover the whole extended timeline rather than repeating the rendered sequence; analysis reused rather than re-run; cancellable with an estimated duration |
-| **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started |
+| **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **LOCAL CANDIDATE, DRAFT PR stacked on #77** — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. **Not merged, not deployed, not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
+| **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is a local candidate in PR #77; the documentation half is unstarted. R7.3 above is the next Audio Layers item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
@@ -838,6 +971,10 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    as a whole rather than as a pile of mismatched formats.
 5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI. **R7 / R7.1 / R7.2 are all local
    candidates in draft PR #77**, owner-tested through R7.1 and awaiting an owner test of R7.2.
+5a. **UX Refresh** — inserted here rather than appended, because it is **stacked on R7.2** and an
+   owner test of it is also an owner test of R7.2's features in their new locations. It changes
+   no R7 engine: the Audio Cutter, the review galleries and Comfort Mix are the same code in
+   different containers, plus one opt-in fade. Awaiting the owner test.
 6. **R7.3 — "When voice clips do not fit"**, the next Audio Layers behaviour change. Modes 1–3 are
    implementable now; mode 4 waits on R10.
 7. **R10 — Repeat Music 1×–30×**, which also unblocks R7.3's fourth mode and the later
@@ -861,5 +998,6 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 | [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) | What changed and when — the AGPL-3.0 §5(a) modification record |
 | [`docs/claude/raw-cutter-edge-cleaner.md`](docs/claude/raw-cutter-edge-cleaner.md) | The R2 feasibility measurement, and why the obvious signal does not work |
 | [`docs/claude/clips-preview-selector-v1.md`](docs/claude/clips-preview-selector-v1.md) | The R5 Clips Preview Selector specification — gallery, classification and safe file movement |
+| [`docs/claude/r8-ux-refresh.md`](docs/claude/r8-ux-refresh.md) | The UX Refresh audit and record — what was observed in the running UI, the seven-tab restructure, and the measurements behind the output profiles and audio fades |
 | [`docs/claude/README.md`](docs/claude/README.md) | Map of the engineering rules and reference material |
 | [`README.md`](README.md) | What the application is and how to run it |

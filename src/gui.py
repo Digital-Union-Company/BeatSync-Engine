@@ -125,6 +125,7 @@ from paths import (
     get_audio_input_dir,
     get_video_input_dir,
     get_output_dir,
+    get_processing_dir,
 )
 
 gpu_data = GPU_INFO
@@ -226,6 +227,24 @@ from beatsync_fork import clips_review as fork_clips
 # suites pin this module's `subprocess.run` site count at exactly two.
 from beatsync_fork import desktop_folders as fork_folders
 from beatsync_fork import user_prefs as fork_prefs
+# [FORK] Digital-Union (R8 UX Refresh): what to do about a taken destination filename, and the
+# cache inspector. Both are stdlib-only and pure enough to be unit-tested without a disk: the
+# collision helper takes the caller's rename as an argument, and the cache inspector is handed its
+# roots and never discovers one. Neither launches a process, so this module's `subprocess.run`
+# site count stays at exactly the two that two suites pin.
+from beatsync_fork import collision as fork_collision
+from beatsync_fork import cache_admin as fork_cache
+# [FORK] Digital-Union (R8 UX Refresh, Commit C): the one composition rule for "what is this
+# render actually going to do creatively". It is a pure view over values this module already has,
+# and it delegates every verdict -- the preset name to `presets.matching_preset`, Freestyle
+# activity to the declaration, the SFX verdict to the caller's `plans_anything_from` result -- so
+# the render tab's summary and the selector on Creative Settings are the same computation.
+from beatsync_fork import effective_profile as fork_effective
+# [FORK] Digital-Union (R8 UX Refresh, Phase 6): the Output Video Profile table and its pure
+# geometry. `resolve` answers None for Auto and every helper returns its fallback unchanged there,
+# so the historical render path is structurally unreachable from a profile rather than merely
+# preserved alongside one.
+from beatsync_fork import render_profiles as fork_render_profiles
 # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
 # the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
 # live inside `audio_cutter` rather than here, because two suites pin this module's
@@ -907,7 +926,23 @@ CLIPS_GALLERY_JS = r"""
   const BADGE = {PENDING: '?', SELECTED: '✓', REJECTED: '✗'};
   let active = null;          // the single mounted <video>, if any
   let lastNonce = null;
-  let readyState = null;      // last observed "every clip decided" answer, or null if unknown
+  let readyState = null;      // last observed readiness answer, or null if unknown
+  // [FORK] R8 Owner Fixes (P0): WHICH PAGE `readyState` describes. This is the whole fix.
+  //
+  // `readyState` used to be a bare boolean that outlived the page it was measured on, and
+  // `syncConfirm` returns early when the new answer equals it. Reproduced with 205 clips: batch
+  // one ends with 12 kept, so `readyState === true`; Proceed sorts it and publishes batch two;
+  // the resync that should have reset it raced the page swap and painted nothing; the operator
+  // then keeps a clip on the new page and `syncConfirm(true)` finds `true === true` and returns
+  // WITHOUT asking the server. Refresh is the only thing that moves the button, so Confirm stays
+  // disabled while the counter correctly reads "Kept 1" -- exactly the owner's report, and
+  // pressing Refresh by hand enabled it instantly, which is what proved the record was never
+  // consulted rather than wrong.
+  //
+  // Keyed to "session/page", a page transition can no longer compare equal to anything, so every
+  // new page asks the server exactly once. It still converges: that answer republishes the grid
+  // under the SAME page token, so the following comparison matches and nothing re-fires.
+  let readyKey = null;
   let decideSeq = 0;          // monotonic stamp so a slow reply cannot repaint newer counts
   let syncTimer = null;
 
@@ -923,6 +958,14 @@ CLIPS_GALLERY_JS = r"""
 
   const grid = () => document.querySelector('#clips-gallery .r5-grid');
   const tileOf = (el) => (el && el.closest) ? el.closest('#clips-gallery .r5-tile') : null;
+
+  // [FORK] R8 Owner Fixes (P0): the identity of the page currently on screen. Every readiness
+  // answer and every server reply is tagged with this, so nothing measured on one page can be
+  // applied to another. Null when no grid is mounted.
+  function pageKey() {
+    const g = grid();
+    return g ? (g.dataset.session + '/' + g.dataset.page) : null;
+  }
 
   function paint(clip, decision, rev) {
     const tile = document.querySelector('#clips-gallery .r5-tile[data-clip="' + clip + '"]');
@@ -942,9 +985,14 @@ CLIPS_GALLERY_JS = r"""
     return document.querySelector('#clips-counts-box textarea, #clips-counts-box input');
   }
 
-  function paintCounts(counts) {
+  // `key` is the page these counts were requested for. A reply that outlived its page is dropped
+  // rather than painted: it would otherwise describe the previous batch in the new batch's
+  // counter, and -- far worse -- hand `syncConfirm` a readiness answer about clips that are no
+  // longer on screen. Callers that genuinely have no page context omit it.
+  function paintCounts(counts, key) {
     const box = countsBox();
     if (!box || !counts) { return; }
+    if (key !== undefined && key !== null && key !== pageKey()) { return; }
     let text = 'Kept ' + counts.SELECTED + '   ·   Discarded ' + counts.REJECTED +
                '   ·   Undecided ' + counts.PENDING + '   ·   Total ' + counts.TOTAL;
     // [R5-P3 / F8] Decisions do not travel through a Gradio event, so this response cannot
@@ -952,9 +1000,13 @@ CLIPS_GALLERY_JS = r"""
     // from the durable record. Rather than leave the operator looking at "Undecided 0" beside a
     // greyed-out Confirm with no explanation, say what is needed. This is display text only: it
     // never enables anything, and the authority stays on the server.
-    if (counts.TOTAL > 0 && counts.PENDING === 0) { text += '\n' + __REFRESH_HINT__; }
+    // [FORK] R8 Final Polish: readiness is "at least one clip KEPT", matching the server's
+    // `_clips_render_current`. The two must agree or the button lights at the wrong moment --
+    // and the server is the authority either way, so a disagreement here only ever costs an
+    // extra read or a late enable, never a wrong enable.
+    if (counts.TOTAL > 0 && counts.SELECTED > 0) { text += '\n' + __REFRESH_HINT__; }
     box.value = text;
-    syncConfirm(counts.TOTAL > 0 && counts.PENDING === 0);
+    syncConfirm(counts.TOTAL > 0 && counts.SELECTED > 0);
   }
 
   // [UX] Ask the server to re-derive the Confirm state, but only when the all-decided answer
@@ -966,8 +1018,15 @@ CLIPS_GALLERY_JS = r"""
   // Only transitions trigger it, so deciding the 2nd of 40 clips sends nothing; and a 120ms
   // coalescing window keeps a burst of fast clicks to a single read. The stamp comparison in
   // `send` means an out-of-order reply cannot drive this with stale counts.
+  //
+  // [FORK] R8 Owner Fixes (P0): the comparison is now (page, answer), not answer alone. A new
+  // page can never compare equal, so it always asks once; the same page with an unchanged answer
+  // still asks nothing, which is what keeps this from becoming a refresh loop.
   function syncConfirm(ready) {
-    if (ready === readyState) { return; }
+    const key = pageKey();
+    if (key === null) { return; }          // no grid on screen: nothing to be ready about
+    if (key === readyKey && ready === readyState) { return; }
+    readyKey = key;
     readyState = ready;
     if (syncTimer) { clearTimeout(syncTimer); }
     syncTimer = setTimeout(() => {
@@ -1000,6 +1059,8 @@ CLIPS_GALLERY_JS = r"""
     // it is about one clip and the server answered for that clip -- but the page-wide counts, and
     // the Confirm sync derived from them, follow the newest reply only.
     const stamp = ++decideSeq;
+    // [FORK] R8 Owner Fixes (P0): the page this decision was sent for, read BEFORE the request.
+    const key = g.dataset.session + '/' + g.dataset.page;
     let res, body;
     try {
       res = await fetch('/r5decide/' + g.dataset.session + '/' + g.dataset.page + '/' + clip, {
@@ -1013,7 +1074,7 @@ CLIPS_GALLERY_JS = r"""
       return;
     }
     window.__r5Last = Object.assign({status: res.status}, body);
-    if (body && body.counts && stamp === decideSeq) { paintCounts(body.counts); }
+    if (body && body.counts && stamp === decideSeq) { paintCounts(body.counts, key); }
     // Repaint on refusal too, so a stale tab is corrected rather than left lying.
     if (body && body.decision) { paint(clip, body.decision, body.rev); }
   }
@@ -1190,6 +1251,11 @@ CLIPS_GALLERY_JS = r"""
   window.__r5Resync = async () => {
     const g = grid();
     if (!g) { return {ok: false, code: 'no_grid'}; }
+    // [FORK] R8 Owner Fixes (P0): the page asked about, captured before the request. Gradio
+    // patches the grid's attributes in place, so a resync fired mid-swap can read a half-applied
+    // session/page pair; tagging the reply means a mismatched answer is dropped instead of
+    // painting the previous batch's counts over the new one.
+    const key = g.dataset.session + '/' + g.dataset.page;
     // [R5-P3 / F2] Never throws: `decide` depends on this answering so that an untrustworthy DOM
     // revision results in a resync or a visible failure, not an unhandled rejection.
     let body;
@@ -1200,24 +1266,51 @@ CLIPS_GALLERY_JS = r"""
       return {ok: false, code: 'network_error'};
     }
     if (!body || !body.ok) { return body || {ok: false, code: 'no_body'}; }
+    if (key !== pageKey()) { return {ok: false, code: 'page_changed'}; }
     Object.keys(body.clips).forEach((clip) => {
       paint(clip, body.clips[clip].decision, body.clips[clip].rev);
     });
-    paintCounts(body.counts);
+    paintCounts(body.counts, key);
     return body;
   };
 
   // A freshly delivered grid seeds its counters from the server instead of sitting at zero.
+  //
+  // [FORK] R8 Owner Fixes (P0), three changes, each one a way the old version could go quiet:
+  //
+  //   * `attributeFilter` is watched as well as `childList`. The nonce exists precisely so a
+  //     repaint is detectable, and it arrives as an ATTRIBUTE mutation -- Gradio morphs this
+  //     grid in place rather than replacing the node (measured: the same `.r5-grid` element
+  //     survives a republish). A childList-only subscription can therefore miss a repaint whose
+  //     structure happens to match.
+  //   * `lastNonce` is only kept if the resync actually succeeded. Pinning it on a resync that
+  //     returned `ok:false` meant the one mutation that could have retried was discarded.
+  //   * a page change clears the readiness memory outright, so nothing from the previous batch
+  //     can satisfy `syncConfirm`'s equality test on the new one.
+  //
+  // None of this can loop: a failed resync mutates no DOM, and a successful one converges after
+  // at most a single Refresh because the republished grid keeps the same page token.
+  async function resyncIfRepainted() {
+    const g = grid();
+    if (!g) { return; }
+    const key = g.dataset.session + '/' + g.dataset.page;
+    if (key !== readyKey) { readyKey = null; readyState = null; }
+    const nonce = g.dataset.nonce;
+    if (nonce === lastNonce) { return; }
+    lastNonce = nonce;
+    unmount();
+    const body = await window.__r5Resync();
+    if ((!body || !body.ok) && lastNonce === nonce) { lastNonce = null; }
+  }
+
   const host = document.querySelector('#clips-gallery');
   if (host) {
-    new MutationObserver(() => {
-      const g = grid();
-      if (g && g.dataset.nonce !== lastNonce) {
-        lastNonce = g.dataset.nonce;
-        unmount();
-        window.__r5Resync();
-      }
-    }).observe(host, {childList: true, subtree: true});
+    new MutationObserver(() => { resyncIfRepainted(); }).observe(host, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-nonce', 'data-page', 'data-session'],
+    });
   }
 }
 """.replace('__REFRESH_HINT__', json.dumps(CLIPS_REFRESH_TO_ENABLE_HINT))
@@ -1949,7 +2042,7 @@ def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: st
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
-                       custom_fps: float, creative: fork_creative.CreativeProfile | None,
+                       output_profile: str, creative: fork_creative.CreativeProfile | None,
                        session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
@@ -2135,13 +2228,21 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         cuda_str = "CuPy CTK" if USING_CUPY_CTK else ("Portable" if USING_PORTABLE_CUDA else "System/None")
 
         # Determine FPS
-        if custom_fps is not None and custom_fps > 0:
-            output_fps = custom_fps
+        #
+        # [FORK] R8 UX Refresh (Phase 6): a fixed Output Video Profile states the frame rate.
+        # Under Auto, `target_fps` returns its fallback unchanged -- here `None` -- so the
+        # auto-detect branch below is reached exactly as it always was.
+        profile_fps = fork_render_profiles.target_fps(output_profile, None)
+        if profile_fps:
+            output_fps = profile_fps
         else:
             output_fps = get_video_fps(local_video_paths[0])
             
         # Prepare output paths
-        output_folder = get_output_dir()
+        # [FORK] R8: the configured Render output folder, falling back to the installation's own
+        # `output/`. Only the PUBLISHED video moves -- `session_dir` below is unchanged, so no
+        # temporary processing directory or cache follows this setting.
+        output_folder = get_render_output_dir()
         os.makedirs(output_folder, exist_ok=True)
         name, _ = os.path.splitext(output_filename)
         ext = '.mov' if is_prores else '.mp4'
@@ -2326,7 +2427,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
-            event_callback=event_callback, lifecycle=lifecycle
+            event_callback=event_callback, lifecycle=lifecycle,
+            # [FORK] R8 Phase 6: the Output Video Profile. `None`/`auto` leaves the renderer on
+            # its historical path -- first-source resolution and a bare scale -- untouched.
+            output_profile=output_profile,
         )
 
         # [FORK] Digital-Union (H1): the ONE durable promotion, and it is a single no-replace OS
@@ -2475,7 +2579,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
         # Generate status message based on mode
         gpu_info = f"⚡ GPU: {GPU_INFO}" if use_gpu else "💻 CPU"
-        fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
+        fps_info = (f"{output_fps:.2f} FPS (profile)" if fork_render_profiles.resolve(output_profile)
+                    else f"{output_fps:.2f} FPS (auto-detected)")
         audio_info = "PCM 24-bit (48kHz)"
         
         if is_prores:
@@ -2624,7 +2729,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
-                 custom_fps: float, session_state: dict,
+                 output_profile: str, session_state: dict,
                  creative: fork_creative.CreativeProfile | None = None,
                  verification_seconds: float | None = None,
                  voice_files: VideoFilesInput = None,
@@ -2680,7 +2785,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     video_files=video_files,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
-                    custom_fps=custom_fps,
+                    output_profile=output_profile,
                     creative=creative,
                     session_state=session_state,
                     progress_callback=progress_callback,
@@ -2794,9 +2899,27 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 # State object holds the backend truth, and process_video_guarded() re-checks it against the
 # filesystem before any Stage 1 work begins.
 
+#: [FORK] R8 UX Refresh (Commit C): the radio's third choice, and the reason it is NOT a third
+#: `SourceMode`.
+#:
+#: "Use Media Library" is not a new kind of source. It is a local folder whose path the operator
+#: configured once in Settings instead of typing every time -- so it maps onto the EXISTING
+#: `LOCAL_FOLDER` mode and reuses the whole engine behind it: the same scan, the same
+#: `SourceSnapshot` identity, the same confirmation gate, the same invalidation rules, the same
+#: media analysis. Nothing about the gate needed changing, which is the point: the task asked for
+#: a convenience, and a third enum member would have been a second source concept for the
+#: snapshot, the session state and every test that enumerates modes to carry forever.
+#:
+#: The consequence an operator can observe is exactly the one required: because selecting it
+#: WRITES `source_folder`, that textbox's own `.change` fires and invalidates any previous
+#: confirmation through the established path -- identical to editing the folder by hand, because
+#: it *is* editing the folder.
+SOURCE_CHOICE_MEDIA_LIBRARY = "media_library"
+
 SOURCE_MODE_VALUES = {
     SourceMode.LOCAL_FOLDER.value: SourceMode.LOCAL_FOLDER,
     SourceMode.BROWSER_FILES.value: SourceMode.BROWSER_FILES,
+    SOURCE_CHOICE_MEDIA_LIBRARY: SourceMode.LOCAL_FOLDER,
 }
 
 
@@ -2812,12 +2935,34 @@ def _source_ui_updates(state) -> Tuple:
 
 
 def _on_source_mode_change(mode_value: str, state) -> Tuple:
+    """Switch source mode, and for "Use Media Library" also fill in the configured folder.
+
+    [FORK] R8: the folder update LEADS the returned tuple and is `gr.update()` -- change nothing --
+    for both pre-existing choices, so their behaviour is untouched.
+
+    When the library is not configured the folder is deliberately **left alone** rather than
+    cleared or invented, and the operator is told where to set it. Clearing it would silently
+    destroy a path they had already typed; inventing one would point the render at a directory
+    nobody chose.
+    """
     mode = SOURCE_MODE_VALUES.get(str(mode_value), SourceMode.LOCAL_FOLDER)
     new_state = set_mode(state, mode)
     is_folder = mode is SourceMode.LOCAL_FOLDER
-    return (gr.update(visible=is_folder), gr.update(visible=not is_folder)) + _source_ui_updates(
-        new_state
-    )
+
+    folder_update = gr.update()
+    if str(mode_value) == SOURCE_CHOICE_MEDIA_LIBRARY:
+        configured = _pref(fork_prefs.CLIPS_LIBRARY)
+        if not configured:
+            gr.Warning(STATUS_LIBRARY_SOURCE_UNSET)
+        elif not os.path.isdir(configured):
+            # Reported, never recreated -- the same rule the rest of the preference store follows.
+            gr.Warning(STATUS_LIBRARY_SOURCE_MISSING.format(path=configured))
+            folder_update = gr.update(value=configured)
+        else:
+            folder_update = gr.update(value=configured)
+
+    return (folder_update, gr.update(visible=is_folder),
+            gr.update(visible=not is_folder)) + _source_ui_updates(new_state)
 
 
 def _on_folder_path_change(folder_path: str, state) -> Tuple:
@@ -2910,8 +3055,21 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
 _FREESTYLE_WIDGET_ORDER = fork_freestyle.SECTION_TYPES
 
 
-def _on_freestyle_change(freestyle_enabled, *styles) -> str:
-    """Re-render the Freestyle summary. Writes the summary textbox and nothing else.
+def _on_freestyle_change(freestyle_enabled, *styles):
+    """Re-render the Freestyle summary, the state badge and the section-rule panel's visibility.
+
+    [FORK] R8 Owner Fixes (P1): three read-outs rather than one, and all three are *display*. The
+    owner could not tell at a glance whether Freestyle was on -- a small tick box is easy to miss
+    next to ten dropdowns. So the panel now states its mode in words, and the ten dropdowns are
+    only shown in the mode where they do anything.
+
+    **Hiding is not clearing.** A Gradio component with `visible=False` keeps its value and still
+    submits it, so switching Freestyle off and on again returns the operator to exactly the rules
+    they built. That is the whole reason the dropdowns are hidden rather than reset, and
+    `test_freestyle_visibility.py` pins it.
+
+    The checkbox remains the only gate. Nothing here is read by a render: the renderer takes the
+    live widget values through its own wrapper arguments, as it always did.
 
     Deliberately does **not** show inherited numeric values: the global controls have five
     legitimate writers (the preset selector, Variant Lab Generate / New / Apply, and Director
@@ -2928,8 +3086,41 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
     # Random sections read as ten Base sections and the panel claimed the render was unmodified
     # while the renderer was generating ten active rules. It was the DEFAULT screen, so every user
     # would have seen it.
-    return fork_freestyle_random.summary_text(
-        freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)))
+    on = bool(freestyle_enabled)
+    return (fork_freestyle_random.summary_text(
+                freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles))),
+            FREESTYLE_BADGE_ON if on else FREESTYLE_BADGE_OFF,
+            gr.update(visible=on))
+
+
+def _on_clear_creative_variations(*styles):
+    """Clear the Variation Seed and turn Freestyle off. Touches nothing else.
+
+    [FORK] R8 Final Polish. Returns `(seed, freestyle_enabled, freestyle_summary)` -- three
+    values, and the third only because the summary is a read-out of the first two and would
+    otherwise sit there describing a Freestyle that is no longer on.
+
+    **What it deliberately does NOT return is the point of it.** No slider, no preset, no Audio
+    Mix widget, no source or preparation widget. Selecting the `Balanced` preset resets the six
+    sliders and nothing else; this resets the seed and Freestyle and nothing else. The two are
+    disjoint, so neither is "reset everything" and neither can be described as such.
+
+    The section dropdowns are read, not written: turning Freestyle off must leave the rules the
+    operator built intact, so ticking the box again restores exactly what was there. Clearing them
+    would make this a destructive action wearing a tidy-up's name.
+
+    [FORK] R8 Owner Fixes (P1): it also writes the Freestyle state badge and hides the section
+    panel. Those two are the same read-outs `_on_freestyle_change` maintains, and they are here
+    for a correctness reason rather than a cosmetic one -- this action turns Freestyle off, so
+    leaving a badge reading "Freestyle is ON" beside a cleared checkbox would be a false
+    statement on screen. The ten section rules are **hidden, not cleared**: tick the box again
+    and they are exactly as the operator left them.
+    """
+    return (0, False,
+            fork_freestyle_random.summary_text(False,
+                                               dict(zip(_FREESTYLE_WIDGET_ORDER, styles))),
+            FREESTYLE_BADGE_OFF,
+            gr.update(visible=False))
 
 
 def _on_surprise_me(freestyle_enabled, *styles):
@@ -2967,26 +3158,51 @@ def _on_surprise_me(freestyle_enabled, *styles):
     return seed, preview
 
 
-def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_files_value,
-                                sfx_folder_value, sfx_roles_value, sfx_amount_value,
-                                *styles) -> str:
-    """[FORK] Digital-Union (GUI Refresh A): what optional settings will affect the next render.
+def _on_render_tab_select(cut_density_value, micro_cuts_value, semantic_emphasis_value,
+                          energy_response_value, motion_bias_value, source_diversity_value,
+                          freestyle_enabled, variation_seed_value, voice_files_value,
+                          sfx_folder_value, sfx_roles_value, sfx_amount_value,
+                          *styles) -> str:
+    """[FORK] Digital-Union (GUI Refresh A): what will actually affect the next render.
 
-    Three tabs mean a user can arm something in Creative Studio or Advanced Tools and then look at
-    a Quick Render screen that shows no sign of it. This says so in one read-only box.
+    Several tabs mean a user can arm something elsewhere and then look at a render screen that
+    shows no sign of it. This says so in one read-only box.
 
     **It is a read-out, not an authority.** It writes nothing, no render path reads it, and it
-    stores no state: it is recomputed from the LIVE widget values every time Quick Render is
+    stores no state: it is recomputed from the LIVE widget values every time the Render tab is
     selected, so it cannot drift from the controls it describes.
+
+    **R8 — it now reports the CREATIVE PROFILE, and the six sliders came back into its inputs.**
+    That is a deliberate reversal of R1's removal, and the reason R1 gave is exactly the reason it
+    is now safe to undo:
+
+    R1 dropped the creative line because the Creative Preset radio sat on *this* tab and could
+    change all six sliders while this box -- refreshed only on tab selection -- went on showing the
+    old answer. That was the one staleness hole the read-out had. R8 Commit C moved the preset to
+    Creative Settings, so **every** control this box describes now lives on another tab, and the
+    `.select()` that fires on the way back here is sufficient for all of them. The hole is closed
+    by the move rather than by the omission.
+
+    What replaced the omission is a stronger statement than either version made. The preset
+    selector and the old extras box were individually true and *jointly misleading*: the selector
+    could read `Balanced` while Freestyle rules, a Variation Seed and SFX were armed, and nothing
+    said the render would not be a plain Balanced render. One composed line fixes that, and the
+    composition rule lives in `beatsync_fork.effective_profile` rather than here, so this label and
+    the selector on the other tab are provably the same computation.
+
+    **It still constructs nothing and judges nothing.** Freestyle activity comes from the
+    declaration's own `is_active()`, the Smart Mix verdict from `plans_anything_from`, and the
+    preset name from `presets.matching_preset` -- each asked of the subsystem that owns it. The
+    two local judgements an earlier version made were both wrong in the same direction, claiming a
+    render would be changed when it would not.
 
     Bound to the tab's own `.select()` rather than to `.change()` on a dozen existing widgets: the
     creative sliders carry exactly one `.input()` registration each by contract, and the Freestyle
     widgets write only their own summary. Adding handlers to them to feed a cosmetic read-out would
     put a second binding on widgets whose single binding is itself a pinned contract.
 
-    **R1 — every claim here is now decided by the subsystem that owns it.** The first version
-    answered two of them locally and got both wrong in the same direction, claiming a render would
-    be changed when it would not:
+    **The two local judgements, kept delegated.** Both are recorded because each was a real defect
+    once, and both are still answered by the owning subsystem rather than here:
 
     * *Freestyle ON with every section on `Base`* has no overrides, so `is_active()` is False and
       the renderer takes the ordinary global path. The checkbox alone was never the gate; the gate
@@ -2994,52 +3210,28 @@ def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_f
     * *Amount 0* is a hard off-branch for Smart Mix however many roles are ticked — exactly what
       `SmartMixConfig.plans_anything` says. The first version ignored Amount entirely.
 
-    Both now go through the real record, which is the maintainable version as well as the correct
-    one: if a subsystem changes its mind about what "on" means, this follows automatically.
+    **What it still refuses to do**, and the reason is unchanged from R1: it adds no second
+    registration to any creative widget. An earlier draft rebuilt this string from a
+    `creative_preset` event, which needed `sfx_folder`, `sfx_roles` and `sfx_amount` wired into
+    that event — forbidden outright by
+    `test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring` — and pushed the
+    selector to two registrations against a pin that exists to keep it at one. A fix that has to
+    relax two guards is the wrong fix. The tab's own `.select()` remains the only trigger.
 
-    **R1 also removed the "Creative Controls away from neutral" line, and removing it was the fix
-    rather than a simplification.** That line was the one thing here the *Quick Render tab itself*
-    could invalidate: the Creative Preset writes all six sliders, so picking `Cinematic` moved them
-    off neutral while this box — refreshed only on tab selection — still read "Nothing optional is
-    active". It was also redundant, and provably so rather than approximately: `PRESETS["Balanced"]`
-    is `(50, 50, 50, 50, 50, 50)`, which is `DEFAULT_CONTROL` six times, and `matching_preset`
-    recomputes the selector from the live sliders on every write. So "some control is off neutral"
-    is *exactly* "the selector does not read Balanced", and that selector sits on this tab, two
-    inches away, permanently correct.
-
-    Deleting the line therefore loses no information and closes the staleness hole at the source --
-    strictly better than keeping it and adding a second `creative_preset` registration to refresh
-    it, which is what an earlier draft of R1 did. That draft had to wire `sfx_folder`, `sfx_roles`
-    and `sfx_amount` into a `creative_preset` event to rebuild the whole string, which
-    `test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring` forbids outright, and it
-    pushed the selector to two registrations against a pin that exists to keep it at one. A fix
-    that has to relax two guards to describe a value already on screen is the wrong fix.
-
-    What remains is exactly the set of things that live in *other* tabs, every one of which is
-    refreshed by the `.select()` that fires on the way back here.
-
-    Total: never raises, so selecting a tab can never fail.
+    Total: never raises, so selecting a tab can never fail. Every value here arrives straight from
+    a widget, and `effective_profile` is total by contract for exactly that reason.
     """
-    notes: list[str] = []
+    # The six live control values, in `CREATIVE_CONTROL_FIELDS` order -- the same order
+    # `creative_control_sliders` uses, because Gradio matches `inputs` positionally and the
+    # preset label is computed from the tuple as a whole.
+    controls = (cut_density_value, micro_cuts_value, semantic_emphasis_value,
+                energy_response_value, motion_bias_value, source_diversity_value)
 
     # Freestyle: the declaration decides, not the checkbox. The live seed is passed because it is
     # already in scope, but activity cannot depend on it -- a `Random` section yields a rule for
-    # every seed, so this asks only whether any rule exists at all.
+    # every seed, so the question asked is only whether any rule exists at all.
     declaration = fork_freestyle_random.declaration_from_styles(
         freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)), variation_seed_value)
-    if declaration.is_active():
-        ruled = len(declaration.ruled_types())
-        notes.append(f"Freestyle: {ruled} section type(s) edited differently (Creative Studio)")
-
-    try:
-        if int(variation_seed_value) != 0:
-            notes.append(f"Variation Seed: {int(variation_seed_value)} (Creative Studio)")
-    except (TypeError, ValueError):
-        pass
-
-    if voice_files_value:
-        count = len(voice_files_value) if isinstance(voice_files_value, (list, tuple)) else 1
-        notes.append(f"Audio Layers: {count} voice clip(s) (Advanced Tools)")
 
     # Smart Mix: `plans_anything_from` is the authority on Amount 0 and on an empty role set.
     #
@@ -3058,13 +3250,28 @@ def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_f
     roles = fork_smart_mix.normalize_roles(sfx_roles_value) if sfx_roles_value else frozenset()
     amount = fork_smart_mix.normalize_control(sfx_amount_value)
     has_folder = isinstance(sfx_folder_value, str) and bool(sfx_folder_value.strip())
-    if has_folder and fork_smart_mix.plans_anything_from(roles, amount):
-        notes.append(f"Smart Mix: {len(roles)} SFX role(s) at Amount "
-                     f"{amount} (Advanced Tools)")
+    smart_mix_on = has_folder and fork_smart_mix.plans_anything_from(roles, amount)
 
-    if not notes:
-        return ("Nothing optional is active — this render uses the defaults shown on this tab.")
-    return "This render will also use:\n" + "\n".join(f"  • {n}" for n in notes)
+    # [FORK] R8: the one resolved line. The composition rule lives in the fork module so that the
+    # preset label here and the selector on Creative Settings are provably the same computation --
+    # both end at `presets.matching_preset` over the same six live values.
+    # [FORK] R8 Owner Fixes (P1): the labelled form. Same two calls underneath -- `base_label`
+    # and `overrides` -- so this is a layout change to a verified-correct read-out, not a second
+    # computation that could drift from the selector.
+    line = fork_effective.summary_labelled(
+        controls,
+        freestyle_declaration=declaration,
+        variation_seed=variation_seed_value,
+        voice_clips=voice_files_value,
+        smart_mix_active=smart_mix_on)
+    if fork_effective.is_modified(
+            controls,
+            freestyle_declaration=declaration,
+            variation_seed=variation_seed_value,
+            voice_clips=voice_files_value,
+            smart_mix_active=smart_mix_on):
+        return f"{line}\n{CREATIVE_PROFILE_MODIFIED_HINT}"
+    return f"{line}\n{CREATIVE_PROFILE_PLAIN_HINT}"
 
 
 # [FORK] Digital-Union (AI Director — V1 introduced the split; V2 added the media step): two thin
@@ -3769,7 +3976,7 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     source_mode: str, source_folder: str,
                                     source_recursive: bool, video_input: VideoFilesInput,
                                     output_filename: str, processing_mode: str,
-                                    custom_fps: float, variation_seed: int,
+                                    output_profile: str, variation_seed: int,
                                     cut_density: int, energy_response: int, motion_bias: int,
                                     source_diversity: int, micro_cuts: int,
                                     semantic_emphasis: int,
@@ -3936,7 +4143,7 @@ def _process_video_guarded_unlocked(audio_file: str,
         video_files=list(decision.paths),
         output_filename=output_filename,
         processing_mode=processing_mode,
-        custom_fps=custom_fps,
+        output_profile=output_profile,
         session_state=session_state,
         creative=creative,
         verification_seconds=verification_seconds,
@@ -4498,7 +4705,9 @@ def _on_open_output_folder_click() -> None:
     soon as the request is accepted; a window could still fail to surface. The success toast
     therefore says the request was made. Visual confirmation is a human step, recorded as such.
     """
-    output_dir = get_output_dir()
+    # [FORK] R8: the SAME resolver the render publishes through, so this button always opens the
+    # folder the last render actually landed in rather than a folder it might not have used.
+    output_dir = get_render_output_dir()
     # Windows-only by construction, same as the rest of the app -- but a *missing* attribute is a
     # fact to report, not an exception to raise, because this runs inside a live Gradio event.
     open_in_shell = getattr(os, 'startfile', None)
@@ -4531,7 +4740,7 @@ def process_video_guarded(audio_file: str,
                           source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
-                          custom_fps: float, variation_seed: int,
+                          output_profile: str, variation_seed: int,
                           cut_density: int, energy_response: int, motion_bias: int,
                           source_diversity: int, micro_cuts: int, semantic_emphasis: int,
                           session_state: dict,
@@ -4596,7 +4805,7 @@ def process_video_guarded(audio_file: str,
             audio_file, voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
             music_under_voice, sfx_folder, sfx_roles, sfx_amount, sfx_level,
             source_mode, source_folder, source_recursive, video_input,
-            output_filename, processing_mode, custom_fps, variation_seed,
+            output_filename, processing_mode, output_profile, variation_seed,
             cut_density, energy_response, motion_bias, source_diversity,
             micro_cuts, semantic_emphasis, session_state, source_state,
             # One frozen tuple of exactly what the user submitted, in
@@ -4651,7 +4860,7 @@ def render_selected_variants_guarded(
         sfx_folder: str, sfx_roles,
         source_mode: str, source_folder: str,
         source_recursive: bool, video_input: VideoFilesInput,
-        output_filename: str, processing_mode: str, custom_fps: float,
+        output_filename: str, processing_mode: str, output_profile: str,
         session_state: dict, source_state,
         # [FORK] Digital-Union (Freestyle V1): the LIVE Freestyle widgets, appended LAST with
         # defaults so no existing positional argument moved. Frozen once below, before the
@@ -4768,7 +4977,7 @@ def render_selected_variants_guarded(
                         audio.music_under_voice_percent,
                         sfx_folder, sfx_roles, audio.sfx_amount, audio.sfx_level_percent,
                         source_mode, source_folder, source_recursive, video_input,
-                        candidate.output_stem, processing_mode, custom_fps,
+                        candidate.output_stem, processing_mode, output_profile,
                         recipe.seed,
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
@@ -6704,18 +6913,79 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
     )
 
 
+#: [FORK] R8: where a previous session's browser uploads are kept instead of being deleted.
+#: Protected from the startup sweep by name, and clearable only through Settings -> Cache
+#: Management, where the operator can see what is in it first.
+RETIRED_UPLOADS_DIR_NAME = 'retired_uploads'
+RETIRED_UPLOADS_DIR = os.path.join(ROOT_DIR, 'input', RETIRED_UPLOADS_DIR_NAME)
+
+
+def _retire_previous_uploads(input_base: str) -> None:
+    """Move the last session's `gradio_uploads` aside instead of deleting it.
+
+    [FORK] R8 UX Refresh. This used to be a `shutil.rmtree`, and it ran before the operator had
+    done anything -- so a file dragged into the browser in a previous session was gone at the next
+    start, with no record that it had existed. A browser upload is a COPY the operator made into
+    the app, and for some of them it is the only copy they still have a path to.
+
+    The replacement is deliberately the simplest thing that is reversible: one `os.rename` into a
+    timestamped folder under `input/retired_uploads/`. No index, no manifest, no restore command,
+    no second copy -- the files are simply still there, under a name that says what they are. That
+    is "reversible" in the sense that matters (the bytes survive and the operator can go and get
+    them) without becoming the backup system this must not grow into.
+
+    Nothing here deletes. If the rename fails for any reason the old folder is left exactly where
+    it is, which is the safe direction: a session that reuses it writes alongside, and the next
+    start tries again.
+
+    The folder is bounded only by the operator's own clearing, which is a real trade: it grows one
+    subdirectory per start that had uploads. That is why it is a first-class Cache Management
+    category with its size on screen, rather than something that silently accumulates.
+    """
+    uploads = os.path.join(input_base, 'gradio_uploads')
+    try:
+        if not os.path.isdir(uploads) or not os.listdir(uploads):
+            return                                   # nothing uploaded last time: nothing to keep
+    except OSError:
+        return
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    destination = os.path.join(RETIRED_UPLOADS_DIR, stamp)
+    try:
+        os.makedirs(RETIRED_UPLOADS_DIR, exist_ok=True)
+        # No-replace: a second start inside the same second must not merge into, or overwrite,
+        # the first one's retirement.
+        suffix = 0
+        candidate = destination
+        while os.path.exists(candidate):
+            suffix += 1
+            candidate = f"{destination}_{suffix:02d}"
+        os.rename(uploads, candidate)
+        print(f"   📦 Kept last session's uploads: {candidate}")
+    except OSError as exc:
+        print(f"   ⚠️  Could not set aside the previous uploads, so they were left alone: {exc}")
+
+
 def cleanup_on_startup():
     """
     Clean temporary runtime files on script start while preserving user inputs
     and the persistent video analysis cache.
+
+    [FORK] R8 UX Refresh: `gradio_uploads` is now RETIRED rather than deleted (see
+    :func:`_retire_previous_uploads`), and `retired_uploads` joins the protected set so the sweep
+    does not simply delete it on the following start -- which would have reproduced the original
+    behaviour one run later. Everything else about this function is unchanged: `processing/` is
+    genuinely disposable scratch from a finished render and is still removed, and `audio`,
+    `video` and the Stage-5 analysis cache are still protected.
     """
     input_base = get_input_dir()
-    protected_dirs = {'audio', 'video', 'video_analysis_cache'}
+    protected_dirs = {'audio', 'video', 'video_analysis_cache', RETIRED_UPLOADS_DIR_NAME}
 
     try:
         os.makedirs(get_audio_input_dir(), exist_ok=True)
         os.makedirs(get_video_input_dir(), exist_ok=True)
-        os.makedirs(os.path.join(input_base, 'gradio_uploads'), exist_ok=True)
+
+        # Before the sweep, because the sweep is what used to destroy them.
+        _retire_previous_uploads(input_base)
 
         if os.path.exists(input_base):
             for item in os.listdir(input_base):
@@ -6925,6 +7195,14 @@ PREFS_LABELS = {
     fork_prefs.CLIPS_LIBRARY: LABEL_CLIPS_LIBRARY,
     fork_prefs.CLIPS_REJECTED: LABEL_CLIPS_REJECTED,
     fork_prefs.RAW_CUTTER_OUTPUT: LABEL_PREF_RAW_OUTPUT,
+    # [FORK] R8: the rest of the destinations, so "that folder has gone away" names the field the
+    # operator recognises instead of falling back to the raw preference key.
+    fork_prefs.AUDIO_LIBRARY: LABEL_PREF_AUDIO_LIBRARY,
+    fork_prefs.AUDIO_DISCARDED: LABEL_PREF_AUDIO_DISCARDED,
+    fork_prefs.AUDIO_CUTTER_OUTPUT: LABEL_PREF_AUDIO_OUTPUT,
+    fork_prefs.AUDIO_PREVIEW_LIBRARY: LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
+    fork_prefs.AUDIO_PREVIEW_DISCARDED: LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
+    fork_prefs.RENDER_OUTPUT: LABEL_PREF_RENDER_OUTPUT,
 }
 
 
@@ -6952,14 +7230,126 @@ def _load_folder_prefs():
     """Read saved defaults once at import. Creates nothing and validates nothing."""
     preferences, notice = fork_prefs.load_preferences(PREFS_PATH)
     missing = fork_prefs.unavailable_notice(preferences, PREFS_LABELS)
-    return preferences, "\n".join(part for part in (notice, missing) if part)
+    # [FORK] R8 Owner Fixes (P1): the work-folder/library overlap is surfaced at startup too, not
+    # only after a save -- an operator who set this up last week never presses Save again.
+    overlap = fork_prefs.overlapping_destinations(preferences, PREFS_LABELS)
+    return preferences, "\n".join(part for part in (notice, missing, overlap) if part)
 
 
 _FOLDER_PREFS, _FOLDER_PREFS_NOTICE = _load_folder_prefs()
 
+#: [FORK] R8: the non-folder options, from the same file and read at the same moment. Kept in a
+#: separate dict rather than merged into `_FOLDER_PREFS`, because `_pref` feeds folder textboxes
+#: and a policy string appearing in one would be a path.
+_FOLDER_OPTIONS = fork_prefs.load_options(PREFS_PATH)
+
 
 def _pref(key: str) -> str:
     return _FOLDER_PREFS.get(key, '')
+
+
+def _option(key: str) -> str:
+    return _FOLDER_OPTIONS.get(key, fork_prefs.OPTION_DEFAULTS.get(key, ''))
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 Owner Fixes (P1): one voice pair, with an optional per-tool override.
+#
+# The owner read the four audio destinations as duplicated. They are four genuinely different
+# settings -- a fresh cut and a clip reviewed next week can legitimately go to different places
+# -- but almost nobody needs that, and four near-identical names make the common case look
+# complicated.
+#
+# So the Audio Cutter's pair is the ordinary one, and Audio Review FALLS BACK to it when its own
+# override is blank. The two properties that make this safe, both pinned by test:
+#
+#   * it is a **read-side default only**. `_on_save_folder_prefs` still writes each key from its
+#     own field, so a fallback is never persisted into the override key and the two settings can
+#     never be silently merged.
+#   * a **non-empty override always wins**. An operator who already set different folders keeps
+#     them; nothing is consolidated, nothing is overwritten.
+#
+# Before this, blank meant "no default at all" and the operator typed a path. Blank now means
+# "the pair above", which is strictly more useful and cannot lose a configured value.
+# ---------------------------------------------------------------------------------------------
+
+def _audio_preview_default(override_key: str, shared_key: str) -> str:
+    """The Audio Review destination to pre-fill: its own override, else the shared voice folder."""
+    return _pref(override_key) or _pref(shared_key)
+
+
+def _audio_overrides_in_use() -> bool:
+    """True when Audio Review has at least one destination of its own.
+
+    Used only to decide whether the optional panel starts open: a setting that is in force must
+    never be hidden behind a closed drawer.
+    """
+    return bool(_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY)
+                or _pref(fork_prefs.AUDIO_PREVIEW_DISCARDED))
+
+
+def _collision_policy() -> str:
+    """The operator's saved filename-collision policy, resolved safely.
+
+    One reader for both sorters, so the video and audio review workflows can never disagree about
+    what the setting means. `resolve_policy` is total, so a hand-edited or corrupt value in
+    `preferences.json` yields the safe default rather than raising inside a live Gradio event.
+    """
+    return fork_collision.resolve_policy(_option(fork_prefs.COLLISION_POLICY))
+
+
+def _on_collision_policy_change(policy):
+    """Apply and persist the collision policy as soon as it is chosen.
+
+    It persists on change rather than waiting for Save defaults, because the two sorters read the
+    *stored* value -- a radio that applied only after a separate Save would mean the screen and
+    the behaviour disagreed until the operator pressed a second button.
+
+    Feedback is a toast and `outputs` is exactly `[]`, which is the pattern
+    `_on_open_output_folder_click` established and for the same reason: writing `pref_status` here
+    would add a third writer to that panel and let changing a radio overwrite the result of a Save
+    the operator is still reading.
+    """
+    resolved = fork_collision.resolve_policy(policy)
+    _FOLDER_OPTIONS[fork_prefs.COLLISION_POLICY] = resolved
+    failure = fork_prefs.save_preferences(
+        PREFS_PATH, _FOLDER_PREFS, {fork_prefs.COLLISION_POLICY: resolved})
+    if failure:
+        # The in-memory value still applies to this session; only persistence failed, and saying
+        # so is better than implying the choice did not take.
+        gr.Warning(f"{failure} The choice applies to this session only.")
+        return
+    gr.Info(STATUS_COLLISION_SAVED_SUFFIX if resolved == fork_collision.SUFFIX
+            else STATUS_COLLISION_SAVED_SKIP)
+
+
+def get_render_output_dir() -> str:
+    """Where a finished render is published. The configured folder, or the installation's own.
+
+    [FORK] R8 UX Refresh. Before this, `output/` inside the installation was the only possible
+    destination, which is wrong for an app whose other five destinations are all configurable.
+
+    Three properties, each deliberate:
+
+    * **It resolves at call time, not at import.** Saving a new folder in Settings takes effect on
+      the next render rather than on the next restart.
+    * **A configured folder is used only if it ALREADY EXISTS.** This function never creates one,
+      which is the same rule the rest of the preference store follows -- a remembered path is a
+      suggestion, not an action, and a folder that has gone away is *reported* (Settings shows it
+      through `unavailable_notice`, since `RENDER_OUTPUT` is a destination key) rather than
+      silently recreated somewhere a typo pointed. Falling back is therefore never silent data
+      loss: the render still lands somewhere real, and Settings says why it was not the configured
+      folder.
+    * **It governs the PUBLISHED render and nothing else.** Temporary processing directories, the
+      Gradio upload folder, `session_dir` and every cache keep resolving through their own
+      constants. Moving finished videos must not relocate the scratch the renderer is mid-way
+      through writing, and the share-staging folder stays a child of whatever this returns, so the
+      final step is still a same-directory rename and `EXDEV` stays structurally impossible.
+    """
+    configured = _pref(fork_prefs.RENDER_OUTPUT)
+    if configured and os.path.isdir(configured):
+        return configured
+    return get_output_dir()
 
 
 def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw_input_folder,
@@ -6967,12 +7357,18 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
                           audio_library_folder, audio_discarded_folder, audio_output_folder,
                           audio_source_file,
                           audio_preview_input_folder, audio_preview_library_folder,
-                          audio_preview_discarded_folder):
+                          audio_preview_discarded_folder,
+                          render_output_folder=None, collision_policy=None):
     """Persist the folder defaults. Writes a file; creates no media directory.
 
     [FORK] R7 appended its four fields at the END of the signature, and R7.2 appended its three
     after those, for the reason the fork appends everywhere else: Gradio passes handler arguments
     POSITIONALLY, so every pre-existing index stays exactly where the registration already put it.
+
+    [FORK] R8 appends two more, and gives both a DEFAULT. The default is not decoration: several
+    suites call this handler with the pre-R8 argument list, and a required parameter would turn
+    every one of them into a `TypeError` that says nothing about the feature being tested. `None`
+    means "not supplied", which is distinct from "supplied empty" and is handled below.
     """
     values = {
         fork_prefs.CLIPS_LIBRARY: library,
@@ -6988,24 +7384,133 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
         fork_prefs.AUDIO_PREVIEW_INPUT: audio_preview_input_folder,
         fork_prefs.AUDIO_PREVIEW_LIBRARY: audio_preview_library_folder,
         fork_prefs.AUDIO_PREVIEW_DISCARDED: audio_preview_discarded_folder,
+        # [FORK] R8: where finished renders are published.
+        fork_prefs.RENDER_OUTPUT: (render_output_folder
+                                   if render_output_folder is not None
+                                   else _pref(fork_prefs.RENDER_OUTPUT)),
     }
-    failure = fork_prefs.save_preferences(PREFS_PATH, values)
+    # A pre-R8 caller supplies no policy, and must not reset the operator's choice to the default
+    # as a side effect of saving folders. `None` therefore means "keep what is stored".
+    options = (None if collision_policy is None
+               else {fork_prefs.COLLISION_POLICY:
+                     fork_collision.resolve_policy(collision_policy)})
+    failure = fork_prefs.save_preferences(PREFS_PATH, values, options)
     if failure:
         return f"❌ {failure}"
     _FOLDER_PREFS.update({key: (values.get(key) or '').strip() for key in fork_prefs.KEYS})
+    if options is not None:
+        _FOLDER_OPTIONS.update(options)
+    # [FORK] R8 Owner Fixes (P2): both notices are recomputed from the values that were JUST
+    # written, never carried over. The owner saw a warning naming superseded paths while the
+    # fields on screen held new ones -- that was the startup notice, which describes the SAVED
+    # settings and is correct until a save replaces it. Saying so is the fix (see
+    # `PREF_STATUS_SCOPE`); recomputing here is what makes the replacement truthful.
+    return _folder_prefs_status(
+        "✅ Saved. These settings will be filled in next time you start BeatSync.")
+
+
+def _folder_prefs_status(headline: str) -> str:
+    """`headline`, followed by whatever is currently worth saying about the saved folders.
+
+    One composer for every writer of the status box, so a save, a reset and the startup notice
+    cannot describe the stored settings in three different ways.
+    """
+    lines = [headline, PREF_STATUS_SCOPE]
     missing = fork_prefs.unavailable_notice(_FOLDER_PREFS, PREFS_LABELS)
-    saved = f"✅ Saved. These folders will be filled in next time you start BeatSync."
-    return f"{saved}\n{missing}" if missing else saved
+    if missing:
+        lines.append(missing)
+    # [FORK] R8 Owner Fixes (P1): reports only -- it relocates nothing and refuses nothing.
+    overlap = fork_prefs.overlapping_destinations(_FOLDER_PREFS, PREFS_LABELS)
+    if overlap:
+        lines.append(overlap)
+    return "\n".join(lines)
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R8 UX Refresh): Settings -> Cache Management.
+#
+# The whole safety argument is CONTAINMENT, and it lives in two halves. This half decides which
+# four directories may ever be named; `beatsync_fork.cache_admin` proves that nothing outside the
+# directory it is handed is touched. Neither half discovers a path, so the list of things that
+# must never be cleared -- input media, finished exports, Media Libraries, Discarded folders,
+# models, the portable runtime, saved preferences, the review decision journals -- is enforced by
+# never appearing here rather than by a blocklist that a future edit could get wrong.
+#
+# Note what is deliberately absent: `output/` (finished renders), `input/audio`, `input/video`
+# (the operator's own media), and `state/clips-review/*.json` (the decision journals, which sit
+# BESIDE the poster cache and are why the poster subdirectory is named rather than its parent).
+# =============================================================================================
+
+def _cache_categories() -> list:
+    """The four clearable caches, built fresh so a changed Render output folder is reflected.
+
+    `CLIPS_POSTER_DIR` rather than `CLIPS_STATE_DIR`: the journals live in the parent, and a
+    category pointed at the parent would delete the operator's review decisions.
+    """
+    return [
+        fork_cache.Category(
+            fork_cache.POSTERS, LABEL_CACHE_POSTERS, INFO_CACHE_POSTERS, CLIPS_POSTER_DIR),
+        fork_cache.Category(
+            fork_cache.PROCESSING, LABEL_CACHE_PROCESSING, INFO_CACHE_PROCESSING,
+            get_processing_dir()),
+        fork_cache.Category(
+            fork_cache.RETIRED_UPLOADS, LABEL_CACHE_UPLOADS, INFO_CACHE_UPLOADS,
+            RETIRED_UPLOADS_DIR),
+        fork_cache.Category(
+            fork_cache.ANALYSIS, LABEL_CACHE_ANALYSIS, INFO_CACHE_ANALYSIS,
+            os.path.join(get_input_dir(), 'video_analysis_cache'), expensive=True),
+    ]
+
+
+def _on_inspect_cache():
+    """Measure every category. Reads only -- creates nothing, deletes nothing, moves nothing."""
+    measurements = [fork_cache.measure(category) for category in _cache_categories()]
+    return "\n".join(fork_cache.report_lines(measurements))
+
+
+def _on_clear_cache(selected, confirmed):
+    """Delete the selected categories, and only after an explicit tick.
+
+    The confirmation is a separate checkbox rather than a second click, because a second click is
+    indistinguishable from an impatient first one. Nothing is deleted until both a selection and
+    the tick are present, and the refusal says which of the two is missing.
+
+    Selection arrives as the checkbox group's values, which are category KEYS. They are matched
+    against the built category list rather than used to construct anything, so a value the browser
+    invented names no directory and is simply not found.
+    """
+    chosen = [str(value) for value in (selected or [])]
+    if not chosen:
+        return "Nothing was selected, so nothing was cleared."
+    if not confirmed:
+        return ("Tick the confirmation box as well — nothing has been deleted.\n"
+                "Clearing a cache cannot be undone.")
+    wanted = [category for category in _cache_categories() if category.key in chosen]
+    if not wanted:
+        return "Those categories are not recognised, so nothing was cleared."
+    outcomes = [fork_cache.clear(category) for category in wanted]
+    return "\n".join(fork_cache.cleared_lines(outcomes))
 
 
 def _on_reset_folder_prefs():
-    """Clear the saved defaults. Removes no folder and no media -- only the remembered choices."""
-    failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences())
+    """Clear the saved defaults. Removes no folder and no media -- only the remembered choices.
+
+    [FORK] R8 appends the Render output box to the cleared set and returns the collision policy
+    to its default. The tuple grew by two and its ORDER matches the registration's `outputs`
+    positionally, as every return on this handler must.
+    """
+    failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences(),
+                                          fork_prefs.empty_options())
     if failure:
-        return ('', '', '', '', '', '', '', '', f"❌ {failure}")
+        return ('', '', '', '', '', '', '', '', '',
+                fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY], f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
-    return ('', '', '', '', '', '', '', '',
-            "✅ Defaults cleared. No folder or file was deleted.")
+    _FOLDER_OPTIONS.update(fork_prefs.empty_options())
+    # [FORK] R8 Owner Fixes (P2): composed like every other status write, so a reset cannot leave
+    # a warning behind that describes the settings it has just cleared.
+    return ('', '', '', '', '', '', '', '', '',
+            fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
+            _folder_prefs_status("✅ Defaults cleared. No folder or file was deleted."))
 
 
 # =============================================================================================
@@ -7031,8 +7536,12 @@ def _audio_tools() -> tuple:
     return FFMPEG_PATH, FFPROBE_PATH
 
 
-def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
-    """Widget values to the five resolved settings, total over anything Gradio can hand over.
+def _audio_settings(threshold, min_silence, pad, min_clip, fmt, fade_edges=False) -> dict:
+    """Widget values to the resolved settings, total over anything Gradio can hand over.
+
+    [FORK] R8 Phase 9: `fade_edges` is APPENDED with a default, so the pre-R8 five-argument
+    call every other caller makes still resolves to fades OFF -- which is the documented
+    default and keeps already-accepted exports bit-identical.
 
     A `gr.Number` legitimately arrives as `None` or as `''` when the operator clears it, so every
     read falls back to the documented default rather than raising inside an event handler.
@@ -7055,6 +7564,9 @@ def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
         # old `FLAC if fmt == FLAC else WAV` form silently mapped MP3 onto WAV, so adding a third
         # format to the widget alone would have written `.wav` files from an MP3 selection.
         'format': fork_audio.normalize_format(fmt),
+        # [FORK] R8 Phase 9: a checkbox, so `bool()` is the whole resolution. Anything Gradio
+        # could hand over that is not truthy means off, which is the safe direction.
+        'fade_edges': bool(fade_edges),
     }
 
 
@@ -7147,8 +7659,36 @@ def _audio_format_line(settings: dict) -> str:
     return f"Format: WAV - 16-bit PCM - {fork_audio.OUTPUT_SAMPLE_RATE} Hz"
 
 
+def _audio_fade_line(settings: dict, segments) -> str:
+    """What the fades ACTUALLY did, or `''` when they are off.
+
+    [FORK] R8 Phase 9. It reports the **measured range across the clips that were planned**, not
+    the setting, because the two differ whenever a clip received less padding than was requested --
+    which is the normal case in a crowded passage and is exactly what the operator needs to see.
+    A clip with no padding gets no fade and is counted as such.
+    """
+    if not settings.get('fade_edges'):
+        return ""
+    lengths = []
+    for segment in segments or ():
+        fade_in, fade_out = fork_audio.fade_lengths(segment, True)
+        lengths.extend([fade_in, fade_out])
+    if not lengths:
+        return "Soft edges: on, but nothing was planned to fade."
+    shaped = [value for value in lengths if value > 0.0]
+    if not shaped:
+        return ("Soft edges: on, but no clip had any padding to fade into, so none was applied. "
+                "Raise Padding to give the fades room.")
+    low, high = min(shaped), max(shaped)
+    span = (f"{low * 1000:.0f} ms" if abs(high - low) < 0.0005
+            else f"{low * 1000:.0f}-{high * 1000:.0f} ms")
+    silent = len(lengths) - len(shaped)
+    note = f" ({silent} edge(s) had no padding and were left sharp)" if silent else ""
+    return f"Soft edges: on - fades of {span}, bounded by each clip's own padding{note}"
+
+
 def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt,
-                  request: gr.Request = None):
+                  fade_edges=False, request: gr.Request = None):
     """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
 
     Re-analyzing rather than trusting the on-screen plan is deliberate and matches the Raw Cutter:
@@ -7160,7 +7700,7 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     are already on disk and the report already says so, so a registry refusal costs the preview and
     nothing else.
     """
-    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt, fade_edges)
     blank = (AUDIO_GALLERY_EMPTY_HTML, AUDIO_COUNTS_INITIAL_TEXT, '', {}, '')
 
     mp3_problem = _audio_mp3_problem(settings['format'])
@@ -7201,7 +7741,8 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
         destination = os.path.join(run_directory, name)
         code, log = fork_audio.run_media_command(
             fork_audio.build_extract_command(ffmpeg, info.path, segment, destination,
-                                             settings['format']),
+                                             settings['format'],
+                                             fade_edges=settings['fade_edges']),
             timeout=fork_audio.EXTRACT_TIMEOUT_SECONDS)
         if code == 0 and os.path.isfile(destination):
             written[segment.index] = name
@@ -7229,9 +7770,14 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
 
     lines = [f"✅ Wrote {len(written)} of {len(segments)} clip(s).",
              f"Output folder:\n{run_directory}", '',
-             _audio_format_line(settings),
-             f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
-             "Your source file was not modified."]
+             _audio_format_line(settings)]
+    # [FORK] R8 Phase 9: the EFFECTIVE fade length, which the task asked to be shown and which
+    # differs from the setting whenever a clip had less padding than was requested.
+    fade_line = _audio_fade_line(settings, segments)
+    if fade_line:
+        lines.append(fade_line)
+    lines += [f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
+              "Your source file was not modified."]
     if failures:
         lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
     report = "\n".join(lines) + manifest_note
@@ -7507,7 +8053,9 @@ def _audio_sort(surface, view, library, discarded, sweep_unmarked):
         view.get('entries') or (), decision_of, name_of,
         {fork_audio_review.SELECTED: library, fork_audio_review.REJECTED: discarded},
         unmarked_as=(fork_audio_review.REJECTED if sweep_unmarked
-                     else fork_audio_review.PENDING))
+                     else fork_audio_review.PENDING),
+        # [FORK] R8: the same saved policy the video sorter reads, for the same reason.
+        policy=_collision_policy())
 
     message = "\n".join(fork_audio_review.sorted_report_lines(outcomes, library, discarded))
     moved = {o.clip_id for o in outcomes if o.ok}
@@ -7859,20 +8407,58 @@ def _on_audio_preview_destinations_change(library_folder, discarded_folder, view
     return message
 
 
-def _on_audio_open_in_preview(run_directory):
-    """"Open results in Audio Preview": hand this cut's output folder to the review tab.
+def _on_audio_open_in_library(run_directory):
+    """"Open results in Media Library": hand this cut's output folder to Audio Review.
 
-    It only fills the folder box and selects the tab. **It deliberately does not scan**, because
-    Phase 2 requires that nothing scans a folder as a side effect -- the operator presses Scan when
-    they are ready, and until then no disk is walked and no session is minted.
+    It only fills the folder box and selects the section. **It deliberately does not scan**,
+    because Phase 2 requires that nothing scans a folder as a side effect -- the operator presses
+    Scan when they are ready, and until then no disk is walked and no session is minted.
+
+    [FORK] R8 UX Refresh (Commit A): Audio Review is now a SECTION of Media Library rather than a
+    top-level tab, so reaching it takes **two** selections, not one -- the outer tab and the inner
+    section. Returning only the inner one lands the operator on whichever top-level tab they were
+    already on, with an invisible selection applied underneath; returning only the outer one shows
+    Media Library on whatever section was last open. Both halves are therefore load-bearing, and a
+    failure path must still return an update for each of the four outputs or Gradio mis-aligns them.
     """
     folder = str(run_directory or '').strip()
     if not folder:
-        return (gr.update(), gr.update(),
+        return (gr.update(), gr.update(), gr.update(),
                 "Cut some clips first — there is no output folder to open yet.")
-    return (gr.update(value=folder), gr.Tabs(selected='tab-audio-preview'),
-            f"Loaded the folder into the Audio Preview tab:\n{folder}\n"
+    return (gr.update(value=folder),
+            gr.Tabs(selected='tab-media-library'),
+            gr.Tabs(selected='tab-audio-review'),
+            f"Loaded the folder into Media Library → Audio Review:\n{folder}\n"
             f"Press Scan Folder there when you are ready to review it.")
+
+
+def _on_cut_open_in_library(output_folder):
+    """"Open results in Media Library": hand the Raw Cutter's output folder to Video Review.
+
+    The symmetric partner of :func:`_on_audio_open_in_library`, and it shares that function's two
+    properties: it selects both the outer tab and the inner section, and **it scans nothing**. The
+    operator presses Scan when they are ready; until then no disk is walked.
+
+    What it hands over is the *parent* output folder with subfolders included, because every run
+    writes its own fresh timestamped subfolder and the Raw Cutter keeps no run-directory state. So
+    the message says exactly that rather than implying this is the one run's directory -- an
+    operator who has cut three times will see all three, which is honest and usually what they
+    want.
+
+    Total by construction: a missing or blank folder is reported and changes nothing, and every
+    return path yields one update per output so Gradio's positional alignment cannot drift.
+    """
+    folder = str(output_folder or '').strip()
+    if not folder:
+        return (gr.update(), gr.update(), gr.update(), gr.update(),
+                "Set an output folder first — there is nothing to open yet.")
+    return (gr.update(value=folder),
+            gr.update(value=True),
+            gr.Tabs(selected='tab-media-library'),
+            gr.Tabs(selected='tab-video-review'),
+            f"Loaded the Raw Cutter output folder into Media Library → Video Review:\n{folder}\n"
+            f"Subfolders are included, because each cut writes its own timestamped subfolder.\n"
+            f"Press Scan Folder there when you are ready to review.")
 
 
 def _browse_audio_source(current):
@@ -7954,8 +8540,15 @@ def _clips_render_current(owner: str, report: str):
     grid = fork_clips.gallery_html(view['entries'], store.snapshot_of(identities),
                                    view['identity'], view['session'], view['page'],
                                    _clips_poster_exists, _clips_durations(view['entries']))
+    # [FORK] R8 Final Polish: Confirm is admitted by AT LEAST ONE KEPT CLIP, not by a page with
+    # nothing undecided. That is the rule Audio Review has always used; the asymmetry was an
+    # unfinished requirement rather than a deliberate difference -- an operator picking six good
+    # shots out of two hundred had to click the other 194 before the button would light.
+    #
+    # Nothing about the authority changed: still derived from `store.counts()`, the durable
+    # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
 
 
 def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, page_size,
@@ -8112,8 +8705,15 @@ def _on_clips_scan(input_folder, recursive, library_folder, rejected_folder, pag
         f"no frame {posters.failures}, {posters.workers} worker(s))\n"
         "Read-only: metadata and one poster frame per clip. No file was moved, renamed or deleted."
     ) + compaction_notice
+    # [FORK] R8 Final Polish: Confirm is admitted by AT LEAST ONE KEPT CLIP, not by a page with
+    # nothing undecided. That is the rule Audio Review has always used; the asymmetry was an
+    # unfinished requirement rather than a deliberate difference -- an operator picking six good
+    # shots out of two hundred had to click the other 194 before the button would light.
+    #
+    # Nothing about the authority changed: still derived from `store.counts()`, the durable
+    # record, and this is still the only place that moves the button.
     return (report, grid, fork_clips.counts_text(counts),
-            gr.update(interactive=counts[fork_clips.PENDING] == 0))
+            gr.update(interactive=counts[fork_clips.SELECTED] > 0))
 
 
 def _clips_decide(owner, session_id, page_token, entry, payload):
@@ -8214,12 +8814,19 @@ def _on_clips_refresh(request: gr.Request = None):
     return _clips_render_current(owner, '')[1:]
 
 
-def _clips_confirm_only(message: str):
-    """A Confirm answer that changes no page state: repaint nothing, say this."""
-    return (gr.update(), gr.update(), gr.update(), gr.update(), message)
+def _clips_confirm_only(message: str, gate=False, signature=''):
+    """A Confirm answer that changes no page state: repaint nothing, say this.
+
+    [FORK] R8 Final Polish: two trailing outputs. `gate` reveals Proceed/Cancel and `signature`
+    is the batch those buttons are attached to -- both default to the pre-R8 values, so every
+    existing refusal through this helper still hides the gate and clears the arming, which is the
+    behaviour a refusal must have.
+    """
+    return (gr.update(), gr.update(), gr.update(), gr.update(), message,
+            gr.update(visible=gate), gr.update(visible=gate), signature)
 
 
-def _on_clips_confirm(request: gr.Request = None):
+def _on_clips_confirm(armed='', request: gr.Request = None):
     """Sort this page: SELECTED to the Media Library, REJECTED to the Discarded folder.
 
     [UX V3] Confirm now does the thing its label promises. What it moves comes entirely from the
@@ -8231,8 +8838,21 @@ def _on_clips_confirm(request: gr.Request = None):
     **re-validated here** rather than re-read from the widgets -- otherwise the folder that was
     checked and the folder that is written could differ.
 
+    [FORK] R8 Final Polish -- KEEP-ONLY CLASSIFICATION, matching Audio Review.
+
+    `armed` is the batch signature the operator last agreed to, and it is the ONLY widget value
+    this handler takes. That is deliberate and preserves the property the no-inputs version had:
+    it is a **change detector, not a credential**. Presenting it authorises nothing, because the
+    plan is re-derived from the server's snapshot and the destinations are re-validated on every
+    press -- a stale or forged signature simply fails to match a freshly computed one, and the
+    gate is shown again.
+
+    The admission rule is now "at least one clip is KEPT" rather than "nothing is undecided", and
+    unmarked clips are swept to Discarded **only** after an explicit Proceed on that exact batch.
+    The durable record is never written by the sweep: see `decision_of` below.
+
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
-    page with undecided clips, or destinations that no longer validate.
+    page with no clip kept, or destinations that no longer validate.
 
     Every move is a single same-volume ``os.rename`` (see `sort_decided_clips`): no overwrite, no
     collision renaming, no deletion, and a cross-volume request is refused in words rather than
@@ -8254,11 +8874,24 @@ def _on_clips_confirm(request: gr.Request = None):
     except (fork_clips.PersistenceError, OSError) as failure:
         return _clips_confirm_only(_clips_state_unavailable_text(failure))
     identities = _clips_identities(view)
-    counts = store.counts(identities)
-    if counts[fork_clips.PENDING]:
+    snapshot = store.snapshot_of(identities)
+
+    # [FORK] R8 Final Polish: keep-only classification, the same two-step gate Audio Review uses.
+    #
+    # The plan comes from `fork_clips.plan_sort` -- the ONE shared model, over the server's own
+    # snapshot, never the browser's. `can_sort` is "at least one clip is kept"; that replaces the
+    # old "nothing may be undecided" admission rule.
+    def _decision(entry):
+        return snapshot.get(view['identity'][entry.clip_id], (fork_clips.PENDING, 0))[0]
+
+    plan = fork_clips.plan_sort(
+        view['entries'], {entry.clip_id: _decision(entry) for entry in view['entries']},
+        view.get('library', ''), view.get('rejected', ''))
+
+    if not plan.can_sort:
         return _clips_confirm_only(
-            f"{CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
-            f"{counts[fork_clips.PENDING]} of {counts['TOTAL']} clip(s) are still undecided.")
+            f"❌ {CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
+            f"{len(plan.unmarked)} of {plan.total} clip(s) are still undecided.")
 
     verdict, roots = fork_clips.validate_roots(
         view['root'], view.get('library', ''), view.get('rejected', ''), app_root=ROOT_DIR)
@@ -8267,16 +8900,44 @@ def _on_clips_confirm(request: gr.Request = None):
             f"❌ Nothing was moved: the destination folders no longer validate.\n"
             f"{verdict.code}\n{verdict.detail}")
 
-    snapshot = store.snapshot_of(identities)
+    # Unmarked clips need an explicit, batch-specific confirmation. Without a signature that
+    # still matches, NOTHING MOVES: the counts and the consequence are shown and Proceed/Cancel
+    # are revealed. The signature covers every clip id, its decision and both destinations, so
+    # changing any of them voids the arming and the gate is shown again.
+    if plan.has_unmarked and str(armed or '') != plan.signature:
+        preview = fork_clips.plan_preview_lines(
+            plan, roots[fork_clips.ROLE_LIBRARY].real, roots[fork_clips.ROLE_REJECTED].real)
+        message = "\n".join([CLIPS_SWEEP_GATE_HEADING, ''] + preview
+                            + ['', CLIPS_SWEEP_GATE_PROMPT])
+        return _clips_confirm_only(message, gate=True, signature=plan.signature)
 
     def decision_of(entry):
-        return snapshot.get(view['identity'][entry.clip_id], (fork_clips.PENDING, 0))[0]
+        """What this clip is filed as **for this batch only**.
+
+        An unmarked clip is treated as REJECTED when, and only when, the operator has just armed
+        this exact batch through the gate above. **The durable record is not written**: the clip
+        stays PENDING in the store, so the sweep is a property of one confirmed batch rather than
+        a decision retroactively attributed to the operator. Re-scan the folder and it is undecided
+        again.
+        """
+        decision = _decision(entry)
+        if decision == fork_clips.PENDING and plan.has_unmarked:
+            return fork_clips.REJECTED
+        return decision
 
     outcomes = fork_clips.sort_decided_clips(
         view['entries'], decision_of,
         {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
-         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real})
+         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real},
+        # [FORK] R8: the operator's saved collision policy, read from the preference store rather
+        # than threaded in as a widget. Deliberate: everything that decides WHERE a file goes
+        # comes from the server, and the one widget value this handler does take (`armed`) is a
+        # change detector that cannot name a folder.
+        _collision_policy())
     message = _clips_sorted_text(outcomes, roots)
+    if plan.has_unmarked:
+        message = (f"{message}\n\n{len(plan.unmarked)} unmarked clip(s) were moved to the "
+                   f"Discarded folder as agreed. Nothing was deleted.")
 
     # Re-enumerate whichever way it went. On a clean batch that publishes the next one; on a
     # partial batch it republishes what is genuinely still on disk, which is the only honest
@@ -8286,7 +8947,21 @@ def _on_clips_confirm(request: gr.Request = None):
     report, grid, counts_text, confirm = _on_clips_scan(
         view['root'], view.get('recursive', True), view.get('library', ''),
         view.get('rejected', ''), view.get('page_size', 100), request)
-    return (report, grid, counts_text, confirm, message)
+    # The gate closes and the arming is cleared: this batch is spent, and a signature that
+    # outlived its batch is exactly what the signature exists to prevent.
+    return (report, grid, counts_text, confirm, message,
+            gr.update(visible=False), gr.update(visible=False), '')
+
+
+def _on_clips_sweep_cancel(request: gr.Request = None):
+    """Back out of the sweep gate. Changes nothing at all.
+
+    [FORK] R8 Final Polish. It does not repaint the grid, does not touch a decision and does not
+    move a file -- it closes the gate and clears the arming, so the next Confirm starts the
+    two-step agreement again from the beginning. "Cancel changes nothing" is the whole contract,
+    and it is kept by this function doing almost nothing.
+    """
+    return _clips_confirm_only(CLIPS_SWEEP_CANCELLED_TEXT)
 
 
 def _clips_sorted_text(outcomes, roots) -> str:
@@ -8387,7 +9062,7 @@ def create_ui() -> gr.Blocks:
         # container is the whole of that capability -- `gr.Tabs(selected=...)` as a return value
         # switches tabs, and nothing else about the tab set changes.
         with gr.Tabs() as main_tabs:
-            with gr.Tab(LABEL_TAB_QUICK_RENDER, id='tab-quick-render') as tab_quick_render:
+            with gr.Tab(LABEL_TAB_RENDER, id='tab-render') as tab_render:
                 with gr.Row():
                     # [FORK] Digital-Union (GUI Refresh A): 3:2 at the top level -- the controls
                     # need the width, the preview needs enough to be watchable.
@@ -8403,17 +9078,39 @@ def create_ui() -> gr.Blocks:
                             # Wider: it holds a drop zone and a file path.
                             with gr.Column(scale=3):
                                 gr.Markdown('### 📁 Input Files')
-                                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
+                                # [FORK] R8 Final Polish: the music track, in a third of the
+                                # height. `height=` bounds the drop zone instead of letting it
+                                # claim the default ~190 px for a single-file control -- measured
+                                # as the largest block above Create Music Video that was not a
+                                # setting. Drag-and-drop is unchanged, and so are the component,
+                                # its `elem_id`, its `type` and every handler that names it.
+                                #
+                                # A native Browse button was ALSO built here and reverted: a
+                                # `gr.File` refuses to display a path outside Gradio's allowed
+                                # roots, and the three ways around that each cost more than the
+                                # button is worth. The measurement, the exact exception and the
+                                # rejected options are in `tests/test_render_music_input.py`.
+                                audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', height=110, elem_id='audio-file-input')
                                 # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
                                 with gr.Group():
+                                    # [FORK] R8 Phase 10: the group heading names the control,
+                                    # so the radio below carries `show_label=False` rather than
+                                    # repeating the same words on a second line under it. The
+                                    # label CONSTANT is kept and still passed, so assistive
+                                    # technology and every test that reads it are unaffected.
                                     gr.Markdown('### 🎬 Video Source')
                                     source_mode = gr.Radio(
                                         choices=[
                                             (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
+                                            # [FORK] R8: the configured Media Library as a local
+                                            # folder. Not a third SourceMode -- see
+                                            # `SOURCE_CHOICE_MEDIA_LIBRARY`.
+                                            (CHOICE_SOURCE_MEDIA_LIBRARY, SOURCE_CHOICE_MEDIA_LIBRARY),
                                             (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
                                         ],
                                         value=SourceMode.LOCAL_FOLDER.value,
                                         label=LABEL_SOURCE_MODE,
+                                        show_label=False,
                                         info=INFO_SOURCE_MODE,
                                         elem_id='source-mode-radio',
                                     )
@@ -8454,35 +9151,42 @@ def create_ui() -> gr.Blocks:
                                     )
                             with gr.Column(scale=2):
                                 with gr.Group():
-                                    gr.Markdown('### ⚙️ Video Settings')
-                                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
+                                    # [FORK] R8 Final Polish: the "### Video Settings" heading
+                                    # that used to sit here is gone. The Group holds exactly one
+                                    # control, and that control's own label already reads
+                                    # "Output Video Profile" -- so the heading was a second line
+                                    # of chrome naming the same thing, directly above the fold
+                                    # that Create Music Video has to stay on. Same for the
+                                    # "Output Settings" heading below.
+                                    # [FORK] R8 UX Refresh (Phase 6): the Output Video Profile
+                                    # REPLACES the free-text "Custom FPS" box, in the same
+                                    # position and at the same index in every handler signature
+                                    # it feeds -- so the positional alignments several suites pin
+                                    # are preserved by arity rather than by renumbering.
+                                    #
+                                    # It answers the question the FPS box could not: the render
+                                    # took its RESOLUTION from the first source video and fitted
+                                    # every other clip to it with a bare `scale=w:h`, so a
+                                    # portrait, 4:3 or anamorphic source was stretched. Auto is
+                                    # first and therefore default, and Auto is the untouched
+                                    # historical path including that behaviour -- see
+                                    # `beatsync_fork/render_profiles.py` for why it is not
+                                    # "fixed" unconditionally.
+                                    output_profile = gr.Radio(
+                                        choices=fork_render_profiles.profile_choices(),
+                                        value=fork_render_profiles.AUTO,
+                                        label=LABEL_OUTPUT_PROFILE,
+                                        info=INFO_OUTPUT_PROFILE,
+                                        elem_id='output-profile-radio',
+                                    )
 
-                                # [FORK] Digital-Union (GUI Refresh A): the preset selector is the one
-                                # creative control on Quick Render, because it is the single choice that
-                                # sets all six sliders at once. The sliders themselves live in Creative
-                                # Studio; the `.input()` graph between them is unchanged and crosses tabs
-                                # perfectly well.
-                                # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
-                                # directly above the six sliders it writes, and below the seed — the layout is
-                                # the first statement that a preset moves those six and nothing else. It is NOT
-                                # a `process_btn` input: the sliders already are, and they stay the only thing
-                                # the render request carries. `Custom` is the last choice because it is a state
-                                # the selector reports, not a recipe a user picks.
-                                creative_preset = gr.Radio(
-                                    choices=list(fork_presets.PRESET_NAMES),
-                                    value=fork_presets.BALANCED_PRESET,
-                                    label=LABEL_CREATIVE_PRESET,
-                                    info=INFO_CREATIVE_PRESET,
-                                    elem_id='creative-preset-radio',
-                                )
                                 with gr.Group():
                                     gr.Markdown(f'### 🎬 Processing Mode')
                                     if NVENC_AVAILABLE:
-                                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, show_label=False, info=get_processing_mode_info_nvenc())
                                     else:
-                                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, show_label=False, info=get_processing_mode_info_cpu())
                                 with gr.Group():
-                                    gr.Markdown('### 📁 Output Settings')
                                     output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)
                                 # [FORK] Digital-Union: starts disabled; enabled only by an explicit confirmation.
                                 process_btn = gr.Button(
@@ -8507,14 +9211,39 @@ def create_ui() -> gr.Blocks:
                                 # measured rather than assumed: heading the column pushed Create Music
                                 # Video from y=1032 down to y=1177, because this box is 145 px tall and
                                 # the button sits below it either way.
-                                active_settings_summary = gr.Textbox(
-                                    label=LABEL_ACTIVE_SETTINGS,
-                                    value=ACTIVE_SETTINGS_PLACEHOLDER,
-                                    lines=3,
-                                    max_lines=8,
+                                #
+                                # [FORK] R8 UX Refresh (Commit C): this replaces `active_settings_summary`
+                                # and answers a different question.
+                                #
+                                # The old box listed optional extras but said nothing about the six
+                                # creative controls, because the Creative Preset radio sat on this very
+                                # tab and stated that part itself. The preset has moved to Creative
+                                # Settings, and more importantly the pair was *misleading together*: the
+                                # selector could read `Balanced` while Freestyle rules, a Variation Seed
+                                # and SFX were all armed, and nothing on screen said the render would not
+                                # be a plain Balanced render.
+                                #
+                                # So this box now carries ONE resolved line -- the base recipe plus every
+                                # active override -- built by `beatsync_fork.effective_profile`. It is
+                                # still a read-out: it writes nothing, no render path reads it, and it is
+                                # recomputed from the live widgets on every tab selection, which is
+                                # sufficient *because* every control it describes now lives on another
+                                # tab. That was not true before the preset moved, and is exactly why the
+                                # six sliders could not be reported from here until now.
+                                creative_profile_summary = gr.Textbox(
+                                    label=LABEL_CREATIVE_PROFILE,
+                                    value=CREATIVE_PROFILE_PLACEHOLDER,
+                                    lines=2,
+                                    max_lines=6,
                                     interactive=False,
-                                    elem_id='active-settings-summary',
+                                    elem_id='creative-profile-summary',
                                 )
+                                # A one-click way to go and change it, which the old layout lacked:
+                                # the summary named settings on other tabs without offering a route
+                                # to them. Selecting a tab is not a render and writes no setting.
+                                open_creative_settings_btn = gr.Button(
+                                    LABEL_OPEN_CREATIVE_SETTINGS, variant='secondary', size='sm',
+                                    elem_id='open-creative-settings-button')
                     with gr.Column(scale=2):
                         gr.Markdown('### 📺 Output')
                         status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
@@ -8535,7 +9264,7 @@ def create_ui() -> gr.Blocks:
                         )
                         gr.Markdown(INFO_OPEN_OUTPUT_FOLDER)
 
-            with gr.Tab(LABEL_TAB_CREATIVE_STUDIO, id='tab-creative-studio'):
+            with gr.Tab(LABEL_TAB_CREATIVE_SETTINGS, id='tab-creative-settings'):
                 # [FORK] Digital-Union (Phase A + Creative Controls Core): creative direction.
                 # Deliberately outside the Video Source group and never wired into `source_outputs`,
                 # so changing any of these cannot invalidate a confirmed source set. All four are
@@ -8544,66 +9273,33 @@ def create_ui() -> gr.Blocks:
                 # GUI Refresh A promoted that group to a tab of its own. The contract above is
                 # unchanged and is exactly why the promotion was safe: nothing in here was ever
                 # part of source identity, so no amount of moving it can reach the render gate.
-                gr.Markdown(INFO_TAB_CREATIVE_STUDIO)
+                gr.Markdown(INFO_TAB_CREATIVE_SETTINGS)
                 with gr.Group():
-                    # [FORK] Digital-Union (AI Director V1): a compact group at the TOP of this
-                    # block, because the order is the explanation — describe the edit, review a
-                    # proposal, then the existing Creative Controls below are what actually gets
-                    # rendered:
+                    # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
+                    # directly above the six sliders it writes, and below the seed — the layout is
+                    # the first statement that a preset moves those six and nothing else. It is NOT
+                    # a `process_btn` input: the sliders already are, and they stay the only thing
+                    # the render request carries. `Custom` is the last choice because it is a state
+                    # the selector reports, not a recipe a user picks.
                     #
-                    #     AI Director  ->  Creative Controls  ->  Variant Lab  ->  Render
+                    # [FORK] R8 UX Refresh (Commit C): MOVED here from the render tab.
                     #
-                    # Five components and one hidden state object. No gallery, no chat UI, no
-                    # conversation history, and deliberately not a new top-level workflow: the
-                    # Director is a second way to fill in controls this app already had.
-                    #
-                    # The instruction box registers NOTHING — it is read at click time, exactly
-                    # like every Variant Lab configuration widget — so typing an instruction
-                    # cannot move a slider, clear a confirmation or start anything.
-                    with gr.Accordion(label=LABEL_AI_DIRECTOR, open=True):
-                        gr.Markdown(INFO_AI_DIRECTOR)
-                        director_instruction = gr.Textbox(
-                            label=LABEL_DIRECTOR_INSTRUCTION,
-                            value='',
-                            placeholder=PLACEHOLDER_DIRECTOR_INSTRUCTION,
-                            info=INFO_DIRECTOR_INSTRUCTION,
-                            lines=3,
-                            max_lines=6,
-                            elem_id='director-instruction-input',
-                        )
-                        with gr.Row():
-                            generate_director_btn = gr.Button(
-                                LABEL_GENERATE_PROPOSAL, variant='secondary',
-                                elem_id='generate-director-proposal-button')
-                            apply_director_btn = gr.Button(
-                                LABEL_APPLY_PROPOSAL, variant='secondary',
-                                elem_id='apply-director-proposal-button')
-                        # Read-only, and formatted entirely by `DirectorProposal.display_text()` —
-                        # one formatter per read-out, exactly as the Variant Lab and mix reports
-                        # work. Four lines of content plus room for a bounded explanation.
-                        director_proposal = gr.Textbox(
-                            label=LABEL_DIRECTOR_PROPOSAL,
-                            value='',
-                            placeholder=PLACEHOLDER_DIRECTOR_PROPOSAL,
-                            lines=6,
-                            max_lines=10,
-                            interactive=False,
-                            elem_id='director-proposal-box',
-                        )
-                        # Its own panel. The Director never borrows `variant_report`,
-                        # `variant_batch_status`, `audio_layers_report` or `smart_mix_report`:
-                        # a panel that described two different things would leave the user unable
-                        # to tell which statement was about which.
-                        director_status = gr.Textbox(
-                            label=LABEL_DIRECTOR_STATUS,
-                            value='',
-                            placeholder=PLACEHOLDER_DIRECTOR_STATUS,
-                            lines=3,
-                            max_lines=5,
-                            interactive=False,
-                            elem_id='director-status-box',
-                        )
-                with gr.Group():
+                    # GUI Refresh A put it on the render tab on the argument that it is the one
+                    # creative choice a user who never opens the studio still wants. That argument
+                    # did not survive contact: the selector is a read-out of six values that live
+                    # on *another* tab, so a user who changed a slider saw a preset name change on
+                    # a screen they were not looking at, and a user on the render tab saw a name
+                    # with no way to see or adjust what it stood for. The `.input()` graph between
+                    # the seven widgets is completely unchanged -- it always crossed tabs and still
+                    # does -- so this is a pure re-parenting, and the render tab now carries a
+                    # truthful resolved *summary* instead of one of the controls.
+                    creative_preset = gr.Radio(
+                        choices=list(fork_presets.PRESET_NAMES),
+                        value=fork_presets.BALANCED_PRESET,
+                        label=LABEL_CREATIVE_PRESET,
+                        info=INFO_CREATIVE_PRESET,
+                        elem_id='creative-preset-radio',
+                    )
                     variation_seed = gr.Number(
                         label=LABEL_VARIATION_SEED,
                         value=0,
@@ -8612,7 +9308,40 @@ def create_ui() -> gr.Blocks:
                         info=INFO_VARIATION_SEED,
                         elem_id='variation-seed-input',
                     )
-                    randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+                    # [FORK] R8 Owner Fixes (P1): two buttons side by side, equal weight.
+                    #
+                    # Clear used to be a small `size='sm'` control underneath a full-width
+                    # Randomize, which the owner read as a text link rather than an action. They
+                    # are opposite operations on the same setting, so they belong on one row at
+                    # the same size -- and Clear carries `variant='stop'` because it discards
+                    # work, which Randomize does not.
+                    with gr.Row():
+                        randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED,
+                                                  elem_id='randomize-seed-button')
+                        clear_variations_btn = gr.Button(
+                            LABEL_CLEAR_VARIATIONS, variant='stop',
+                            elem_id='clear-variations-button')
+                    gr.Markdown(INFO_CLEAR_VARIATIONS)
+
+                    # [FORK] R8 Final Polish: Clear Creative Variations.
+                    #
+                    # It exists because the obvious alternative is a FALSE statement. Selecting
+                    # the `Balanced` preset resets the six base sliders and NOTHING ELSE -- it
+                    # leaves the Variation Seed, Freestyle and every Audio Mix setting exactly as
+                    # they were -- so describing it as "start from scratch" would be wrong, and
+                    # an earlier draft of this refresh did describe it that way.
+                    #
+                    # So the two actions are deliberately disjoint and neither is a superset:
+                    #
+                    #     Balanced preset          ->  the six sliders, and only those
+                    #     Clear Creative Variations ->  the seed and Freestyle, and only those
+                    #
+                    # It writes no slider, so it cannot become a second preset authority, and it
+                    # touches nothing in Audio Mix, which is a different tab and a different
+                    # decision. Those two absences are what keep it from being a second source of
+                    # truth; both are pinned by test. (The widget itself is declared in the Row
+                    # above, beside Randomize.)
+
                     # Randomize stays seed-only on purpose; these three have no randomizer and no
                     # reset. 50 is current BeatSync behaviour in every one of them, and the default
                     # is the fork module's constant rather than a literal repeated here.
@@ -8690,72 +9419,156 @@ def create_ui() -> gr.Blocks:
                     # These widgets write NO global creative widget. They are also live inputs to
                     # both render events, which is what makes them execution authority rather than
                     # the summary state.
-                    with gr.Accordion(label=LABEL_FREESTYLE, open=True):
-                        gr.Markdown(INFO_FREESTYLE)
-                        freestyle_enabled = gr.Checkbox(
-                            value=False,
-                            label=LABEL_FREESTYLE_ENABLED,
-                            info=INFO_FREESTYLE_ENABLED,
-                            elem_id='freestyle-enabled-checkbox',
+                    # [FORK] R8 Final Polish: the Director MOVED below the six controls, and all
+                    # three big blocks are COLLAPSED.
+                    #
+                    # GUI Refresh A opened the Director and Freestyle on the argument that they
+                    # were easy to overlook. Measured afterwards, this tab was 3,516 px tall and
+                    # the controls an operator actually reaches for every render -- the preset,
+                    # the seed, the six sliders -- were the part you had to scroll past three
+                    # open panels to reach. Discoverability is a tab away; scrolling is on every
+                    # visit. The order is now frequency of use, and the explanation the old
+                    # ordering carried ("describe the edit, then the controls") survives as the
+                    # order of the collapsed panels themselves.
+                    # [FORK] Digital-Union (AI Director V1): a compact group at the TOP of this
+                    # block, because the order is the explanation — describe the edit, review a
+                    # proposal, then the existing Creative Controls below are what actually gets
+                    # rendered:
+                    #
+                    #     AI Director  ->  Creative Controls  ->  Variant Lab  ->  Render
+                    #
+                    # Five components and one hidden state object. No gallery, no chat UI, no
+                    # conversation history, and deliberately not a new top-level workflow: the
+                    # Director is a second way to fill in controls this app already had.
+                    #
+                    # The instruction box registers NOTHING — it is read at click time, exactly
+                    # like every Variant Lab configuration widget — so typing an instruction
+                    # cannot move a slider, clear a confirmation or start anything.
+                    with gr.Accordion(label=LABEL_AI_DIRECTOR, open=False):
+                        gr.Markdown(INFO_AI_DIRECTOR)
+                        director_instruction = gr.Textbox(
+                            label=LABEL_DIRECTOR_INSTRUCTION,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_INSTRUCTION,
+                            info=INFO_DIRECTOR_INSTRUCTION,
+                            lines=3,
+                            max_lines=6,
+                            elem_id='director-instruction-input',
                         )
-                        # One dropdown per Stage-3 section type, declared explicitly rather than in
-                        # a loop so each widget is visible to the per-widget seam assertions — the
-                        # same reason the six slider bindings are written out one at a time.
-                        # [FORK] Digital-Union (Random Freestyle V2): `Random` is now the default,
-                        # so enabling Freestyle is experimental without ten manual picks. `Base`
-                        # remains available and still means "inherit the live global value"; the
-                        # other four named styles are unchanged. Freestyle OFF is unaffected —
-                        # the switch is still the only gate.
-                        freestyle_intro = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
-                            elem_id='freestyle-intro')
-                        freestyle_hook = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
-                            elem_id='freestyle-hook')
-                        freestyle_outro = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
-                            elem_id='freestyle-outro')
-                        freestyle_finale = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
-                            elem_id='freestyle-finale')
-                        freestyle_drop = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
-                            elem_id='freestyle-drop')
-                        freestyle_chorus = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
-                            elem_id='freestyle-chorus')
-                        freestyle_bridge = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
-                            elem_id='freestyle-bridge')
-                        freestyle_breakdown = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
-                            elem_id='freestyle-breakdown')
-                        freestyle_verse = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
-                            elem_id='freestyle-verse')
-                        freestyle_body = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
-                            elem_id='freestyle-body')
+                        with gr.Row():
+                            generate_director_btn = gr.Button(
+                                LABEL_GENERATE_PROPOSAL, variant='secondary',
+                                elem_id='generate-director-proposal-button')
+                            apply_director_btn = gr.Button(
+                                LABEL_APPLY_PROPOSAL, variant='secondary',
+                                elem_id='apply-director-proposal-button')
+                        # Read-only, and formatted entirely by `DirectorProposal.display_text()` —
+                        # one formatter per read-out, exactly as the Variant Lab and mix reports
+                        # work. Four lines of content plus room for a bounded explanation.
+                        director_proposal = gr.Textbox(
+                            label=LABEL_DIRECTOR_PROPOSAL,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_PROPOSAL,
+                            lines=6,
+                            max_lines=10,
+                            interactive=False,
+                            elem_id='director-proposal-box',
+                        )
+                        # Its own panel. The Director never borrows `variant_report`,
+                        # `variant_batch_status`, `audio_layers_report` or `smart_mix_report`:
+                        # a panel that described two different things would leave the user unable
+                        # to tell which statement was about which.
+                        director_status = gr.Textbox(
+                            label=LABEL_DIRECTOR_STATUS,
+                            value='',
+                            placeholder=PLACEHOLDER_DIRECTOR_STATUS,
+                            lines=3,
+                            max_lines=5,
+                            interactive=False,
+                            elem_id='director-status-box',
+                        )
+                    with gr.Accordion(label=LABEL_FREESTYLE, open=False):
+                        gr.Markdown(INFO_FREESTYLE)
+                        # [FORK] R8 Owner Fixes (P1): the switch, and a badge that SAYS which mode
+                        # the panel is in. The owner reported the checkbox alone was easy to miss
+                        # among ten dropdowns -- which matters because Freestyle silently replaces
+                        # the global Creative Controls, so missing its state means misreading the
+                        # whole render. The badge is Markdown written by `_on_freestyle_change`
+                        # from the live checkbox value; it gates nothing.
+                        with gr.Group(elem_id='freestyle-switch-row'):
+                            freestyle_enabled = gr.Checkbox(
+                                value=False,
+                                label=LABEL_FREESTYLE_ENABLED,
+                                info=INFO_FREESTYLE_ENABLED,
+                                elem_id='freestyle-enabled-checkbox',
+                            )
+                            freestyle_state_badge = gr.Markdown(
+                                FREESTYLE_BADGE_OFF, elem_id='freestyle-state-badge')
+                        # The ten section rules, shown only in the mode where they do anything.
+                        #
+                        # `visible=False` HIDES but does not clear: Gradio keeps a hidden
+                        # component's value and still submits it, so a rule set survives being
+                        # switched off and comes back untouched. Resetting them instead would make
+                        # the switch destructive, which is the opposite of what was asked for.
+                        with gr.Group(visible=False) as freestyle_sections_group:
+                                # One dropdown per Stage-3 section type, declared explicitly rather than in
+                            # a loop so each widget is visible to the per-widget seam assertions — the
+                            # same reason the six slider bindings are written out one at a time.
+                            # [FORK] Digital-Union (Random Freestyle V2): `Random` is now the default,
+                            # so enabling Freestyle is experimental without ten manual picks. `Base`
+                            # remains available and still means "inherit the live global value"; the
+                            # other four named styles are unchanged. Freestyle OFF is unaffected —
+                            # the switch is still the only gate.
+                            freestyle_intro = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
+                                elem_id='freestyle-intro')
+                            freestyle_hook = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
+                                elem_id='freestyle-hook')
+                            freestyle_outro = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
+                                elem_id='freestyle-outro')
+                            freestyle_finale = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
+                                elem_id='freestyle-finale')
+                            freestyle_drop = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
+                                elem_id='freestyle-drop')
+                            freestyle_chorus = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
+                                elem_id='freestyle-chorus')
+                            freestyle_bridge = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
+                                elem_id='freestyle-bridge')
+                            freestyle_breakdown = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
+                                elem_id='freestyle-breakdown')
+                            freestyle_verse = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
+                                elem_id='freestyle-verse')
+                            freestyle_body = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
+                                elem_id='freestyle-body')
                         # Read-only, and formatted entirely by `freestyle.summary_text()` — one
                         # formatter per read-out, exactly as the Variant Lab, mix and Director
                         # reports work. It never prints an inherited number; see the handler.
@@ -8783,13 +9596,25 @@ def create_ui() -> gr.Blocks:
                     # registers a handler, none is a `process_btn` input, and none appears in
                     # `source_outputs` or `prep_outputs`.
                     with gr.Accordion(label=LABEL_VARIANT_LAB, open=False):
-                        gr.Markdown(INFO_VARIANT_LAB)
+                        # [FORK] R8 Owner Fixes (P2): one sentence visible, the rest one click
+                        # away. The long Markdown blocks that used to sit beside the controls
+                        # they describe are REUSED VERBATIM inside the help panel below -- there
+                        # is no shortened second version of any of them to drift out of date.
+                        gr.Markdown(INFO_VARIANT_LAB_LEAD)
+                        with gr.Accordion(label=LABEL_VARIANT_HELP, open=False):
+                            gr.Markdown(INFO_VARIANT_LAB)
+                            gr.Markdown(f"**{LABEL_MASTER_SEED}**\n\n{INFO_MASTER_SEED}")
+                            gr.Markdown(INFO_VARIANT_RANGES)
+                            gr.Markdown(INFO_VARIANT_AUDIO)
+                            gr.Markdown(INFO_VARIANT_AUDIO_RANGES)
+                            gr.Markdown(INFO_VARIANT_COMPARE)
+                            gr.Markdown(INFO_VARIANT_APPLY)
                         variant_master_seed = gr.Number(
                             label=LABEL_MASTER_SEED,
                             value=0,
                             precision=0,
                             minimum=0,
-                            info=INFO_MASTER_SEED,
+                            info=INFO_MASTER_SEED_SHORT,
                             elem_id='variant-master-seed-input',
                         )
                         variation_spread = gr.Slider(
@@ -8812,7 +9637,6 @@ def create_ui() -> gr.Blocks:
                             info=INFO_VARIANT_RANDOMIZE,
                             elem_id='variant-randomize-group',
                         )
-                        gr.Markdown(INFO_VARIANT_RANGES)
                         # `gr.RangeSlider` does not exist in Gradio 6.19.0 (verified against the
                         # installed package), and a custom JS control is out of scope, so each
                         # control gets an explicit min/max pair. Declared one widget at a time, like
@@ -8841,7 +9665,6 @@ def create_ui() -> gr.Blocks:
                         # deliberately no audio master seed and no audio Spread; the two above drive
                         # both halves. Like every other lab widget these register NOTHING and are
                         # read at click time only.
-                        gr.Markdown(INFO_VARIANT_AUDIO)
                         # `(label, value)` choices, so the returned value IS the exact field name
                         # the resolver keys on and the RNG stream is named by. Never derived from
                         # the display label by lowercasing or rewriting: these three strings are
@@ -8859,7 +9682,6 @@ def create_ui() -> gr.Blocks:
                             info=INFO_VARIANT_AUDIO_RANDOMIZE,
                             elem_id='variant-audio-randomize-group',
                         )
-                        gr.Markdown(INFO_VARIANT_AUDIO_RANGES)
                         with gr.Row():
                             range_music_under_voice_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} min', elem_id='variant-range-music-under-voice-min')
                             range_music_under_voice_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} max', elem_id='variant-range-music-under-voice-max')
@@ -8879,12 +9701,17 @@ def create_ui() -> gr.Blocks:
                         # Raised for truthful display only — if the box were left at five the audio
                         # half would be silently clipped out of a read-out that claims to describe
                         # the whole generated variant.
+                        # [FORK] R8 Owner Fixes (P2): `lines` is the EMPTY height, `max_lines`
+                        # the grown one -- Gradio expands a textbox toward `max_lines` as content
+                        # arrives. The old pair was 7/7, so an empty lab reserved its full report
+                        # height before a single variant existed. The ceiling is RAISED, not cut:
+                        # a report must never be clipped, which is why 7 was chosen originally.
                         variant_report = gr.Textbox(
                             label=LABEL_VARIANT_REPORT,
                             value='',
                             placeholder=PLACEHOLDER_VARIANT_REPORT,
-                            lines=7,
-                            max_lines=7,
+                            lines=2,
+                            max_lines=12,
                             interactive=False,
                             elem_id='variant-report-box',
                         )
@@ -8894,7 +9721,6 @@ def create_ui() -> gr.Blocks:
                         # second Variant Lab. Like every other lab widget these are read at click
                         # time and register nothing; the candidate selector deliberately has no
                         # `.change()` handler, since Apply reads its current value itself.
-                        gr.Markdown(INFO_VARIANT_COMPARE)
                         variant_candidate_count = gr.Number(
                             label=LABEL_CANDIDATE_COUNT,
                             value=fork_batch.CANDIDATE_COUNT_DEFAULT,
@@ -8915,7 +9741,10 @@ def create_ui() -> gr.Blocks:
                             label=LABEL_VARIANT_BATCH_TABLE,
                             value='',
                             placeholder=PLACEHOLDER_VARIANT_BATCH_TABLE,
-                            lines=13,
+                            # [FORK] R8 Owner Fixes (P2): 13 empty lines before any candidate
+                            # exists. The ceiling stays 16 -- it is what holds the header, the
+                            # column rule and twelve candidate rows without clipping one.
+                            lines=3,
                             max_lines=16,
                             interactive=False,
                             elem_id='variant-batch-table',
@@ -8942,7 +9771,6 @@ def create_ui() -> gr.Blocks:
                             interactive=False,
                             elem_id='variant-batch-status',
                         )
-                        gr.Markdown(INFO_VARIANT_APPLY)
                         # [FORK] Digital-Union (C3-R0 -> C3-R1B-b): render 2 to 4 of the compared
                         # candidates. A SEPARATE selector from the Apply Radio above — one control
                         # cannot honestly mean both "apply this one" and "render these", and
@@ -9210,13 +10038,250 @@ def create_ui() -> gr.Blocks:
                                 max_lines=34,
                                 elem_id='cut-batch-summary',
                             )
+                # [FORK] R8 UX Refresh (Commit A): the Raw Cutter's half of "Open results in
+                # Media Library", the symmetric partner of the Audio Cutter's button.
+                #
+                # It sits OUTSIDE both `cut_single_readouts` and `cut_batch_readouts` on purpose,
+                # so it is available in Single and Folder Batch alike -- those two columns are
+                # mutually exclusive and a button inside either would vanish in the other mode.
+                #
+                # It hands over `cut_output` (the parent output folder) with subfolders INCLUDED,
+                # rather than the exact run directory. That is a deliberate accuracy trade and not
+                # laziness: every run writes its own fresh timestamped subfolder, and the Raw
+                # Cutter keeps no run-directory state the way the Audio Cutter's
+                # `audio_run_dir_state` does. Adding one would mean changing the Cut handler's
+                # return signature, which several suites pin positionally -- so the button reads a
+                # widget that already exists and tells the operator exactly what it did. Reviewing
+                # still never requires having run a cutter: Video Review's folder box is editable
+                # and this only ever fills it in.
+                cut_open_library_btn = gr.Button(
+                    LABEL_CUT_OPEN_LIBRARY, variant='secondary', size='sm',
+                    elem_id='cut-open-library-button')
+                gr.Markdown(INFO_CUT_OPEN_LIBRARY)
+
                 # The plan rides as a plain dict of primitives. Nothing live -- no thread, lock,
                 # handle or lifecycle -- may enter `gr.State`, and a dict is also what lets the
                 # Cut handler recompute the staleness signature and compare it.
                 cut_plan_state = gr.State(None)
 
-            with gr.Tab(LABEL_TAB_ADVANCED, id='tab-advanced-tools'):
-                gr.Markdown(INFO_TAB_ADVANCED)
+            # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
+            # between Advanced Tools and Clips Preview.
+            #
+            # That position is chosen, not incidental. Placing it here keeps Advanced Tools at
+            # index 3, so every containment assertion in `test_gui_tabs.py` that counts from the
+            # front is unaffected; it keeps Clips Preview LAST, which its own suite requires; and
+            # it keeps this markup out of the Raw-Cutter-to-Advanced span that
+            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+            #
+            # Every numeric control here is a Number widget, and that is the same non-cosmetic
+            # constraint the Clips Preview tab records: a tab in this region falls inside the
+            # source span that
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+            # a substring check, so the forbidden widget type must not appear in this span even
+            # inside a comment explaining its absence -- which is why this one does not name it.
+            with gr.Tab(LABEL_TAB_AUDIO_CUTTER, id='tab-audio-cutter'):
+                gr.Markdown(INFO_TAB_AUDIO_CUTTER)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        with gr.Group():
+                            audio_source = gr.Textbox(
+                                label=LABEL_AUDIO_SOURCE,
+                                info=INFO_AUDIO_SOURCE,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_INPUT),
+                                placeholder=r"J:\Recordings\interview_take2.wav",
+                                elem_id='audio-source')
+                            audio_source_browse = gr.Button(
+                                LABEL_BROWSE_FILE, variant='secondary', scale=0,
+                                elem_id='audio-source-browse')
+                        with gr.Group():
+                            audio_output = gr.Textbox(
+                                label=LABEL_AUDIO_OUTPUT,
+                                info=INFO_AUDIO_OUTPUT,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                                placeholder=r"J:\Voice Parts",
+                                elem_id='audio-output')
+                            audio_output_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='audio-output-browse')
+                        with gr.Group():
+                            with gr.Row():
+                                audio_threshold = gr.Number(
+                                    label=LABEL_AUDIO_THRESHOLD,
+                                    info=INFO_AUDIO_THRESHOLD,
+                                    value=fork_audio.DEFAULT_THRESHOLD_DB,
+                                    elem_id='audio-threshold')
+                                audio_min_silence = gr.Number(
+                                    label=LABEL_AUDIO_MIN_SILENCE,
+                                    info=INFO_AUDIO_MIN_SILENCE,
+                                    value=fork_audio.DEFAULT_MIN_SILENCE, minimum=0,
+                                    elem_id='audio-min-silence')
+                            with gr.Row():
+                                audio_pad = gr.Number(
+                                    label=LABEL_AUDIO_PAD,
+                                    info=INFO_AUDIO_PAD,
+                                    value=fork_audio.DEFAULT_PAD, minimum=0,
+                                    elem_id='audio-pad')
+                                audio_min_clip = gr.Number(
+                                    label=LABEL_AUDIO_MIN_CLIP,
+                                    info=INFO_AUDIO_MIN_CLIP,
+                                    value=fork_audio.DEFAULT_MIN_CLIP, minimum=0,
+                                    elem_id='audio-min-clip')
+                            # [R7.2] One choice per entry in `fork_audio.FORMATS`, APPENDED so
+                            # WAV stays the default and the two existing values keep their
+                            # positions. A test pins this list against `FORMATS` by value,
+                            # because the first browser smoke test of Phase 5 found the core, the
+                            # handler, the manifest and the argv all supporting MP3 while the
+                            # selector still offered only two options -- the one place an operator
+                            # could actually choose it.
+                            audio_format = gr.Radio(
+                                label=LABEL_AUDIO_FORMAT,
+                                info=INFO_AUDIO_FORMAT,
+                                choices=[("WAV · 16-bit PCM · 48 kHz", fork_audio.FORMAT_WAV),
+                                         ("FLAC · lossless · 48 kHz", fork_audio.FORMAT_FLAC),
+                                         (f"MP3 · {fork_audio.DEFAULT_MP3_BITRATE_KBPS} kbps · "
+                                          f"smaller files, lossy", fork_audio.FORMAT_MP3)],
+                                value=fork_audio.FORMAT_WAV,
+                                elem_id='audio-format')
+                            # [FORK] R8 UX Refresh (Phase 9): optional soft edges. OFF by
+                            # default, so every export already accepted stays bit-identical
+                            # unless the operator asks for this.
+                            audio_fade_edges = gr.Checkbox(
+                                value=False,
+                                label=LABEL_AUDIO_FADE_EDGES,
+                                info=INFO_AUDIO_FADE_EDGES,
+                                elem_id='audio-fade-edges')
+                        with gr.Row():
+                            audio_analyze_btn = gr.Button(
+                                LABEL_AUDIO_ANALYZE, variant='secondary',
+                                elem_id='audio-analyze-button')
+                            audio_cut_btn = gr.Button(
+                                LABEL_AUDIO_CUT, variant='primary',
+                                elem_id='audio-cut-button')
+                        gr.Markdown(INFO_AUDIO_BUTTONS)
+                    with gr.Column(scale=2):
+                        audio_plan = gr.Textbox(
+                            label=LABEL_AUDIO_PLAN,
+                            value=AUDIO_PLAN_INITIAL_TEXT,
+                            interactive=False, lines=12, max_lines=20,
+                            elem_id='audio-plan-box')
+                        audio_table = gr.Dataframe(
+                            headers=["Clip", "Start", "End", "Length", "Output name"],
+                            datatype=["number", "str", "str", "str", "str"],
+                            value=[], interactive=False, wrap=True,
+                            label=LABEL_AUDIO_TABLE,
+                            elem_id='audio-table')
+                        audio_report = gr.Textbox(
+                            label=LABEL_AUDIO_REPORT,
+                            value=AUDIO_REPORT_INITIAL_TEXT,
+                            interactive=False, lines=8, max_lines=16,
+                            elem_id='audio-report-box')
+
+                # The review half: listen to what was actually written, then file it.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_AUDIO_REVIEW}\n\n{INFO_AUDIO_REVIEW}")
+                    with gr.Row():
+                        audio_library_folder = gr.Textbox(
+                            label=LABEL_AUDIO_LIBRARY,
+                            info=INFO_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='audio-library-folder')
+                        audio_discarded_folder = gr.Textbox(
+                            label=LABEL_AUDIO_DISCARDED,
+                            info=INFO_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='audio-discarded-folder')
+                    with gr.Row():
+                        audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-library-browse')
+                        audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-discarded-browse')
+                    # [R7.2 Phase 4] The live destination read-out. Written by the two folder
+                    # `.change()` handlers and by Confirm, so "these two folders are the same" is
+                    # visible while the operator is still typing rather than only when a sort is
+                    # refused -- which is the defect reported from real use.
+                    audio_destination_status = gr.Textbox(
+                        label=LABEL_AUDIO_DESTINATION_STATUS,
+                        value=AUDIO_DESTINATION_STATUS_INITIAL,
+                        interactive=False, lines=2, max_lines=5,
+                        elem_id='audio-destination-status')
+                    gr.Markdown(INFO_AUDIO_GALLERY)
+                    gr.HTML(AUDIO_GALLERY_CSS)
+                    with gr.Row():
+                        audio_enable_hover = gr.Button(
+                            LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                            elem_id='audio-enable-hover',
+                            elem_classes=['r7-enable-hover'])
+                        audio_counts = gr.Textbox(
+                            label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                            interactive=False, elem_id='audio-counts')
+                    audio_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
+                                            elem_id='audio-gallery')
+                    # The ONE server contract with the page: every decision and every edited name
+                    # as JSON. Hidden because it is machinery, not a control -- but a real widget,
+                    # so Gradio carries it with the click like any other input.
+                    # NOT `visible=False`: Gradio drops an invisible component from the DOM
+                    # entirely, and the page has to be able to write into this one. It is hidden
+                    # with CSS instead -- present, carried with the click, and off screen.
+                    audio_decisions = gr.Textbox(
+                        value='', label=' ', elem_id='audio-decisions')
+                    audio_confirm_btn = gr.Button(
+                        LABEL_AUDIO_CONFIRM, variant='primary',
+                        elem_id='audio-confirm-button',
+                        # The client releases the player on `pointerdown` of anything carrying
+                        # this class. Windows will not rename a file a player still holds open.
+                        elem_classes=['r7-release-audio'])
+                    # [R7.2 Phase 3] The sweep gate. Hidden until Confirm finds unmarked clips, and
+                    # hidden again the moment the batch is resolved either way, so the screen never
+                    # offers a Proceed that is not attached to a specific set of counts.
+                    with gr.Row():
+                        audio_proceed_btn = gr.Button(
+                            LABEL_AUDIO_PROCEED, variant='stop', visible=False,
+                            elem_id='audio-proceed-button',
+                            elem_classes=['r7-release-audio'])
+                        audio_sweep_cancel_btn = gr.Button(
+                            LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
+                            elem_id='audio-sweep-cancel-button')
+                    audio_open_preview_btn = gr.Button(
+                        LABEL_AUDIO_OPEN_IN_PREVIEW, variant='secondary',
+                        elem_id='audio-open-preview-button')
+                    gr.Markdown(INFO_AUDIO_OPEN_IN_PREVIEW)
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            audio_clip_name = gr.Textbox(
+                                label=LABEL_AUDIO_CLIP_NAME,
+                                info=INFO_AUDIO_CLIP_NAME,
+                                value='', visible=False, elem_id='audio-clip-name')
+                        with gr.Column(scale=3):
+                            # [R7.1] Kept as a fallback player for a single clip, hidden by
+                            # default: the gallery's hover playback is the review surface now.
+                            audio_player = gr.HTML(
+                                value='', visible=False, elem_id='audio-player')
+                    audio_file_report = gr.Textbox(
+                        label=LABEL_AUDIO_FILE_REPORT,
+                        value=AUDIO_FILE_REPORT_INITIAL_TEXT,
+                        interactive=False, lines=4, max_lines=10,
+                        elem_id='audio-file-report')
+                    # Per-browser-session, so one operator's review list is not reachable from
+                    # another tab. Nothing about the clips lives in a module-level record.
+                    #
+                    # [R7.2] Holds the whole view: the registry session and page tokens, the frozen
+                    # entries, and the decision/name records keyed by FILE IDENTITY so they survive
+                    # paging. `audio_armed_state` holds the sweep signature of the batch the
+                    # operator confirmed, and only that batch -- a plain string, never a live
+                    # object.
+                    audio_review_state = gr.State({})
+                    audio_armed_state = gr.State('')
+                    audio_run_dir_state = gr.State('')
+
+                gr.Markdown(INFO_AUDIO_LAYERS_TIP)
+
+            with gr.Tab(LABEL_TAB_AUDIO_MIX, id='tab-audio-mix'):
+                gr.Markdown(INFO_TAB_AUDIO_MIX)
                 # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed.
                 # GUI Refresh A moved it out from under the main audio input and into this tab: it
                 # is an occasional extra, and keeping it beside the audio picker cost the render
@@ -9350,607 +10415,465 @@ def create_ui() -> gr.Blocks:
                         elem_id='smart-mix-report-box',
                     )
 
-                # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
-                # workflow, not part of the render flow. Nothing in here is wired to
-                # `source_outputs`, so it cannot touch the Create Music Video gate.
-                #
-                # It stays collapsed (pinned by test) even though it now has its own tab, and it is
-                # deliberately the LAST block in that tab: nothing containing a `gr.Slider` may sit
-                # between the sample UI and the event wiring, which is the span
-                # `test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices to prove the
-                # approved sample resource policy is not widenable from the GUI.
-                #
-                # (GUI Refresh A note: this comment used to describe the section as "rather than a
-                # restructuring of the app into tabs". That restructuring has since happened, and
-                # this block was one of the things it moved.)
-                with gr.Accordion(label=LABEL_PREP_SECTION, open=False):
-                    gr.Markdown(INFO_PREP_SECTION)
-                    prep_folder = gr.Textbox(
-                        label=LABEL_PREP_FOLDER,
-                        placeholder=PLACEHOLDER_SOURCE_FOLDER,
-                        info=INFO_PREP_FOLDER,
-                        elem_id='prep-folder-input',
-                    )
-                    prep_recursive = gr.Checkbox(
-                        value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
-                    )
-                    # No `maximum`: this bounds one analysis run, never the supported library size.
-                    # The default is the preparation module's constant, not a literal repeated here.
-                    prep_batch_size = gr.Number(
-                        value=fork_prep.DEFAULT_ANALYZE_BATCH_SIZE,
-                        precision=0,
-                        minimum=1,
-                        label=LABEL_PREP_BATCH_SIZE,
-                        info=INFO_PREP_BATCH_SIZE,
-                        elem_id='prep-batch-size',
-                    )
-                    prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
-                    prep_report = gr.Textbox(
-                        label=LABEL_PREP_REPORT,
-                        value=initial_prep_state().report_text,
-                        interactive=False,
-                        lines=10,
-                        max_lines=16,
-                        elem_id='prep-report-box',
-                    )
-                    prep_analyze_btn = gr.Button(
-                        LABEL_PREP_ANALYZE, interactive=False, elem_id='prep-analyze-button'
-                    )
-                    prep_status = gr.Markdown(
-                        initial_prep_state().notice, elem_id='prep-status'
-                    )
-
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
-                    # Inside this accordion because it asks about the same library folder, and
-                    # below Analyze because it is the "did my files change / are they still OK"
-                    # question you ask around a preparation run rather than part of one.
-                    #
-                    # Like the rest of this section it is absent from `source_outputs` and from
-                    # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
-                    # move the preparation state machine. It is also ALWAYS interactive -- the
-                    # render mutex, not a disabled button, is what prevents it running during a
-                    # render, because a button's interactivity is per-session UX while the mutex is
-                    # process-global truth.
-                    gr.Markdown(INFO_PREP_VERIFY)
-                    prep_verify_btn = gr.Button(
-                        LABEL_PREP_VERIFY, variant='secondary',
-                        elem_id='prep-verify-button',
-                    )
-                    prep_verify_report = gr.Textbox(
-                        label=LABEL_PREP_VERIFY_REPORT,
-                        value=PREP_VERIFY_INITIAL_TEXT,
-                        interactive=False,
-                        lines=12,
-                        max_lines=24,
-                        elem_id='prep-verify-report-box',
-                    )
-
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample decode.
-                    # Immediately after Verify Sources because it is the natural follow-up
-                    # question -- "the metadata reads fine, but can FFmpeg actually produce frames
-                    # here?" -- and it is deliberately a DIFFERENT question, on one file rather
-                    # than the whole library.
-                    #
-                    # Like the rest of this accordion it is absent from `source_outputs` and
-                    # `prep_outputs`: it cannot touch the Create Music Video gate and cannot move
-                    # the preparation state machine. Also ALWAYS interactive, for the same reason
-                    # Verify Sources is -- the render mutex, not a disabled button, is what
-                    # prevents it running during a render, because interactivity is per-session UX
-                    # while the mutex is process-global truth.
-                    #
-                    # One file, one position, one explicit button. No dropdown of the library (a
-                    # ~2,000-source folder on a mechanical drive would have to be enumerated to
-                    # build it), no browser upload (it would copy large media into a temp folder),
-                    # no frame-count control and no timeout control.
-                    gr.Markdown(INFO_PREP_SAMPLE)
-                    sample_path = gr.Textbox(
-                        label=LABEL_PREP_SAMPLE_PATH,
-                        placeholder=PLACEHOLDER_SAMPLE_VIDEO,
-                        elem_id='prep-sample-path',
-                    )
-                    # Seconds, never a frame number: the diagnostic's own contract forbids
-                    # frames/fps arithmetic, and the selected stream's reported duration is what
-                    # decides whether a position is out of range.
-                    #
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
-                    # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
-                    # client-side courtesy while `run_sample_check` owns the real rejection. GUI
-                    # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
-                    # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
-                    # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
-                    # `_on_sample_decode_click` was ever entered. The operator saw a framework error
-                    # toast instead of the diagnostic's own report, and the core's
-                    # finite-and-non-negative branch was unreachable from this widget.
-                    #
-                    # Removing the bound hands the decision back to the accepted core, which refuses
-                    # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
-                    # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
-                    # work. No GUI-side validation, clamping or normalisation is added here: a
-                    # second opinion about what a valid seek is would be exactly the duplication
-                    # this integration exists to avoid.
-                    sample_seek = gr.Number(
-                        value=1.0,
-                        step=0.5,
-                        label=LABEL_PREP_SAMPLE_SEEK,
-                        elem_id='prep-sample-seek',
-                    )
-                    sample_btn = gr.Button(
-                        LABEL_PREP_SAMPLE, variant='secondary',
-                        elem_id='prep-sample-button',
-                    )
-                    sample_report = gr.Textbox(
-                        label=LABEL_PREP_SAMPLE_REPORT,
-                        value=PREP_SAMPLE_INITIAL_TEXT,
-                        interactive=False,
-                        lines=14,
-                        max_lines=28,
-                        elem_id='prep-sample-report-box',
-                    )
-
-            # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
-            # between Advanced Tools and Clips Preview.
+            # [FORK] Digital-Union (R8 UX Refresh, Commit A): the Media Library tab.
             #
-            # That position is chosen, not incidental. Placing it here keeps Advanced Tools at
-            # index 3, so every containment assertion in `test_gui_tabs.py` that counts from the
-            # front is unaffected; it keeps Clips Preview LAST, which its own suite requires; and
-            # it keeps this markup out of the Raw-Cutter-to-Advanced span that
-            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+            # Three review and maintenance workflows that all answer "what is in my library?"
+            # used to be two separate top-level tabs plus an accordion buried at the bottom of
+            # Advanced Tools. They are the same job at three stages, so they are now three
+            # sections of one tab -- and nothing about their engines changed: every widget,
+            # `elem_id` and event registration below is the pre-existing one, re-parented.
             #
-            # Every numeric control here is a Number widget, and that is the same non-cosmetic
-            # constraint the Clips Preview tab records: a tab in this region falls inside the
-            # source span that
+            # Prepare & Verify is deliberately LAST. The span from `INFO_PREP_SAMPLE` to
+            # `sample_btn.click(` is what
             # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
-            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
-            # a substring check, so the forbidden widget type must not appear in this span even
-            # inside a comment explaining its absence -- which is why this one does not name it.
-            with gr.Tab(LABEL_TAB_AUDIO_CUTTER, id='tab-audio-cutter'):
-                gr.Markdown(INFO_TAB_AUDIO_CUTTER)
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        with gr.Group():
-                            audio_source = gr.Textbox(
-                                label=LABEL_AUDIO_SOURCE,
-                                info=INFO_AUDIO_SOURCE,
-                                value=_pref(fork_prefs.AUDIO_CUTTER_INPUT),
-                                placeholder=r"J:\Recordings\interview_take2.wav",
-                                elem_id='audio-source')
-                            audio_source_browse = gr.Button(
-                                LABEL_BROWSE_FILE, variant='secondary', scale=0,
-                                elem_id='audio-source-browse')
-                        with gr.Group():
-                            audio_output = gr.Textbox(
-                                label=LABEL_AUDIO_OUTPUT,
-                                info=INFO_AUDIO_OUTPUT,
-                                value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
-                                placeholder=r"J:\Voice Parts",
-                                elem_id='audio-output')
-                            audio_output_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='audio-output-browse')
-                        with gr.Group():
-                            with gr.Row():
-                                audio_threshold = gr.Number(
-                                    label=LABEL_AUDIO_THRESHOLD,
-                                    info=INFO_AUDIO_THRESHOLD,
-                                    value=fork_audio.DEFAULT_THRESHOLD_DB,
-                                    elem_id='audio-threshold')
-                                audio_min_silence = gr.Number(
-                                    label=LABEL_AUDIO_MIN_SILENCE,
-                                    info=INFO_AUDIO_MIN_SILENCE,
-                                    value=fork_audio.DEFAULT_MIN_SILENCE, minimum=0,
-                                    elem_id='audio-min-silence')
-                            with gr.Row():
-                                audio_pad = gr.Number(
-                                    label=LABEL_AUDIO_PAD,
-                                    info=INFO_AUDIO_PAD,
-                                    value=fork_audio.DEFAULT_PAD, minimum=0,
-                                    elem_id='audio-pad')
-                                audio_min_clip = gr.Number(
-                                    label=LABEL_AUDIO_MIN_CLIP,
-                                    info=INFO_AUDIO_MIN_CLIP,
-                                    value=fork_audio.DEFAULT_MIN_CLIP, minimum=0,
-                                    elem_id='audio-min-clip')
-                            # [R7.2] One choice per entry in `fork_audio.FORMATS`, APPENDED so
-                            # WAV stays the default and the two existing values keep their
-                            # positions. A test pins this list against `FORMATS` by value,
-                            # because the first browser smoke test of Phase 5 found the core, the
-                            # handler, the manifest and the argv all supporting MP3 while the
-                            # selector still offered only two options -- the one place an operator
-                            # could actually choose it.
-                            audio_format = gr.Radio(
-                                label=LABEL_AUDIO_FORMAT,
-                                info=INFO_AUDIO_FORMAT,
-                                choices=[("WAV · 16-bit PCM · 48 kHz", fork_audio.FORMAT_WAV),
-                                         ("FLAC · lossless · 48 kHz", fork_audio.FORMAT_FLAC),
-                                         (f"MP3 · {fork_audio.DEFAULT_MP3_BITRATE_KBPS} kbps · "
-                                          f"smaller files, lossy", fork_audio.FORMAT_MP3)],
-                                value=fork_audio.FORMAT_WAV,
-                                elem_id='audio-format')
+            # slices to prove the approved sample resource policy is not widenable from the GUI,
+            # and it enforces that by OMISSION of one widget type over the whole remaining
+            # source. Putting this section last keeps the Audio Mix sliders *before* it, and
+            # leaves only the Settings tab after it -- which is why every numeric control in
+            # Settings is a Number. The guard is a substring check, so this comment does not
+            # name the banned type either.
+            with gr.Tab(LABEL_TAB_MEDIA_LIBRARY, id='tab-media-library'):
+                gr.Markdown(INFO_TAB_MEDIA_LIBRARY)
+                with gr.Tabs() as library_tabs:
+                    # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
+                    #
+                    # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
+                    # It keeps Advanced Tools at tab index 3, so every existing containment assertion in
+                    # `test_gui_tabs.py` needs no index change; and it keeps this tab's markup out of the
+                    # Raw-Cutter-to-Advanced source span that
+                    # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
+                    #
+                    # Page size is a Number widget, and that is also not cosmetic. A tab placed last
+                    # falls inside the source span that
+                    # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+                    # guards -- measured in R5-P0 as ~39 k characters, running past `source_outputs = [`
+                    # into the event wiring. That test enforces the approved sample resource policy by
+                    # OMISSION, so the forbidden widget type must not appear anywhere in this span, not
+                    # even in a comment explaining why: the guard is a substring check, and prose naming
+                    # the banned token trips it exactly as real code would. (It has now done so five
+                    # times in this repository.) The test is right; the widget is a Number and this
+                    # comment does not name the alternative.
+                    with gr.Tab(LABEL_SECTION_VIDEO_REVIEW, id='tab-video-review'):
+                        gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
                         with gr.Row():
-                            audio_analyze_btn = gr.Button(
-                                LABEL_AUDIO_ANALYZE, variant='secondary',
-                                elem_id='audio-analyze-button')
-                            audio_cut_btn = gr.Button(
-                                LABEL_AUDIO_CUT, variant='primary',
-                                elem_id='audio-cut-button')
-                        gr.Markdown(INFO_AUDIO_BUTTONS)
-                    with gr.Column(scale=2):
-                        audio_plan = gr.Textbox(
-                            label=LABEL_AUDIO_PLAN,
-                            value=AUDIO_PLAN_INITIAL_TEXT,
-                            interactive=False, lines=12, max_lines=20,
-                            elem_id='audio-plan-box')
-                        audio_table = gr.Dataframe(
-                            headers=["Clip", "Start", "End", "Length", "Output name"],
-                            datatype=["number", "str", "str", "str", "str"],
-                            value=[], interactive=False, wrap=True,
-                            label=LABEL_AUDIO_TABLE,
-                            elem_id='audio-table')
-                        audio_report = gr.Textbox(
-                            label=LABEL_AUDIO_REPORT,
-                            value=AUDIO_REPORT_INITIAL_TEXT,
-                            interactive=False, lines=8, max_lines=16,
-                            elem_id='audio-report-box')
+                            clips_input = gr.Textbox(
+                                label=LABEL_CLIPS_INPUT,
+                                info=INFO_CLIPS_INPUT,
+                                value=_pref(fork_prefs.CLIPS_INPUT),
+                                placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
+                                elem_id='clips-input-folder',
+                            )
+                            clips_recursive = gr.Checkbox(
+                                value=True,
+                                label=LABEL_CLIPS_RECURSIVE,
+                                info=INFO_CLIPS_RECURSIVE,
+                                elem_id='clips-recursive',
+                            )
+                        with gr.Row():
+                            clips_input_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-input-browse')
+                        with gr.Row():
+                            clips_library = gr.Textbox(
+                                label=LABEL_CLIPS_LIBRARY,
+                                info=INFO_CLIPS_LIBRARY,
+                                value=_pref(fork_prefs.CLIPS_LIBRARY),
+                                placeholder=r"J:\Media Library",
+                                elem_id='clips-library-folder',
+                            )
+                            clips_rejected = gr.Textbox(
+                                label=LABEL_CLIPS_REJECTED,
+                                info=INFO_CLIPS_REJECTED,
+                                value=_pref(fork_prefs.CLIPS_REJECTED),
+                                placeholder=r"J:\Discarded",
+                                elem_id='clips-rejected-folder',
+                            )
+                        with gr.Row():
+                            clips_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-library-browse')
+                            clips_rejected_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-rejected-browse')
+                        with gr.Row():
+                            clips_page_size = gr.Number(
+                                value=100,
+                                precision=0,
+                                minimum=1,
+                                maximum=fork_clips.MAX_CLIPS_PER_PAGE,
+                                label=LABEL_CLIPS_PAGE_SIZE,
+                                info=INFO_CLIPS_PAGE_SIZE,
+                                elem_id='clips-page-size',
+                            )
+                            clips_check_btn = gr.Button(
+                                LABEL_CLIPS_CHECK, variant='secondary', elem_id='clips-check-button')
+                            clips_scan_btn = gr.Button(
+                                LABEL_CLIPS_SCAN, variant='primary', elem_id='clips-scan-button')
+                            clips_refresh_btn = gr.Button(
+                                LABEL_CLIPS_REFRESH, variant='secondary',
+                                elem_id='clips-refresh-button')
+                        clips_report = gr.Textbox(
+                            label=LABEL_CLIPS_REPORT,
+                            value=CLIPS_REPORT_INITIAL_TEXT,
+                            interactive=False,
+                            lines=7,
+                            max_lines=14,
+                            elem_id='clips-report-box',
+                        )
+                        clips_counts = gr.Textbox(
+                            label=LABEL_CLIPS_COUNTS,
+                            value=CLIPS_COUNTS_INITIAL_TEXT,
+                            interactive=False,
+                            elem_id='clips-counts-box',
+                        )
+                        # The grid is server-rendered markup. The browser never receives a path, only
+                        # opaque ids, and the authority for what each tile says is the decision journal.
+                        clips_gallery = gr.HTML(
+                            CLIPS_GALLERY_INITIAL_HTML, elem_id='clips-gallery')
+                        clips_confirm_btn = gr.Button(
+                            LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
+                            elem_id='clips-confirm-button')
+                        # [FORK] R8 Final Polish: the sweep gate, mirroring Audio Review exactly.
+                        # Hidden until a Confirm finds unmarked clips, and the ONE thing that can
+                        # authorise moving them. `clips_armed_state` holds the batch signature
+                        # those two buttons are attached to -- a plain string, never anything
+                        # live, and void the moment a decision or a destination changes.
+                        with gr.Row():
+                            clips_proceed_btn = gr.Button(
+                                LABEL_CLIPS_PROCEED, variant='stop', visible=False,
+                                elem_id='clips-proceed-button')
+                            clips_sweep_cancel_btn = gr.Button(
+                                LABEL_CLIPS_SWEEP_CANCEL, variant='secondary', visible=False,
+                                elem_id='clips-sweep-cancel-button')
+                        clips_armed_state = gr.State('')
+                        clips_confirm_out = gr.Textbox(
+                            label=LABEL_CLIPS_CONFIRM_OUT,
+                            value=CLIPS_CONFIRM_DISABLED_TEXT,
+                            interactive=False,
+                            lines=5,
+                            max_lines=10,
+                            elem_id='clips-confirm-box',
+                        )
 
-                # The review half: listen to what was actually written, then file it.
-                with gr.Group():
-                    gr.Markdown(f"### {LABEL_AUDIO_REVIEW}\n\n{INFO_AUDIO_REVIEW}")
-                    with gr.Row():
-                        audio_library_folder = gr.Textbox(
-                            label=LABEL_AUDIO_LIBRARY,
-                            info=INFO_AUDIO_LIBRARY,
-                            value=_pref(fork_prefs.AUDIO_LIBRARY),
-                            placeholder=r"J:\Voice Library",
-                            elem_id='audio-library-folder')
-                        audio_discarded_folder = gr.Textbox(
-                            label=LABEL_AUDIO_DISCARDED,
-                            info=INFO_AUDIO_DISCARDED,
-                            value=_pref(fork_prefs.AUDIO_DISCARDED),
-                            placeholder=r"J:\Voice Discarded",
-                            elem_id='audio-discarded-folder')
-                    with gr.Row():
-                        audio_library_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='audio-library-browse')
-                        audio_discarded_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='audio-discarded-browse')
-                    # [R7.2 Phase 4] The live destination read-out. Written by the two folder
-                    # `.change()` handlers and by Confirm, so "these two folders are the same" is
-                    # visible while the operator is still typing rather than only when a sort is
-                    # refused -- which is the defect reported from real use.
-                    audio_destination_status = gr.Textbox(
-                        label=LABEL_AUDIO_DESTINATION_STATUS,
-                        value=AUDIO_DESTINATION_STATUS_INITIAL,
-                        interactive=False, lines=2, max_lines=5,
-                        elem_id='audio-destination-status')
-                    gr.Markdown(INFO_AUDIO_GALLERY)
-                    gr.HTML(AUDIO_GALLERY_CSS)
-                    with gr.Row():
-                        audio_enable_hover = gr.Button(
-                            LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
-                            elem_id='audio-enable-hover',
-                            elem_classes=['r7-enable-hover'])
-                        audio_counts = gr.Textbox(
-                            label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
-                            interactive=False, elem_id='audio-counts')
-                    audio_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
-                                            elem_id='audio-gallery')
-                    # The ONE server contract with the page: every decision and every edited name
-                    # as JSON. Hidden because it is machinery, not a control -- but a real widget,
-                    # so Gradio carries it with the click like any other input.
-                    # NOT `visible=False`: Gradio drops an invisible component from the DOM
-                    # entirely, and the page has to be able to write into this one. It is hidden
-                    # with CSS instead -- present, carried with the click, and off screen.
-                    audio_decisions = gr.Textbox(
-                        value='', label=' ', elem_id='audio-decisions')
-                    audio_confirm_btn = gr.Button(
-                        LABEL_AUDIO_CONFIRM, variant='primary',
-                        elem_id='audio-confirm-button',
-                        # The client releases the player on `pointerdown` of anything carrying
-                        # this class. Windows will not rename a file a player still holds open.
-                        elem_classes=['r7-release-audio'])
-                    # [R7.2 Phase 3] The sweep gate. Hidden until Confirm finds unmarked clips, and
-                    # hidden again the moment the batch is resolved either way, so the screen never
-                    # offers a Proceed that is not attached to a specific set of counts.
-                    with gr.Row():
-                        audio_proceed_btn = gr.Button(
-                            LABEL_AUDIO_PROCEED, variant='stop', visible=False,
-                            elem_id='audio-proceed-button',
-                            elem_classes=['r7-release-audio'])
-                        audio_sweep_cancel_btn = gr.Button(
-                            LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
-                            elem_id='audio-sweep-cancel-button')
-                    audio_open_preview_btn = gr.Button(
-                        LABEL_AUDIO_OPEN_IN_PREVIEW, variant='secondary',
-                        elem_id='audio-open-preview-button')
-                    gr.Markdown(INFO_AUDIO_OPEN_IN_PREVIEW)
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            audio_clip_name = gr.Textbox(
-                                label=LABEL_AUDIO_CLIP_NAME,
-                                info=INFO_AUDIO_CLIP_NAME,
-                                value='', visible=False, elem_id='audio-clip-name')
-                        with gr.Column(scale=3):
-                            # [R7.1] Kept as a fallback player for a single clip, hidden by
-                            # default: the gallery's hover playback is the review surface now.
-                            audio_player = gr.HTML(
-                                value='', visible=False, elem_id='audio-player')
-                    audio_file_report = gr.Textbox(
-                        label=LABEL_AUDIO_FILE_REPORT,
-                        value=AUDIO_FILE_REPORT_INITIAL_TEXT,
-                        interactive=False, lines=4, max_lines=10,
-                        elem_id='audio-file-report')
-                    # Per-browser-session, so one operator's review list is not reachable from
-                    # another tab. Nothing about the clips lives in a module-level record.
+                    # [FORK] Digital-Union (R7.2 Phase 2): the SEVENTH top-level tab, 🎧 Audio Preview.
                     #
-                    # [R7.2] Holds the whole view: the registry session and page tokens, the frozen
-                    # entries, and the decision/name records keyed by FILE IDENTITY so they survive
-                    # paging. `audio_armed_state` holds the sweep signature of the batch the
-                    # operator confirmed, and only that batch -- a plain string, never a live
-                    # object.
-                    audio_review_state = gr.State({})
-                    audio_armed_state = gr.State('')
-                    audio_run_dir_state = gr.State('')
+                    # Placed between Audio Cutter and Clips Preview, and that position is chosen rather
+                    # than incidental. It keeps Advanced Tools at `_TABS` index 3, so every containment
+                    # assertion in `test_gui_tabs.py` that counts from the front is unaffected; it keeps
+                    # Clips Preview LAST, which its own suite requires; and it keeps this markup out of the
+                    # Raw-Cutter-to-Advanced span that
+                    # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+                    #
+                    # Every numeric control here is a Number widget, which is the same non-cosmetic
+                    # constraint the two tabs either side of it record: a tab in this region falls inside
+                    # the source span that
+                    # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+                    # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+                    # a substring check over this whole region, so the forbidden widget type must not
+                    # appear in this span even inside a comment explaining its absence -- which is why
+                    # this one does not name it.
+                    with gr.Tab(LABEL_SECTION_AUDIO_REVIEW, id='tab-audio-review'):
+                        gr.Markdown(INFO_TAB_AUDIO_PREVIEW)
+                        gr.HTML(AUDIO_GALLERY_CSS)
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                with gr.Group():
+                                    audio_preview_folder = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_FOLDER,
+                                        info=INFO_AUDIO_PREVIEW_FOLDER,
+                                        value=_pref(fork_prefs.AUDIO_PREVIEW_INPUT),
+                                        placeholder=r"J:\New folder\CutsAudio\VOICE OVER",
+                                        elem_id='audio-preview-folder')
+                                    with gr.Row():
+                                        audio_preview_browse = gr.Button(
+                                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                            elem_id='audio-preview-browse')
+                                        audio_preview_recursive = gr.Checkbox(
+                                            label=LABEL_AUDIO_PREVIEW_RECURSIVE,
+                                            info=INFO_AUDIO_PREVIEW_RECURSIVE,
+                                            value=False, elem_id='audio-preview-recursive')
+                                    with gr.Row():
+                                        audio_preview_page_size = gr.Number(
+                                            label=LABEL_AUDIO_PREVIEW_PAGE_SIZE,
+                                            info=INFO_AUDIO_PREVIEW_PAGE_SIZE,
+                                            value=fork_audio_review.DEFAULT_PAGE_SIZE,
+                                            minimum=1, maximum=fork_audio_review.MAX_PAGE_SIZE,
+                                            step=1, elem_id='audio-preview-page-size')
+                                        audio_preview_scan_btn = gr.Button(
+                                            LABEL_AUDIO_PREVIEW_SCAN, variant='primary',
+                                            elem_id='audio-preview-scan-button')
+                                with gr.Group():
+                                    audio_preview_library = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_LIBRARY,
+                                        info=INFO_AUDIO_LIBRARY,
+                                        # [FORK] R8 Owner Fixes (P1): its own override, else
+                                        # the shared voice folder. Read-side only -- saving still
+                                        # writes each key from its own Settings field.
+                                        value=_audio_preview_default(
+                                            fork_prefs.AUDIO_PREVIEW_LIBRARY,
+                                            fork_prefs.AUDIO_LIBRARY),
+                                        placeholder=r"J:\Voice Library",
+                                        elem_id='audio-preview-library')
+                                    audio_preview_library_browse = gr.Button(
+                                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                        elem_id='audio-preview-library-browse')
+                                    audio_preview_discarded = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_DISCARDED,
+                                        info=INFO_AUDIO_DISCARDED,
+                                        value=_audio_preview_default(
+                                            fork_prefs.AUDIO_PREVIEW_DISCARDED,
+                                            fork_prefs.AUDIO_DISCARDED),
+                                        placeholder=r"J:\Voice Discarded",
+                                        elem_id='audio-preview-discarded')
+                                    audio_preview_discarded_browse = gr.Button(
+                                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                        elem_id='audio-preview-discarded-browse')
+                                    audio_preview_destination_status = gr.Textbox(
+                                        label=LABEL_AUDIO_DESTINATION_STATUS,
+                                        value=AUDIO_DESTINATION_STATUS_INITIAL,
+                                        interactive=False, lines=2, max_lines=5,
+                                        elem_id='audio-preview-destination-status')
+                            with gr.Column(scale=2):
+                                audio_preview_report = gr.Textbox(
+                                    label=LABEL_AUDIO_PREVIEW_REPORT,
+                                    value=AUDIO_PREVIEW_REPORT_INITIAL,
+                                    interactive=False, lines=10, max_lines=18,
+                                    elem_id='audio-preview-report')
 
-                gr.Markdown(INFO_AUDIO_LAYERS_TIP)
+                        gr.Markdown(INFO_AUDIO_GALLERY)
+                        with gr.Row():
+                            audio_preview_enable_hover = gr.Button(
+                                LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                                elem_id='audio-preview-enable-hover',
+                                elem_classes=['r7-enable-hover'])
+                            audio_preview_counts = gr.Textbox(
+                                label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                                interactive=False, elem_id='audio-preview-counts')
+                        with gr.Row():
+                            audio_preview_prev_btn = gr.Button(
+                                LABEL_AUDIO_PREVIEW_PREV, variant='secondary', scale=0,
+                                elem_id='audio-preview-prev-button')
+                            audio_preview_page_label = gr.Textbox(
+                                label=LABEL_AUDIO_PREVIEW_PAGE,
+                                value=AUDIO_PREVIEW_PAGE_INITIAL,
+                                interactive=False, elem_id='audio-preview-page-label')
+                            audio_preview_next_btn = gr.Button(
+                                LABEL_AUDIO_PREVIEW_NEXT, variant='secondary', scale=0,
+                                elem_id='audio-preview-next-button')
+                        audio_preview_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
+                                                        elem_id='audio-preview-gallery')
+                        # This tab's own hidden decision channel. The grid names it in `data-store`, so the
+                        # client writes HERE and never into the Audio Cutter's field -- which is the whole
+                        # reason the grid carries that attribute.
+                        audio_preview_decisions = gr.Textbox(
+                            value='', label=' ', elem_id='audio-preview-decisions')
+                        audio_preview_confirm_btn = gr.Button(
+                            LABEL_AUDIO_CONFIRM, variant='primary',
+                            elem_id='audio-preview-confirm-button',
+                            elem_classes=['r7-release-audio'])
+                        with gr.Row():
+                            audio_preview_proceed_btn = gr.Button(
+                                LABEL_AUDIO_PROCEED, variant='stop', visible=False,
+                                elem_id='audio-preview-proceed-button',
+                                elem_classes=['r7-release-audio'])
+                            audio_preview_sweep_cancel_btn = gr.Button(
+                                LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
+                                elem_id='audio-preview-sweep-cancel-button')
+                        # Per-browser-session, exactly like the cutter's. The decision and name records are
+                        # keyed by file identity, which is what makes paging lossless.
+                        audio_preview_state = gr.State({})
+                        audio_preview_armed_state = gr.State('')
 
-            # [FORK] Digital-Union (R7.2 Phase 2): the SEVENTH top-level tab, 🎧 Audio Preview.
+                    with gr.Tab(LABEL_SECTION_PREPARE_VERIFY, id='tab-prepare-verify'):
+                        # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
+                        # workflow, not part of the render flow. Nothing in here is wired to
+                        # `source_outputs`, so it cannot touch the Create Music Video gate.
+                        #
+                        # It stays collapsed (pinned by test) even though it now has its own tab, and it is
+                        # deliberately the LAST block in that tab: nothing containing a `gr.Slider` may sit
+                        # between the sample UI and the event wiring, which is the span
+                        # `test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices to prove the
+                        # approved sample resource policy is not widenable from the GUI.
+                        #
+                        # (GUI Refresh A note: this comment used to describe the section as "rather than a
+                        # restructuring of the app into tabs". That restructuring has since happened, and
+                        # this block was one of the things it moved.)
+                        # [FORK] R8 UX Refresh (Commit A): OPEN, where it used to be collapsed.
+                        #
+                        # Collapsing it was right while it shared the Advanced Tools tab with
+                        # Audio Layers and Smart Mix -- three long blocks in one column, so each
+                        # one being shut is what made the tab readable. It is now the whole of its
+                        # own Media Library section, so collapsing it means an operator who
+                        # deliberately navigated to Prepare & Verify is shown a single closed
+                        # drawer and nothing else. That is precisely the discoverability problem
+                        # this refresh exists to fix, measured in the running app.
+                        with gr.Accordion(label=LABEL_PREP_SECTION, open=True):
+                            gr.Markdown(INFO_PREP_SECTION)
+                            prep_folder = gr.Textbox(
+                                label=LABEL_PREP_FOLDER,
+                                placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                                info=INFO_PREP_FOLDER,
+                                elem_id='prep-folder-input',
+                            )
+                            prep_recursive = gr.Checkbox(
+                                value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
+                            )
+                            # No `maximum`: this bounds one analysis run, never the supported library size.
+                            # The default is the preparation module's constant, not a literal repeated here.
+                            prep_batch_size = gr.Number(
+                                value=fork_prep.DEFAULT_ANALYZE_BATCH_SIZE,
+                                precision=0,
+                                minimum=1,
+                                label=LABEL_PREP_BATCH_SIZE,
+                                info=INFO_PREP_BATCH_SIZE,
+                                elem_id='prep-batch-size',
+                            )
+                            prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
+                            prep_report = gr.Textbox(
+                                label=LABEL_PREP_REPORT,
+                                value=initial_prep_state().report_text,
+                                interactive=False,
+                                lines=10,
+                                max_lines=16,
+                                elem_id='prep-report-box',
+                            )
+                            prep_analyze_btn = gr.Button(
+                                LABEL_PREP_ANALYZE, interactive=False, elem_id='prep-analyze-button'
+                            )
+                            prep_status = gr.Markdown(
+                                initial_prep_state().notice, elem_id='prep-status'
+                            )
+
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+                            # Inside this accordion because it asks about the same library folder, and
+                            # below Analyze because it is the "did my files change / are they still OK"
+                            # question you ask around a preparation run rather than part of one.
+                            #
+                            # Like the rest of this section it is absent from `source_outputs` and from
+                            # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
+                            # move the preparation state machine. It is also ALWAYS interactive -- the
+                            # render mutex, not a disabled button, is what prevents it running during a
+                            # render, because a button's interactivity is per-session UX while the mutex is
+                            # process-global truth.
+                            gr.Markdown(INFO_PREP_VERIFY)
+                            prep_verify_btn = gr.Button(
+                                LABEL_PREP_VERIFY, variant='secondary',
+                                elem_id='prep-verify-button',
+                            )
+                            prep_verify_report = gr.Textbox(
+                                label=LABEL_PREP_VERIFY_REPORT,
+                                value=PREP_VERIFY_INITIAL_TEXT,
+                                interactive=False,
+                                lines=12,
+                                max_lines=24,
+                                elem_id='prep-verify-report-box',
+                            )
+
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample decode.
+                            # Immediately after Verify Sources because it is the natural follow-up
+                            # question -- "the metadata reads fine, but can FFmpeg actually produce frames
+                            # here?" -- and it is deliberately a DIFFERENT question, on one file rather
+                            # than the whole library.
+                            #
+                            # Like the rest of this accordion it is absent from `source_outputs` and
+                            # `prep_outputs`: it cannot touch the Create Music Video gate and cannot move
+                            # the preparation state machine. Also ALWAYS interactive, for the same reason
+                            # Verify Sources is -- the render mutex, not a disabled button, is what
+                            # prevents it running during a render, because interactivity is per-session UX
+                            # while the mutex is process-global truth.
+                            #
+                            # One file, one position, one explicit button. No dropdown of the library (a
+                            # ~2,000-source folder on a mechanical drive would have to be enumerated to
+                            # build it), no browser upload (it would copy large media into a temp folder),
+                            # no frame-count control and no timeout control.
+                            gr.Markdown(INFO_PREP_SAMPLE)
+                            sample_path = gr.Textbox(
+                                label=LABEL_PREP_SAMPLE_PATH,
+                                placeholder=PLACEHOLDER_SAMPLE_VIDEO,
+                                elem_id='prep-sample-path',
+                            )
+                            # Seconds, never a frame number: the diagnostic's own contract forbids
+                            # frames/fps arithmetic, and the selected stream's reported duration is what
+                            # decides whether a position is out of range.
+                            #
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
+                            # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
+                            # client-side courtesy while `run_sample_check` owns the real rejection. GUI
+                            # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
+                            # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
+                            # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
+                            # `_on_sample_decode_click` was ever entered. The operator saw a framework error
+                            # toast instead of the diagnostic's own report, and the core's
+                            # finite-and-non-negative branch was unreachable from this widget.
+                            #
+                            # Removing the bound hands the decision back to the accepted core, which refuses
+                            # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
+                            # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
+                            # work. No GUI-side validation, clamping or normalisation is added here: a
+                            # second opinion about what a valid seek is would be exactly the duplication
+                            # this integration exists to avoid.
+                            sample_seek = gr.Number(
+                                value=1.0,
+                                step=0.5,
+                                label=LABEL_PREP_SAMPLE_SEEK,
+                                elem_id='prep-sample-seek',
+                            )
+                            sample_btn = gr.Button(
+                                LABEL_PREP_SAMPLE, variant='secondary',
+                                elem_id='prep-sample-button',
+                            )
+                            sample_report = gr.Textbox(
+                                label=LABEL_PREP_SAMPLE_REPORT,
+                                value=PREP_SAMPLE_INITIAL_TEXT,
+                                interactive=False,
+                                lines=14,
+                                max_lines=28,
+                                elem_id='prep-sample-report-box',
+                            )
+
+            # [FORK] Digital-Union (R8 UX Refresh, Commit A): the Settings tab.
             #
-            # Placed between Audio Cutter and Clips Preview, and that position is chosen rather
-            # than incidental. It keeps Advanced Tools at `_TABS` index 3, so every containment
-            # assertion in `test_gui_tabs.py` that counts from the front is unaffected; it keeps
-            # Clips Preview LAST, which its own suite requires; and it keeps this markup out of the
-            # Raw-Cutter-to-Advanced span that
-            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
-            #
-            # Every numeric control here is a Number widget, which is the same non-cosmetic
-            # constraint the two tabs either side of it record: a tab in this region falls inside
-            # the source span that
-            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
-            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
-            # a substring check over this whole region, so the forbidden widget type must not
-            # appear in this span even inside a comment explaining its absence -- which is why
-            # this one does not name it.
-            with gr.Tab(LABEL_TAB_AUDIO_PREVIEW, id='tab-audio-preview'):
-                gr.Markdown(INFO_TAB_AUDIO_PREVIEW)
-                gr.HTML(AUDIO_GALLERY_CSS)
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        with gr.Group():
-                            audio_preview_folder = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_FOLDER,
-                                info=INFO_AUDIO_PREVIEW_FOLDER,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_INPUT),
-                                placeholder=r"J:\New folder\CutsAudio\VOICE OVER",
-                                elem_id='audio-preview-folder')
-                            with gr.Row():
-                                audio_preview_browse = gr.Button(
-                                    LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                    elem_id='audio-preview-browse')
-                                audio_preview_recursive = gr.Checkbox(
-                                    label=LABEL_AUDIO_PREVIEW_RECURSIVE,
-                                    info=INFO_AUDIO_PREVIEW_RECURSIVE,
-                                    value=False, elem_id='audio-preview-recursive')
-                            with gr.Row():
-                                audio_preview_page_size = gr.Number(
-                                    label=LABEL_AUDIO_PREVIEW_PAGE_SIZE,
-                                    info=INFO_AUDIO_PREVIEW_PAGE_SIZE,
-                                    value=fork_audio_review.DEFAULT_PAGE_SIZE,
-                                    minimum=1, maximum=fork_audio_review.MAX_PAGE_SIZE,
-                                    step=1, elem_id='audio-preview-page-size')
-                                audio_preview_scan_btn = gr.Button(
-                                    LABEL_AUDIO_PREVIEW_SCAN, variant='primary',
-                                    elem_id='audio-preview-scan-button')
-                        with gr.Group():
-                            audio_preview_library = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_LIBRARY,
-                                info=INFO_AUDIO_LIBRARY,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
-                                placeholder=r"J:\Voice Library",
-                                elem_id='audio-preview-library')
-                            audio_preview_library_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='audio-preview-library-browse')
-                            audio_preview_discarded = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_DISCARDED,
-                                info=INFO_AUDIO_DISCARDED,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
-                                placeholder=r"J:\Voice Discarded",
-                                elem_id='audio-preview-discarded')
-                            audio_preview_discarded_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='audio-preview-discarded-browse')
-                            audio_preview_destination_status = gr.Textbox(
-                                label=LABEL_AUDIO_DESTINATION_STATUS,
-                                value=AUDIO_DESTINATION_STATUS_INITIAL,
-                                interactive=False, lines=2, max_lines=5,
-                                elem_id='audio-preview-destination-status')
-                    with gr.Column(scale=2):
-                        audio_preview_report = gr.Textbox(
-                            label=LABEL_AUDIO_PREVIEW_REPORT,
-                            value=AUDIO_PREVIEW_REPORT_INITIAL,
-                            interactive=False, lines=10, max_lines=18,
-                            elem_id='audio-preview-report')
-
-                gr.Markdown(INFO_AUDIO_GALLERY)
-                with gr.Row():
-                    audio_preview_enable_hover = gr.Button(
-                        LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
-                        elem_id='audio-preview-enable-hover',
-                        elem_classes=['r7-enable-hover'])
-                    audio_preview_counts = gr.Textbox(
-                        label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
-                        interactive=False, elem_id='audio-preview-counts')
-                with gr.Row():
-                    audio_preview_prev_btn = gr.Button(
-                        LABEL_AUDIO_PREVIEW_PREV, variant='secondary', scale=0,
-                        elem_id='audio-preview-prev-button')
-                    audio_preview_page_label = gr.Textbox(
-                        label=LABEL_AUDIO_PREVIEW_PAGE,
-                        value=AUDIO_PREVIEW_PAGE_INITIAL,
-                        interactive=False, elem_id='audio-preview-page-label')
-                    audio_preview_next_btn = gr.Button(
-                        LABEL_AUDIO_PREVIEW_NEXT, variant='secondary', scale=0,
-                        elem_id='audio-preview-next-button')
-                audio_preview_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
-                                                elem_id='audio-preview-gallery')
-                # This tab's own hidden decision channel. The grid names it in `data-store`, so the
-                # client writes HERE and never into the Audio Cutter's field -- which is the whole
-                # reason the grid carries that attribute.
-                audio_preview_decisions = gr.Textbox(
-                    value='', label=' ', elem_id='audio-preview-decisions')
-                audio_preview_confirm_btn = gr.Button(
-                    LABEL_AUDIO_CONFIRM, variant='primary',
-                    elem_id='audio-preview-confirm-button',
-                    elem_classes=['r7-release-audio'])
-                with gr.Row():
-                    audio_preview_proceed_btn = gr.Button(
-                        LABEL_AUDIO_PROCEED, variant='stop', visible=False,
-                        elem_id='audio-preview-proceed-button',
-                        elem_classes=['r7-release-audio'])
-                    audio_preview_sweep_cancel_btn = gr.Button(
-                        LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
-                        elem_id='audio-preview-sweep-cancel-button')
-                # Per-browser-session, exactly like the cutter's. The decision and name records are
-                # keyed by file identity, which is what makes paging lossless.
-                audio_preview_state = gr.State({})
-                audio_preview_armed_state = gr.State('')
-
-            # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
-            #
-            # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
-            # It keeps Advanced Tools at tab index 3, so every existing containment assertion in
-            # `test_gui_tabs.py` needs no index change; and it keeps this tab's markup out of the
-            # Raw-Cutter-to-Advanced source span that
-            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
-            #
-            # Page size is a Number widget, and that is also not cosmetic. A tab placed last
-            # falls inside the source span that
-            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
-            # guards -- measured in R5-P0 as ~39 k characters, running past `source_outputs = [`
-            # into the event wiring. That test enforces the approved sample resource policy by
-            # OMISSION, so the forbidden widget type must not appear anywhere in this span, not
-            # even in a comment explaining why: the guard is a substring check, and prose naming
-            # the banned token trips it exactly as real code would. (It has now done so five
-            # times in this repository.) The test is right; the widget is a Number and this
-            # comment does not name the alternative.
-            with gr.Tab(LABEL_TAB_CLIPS_PREVIEW, id='tab-clips-preview'):
-                gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
-                with gr.Row():
-                    clips_input = gr.Textbox(
-                        label=LABEL_CLIPS_INPUT,
-                        info=INFO_CLIPS_INPUT,
-                        value=_pref(fork_prefs.CLIPS_INPUT),
-                        placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
-                        elem_id='clips-input-folder',
-                    )
-                    clips_recursive = gr.Checkbox(
-                        value=True,
-                        label=LABEL_CLIPS_RECURSIVE,
-                        info=INFO_CLIPS_RECURSIVE,
-                        elem_id='clips-recursive',
-                    )
-                with gr.Row():
-                    clips_input_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-input-browse')
-                with gr.Row():
-                    clips_library = gr.Textbox(
-                        label=LABEL_CLIPS_LIBRARY,
-                        info=INFO_CLIPS_LIBRARY,
-                        value=_pref(fork_prefs.CLIPS_LIBRARY),
-                        placeholder=r"J:\Media Library",
-                        elem_id='clips-library-folder',
-                    )
-                    clips_rejected = gr.Textbox(
-                        label=LABEL_CLIPS_REJECTED,
-                        info=INFO_CLIPS_REJECTED,
-                        value=_pref(fork_prefs.CLIPS_REJECTED),
-                        placeholder=r"J:\Discarded",
-                        elem_id='clips-rejected-folder',
-                    )
-                with gr.Row():
-                    clips_library_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-library-browse')
-                    clips_rejected_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-rejected-browse')
-                with gr.Row():
-                    clips_page_size = gr.Number(
-                        value=100,
-                        precision=0,
-                        minimum=1,
-                        maximum=fork_clips.MAX_CLIPS_PER_PAGE,
-                        label=LABEL_CLIPS_PAGE_SIZE,
-                        info=INFO_CLIPS_PAGE_SIZE,
-                        elem_id='clips-page-size',
-                    )
-                    clips_check_btn = gr.Button(
-                        LABEL_CLIPS_CHECK, variant='secondary', elem_id='clips-check-button')
-                    clips_scan_btn = gr.Button(
-                        LABEL_CLIPS_SCAN, variant='primary', elem_id='clips-scan-button')
-                    clips_refresh_btn = gr.Button(
-                        LABEL_CLIPS_REFRESH, variant='secondary',
-                        elem_id='clips-refresh-button')
-                clips_report = gr.Textbox(
-                    label=LABEL_CLIPS_REPORT,
-                    value=CLIPS_REPORT_INITIAL_TEXT,
-                    interactive=False,
-                    lines=7,
-                    max_lines=14,
-                    elem_id='clips-report-box',
-                )
-                clips_counts = gr.Textbox(
-                    label=LABEL_CLIPS_COUNTS,
-                    value=CLIPS_COUNTS_INITIAL_TEXT,
-                    interactive=False,
-                    elem_id='clips-counts-box',
-                )
-                # The grid is server-rendered markup. The browser never receives a path, only
-                # opaque ids, and the authority for what each tile says is the decision journal.
-                clips_gallery = gr.HTML(
-                    CLIPS_GALLERY_INITIAL_HTML, elem_id='clips-gallery')
-                clips_confirm_btn = gr.Button(
-                    LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
-                    elem_id='clips-confirm-button')
-                clips_confirm_out = gr.Textbox(
-                    label=LABEL_CLIPS_CONFIRM_OUT,
-                    value=CLIPS_CONFIRM_DISABLED_TEXT,
-                    interactive=False,
-                    lines=5,
-                    max_lines=10,
-                    elem_id='clips-confirm-box',
-                )
-
+            # The remembered-folder defaults used to sit at the bottom of the Clips Preview tab,
+            # which is where they were asked for but not where anyone looks for settings. The
+            # panel below is the pre-existing one, re-parented verbatim: the same widgets, the
+            # same `elem_id`s, the same two handlers, and the same contract -- saving writes
+            # `state/preferences.json` and nothing else, no directory is created, nothing is
+            # scanned and nothing is moved.
+            with gr.Tab(LABEL_TAB_SETTINGS, id='tab-settings'):
+                gr.Markdown(INFO_TAB_SETTINGS)
                 # [UX V4] Remembered folders. Deliberately placed here rather than in a settings
                 # tab of its own: these are the folders this tab asks for, so the operator sets
                 # them where they already are. Saving writes `state/preferences.json` and nothing
                 # else -- no directory is created, nothing is scanned and nothing is moved.
-                # Deliberately a plain Group, not a collapsible panel: a test asserts this tab
-                # hides none of its controls, and that rule is right -- an operator should be
+                # Deliberately a plain Group, not a collapsible panel -- an operator should be
                 # able to see what their destinations are set to without opening anything.
+                #
+                # [FORK] R8 Final Polish: the layout, and ONLY the layout, changed here. Every
+                # field keeps its widget name, its `elem_id`, its preference key and its saved
+                # value; `_on_save_folder_prefs` and `_on_reset_folder_prefs` are untouched, so a
+                # `state/preferences.json` written by any earlier build still loads unchanged.
+                #
+                # Two things were wrong. Browse buttons were collected into their own Row BELOW a
+                # Row of two text fields, so a button sat under the gap between the two boxes and
+                # read as belonging to neither. And nine paths arrived as one undifferentiated
+                # list. So: one field per Row with its OWN Browse beside it -- the pattern the
+                # render and raw-cutter fields already used -- and three purpose groups.
                 with gr.Group():
                     gr.Markdown(f"### {LABEL_PREF_SECTION}\n\n{INFO_PREF_SECTION}")
+
+                    gr.Markdown(f"**{LABEL_PREF_GROUP_VIDEO}**")
+                    # [FORK] R8: where finished renders go. The one destination that used to be a
+                    # fixed property of the installation; see `get_render_output_dir`.
                     with gr.Row():
-                        pref_library = gr.Textbox(
-                            label=LABEL_CLIPS_LIBRARY,
-                            value=_pref(fork_prefs.CLIPS_LIBRARY),
-                            placeholder=r"J:\Media Library",
-                            elem_id='pref-library')
-                        pref_rejected = gr.Textbox(
-                            label=LABEL_CLIPS_REJECTED,
-                            value=_pref(fork_prefs.CLIPS_REJECTED),
-                            placeholder=r"J:\Discarded",
-                            elem_id='pref-rejected')
-                    with gr.Row():
-                        pref_library_browse = gr.Button(
+                        pref_render_output = gr.Textbox(
+                            label=LABEL_PREF_RENDER_OUTPUT,
+                            value=_pref(fork_prefs.RENDER_OUTPUT),
+                            info=INFO_PREF_RENDER_OUTPUT,
+                            placeholder=r"J:\Finished Videos",
+                            elem_id='pref-render-output')
+                        pref_render_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-library-browse')
-                        pref_rejected_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-rejected-browse')
+                            elem_id='pref-render-output-browse')
                     with gr.Row():
                         pref_raw_output = gr.Textbox(
                             label=LABEL_PREF_RAW_OUTPUT,
@@ -9960,25 +10883,9 @@ def create_ui() -> gr.Blocks:
                         pref_raw_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-raw-output-browse')
-                    # [FORK] R7: the Audio Cutter's three destinations, remembered the same way.
-                    with gr.Row():
-                        pref_audio_library = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_LIBRARY,
-                            value=_pref(fork_prefs.AUDIO_LIBRARY),
-                            placeholder=r"J:\Voice Library",
-                            elem_id='pref-audio-library')
-                        pref_audio_discarded = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_DISCARDED,
-                            value=_pref(fork_prefs.AUDIO_DISCARDED),
-                            placeholder=r"J:\Voice Discarded",
-                            elem_id='pref-audio-discarded')
-                    with gr.Row():
-                        pref_audio_library_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-library-browse')
-                        pref_audio_discarded_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-discarded-browse')
+
+                    gr.Markdown(f"**{LABEL_PREF_GROUP_AUDIO}**")
+                    # [FORK] R7: the Audio Cutter's output, remembered the same way.
                     with gr.Row():
                         pref_audio_output = gr.Textbox(
                             label=LABEL_PREF_AUDIO_OUTPUT,
@@ -9988,27 +10895,88 @@ def create_ui() -> gr.Blocks:
                         pref_audio_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-audio-output-browse')
+
+                    gr.Markdown(
+                        f"**{LABEL_PREF_GROUP_REVIEW}**\n\n{INFO_PREF_GROUP_REVIEW}")
+                    with gr.Row():
+                        pref_library = gr.Textbox(
+                            label=LABEL_CLIPS_LIBRARY,
+                            value=_pref(fork_prefs.CLIPS_LIBRARY),
+                            placeholder=r"J:\Media Library",
+                            elem_id='pref-library')
+                        pref_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-library-browse')
+                    with gr.Row():
+                        pref_rejected = gr.Textbox(
+                            label=LABEL_CLIPS_REJECTED,
+                            value=_pref(fork_prefs.CLIPS_REJECTED),
+                            placeholder=r"J:\Discarded",
+                            elem_id='pref-rejected')
+                        pref_rejected_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-rejected-browse')
+                    # [FORK] R8 Owner Fixes (P1): the Audio Cutter's pair is presented as THE
+                    # voice pair, because for the ordinary setup it is -- Audio Review falls back
+                    # to it when its own override is blank (see `_audio_preview_default`). The
+                    # keys, the widgets and the saved values are all unchanged; only the framing
+                    # and the position are.
+                    gr.Markdown(f"**{LABEL_PREF_VOICE_PAIR}**\n\n{INFO_PREF_VOICE_PAIR}")
+                    with gr.Row():
+                        pref_audio_library = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='pref-audio-library')
+                        pref_audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-library-browse')
+                    with gr.Row():
+                        pref_audio_discarded = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='pref-audio-discarded')
+                        pref_audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-discarded-browse')
                     # [FORK] R7.2: the Audio Preview tab's two destinations. Separate keys from the
                     # cutter's, because the folder a later review sorts into is a different
                     # decision from the folder a fresh cut files into.
-                    with gr.Row():
-                        pref_audio_preview_library = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
-                            value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
-                            placeholder=r"J:\Voice Library",
-                            elem_id='pref-audio-preview-library')
-                        pref_audio_preview_discarded = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
-                            value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
-                            placeholder=r"J:\Voice Discarded",
-                            elem_id='pref-audio-preview-discarded')
-                    with gr.Row():
-                        pref_audio_preview_library_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-preview-library-browse')
-                        pref_audio_preview_discarded_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-preview-discarded-browse')
+                    #
+                    # [FORK] R8 Owner Fixes (P1): collapsed into an OPTIONAL override panel. The
+                    # owner read four near-identically named audio folders as duplication. They
+                    # are not duplicates, but three of four operators will never need the second
+                    # pair -- so the panel is shut by default and blank now MEANS "use the pair
+                    # above" rather than "no default".
+                    #
+                    # It is opened on load when either override is already set, so an operator
+                    # who DOES use them is never shown a closed drawer hiding settings that are
+                    # actually in force. Nothing is consolidated and nothing is overwritten:
+                    # a stored override keeps winning, and the save path still writes each key
+                    # from its own field.
+                    with gr.Accordion(label=LABEL_PREF_AUDIO_OVERRIDES,
+                                      open=_audio_overrides_in_use()):
+                        gr.Markdown(INFO_PREF_AUDIO_OVERRIDES)
+                        with gr.Row():
+                            pref_audio_preview_library = gr.Textbox(
+                                label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                                placeholder=r"J:\Voice Library",
+                                elem_id='pref-audio-preview-library')
+                            pref_audio_preview_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='pref-audio-preview-library-browse')
+                        with gr.Row():
+                            pref_audio_preview_discarded = gr.Textbox(
+                                label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                                placeholder=r"J:\Voice Discarded",
+                                elem_id='pref-audio-preview-discarded')
+                            pref_audio_preview_discarded_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='pref-audio-preview-discarded-browse')
+
                     with gr.Row():
                         pref_save_btn = gr.Button(
                             LABEL_PREF_SAVE, variant='primary', elem_id='pref-save-button')
@@ -10019,6 +10987,66 @@ def create_ui() -> gr.Blocks:
                         value=_FOLDER_PREFS_NOTICE or PREF_STATUS_INITIAL,
                         interactive=False, lines=3, max_lines=6,
                         elem_id='pref-status-box')
+
+                # [FORK] R8 UX Refresh: the filename-collision policy. Saved with the folder
+                # defaults because it belongs to the same Save button and the same file -- see
+                # `user_prefs.OPTION_KEYS` for why it is a separate section of that file.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_COLLISION_SECTION}\n\n{INFO_COLLISION_POLICY}")
+                    pref_collision = gr.Radio(
+                        choices=[(CHOICE_COLLISION_SKIP, fork_collision.SKIP),
+                                 (CHOICE_COLLISION_SUFFIX, fork_collision.SUFFIX)],
+                        value=fork_collision.resolve_policy(
+                            _option(fork_prefs.COLLISION_POLICY)),
+                        label=LABEL_COLLISION_SECTION,
+                        show_label=False,
+                        elem_id='pref-collision-policy')
+
+                # [FORK] R8 UX Refresh: Cache Management.
+                #
+                # Every numeric read-out here is text, and the one interactive numeric control
+                # this section might have wanted does not exist, which is not an aesthetic
+                # choice: the whole remainder of the source after `INFO_PREP_SAMPLE` is the span
+                # `test_media_sample.py` scans to prove the approved sample resource policy is
+                # not widenable from the GUI, and it enforces that by OMISSION of one widget
+                # type. Settings is the last tab, so everything here is inside that span. The
+                # guard is a substring check, so this comment does not name the type either.
+                #
+                # [FORK] R8 Final Polish: collapsed. This is the one block on the tab an operator
+                # does NOT set up once and leave alone -- it is occasional maintenance with a
+                # destructive button in it, so it opens on request rather than greeting everyone
+                # who came to change a folder. The deletion logic, the selection choices, the
+                # confirmation checkbox and the report are all unchanged; only the container is.
+                with gr.Accordion(label=LABEL_CACHE_SECTION, open=False):
+                    gr.Markdown(INFO_CACHE_SECTION)
+                    with gr.Row():
+                        cache_inspect_btn = gr.Button(
+                            LABEL_CACHE_INSPECT, variant='secondary',
+                            elem_id='cache-inspect-button')
+                    cache_select = gr.CheckboxGroup(
+                        choices=[(LABEL_CACHE_POSTERS, fork_cache.POSTERS),
+                                 (LABEL_CACHE_PROCESSING, fork_cache.PROCESSING),
+                                 (LABEL_CACHE_UPLOADS, fork_cache.RETIRED_UPLOADS),
+                                 (LABEL_CACHE_ANALYSIS, fork_cache.ANALYSIS)],
+                        value=[],
+                        label=LABEL_CACHE_SELECT,
+                        elem_id='cache-select')
+                    gr.Markdown(
+                        f"- **{LABEL_CACHE_POSTERS}** — {INFO_CACHE_POSTERS}\n"
+                        f"- **{LABEL_CACHE_PROCESSING}** — {INFO_CACHE_PROCESSING}\n"
+                        f"- **{LABEL_CACHE_UPLOADS}** — {INFO_CACHE_UPLOADS}\n"
+                        f"- **{LABEL_CACHE_ANALYSIS}** — {INFO_CACHE_ANALYSIS}")
+                    cache_confirm = gr.Checkbox(
+                        value=False, label=LABEL_CACHE_CONFIRM, info=INFO_CACHE_CONFIRM,
+                        elem_id='cache-confirm')
+                    cache_clear_btn = gr.Button(
+                        LABEL_CACHE_CLEAR, variant='stop', elem_id='cache-clear-button')
+                    cache_report = gr.Textbox(
+                        label=LABEL_CACHE_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_CACHE_REPORT,
+                        interactive=False, lines=10, max_lines=24,
+                        elem_id='cache-report-box')
 
         # [UX V4] One helper, six folder fields plus the three saved defaults. Each button sends
         # its own textbox in and writes the same textbox back, so Browse is self-contained: it
@@ -10048,13 +11076,17 @@ def create_ui() -> gr.Blocks:
                 (audio_preview_library_browse, audio_preview_library),
                 (audio_preview_discarded_browse, audio_preview_discarded),
                 (pref_audio_preview_library_browse, pref_audio_preview_library),
-                (pref_audio_preview_discarded_browse, pref_audio_preview_discarded)):
+                (pref_audio_preview_discarded_browse, pref_audio_preview_discarded),
+                # [FORK] R8: the Render output destination uses the identical helper, so Browse
+                # behaves the same here as on every other folder field in the app.
+                (pref_render_output_browse, pref_render_output)):
             _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
                                  concurrency_limit=None)
 
         # [FORK] R7: the one FILE field, which needs the file dialog rather than the folder one.
         audio_source_browse.click(fn=_browse_audio_source, inputs=[audio_source],
                                   outputs=[audio_source], concurrency_limit=None)
+
 
         pref_save_btn.click(
             fn=_on_save_folder_prefs,
@@ -10064,7 +11096,9 @@ def create_ui() -> gr.Blocks:
                     pref_audio_library, pref_audio_discarded, pref_audio_output, audio_source,
                     # [FORK] R7.2: appended after those, for the same reason.
                     audio_preview_folder, pref_audio_preview_library,
-                    pref_audio_preview_discarded],
+                    pref_audio_preview_discarded,
+                    # [FORK] R8: appended after those, for the same reason again.
+                    pref_render_output, pref_collision],
             outputs=[pref_status],
         )
         pref_reset_btn.click(
@@ -10072,7 +11106,44 @@ def create_ui() -> gr.Blocks:
             inputs=None,
             outputs=[pref_library, pref_rejected, pref_raw_output,
                      pref_audio_library, pref_audio_discarded, pref_audio_output,
-                     pref_audio_preview_library, pref_audio_preview_discarded, pref_status],
+                     pref_audio_preview_library, pref_audio_preview_discarded,
+                     # [FORK] R8: the render destination clears with the rest, and the policy
+                     # returns to its default. Both are APPENDED before the status box, and the
+                     # handler's return tuple matches this order positionally.
+                     pref_render_output, pref_collision,
+                     pref_status],
+        )
+
+        # [FORK] R8 UX Refresh: the collision policy applies and persists the moment it is picked.
+        # `outputs=[]` is exact and load-bearing -- feedback is a toast so this cannot become a
+        # third writer of `pref_status`. `.change()` rather than `.input()` because the Reset
+        # button writes this radio programmatically and the stored value must follow it.
+        pref_collision.change(
+            fn=_on_collision_policy_change,
+            inputs=[pref_collision],
+            outputs=[],
+            concurrency_limit=None,
+        )
+
+        # [FORK] R8 UX Refresh: Cache Management. Two read-mostly events, neither of which is a
+        # render: no `_RENDER_LOCK`, no render lane, and `concurrency_limit=None` for the same
+        # measured R3 reason every other non-render registration here carries -- on the pinned
+        # gradio 6.19.0 a full concurrency group leaves an event QUEUED rather than refusing it.
+        #
+        # Both write only `cache_report`. Neither touches a source, preparation, creative or
+        # render widget, so inspecting or clearing a cache cannot invalidate a confirmed source
+        # set or change what the next render would do.
+        cache_inspect_btn.click(
+            fn=_on_inspect_cache,
+            inputs=[],
+            outputs=[cache_report],
+            concurrency_limit=None,
+        )
+        cache_clear_btn.click(
+            fn=_on_clear_cache,
+            inputs=[cache_select, cache_confirm],
+            outputs=[cache_report],
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (R7 Raw Audio Cutter V1): five registrations, all isolated.
@@ -10095,8 +11166,13 @@ def create_ui() -> gr.Blocks:
         )
         audio_cut_btn.click(
             fn=_on_audio_cut,
+            # [FORK] R8 Phase 9: `audio_fade_edges` is APPENDED last, before the injected
+            # `gr.Request`, so every pre-existing positional index is unchanged. Analyze is
+            # deliberately NOT given it: fades change what is written, never where a clip begins
+            # or ends, so the plan on screen is identical either way and adding it there would
+            # imply the planner had changed.
             inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
-                    audio_pad, audio_min_clip, audio_format],
+                    audio_pad, audio_min_clip, audio_format, audio_fade_edges],
             outputs=[audio_report, audio_table, audio_gallery, audio_counts,
                      audio_decisions, audio_review_state, audio_run_dir_state],
             concurrency_limit=None,
@@ -10151,13 +11227,15 @@ def create_ui() -> gr.Blocks:
             outputs=[audio_destination_status],
             concurrency_limit=None,
         )
-        # [R7.2 Phase 2] "Open results in Audio Preview" fills the other tab's folder box and
+        # [R7.2 Phase 2] "Open results in Media Library" fills Audio Review's folder box and
         # selects it. It scans nothing, which is the requirement: no folder is read as a side
         # effect of anything but a deliberate Scan.
+        # [R8 Commit A] Two tab containers in `outputs`, because the destination is now a section
+        # inside Media Library -- see the handler's docstring for why one is not enough.
         audio_open_preview_btn.click(
-            fn=_on_audio_open_in_preview,
+            fn=_on_audio_open_in_library,
             inputs=[audio_run_dir_state],
-            outputs=[audio_preview_folder, main_tabs, audio_file_report],
+            outputs=[audio_preview_folder, main_tabs, library_tabs, audio_file_report],
             concurrency_limit=None,
         )
 
@@ -10284,6 +11362,27 @@ def create_ui() -> gr.Blocks:
             concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
             concurrency_limit=None,
         )
+        # [R8 Commit A] "Open results in Media Library". Registered HERE, among the Raw Cutter's
+        # own events, rather than beside the Video Review registrations -- deliberately, because
+        # `test_gui_tabs.py::test_the_clips_tab_writes_no_render_or_source_widget` slices the span
+        # bounded by the first Video Review registration and the first app-load hook, and pins the
+        # registration count inside it. This is a Raw Cutter action that happens to fill two Video
+        # Review widgets, so it belongs to the cutter's event block and must stay out of that span.
+        #
+        # Note the wording above avoids spelling either boundary token literally: that guard finds
+        # its span with `str.index`, so a comment naming the anchor becomes the match and silently
+        # relocates the span. This repository has now been bitten by prose tripping a substring
+        # check six times; see `prose-mentioning-a-ban-trips-substring-bans`.
+        #
+        # It is not a render and not a cut: no `_RENDER_LOCK`, no cutter lane, and its own
+        # unlimited concurrency lane for the measured R3 reason -- a lane of 1 would queue a
+        # second click instead of letting it run.
+        cut_open_library_btn.click(
+            fn=_on_cut_open_in_library,
+            inputs=[cut_output],
+            outputs=[clips_input, clips_recursive, main_tabs, library_tabs, clips_report],
+            concurrency_limit=None,
+        )
 
         # [FORK] P1: a planning setting moved, so the plan on screen is no longer about this
         # source. Cut Video goes unavailable and says why. Presentation only -- `_on_cut_run`
@@ -10348,10 +11447,14 @@ def create_ui() -> gr.Blocks:
 
         source_outputs = [source_report, confirm_btn, confirm_status, process_btn, source_state]
 
+        # [FORK] R8 Commit C: `source_folder` is PREPENDED to the outputs so "Use Media Library"
+        # can fill it in. Prepended rather than appended purely so the two group-visibility
+        # updates stay adjacent to each other; the handler's return tuple matches this order
+        # positionally, as every handler on this gate must.
         source_mode.change(
             fn=_on_source_mode_change,
             inputs=[source_mode, source_state],
-            outputs=[folder_group, browser_group] + source_outputs,
+            outputs=[source_folder, folder_group, browser_group] + source_outputs,
         )
         source_folder.change(
             fn=_on_folder_path_change,
@@ -10465,6 +11568,13 @@ def create_ui() -> gr.Blocks:
         ]
         freestyle_live_inputs = [freestyle_enabled] + freestyle_section_dropdowns
 
+        # [FORK] R8 Owner Fixes (P1): all eleven Freestyle registrations write the same three
+        # read-outs -- the summary, the state badge and the section panel's visibility. One
+        # handler, one output list, so the badge can never disagree with the switch that produced
+        # it. All three are display: no execution widget, no state, no render input.
+        _freestyle_readout_outputs = [freestyle_summary, freestyle_state_badge,
+                                      freestyle_sections_group]
+
         # [FORK] Digital-Union (GUI Refresh A): one registration on the TAB, not on the widgets.
         #
         # Reads eleven live values and writes exactly one read-only textbox. Binding it to the
@@ -10489,11 +11599,26 @@ def create_ui() -> gr.Blocks:
         # selector is recomputed from the live sliders). Every remaining input lives in another
         # tab, so the `.select()` that fires on the way back here is sufficient to keep all of them
         # current — no creative control needs a second binding, and no event here can be stale.
-        tab_quick_render.select(
-            fn=_on_quick_render_tab_select,
-            inputs=[freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
-                    sfx_amount] + freestyle_section_dropdowns,
-            outputs=[active_settings_summary])
+        # [FORK] R8 Commit C: the six sliders LEAD the input list, in `creative_control_sliders`
+        # order so the handler's six named parameters line up positionally with the one tuple the
+        # preset label is computed from. The ten Freestyle dropdowns still ride LAST and are still
+        # collected by `*styles`, so every other parameter keeps a fixed index.
+        tab_render.select(
+            fn=_on_render_tab_select,
+            inputs=creative_control_sliders
+            + [freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
+               sfx_amount] + freestyle_section_dropdowns,
+            outputs=[creative_profile_summary])
+
+        # [FORK] R8 Commit C: a one-click route to the tab the summary talks about. Selecting a
+        # tab is not a render: no `_RENDER_LOCK`, no lane, and it writes no setting -- `outputs`
+        # is exactly the tab container, which is what `gr.Tabs(selected=...)` needs.
+        open_creative_settings_btn.click(
+            fn=lambda: gr.Tabs(selected='tab-creative-settings'),
+            inputs=[],
+            outputs=[main_tabs],
+            concurrency_limit=None,
+        )
 
         # Each widget refreshes the summary and writes NOTHING else. `.change()` is correct here
         # (unlike the preset/slider graph, which needs `.input()` to stay acyclic): nothing ever
@@ -10509,27 +11634,38 @@ def create_ui() -> gr.Blocks:
             outputs=[variation_seed, freestyle_summary])
 
         freestyle_enabled.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_intro.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_hook.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_outro.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_finale.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_drop.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_chorus.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_bridge.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_breakdown.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_verse.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_body.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
 
         # [FORK] Digital-Union (AI Director V1): the Director's entire wiring — two button clicks.
         #
@@ -10563,6 +11699,27 @@ def create_ui() -> gr.Blocks:
             fn=_on_generate_director_proposal,
             inputs=[director_instruction, prep_folder, prep_recursive, prep_state],
             outputs=[director_proposal_state, director_proposal, director_status],
+        )
+
+        # [FORK] R8 Final Polish: Clear Creative Variations -- the SEVENTH writer of
+        # `variation_seed`, and the matrix is extended by exactly one with its reason stated,
+        # never relaxed to a containment check.
+        #
+        # It is legitimate for the same reason Randomize is: "no variation" is a seed value, and
+        # 0 is the documented precision baseline rather than a magic number. It writes no slider
+        # and no preset, so it adds nothing to either of those matrices -- a test asserts that
+        # absence, because a reset that quietly moved the sliders would be a second preset.
+        clear_variations_btn.click(
+            fn=_on_clear_creative_variations,
+            inputs=freestyle_section_dropdowns,
+            # [FORK] R8 Owner Fixes (P1): the badge and the section panel are appended. They are
+            # READ-OUTS of the checkbox this action clears -- without them the panel would keep
+            # claiming "Freestyle is ON" next to an unticked box. The prohibition this list
+            # exists to enforce is unchanged and still pinned: no slider, no preset, no Audio Mix
+            # widget, nothing from a source, preparation or render surface.
+            outputs=[variation_seed, freestyle_enabled, freestyle_summary,
+                     freestyle_state_badge, freestyle_sections_group],
+            concurrency_limit=None,
         )
 
         # Apply is the ONE Director writer of execution widgets, and the exact set is the
@@ -10694,7 +11851,7 @@ def create_ui() -> gr.Blocks:
                 voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
                 sfx_folder, sfx_roles,
                 source_mode, source_folder, source_recursive, video_input,
-                output_filename, processing_mode, custom_fps,
+                output_filename, processing_mode, output_profile,
                 session_state, source_state,
                 # [FORK] Digital-Union (Freestyle V1): the same live widgets, appended at the end
                 # and written out explicitly for the same inspectability reason. The batch freezes
@@ -10898,7 +12055,7 @@ def create_ui() -> gr.Blocks:
                 # same contract. The report is an output only and is deliberately absent here.
                 sfx_folder, sfx_roles, sfx_amount, sfx_level,
                 source_mode, source_folder, source_recursive, video_input,
-                output_filename, processing_mode, custom_fps, variation_seed,
+                output_filename, processing_mode, output_profile, variation_seed,
                 cut_density, energy_response, motion_bias,
                 source_diversity, micro_cuts, semantic_emphasis,
                 session_state, source_state,
@@ -10969,13 +12126,38 @@ def create_ui() -> gr.Blocks:
         )
         # [UX V3] Confirm now sorts the page, so it repaints what it changed: the report, the
         # grid (the next batch, or this one again if anything stayed), the counts and the button.
-        # The sources are the registry page and the durable record -- this click sends no inputs
-        # at all, which is what keeps the browser out of the decision about where a file goes.
+        # The sources are the registry page and the durable record -- the only widget value this
+        # click sends is the batch signature, which cannot name a folder or a decision, so the
+        # browser is still out of the decision about where a file goes.
+        #
+        # [FORK] R8 Final Polish: Confirm, Proceed and Cancel all write the SAME eight outputs
+        # through the same helper, which is what keeps the sweep gate honest -- there is no path
+        # on which Proceed can repaint something Confirm cannot, and no path on which a refusal
+        # leaves the gate open. The same one-assembler discipline Audio Review uses.
+        _clips_confirm_outputs = [clips_report, clips_gallery, clips_counts, clips_confirm_btn,
+                                  clips_confirm_out, clips_proceed_btn, clips_sweep_cancel_btn,
+                                  clips_armed_state]
         clips_confirm_btn.click(
             fn=_on_clips_confirm,
+            inputs=[clips_armed_state],
+            outputs=_clips_confirm_outputs,
+            concurrency_limit=None,
+        )
+        # Proceed is the SAME handler. It is not a second sorting path: it re-derives the plan,
+        # re-validates the destinations and compares the signature exactly as Confirm does -- the
+        # only difference is that by now `clips_armed_state` holds a signature that matches, so
+        # the gate falls through instead of being shown. A second entry point that skipped any of
+        # those checks would be a way around them.
+        clips_proceed_btn.click(
+            fn=_on_clips_confirm,
+            inputs=[clips_armed_state],
+            outputs=_clips_confirm_outputs,
+            concurrency_limit=None,
+        )
+        clips_sweep_cancel_btn.click(
+            fn=_on_clips_sweep_cancel,
             inputs=[],
-            outputs=[clips_report, clips_gallery, clips_counts, clips_confirm_btn,
-                     clips_confirm_out],
+            outputs=_clips_confirm_outputs,
             concurrency_limit=None,
         )
 
