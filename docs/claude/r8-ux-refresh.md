@@ -409,3 +409,91 @@ branches would have "passed"):
 The report shows the **effective** fade range across the planned clips, not the setting, and names
 how many edges had no padding and were left sharp — because those two numbers differ exactly when
 the operator needs to know.
+
+## Commit E — text, duplication, and what was left undone
+
+Phase 10, plus the verification pass.
+
+### Permanent text
+
+The audit's finding 13 was visible in the very first screenshot: the Render tab's single largest
+block of text was the *Cancel Active Render* explanation, taller than the button it sat under.
+Four of the longest permanent paragraphs were cut without losing a claim anyone acts on:
+
+| Constant | Was | Is |
+|---|---|---|
+| `INFO_CANCEL_RENDER` | 530 chars | 150 |
+| `INFO_OPEN_OUTPUT_FOLDER` | 501 | 140 |
+| `INFO_TAB_CLIPS_PREVIEW` | 606 | 200 |
+| `INFO_TAB_AUDIO_PREVIEW` | 678 | 240 |
+
+The Render tab went from **1686 px to 1418 px** at a 1440-wide viewport — 16 % shorter, measured.
+
+Two rules were followed rather than invented. `test_open_output_folder.py` pins three claims in
+that help text (whose machine opens it, that it is Explorer, that nothing is downloaded) and all
+three survive. And the supported-format list left the Audio Review section intro for the folder
+field's own hint, because it matters at the moment of choosing a folder rather than as a
+permanent paragraph above everything.
+
+### Duplication
+
+`Video Source` and `Processing Mode` each printed their name twice — once as a group heading and
+again as the radio's own label. Both radios now carry `show_label=False`; the label **constant is
+still passed**, so assistive technology and every test that reads it are unaffected.
+
+### Accordions were NOT the tool for this
+
+The obvious move — put long text in a collapsed help accordion — is unavailable in exactly the
+places that needed it most. `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` and
+`test_video_review_hides_none_of_its_controls` both assert `"gr.Accordion" not in <span>`, and
+they are right to: those tabs exist because burying controls behind a click is the problem this
+refresh is fixing. A help accordion would have tripped guards written against hiding *controls*.
+Shortening the text is the better answer anyway — an accordion keeps the words and adds a click.
+
+### What a fresh pair of eyes should look at first
+
+Recorded honestly rather than left for the owner to discover:
+
+* **Settings' Browse buttons sit in their own narrow column**, so the row reads as a wide text
+  box with a small detached button. It works; it is not pretty.
+* **The Creative Settings tab is 3516 px tall** — by far the longest screen in the app. Variant
+  Lab, the Director and Freestyle are all legitimately large, and the three bulky ones are
+  collapsed, but this tab is the next candidate for the same treatment the Render tab just had.
+* **`output_profile` is now a parameter name in two unrelated handler families** — the Raw
+  Cutter's export profile and the render's output profile. They are in separate function scopes
+  and the *widgets* are distinct (`cut_output_profile` versus `output_profile`), so there is no
+  defect, but the name is ambiguous to a reader.
+### The first-Confirm Proceed/Cancel visibility issue: checked, and it does NOT reproduce
+
+The brief asked for this to be checked and fixed if reproducible. It was driven end to end in the
+running app — three real WAV clips, Media Library → Audio Review, Scan, mark one Keep, press
+Confirm with two still unmarked — and the gate behaves correctly:
+
+```
+proceed : flex 913x40  "➡️ Proceed — sort it as listed"
+cancel  : flex 913x40  "↩️ Cancel — go back and mark m…"
+report  : ⚠️ Some clips are still unmarked. Nothing has moved yet — here is what Confirm would do:
+clips   : all three still in the review folder; library and discarded both EMPTY
+```
+
+The server was observed sending both `{"visible":true,"__type__":"update"}` objects, and the
+buttons are 913×40 on screen.
+
+**I first recorded this as reproduced, and that was my measurement error — worth writing down
+because it is an easy one to repeat.** The first probe polled with
+`for (…) { btn = document.getElementById(…); if (btn) break; }` and then read `display`.
+Existence and visibility are two different transitions here — the same button was observed
+**absent** from the DOM before any interaction, and **present with `display: none`** shortly after
+the click — so `if (btn) break` exits on the first of the two and the subsequent `display` read
+lands in the window before the visible state settles.
+
+Worse, the follow-up looked like corroboration: pressing Confirm a second time swept the unmarked
+clips, which reads as "the gate armed invisibly and the only visible button did the destructive
+thing". It is in fact the documented behaviour — *"with a signature that still matches, the sweep
+proceeds"* — and the second press was a legitimate confirmation of a gate that had been shown
+correctly.
+
+**The rule: when a control's visibility is the thing under test, never poll for the element's
+existence.** Poll for the property itself (`getComputedStyle(el).display !== 'none'`), or wait on
+the network response. An element that exists in both states makes existence a constant, and a
+probe whose condition is already true measures nothing.

@@ -8813,6 +8813,11 @@ def create_ui() -> gr.Blocks:
                                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', elem_id='audio-file-input')
                                 # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
                                 with gr.Group():
+                                    # [FORK] R8 Phase 10: the group heading names the control,
+                                    # so the radio below carries `show_label=False` rather than
+                                    # repeating the same words on a second line under it. The
+                                    # label CONSTANT is kept and still passed, so assistive
+                                    # technology and every test that reads it are unaffected.
                                     gr.Markdown('### 🎬 Video Source')
                                     source_mode = gr.Radio(
                                         choices=[
@@ -8825,6 +8830,7 @@ def create_ui() -> gr.Blocks:
                                         ],
                                         value=SourceMode.LOCAL_FOLDER.value,
                                         label=LABEL_SOURCE_MODE,
+                                        show_label=False,
                                         info=INFO_SOURCE_MODE,
                                         elem_id='source-mode-radio',
                                     )
@@ -8891,9 +8897,9 @@ def create_ui() -> gr.Blocks:
                                 with gr.Group():
                                     gr.Markdown(f'### 🎬 Processing Mode')
                                     if NVENC_AVAILABLE:
-                                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_nvenc())
+                                        processing_mode = gr.Radio(choices=[('NVIDIA NVENC H.264', 'h264_nvenc'), ('NVIDIA NVENC HEVC (H.265)', 'hevc_nvenc'), ('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='h264_nvenc', label=LABEL_PROCESSING_MODE, show_label=False, info=get_processing_mode_info_nvenc())
                                     else:
-                                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, info=get_processing_mode_info_cpu())
+                                        processing_mode = gr.Radio(choices=[('CPU (H.264)', 'cpu'), ('ProRes 422 Proxy (Precise Mode)', 'prores_proxy')], value='cpu', label=LABEL_PROCESSING_MODE, show_label=False, info=get_processing_mode_info_cpu())
                                 with gr.Group():
                                     gr.Markdown('### 📁 Output Settings')
                                     output_filename = gr.Textbox(value='music_video.mp4', label=LABEL_OUTPUT_FILENAME, info=INFO_OUTPUT_FILENAME)

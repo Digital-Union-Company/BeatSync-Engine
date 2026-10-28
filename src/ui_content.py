@@ -695,14 +695,14 @@ INFO_TAB_SETTINGS = (
 # Cutter produced. P1 moves nothing; transfer is a separate authorized phase.
 # ============================================================================
 
+# [FORK] R8 UX Refresh (Phase 10): shortened from 606 characters. The Media Library tab's own
+# intro already says what the three sections are for, so this no longer repeats it — and the
+# "nothing moves until you confirm" promise, which is the one an operator needs before clicking,
+# is kept.
 INFO_TAB_CLIPS_PREVIEW = (
-    "**Review the clips you just cut, and mark each one keep or discard.** Point it at a folder of "
-    "clips, press Scan, then classify: left click keeps, right click discards, and the ↺ button "
-    "puts a clip back to undecided. Every decision is recorded on the server, so a reload, a second "
-    "browser tab or a restart cannot change what you decided.\n\n"
-    "**This phase does not move any file.** Classifying is read-only — the clips stay exactly where "
-    "they are, and the destination folders below are validated but never written to. Actually "
-    "moving the selected and discarded clips is a separate, separately reviewed step."
+    "**Mark each clip keep or discard.** Left click keeps, right click discards, ↺ undoes. "
+    "Decisions are recorded on the server, so a reload or a restart cannot change them — and "
+    "**nothing moves until you press Confirm**."
 )
 
 LABEL_CLIPS_INPUT = "📂 Clips folder (the clips to review)"
@@ -1358,13 +1358,16 @@ INFO_RENDER_SELECTED = (
 )
 
 LABEL_CANCEL_RENDER = "⏹️ Cancel Active Render"
+# [FORK] R8 UX Refresh (Phase 10): shortened from 530 characters.
+#
+# The original was accurate and sat permanently on the Render tab, where it was the single
+# largest block of text on the screen -- taller than the Create Music Video button it sat under.
+# Everything it said is still true and still worth saying; it is said in one line, with the
+# qualifications that only matter once Cancel has been pressed moved into the status panel's own
+# wording, which is where someone actually reads them.
 INFO_CANCEL_RENDER = (
-    "Stops whichever render is currently running — Create Music Video or Render Selected "
-    "Variants. **Not instant.** Video encoding (clip extraction, assembly, audio mixdown) stops "
-    "within moments. An in-progress AI scene-analysis step is never interrupted mid-call — it is "
-    "never force-killed — and the render stops only once that call returns naturally. A candidate "
-    "already durably rendered before you pressed Cancel is kept; nothing already written to your "
-    "output folder is deleted. Pressing this with no render running does nothing."
+    "Stops the render in progress. Not instant: encoding stops within moments, and an "
+    "AI scene-analysis step finishes its current call first. Anything already finished is kept."
 )
 STATUS_CANCEL_REQUESTED = (
     "⏹️ Cancel requested — stopping at the next safe point. This is not instant: an in-progress "
@@ -1379,13 +1382,13 @@ STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
 # loopback-only app is the same machine the browser is on — but saying "your" folder without
 # qualification would be a lie if the page were ever opened from another device.
 LABEL_OPEN_OUTPUT_FOLDER = "📂 Open Output Folder"
+# [FORK] R8 UX Refresh (Phase 10): shortened from 501 characters, keeping every claim a test
+# pins -- it still says WHOSE machine opens ("running BeatSync"), still names Explorer, and still
+# promises no download. The master/share distinction it used to explain here is stated by the
+# render's own status panel, which names whichever files it actually wrote.
 INFO_OPEN_OUTPUT_FOLDER = (
-    "Opens this BeatSync installation's `output` folder in Windows File Explorer, on the computer "
-    "running BeatSync. It holds the completed high-quality masters and any shareable MP4 files "
-    "that were successfully saved: the master of a finished render is guaranteed, the shareable "
-    "copy beside it is best-effort, and that render's own status panel names whichever of the two "
-    "it actually wrote. The folder opens whether or not you have rendered anything yet, and this "
-    "never starts, stops or changes a render."
+    "Opens the folder your finished videos go to, in Windows File Explorer on the computer "
+    "running BeatSync. Works before your first render."
 )
 #: Deliberately **not** "Explorer opened". `os.startfile` hands the path to the Windows shell and
 #: returns immediately; it reports that the request was accepted, not that a window appeared. Only
@@ -1876,21 +1879,28 @@ AUDIO_DESTINATION_STATUS_INITIAL = (
 # every handler are unchanged, only the container is.
 # ---------------------------------------------------------------------------------------------
 
+# [FORK] R8 UX Refresh (Phase 10): shortened from 678 characters, and the heading is gone --
+# this is now a SECTION inside Media Library, so the section tab already names it and a `###`
+# here repeated the label immediately above it.
+#
+# Two claims were kept because they are the ones that change what an operator does: that it works
+# on any folder without the cutter having run (otherwise they will not try it), and that nothing
+# is deleted (otherwise they will not press Confirm). The supported-format list moved to the
+# folder field's own hint, where it is relevant at the moment of choosing a folder.
 INFO_TAB_AUDIO_PREVIEW = (
-    "### \U0001f3a7 Audio Preview \u2014 review and sort a folder of audio clips\n\n"
-    "Point this at **any folder of audio clips** and classify them: the ones the Raw Audio Cutter "
-    "made earlier, or clips from anywhere else. It does **not** need the Audio Cutter to have run "
-    "in this browser session, so you can cut today and sort next week.\n\n"
-    "Supported: **WAV**, **FLAC**, **MP3**, M4A, AAC, OGG and Opus. Large folders are paged, and "
-    "**your decisions are remembered as you move between pages**.\n\n"
+    "**Review and sort any folder of audio clips** \u2014 the Audio Cutter does not need to have run "
+    "in this session, so you can cut today and sort next week.\n\n"
     "Nothing is scanned until you press **Scan Folder**, nothing moves until you press "
-    "**Confirm and Sort**, and discarding always means *moved to your Discarded folder* \u2014 "
-    "never deleted."
+    "**Confirm and Sort**, and discarding means *moved to your Discarded folder* \u2014 never "
+    "deleted."
 )
 LABEL_AUDIO_PREVIEW_FOLDER = "\U0001f4c2 Folder of audio clips to review"
 INFO_AUDIO_PREVIEW_FOLDER = (
     "The folder holding the clips. An Audio Cutter output folder "
-    "(\u201cAudioCutter_\u2026\u201d) is the usual one, but any folder of audio works."
+    "(\u201cAudioCutter_\u2026\u201d) is the usual one, but any folder of audio works.\n\n"
+    # [FORK] R8 Phase 10: moved here from the section intro. The format list matters at the
+    # moment an operator chooses a folder, not as a permanent paragraph above the whole section.
+    "Reads **WAV**, **FLAC**, **MP3**, M4A, AAC, OGG and Opus."
 )
 LABEL_AUDIO_PREVIEW_RECURSIVE = "Include subfolders"
 INFO_AUDIO_PREVIEW_RECURSIVE = (
