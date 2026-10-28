@@ -637,3 +637,163 @@ middlewares were attached. Posters still drew, but every clip decision POSTed to
 not exist and came back **404**, surfaced only in `window.__r5Last`. A silent dead click in a
 harness is indistinguishable from a broken feature. The launcher now mirrors `gui.main()`'s
 launch arguments exactly.
+
+---
+
+## Commit G — the owner's hands-on playtest fixes
+
+A third brief, written after the owner used the app on a real folder. One P0 defect that stopped
+work, three P1 usability complaints, and some text that had become false.
+
+### P0 — Confirm died after the first batch. Root cause, and why it looked like a server bug
+
+**Reproduced exactly**, with 205 synthetic clips at page size 100: batch one (12 kept, 5
+rejected, 83 swept) sorted 100/100 and published batch two; marking a clip on batch two produced
+`Kept 1 ... Undecided 99` and the hint *"Confirm is being enabled from the server's record"* — and
+Confirm stayed disabled.
+
+The decisive measurement was pressing *Re-read the server's record* by hand: Confirm enabled
+**instantly**. So the record was right all along and the server had simply never been asked.
+
+The gallery script asks for a Refresh from exactly one place, `syncConfirm`, which returns early
+when the readiness answer equals the last one it saw:
+
+```js
+let readyState = null;                     // a bare boolean, with no idea which page it described
+function syncConfirm(ready) {
+  if (ready === readyState) { return; }    // <-- the whole defect
+```
+
+End of batch one leaves `readyState === true`. The resync that should have reset it for batch two
+raced the page swap — Gradio **morphs the grid in place**, so a resync fired mid-swap reads a
+half-applied `data-session` / `data-page` pair — and painted nothing. The first keep on batch two
+then computed `true`, matched the stale `true`, and no Refresh was ever requested. Since Refresh
+is the only thing permitted to move the button, Confirm stayed exactly as the new page had been
+published: disabled.
+
+Three changes, and the first is the fix:
+
+* **Readiness is keyed to `session/page`.** A page transition cannot compare equal to anything,
+  so every new page asks once. It still converges, because that answer republishes the grid under
+  the *same* page token — so the next comparison matches and nothing re-fires.
+* **Every reply is tagged with the page it was requested for**, in both `send` and `__r5Resync`,
+  captured *before* the request. A reply that outlived its page is dropped rather than painted.
+* **The repaint observer watches the nonce attribute**, not only `childList` — the nonce exists
+  to make a repaint detectable and arrives as an attribute mutation on an element Gradio reuses —
+  and a nonce whose resync failed is released so a later mutation can retry it.
+
+The server-authoritative model is untouched: nothing in the gallery script may write the button,
+and `test_the_client_still_never_touches_the_button` keeps it that way.
+
+**Three-batch browser result** (205 clips, page size 100):
+
+| batch | action | result |
+|---|---|---|
+| 1 (100) | 12 keep, 5 reject, 83 unmarked → Confirm → Proceed | sorted 100/100, batch 2 auto-loaded |
+| 2 (100) | one keep | **Confirm enabled automatically, no manual Refresh** |
+| 2 (100) | 18 keep / 82 reject (the owner's reported shape) | server record `SELECTED 18`, Chrome `disabled === false`, **they agree** |
+| 2 | fully decided → Confirm | sorted with no gate, batch 3 auto-loaded |
+| 3 (5) | one keep → Confirm → **Cancel** | nothing moved; all five still in the source folder |
+| 3 (5) | Confirm → Proceed | sorted |
+
+Final tally: **31 kept + 174 discarded = 205**, 205 distinct original filenames, nothing lost,
+duplicated, renamed or overwritten.
+
+### P1 — Freestyle says which mode it is in, and hiding is not clearing
+
+A small checkbox decided whether the six global Creative Controls applied at all. It now carries
+a badge — "Freestyle is OFF" / "Freestyle is ON" — and the off state names what is used instead,
+because something always is.
+
+The ten section rules are shown only while Freestyle is on, and the property that makes that safe
+is that a Gradio component with `visible=False` **keeps and still submits its value**. Measured:
+set intro to `Cinematic`, switch off, switch on — still `Cinematic`. Resetting them instead would
+have made a visibility switch destructive.
+
+All eleven Freestyle registrations now write one shared list, so the badge cannot disagree with
+the switch that produced it.
+
+### P1 — two real buttons, and a labelled profile
+
+Clear Creative Variations was a `size='sm'` control under a full-width Randomize. They are
+opposite operations on the same setting, so they are now one row at equal size (measured 479 px
+each), and Clear carries `variant='stop'` because it discards work.
+
+Measured distinctness: Randomize moved the seed `0 → 122885` and left the Cinematic rule and the
+sliders alone; Clear moved it back to 0, turned Freestyle off, updated the badge — and left
+`cut_density`, `micro_cuts` and `semantic_emphasis` at 50 with the Cinematic rule remembered.
+
+The Creative Profile read-out keeps the same computation and gains labels:
+
+```
+Base preset: High Energy
+Active variations: Freestyle (10 section rules), Variation Seed 367319
+```
+
+`summary_labelled` calls the same `base_label` and `overrides` as `summary`, which is what makes
+the two incapable of disagreeing. No remembered preset state was introduced.
+
+### P1 — one voice pair, an optional override, and nothing consolidated
+
+Four near-identically named audio destinations read as duplication. They are four real settings,
+so none was removed. Instead the Audio Cutter's pair is presented as *the* Voice library /
+Discarded pair, and **Audio Review falls back to it when its own override is blank**. Two
+properties make that safe, both pinned:
+
+* the fallback is **read-side only** — `_on_save_folder_prefs` still writes each key from its own
+  field, so a fallback is never persisted and two settings can never silently merge;
+* a **non-empty override always wins**, so an operator who already set different folders keeps
+  them.
+
+Measured across a restart with `audio_preview_library` set and `audio_preview_discarded` blank:
+Settings showed the stored truth (one path, one empty field) while the Audio Review tab showed
+the override for the library and the shared folder for discarded. The blank key stayed blank on
+disk.
+
+The optional panel is collapsed — but **opens on load when an override is actually set**, because
+a setting in force must never hide behind a closed drawer.
+
+### P1 — a work folder that is also a finished library
+
+The owner's screenshot had the Audio Cutter output and the Audio Preview Media Library both at
+`Raw_Cutts`. `overlapping_destinations` reports it, in the status box and at startup:
+
+> Heads up — a work folder is also set as a finished library: … Reviewed and unreviewed clips will
+> be mixed together in it. **Nothing was moved or changed**; set different folders if that was not
+> intended.
+
+It compares normalised paths so case, separator and a trailing slash are recognised as the same
+place, and it **touches no filesystem** — pinned by a test that makes `os.path.exists`, `isdir`,
+`realpath` and `stat` raise. It relocates nothing and refuses no save.
+
+### P2 — text that had become false
+
+* "Media Library folder (where KEPT clips would go)" described the plan-only version. Confirm has
+  moved files since UX V3, so both destination labels now say **MOVED**, and Discarded still says
+  *never deleted*.
+* The Confirm label said *"sort the decided clips"*; keep-only sorting also files the unmarked
+  ones after an explicit Proceed, so it now reads *"file this page into its folders"*.
+* The Render tab printed *"Create Music Video stays disabled until you confirm the source list"*
+  **unconditionally**, including while the list was confirmed and Stage 6 was rendering. The
+  permanent line now states the gate's property; the live half is `confirm_status`, which already
+  tracked the real state. Confirmation authority and render admission are unchanged.
+* The Saved-folders status now says what it describes — *"(This describes your saved settings.
+  Edits above take effect when you press Save defaults.)"* The owner's stale-looking warning was
+  correct: it reported saved settings while the fields held unsaved edits. Every writer (save,
+  reset, startup) now goes through one composer, so a successful save cannot leave a warning
+  describing superseded settings.
+
+### P2 — Variant Lab presentation
+
+Roughly 3.9 KB of permanently visible explanation moved behind an "How Variant Lab works" panel,
+**reused verbatim** so there is no shortened second copy to drift. The Master Seed keeps a
+one-line `info=`; its full explanation is in the panel.
+
+Result boxes now start small and grow: `variant_report` 7/7 → 2/12 and `variant_batch_table`
+13/16 → 3/16. The ceilings were kept or raised — cutting them would clip a real report, which is
+the opposite of the fix. Every control, range, candidate and render operation is unchanged.
+
+### Render still correct
+
+1080p · 25 fps chosen in the UI over four sources rendered `width=1920 height=1080
+r_frame_rate=25/1`. No encoding or output-profile code was touched.

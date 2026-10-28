@@ -644,6 +644,23 @@ INFO_FREESTYLE_ENABLED = (
     "what it would be without Freestyle at all."
 )
 
+# [FORK] R8 Owner Fixes (P1): the state badge. The owner's complaint was that a small checkbox is
+# easy to miss, so the panel now SAYS which mode it is in rather than leaving the operator to
+# read a tick box. Two states, two sentences, and the off state names what is used instead --
+# "nothing happens" is not an explanation.
+#
+# These are display text written by `_on_freestyle_change` from the live checkbox value. They
+# carry no authority: the checkbox is still the only gate, exactly as it was.
+FREESTYLE_BADGE_OFF = (
+    "### ⚪ Freestyle is OFF\n\n"
+    "Every section of the song is edited with the six global **Creative Controls** above."
+)
+FREESTYLE_BADGE_ON = (
+    "### 🟢 Freestyle is ON\n\n"
+    "The per-section rules below replace the global Creative Controls for the section types you "
+    "set. Micro Cuts and the Variation Seed stay global."
+)
+
 # ============================================================================
 # [FORK] Digital-Union: GUI Refresh A — tabs
 # Layout only. No execution setting is duplicated and no new authority exists.
@@ -721,17 +738,22 @@ INFO_CLIPS_RECURSIVE = (
     "leaving this on is what finds the clips inside them."
 )
 
-LABEL_CLIPS_LIBRARY = "✅ Media Library folder (where KEPT clips would go)"
+# [FORK] R8 Owner Fixes (P2): "would go" is left over from when Confirm only reported a plan.
+# It has moved files since UX V3, and a label in the conditional is the one place an operator
+# looks to find out whether anything is at stake.
+LABEL_CLIPS_LIBRARY = "✅ Media Library folder — kept clips are MOVED here"
 INFO_CLIPS_LIBRARY = (
-    "Validated now, written to later. It must not be inside the clips folder, must not contain it, "
+    "Validated when you scan, written when you confirm — keeping a clip moves the file, it does "
+    "not copy it. It must not be inside the clips folder, must not contain it, "
     "and must not be the discard folder or a protected runtime directory — those are refused before "
     "anything is read, and the check follows junctions and symlinks rather than comparing the text "
     "you typed."
 )
 
-LABEL_CLIPS_REJECTED = "🗑️ Discarded folder (quarantine, never deletion)"
+LABEL_CLIPS_REJECTED = "🗑️ Discarded folder — clips are MOVED here, never deleted"
 INFO_CLIPS_REJECTED = (
-    "Discarding is quarantine, not deletion: a discarded clip would be moved here, intact, for you "
+    "Discarding is quarantine, not deletion: a discarded clip is moved here, intact and under its "
+    "original name, for you "
     "to deal with outside this tool. There is no retention expiry and no permanent delete."
 )
 
@@ -749,7 +771,7 @@ LABEL_CLIPS_REFRESH = "🔁 Re-read the server's record"
 # now sorts, so a button that still said "moving is not enabled yet" told the operator the exact
 # opposite of what pressing it does to their files -- the one place a stale label is dangerous
 # rather than untidy.
-LABEL_CLIPS_CONFIRM = "✅ Confirm — sort the decided clips into their folders"
+LABEL_CLIPS_CONFIRM = "✅ Confirm — file this page into its folders"
 LABEL_CLIPS_REPORT = "Scan report"
 LABEL_CLIPS_COUNTS = "Decisions (server record)"
 LABEL_CLIPS_CONFIRM_OUT = "Confirm"
@@ -841,6 +863,39 @@ LABEL_PREF_GROUP_REVIEW = "📂 Review destinations"
 INFO_PREF_GROUP_REVIEW = (
     "Where a review files what you decide. Keeping and discarding are both *moves* — nothing is "
     "ever deleted, and the original filename is preserved."
+)
+
+# [FORK] R8 Owner Fixes (P1): the four audio destinations, explained rather than renamed.
+#
+# The owner read them as duplicated. They are not duplicates -- the Audio Cutter files a fresh
+# cut, Audio Review files a clip reviewed later, and those are genuinely different decisions --
+# but four entries with near-identical names is a fair complaint. So the Cutter's pair is now
+# presented as the ordinary Voice library / Discarded pair, Audio Review's pair is an OPTIONAL
+# override in a collapsed panel, and Audio Review falls back to the Cutter's pair when its own
+# is left blank.
+#
+# Nothing is consolidated: a stored Audio Review folder that differs keeps winning, and no save
+# ever copies one key's value into another.
+LABEL_PREF_VOICE_PAIR = "🎙️ Voice library and Discarded (used by both audio tabs)"
+INFO_PREF_VOICE_PAIR = (
+    "The two folders audio reviewing files into. **Audio Review uses these as well** unless you "
+    "set it its own pair below."
+)
+LABEL_PREF_AUDIO_OVERRIDES = "Separate folders for Audio Review (optional)"
+INFO_PREF_AUDIO_OVERRIDES = (
+    "Leave both blank and Audio Review files into the Voice library and Discarded folders above "
+    "— that is the usual setup. Fill one in only if reviewing a clip *later* should send it "
+    "somewhere different from a fresh cut.\n\n"
+    "Anything already saved here is kept exactly as it is: filling these in never changes the "
+    "folders above, and the folders above never overwrite these."
+)
+
+#: [FORK] R8 Owner Fixes (P2): what the status box is actually describing. The owner saw it
+#: naming old paths while new ones were visible in the fields, which is correct behaviour --
+#: the box reports SAVED settings and the fields were edited but not yet saved -- and reads as a
+#: contradiction unless it says so.
+PREF_STATUS_SCOPE = (
+    "(This describes your saved settings. Edits above take effect when you press Save defaults.)"
 )
 
 # [FORK] R8 UX Refresh (Commit C): the Media Library as a video source.
@@ -1235,6 +1290,22 @@ INFO_SURPRISE_ME = (
 # ============================================================================
 
 LABEL_VARIANT_LAB = "🧪 Variant Lab"
+# [FORK] R8 Owner Fixes (P2): the lead sentence and the help panel.
+#
+# The lab carried roughly 3.9 KB of permanently visible explanation -- six Markdown blocks plus
+# two long `info=` strings -- above controls that are themselves advanced. Every word of it is
+# still available; it is now one click away instead of always on screen, and `INFO_VARIANT_LAB`
+# and friends are reused verbatim inside the panel rather than rewritten, so there is no second
+# version of the explanation to drift.
+LABEL_VARIANT_HELP = "ℹ️ How Variant Lab works"
+INFO_VARIANT_LAB_LEAD = (
+    "Generate recipes near your current six sliders, compare them, and apply one. "
+    "**Nothing renders and no setting changes until you press Apply.**"
+)
+#: A short `info=` for the Master Seed. The full explanation -- what makes a draw repeat, and why
+#: it is not the Variation Seed -- moved into the help panel.
+INFO_MASTER_SEED_SHORT = "Repeats a draw. 0 means a fresh random one each time."
+
 INFO_VARIANT_LAB = (
     "Explore beyond the seed. Tick the controls that may vary, give each one an allowed range, "
     "choose how far from your current settings to wander, and generate one recipe. "
@@ -1495,9 +1566,18 @@ LABEL_SCAN_FOLDER = "🔍 Scan Folder"
 LABEL_SOURCE_REPORT = "📋 Source Status"
 LABEL_CONFIRM_SOURCES = "✅ Confirm source files"
 
+# [FORK] R8 Owner Fixes (P2): the permanent instruction is gone.
+#
+# It read "Create Music Video stays disabled until you confirm the source list" and was printed
+# unconditionally -- including while the list WAS confirmed and Stage 6 was actively rendering,
+# where it is simply false. The fact it carried is still worth stating, so it is stated as a
+# property of the gate rather than as an instruction about the button's current state, and the
+# live, changing half is `confirm_status`, which already tracks the real source state.
+#
+# The gate itself is untouched: confirmation authority and render admission are unchanged.
 INFO_CONFIRMATION_GATE = (
-    "Create Music Video stays disabled until you confirm the source list. "
-    "Confirmation covers the actual files, not just the count, and is re-checked before rendering."
+    "Source confirmation covers the actual files, not just the count, and is re-checked before "
+    "rendering."
 )
 
 # ============================================================================

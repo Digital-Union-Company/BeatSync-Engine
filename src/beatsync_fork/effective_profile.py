@@ -154,6 +154,34 @@ def summary(controls, *, freestyle_declaration=None, variation_seed=0, voice_cli
     return _JOIN.join(parts)
 
 
+def summary_labelled(controls, *, freestyle_declaration=None, variation_seed=0, voice_clips=None,
+                     smart_mix_active=False) -> str:
+    """The same facts as :func:`summary`, labelled over one or two lines.
+
+    [FORK] R8 Owner Fixes (P1). The owner confirmed the one-line form was *correct* --
+    ``High Energy + Freestyle (10 section rules) + Variation Seed 367319`` -- and asked only that
+    it be easier to read. Chaining four clauses with ``+`` makes the base preset and the things
+    layered on top of it look like peers, when they are not: one is the recipe, the rest modify
+    it.
+
+    So this is a presentation of the SAME computation, not a second one. It calls
+    :func:`base_label` and :func:`overrides` exactly as :func:`summary` does, which is what keeps
+    the two incapable of disagreeing. :func:`summary` is unchanged and still used wherever a
+    single line is wanted.
+
+    With nothing layered on, the second line is omitted rather than printed empty -- "Active
+    variations: none" invites the reader to look for something that is not there.
+    """
+    active = overrides(freestyle_declaration=freestyle_declaration,
+                       variation_seed=variation_seed,
+                       voice_clips=voice_clips,
+                       smart_mix_active=smart_mix_active)
+    head = f"Base preset: {base_label(controls)}"
+    if not active:
+        return head
+    return f"{head}\nActive variations: {', '.join(active)}"
+
+
 def is_modified(controls, *, freestyle_declaration=None, variation_seed=0, voice_clips=None,
                 smart_mix_active=False) -> bool:
     """True when the render is not a plain named-preset render.

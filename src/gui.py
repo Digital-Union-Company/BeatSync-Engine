@@ -926,7 +926,23 @@ CLIPS_GALLERY_JS = r"""
   const BADGE = {PENDING: '?', SELECTED: '✓', REJECTED: '✗'};
   let active = null;          // the single mounted <video>, if any
   let lastNonce = null;
-  let readyState = null;      // last observed "every clip decided" answer, or null if unknown
+  let readyState = null;      // last observed readiness answer, or null if unknown
+  // [FORK] R8 Owner Fixes (P0): WHICH PAGE `readyState` describes. This is the whole fix.
+  //
+  // `readyState` used to be a bare boolean that outlived the page it was measured on, and
+  // `syncConfirm` returns early when the new answer equals it. Reproduced with 205 clips: batch
+  // one ends with 12 kept, so `readyState === true`; Proceed sorts it and publishes batch two;
+  // the resync that should have reset it raced the page swap and painted nothing; the operator
+  // then keeps a clip on the new page and `syncConfirm(true)` finds `true === true` and returns
+  // WITHOUT asking the server. Refresh is the only thing that moves the button, so Confirm stays
+  // disabled while the counter correctly reads "Kept 1" -- exactly the owner's report, and
+  // pressing Refresh by hand enabled it instantly, which is what proved the record was never
+  // consulted rather than wrong.
+  //
+  // Keyed to "session/page", a page transition can no longer compare equal to anything, so every
+  // new page asks the server exactly once. It still converges: that answer republishes the grid
+  // under the SAME page token, so the following comparison matches and nothing re-fires.
+  let readyKey = null;
   let decideSeq = 0;          // monotonic stamp so a slow reply cannot repaint newer counts
   let syncTimer = null;
 
@@ -942,6 +958,14 @@ CLIPS_GALLERY_JS = r"""
 
   const grid = () => document.querySelector('#clips-gallery .r5-grid');
   const tileOf = (el) => (el && el.closest) ? el.closest('#clips-gallery .r5-tile') : null;
+
+  // [FORK] R8 Owner Fixes (P0): the identity of the page currently on screen. Every readiness
+  // answer and every server reply is tagged with this, so nothing measured on one page can be
+  // applied to another. Null when no grid is mounted.
+  function pageKey() {
+    const g = grid();
+    return g ? (g.dataset.session + '/' + g.dataset.page) : null;
+  }
 
   function paint(clip, decision, rev) {
     const tile = document.querySelector('#clips-gallery .r5-tile[data-clip="' + clip + '"]');
@@ -961,9 +985,14 @@ CLIPS_GALLERY_JS = r"""
     return document.querySelector('#clips-counts-box textarea, #clips-counts-box input');
   }
 
-  function paintCounts(counts) {
+  // `key` is the page these counts were requested for. A reply that outlived its page is dropped
+  // rather than painted: it would otherwise describe the previous batch in the new batch's
+  // counter, and -- far worse -- hand `syncConfirm` a readiness answer about clips that are no
+  // longer on screen. Callers that genuinely have no page context omit it.
+  function paintCounts(counts, key) {
     const box = countsBox();
     if (!box || !counts) { return; }
+    if (key !== undefined && key !== null && key !== pageKey()) { return; }
     let text = 'Kept ' + counts.SELECTED + '   ·   Discarded ' + counts.REJECTED +
                '   ·   Undecided ' + counts.PENDING + '   ·   Total ' + counts.TOTAL;
     // [R5-P3 / F8] Decisions do not travel through a Gradio event, so this response cannot
@@ -989,8 +1018,15 @@ CLIPS_GALLERY_JS = r"""
   // Only transitions trigger it, so deciding the 2nd of 40 clips sends nothing; and a 120ms
   // coalescing window keeps a burst of fast clicks to a single read. The stamp comparison in
   // `send` means an out-of-order reply cannot drive this with stale counts.
+  //
+  // [FORK] R8 Owner Fixes (P0): the comparison is now (page, answer), not answer alone. A new
+  // page can never compare equal, so it always asks once; the same page with an unchanged answer
+  // still asks nothing, which is what keeps this from becoming a refresh loop.
   function syncConfirm(ready) {
-    if (ready === readyState) { return; }
+    const key = pageKey();
+    if (key === null) { return; }          // no grid on screen: nothing to be ready about
+    if (key === readyKey && ready === readyState) { return; }
+    readyKey = key;
     readyState = ready;
     if (syncTimer) { clearTimeout(syncTimer); }
     syncTimer = setTimeout(() => {
@@ -1023,6 +1059,8 @@ CLIPS_GALLERY_JS = r"""
     // it is about one clip and the server answered for that clip -- but the page-wide counts, and
     // the Confirm sync derived from them, follow the newest reply only.
     const stamp = ++decideSeq;
+    // [FORK] R8 Owner Fixes (P0): the page this decision was sent for, read BEFORE the request.
+    const key = g.dataset.session + '/' + g.dataset.page;
     let res, body;
     try {
       res = await fetch('/r5decide/' + g.dataset.session + '/' + g.dataset.page + '/' + clip, {
@@ -1036,7 +1074,7 @@ CLIPS_GALLERY_JS = r"""
       return;
     }
     window.__r5Last = Object.assign({status: res.status}, body);
-    if (body && body.counts && stamp === decideSeq) { paintCounts(body.counts); }
+    if (body && body.counts && stamp === decideSeq) { paintCounts(body.counts, key); }
     // Repaint on refusal too, so a stale tab is corrected rather than left lying.
     if (body && body.decision) { paint(clip, body.decision, body.rev); }
   }
@@ -1213,6 +1251,11 @@ CLIPS_GALLERY_JS = r"""
   window.__r5Resync = async () => {
     const g = grid();
     if (!g) { return {ok: false, code: 'no_grid'}; }
+    // [FORK] R8 Owner Fixes (P0): the page asked about, captured before the request. Gradio
+    // patches the grid's attributes in place, so a resync fired mid-swap can read a half-applied
+    // session/page pair; tagging the reply means a mismatched answer is dropped instead of
+    // painting the previous batch's counts over the new one.
+    const key = g.dataset.session + '/' + g.dataset.page;
     // [R5-P3 / F2] Never throws: `decide` depends on this answering so that an untrustworthy DOM
     // revision results in a resync or a visible failure, not an unhandled rejection.
     let body;
@@ -1223,24 +1266,51 @@ CLIPS_GALLERY_JS = r"""
       return {ok: false, code: 'network_error'};
     }
     if (!body || !body.ok) { return body || {ok: false, code: 'no_body'}; }
+    if (key !== pageKey()) { return {ok: false, code: 'page_changed'}; }
     Object.keys(body.clips).forEach((clip) => {
       paint(clip, body.clips[clip].decision, body.clips[clip].rev);
     });
-    paintCounts(body.counts);
+    paintCounts(body.counts, key);
     return body;
   };
 
   // A freshly delivered grid seeds its counters from the server instead of sitting at zero.
+  //
+  // [FORK] R8 Owner Fixes (P0), three changes, each one a way the old version could go quiet:
+  //
+  //   * `attributeFilter` is watched as well as `childList`. The nonce exists precisely so a
+  //     repaint is detectable, and it arrives as an ATTRIBUTE mutation -- Gradio morphs this
+  //     grid in place rather than replacing the node (measured: the same `.r5-grid` element
+  //     survives a republish). A childList-only subscription can therefore miss a repaint whose
+  //     structure happens to match.
+  //   * `lastNonce` is only kept if the resync actually succeeded. Pinning it on a resync that
+  //     returned `ok:false` meant the one mutation that could have retried was discarded.
+  //   * a page change clears the readiness memory outright, so nothing from the previous batch
+  //     can satisfy `syncConfirm`'s equality test on the new one.
+  //
+  // None of this can loop: a failed resync mutates no DOM, and a successful one converges after
+  // at most a single Refresh because the republished grid keeps the same page token.
+  async function resyncIfRepainted() {
+    const g = grid();
+    if (!g) { return; }
+    const key = g.dataset.session + '/' + g.dataset.page;
+    if (key !== readyKey) { readyKey = null; readyState = null; }
+    const nonce = g.dataset.nonce;
+    if (nonce === lastNonce) { return; }
+    lastNonce = nonce;
+    unmount();
+    const body = await window.__r5Resync();
+    if ((!body || !body.ok) && lastNonce === nonce) { lastNonce = null; }
+  }
+
   const host = document.querySelector('#clips-gallery');
   if (host) {
-    new MutationObserver(() => {
-      const g = grid();
-      if (g && g.dataset.nonce !== lastNonce) {
-        lastNonce = g.dataset.nonce;
-        unmount();
-        window.__r5Resync();
-      }
-    }).observe(host, {childList: true, subtree: true});
+    new MutationObserver(() => { resyncIfRepainted(); }).observe(host, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-nonce', 'data-page', 'data-session'],
+    });
   }
 }
 """.replace('__REFRESH_HINT__', json.dumps(CLIPS_REFRESH_TO_ENABLE_HINT))
@@ -2985,8 +3055,21 @@ def _on_creative_control_input(cut_density, micro_cuts, semantic_emphasis,
 _FREESTYLE_WIDGET_ORDER = fork_freestyle.SECTION_TYPES
 
 
-def _on_freestyle_change(freestyle_enabled, *styles) -> str:
-    """Re-render the Freestyle summary. Writes the summary textbox and nothing else.
+def _on_freestyle_change(freestyle_enabled, *styles):
+    """Re-render the Freestyle summary, the state badge and the section-rule panel's visibility.
+
+    [FORK] R8 Owner Fixes (P1): three read-outs rather than one, and all three are *display*. The
+    owner could not tell at a glance whether Freestyle was on -- a small tick box is easy to miss
+    next to ten dropdowns. So the panel now states its mode in words, and the ten dropdowns are
+    only shown in the mode where they do anything.
+
+    **Hiding is not clearing.** A Gradio component with `visible=False` keeps its value and still
+    submits it, so switching Freestyle off and on again returns the operator to exactly the rules
+    they built. That is the whole reason the dropdowns are hidden rather than reset, and
+    `test_freestyle_visibility.py` pins it.
+
+    The checkbox remains the only gate. Nothing here is read by a render: the renderer takes the
+    live widget values through its own wrapper arguments, as it always did.
 
     Deliberately does **not** show inherited numeric values: the global controls have five
     legitimate writers (the preset selector, Variant Lab Generate / New / Apply, and Director
@@ -3003,8 +3086,11 @@ def _on_freestyle_change(freestyle_enabled, *styles) -> str:
     # Random sections read as ten Base sections and the panel claimed the render was unmodified
     # while the renderer was generating ten active rules. It was the DEFAULT screen, so every user
     # would have seen it.
-    return fork_freestyle_random.summary_text(
-        freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)))
+    on = bool(freestyle_enabled)
+    return (fork_freestyle_random.summary_text(
+                freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles))),
+            FREESTYLE_BADGE_ON if on else FREESTYLE_BADGE_OFF,
+            gr.update(visible=on))
 
 
 def _on_clear_creative_variations(*styles):
@@ -3022,10 +3108,19 @@ def _on_clear_creative_variations(*styles):
     The section dropdowns are read, not written: turning Freestyle off must leave the rules the
     operator built intact, so ticking the box again restores exactly what was there. Clearing them
     would make this a destructive action wearing a tidy-up's name.
+
+    [FORK] R8 Owner Fixes (P1): it also writes the Freestyle state badge and hides the section
+    panel. Those two are the same read-outs `_on_freestyle_change` maintains, and they are here
+    for a correctness reason rather than a cosmetic one -- this action turns Freestyle off, so
+    leaving a badge reading "Freestyle is ON" beside a cleared checkbox would be a false
+    statement on screen. The ten section rules are **hidden, not cleared**: tick the box again
+    and they are exactly as the operator left them.
     """
     return (0, False,
             fork_freestyle_random.summary_text(False,
-                                               dict(zip(_FREESTYLE_WIDGET_ORDER, styles))))
+                                               dict(zip(_FREESTYLE_WIDGET_ORDER, styles))),
+            FREESTYLE_BADGE_OFF,
+            gr.update(visible=False))
 
 
 def _on_surprise_me(freestyle_enabled, *styles):
@@ -3160,7 +3255,10 @@ def _on_render_tab_select(cut_density_value, micro_cuts_value, semantic_emphasis
     # [FORK] R8: the one resolved line. The composition rule lives in the fork module so that the
     # preset label here and the selector on Creative Settings are provably the same computation --
     # both end at `presets.matching_preset` over the same six live values.
-    line = fork_effective.summary(
+    # [FORK] R8 Owner Fixes (P1): the labelled form. Same two calls underneath -- `base_label`
+    # and `overrides` -- so this is a layout change to a verified-correct read-out, not a second
+    # computation that could drift from the selector.
+    line = fork_effective.summary_labelled(
         controls,
         freestyle_declaration=declaration,
         variation_seed=variation_seed_value,
@@ -7132,7 +7230,10 @@ def _load_folder_prefs():
     """Read saved defaults once at import. Creates nothing and validates nothing."""
     preferences, notice = fork_prefs.load_preferences(PREFS_PATH)
     missing = fork_prefs.unavailable_notice(preferences, PREFS_LABELS)
-    return preferences, "\n".join(part for part in (notice, missing) if part)
+    # [FORK] R8 Owner Fixes (P1): the work-folder/library overlap is surfaced at startup too, not
+    # only after a save -- an operator who set this up last week never presses Save again.
+    overlap = fork_prefs.overlapping_destinations(preferences, PREFS_LABELS)
+    return preferences, "\n".join(part for part in (notice, missing, overlap) if part)
 
 
 _FOLDER_PREFS, _FOLDER_PREFS_NOTICE = _load_folder_prefs()
@@ -7149,6 +7250,42 @@ def _pref(key: str) -> str:
 
 def _option(key: str) -> str:
     return _FOLDER_OPTIONS.get(key, fork_prefs.OPTION_DEFAULTS.get(key, ''))
+
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 Owner Fixes (P1): one voice pair, with an optional per-tool override.
+#
+# The owner read the four audio destinations as duplicated. They are four genuinely different
+# settings -- a fresh cut and a clip reviewed next week can legitimately go to different places
+# -- but almost nobody needs that, and four near-identical names make the common case look
+# complicated.
+#
+# So the Audio Cutter's pair is the ordinary one, and Audio Review FALLS BACK to it when its own
+# override is blank. The two properties that make this safe, both pinned by test:
+#
+#   * it is a **read-side default only**. `_on_save_folder_prefs` still writes each key from its
+#     own field, so a fallback is never persisted into the override key and the two settings can
+#     never be silently merged.
+#   * a **non-empty override always wins**. An operator who already set different folders keeps
+#     them; nothing is consolidated, nothing is overwritten.
+#
+# Before this, blank meant "no default at all" and the operator typed a path. Blank now means
+# "the pair above", which is strictly more useful and cannot lose a configured value.
+# ---------------------------------------------------------------------------------------------
+
+def _audio_preview_default(override_key: str, shared_key: str) -> str:
+    """The Audio Review destination to pre-fill: its own override, else the shared voice folder."""
+    return _pref(override_key) or _pref(shared_key)
+
+
+def _audio_overrides_in_use() -> bool:
+    """True when Audio Review has at least one destination of its own.
+
+    Used only to decide whether the optional panel starts open: a setting that is in force must
+    never be hidden behind a closed drawer.
+    """
+    return bool(_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY)
+                or _pref(fork_prefs.AUDIO_PREVIEW_DISCARDED))
 
 
 def _collision_policy() -> str:
@@ -7263,9 +7400,30 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
     _FOLDER_PREFS.update({key: (values.get(key) or '').strip() for key in fork_prefs.KEYS})
     if options is not None:
         _FOLDER_OPTIONS.update(options)
+    # [FORK] R8 Owner Fixes (P2): both notices are recomputed from the values that were JUST
+    # written, never carried over. The owner saw a warning naming superseded paths while the
+    # fields on screen held new ones -- that was the startup notice, which describes the SAVED
+    # settings and is correct until a save replaces it. Saying so is the fix (see
+    # `PREF_STATUS_SCOPE`); recomputing here is what makes the replacement truthful.
+    return _folder_prefs_status(
+        "✅ Saved. These settings will be filled in next time you start BeatSync.")
+
+
+def _folder_prefs_status(headline: str) -> str:
+    """`headline`, followed by whatever is currently worth saying about the saved folders.
+
+    One composer for every writer of the status box, so a save, a reset and the startup notice
+    cannot describe the stored settings in three different ways.
+    """
+    lines = [headline, PREF_STATUS_SCOPE]
     missing = fork_prefs.unavailable_notice(_FOLDER_PREFS, PREFS_LABELS)
-    saved = f"✅ Saved. These settings will be filled in next time you start BeatSync."
-    return f"{saved}\n{missing}" if missing else saved
+    if missing:
+        lines.append(missing)
+    # [FORK] R8 Owner Fixes (P1): reports only -- it relocates nothing and refuses nothing.
+    overlap = fork_prefs.overlapping_destinations(_FOLDER_PREFS, PREFS_LABELS)
+    if overlap:
+        lines.append(overlap)
+    return "\n".join(lines)
 
 
 # =============================================================================================
@@ -7348,9 +7506,11 @@ def _on_reset_folder_prefs():
                 fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY], f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
     _FOLDER_OPTIONS.update(fork_prefs.empty_options())
+    # [FORK] R8 Owner Fixes (P2): composed like every other status write, so a reset cannot leave
+    # a warning behind that describes the settings it has just cleared.
     return ('', '', '', '', '', '', '', '', '',
             fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
-            "✅ Defaults cleared. No folder or file was deleted.")
+            _folder_prefs_status("✅ Defaults cleared. No folder or file was deleted."))
 
 
 # =============================================================================================
@@ -9148,7 +9308,20 @@ def create_ui() -> gr.Blocks:
                         info=INFO_VARIATION_SEED,
                         elem_id='variation-seed-input',
                     )
-                    randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+                    # [FORK] R8 Owner Fixes (P1): two buttons side by side, equal weight.
+                    #
+                    # Clear used to be a small `size='sm'` control underneath a full-width
+                    # Randomize, which the owner read as a text link rather than an action. They
+                    # are opposite operations on the same setting, so they belong on one row at
+                    # the same size -- and Clear carries `variant='stop'` because it discards
+                    # work, which Randomize does not.
+                    with gr.Row():
+                        randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED,
+                                                  elem_id='randomize-seed-button')
+                        clear_variations_btn = gr.Button(
+                            LABEL_CLEAR_VARIATIONS, variant='stop',
+                            elem_id='clear-variations-button')
+                    gr.Markdown(INFO_CLEAR_VARIATIONS)
 
                     # [FORK] R8 Final Polish: Clear Creative Variations.
                     #
@@ -9166,11 +9339,8 @@ def create_ui() -> gr.Blocks:
                     # It writes no slider, so it cannot become a second preset authority, and it
                     # touches nothing in Audio Mix, which is a different tab and a different
                     # decision. Those two absences are what keep it from being a second source of
-                    # truth; both are pinned by test.
-                    clear_variations_btn = gr.Button(
-                        LABEL_CLEAR_VARIATIONS, variant='secondary', size='sm',
-                        elem_id='clear-variations-button')
-                    gr.Markdown(INFO_CLEAR_VARIATIONS)
+                    # truth; both are pinned by test. (The widget itself is declared in the Row
+                    # above, beside Randomize.)
 
                     # Randomize stays seed-only on purpose; these three have no randomizer and no
                     # reset. 50 is current BeatSync behaviour in every one of them, and the default
@@ -9319,70 +9489,86 @@ def create_ui() -> gr.Blocks:
                         )
                     with gr.Accordion(label=LABEL_FREESTYLE, open=False):
                         gr.Markdown(INFO_FREESTYLE)
-                        freestyle_enabled = gr.Checkbox(
-                            value=False,
-                            label=LABEL_FREESTYLE_ENABLED,
-                            info=INFO_FREESTYLE_ENABLED,
-                            elem_id='freestyle-enabled-checkbox',
-                        )
-                        # One dropdown per Stage-3 section type, declared explicitly rather than in
-                        # a loop so each widget is visible to the per-widget seam assertions — the
-                        # same reason the six slider bindings are written out one at a time.
-                        # [FORK] Digital-Union (Random Freestyle V2): `Random` is now the default,
-                        # so enabling Freestyle is experimental without ten manual picks. `Base`
-                        # remains available and still means "inherit the live global value"; the
-                        # other four named styles are unchanged. Freestyle OFF is unaffected —
-                        # the switch is still the only gate.
-                        freestyle_intro = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
-                            elem_id='freestyle-intro')
-                        freestyle_hook = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
-                            elem_id='freestyle-hook')
-                        freestyle_outro = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
-                            elem_id='freestyle-outro')
-                        freestyle_finale = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
-                            elem_id='freestyle-finale')
-                        freestyle_drop = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
-                            elem_id='freestyle-drop')
-                        freestyle_chorus = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
-                            elem_id='freestyle-chorus')
-                        freestyle_bridge = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
-                            elem_id='freestyle-bridge')
-                        freestyle_breakdown = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
-                            elem_id='freestyle-breakdown')
-                        freestyle_verse = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
-                            elem_id='freestyle-verse')
-                        freestyle_body = gr.Dropdown(
-                            choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
-                            value=fork_freestyle_random.RANDOM_STYLE,
-                            label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
-                            elem_id='freestyle-body')
+                        # [FORK] R8 Owner Fixes (P1): the switch, and a badge that SAYS which mode
+                        # the panel is in. The owner reported the checkbox alone was easy to miss
+                        # among ten dropdowns -- which matters because Freestyle silently replaces
+                        # the global Creative Controls, so missing its state means misreading the
+                        # whole render. The badge is Markdown written by `_on_freestyle_change`
+                        # from the live checkbox value; it gates nothing.
+                        with gr.Group(elem_id='freestyle-switch-row'):
+                            freestyle_enabled = gr.Checkbox(
+                                value=False,
+                                label=LABEL_FREESTYLE_ENABLED,
+                                info=INFO_FREESTYLE_ENABLED,
+                                elem_id='freestyle-enabled-checkbox',
+                            )
+                            freestyle_state_badge = gr.Markdown(
+                                FREESTYLE_BADGE_OFF, elem_id='freestyle-state-badge')
+                        # The ten section rules, shown only in the mode where they do anything.
+                        #
+                        # `visible=False` HIDES but does not clear: Gradio keeps a hidden
+                        # component's value and still submits it, so a rule set survives being
+                        # switched off and comes back untouched. Resetting them instead would make
+                        # the switch destructive, which is the opposite of what was asked for.
+                        with gr.Group(visible=False) as freestyle_sections_group:
+                                # One dropdown per Stage-3 section type, declared explicitly rather than in
+                            # a loop so each widget is visible to the per-widget seam assertions — the
+                            # same reason the six slider bindings are written out one at a time.
+                            # [FORK] Digital-Union (Random Freestyle V2): `Random` is now the default,
+                            # so enabling Freestyle is experimental without ten manual picks. `Base`
+                            # remains available and still means "inherit the live global value"; the
+                            # other four named styles are unchanged. Freestyle OFF is unaffected —
+                            # the switch is still the only gate.
+                            freestyle_intro = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} intro',
+                                elem_id='freestyle-intro')
+                            freestyle_hook = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} hook',
+                                elem_id='freestyle-hook')
+                            freestyle_outro = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} outro',
+                                elem_id='freestyle-outro')
+                            freestyle_finale = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} finale',
+                                elem_id='freestyle-finale')
+                            freestyle_drop = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} drop',
+                                elem_id='freestyle-drop')
+                            freestyle_chorus = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} chorus',
+                                elem_id='freestyle-chorus')
+                            freestyle_bridge = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} bridge',
+                                elem_id='freestyle-bridge')
+                            freestyle_breakdown = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} breakdown',
+                                elem_id='freestyle-breakdown')
+                            freestyle_verse = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} verse',
+                                elem_id='freestyle-verse')
+                            freestyle_body = gr.Dropdown(
+                                choices=list(fork_freestyle_random.SECTION_STYLE_CHOICES),
+                                value=fork_freestyle_random.RANDOM_STYLE,
+                                label=f'{LABEL_FREESTYLE_SECTION_PREFIX} body',
+                                elem_id='freestyle-body')
                         # Read-only, and formatted entirely by `freestyle.summary_text()` — one
                         # formatter per read-out, exactly as the Variant Lab, mix and Director
                         # reports work. It never prints an inherited number; see the handler.
@@ -9410,13 +9596,25 @@ def create_ui() -> gr.Blocks:
                     # registers a handler, none is a `process_btn` input, and none appears in
                     # `source_outputs` or `prep_outputs`.
                     with gr.Accordion(label=LABEL_VARIANT_LAB, open=False):
-                        gr.Markdown(INFO_VARIANT_LAB)
+                        # [FORK] R8 Owner Fixes (P2): one sentence visible, the rest one click
+                        # away. The long Markdown blocks that used to sit beside the controls
+                        # they describe are REUSED VERBATIM inside the help panel below -- there
+                        # is no shortened second version of any of them to drift out of date.
+                        gr.Markdown(INFO_VARIANT_LAB_LEAD)
+                        with gr.Accordion(label=LABEL_VARIANT_HELP, open=False):
+                            gr.Markdown(INFO_VARIANT_LAB)
+                            gr.Markdown(f"**{LABEL_MASTER_SEED}**\n\n{INFO_MASTER_SEED}")
+                            gr.Markdown(INFO_VARIANT_RANGES)
+                            gr.Markdown(INFO_VARIANT_AUDIO)
+                            gr.Markdown(INFO_VARIANT_AUDIO_RANGES)
+                            gr.Markdown(INFO_VARIANT_COMPARE)
+                            gr.Markdown(INFO_VARIANT_APPLY)
                         variant_master_seed = gr.Number(
                             label=LABEL_MASTER_SEED,
                             value=0,
                             precision=0,
                             minimum=0,
-                            info=INFO_MASTER_SEED,
+                            info=INFO_MASTER_SEED_SHORT,
                             elem_id='variant-master-seed-input',
                         )
                         variation_spread = gr.Slider(
@@ -9439,7 +9637,6 @@ def create_ui() -> gr.Blocks:
                             info=INFO_VARIANT_RANDOMIZE,
                             elem_id='variant-randomize-group',
                         )
-                        gr.Markdown(INFO_VARIANT_RANGES)
                         # `gr.RangeSlider` does not exist in Gradio 6.19.0 (verified against the
                         # installed package), and a custom JS control is out of scope, so each
                         # control gets an explicit min/max pair. Declared one widget at a time, like
@@ -9468,7 +9665,6 @@ def create_ui() -> gr.Blocks:
                         # deliberately no audio master seed and no audio Spread; the two above drive
                         # both halves. Like every other lab widget these register NOTHING and are
                         # read at click time only.
-                        gr.Markdown(INFO_VARIANT_AUDIO)
                         # `(label, value)` choices, so the returned value IS the exact field name
                         # the resolver keys on and the RNG stream is named by. Never derived from
                         # the display label by lowercasing or rewriting: these three strings are
@@ -9486,7 +9682,6 @@ def create_ui() -> gr.Blocks:
                             info=INFO_VARIANT_AUDIO_RANDOMIZE,
                             elem_id='variant-audio-randomize-group',
                         )
-                        gr.Markdown(INFO_VARIANT_AUDIO_RANGES)
                         with gr.Row():
                             range_music_under_voice_min = gr.Number(value=fork_lab.DEFAULT_RANGE_LO, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} min', elem_id='variant-range-music-under-voice-min')
                             range_music_under_voice_max = gr.Number(value=fork_lab.DEFAULT_RANGE_HI, precision=0, minimum=fork_creative.CONTROL_MIN, maximum=fork_creative.CONTROL_MAX, label=f'{LABEL_MUSIC_UNDER_VOICE} max', elem_id='variant-range-music-under-voice-max')
@@ -9506,12 +9701,17 @@ def create_ui() -> gr.Blocks:
                         # Raised for truthful display only — if the box were left at five the audio
                         # half would be silently clipped out of a read-out that claims to describe
                         # the whole generated variant.
+                        # [FORK] R8 Owner Fixes (P2): `lines` is the EMPTY height, `max_lines`
+                        # the grown one -- Gradio expands a textbox toward `max_lines` as content
+                        # arrives. The old pair was 7/7, so an empty lab reserved its full report
+                        # height before a single variant existed. The ceiling is RAISED, not cut:
+                        # a report must never be clipped, which is why 7 was chosen originally.
                         variant_report = gr.Textbox(
                             label=LABEL_VARIANT_REPORT,
                             value='',
                             placeholder=PLACEHOLDER_VARIANT_REPORT,
-                            lines=7,
-                            max_lines=7,
+                            lines=2,
+                            max_lines=12,
                             interactive=False,
                             elem_id='variant-report-box',
                         )
@@ -9521,7 +9721,6 @@ def create_ui() -> gr.Blocks:
                         # second Variant Lab. Like every other lab widget these are read at click
                         # time and register nothing; the candidate selector deliberately has no
                         # `.change()` handler, since Apply reads its current value itself.
-                        gr.Markdown(INFO_VARIANT_COMPARE)
                         variant_candidate_count = gr.Number(
                             label=LABEL_CANDIDATE_COUNT,
                             value=fork_batch.CANDIDATE_COUNT_DEFAULT,
@@ -9542,7 +9741,10 @@ def create_ui() -> gr.Blocks:
                             label=LABEL_VARIANT_BATCH_TABLE,
                             value='',
                             placeholder=PLACEHOLDER_VARIANT_BATCH_TABLE,
-                            lines=13,
+                            # [FORK] R8 Owner Fixes (P2): 13 empty lines before any candidate
+                            # exists. The ceiling stays 16 -- it is what holds the header, the
+                            # column rule and twelve candidate rows without clipping one.
+                            lines=3,
                             max_lines=16,
                             interactive=False,
                             elem_id='variant-batch-table',
@@ -9569,7 +9771,6 @@ def create_ui() -> gr.Blocks:
                             interactive=False,
                             elem_id='variant-batch-status',
                         )
-                        gr.Markdown(INFO_VARIANT_APPLY)
                         # [FORK] Digital-Union (C3-R0 -> C3-R1B-b): render 2 to 4 of the compared
                         # candidates. A SEPARATE selector from the Apply Radio above — one control
                         # cannot honestly mean both "apply this one" and "render these", and
@@ -10405,7 +10606,12 @@ def create_ui() -> gr.Blocks:
                                     audio_preview_library = gr.Textbox(
                                         label=LABEL_AUDIO_PREVIEW_LIBRARY,
                                         info=INFO_AUDIO_LIBRARY,
-                                        value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                                        # [FORK] R8 Owner Fixes (P1): its own override, else
+                                        # the shared voice folder. Read-side only -- saving still
+                                        # writes each key from its own Settings field.
+                                        value=_audio_preview_default(
+                                            fork_prefs.AUDIO_PREVIEW_LIBRARY,
+                                            fork_prefs.AUDIO_LIBRARY),
                                         placeholder=r"J:\Voice Library",
                                         elem_id='audio-preview-library')
                                     audio_preview_library_browse = gr.Button(
@@ -10414,7 +10620,9 @@ def create_ui() -> gr.Blocks:
                                     audio_preview_discarded = gr.Textbox(
                                         label=LABEL_AUDIO_PREVIEW_DISCARDED,
                                         info=INFO_AUDIO_DISCARDED,
-                                        value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                                        value=_audio_preview_default(
+                                            fork_prefs.AUDIO_PREVIEW_DISCARDED,
+                                            fork_prefs.AUDIO_DISCARDED),
                                         placeholder=r"J:\Voice Discarded",
                                         elem_id='audio-preview-discarded')
                                     audio_preview_discarded_browse = gr.Button(
@@ -10708,6 +10916,12 @@ def create_ui() -> gr.Blocks:
                         pref_rejected_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-rejected-browse')
+                    # [FORK] R8 Owner Fixes (P1): the Audio Cutter's pair is presented as THE
+                    # voice pair, because for the ordinary setup it is -- Audio Review falls back
+                    # to it when its own override is blank (see `_audio_preview_default`). The
+                    # keys, the widgets and the saved values are all unchanged; only the framing
+                    # and the position are.
+                    gr.Markdown(f"**{LABEL_PREF_VOICE_PAIR}**\n\n{INFO_PREF_VOICE_PAIR}")
                     with gr.Row():
                         pref_audio_library = gr.Textbox(
                             label=LABEL_PREF_AUDIO_LIBRARY,
@@ -10729,24 +10943,39 @@ def create_ui() -> gr.Blocks:
                     # [FORK] R7.2: the Audio Preview tab's two destinations. Separate keys from the
                     # cutter's, because the folder a later review sorts into is a different
                     # decision from the folder a fresh cut files into.
-                    with gr.Row():
-                        pref_audio_preview_library = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
-                            value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
-                            placeholder=r"J:\Voice Library",
-                            elem_id='pref-audio-preview-library')
-                        pref_audio_preview_library_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-preview-library-browse')
-                    with gr.Row():
-                        pref_audio_preview_discarded = gr.Textbox(
-                            label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
-                            value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
-                            placeholder=r"J:\Voice Discarded",
-                            elem_id='pref-audio-preview-discarded')
-                        pref_audio_preview_discarded_browse = gr.Button(
-                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                            elem_id='pref-audio-preview-discarded-browse')
+                    #
+                    # [FORK] R8 Owner Fixes (P1): collapsed into an OPTIONAL override panel. The
+                    # owner read four near-identically named audio folders as duplication. They
+                    # are not duplicates, but three of four operators will never need the second
+                    # pair -- so the panel is shut by default and blank now MEANS "use the pair
+                    # above" rather than "no default".
+                    #
+                    # It is opened on load when either override is already set, so an operator
+                    # who DOES use them is never shown a closed drawer hiding settings that are
+                    # actually in force. Nothing is consolidated and nothing is overwritten:
+                    # a stored override keeps winning, and the save path still writes each key
+                    # from its own field.
+                    with gr.Accordion(label=LABEL_PREF_AUDIO_OVERRIDES,
+                                      open=_audio_overrides_in_use()):
+                        gr.Markdown(INFO_PREF_AUDIO_OVERRIDES)
+                        with gr.Row():
+                            pref_audio_preview_library = gr.Textbox(
+                                label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                                placeholder=r"J:\Voice Library",
+                                elem_id='pref-audio-preview-library')
+                            pref_audio_preview_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='pref-audio-preview-library-browse')
+                        with gr.Row():
+                            pref_audio_preview_discarded = gr.Textbox(
+                                label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                                placeholder=r"J:\Voice Discarded",
+                                elem_id='pref-audio-preview-discarded')
+                            pref_audio_preview_discarded_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='pref-audio-preview-discarded-browse')
 
                     with gr.Row():
                         pref_save_btn = gr.Button(
@@ -11339,6 +11568,13 @@ def create_ui() -> gr.Blocks:
         ]
         freestyle_live_inputs = [freestyle_enabled] + freestyle_section_dropdowns
 
+        # [FORK] R8 Owner Fixes (P1): all eleven Freestyle registrations write the same three
+        # read-outs -- the summary, the state badge and the section panel's visibility. One
+        # handler, one output list, so the badge can never disagree with the switch that produced
+        # it. All three are display: no execution widget, no state, no render input.
+        _freestyle_readout_outputs = [freestyle_summary, freestyle_state_badge,
+                                      freestyle_sections_group]
+
         # [FORK] Digital-Union (GUI Refresh A): one registration on the TAB, not on the widgets.
         #
         # Reads eleven live values and writes exactly one read-only textbox. Binding it to the
@@ -11398,27 +11634,38 @@ def create_ui() -> gr.Blocks:
             outputs=[variation_seed, freestyle_summary])
 
         freestyle_enabled.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_intro.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_hook.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_outro.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_finale.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_drop.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_chorus.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_bridge.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_breakdown.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_verse.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
         freestyle_body.change(
-            fn=_on_freestyle_change, inputs=freestyle_live_inputs, outputs=[freestyle_summary])
+            fn=_on_freestyle_change, inputs=freestyle_live_inputs,
+            outputs=_freestyle_readout_outputs)
 
         # [FORK] Digital-Union (AI Director V1): the Director's entire wiring — two button clicks.
         #
@@ -11465,7 +11712,13 @@ def create_ui() -> gr.Blocks:
         clear_variations_btn.click(
             fn=_on_clear_creative_variations,
             inputs=freestyle_section_dropdowns,
-            outputs=[variation_seed, freestyle_enabled, freestyle_summary],
+            # [FORK] R8 Owner Fixes (P1): the badge and the section panel are appended. They are
+            # READ-OUTS of the checkbox this action clears -- without them the panel would keep
+            # claiming "Freestyle is ON" next to an unticked box. The prohibition this list
+            # exists to enforce is unchanged and still pinned: no slider, no preset, no Audio Mix
+            # widget, nothing from a source, preparation or render surface.
+            outputs=[variation_seed, freestyle_enabled, freestyle_summary,
+                     freestyle_state_badge, freestyle_sections_group],
             concurrency_limit=None,
         )
 

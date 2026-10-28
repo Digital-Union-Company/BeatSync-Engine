@@ -234,6 +234,65 @@ def unavailable_notice(preferences: dict, labels: dict) -> str:
             f"{named}. Pick them again or edit the path.")
 
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 Owner Fixes (P1): work folders that are also finished libraries.
+#
+# The owner's screenshot had the Audio Cutter's OUTPUT folder and the Audio Preview MEDIA LIBRARY
+# both pointing at `Raw_Cutts`. Nothing is broken by that -- every move still validates, nothing
+# is overwritten -- but it quietly defeats the point of reviewing: fresh unreviewed cuts land in
+# the same directory that "keep" files into, so the two become indistinguishable on disk and the
+# next scan re-offers clips that were already accepted.
+#
+# This reports; it never relocates, never rewrites a preference and never refuses a save. The
+# operator may well mean it.
+# ---------------------------------------------------------------------------------------------
+
+#: Keys that receive freshly produced, not-yet-reviewed material.
+WORK_OUTPUT_KEYS = (RAW_CUTTER_OUTPUT, AUDIO_CUTTER_OUTPUT)
+
+#: Keys that receive material an operator has decided to KEEP.
+FINISHED_LIBRARY_KEYS = (CLIPS_LIBRARY, AUDIO_LIBRARY, AUDIO_PREVIEW_LIBRARY)
+
+
+def _comparable(path) -> str:
+    """A path in a form two settings can be compared by, or `""` when there is nothing to compare.
+
+    `normcase` so `J:\\Raw_Cutts` and `j:/raw_cutts` are recognised as the same place on Windows,
+    and a trailing separator is dropped for the same reason. This is deliberately NOT `realpath`:
+    a read-out must not touch the filesystem, and a folder that does not exist yet should still
+    be comparable with one that does.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.normpath(text))
+
+
+def overlapping_destinations(preferences: dict, labels: dict) -> str:
+    """One sentence naming each work folder that is also configured as a finished library, or `""`.
+
+    Pairs are reported in a fixed order so the same configuration always produces the same
+    sentence -- an operator comparing two screens must not see a difference that is not there.
+    """
+    pairs = []
+    for work_key in WORK_OUTPUT_KEYS:
+        work = _comparable(preferences.get(work_key))
+        if not work:
+            continue
+        for library_key in FINISHED_LIBRARY_KEYS:
+            if _comparable(preferences.get(library_key)) == work:
+                pairs.append((work_key, library_key))
+    if not pairs:
+        return ""
+    named = "; ".join(
+        f"{labels.get(work, work)} and {labels.get(library, library)} "
+        f"are both {preferences.get(work, '')}"
+        for work, library in pairs)
+    return ("Heads up — a work folder is also set as a finished library: "
+            f"{named}. Reviewed and unreviewed clips will be mixed together in it. "
+            "Nothing was moved or changed; set different folders if that was not intended.")
+
+
 __all__ = ["CLIPS_LIBRARY", "CLIPS_REJECTED", "CLIPS_INPUT", "RAW_CUTTER_OUTPUT",
            "RAW_CUTTER_INPUT", "QUICK_RENDER_SOURCE",
            "AUDIO_LIBRARY", "AUDIO_DISCARDED", "AUDIO_CUTTER_OUTPUT", "AUDIO_CUTTER_INPUT",
@@ -242,5 +301,6 @@ __all__ = ["CLIPS_LIBRARY", "CLIPS_REJECTED", "CLIPS_INPUT", "RAW_CUTTER_OUTPUT"
            "DESTINATION_KEYS", "LAST_USED_KEYS",
            "KEYS", "SCHEMA", "empty_preferences", "preferences_path", "load_preferences",
            "save_preferences", "missing_folders", "unavailable_notice",
+           "WORK_OUTPUT_KEYS", "FINISHED_LIBRARY_KEYS", "overlapping_destinations",
            "COLLISION_POLICY", "OPTION_KEYS", "OPTION_DEFAULTS", "empty_options",
            "load_options"]

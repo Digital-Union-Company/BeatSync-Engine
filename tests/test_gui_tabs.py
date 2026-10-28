@@ -622,7 +622,7 @@ def test_the_folder_defaults_are_grouped_by_purpose(source: str):
         "review heading, review field")
 
 
-def test_cache_management_is_the_one_collapsed_block_on_settings(source: str):
+def test_cache_management_is_collapsed_on_settings(source: str):
     """It is occasional maintenance with a destructive button in it, not setup -- so it opens on
     request. The folder defaults and the collision policy stay visible, because an operator should
     be able to read their destinations without opening anything.
@@ -631,8 +631,34 @@ def test_cache_management_is_the_one_collapsed_block_on_settings(source: str):
     block = source[start:end]
     assert "gr.Accordion(label=LABEL_CACHE_SECTION, open=False)" in block
     assert "gr.Accordion(label=LABEL_CACHE_SECTION, open=True)" not in block
-    assert block.count("gr.Accordion(") == 1, \
-        "Settings hides exactly one block; the folder defaults and the policy stay visible"
+
+
+def test_only_cache_and_the_audio_overrides_are_collapsible(source: str):
+    """[FORK] R8 Owner Fixes (P1): the exact set, by label, rather than a count.
+
+    A bare count said "Settings hides one block" and would be satisfied by hiding the wrong one.
+    Two blocks now collapse and each earns it differently: Cache Management is occasional
+    maintenance, and the Audio Review overrides are a setting most operators never touch -- four
+    near-identically named audio folders is what the owner read as duplication.
+
+    Everything else stays visible: the folder defaults and the collision policy are what an
+    operator comes to this tab to read.
+    """
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    block = source[start:end]
+    collapsible = {line.split("label=")[1].split(",")[0].split(")")[0]
+                   for line in block.splitlines() if "gr.Accordion(" in line}
+    assert collapsible == {"LABEL_CACHE_SECTION", "LABEL_PREF_AUDIO_OVERRIDES"}, collapsible
+
+
+def test_the_audio_overrides_panel_opens_when_an_override_is_actually_set(source: str):
+    """A setting that is in force must never be hidden behind a closed drawer -- otherwise an
+    operator whose Audio Review files somewhere unexpected has no way to see why."""
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    block = source[start:end]
+    assert "gr.Accordion(label=LABEL_PREF_AUDIO_OVERRIDES,\n" in block
+    assert "open=_audio_overrides_in_use()" in block, \
+        "the panel's open state must follow whether an override exists"
 
 
 def test_the_cache_deletion_wiring_was_not_touched_by_the_re_layout(source: str):
@@ -922,10 +948,30 @@ def _first_line(answer: str) -> str:
     return answer.splitlines()[0]
 
 
+#: [FORK] R8 Owner Fixes (P1): the read-out is now labelled over up to two lines --
+#:
+#:     Base preset: High Energy
+#:     Active variations: Freestyle (10 section rules), Variation Seed 367319
+#:
+#: instead of chaining the same clauses with " + ". The owner confirmed the one-line form was
+#: CORRECT and asked only that it be easier to read, so these helpers re-point the existing
+#: assertions at the same facts rather than weakening them: `_base` still answers "which recipe",
+#: and the over-reporting tests still search the whole answer for an override's name.
+_BASE_PREFIX = "Base preset: "
+_ACTIVE_PREFIX = "Active variations: "
+
+
+def _base(answer: str) -> str:
+    """The base preset name, with the label stripped."""
+    head = _first_line(answer)
+    assert head.startswith(_BASE_PREFIX), f"the read-out lost its base label: {head!r}"
+    return head[len(_BASE_PREFIX):]
+
+
 def test_an_untouched_screen_reads_as_the_named_default(read_out):
     from beatsync_fork import presets as fork_presets
 
-    assert _first_line(read_out()) == fork_presets.BALANCED_PRESET
+    assert _base(read_out()) == fork_presets.BALANCED_PRESET
 
 
 def test_a_named_preset_with_freestyle_armed_is_not_presented_as_unmodified(read_out):
@@ -935,22 +981,23 @@ def test_a_named_preset_with_freestyle_armed_is_not_presented_as_unmodified(read
 
     styles = {section: fork_freestyle.BASE_STYLE for section in fork_freestyle.SECTION_TYPES}
     styles[fork_freestyle.SECTION_TYPES[0]] = "Cinematic"
-    answer = _first_line(read_out(freestyle_enabled=True, styles=styles))
-    assert answer != fork_presets.BALANCED_PRESET, answer
-    assert fork_presets.BALANCED_PRESET in answer and "Freestyle" in answer, answer
+    answer = read_out(freestyle_enabled=True, styles=styles)
+    assert _first_line(answer) != fork_presets.BALANCED_PRESET, answer
+    assert _base(answer) == fork_presets.BALANCED_PRESET, answer
+    assert _ACTIVE_PREFIX in answer and "Freestyle" in answer, answer
 
 
 def test_moving_a_slider_off_a_recipe_reads_as_custom(read_out):
     from beatsync_fork import effective_profile as fork_effective
 
-    assert _first_line(read_out(controls=(7, 7, 7, 7, 7, 7))) == fork_effective.CUSTOM_LABEL
+    assert _base(read_out(controls=(7, 7, 7, 7, 7, 7))) == fork_effective.CUSTOM_LABEL
 
 
 def test_selecting_another_recipe_reads_as_that_recipe(read_out):
     from beatsync_fork import presets as fork_presets
 
     cinematic = fork_presets.preset_values("Cinematic")
-    assert _first_line(read_out(controls=cinematic)) == "Cinematic"
+    assert _base(read_out(controls=cinematic)) == "Cinematic"
 
 
 # -- the over-reporting direction, preserved from the previous block ---------------------------
@@ -964,7 +1011,7 @@ def test_freestyle_on_with_every_section_base_is_not_reported(read_out):
 
     styles = {section: fork_freestyle.BASE_STYLE for section in fork_freestyle.SECTION_TYPES}
     answer = read_out(freestyle_enabled=True, styles=styles)
-    assert _first_line(answer) == fork_presets.BALANCED_PRESET, answer
+    assert _base(answer) == fork_presets.BALANCED_PRESET, answer
     assert "Freestyle" not in answer
 
 
@@ -988,7 +1035,7 @@ def test_freestyle_off_is_never_reported_whatever_the_sections_say(read_out):
 
     styles = {section: fork_freestyle_random.RANDOM_STYLE
               for section in fork_freestyle.SECTION_TYPES}
-    assert _first_line(read_out(freestyle_enabled=False, styles=styles)) \
+    assert _base(read_out(freestyle_enabled=False, styles=styles)) \
         == fork_presets.BALANCED_PRESET
 
 
@@ -1011,7 +1058,7 @@ def test_smart_mix_at_amount_zero_is_not_reported(read_out):
     from beatsync_fork import presets as fork_presets
 
     answer = read_out(sfx_folder=r"C:\sfx", sfx_roles=("impact", "transition"), sfx_amount=0)
-    assert _first_line(answer) == fork_presets.BALANCED_PRESET, answer
+    assert _base(answer) == fork_presets.BALANCED_PRESET, answer
     assert "Smart Mix" not in answer
 
 

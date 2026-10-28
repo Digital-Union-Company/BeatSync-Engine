@@ -1488,7 +1488,10 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
     here; the prose is free to change.
     """
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
-    start = source.index("INFO_MASTER_SEED")
+    # The ASSIGNMENT, not the bare name: R8 added `INFO_MASTER_SEED_SHORT` nearby, and a prefix
+    # match would slice the wrong constant. A locator that can silently select a different string
+    # makes every assertion below it meaningless.
+    start = source.index("INFO_MASTER_SEED = (")
     info = source[start:source.index("\n)", start)]
     lowered = info.lower()
 
@@ -1520,7 +1523,9 @@ def test_the_master_seed_help_text_does_not_claim_master_only_reproducibility():
 
 def test_the_variant_lab_help_text_explains_the_write_back():
     source = open(os.path.join(_REPO_ROOT, "src", "ui_content.py"), encoding="utf-8").read()
-    start = source.index("INFO_VARIANT_LAB")
+    # The ASSIGNMENT, not the bare name -- the comment introducing the R8 help panel mentions
+    # `INFO_VARIANT_LAB`, and a prefix match landed in that comment instead of the constant.
+    start = source.index("INFO_VARIANT_LAB = (")
     info = source[start:source.index("\n)", start)].lower()
     assert "starting point" in info
     assert "writes the result back" in info or "writes it back" in info

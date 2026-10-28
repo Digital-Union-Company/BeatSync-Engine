@@ -892,6 +892,38 @@ The measurement and the exact exception are pinned in `tests/test_render_music_i
 End to end after all four: 720p · 30 fps chosen in the UI over four 320×240 sources rendered
 `width=1280 height=720 r_frame_rate=30/1`.
 
+#### Owner playtest fixes — what real use found
+
+A seventh commit, from the owner's own hands-on session rather than from a review:
+
+- **P0, Video Review Confirm died after the first batch.** The highest-priority defect, and it
+  stopped work entirely: batch one sorted 100/100, batch two showed a correct `Kept 18 ·
+  Discarded 82 · Undecided 0` and the button stayed greyed out. **Root cause was a client-side
+  readiness cache with no notion of which page it described** — `syncConfirm` returns early when
+  the answer equals the last one it saw, and the `true` left over from batch one swallowed batch
+  two's first genuine transition, so the server was never asked. Pressing Re-read by hand enabled
+  it instantly, which is what proved the record was right. Readiness is now keyed to
+  `session/page`, every reply is tagged with the page it was requested for, and the repaint
+  observer also watches the nonce attribute. **Verified across three real page transitions with
+  205 clips: 31 kept + 174 discarded = 205, all original names, nothing lost or duplicated.**
+- **Freestyle states its mode** and shows the ten section rules only when on — *hidden, never
+  cleared*, so a rule set survives being switched off and back on.
+- **Randomize and Clear are two equal buttons on one row**, still behaviourally disjoint, and the
+  Creative Profile reads `Base preset: …` / `Active variations: …` from the same computation as
+  before.
+- **The four audio destinations stay four settings**, but Audio Review now falls back to the
+  Voice pair when its own override is blank. The fallback is read-side only and a set override
+  always wins, so nothing is ever consolidated or overwritten. A work folder that is also a
+  finished library is now reported — and only reported.
+- **Stale text corrected**: "where KEPT clips would go" (files move), "sort the decided clips"
+  (keep-only also files the unmarked ones), and the Render tab's permanent "stays disabled until
+  you confirm" that printed while confirmed and rendering.
+- **Variant Lab**: long guidance behind a help panel, result boxes small when empty. Presentation
+  only.
+
+Encoding and the output profiles were not touched; 1080p · 25 fps still renders
+`1920×1080 @ 25/1`.
+
 ---
 
 ## Status summary

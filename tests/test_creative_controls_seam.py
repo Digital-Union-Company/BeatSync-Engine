@@ -779,13 +779,23 @@ def test_clear_creative_variations_is_disjoint_from_the_preset():
     Asserted as two absences, because an absence is what keeps them disjoint: this button writes
     no slider (or it would be a second preset authority) and no Audio Mix widget (which is a
     different tab and a different decision).
+
+    [FORK] R8 Owner Fixes (P1): the exact set gained `freestyle_state_badge` and
+    `freestyle_sections_group`, and the reviewed reason is that both are READ-OUTS OF
+    `freestyle_enabled`, which this action already wrote. The badge states in words whether
+    Freestyle is on and the group holds the ten section dropdowns; clearing the checkbox without
+    them would leave a panel reading "Freestyle is ON" beside an unticked box. Neither carries a
+    value a render reads, and the disjointness this test exists for is untouched -- the two
+    absence checks below are the real contract and are unchanged.
     """
     tree = _gui_tree()
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                 and ast.unparse(n.func) == "clear_variations_btn.click")
     outputs = _names(next(kw for kw in call.keywords if kw.arg == "outputs").value)
 
-    assert sorted(outputs) == ["freestyle_enabled", "freestyle_summary", "variation_seed"], outputs
+    assert sorted(outputs) == ["freestyle_enabled", "freestyle_sections_group",
+                               "freestyle_state_badge", "freestyle_summary",
+                               "variation_seed"], outputs
     for forbidden in _NEW_CONTROLS_IN_FIELD_ORDER:
         assert forbidden not in outputs, f"it writes the slider {forbidden}"
     for forbidden in ("creative_preset", "music_under_voice", "sfx_amount", "sfx_level",
@@ -802,7 +812,11 @@ def test_clear_creative_variations_is_disjoint_from_the_preset():
     assert "freestyle_section_dropdowns" in inputs
     handler = _func(_gui_tree(), "_on_clear_creative_variations")
     returns = [n for n in ast.walk(handler) if isinstance(n, ast.Return)]
-    assert len(returns) == 1 and len(returns[0].value.elts) == 3, ast.unparse(handler)
+    # [FORK] R8 Owner Fixes (P1): five, matching the five outputs above -- the two added ones are
+    # the state badge and the section panel's visibility. The arity is pinned rather than the
+    # contents because a positional mismatch between this tuple and that list is the failure this
+    # assertion exists to catch.
+    assert len(returns) == 1 and len(returns[0].value.elts) == len(outputs), ast.unparse(handler)
 
 
 def test_randomize_still_writes_the_seed_and_only_the_seed():
