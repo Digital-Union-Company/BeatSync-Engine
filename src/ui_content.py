@@ -772,6 +772,66 @@ PREF_STATUS_INITIAL = (
     "moved by saving."
 )
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 UX Refresh: the Settings tab's new content.
+# ---------------------------------------------------------------------------------------------
+
+LABEL_PREF_RENDER_OUTPUT = "Render output"
+INFO_PREF_RENDER_OUTPUT = (
+    "Where finished music videos are published. Leave blank to use the `output` folder inside "
+    "BeatSync itself. Only affects the final video — temporary working files and caches stay "
+    "where they are."
+)
+
+LABEL_COLLISION_SECTION = "📄 When a destination filename already exists"
+CHOICE_COLLISION_SKIP = "Skip and report it"
+CHOICE_COLLISION_SUFFIX = "Rename automatically (clip_01, clip_02, …)"
+INFO_COLLISION_POLICY = (
+    "Applies when filing reviewed clips into a Media Library or Discarded folder. An existing "
+    "file is **never** overwritten under either setting."
+)
+
+STATUS_COLLISION_SAVED_SKIP = (
+    "Saved: a clip whose name is already taken will be skipped and reported."
+)
+STATUS_COLLISION_SAVED_SUFFIX = (
+    "Saved: a clip whose name is already taken will be renamed clip_01, clip_02, and so on. "
+    "Nothing is ever overwritten."
+)
+
+LABEL_CACHE_SECTION = "🧹 Cache management"
+INFO_CACHE_SECTION = (
+    "Disposable files BeatSync creates while it works. Press Inspect to see what is there, then "
+    "tick what you want removed.\n\n"
+    "Only these four folders can be cleared. Your source media, finished videos, Media "
+    "Libraries, Discarded folders, saved settings and review decisions are never touched."
+)
+LABEL_CACHE_POSTERS = "Preview thumbnails"
+INFO_CACHE_POSTERS = "Video Review poster images. Rebuilt automatically on the next scan."
+LABEL_CACHE_PROCESSING = "Temporary processing files"
+INFO_CACHE_PROCESSING = "Clip fragments left over from finished renders."
+LABEL_CACHE_UPLOADS = "Retired browser uploads"
+INFO_CACHE_UPLOADS = (
+    "Files earlier sessions copied in through the browser, set aside at startup instead of "
+    "being deleted. Check these before clearing — for a file you dragged in, this copy may be "
+    "the only one you still have a path to."
+)
+LABEL_CACHE_ANALYSIS = "Video analysis cache (Stage 5)"
+INFO_CACHE_ANALYSIS = (
+    "⚠️ Expensive to rebuild. Clearing this makes BeatSync re-run the full video and Qwen "
+    "analysis the next time it reads those sources, which can take many minutes."
+)
+LABEL_CACHE_INSPECT = "🔍 Inspect cache"
+LABEL_CACHE_SELECT = "Clear which caches?"
+LABEL_CACHE_CONFIRM = "Yes, delete the selected caches"
+INFO_CACHE_CONFIRM = "Clearing cannot be undone."
+LABEL_CACHE_CLEAR = "🧹 Clear selected cache"
+LABEL_CACHE_REPORT = "Cache"
+PLACEHOLDER_CACHE_REPORT = (
+    "Press Inspect cache to see how much space each category is using. Nothing is deleted until "
+    "you select categories, tick the confirmation and press Clear."
+)
+
 CLIPS_REFRESH_TO_ENABLE_HINT = (
     "All clips decided — Confirm is being enabled from the server's record."
 )

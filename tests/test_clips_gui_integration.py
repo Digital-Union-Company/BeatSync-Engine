@@ -35,6 +35,7 @@ from collections import OrderedDict
 import pytest
 
 from beatsync_fork import clips_review as cr
+from beatsync_fork import collision
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -118,6 +119,13 @@ def _build(state_dir, ui_constants, poster_runner=None, poster_hook=None):
         "_CLIPS_STORE": None,
         "CLIPS_MAX_TRACKED_SESSIONS": 32,
         "_CLIPS_SCANS": cr.ScanCoordinator(max_owners=32),
+        # [FORK] R8 UX Refresh: Confirm reads the operator's saved filename-collision policy, so
+        # the handler names `gui._collision_policy`. It is stubbed to the DEFAULT here on purpose:
+        # every assertion in this suite is about the pre-R8 behaviour -- one clip per name, an
+        # occupied destination refused, nothing overwritten -- and the default is exactly that
+        # behaviour. The opt-in `suffix` policy has its own suite, `test_collision.py`, which
+        # exercises both policies against a real filesystem.
+        "_collision_policy": lambda: collision.DEFAULT_POLICY,
     }
     namespace.update(ui_constants)
     sys.modules.setdefault("ffmpeg_processing", _FfmpegProcessing)

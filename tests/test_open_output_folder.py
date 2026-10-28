@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 
 import pytest
@@ -149,7 +150,15 @@ def load_handler(output_dir, *, os_module=None, gr_module=None) -> dict:
     namespace = {
         "os": os_module if os_module is not None else _OsShim(),
         "gr": gr_module if gr_module is not None else _Toasts(),
-        # the one seam: a callable standing in for the real `paths.get_output_dir`
+        # The one seam: a callable standing in for the real resolver.
+        #
+        # [FORK] R8 UX Refresh: that resolver is now `gui.get_render_output_dir`, not
+        # `paths.get_output_dir`. The Render output folder became configurable, and this button
+        # must open the folder the render ACTUALLY published into -- opening `output/` while the
+        # render wrote somewhere else would be a confidently wrong answer. `get_output_dir` stays
+        # in the namespace because `get_render_output_dir` falls back to it.
+        "get_render_output_dir": (output_dir if callable(output_dir)
+                                  else (lambda: output_dir)),
         "get_output_dir": (output_dir if callable(output_dir) else (lambda: output_dir)),
         "STATUS_OPEN_FOLDER_REQUESTED": ui_content.STATUS_OPEN_FOLDER_REQUESTED,
         "STATUS_OPEN_FOLDER_MISSING": ui_content.STATUS_OPEN_FOLDER_MISSING,
@@ -192,13 +201,21 @@ def _snapshot(root):
 # ===========================================================================
 
 
-def test_the_handler_reads_get_output_dir_and_nothing_else():
-    """The folder is a fixed property of the installation, never derived from render state."""
+def test_the_handler_reads_the_render_output_resolver_and_nothing_else():
+    """The folder is a property of the configuration, never derived from render state.
+
+    [FORK] R8: "a fixed property of the installation" is no longer true -- the Render output
+    folder is configurable. What still matters, and is what this test was really protecting, is
+    that the folder comes from ONE resolver call and from nothing on screen: not the last output
+    path, not the render outcome, not the status text, not session state.
+    """
     node = _func(_GUI, HANDLER)
     code = _code(node)
 
     calls = [ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)]
-    assert calls.count("get_output_dir") == 1, calls
+    assert calls.count("get_render_output_dir") == 1, calls
+    assert calls.count("get_output_dir") == 0, \
+        "the handler must go through the resolver, not around it"
 
     for forbidden in ("LAST_OUTPUT_PATH_KEY", "RENDER_OUTCOME_KEY", "session_state",
                       "status_output", "video_output", "output_filename", "preview_path",
@@ -215,17 +232,44 @@ def test_the_handler_takes_no_arguments_at_all():
     assert args.vararg is None and args.kwarg is None
 
 
-def test_the_folder_is_the_running_installations_own_output_dir():
-    """It must be the SAME name `_process_video_impl` resolves `output/` with — not a literal, not
-    a drive letter, not a second definition.
+def test_the_folder_is_the_same_one_the_render_publishes_into():
+    """It must be the SAME name `_process_video_impl` resolves the output folder with — not a
+    literal, not a drive letter, not a second definition.
 
-    `paths.py` cannot be imported here (it imports `logger`, which imports librosa), so the chain
-    is verified on the real source instead: `gui.py` imports `get_output_dir` from `paths`, that
-    function returns `OUTPUT_DIR`, and `OUTPUT_DIR` is built from `logger.ROOT_DIR` — i.e. the
-    directory of the installation actually running, discovered at import rather than configured.
+    [FORK] R8: that name is `get_render_output_dir`, declared once in `gui.py`. The two call
+    sites — the render's publication and this button — are asserted to be the only ones, because
+    a second resolver is exactly how the button could start opening a folder the render no longer
+    uses.
+
+    Its FALLBACK is still the installation's own `output/`, and that chain is verified on the real
+    source as before: `paths.py` cannot be imported here (it imports `logger`, which imports
+    librosa), so `gui.py` is checked to import `get_output_dir` from `paths`, that function to
+    return `OUTPUT_DIR`, and `OUTPUT_DIR` to be built from `logger.ROOT_DIR`.
     """
     gui = _source(_GUI)
     assert "    get_output_dir,\n" in gui, "get_output_dir is not imported from paths"
+
+    gui_tree = _tree(_GUI)
+    resolvers = [n for n in ast.walk(gui_tree) if isinstance(n, ast.FunctionDef)
+                 and n.name == "get_render_output_dir"]
+    assert len(resolvers) == 1, "there must be exactly one render-output resolver"
+    # It falls back to the installation's own folder rather than inventing a path.
+    body = ast.unparse(resolvers[0])
+    assert "get_output_dir()" in body, "the resolver does not fall back to the installation"
+    # No hardcoded location: the configured value comes from the preference store and the fallback
+    # from `paths`. Matched as a drive-letter pattern rather than by banning ":" outright, because
+    # `ast.unparse` of any function contains the colon of its own `def` line.
+    assert not re.search(r"['\"][A-Za-z]:[\\/]", body), \
+        "the resolver hardcodes a drive letter"
+    # And it NEVER creates the folder: a remembered path is a suggestion, not an action.
+    for forbidden in ("makedirs", "mkdir"):
+        assert forbidden not in body, f"the resolver calls {forbidden}"
+
+    callers = [ast.unparse(n.func) for n in ast.walk(gui_tree) if isinstance(n, ast.Call)
+               and ast.unparse(n.func) == "get_render_output_dir"]
+    assert len(callers) == 2, (
+        f"expected exactly two call sites (the render's publication and the folder button), "
+        f"found {len(callers)}")
 
     paths_tree = _tree(os.path.join(_SRC, "paths.py"))
     getter = next(n for n in ast.walk(paths_tree)
@@ -249,7 +293,7 @@ def test_the_folder_is_the_running_installations_own_output_dir():
     # and the handler calls exactly that name, not a path expression of its own
     handler = _func(_GUI, HANDLER)
     assigns = [ast.unparse(n) for n in ast.walk(handler) if isinstance(n, ast.Assign)]
-    assert "output_dir = get_output_dir()" in assigns, assigns
+    assert "output_dir = get_render_output_dir()" in assigns, assigns
 
 
 def test_the_handler_never_opens_a_file_only_the_folder(folder):
@@ -945,13 +989,54 @@ def test_the_master_success_commit_point_is_still_single_and_unmoved():
         "session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.SUCCESS")
 
 
-def test_the_two_renames_are_still_exactly_the_promotion_and_the_publication():
+def test_every_rename_in_the_gui_is_one_of_the_three_audited_ones():
+    """`gui.py`'s complete set of `os.rename` call sites, by exact identity.
+
+    A rename is how this application moves a file that matters, so the set is pinned rather than
+    counted: a NEW one must be reviewed deliberately, which is what this assertion forces.
+
+    [FORK] R8 UX Refresh adds the THIRD, and it is a different kind of operation from the first
+    two. Those two are durable publications of a finished render; this one moves the previous
+    session's browser uploads aside at startup instead of deleting them, and it exists precisely
+    so that a `shutil.rmtree` no longer runs over files an operator may have no other path to.
+
+    It cannot be mistaken for a publication, and the distinctions are worth stating because they
+    are what make a third rename acceptable here:
+
+      * it runs in `_retire_previous_uploads`, during startup, before any render exists;
+      * its source is `input/gradio_uploads` and its destination is under
+        `input/retired_uploads/`, so it never touches `output/` or a staging folder;
+      * it is no-replace by construction -- the destination name is advanced until it is free, so
+        two starts in the same second cannot merge or overwrite;
+      * it writes neither `RENDER_OUTCOME_KEY` nor `LAST_OUTPUT_PATH_KEY`, so it is invisible to
+        the render outcome model and to batch continuation.
+    """
     renames = [ast.unparse(n) for n in ast.walk(_tree(_GUI))
                if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.rename"]
     assert renames == [
-        "os.rename(temp_output, output_path)",
-        "os.rename(staging_path, share_path)",
+        "os.rename(temp_output, output_path)",        # H1: the authoritative master promotion
+        "os.rename(staging_path, share_path)",        # H1-b: the subordinate share publication
+        "os.rename(uploads, candidate)",              # R8: retire, rather than delete, uploads
     ], renames
+
+
+def test_the_upload_retirement_is_a_move_and_never_a_deletion():
+    """The whole point of the third rename: nothing on this path deletes an uploaded file.
+
+    Asserted over CALLS so the docstring may explain what it does not do.
+    """
+    retire = _func(_GUI, "_retire_previous_uploads")
+    calls = {ast.unparse(n.func) for n in ast.walk(retire) if isinstance(n, ast.Call)}
+    for forbidden in ("shutil.rmtree", "os.remove", "os.unlink", "os.rmdir", "os.replace",
+                      "shutil.move"):
+        assert forbidden not in calls, f"{forbidden} is reachable while retiring uploads"
+    assert "os.rename" in calls, "retirement must actually move the folder"
+
+    # And the startup sweep must not delete the retirement folder on the NEXT start, which would
+    # reproduce the old behaviour one run later.
+    cleanup = ast.unparse(_func(_GUI, "cleanup_on_startup"))
+    assert "RETIRED_UPLOADS_DIR_NAME" in cleanup, \
+        "the retirement folder is not protected from the startup sweep"
 
 
 def test_the_protected_contract_constants_are_unchanged():

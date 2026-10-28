@@ -299,11 +299,24 @@ def test_a_preferences_file_written_before_this_release_still_loads(tmp_path):
 
 def test_the_preference_handlers_carry_the_three_new_fields(gui_tree: ast.Module):
     """Appended at the END of the signature, because Gradio passes arguments positionally and
-    every pre-existing index must stay where the registration already put it."""
+    every pre-existing index must stay where the registration already put it.
+
+    [FORK] R8 appended two more fields after these three, so `names[-3:]` is no longer this
+    feature's tail. The assertion moves to the property that mattered and is unaffected by a
+    later append: the three arrived as one CONTIGUOUS run, and nothing was inserted before them
+    or between them. An insertion anywhere earlier would shift their indices and fail here, which
+    is exactly what the original `[-3:]` check was for.
+    """
     save = _func(gui_tree, "_on_save_folder_prefs")
     names = [arg.arg for arg in save.args.args]
-    assert names[-3:] == ["audio_preview_input_folder", "audio_preview_library_folder",
-                          "audio_preview_discarded_folder"]
+    expected = ["audio_preview_input_folder", "audio_preview_library_folder",
+                "audio_preview_discarded_folder"]
+    assert all(name in names for name in expected), names
+    first = names.index(expected[0])
+    assert names[first:first + 3] == expected, (
+        f"the three R7.2 fields are no longer one contiguous run: {names}")
+    # They are still the R7.2 tail: everything after them was appended later, never inserted.
+    assert first + 3 <= len(names), names
     read = _wired(gui_tree, "pref_save_btn", "click", "inputs")
     assert {"audio_preview_folder", "pref_audio_preview_library",
             "pref_audio_preview_discarded"} <= read

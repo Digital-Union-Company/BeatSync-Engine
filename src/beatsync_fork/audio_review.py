@@ -47,6 +47,7 @@ from typing import Any, Iterable
 
 from beatsync_fork import audio_library
 from beatsync_fork import clips_review as core
+from beatsync_fork import collision
 
 # ---------------------------------------------------------------------------------------------
 # Vocabulary -- deliberately the SAME three words the Clips Preview uses
@@ -634,7 +635,8 @@ class FilingOutcome:
 
 
 def file_entry(entry: core.ClipEntry, destination_folder: str,
-               preferred_name: str = "") -> FilingOutcome:
+               preferred_name: str = "",
+               policy: str = collision.DEFAULT_POLICY) -> FilingOutcome:
     """Move one enumerated clip, revalidating its identity first.
 
     Identity is re-checked against what the scan recorded immediately before the move, so a file
@@ -664,18 +666,27 @@ def file_entry(entry: core.ClipEntry, destination_folder: str,
                           "Nothing was changed.")
         return outcome
 
+    requested = audio_library.target_name(preferred_name, entry.path)
     try:
-        destination = audio_library.file_clip(entry.path, destination_folder, preferred_name)
+        destination = audio_library.file_clip(entry.path, destination_folder, preferred_name,
+                                              policy)
     except audio_library.FilingError as failure:
         outcome.detail = str(failure)
         return outcome
     outcome.status = MOVED
     outcome.destination = destination
+    # [FORK] R8: say so when the written name is not the requested one. Derived by comparing the
+    # two names rather than by trusting the policy, so the note describes what actually happened
+    # on disk -- under SUFFIX most clips still keep their own name and must not be annotated.
+    if os.path.basename(destination) != requested:
+        outcome.detail = (f"renamed to {os.path.basename(destination)} — "
+                          f"{requested} was already there")
     return outcome
 
 
 def sort_clips(entries: Iterable[core.ClipEntry], decision_of, name_of,
-               destinations: dict, unmarked_as: str = REJECTED) -> list[FilingOutcome]:
+               destinations: dict, unmarked_as: str = REJECTED,
+               policy: str = collision.DEFAULT_POLICY) -> list[FilingOutcome]:
     """File every clip the plan accounts for. Returns one outcome per clip, in order.
 
     ``decision_of(entry) -> str`` and ``name_of(entry) -> str`` read the **server's** state;
@@ -718,7 +729,7 @@ def sort_clips(entries: Iterable[core.ClipEntry], decision_of, name_of,
                     detail=f"{core.io_detail(exc)}. Nothing was changed.", automatic=automatic))
                 continue
             made.add(folder)
-        outcome = file_entry(entry, folder, name_of(entry))
+        outcome = file_entry(entry, folder, name_of(entry), policy)
         outcome.decision = decision
         outcome.automatic = automatic
         outcomes.append(outcome)

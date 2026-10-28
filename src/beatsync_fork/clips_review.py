@@ -53,6 +53,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from . import collision
+
 # --------------------------------------------------------------------------------------------
 # Decisions
 # --------------------------------------------------------------------------------------------
@@ -1453,8 +1455,9 @@ class MoveOutcome:
         return self.status == MOVED
 
 
-def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
-    """Relocate one clip into ``destination_dir``. Never overwrites, never deletes, never renames.
+def move_decided_clip(entry: ClipEntry, destination_dir: str,
+                      policy: str = collision.DEFAULT_POLICY) -> MoveOutcome:
+    """Relocate one clip into ``destination_dir``. Never overwrites and never deletes.
 
     The whole operation is a single ``os.rename``, and that is the design rather than an
     implementation detail:
@@ -1464,11 +1467,21 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
       could destroy an original. The device is compared up front so the operator gets a sentence
       instead of a winerror, but the syscall is the real guarantee.
     * **No overwrite.** On Windows ``os.rename`` refuses an existing destination with
-      ``FileExistsError``. The pre-check below exists for the message; the refusal is enforced by
-      the call itself, so a file that appears in the gap is still not clobbered. ``os.replace``
-      would overwrite and is deliberately never used here.
-    * **No collision renaming.** A taken name is reported as :data:`OCCUPIED` and the clip stays
-      put. Inventing ``clip (2).mp4`` would quietly produce a library the operator never approved.
+      ``FileExistsError``. The refusal is enforced by the call itself, so a file that appears
+      between any check and the move is still not clobbered. ``os.replace`` would overwrite and is
+      deliberately never used here.
+    * **Collision renaming is OPT-IN and off by default.** [FORK] R8. Until then a taken name was
+      always reported as :data:`OCCUPIED` and the clip stayed put, on the grounds that inventing
+      ``clip (2).mp4`` would produce a library the operator never approved. That reasoning stands,
+      which is why :data:`collision.SKIP` remains the default and is byte-identical in behaviour.
+      What changed is that the operator can now *approve* it in Settings, in which case the
+      sequence is the documented ``clip_01``, ``clip_02``, … and the written name is reported.
+
+      The pre-check that used to produce the :data:`OCCUPIED` message is **gone**, and that is
+      required rather than incidental: a pre-check would have short-circuited the suffix sequence
+      before the rename could advance it. The message is now derived from the rename's own
+      ``FileExistsError``, which is strictly more accurate -- it reports the state at the instant
+      of the move rather than at the instant of an earlier look.
     * **Nothing is deleted.** There is no ``unlink`` on any path through this function.
 
     The clip's identity is re-checked against what the scan recorded immediately before the move,
@@ -1501,17 +1514,22 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
         result.detail = "the destination is on a different drive"
         return result
 
-    target = os.path.join(destination_dir, os.path.basename(entry.path))
+    requested = os.path.basename(entry.path)
+    target = os.path.join(destination_dir, requested)
     result.destination = target
-    if os.path.exists(target):
-        result.status = OCCUPIED
-        result.detail = "a file of that name is already there; nothing was overwritten"
-        return result
     try:
-        os.rename(entry.path, target)
-    except FileExistsError:
+        target, tries = collision.publish(entry.path, destination_dir, requested, os.rename,
+                                          policy=policy)
+        result.destination = target
+    except collision.NoFreeName as exhausted:
         result.status = OCCUPIED
-        result.detail = "a file of that name appeared there first; nothing was overwritten"
+        # One attempt is the plain taken-name case, which is all the default policy can produce,
+        # so it keeps the exact pre-R8 sentence. Only an exhausted suffix sequence reads
+        # differently, because only then is "a file of that name" an incomplete explanation.
+        result.detail = ("a file of that name is already there; nothing was overwritten"
+                         if exhausted.attempts <= 1 else
+                         "that name and every numbered alternative are taken; nothing was "
+                         "overwritten")
         return result
     except OSError as exc:
         # Cross-volume shows up here too on some filesystems; report it as what it is.
@@ -1529,11 +1547,17 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str) -> MoveOutcome:
             result.status, result.detail = FAILED, io_detail(exc)
         return result
     result.status = MOVED
+    # [FORK] R8: name the file that was actually written, when it is not the one asked for.
+    # Derived from the returned path rather than from the policy, so a clip that kept its own name
+    # under SUFFIX carries no note.
+    if tries > 1:
+        result.detail = (f"renamed to {os.path.basename(target)} — "
+                         f"{requested} was already there")
     return result
 
 
 def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: dict[str, str],
-                       ) -> list[MoveOutcome]:
+                       policy: str = collision.DEFAULT_POLICY) -> list[MoveOutcome]:
     """Move each decided clip to the folder its decision names. Returns one outcome per clip.
 
     ``decision_of(entry) -> str`` reads the **server's durable record**; nothing here looks at
@@ -1562,7 +1586,7 @@ def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: 
                                             detail=io_detail(exc)))
                 continue
             made.add(destination_dir)
-        outcome = move_decided_clip(entry, destination_dir)
+        outcome = move_decided_clip(entry, destination_dir, policy)
         outcome.decision = decision
         outcomes.append(outcome)
     return outcomes

@@ -108,3 +108,129 @@ because **Prepare & Verify is the last Media Library section** — so Audio Mix'
 earlier in the source — and because only the Settings tab follows it, which is why every numeric
 control in Settings is a `gr.Number`. That constraint is now written down in both the source and
 the test instead of being an accident of ordering.
+
+## Commit B — Settings, central paths, collision policy, cache management
+
+Phases 3, 7 and 8. Two new stdlib-only fork modules, one new preference key, one new preference
+*section*, and the end of a `shutil.rmtree` that ran before the operator had done anything.
+
+### Preferences stayed backward-compatible, and that is measured
+
+`state/preferences.json` keeps its schema string, `beatsync-folder-preferences-1`, deliberately.
+`folders` keeps exactly the shape it had; `render_output` is **appended** to the key list, which
+`load_preferences` fills with `""` when absent, so a file written by any previous version loads
+with no migration step. Non-folder settings went into a separate top-level `options` section, so
+an older build reads the file and ignores them — the correct outcome, since an older build has no
+feature to apply them to.
+
+The one real hazard this created is a writer that drops a section it does not own.
+`save_preferences(path, preferences)` replaces the whole file, so the two-argument form every
+pre-R8 call site uses would have deleted the options — the operator would have watched a setting
+reset itself every time they pressed Save defaults. It now reads the stored options back and
+writes them out again, and that is asserted directly: a two-argument save after an options-only
+write must leave the options intact.
+
+### Where the Render output folder does and does not reach
+
+`get_render_output_dir()` resolves the configured folder at **call time** (so saving takes effect
+on the next render, not the next restart), uses it only if it **already exists** (it never creates
+a folder — a remembered path is a suggestion, and a folder that has gone away is reported through
+the existing `unavailable_notice`, for free, because `RENDER_OUTPUT` is a destination key), and
+governs the **published** render only. `session_dir`, the processing directory, the Gradio upload
+folder and every cache keep resolving through their own constants. The share-staging folder stays
+a child of whatever the resolver returns, so the final step is still a same-directory rename and
+`EXDEV` remains structurally impossible rather than merely unlikely.
+
+It has exactly two callers — the render's publication and Open Output Folder — and a test pins
+that count, because a second resolver is precisely how the button could start opening a folder the
+render no longer writes to.
+
+### The collision policy is opt-in, and the default is provably unchanged
+
+`beatsync_fork/collision.py` is one small module both review workflows now share. Four properties
+make the opt-in safe, and each is asserted:
+
+* **The rename is the authority, never an `exists()` check.** `publish()` advances to the next
+  candidate when the caller's no-replace rename *reports the name is taken*. There is no window in
+  which another process could create the file between a check and a move, because the check **is**
+  the move. A test asserts the module contains no `os.path.exists`, `os.stat`, `listdir` or
+  `scandir` at all.
+* **It retries.** Two review sessions filing into one library will race, and the loser should take
+  `_02`, not report an error.
+* **`SKIP` attempts exactly one name.** That is what makes the default *provably* identical to the
+  pre-R8 behaviour rather than merely similar to it — and `NoFreeName.attempts == 1` is the signal
+  both callers branch on to reproduce their original wording verbatim. Callers branch on the
+  attempt count, never on the policy they passed.
+* **The original is never lost.** Exhaustion raises with nothing moved.
+
+One pre-existing pre-check had to **go** rather than be kept: `move_decided_clip` used to test
+`os.path.exists(target)` to produce its `OCCUPIED` message. Keeping it would have short-circuited
+the suffix sequence before the rename could advance it. The message now derives from the rename's
+own `FileExistsError`, which is strictly more accurate — it reports the state at the instant of the
+move rather than at the instant of an earlier look.
+
+Measured on real files through real `os.rename`, three clips all wanting one name:
+
+| Policy | Published | Library afterwards | Sources left |
+|---|---|---|---|
+| `skip` (default) | 1 of 3 | `clip.wav` | the other 2, bytes intact |
+| `suffix` | 3 of 3 | `clip.wav`, `clip_01.wav`, `clip_02.wav` | none |
+
+Under `suffix` the three written files held three distinct payloads, so nothing was overwritten on
+the way; and the clip that kept its own name carries **no** rename note, which is what stops the
+report annotating lines that did not change.
+
+### Cache management: containment is the whole mechanism
+
+`beatsync_fork/cache_admin.py` never discovers a directory. `gui.py`'s `_cache_categories()` is the
+only function that chooses what may be cleared, and it names four roots; the module proves every
+path it touches lies inside the root it was handed, by `realpath` + `commonpath` rather than a
+string prefix. So the never-delete list is enforced by **construction**, not by a blocklist a
+future edit could get wrong — and a test asserts the absence of `get_output_dir`,
+`get_render_output_dir`, the two input-media directories, `PREFS_PATH` and `CLIPS_STATE_DIR` from
+that builder.
+
+`CLIPS_POSTER_DIR`, never `CLIPS_STATE_DIR`, is the subtlety worth stating: the review decision
+journals live in the *parent* of the poster cache, so a category pointed one level up would delete
+the operator's decisions.
+
+Two further properties, both measured against a real filesystem:
+
+* **`os.walk` descends an NTFS junction** (measured previously in this repository), so a junction
+  inside a cache would turn "clear 40 MB of thumbnails" into "delete whatever it points at".
+  Reparse-point entries are pruned from `dirnames` in place, `followlinks=False`, and both are
+  pinned by test.
+* **A file an active job holds open is reported and kept, and so are its parent folders.** Files
+  are removed individually and only *empty* directories are pruned with `os.rmdir`, which refuses
+  a non-empty one — so anything the clear declined to delete keeps its parents alive instead of
+  being swept away inside a recursive removal. `shutil.rmtree` appears nowhere in the module.
+
+Verified in the running GUI: with 3 posters (150 KB), 3 processing files (500 KB) and a 400 KB
+Stage-5 cache entry seeded, Inspect reported all three accurately with the expensive warning on
+the analysis cache; Clear with the two cheap categories selected and the confirmation **unticked**
+refused and deleted nothing; ticked, it freed 650 KB and 6 files and pruned one empty folder. The
+decision journal, the unselected Stage-5 cache, a finished render in `output/`, the operator's
+`input/audio` track and both cache roots all survived.
+
+### `cleanup_on_startup` no longer deletes browser uploads
+
+It used to `shutil.rmtree` everything under `input/` except three protected names — including
+`gradio_uploads`, before the operator had done anything. A browser upload is a copy the operator
+made *into* the app, and for some of them it is the only copy they still have a path to.
+
+The replacement is the simplest thing that is reversible: one `os.rename` into
+`input/retired_uploads/<timestamp>/`. No index, no manifest, no restore command, no second copy —
+the files are simply still there under a name that says what they are. `retired_uploads` joins the
+protected set, because otherwise the next start would delete it and reproduce the old behaviour one
+run later. An empty `gradio_uploads` is skipped, so no empty folder accumulates.
+
+It is bounded only by the operator's own clearing — one subdirectory per start that had uploads —
+which is exactly why it is a first-class Cache Management category with its size on screen rather
+than something that silently grows.
+
+This is `gui.py`'s **third** `os.rename`, where a test previously pinned exactly two. The
+invariant was never "two renames"; it was "no further durable publication into `output/`", and
+that is preserved exactly: the retirement writes under `input/`, writes neither
+`RENDER_OUTCOME_KEY` nor `LAST_OUTPUT_PATH_KEY`, is unreachable from the render body, and the two
+publication renames are still asserted to be exactly two. The test now says all of that instead
+of counting to two.

@@ -996,20 +996,48 @@ def test_the_final_promotion_is_one_owned_no_replace_helper():
     assert "shutil.move(" not in source, "shutil.move silently replaces; it must not return"
     assert "os.replace(" not in source, "os.replace silently replaces"
 
-    # Exactly two renames exist in the module, and each is named explicitly.
+    # Every rename in the module, by exact identity.
     #
     # [FORK] Digital-Union (Deliverable Export V1-B-S1 / H1-b): this used to assert a single
-    # rename. It is now an exact two-element list rather than a relaxed membership test, because
-    # H1-b authorises one SUBORDINATE publication alongside H1's authoritative promotion -- and a
-    # third rename into `output/` would be a new durable artifact nobody reviewed. Both entries are
-    # pinned by their exact argument names, so a renamed variable fails this rather than sneaking a
-    # different source or destination past it.
+    # rename. It became an exact list rather than a relaxed membership test, because H1-b
+    # authorises one SUBORDINATE publication alongside H1's authoritative promotion -- and a
+    # further rename **into `output/`** would be a new durable artifact nobody reviewed. Every
+    # entry is pinned by its exact argument names, so a renamed variable fails this rather than
+    # sneaking a different source or destination past it.
+    #
+    # [FORK] R8 UX Refresh adds a third, and the invariant above is preserved exactly rather than
+    # loosened: the prohibition was on another publication into `output/`, and this one does not
+    # go there. It moves the previous session's browser uploads from `input/gradio_uploads` into
+    # `input/retired_uploads/` at startup, replacing a `shutil.rmtree` that used to delete files
+    # an operator may have had no other path to. The two durable-publication renames are still
+    # exactly two, and that is asserted separately below so the distinction cannot erode.
     renames = [ast.unparse(n) for n in ast.walk(_gui_tree())
                if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.rename"]
     assert renames == [
         "os.rename(temp_output, output_path)",       # H1  : the authoritative master promotion
         "os.rename(staging_path, share_path)",       # H1-b: the subordinate share publication
+        "os.rename(uploads, candidate)",             # R8  : retire, not delete, old uploads
     ], renames
+
+    # The load-bearing half: still exactly TWO renames anywhere near the render, and the third is
+    # not one of them. `_retire_previous_uploads` runs at startup, writes no render state, and is
+    # unreachable from the render body -- so it cannot become a third durable artifact.
+    publication_renames = [
+        r for r in renames
+        if r in ("os.rename(temp_output, output_path)", "os.rename(staging_path, share_path)")]
+    assert len(publication_renames) == 2, publication_renames
+    retire = next(n for n in ast.walk(_gui_tree())
+                  if isinstance(n, ast.FunctionDef) and n.name == "_retire_previous_uploads")
+    retire_body = ast.unparse(retire)
+    assert "os.rename(uploads, candidate)" in retire_body, \
+        "the third rename is not the upload retirement"
+    for forbidden in ("output_path", "share_path", "staging_path", "temp_output",
+                      "RENDER_OUTCOME_KEY", "LAST_OUTPUT_PATH_KEY", "get_output_dir",
+                      "get_render_output_dir"):
+        assert forbidden not in retire_body, \
+            f"the upload retirement reaches {forbidden}, so it is not isolated from the render"
+    assert "_retire_previous_uploads" not in ast.unparse(_gui_func("_process_video_impl")), \
+        "the render body calls the startup retirement"
     # and the subordinate one publishes from staging, never from the session preview directly,
     # so the preview `gr.Video` is serving can never be moved out from under it
     assert "os.rename(preview_target, " not in _gui_source()
@@ -1315,6 +1343,12 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
         "fork_creative": fork_creative, "fork_audio_mix": fork_audio_mix,
         "fork_smart_mix": fork_smart_mix, "audio_mixdown": _StubAudioMixdown,
         "analyze_beats_auto": analyze_beats_auto, "create_music_video": create_music_video,
+        # [FORK] R8 UX Refresh: the render publishes through `get_render_output_dir`, which
+        # resolves the operator's configured Render output folder and falls back to
+        # `get_output_dir`. Both are stubbed to the same scratch directory here, so every
+        # existing assertion about where the master and share files land is unchanged -- the
+        # feature under test in this suite is the gate, not the destination.
+        "get_render_output_dir": lambda: out_dir,
         "get_output_dir": lambda: out_dir,
         "get_video_fps": lambda path: 30.0,
         "get_success_message_auto": lambda *a, **k: "✅ rendered",

@@ -125,6 +125,7 @@ from paths import (
     get_audio_input_dir,
     get_video_input_dir,
     get_output_dir,
+    get_processing_dir,
 )
 
 gpu_data = GPU_INFO
@@ -226,6 +227,13 @@ from beatsync_fork import clips_review as fork_clips
 # suites pin this module's `subprocess.run` site count at exactly two.
 from beatsync_fork import desktop_folders as fork_folders
 from beatsync_fork import user_prefs as fork_prefs
+# [FORK] Digital-Union (R8 UX Refresh): what to do about a taken destination filename, and the
+# cache inspector. Both are stdlib-only and pure enough to be unit-tested without a disk: the
+# collision helper takes the caller's rename as an argument, and the cache inspector is handed its
+# roots and never discovers one. Neither launches a process, so this module's `subprocess.run`
+# site count stays at exactly the two that two suites pin.
+from beatsync_fork import collision as fork_collision
+from beatsync_fork import cache_admin as fork_cache
 # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
 # the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
 # live inside `audio_cutter` rather than here, because two suites pin this module's
@@ -2141,7 +2149,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             output_fps = get_video_fps(local_video_paths[0])
             
         # Prepare output paths
-        output_folder = get_output_dir()
+        # [FORK] R8: the configured Render output folder, falling back to the installation's own
+        # `output/`. Only the PUBLISHED video moves -- `session_dir` below is unchanged, so no
+        # temporary processing directory or cache follows this setting.
+        output_folder = get_render_output_dir()
         os.makedirs(output_folder, exist_ok=True)
         name, _ = os.path.splitext(output_filename)
         ext = '.mov' if is_prores else '.mp4'
@@ -4498,7 +4509,9 @@ def _on_open_output_folder_click() -> None:
     soon as the request is accepted; a window could still fail to surface. The success toast
     therefore says the request was made. Visual confirmation is a human step, recorded as such.
     """
-    output_dir = get_output_dir()
+    # [FORK] R8: the SAME resolver the render publishes through, so this button always opens the
+    # folder the last render actually landed in rather than a folder it might not have used.
+    output_dir = get_render_output_dir()
     # Windows-only by construction, same as the rest of the app -- but a *missing* attribute is a
     # fact to report, not an exception to raise, because this runs inside a live Gradio event.
     open_in_shell = getattr(os, 'startfile', None)
@@ -6704,18 +6717,79 @@ def _on_prep_analyze_click(folder_path: str, recursive: bool, batch_size,
     )
 
 
+#: [FORK] R8: where a previous session's browser uploads are kept instead of being deleted.
+#: Protected from the startup sweep by name, and clearable only through Settings -> Cache
+#: Management, where the operator can see what is in it first.
+RETIRED_UPLOADS_DIR_NAME = 'retired_uploads'
+RETIRED_UPLOADS_DIR = os.path.join(ROOT_DIR, 'input', RETIRED_UPLOADS_DIR_NAME)
+
+
+def _retire_previous_uploads(input_base: str) -> None:
+    """Move the last session's `gradio_uploads` aside instead of deleting it.
+
+    [FORK] R8 UX Refresh. This used to be a `shutil.rmtree`, and it ran before the operator had
+    done anything -- so a file dragged into the browser in a previous session was gone at the next
+    start, with no record that it had existed. A browser upload is a COPY the operator made into
+    the app, and for some of them it is the only copy they still have a path to.
+
+    The replacement is deliberately the simplest thing that is reversible: one `os.rename` into a
+    timestamped folder under `input/retired_uploads/`. No index, no manifest, no restore command,
+    no second copy -- the files are simply still there, under a name that says what they are. That
+    is "reversible" in the sense that matters (the bytes survive and the operator can go and get
+    them) without becoming the backup system this must not grow into.
+
+    Nothing here deletes. If the rename fails for any reason the old folder is left exactly where
+    it is, which is the safe direction: a session that reuses it writes alongside, and the next
+    start tries again.
+
+    The folder is bounded only by the operator's own clearing, which is a real trade: it grows one
+    subdirectory per start that had uploads. That is why it is a first-class Cache Management
+    category with its size on screen, rather than something that silently accumulates.
+    """
+    uploads = os.path.join(input_base, 'gradio_uploads')
+    try:
+        if not os.path.isdir(uploads) or not os.listdir(uploads):
+            return                                   # nothing uploaded last time: nothing to keep
+    except OSError:
+        return
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    destination = os.path.join(RETIRED_UPLOADS_DIR, stamp)
+    try:
+        os.makedirs(RETIRED_UPLOADS_DIR, exist_ok=True)
+        # No-replace: a second start inside the same second must not merge into, or overwrite,
+        # the first one's retirement.
+        suffix = 0
+        candidate = destination
+        while os.path.exists(candidate):
+            suffix += 1
+            candidate = f"{destination}_{suffix:02d}"
+        os.rename(uploads, candidate)
+        print(f"   📦 Kept last session's uploads: {candidate}")
+    except OSError as exc:
+        print(f"   ⚠️  Could not set aside the previous uploads, so they were left alone: {exc}")
+
+
 def cleanup_on_startup():
     """
     Clean temporary runtime files on script start while preserving user inputs
     and the persistent video analysis cache.
+
+    [FORK] R8 UX Refresh: `gradio_uploads` is now RETIRED rather than deleted (see
+    :func:`_retire_previous_uploads`), and `retired_uploads` joins the protected set so the sweep
+    does not simply delete it on the following start -- which would have reproduced the original
+    behaviour one run later. Everything else about this function is unchanged: `processing/` is
+    genuinely disposable scratch from a finished render and is still removed, and `audio`,
+    `video` and the Stage-5 analysis cache are still protected.
     """
     input_base = get_input_dir()
-    protected_dirs = {'audio', 'video', 'video_analysis_cache'}
+    protected_dirs = {'audio', 'video', 'video_analysis_cache', RETIRED_UPLOADS_DIR_NAME}
 
     try:
         os.makedirs(get_audio_input_dir(), exist_ok=True)
         os.makedirs(get_video_input_dir(), exist_ok=True)
-        os.makedirs(os.path.join(input_base, 'gradio_uploads'), exist_ok=True)
+
+        # Before the sweep, because the sweep is what used to destroy them.
+        _retire_previous_uploads(input_base)
 
         if os.path.exists(input_base):
             for item in os.listdir(input_base):
@@ -6925,6 +6999,14 @@ PREFS_LABELS = {
     fork_prefs.CLIPS_LIBRARY: LABEL_CLIPS_LIBRARY,
     fork_prefs.CLIPS_REJECTED: LABEL_CLIPS_REJECTED,
     fork_prefs.RAW_CUTTER_OUTPUT: LABEL_PREF_RAW_OUTPUT,
+    # [FORK] R8: the rest of the destinations, so "that folder has gone away" names the field the
+    # operator recognises instead of falling back to the raw preference key.
+    fork_prefs.AUDIO_LIBRARY: LABEL_PREF_AUDIO_LIBRARY,
+    fork_prefs.AUDIO_DISCARDED: LABEL_PREF_AUDIO_DISCARDED,
+    fork_prefs.AUDIO_CUTTER_OUTPUT: LABEL_PREF_AUDIO_OUTPUT,
+    fork_prefs.AUDIO_PREVIEW_LIBRARY: LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
+    fork_prefs.AUDIO_PREVIEW_DISCARDED: LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
+    fork_prefs.RENDER_OUTPUT: LABEL_PREF_RENDER_OUTPUT,
 }
 
 
@@ -6957,9 +7039,82 @@ def _load_folder_prefs():
 
 _FOLDER_PREFS, _FOLDER_PREFS_NOTICE = _load_folder_prefs()
 
+#: [FORK] R8: the non-folder options, from the same file and read at the same moment. Kept in a
+#: separate dict rather than merged into `_FOLDER_PREFS`, because `_pref` feeds folder textboxes
+#: and a policy string appearing in one would be a path.
+_FOLDER_OPTIONS = fork_prefs.load_options(PREFS_PATH)
+
 
 def _pref(key: str) -> str:
     return _FOLDER_PREFS.get(key, '')
+
+
+def _option(key: str) -> str:
+    return _FOLDER_OPTIONS.get(key, fork_prefs.OPTION_DEFAULTS.get(key, ''))
+
+
+def _collision_policy() -> str:
+    """The operator's saved filename-collision policy, resolved safely.
+
+    One reader for both sorters, so the video and audio review workflows can never disagree about
+    what the setting means. `resolve_policy` is total, so a hand-edited or corrupt value in
+    `preferences.json` yields the safe default rather than raising inside a live Gradio event.
+    """
+    return fork_collision.resolve_policy(_option(fork_prefs.COLLISION_POLICY))
+
+
+def _on_collision_policy_change(policy):
+    """Apply and persist the collision policy as soon as it is chosen.
+
+    It persists on change rather than waiting for Save defaults, because the two sorters read the
+    *stored* value -- a radio that applied only after a separate Save would mean the screen and
+    the behaviour disagreed until the operator pressed a second button.
+
+    Feedback is a toast and `outputs` is exactly `[]`, which is the pattern
+    `_on_open_output_folder_click` established and for the same reason: writing `pref_status` here
+    would add a third writer to that panel and let changing a radio overwrite the result of a Save
+    the operator is still reading.
+    """
+    resolved = fork_collision.resolve_policy(policy)
+    _FOLDER_OPTIONS[fork_prefs.COLLISION_POLICY] = resolved
+    failure = fork_prefs.save_preferences(
+        PREFS_PATH, _FOLDER_PREFS, {fork_prefs.COLLISION_POLICY: resolved})
+    if failure:
+        # The in-memory value still applies to this session; only persistence failed, and saying
+        # so is better than implying the choice did not take.
+        gr.Warning(f"{failure} The choice applies to this session only.")
+        return
+    gr.Info(STATUS_COLLISION_SAVED_SUFFIX if resolved == fork_collision.SUFFIX
+            else STATUS_COLLISION_SAVED_SKIP)
+
+
+def get_render_output_dir() -> str:
+    """Where a finished render is published. The configured folder, or the installation's own.
+
+    [FORK] R8 UX Refresh. Before this, `output/` inside the installation was the only possible
+    destination, which is wrong for an app whose other five destinations are all configurable.
+
+    Three properties, each deliberate:
+
+    * **It resolves at call time, not at import.** Saving a new folder in Settings takes effect on
+      the next render rather than on the next restart.
+    * **A configured folder is used only if it ALREADY EXISTS.** This function never creates one,
+      which is the same rule the rest of the preference store follows -- a remembered path is a
+      suggestion, not an action, and a folder that has gone away is *reported* (Settings shows it
+      through `unavailable_notice`, since `RENDER_OUTPUT` is a destination key) rather than
+      silently recreated somewhere a typo pointed. Falling back is therefore never silent data
+      loss: the render still lands somewhere real, and Settings says why it was not the configured
+      folder.
+    * **It governs the PUBLISHED render and nothing else.** Temporary processing directories, the
+      Gradio upload folder, `session_dir` and every cache keep resolving through their own
+      constants. Moving finished videos must not relocate the scratch the renderer is mid-way
+      through writing, and the share-staging folder stays a child of whatever this returns, so the
+      final step is still a same-directory rename and `EXDEV` stays structurally impossible.
+    """
+    configured = _pref(fork_prefs.RENDER_OUTPUT)
+    if configured and os.path.isdir(configured):
+        return configured
+    return get_output_dir()
 
 
 def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw_input_folder,
@@ -6967,12 +7122,18 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
                           audio_library_folder, audio_discarded_folder, audio_output_folder,
                           audio_source_file,
                           audio_preview_input_folder, audio_preview_library_folder,
-                          audio_preview_discarded_folder):
+                          audio_preview_discarded_folder,
+                          render_output_folder=None, collision_policy=None):
     """Persist the folder defaults. Writes a file; creates no media directory.
 
     [FORK] R7 appended its four fields at the END of the signature, and R7.2 appended its three
     after those, for the reason the fork appends everywhere else: Gradio passes handler arguments
     POSITIONALLY, so every pre-existing index stays exactly where the registration already put it.
+
+    [FORK] R8 appends two more, and gives both a DEFAULT. The default is not decoration: several
+    suites call this handler with the pre-R8 argument list, and a required parameter would turn
+    every one of them into a `TypeError` that says nothing about the feature being tested. `None`
+    means "not supplied", which is distinct from "supplied empty" and is handled below.
     """
     values = {
         fork_prefs.CLIPS_LIBRARY: library,
@@ -6988,23 +7149,109 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
         fork_prefs.AUDIO_PREVIEW_INPUT: audio_preview_input_folder,
         fork_prefs.AUDIO_PREVIEW_LIBRARY: audio_preview_library_folder,
         fork_prefs.AUDIO_PREVIEW_DISCARDED: audio_preview_discarded_folder,
+        # [FORK] R8: where finished renders are published.
+        fork_prefs.RENDER_OUTPUT: (render_output_folder
+                                   if render_output_folder is not None
+                                   else _pref(fork_prefs.RENDER_OUTPUT)),
     }
-    failure = fork_prefs.save_preferences(PREFS_PATH, values)
+    # A pre-R8 caller supplies no policy, and must not reset the operator's choice to the default
+    # as a side effect of saving folders. `None` therefore means "keep what is stored".
+    options = (None if collision_policy is None
+               else {fork_prefs.COLLISION_POLICY:
+                     fork_collision.resolve_policy(collision_policy)})
+    failure = fork_prefs.save_preferences(PREFS_PATH, values, options)
     if failure:
         return f"❌ {failure}"
     _FOLDER_PREFS.update({key: (values.get(key) or '').strip() for key in fork_prefs.KEYS})
+    if options is not None:
+        _FOLDER_OPTIONS.update(options)
     missing = fork_prefs.unavailable_notice(_FOLDER_PREFS, PREFS_LABELS)
-    saved = f"✅ Saved. These folders will be filled in next time you start BeatSync."
+    saved = f"✅ Saved. These settings will be filled in next time you start BeatSync."
     return f"{saved}\n{missing}" if missing else saved
 
 
+# =============================================================================================
+# [FORK] Digital-Union (R8 UX Refresh): Settings -> Cache Management.
+#
+# The whole safety argument is CONTAINMENT, and it lives in two halves. This half decides which
+# four directories may ever be named; `beatsync_fork.cache_admin` proves that nothing outside the
+# directory it is handed is touched. Neither half discovers a path, so the list of things that
+# must never be cleared -- input media, finished exports, Media Libraries, Discarded folders,
+# models, the portable runtime, saved preferences, the review decision journals -- is enforced by
+# never appearing here rather than by a blocklist that a future edit could get wrong.
+#
+# Note what is deliberately absent: `output/` (finished renders), `input/audio`, `input/video`
+# (the operator's own media), and `state/clips-review/*.json` (the decision journals, which sit
+# BESIDE the poster cache and are why the poster subdirectory is named rather than its parent).
+# =============================================================================================
+
+def _cache_categories() -> list:
+    """The four clearable caches, built fresh so a changed Render output folder is reflected.
+
+    `CLIPS_POSTER_DIR` rather than `CLIPS_STATE_DIR`: the journals live in the parent, and a
+    category pointed at the parent would delete the operator's review decisions.
+    """
+    return [
+        fork_cache.Category(
+            fork_cache.POSTERS, LABEL_CACHE_POSTERS, INFO_CACHE_POSTERS, CLIPS_POSTER_DIR),
+        fork_cache.Category(
+            fork_cache.PROCESSING, LABEL_CACHE_PROCESSING, INFO_CACHE_PROCESSING,
+            get_processing_dir()),
+        fork_cache.Category(
+            fork_cache.RETIRED_UPLOADS, LABEL_CACHE_UPLOADS, INFO_CACHE_UPLOADS,
+            RETIRED_UPLOADS_DIR),
+        fork_cache.Category(
+            fork_cache.ANALYSIS, LABEL_CACHE_ANALYSIS, INFO_CACHE_ANALYSIS,
+            os.path.join(get_input_dir(), 'video_analysis_cache'), expensive=True),
+    ]
+
+
+def _on_inspect_cache():
+    """Measure every category. Reads only -- creates nothing, deletes nothing, moves nothing."""
+    measurements = [fork_cache.measure(category) for category in _cache_categories()]
+    return "\n".join(fork_cache.report_lines(measurements))
+
+
+def _on_clear_cache(selected, confirmed):
+    """Delete the selected categories, and only after an explicit tick.
+
+    The confirmation is a separate checkbox rather than a second click, because a second click is
+    indistinguishable from an impatient first one. Nothing is deleted until both a selection and
+    the tick are present, and the refusal says which of the two is missing.
+
+    Selection arrives as the checkbox group's values, which are category KEYS. They are matched
+    against the built category list rather than used to construct anything, so a value the browser
+    invented names no directory and is simply not found.
+    """
+    chosen = [str(value) for value in (selected or [])]
+    if not chosen:
+        return "Nothing was selected, so nothing was cleared."
+    if not confirmed:
+        return ("Tick the confirmation box as well — nothing has been deleted.\n"
+                "Clearing a cache cannot be undone.")
+    wanted = [category for category in _cache_categories() if category.key in chosen]
+    if not wanted:
+        return "Those categories are not recognised, so nothing was cleared."
+    outcomes = [fork_cache.clear(category) for category in wanted]
+    return "\n".join(fork_cache.cleared_lines(outcomes))
+
+
 def _on_reset_folder_prefs():
-    """Clear the saved defaults. Removes no folder and no media -- only the remembered choices."""
-    failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences())
+    """Clear the saved defaults. Removes no folder and no media -- only the remembered choices.
+
+    [FORK] R8 appends the Render output box to the cleared set and returns the collision policy
+    to its default. The tuple grew by two and its ORDER matches the registration's `outputs`
+    positionally, as every return on this handler must.
+    """
+    failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences(),
+                                          fork_prefs.empty_options())
     if failure:
-        return ('', '', '', '', '', '', '', '', f"❌ {failure}")
+        return ('', '', '', '', '', '', '', '', '',
+                fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY], f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
-    return ('', '', '', '', '', '', '', '',
+    _FOLDER_OPTIONS.update(fork_prefs.empty_options())
+    return ('', '', '', '', '', '', '', '', '',
+            fork_prefs.OPTION_DEFAULTS[fork_prefs.COLLISION_POLICY],
             "✅ Defaults cleared. No folder or file was deleted.")
 
 
@@ -7507,7 +7754,9 @@ def _audio_sort(surface, view, library, discarded, sweep_unmarked):
         view.get('entries') or (), decision_of, name_of,
         {fork_audio_review.SELECTED: library, fork_audio_review.REJECTED: discarded},
         unmarked_as=(fork_audio_review.REJECTED if sweep_unmarked
-                     else fork_audio_review.PENDING))
+                     else fork_audio_review.PENDING),
+        # [FORK] R8: the same saved policy the video sorter reads, for the same reason.
+        policy=_collision_policy())
 
     message = "\n".join(fork_audio_review.sorted_report_lines(outcomes, library, discarded))
     moved = {o.clip_id for o in outcomes if o.ok}
@@ -8313,7 +8562,13 @@ def _on_clips_confirm(request: gr.Request = None):
     outcomes = fork_clips.sort_decided_clips(
         view['entries'], decision_of,
         {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
-         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real})
+         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real},
+        # [FORK] R8: the operator's saved collision policy, read from the preference store rather
+        # than threaded in as a widget. Deliberate: `_on_clips_confirm` takes no widget input at
+        # all -- everything that decides where a file goes comes from the server -- and adding one
+        # would both break that property and move the positional alignment several suites pin.
+        # The radio persists on change, so the stored value is always the live one.
+        _collision_policy())
     message = _clips_sorted_text(outcomes, roots)
 
     # Re-enumerate whichever way it went. On a clean batch that publishes the next one; on a
@@ -10059,6 +10314,18 @@ def create_ui() -> gr.Blocks:
                         pref_raw_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-raw-output-browse')
+                    # [FORK] R8: where finished renders go. The one destination that used to be a
+                    # fixed property of the installation; see `get_render_output_dir`.
+                    with gr.Row():
+                        pref_render_output = gr.Textbox(
+                            label=LABEL_PREF_RENDER_OUTPUT,
+                            value=_pref(fork_prefs.RENDER_OUTPUT),
+                            info=INFO_PREF_RENDER_OUTPUT,
+                            placeholder=r"J:\Finished Videos",
+                            elem_id='pref-render-output')
+                        pref_render_output_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-render-output-browse')
                     # [FORK] R7: the Audio Cutter's three destinations, remembered the same way.
                     with gr.Row():
                         pref_audio_library = gr.Textbox(
@@ -10119,6 +10386,60 @@ def create_ui() -> gr.Blocks:
                         interactive=False, lines=3, max_lines=6,
                         elem_id='pref-status-box')
 
+                # [FORK] R8 UX Refresh: the filename-collision policy. Saved with the folder
+                # defaults because it belongs to the same Save button and the same file -- see
+                # `user_prefs.OPTION_KEYS` for why it is a separate section of that file.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_COLLISION_SECTION}\n\n{INFO_COLLISION_POLICY}")
+                    pref_collision = gr.Radio(
+                        choices=[(CHOICE_COLLISION_SKIP, fork_collision.SKIP),
+                                 (CHOICE_COLLISION_SUFFIX, fork_collision.SUFFIX)],
+                        value=fork_collision.resolve_policy(
+                            _option(fork_prefs.COLLISION_POLICY)),
+                        label=LABEL_COLLISION_SECTION,
+                        show_label=False,
+                        elem_id='pref-collision-policy')
+
+                # [FORK] R8 UX Refresh: Cache Management.
+                #
+                # Every numeric read-out here is text, and the one interactive numeric control
+                # this section might have wanted does not exist, which is not an aesthetic
+                # choice: the whole remainder of the source after `INFO_PREP_SAMPLE` is the span
+                # `test_media_sample.py` scans to prove the approved sample resource policy is
+                # not widenable from the GUI, and it enforces that by OMISSION of one widget
+                # type. Settings is the last tab, so everything here is inside that span. The
+                # guard is a substring check, so this comment does not name the type either.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_CACHE_SECTION}\n\n{INFO_CACHE_SECTION}")
+                    with gr.Row():
+                        cache_inspect_btn = gr.Button(
+                            LABEL_CACHE_INSPECT, variant='secondary',
+                            elem_id='cache-inspect-button')
+                    cache_select = gr.CheckboxGroup(
+                        choices=[(LABEL_CACHE_POSTERS, fork_cache.POSTERS),
+                                 (LABEL_CACHE_PROCESSING, fork_cache.PROCESSING),
+                                 (LABEL_CACHE_UPLOADS, fork_cache.RETIRED_UPLOADS),
+                                 (LABEL_CACHE_ANALYSIS, fork_cache.ANALYSIS)],
+                        value=[],
+                        label=LABEL_CACHE_SELECT,
+                        elem_id='cache-select')
+                    gr.Markdown(
+                        f"- **{LABEL_CACHE_POSTERS}** — {INFO_CACHE_POSTERS}\n"
+                        f"- **{LABEL_CACHE_PROCESSING}** — {INFO_CACHE_PROCESSING}\n"
+                        f"- **{LABEL_CACHE_UPLOADS}** — {INFO_CACHE_UPLOADS}\n"
+                        f"- **{LABEL_CACHE_ANALYSIS}** — {INFO_CACHE_ANALYSIS}")
+                    cache_confirm = gr.Checkbox(
+                        value=False, label=LABEL_CACHE_CONFIRM, info=INFO_CACHE_CONFIRM,
+                        elem_id='cache-confirm')
+                    cache_clear_btn = gr.Button(
+                        LABEL_CACHE_CLEAR, variant='stop', elem_id='cache-clear-button')
+                    cache_report = gr.Textbox(
+                        label=LABEL_CACHE_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_CACHE_REPORT,
+                        interactive=False, lines=10, max_lines=24,
+                        elem_id='cache-report-box')
+
         # [UX V4] One helper, six folder fields plus the three saved defaults. Each button sends
         # its own textbox in and writes the same textbox back, so Browse is self-contained: it
         # starts where the field already points and cannot touch anything else. Cancel returns
@@ -10147,7 +10468,10 @@ def create_ui() -> gr.Blocks:
                 (audio_preview_library_browse, audio_preview_library),
                 (audio_preview_discarded_browse, audio_preview_discarded),
                 (pref_audio_preview_library_browse, pref_audio_preview_library),
-                (pref_audio_preview_discarded_browse, pref_audio_preview_discarded)):
+                (pref_audio_preview_discarded_browse, pref_audio_preview_discarded),
+                # [FORK] R8: the Render output destination uses the identical helper, so Browse
+                # behaves the same here as on every other folder field in the app.
+                (pref_render_output_browse, pref_render_output)):
             _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
                                  concurrency_limit=None)
 
@@ -10163,7 +10487,9 @@ def create_ui() -> gr.Blocks:
                     pref_audio_library, pref_audio_discarded, pref_audio_output, audio_source,
                     # [FORK] R7.2: appended after those, for the same reason.
                     audio_preview_folder, pref_audio_preview_library,
-                    pref_audio_preview_discarded],
+                    pref_audio_preview_discarded,
+                    # [FORK] R8: appended after those, for the same reason again.
+                    pref_render_output, pref_collision],
             outputs=[pref_status],
         )
         pref_reset_btn.click(
@@ -10171,7 +10497,44 @@ def create_ui() -> gr.Blocks:
             inputs=None,
             outputs=[pref_library, pref_rejected, pref_raw_output,
                      pref_audio_library, pref_audio_discarded, pref_audio_output,
-                     pref_audio_preview_library, pref_audio_preview_discarded, pref_status],
+                     pref_audio_preview_library, pref_audio_preview_discarded,
+                     # [FORK] R8: the render destination clears with the rest, and the policy
+                     # returns to its default. Both are APPENDED before the status box, and the
+                     # handler's return tuple matches this order positionally.
+                     pref_render_output, pref_collision,
+                     pref_status],
+        )
+
+        # [FORK] R8 UX Refresh: the collision policy applies and persists the moment it is picked.
+        # `outputs=[]` is exact and load-bearing -- feedback is a toast so this cannot become a
+        # third writer of `pref_status`. `.change()` rather than `.input()` because the Reset
+        # button writes this radio programmatically and the stored value must follow it.
+        pref_collision.change(
+            fn=_on_collision_policy_change,
+            inputs=[pref_collision],
+            outputs=[],
+            concurrency_limit=None,
+        )
+
+        # [FORK] R8 UX Refresh: Cache Management. Two read-mostly events, neither of which is a
+        # render: no `_RENDER_LOCK`, no render lane, and `concurrency_limit=None` for the same
+        # measured R3 reason every other non-render registration here carries -- on the pinned
+        # gradio 6.19.0 a full concurrency group leaves an event QUEUED rather than refusing it.
+        #
+        # Both write only `cache_report`. Neither touches a source, preparation, creative or
+        # render widget, so inspecting or clearing a cache cannot invalidate a confirmed source
+        # set or change what the next render would do.
+        cache_inspect_btn.click(
+            fn=_on_inspect_cache,
+            inputs=[],
+            outputs=[cache_report],
+            concurrency_limit=None,
+        )
+        cache_clear_btn.click(
+            fn=_on_clear_cache,
+            inputs=[cache_select, cache_confirm],
+            outputs=[cache_report],
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (R7 Raw Audio Cutter V1): five registrations, all isolated.

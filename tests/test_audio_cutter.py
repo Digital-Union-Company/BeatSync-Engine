@@ -582,13 +582,58 @@ def test_the_module_contains_no_deletion_primitive_at_all():
 
 
 def test_os_replace_is_never_used_because_it_would_overwrite():
-    path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "audio_library.py")
-    with open(path, encoding="utf-8") as handle:
-        source = handle.read()
-    tree = ast.parse(source)
-    renames = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-               and ast.unparse(n.func) == "os.rename"]
-    assert len(renames) == 1, "the move must be exactly one os.rename"
+    """The move is a no-replace rename, and `os.replace` appears nowhere on the path.
+
+    [FORK] R8 UX Refresh. This used to count `os.rename` CALLS in `audio_library.py` and require
+    exactly one. R8 moved the rename loop into `beatsync_fork.collision`, which both review
+    workflows now share, so `audio_library` *passes* `os.rename` rather than calling it -- and the
+    old assertion would read zero and fail while the property it protects is intact.
+
+    The property is therefore asserted where it now lives, in two halves, which is strictly
+    stronger than the single count it replaces:
+
+    1. `audio_library` hands over `os.rename` and nothing else -- never `os.replace`, never a
+       `shutil` move, and never a second rename of its own.
+    2. `collision.publish` performs exactly one call to the rename it was given, and `collision`
+       contains no overwriting or deleting primitive at all.
+    """
+    library_path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "audio_library.py")
+    with open(library_path, encoding="utf-8") as handle:
+        library_tree = ast.parse(handle.read())
+
+    # 1. The primitive audio_library hands to the publisher is os.rename, passed not called.
+    publishes = [n for n in ast.walk(library_tree) if isinstance(n, ast.Call)
+                 and ast.unparse(n.func).endswith("collision.publish")]
+    assert len(publishes) == 1, "there must be exactly one publication site"
+    handed = {ast.unparse(a) for a in publishes[0].args}
+    assert "os.rename" in handed, f"os.rename is not the primitive handed over: {handed}"
+    assert "os.replace" not in handed, "os.replace would overwrite"
+
+    # Asserted over CALLS, not over the rendered source. The module docstring legitimately names
+    # `os.replace` in the sentence explaining why it is never used, and a ban that the
+    # explanation of the ban cannot survive forces documentation to be written around a test.
+    # This repository has paid for that mistake several times.
+    library_calls = {ast.unparse(n.func) for n in ast.walk(library_tree)
+                     if isinstance(n, ast.Call)}
+    for forbidden in ("os.replace", "shutil.move", "shutil.copy", "shutil.copy2"):
+        assert forbidden not in library_calls, \
+            f"{forbidden} is reachable from the filing module"
+
+    # 2. The publisher calls the injected rename exactly once, and owns no destructive primitive.
+    collision_path = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "collision.py")
+    with open(collision_path, encoding="utf-8") as handle:
+        collision_tree = ast.parse(handle.read())
+    publish = next(n for n in ast.walk(collision_tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "publish")
+    renames = [n for n in ast.walk(publish) if isinstance(n, ast.Call)
+               and ast.unparse(n.func) == "rename"]
+    assert len(renames) == 1, "the move must be exactly one call to the injected rename"
+
+    collision_calls = {ast.unparse(n.func) for n in ast.walk(collision_tree)
+                       if isinstance(n, ast.Call)}
+    for forbidden in ("os.remove", "os.unlink", "os.rmdir", "os.replace", "shutil.rmtree",
+                      "shutil.move", "shutil.copy", "shutil.copy2"):
+        assert forbidden not in collision_calls, f"{forbidden} is reachable from the publisher"
 
 
 def test_a_missing_destination_folder_is_refused_without_creating_it(tmp_path):
