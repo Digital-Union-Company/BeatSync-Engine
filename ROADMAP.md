@@ -556,6 +556,160 @@ per cut; Comfort Mix measures the **longest** voice clip as the representative o
 than every clip; and the Variant Lab batch render keeps the legacy mix, because Comfort Mix is
 wired to the single-render click only.
 
+> **Three of those limitations were closed by R7.2 below** — the byte budget, the one-page gallery
+> and the Cutter-session-only review. The two Comfort Mix ones are still open.
+
+#### R7.2 — lazy audio preview, a review tab, keep-only sorting, MP3 · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+
+Five owner-requested improvements after a hands-on R7.1 test on real footage and a rendered music
+video. **The silence planner is unchanged, and so is every WAV/FLAC behaviour.** What the owner
+confirmed good and R7.2 preserves: silence-based cuts (0.5–0.6 s ideal), no missing word endings,
+hover playback and classification, Comfort Mix, and voice clips audible in the finished video.
+
+**1 — Audio is no longer in the page, so clip size cannot make a clip unplayable.** R7.1 embedded
+each clip as a base64 data URI under a cumulative ~40 MiB budget, and the budget failed exactly as
+a budget must: a perfectly valid clip became unplayable because *earlier* clips had spent the
+page's allowance, and the tile said "not loaded for preview on this page" — a sentence about a page
+limit rather than about that clip. A tile now carries an **opaque URL** and no bytes, and one
+`<audio>` element is created on hover and re-pointed as the pointer moves. Page weight is now
+independent of clip size.
+
+The bytes come from a **new authorized endpoint** that reuses the R5 Clips Preview's registry, its
+six authorization gates and its descriptor-identity revalidation unmodified — the browser still
+never receives a filesystem path, and `allowed_paths` was refused again for the reason it was
+refused before. The route is byte-range capable, which is what makes Shift+wheel seeking work
+without fetching a whole clip. **The loading limit is gone rather than raised**, so the only
+remaining failures are genuine ones: a refused fetch and an undecodable clip are now reported
+distinctly, and an unplayable clip stays classifiable.
+
+**2 — A standalone 🎧 Audio Preview tab**, because the owner often cuts recordings and classifies
+them later. It reads **any folder** of audio clips, needs no Audio Cutter run in the browser
+session, and works after restarting BeatSync. WAV, FLAC and MP3 plus M4A/AAC/OGG/Opus; a native
+Browse Folder button, optional subfolders, saved default paths, duration, filename, an editable
+destination name and a Keep/Discard badge per tile. Large folders are **paged**, and decisions are
+keyed by **file identity** rather than by page position, so paging loses none of them and a
+re-recorded clip does not inherit an old decision. **Nothing scans as a side effect** — loading
+saved preferences fills the folder box and reads no disk. A convenience **Open results in Audio
+Preview** button on the Cutter fills that box and selects the tab, and still scans nothing.
+
+The gallery, the sort policy and the destination rules are **one implementation** in
+`beatsync_fork/audio_review.py`, used by both surfaces. The two surfaces hold **separate
+registries**, because `ClipRegistry.new_session` revokes an owner's previous sessions and a shared
+one would let an Audio Preview scan silently kill the Cutter's just-cut gallery.
+
+**3 — Confirm needs one KEPT clip, not a fully decided page.** R7.1 refused Confirm while anything
+was undecided, which made the operator click Reject on every clip they did not want. Marking the
+good ones is now enough: explicit rejections still go to Discarded, and **unmarked clips are swept
+there too — but only after an explicit confirmation showing the counts first**, e.g. *6 selected to
+KEEP · 2 explicitly rejected · 12 unmarked will ALSO be moved to Discarded · nothing will be
+permanently deleted*, with Proceed and Cancel. That confirmation is bound to **one batch** by a
+signature over every decision and both destinations, so changing anything asks again. The report
+afterwards keeps all four counts distinct — kept, explicitly discarded, automatically discarded,
+failed — because "14 discarded" cannot tell an operator whether they rejected 14 clips or forgot 12.
+Discarding is still a **move into quarantine**, never a deletion; nothing is ever overwritten; the
+same-volume rule still holds; and a partial failure leaves the clips that did not move on screen
+for another attempt.
+
+**4 — Identical or nested destination folders are refused, visibly and immediately.** The owner
+found this one in use: both destination fields were set to the same folder
+(`…\VOICE OVER\Discart`) and sorting proceeded, so kept and discarded clips would have been mixed
+together. Both audio surfaces now reuse the Clips Preview's **resolved-real-path** validation —
+`commonpath` rather than string prefixes, plus the Windows `(st_dev, st_ino)` cross-check, so a
+junction, a `subst` drive, a hard link, a trailing separator and a difference of letter case are
+all recognised as the same folder. Refused: identical destinations, either nested in the other,
+either inside the review folder, the review folder inside either, and the protected runtime
+directories. It is checked **as the operator types** and **again at Confirm** — the folder that was
+checked and the folder that is written must be the same one. The gallery stays fully usable while
+the folders are being corrected; only sorting is withheld.
+
+**5 — MP3 output** (libmp3lame, 192 kbps CBR), beside the unchanged WAV PCM-16/48 kHz default and
+FLAC. `libmp3lame` is verified in the installed portable FFmpeg **before** anything is written, so
+a missing encoder refuses in words instead of producing a folder of unplayable files. Correct
+`.mp3` naming, mono/stereo preserved by omission, codec/format/bitrate recorded in the manifest,
+and MP3 already accepted by Audio Layers' voice input. The UI is **blunt about the trade**: MP3 is
+a lossy re-encode *including from an MP3 source*, because the silences are found by decoding the
+audio and there is no stream-copy path across an arbitrary cut point. The advantage is smaller
+files, not better audio.
+
+*Measured on the portable build* (five clips from a 48 kHz mono source, all three input cases —
+WAV in, MP3 in and a video file in — each writing 5 of 5 clips): `libmp3lame` present, output
+`mp3 / 48000 Hz / 1ch / 192 kbps`, **mono preserved**, and per-clip duration drift of
+**+0.000 s** at millisecond resolution against the planned segment. MP3 came to **26.2 %** of the
+WAV size (653,148 → 171,297 bytes), FLAC to 18.8 %. The "about a quarter" figure in the UI is that
+mono measurement; a stereo source is nearer an eighth, and an earlier draft of this note said
+"an eighth" without qualifying it, which was wrong for the mono case the cutter is normally used
+for.
+
+**Known R7.2 limitations.** Decisions still live in the page until Confirm, so a reload loses them
+— the Clips Preview's durable journal is still deliberately not duplicated for audio. Paging reuses
+the file list captured at Scan, so a file added to the folder mid-review appears only after the
+next Scan (a sort re-enumerates automatically). The sweep signature is a **change detector, not a
+credential**: it prevents a stale confirmation from applying to a different batch, and the server
+re-derives the whole plan and re-validates both folders before moving a byte regardless. MP3 clip
+boundaries are frame-quantised to 1152 samples with the delay and padding recorded in the
+Xing/LAME header — close, and **not** sample-exact, which is why WAV remains the default. The two
+Comfort Mix limitations above are untouched.
+
+### R7.3 — Voice clips that exceed the music duration · **PLANNED, NOT IMPLEMENTED**
+
+Raised while testing R7.2: Audio Layers currently **fails the whole render** when the voice clips
+it was given cannot all be placed before the music ends. That is the safe default and must remain
+available, but it is not always the behaviour the operator wants.
+
+A future Audio Layers setting — **"When voice clips do not fit"** — with four modes:
+
+1. **Strict / Error** — the historical behaviour. Refuse the render and name the clip, its duration
+   and the cursor position, exactly as today. **This stays available and stays the thing an
+   operator can choose.**
+2. **Skip clips that cannot fit** — place what fits, skip the rest, report which.
+3. **Trim the final usable clip at the music end, then skip the rest** — the only mode that
+   deliberately shortens a clip, so it must say so per clip rather than in aggregate.
+4. **Repeat Music to Fit** — extend the music instead of dropping speech. **Activate only after
+   R10 exists**; until then the mode is not offered at all rather than offered and refused.
+
+**The decision is a placement question, not an arithmetic one, and that is the part worth getting
+right.** Whether a clip fits is not `sum(durations) <= music_duration`: placement already walks the
+beat grid, honours **Minimum Gap**, respects **Avoid Drops** over the whole clip interval (not just
+its start), and looks ahead at most `PLACEMENT_LOOKAHEAD_SECONDS` for a preferred section start. A
+clip can therefore fail to fit with minutes of music left, and a naive duration sum would report
+the opposite. The mode must be evaluated against the real planner, by the planner.
+
+Acceptance goals:
+
+- every mode **always reports clips used, trimmed and skipped**, by name;
+- **no silent truncation and no silent dropping**, in any mode;
+- Strict remains selectable and remains the default until the owner says otherwise;
+- the placement rules above are unchanged — this chooses what to do when placement fails, it does
+  not relax placement;
+- deterministic and seedless, like the rest of Audio Layers.
+
+### R10 — Quick Render music repeat · **PLANNED, NOT IMPLEMENTED**
+
+A control beside the main music selector: **Repeat Music: 1×–30×**.
+
+- **1× preserves the existing render path exactly** — same analysis, same planner, same output.
+  Not "equivalent": the same path, so a non-repeating render cannot regress.
+- **2×–30× repeats the selected song sequentially** and the **video duration extends with the
+  audio**.
+- **Cuts and source choices must cover the whole extended timeline.** Re-showing the
+  already-rendered visual sequence is explicitly *not* acceptable — the point is a longer video,
+  not a looped one.
+- **Original speed and pitch preserved**; no time-stretch, no resampling.
+- **Audio/video frame synchronisation maintained** across every repeat boundary, which is where
+  this will actually be hard: the frame-lock invariant quantises absolute cut positions once over
+  the whole timeline, so the repeat has to be part of that timeline rather than a concatenation of
+  separately locked renders.
+- **Reuse the analysis rather than repeating it.** Beat grid, sections and energy for repeat *n*
+  are the first pass shifted by `n × duration`; re-running Stages 1–3 thirty times would be the
+  obvious implementation and the wrong one.
+- **Progress and an estimated output duration** before the render starts, and **cancellable**,
+  through the existing `RenderLifecycle` rather than a second mechanism.
+- Later, **Auto Repeat to Fit Voice Layers**: choose the smallest repeat count up to 30 that makes
+  the voice selection placeable, decided by **actual placement feasibility** rather than by summing
+  durations — the same correction R7.3 records above.
+
+**Not in PR #77 and not started.** R7.3's mode 4 is blocked on this.
+
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
 Only once R7 has proven useful in practice:
@@ -659,8 +813,11 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R6** — Raw Cutter output video profiles | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders in production |
 | **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **IN DRAFT PR #77** — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not merged, not deployed, not independently reviewed** |
 | **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **LOCAL CANDIDATE, IN DRAFT PR #77** — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. **Not merged, not deployed** |
+| **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **LOCAL CANDIDATE, IN DRAFT PR #77** — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. **Not merged, not deployed, not independently reviewed** |
+| **R7.3** — "When voice clips do not fit" modes | **PLANNED, NOT IMPLEMENTED** — Strict (today's behaviour, retained) / Skip / Trim-then-skip / Repeat-music (blocked on R10). Must be decided by real placement feasibility, not by summing durations |
+| **R10** — Quick Render **Repeat Music 1×–30×** | **PLANNED, NOT IMPLEMENTED** — 1× must be the existing path unchanged; cuts must cover the whole extended timeline rather than repeating the rendered sequence; analysis reused rather than re-run; cancellable with an estimated duration |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started |
-| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is a local candidate in PR #77; the documentation half is unstarted |
+| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is a local candidate in PR #77; the documentation half is unstarted. R7.3 above is the next Audio Layers item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
@@ -679,9 +836,14 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 4. **R6 — Raw Cutter output video profiles.** The recommended next build: it is bounded, it has a
    default that cannot regress anything (*Same as source*), and it makes the clip library usable
    as a whole rather than as a pile of mismatched formats.
-5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI.
-6. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
-7. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
+5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI. **R7 / R7.1 / R7.2 are all local
+   candidates in draft PR #77**, owner-tested through R7.1 and awaiting an owner test of R7.2.
+6. **R7.3 — "When voice clips do not fit"**, the next Audio Layers behaviour change. Modes 1–3 are
+   implementable now; mode 4 waits on R10.
+7. **R10 — Repeat Music 1×–30×**, which also unblocks R7.3's fourth mode and the later
+   Auto-Repeat-to-Fit.
+8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
+9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
    Qwen worker.
 
