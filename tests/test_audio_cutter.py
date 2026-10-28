@@ -675,12 +675,21 @@ def test_a_picked_file_comes_back_absolute():
 # The GUI seam
 # =============================================================================================
 
-def test_the_audio_cutter_is_the_sixth_top_level_tab_before_clips_preview(gui_source: str):
+def test_the_audio_cutter_is_a_top_level_tab_beside_the_other_cutter(gui_source: str):
+    """R8 UX Refresh (Commit A). It used to be "the sixth tab, after Advanced Tools and before
+    Clips Preview" -- a position chosen to keep two other suites' index arithmetic valid rather
+    than for any reason an operator would recognise.
+
+    The claim that survives, and the one the re-order was for: the Audio Cutter is a top-level
+    destination of its own, and it sits directly beside the Raw Cutter, because the two are the
+    same job on different media and an operator looking for one will look for the other.
+    """
     assert "gr.Tab(LABEL_TAB_AUDIO_CUTTER" in gui_source
     audio = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
-    assert gui_source.index("gr.Tab(LABEL_TAB_ADVANCED") < audio, "it must follow Advanced Tools"
-    assert audio < gui_source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW"), \
-        "Clips Preview must stay LAST"
+    raw = gui_source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
+    assert raw < audio, "the two cutters must stay adjacent, Raw then Audio"
+    mix = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_MIX")
+    assert audio < mix, "the Audio Cutter must come before Audio Mix"
 
 
 def _audio_tab_body(tree: ast.Module) -> str:
@@ -1085,9 +1094,15 @@ def test_the_audio_layers_tip_is_present_and_names_the_real_controls(gui_source:
 
 
 def test_the_feature_claims_no_transcription_or_classifier(gui_source: str):
-    """R8 is where that would live, and R7 is deliberately not it."""
+    """A later phase is where that would live, and R7 is deliberately not it.
+
+    R8 note: the span is now the Audio Cutter tab up to the tab that follows it, which the
+    re-order changed from Clips Preview to Audio Mix. Scoping it to this tab is the point -- the
+    old bound happened to sweep two unrelated tabs as well, which would have made an unrelated
+    tab's wording fail this assertion.
+    """
     audio = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
-    block = gui_source[audio:gui_source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")]
+    block = gui_source[audio:gui_source.index("gr.Tab(LABEL_TAB_AUDIO_MIX")]
     for forbidden in ("whisper", "Whisper", "transcri", "qwen", "Qwen", "classif"):
         assert forbidden not in block, f"the Audio Cutter tab mentions {forbidden}"
 

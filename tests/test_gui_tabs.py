@@ -1,12 +1,19 @@
-"""The three-tab layout (GUI Refresh A), and the properties the re-layout had to preserve.
+"""The tab layout, and the properties each re-layout had to preserve.
+
+Originally the three-tab GUI Refresh A; grown to seven top-level tabs one feature at a time, and
+re-organised by **R8 UX Refresh (Commit A)** into seven workflow-named tabs with three of the
+former tabs demoted to sections of a new Media Library tab. See `_TABS` for the current topology
+and why it changed.
 
 `gui.py` cannot be imported on a bare interpreter, so everything here is `ast` over real source —
 the same technique as the other GUI seam suites.
 
-The refresh was a **pure re-parenting**: every component definition and every event registration
-moved verbatim inside new `with` blocks. So the interesting assertions are mostly about what did
-*not* change, and the one genuinely new seam is the active-settings read-out. In particular this
-suite exists to catch the two ways a cosmetic re-layout can quietly break the app:
+Every one of these re-layouts was a **pure re-parenting**: every component definition and every
+event registration moved verbatim inside new `with` blocks, which R8 proved mechanically by
+comparing the complete set of `name = gr.X(` assignments before and after (233 names, unchanged).
+So the interesting assertions are mostly about what did *not* change, and the one genuinely new
+seam is the active-settings read-out. In particular this suite exists to catch the two ways a
+cosmetic re-layout can quietly break the app:
 
 * a widget **duplicated** instead of moved, giving one execution setting two sources of truth;
 * a widget moved into a tab while its event registration still names the old object, or a handler's
@@ -108,96 +115,139 @@ def _registrations(tree: ast.Module, suffix: str) -> list[ast.Call]:
 #: -- so it sits beside the other workflows rather than inside Advanced Tools, which is exactly
 #: the discoverability problem the three-tab refresh existed to fix.
 #:
-#: Amended by R5 P1: a FIFTH top-level tab, the Clips Preview Selector, placed LAST. Last is
-#: deliberate and keeps two existing contracts intact: Advanced Tools stays at index 3, so every
-#: containment assertion below needs no index change, and the new tab's markup stays OUT of the
-#: `source[cutter:advanced]` block that
-#: `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
-#: Amended by R7: a SIXTH top-level tab, the Raw Audio Cutter, placed between Advanced Tools and
-#: Clips Preview. That slot keeps Advanced Tools at index 3 -- so every containment assertion here
-#: that counts from the front is unaffected -- and keeps Clips Preview LAST, which its own
-#: assertion below requires.
-#: Amended by R7.2: a SEVENTH, the standalone Audio Preview review tab, in the same slot and for
-#: exactly the same two reasons -- between Audio Cutter and Clips Preview, so Advanced Tools stays
-#: at index 3 and Clips Preview stays last.
-_TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-         "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
-         "LABEL_TAB_CLIPS_PREVIEW")
+#: R5 P1, R7 and R7.2 each added one more top-level tab (Clips Preview, the Raw Audio Cutter, and
+#: Audio Preview), and each one was slotted to keep Advanced Tools at index 3 and Clips Preview
+#: last, because the containment assertions below counted from the front.
+#:
+#: **Rewritten by R8 UX Refresh (Commit A).** Seven top-level tabs grew one at a time, each
+#: justified on its own, and the result was a drawer named "Advanced Tools" holding three
+#: unrelated tenants plus two separate review tabs plus a settings panel buried at the foot of a
+#: third. The order is now the operator's workflow rather than the order features arrived:
+#:
+#:     Render -> Creative Settings -> Raw Cutter -> Audio Cutter -> Audio Mix
+#:            -> Media Library -> Settings
+#:
+#: Two structural changes follow from it, and both are asserted below rather than assumed:
+#:
+#: * **Three former containers are now SECTIONS**, not top-level tabs: Video Review (was Clips
+#:   Preview), Audio Review (was Audio Preview) and Prepare & Verify (was the Library Preparation
+#:   accordion inside Advanced Tools). They are `gr.Tab`s nested in a second `gr.Tabs()` inside
+#:   Media Library, so there are now 7 top-level tabs, 10 `gr.Tab` calls and 2 `gr.Tabs` calls.
+#: * **Index-counting is gone.** `_tab_span` keys off the label it is given rather than a position,
+#:   so the next re-order cannot silently point an assertion at the wrong tab. That is why these
+#:   are two separate tuples: the order assertion needs a sequence, the containment assertions
+#:   need a name.
+_TABS = ("LABEL_TAB_RENDER", "LABEL_TAB_CREATIVE_SETTINGS", "LABEL_TAB_RAW_CUTTER",
+         "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+         "LABEL_TAB_SETTINGS")
+
+#: The Media Library sections, in their declared order. Prepare & Verify is LAST, and that is
+#: load-bearing for `test_the_sample_policy_span_still_holds` below.
+_SECTIONS = ("LABEL_SECTION_VIDEO_REVIEW", "LABEL_SECTION_AUDIO_REVIEW",
+             "LABEL_SECTION_PREPARE_VERIFY")
 
 
 def test_the_tab_set_is_exactly_the_documented_one(tree: ast.Module):
     """Asserted by IDENTITY, not by a bare count.
 
     The count alone used to do double duty -- it kept the topology fixed *and* incidentally banned
-    any further tab. R7 legitimately adds one, and renumbering a count would let any mistaken tab
-    satisfy it. So the set itself is the assertion: these labels, nothing else.
+    any further tab. R7 legitimately added one, and renumbering a count would let any mistaken tab
+    satisfy it. So the sets themselves are the assertion: these labels, nothing else.
+
+    R8 splits that into two claims, because "a tab" is now two different things: a top-level
+    destination and a Media Library section. A section promoted to a top-level tab, or a tab
+    demoted to a section, must fail here rather than quietly pass a combined count.
     """
     items = [i for i in _with_items(tree) if i.startswith("gr.Tab(")]
-    assert len(items) == len(_TABS), f"expected {len(_TABS)} tabs, found {len(items)}: {items}"
-    for label in _TABS:
+    expected = _TABS + _SECTIONS
+    assert len(items) == len(expected), \
+        f"expected {len(expected)} gr.Tab calls, found {len(items)}: {items}"
+    for label in expected:
         assert any(i.startswith(f"gr.Tab({label}") for i in items), f"{label} is not a tab"
-    assert len([i for i in _with_items(tree) if i.startswith("gr.Tabs(")]) == 1
+
+    # Exactly two tab containers: the top-level set, and Media Library's sections.
+    containers = [i for i in _with_items(tree) if i.startswith("gr.Tabs(")]
+    assert len(containers) == 2, f"expected 2 gr.Tabs containers, found {containers}"
 
 
-def test_the_tabs_are_the_documented_five_in_order(source: str):
+def test_the_tabs_are_in_the_documented_order(source: str):
     positions = [source.index(f"gr.Tab({label}") for label in _TABS]
     assert positions == sorted(positions), (
-        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools, then Audio "
-        "Cutter, then Clips Preview — the order is load-bearing for several containment "
-        "assertions in other suites")
+        "Render, Creative Settings, Raw Cutter, Audio Cutter, Audio Mix, Media Library, Settings "
+        "— the order is the operator's workflow and is load-bearing for the containment "
+        "assertions below")
+
+
+def test_the_media_library_sections_are_in_the_documented_order(source: str):
+    positions = [source.index(f"gr.Tab({label}") for label in _SECTIONS]
+    assert positions == sorted(positions), (
+        "Video Review, then Audio Review, then Prepare & Verify — Prepare & Verify must stay "
+        "last; see test_the_sample_policy_span_still_holds")
+
+
+def test_the_sections_are_nested_inside_the_media_library_tab(source: str):
+    """A section is only a section if it is actually inside the tab. Asserted on source position
+    against the NEXT top-level tab, so a section that escaped into Settings fails.
+    """
+    library = source.index("gr.Tab(LABEL_TAB_MEDIA_LIBRARY")
+    settings = source.index("gr.Tab(LABEL_TAB_SETTINGS")
+    assert library < settings
+    for label in _SECTIONS:
+        where = source.index(f"gr.Tab({label}")
+        assert library < where < settings, f"{label} is not inside the Media Library tab"
+    assert "with gr.Tabs() as library_tabs:" in source, \
+        "the sections need a named container so Open-results-in-Media-Library can select one"
 
 
 def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: ast.Module):
-    """The whole placement decision, pinned. Burying the cutter inside Advanced Tools would
+    """The whole placement decision, pinned. Burying the cutter inside another tab would
     reproduce the problem the tab refresh fixed, so it must be a `gr.Tab` of its own and its
-    widgets must not end up inside any accordion."""
+    widgets must not end up inside any accordion.
+
+    R8: the span's end used to be the hardcoded Advanced Tools tab, which is no longer the tab
+    that follows. `_tab_span` finds the real next boundary, so this survives the next re-order.
+    """
     assert "gr.Tab(LABEL_TAB_RAW_CUTTER" in source
-    cutter = source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
-    advanced = source.index("gr.Tab(LABEL_TAB_ADVANCED")
-    assert cutter < advanced
-    block = source[cutter:advanced]
+    start, end = _tab_span(source, "LABEL_TAB_RAW_CUTTER")
+    block = source[start:end]
     assert "gr.Accordion" not in block, "the Raw Cutter must not hide its controls in an accordion"
     for widget in ("cut_source", "cut_output", "cut_sensitivity", "cut_min_seconds",
                    "cut_max_seconds", "cut_remove_audio", "cut_rename_output",
                    "cut_analyze_btn", "cut_run_btn",
-                   "cut_cancel_btn", "cut_summary", "cut_table", "cut_report"):
+                   "cut_cancel_btn", "cut_summary", "cut_table", "cut_report",
+                   "cut_open_library_btn"):
         assert f"{widget} = gr." in block, f"{widget} is not in the Raw Cutter tab"
 
 
-def test_the_clips_preview_tab_is_last_and_top_level(source: str, tree: ast.Module):
-    """[FORK] R5 P1. Two separate claims: it is a `gr.Tab` of its own rather than something
-    buried in an accordion, and it is the LAST one.
+def test_video_review_hides_none_of_its_controls(source: str, tree: ast.Module):
+    """[FORK] R5 P1, amended by R8.
 
-    Last is not cosmetic. Inserting it between Raw Cutter and Advanced Tools would move Advanced
-    to index 4 -- breaking `test_the_occasional_tools_are_on_the_advanced_tab` and
-    `test_library_prep_is_the_last_block_in_the_advanced_tab` -- and would pull this tab's markup
-    into the span `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for
-    `gr.Accordion`.
+    The original claim was "it is a top-level tab, and it is LAST". R8 demotes it to the first
+    SECTION of Media Library, so "last" is gone and "top-level" is deliberately false now. What
+    the test was actually protecting survives unchanged and is what is asserted here: an operator
+    reviewing clips must be able to see every control without opening anything, so no part of
+    this section may be behind an accordion.
     """
-    assert "gr.Tab(LABEL_TAB_CLIPS_PREVIEW" in source
-    clips = source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")
-    for earlier in _TABS[:-1]:
-        assert source.index(f"gr.Tab({earlier}") < clips, f"{earlier} must come before it"
-    block = source[clips:source.index("source_outputs = [", clips)]
-    assert "gr.Accordion" not in block, "the Clips Preview tab must not hide its controls"
-    for widget in ("clips_input", "clips_recursive", "clips_library", "clips_rejected",
-                   "clips_page_size", "clips_check_btn", "clips_scan_btn", "clips_refresh_btn",
-                   "clips_report", "clips_counts", "clips_gallery", "clips_confirm_btn",
-                   "clips_confirm_out"):
-        assert f"{widget} = gr." in block, f"{widget} is not in the Clips Preview tab"
+    start, end = _section_span(source, "LABEL_SECTION_VIDEO_REVIEW")
+    block = source[start:end]
+    assert "gr.Accordion" not in block, "Video Review must not hide its controls"
 
 
-def test_the_clips_preview_tab_uses_no_slider(source: str):
+def test_video_review_uses_no_slider(source: str):
     """Measured in R5-P0, and the reason page size is a `gr.Number`.
 
-    `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices
-    `source[INFO_PREP_SAMPLE : sample_btn.click(]` and forbids `gr.Slider` in it. That span runs
-    past `source_outputs = [` into the event wiring, so a tab placed last falls inside it -- a
-    slider here would fail a test protecting the approved sample resource policy. The test is
-    right; the widget is a Number.
+    `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui` forbids
+    `gr.Slider` over a span that runs past the tab markup into the event wiring, so a slider
+    anywhere in this region would fail a test protecting the approved sample resource policy. The
+    test is right; the widget is a Number.
+
+    R8 note: Video Review now sits *before* Prepare & Verify, so it is no longer inside that span
+    at all. The Number is kept regardless — the control was chosen for this reason once, and
+    re-introducing the other widget type here would be a latent trap for the next re-order rather
+    than an immediate failure. A latent trap is worse.
     """
-    clips = source.index("gr.Tab(LABEL_TAB_CLIPS_PREVIEW")
-    block = source[clips:source.index("source_outputs = [", clips)]
+    start, end = _section_span(source, "LABEL_SECTION_VIDEO_REVIEW")
+    block = source[start:end]
     assert "gr.Slider" not in block
     assert "clips_page_size = gr.Number(" in block
 
@@ -244,7 +294,7 @@ def test_the_clips_handlers_take_an_injected_request_not_a_widget(tree: ast.Modu
 def test_every_tab_label_is_defined_in_ui_content(source: str):
     with open(_UI_CONTENT, encoding="utf-8") as handle:
         content = handle.read()
-    for label in _TABS:
+    for label in _TABS + _SECTIONS:
         assert f"{label} = " in content, f"{label} is not defined in ui_content.py"
 
 
@@ -252,9 +302,8 @@ def test_the_render_column_split_is_three_to_two(source: str):
     """The task asked for roughly 3:2. The controls need the width; the preview needs enough to be
     watchable. Asserted so a later tidy-up cannot silently collapse it back to 1:1.
     """
-    quick = source.index("gr.Tab(LABEL_TAB_QUICK_RENDER")
-    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
-    block = source[quick:studio]
+    start, end = _tab_span(source, "LABEL_TAB_RENDER")
+    block = source[start:end]
     assert "gr.Column(scale=3)" in block
     assert "gr.Column(scale=2)" in block
 
@@ -274,7 +323,7 @@ def test_the_quick_render_controls_are_two_side_by_side_sub_columns(tree: ast.Mo
     for node in ast.walk(tree):
         if isinstance(node, ast.With):
             for item in node.items:
-                if "LABEL_TAB_QUICK_RENDER" in ast.unparse(item.context_expr):
+                if "LABEL_TAB_RENDER" in ast.unparse(item.context_expr):
                     tab = node
     assert tab is not None
 
@@ -381,12 +430,29 @@ def test_the_ten_freestyle_dropdowns_are_still_ten(tree: ast.Module):
 # Which tab each thing landed in
 # ---------------------------------------------------------------------------------------------
 
-def _tab_span(source: str, index: int) -> tuple[int, int]:
-    start = source.index(f"gr.Tab({_TABS[index]}")
-    if index + 1 < len(_TABS):
-        return start, source.index(f"gr.Tab({_TABS[index + 1]}")
+def _tab_span(source: str, label: str) -> tuple[int, int]:
+    """The source span of one top-level tab, located BY LABEL rather than by position.
+
+    R8 replaces the old `_tab_span(source, index)`. Index-based lookup meant that re-ordering the
+    tabs left every containment assertion pointing at a different tab while still passing, which
+    is precisely the failure mode a containment assertion exists to catch. The boundary is the
+    next top-level tab in *source order*, computed from positions, so neither the declaration
+    order nor `_TABS` order has to be maintained by hand.
+    """
+    start = source.index(f"gr.Tab({label}")
+    later = [p for p in (source.index(f"gr.Tab({other}") for other in _TABS) if p > start]
     # The last tab runs to the start of the event wiring, which begins with `source_outputs`.
-    return start, source.index("source_outputs = [", start)
+    return start, min(later) if later else source.index("source_outputs = [", start)
+
+
+def _section_span(source: str, label: str) -> tuple[int, int]:
+    """The same, for a Media Library section. Its boundary is the next section, or the end of the
+    Media Library tab (= the next top-level tab) for the last one."""
+    start = source.index(f"gr.Tab({label}")
+    later = [p for p in (source.index(f"gr.Tab({other}") for other in _SECTIONS) if p > start]
+    if later:
+        return start, min(later)
+    return start, _tab_span(source, "LABEL_TAB_MEDIA_LIBRARY")[1]
 
 
 @pytest.mark.parametrize("widget", [
@@ -394,12 +460,12 @@ def _tab_span(source: str, index: int) -> tuple[int, int]:
     "creative_preset", "processing_mode", "output_filename", "process_btn", "cancel_render_btn",
     "status_output", "video_output", "open_output_folder_btn", "active_settings_summary",
 ])
-def test_the_render_workflow_is_on_the_quick_render_tab(source: str, widget: str):
+def test_the_render_workflow_is_on_the_render_tab(source: str, widget: str):
     """Everything needed for one ordinary render, and nothing that needs another tab. This is the
     whole point of the refresh: Create Music Video used to sit below six collapsed accordions.
     """
-    start, end = _tab_span(source, 0)
-    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not on Quick Render"
+    start, end = _tab_span(source, "LABEL_TAB_RENDER")
+    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not on Render"
 
 
 @pytest.mark.parametrize("widget", [
@@ -407,39 +473,79 @@ def test_the_render_workflow_is_on_the_quick_render_tab(source: str, widget: str
     "energy_response", "motion_bias", "source_diversity", "freestyle_enabled",
     "freestyle_summary", "surprise_btn",
 ])
-def test_the_creative_state_is_on_the_creative_studio_tab(source: str, widget: str):
-    start, end = _tab_span(source, 1)
-    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Creative Studio"
+def test_the_creative_state_is_on_the_creative_settings_tab(source: str, widget: str):
+    start, end = _tab_span(source, "LABEL_TAB_CREATIVE_SETTINGS")
+    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Creative Settings"
+
+
+@pytest.mark.parametrize("widget", ["voice_files", "sfx_folder", "sfx_roles"])
+def test_the_audio_extras_are_on_the_audio_mix_tab(source: str, widget: str):
+    """R8 splits the old "occasional tools" assertion in two, because the tab it named held two
+    unrelated jobs. Voice and SFX layering is audio mixing and stays here; library preparation is
+    a Media Library job and moved there. Keeping one combined assertion would have let either
+    tenant drift into the other's tab unnoticed.
+    """
+    start, end = _tab_span(source, "LABEL_TAB_AUDIO_MIX")
+    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Audio Mix"
 
 
 @pytest.mark.parametrize("widget", [
-    "voice_files", "sfx_folder", "sfx_roles", "prep_folder", "prep_recursive",
-    "prep_verify_btn", "prep_verify_report", "sample_btn", "sample_report",
+    "prep_folder", "prep_recursive", "prep_verify_btn", "prep_verify_report",
+    "sample_btn", "sample_report",
 ])
-def test_the_occasional_tools_are_on_the_advanced_tab(source: str, widget: str):
-    # Index 3 since Raw Cutter V1 inserted a tab at position 2.
-    start, end = _tab_span(source, 3)
-    assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Advanced Tools"
+def test_library_preparation_is_in_the_media_library_tab(source: str, widget: str):
+    start, end = _section_span(source, "LABEL_SECTION_PREPARE_VERIFY")
+    assert start < source.index(f"{widget} = gr.") < end, \
+        f"{widget} is not in Media Library -> Prepare & Verify"
 
 
-def test_library_prep_is_the_last_block_in_the_advanced_tab(source: str):
+@pytest.mark.parametrize("widget", [
+    "clips_input", "clips_recursive", "clips_library", "clips_rejected", "clips_page_size",
+    "clips_check_btn", "clips_scan_btn", "clips_refresh_btn", "clips_report", "clips_counts",
+    "clips_gallery", "clips_confirm_btn", "clips_confirm_out",
+])
+def test_video_review_is_in_the_media_library_tab(source: str, widget: str):
+    start, end = _section_span(source, "LABEL_SECTION_VIDEO_REVIEW")
+    assert start < source.index(f"{widget} = gr.") < end, \
+        f"{widget} is not in Media Library -> Video Review"
+
+
+def test_the_sample_policy_span_still_holds(source: str):
     """Deliberate, and load-bearing for a different suite.
 
     `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices from
-    `INFO_PREP_SAMPLE` to `sample_btn.click(` and asserts no `gr.Slider` appears in between — the
-    approved sample resource policy is enforced by omission, so a slider in that span would be the
-    defect. Audio Layers and Smart Mix both contain sliders, so they must not sit between the
-    preparation block and the event wiring.
+    `INFO_PREP_SAMPLE` to the sample button's registration and asserts no `gr.Slider` appears in
+    between — the approved sample resource policy is enforced by OMISSION, so a slider in that
+    span would be the defect.
+
+    R8 moved the preparation block out of the tab that used to guarantee this by being third of
+    four. The guarantee is now bought differently, and both halves are asserted here:
+
+    * Prepare & Verify is the LAST Media Library section, so Audio Mix's sliders (Smart Mix
+      Amount and Level, the voice controls) all sit *earlier* in the source and fall outside.
+    * Only the Settings tab follows it, which is why every numeric control in Settings is a
+      Number widget rather than the banned type.
     """
-    start, end = _tab_span(source, 3)
-    block = source[start:end]
-    assert block.index("LABEL_AUDIO_LAYERS") < block.index("LABEL_PREP_SECTION")
-    assert block.index("LABEL_SMART_MIX") < block.index("LABEL_PREP_SECTION")
+    prep = source.index("gr.Tab(LABEL_SECTION_PREPARE_VERIFY")
+    assert source.index("gr.Tab(LABEL_TAB_AUDIO_MIX") < prep, \
+        "Audio Mix must come before Prepare & Verify or its sliders land in the guarded span"
+    for label in _SECTIONS[:-1]:
+        assert source.index(f"gr.Tab({label}") < prep, f"{label} must precede Prepare & Verify"
 
     span = source[source.index("INFO_PREP_SAMPLE"):source.index("sample_btn.click(")]
     assert "gr.Slider" not in span, (
         "a slider sits between the sample UI block and the event wiring, which defeats the "
         "omission-based sample resource policy")
+
+
+def test_the_settings_tab_holds_the_remembered_folders(source: str):
+    """The panel's whole reason for moving: preferences were at the foot of a review tab."""
+    start, end = _tab_span(source, "LABEL_TAB_SETTINGS")
+    for widget in ("pref_library", "pref_rejected", "pref_raw_output", "pref_audio_library",
+                   "pref_audio_discarded", "pref_audio_output", "pref_audio_preview_library",
+                   "pref_audio_preview_discarded", "pref_save_btn", "pref_reset_btn",
+                   "pref_status"):
+        assert start < source.index(f"{widget} = gr.") < end, f"{widget} is not in Settings"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -456,14 +562,28 @@ def test_the_ai_director_and_freestyle_are_no_longer_collapsed(source: str):
     assert "gr.Accordion(label=LABEL_FREESTYLE, open=False)" not in source
 
 
-def test_the_three_bulky_blocks_stay_collapsed(source: str):
-    """Opened accordions are a budget, not a default. These three are long, occasional
-    configuration rather than entry points someone loses a render by missing, and each one's
-    collapsed state is independently pinned by its own subsystem suite.
+def test_the_bulky_blocks_stay_collapsed(source: str):
+    """Opened accordions are a budget, not a default. These are long, occasional configuration
+    rather than entry points someone loses a render by missing, and each one's collapsed state is
+    independently pinned by its own subsystem suite.
+
+    R8 UX Refresh (Commit A) removed `LABEL_PREP_SECTION` from this list, and the reason is the
+    whole argument for the budget rather than an exception to it. It was collapsed because it
+    shared the Advanced Tools tab with Audio Layers and Smart Mix, and three long open blocks in
+    one column is unreadable. It is now the entire content of its own Media Library section, so
+    collapsing it shows an operator who navigated deliberately to Prepare & Verify one closed
+    drawer and nothing else. The budget exists to keep a *shared* column readable; it was never a
+    reason to hide the only thing on a screen.
     """
-    for label in ("LABEL_VARIANT_LAB", "LABEL_AUDIO_LAYERS", "LABEL_SMART_MIX",
-                  "LABEL_PREP_SECTION"):
+    for label in ("LABEL_VARIANT_LAB", "LABEL_AUDIO_LAYERS", "LABEL_SMART_MIX"):
         assert f"gr.Accordion(label={label}, open=False)" in source, label
+
+
+def test_library_preparation_is_open_now_that_it_owns_a_section(source: str):
+    """The positive half of the change above, asserted so a later tidy-up cannot quietly shut it
+    again and reintroduce the empty-looking section."""
+    assert "gr.Accordion(label=LABEL_PREP_SECTION, open=True)" in source
+    assert "gr.Accordion(label=LABEL_PREP_SECTION, open=False)" not in source
 
 
 # ---------------------------------------------------------------------------------------------
@@ -490,7 +610,7 @@ def test_the_summary_has_exactly_one_writer_and_it_is_the_tab(tree: ast.Module):
         for keyword in call.keywords:
             if keyword.arg == "outputs" and "active_settings_summary" in ast.unparse(keyword.value):
                 writers.append(ast.unparse(call.func))
-    assert writers == ["tab_quick_render.select"], f"unexpected writers: {writers}"
+    assert writers == ["tab_render.select"], f"unexpected writers: {writers}"
 
 
 def test_the_tab_select_writes_nothing_else(tree: ast.Module):
@@ -498,7 +618,7 @@ def test_the_tab_select_writes_nothing_else(tree: ast.Module):
     execution widget — would make looking at a tab change the next render.
     """
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "tab_quick_render.select")
+                and ast.unparse(n.func) == "tab_render.select")
     outputs = next(kw for kw in call.keywords if kw.arg == "outputs")
     assert ast.unparse(outputs.value) == "[active_settings_summary]"
 
@@ -512,7 +632,7 @@ def test_the_tab_select_inputs_match_the_handler_signature(tree: ast.Module):
     whole tail — a dropdown landing anywhere but the tail would be read as a named parameter.
     """
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "tab_quick_render.select")
+                and ast.unparse(n.func) == "tab_render.select")
     inputs = next(kw for kw in call.keywords if kw.arg == "inputs")
     # `[...] + freestyle_section_dropdowns`
     assert isinstance(inputs.value, ast.BinOp), "the dropdowns must be appended as a whole list"
@@ -543,7 +663,7 @@ def test_the_six_creative_sliders_are_not_inputs_of_the_read_out(tree: ast.Modul
     stale about anything it still reports.
     """
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "tab_quick_render.select")
+                and ast.unparse(n.func) == "tab_render.select")
     inputs = next(kw for kw in call.keywords if kw.arg == "inputs")
     rendered = ast.unparse(inputs.value)
     for slider in ("cut_density", "micro_cuts", "semantic_emphasis", "energy_response",
@@ -868,7 +988,7 @@ def test_the_tab_select_is_not_in_the_render_or_cancel_lane(tree: ast.Module):
     gradio 6.19.0 a full concurrency group leaves the event queued rather than refused.
     """
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "tab_quick_render.select")
+                and ast.unparse(n.func) == "tab_render.select")
     keywords = {kw.arg for kw in call.keywords}
     assert keywords == {"fn", "inputs", "outputs"}, f"unexpected keywords: {keywords}"
 

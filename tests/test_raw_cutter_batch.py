@@ -682,9 +682,10 @@ def test_batch_mode_is_not_a_top_level_tab_of_its_own(gui_source):
     # standalone Audio Preview tab. The claim this test actually makes is unchanged and is asserted
     # below by identity: no tab of this feature's own exists, and none of its widgets is declared
     # in somebody else's tab.
-    expected = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-                "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
-                "LABEL_TAB_CLIPS_PREVIEW")
+    expected = ("LABEL_TAB_RENDER", "LABEL_TAB_CREATIVE_SETTINGS", "LABEL_TAB_RAW_CUTTER",
+                "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                "LABEL_TAB_SETTINGS", "LABEL_SECTION_VIDEO_REVIEW",
+                "LABEL_SECTION_AUDIO_REVIEW", "LABEL_SECTION_PREPARE_VERIFY")
     assert gui_source.count("gr.Tab(") == len(expected), "the top-level tab set changed"
     for label in expected:
         assert f"gr.Tab({label}" in gui_source, f"{label} is not a top-level tab"
@@ -698,9 +699,9 @@ def test_batch_mode_is_not_a_top_level_tab_of_its_own(gui_source):
     # And the mode selector plus every batch widget sit inside the Raw Cutter tab's own block,
     # which is the containment the old count was standing in for.
     cutter = gui_source.index("gr.Tab(LABEL_TAB_RAW_CUTTER")
-    advanced = gui_source.index("gr.Tab(LABEL_TAB_ADVANCED")
-    assert cutter < advanced
-    block = gui_source[cutter:advanced]
+    following = gui_source.index("gr.Tab(LABEL_TAB_AUDIO_CUTTER")
+    assert cutter < following
+    block = gui_source[cutter:following]
     for widget in ("cut_mode", "cut_batch_folder", "cut_batch_recursive", "cut_batch_start_btn",
                    "cut_batch_cancel_btn", "cut_batch_status", "cut_batch_summary"):
         assert f"{widget} = gr." in block, f"{widget} is not inside the Raw Cutter tab"

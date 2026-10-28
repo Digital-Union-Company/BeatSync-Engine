@@ -625,20 +625,52 @@ INFO_FREESTYLE_ENABLED = (
 )
 
 # ============================================================================
-# [FORK] Digital-Union: GUI Refresh A — three tabs
+# [FORK] Digital-Union: GUI Refresh A — tabs
 # Layout only. No execution setting is duplicated and no new authority exists.
+#
+# [FORK] R8 UX Refresh (Commit A): seven top-level tabs, named for what the operator is
+# trying to do rather than for how the feature arrived. Four renames and two new tabs:
+#
+#   Quick Render     -> Render            (there is only one render workflow; "Quick" implied
+#                                          a second, faster one that never existed)
+#   Creative Studio  -> Creative Settings (it is where creative configuration lives, and the
+#                                          preset selector moved here to join its six sliders)
+#   Advanced Tools   -> Audio Mix         ("Advanced Tools" named a drawer, not a job; the
+#                                          non-audio tenant moved to Media Library)
+#   Clips Preview  \
+#   Audio Preview   >-> Media Library     (three views of one library, now sections of one tab)
+#   Library Prep   /
+#   (new)            -> Settings          (preferences were buried at the foot of Clips Preview)
+#
+# The old constant names are deliberately NOT kept as aliases: a stale alias is how a label
+# and the thing it names drift apart, and every reference is in this repository.
 # ============================================================================
 
-LABEL_TAB_QUICK_RENDER = "⚡ Quick Render"
-LABEL_TAB_CREATIVE_STUDIO = "🎨 Creative Studio"
+LABEL_TAB_RENDER = "⚡ Render"
+LABEL_TAB_CREATIVE_SETTINGS = "🎨 Creative Settings"
 LABEL_TAB_RAW_CUTTER = "✂️ Raw Cutter"
-LABEL_TAB_ADVANCED = "🔧 Advanced Tools"
+LABEL_TAB_AUDIO_MIX = "🎚️ Audio Mix"
+LABEL_TAB_MEDIA_LIBRARY = "📚 Media Library"
+LABEL_TAB_SETTINGS = "⚙️ Settings"
 
-# [FORK] Digital-Union: R5 Clips Preview Selector — a FIFTH top-level tab, placed LAST.
-# Placed after Advanced Tools deliberately: it keeps Advanced at tab index 3 so the existing
-# containment assertions need no index change, and it keeps this tab's markup out of the
-# Raw-Cutter-to-Advanced source span that `test_gui_tabs.py` scans for `gr.Accordion`.
-LABEL_TAB_CLIPS_PREVIEW = "🖼️ Clips Preview"
+# The three Media Library sections. These are `gr.Tab`s nested inside the Media Library tab,
+# so they are sections of a workflow rather than top-level destinations.
+LABEL_SECTION_VIDEO_REVIEW = "🖼️ Video Review"
+LABEL_SECTION_AUDIO_REVIEW = "🎧 Audio Review"
+LABEL_SECTION_PREPARE_VERIFY = "📚 Prepare & Verify"
+
+INFO_TAB_MEDIA_LIBRARY = (
+    "**Everything about the footage and audio you already have.** Review what a cutter "
+    "produced, file it into your library or your discard folder, and prepare or verify a "
+    "library before a render reads it.\n\n"
+    "Each section works on its own folder, so you can review a folder here without running "
+    "a cutter first — and reviewing never moves a file until you confirm."
+)
+
+INFO_TAB_SETTINGS = (
+    "**Preferences and maintenance.** Default folders are remembered between sessions and are "
+    "only ever suggestions: nothing here is created, scanned or moved when settings load."
+)
 
 # ============================================================================
 # [FORK] Digital-Union: R5 Clips Preview Selector (P1 — read-only review)
@@ -1009,17 +1041,17 @@ CUT_SETTINGS_CHANGED_TEXT = (
     "Press Analyze / Preview again before cutting."
 )
 
-INFO_TAB_CREATIVE_STUDIO = (
-    "**Shape how the edit feels.** Everything here is optional — a render with all of it left "
-    "alone is exactly the render Quick Render describes. The Creative Preset lives on Quick "
-    "Render because it is the one choice that sets all six sliders at once; change it there and "
-    "the sliders below follow."
+INFO_TAB_CREATIVE_SETTINGS = (
+    "**Shape how the edit feels.** Everything here is optional — leave it all alone and you get "
+    "the straightforward render the Render tab describes. Start with a Creative Preset, then "
+    "adjust the six sliders if you want to; the preset is just a name for those six numbers, so "
+    "moving any slider reads back as *Custom*."
 )
 
-INFO_TAB_ADVANCED = (
-    "**Occasional maintenance and diagnostics.** Prepare a media library ahead of time, check "
-    "that sources are readable, or layer voice and SFX over the music. None of this is needed "
-    "for an ordinary render."
+INFO_TAB_AUDIO_MIX = (
+    "**Layer voice and sound effects over the music.** Optional — a render with none of this set "
+    "uses the music track alone.\n\n"
+    "*Library preparation and source checks moved to Media Library → Prepare & Verify.*"
 )
 
 LABEL_ACTIVE_SETTINGS = "Active optional settings"
@@ -1733,10 +1765,14 @@ AUDIO_DESTINATION_STATUS_INITIAL = (
 )
 
 # ---------------------------------------------------------------------------------------------
-# [FORK] Digital-Union (R7.2 Phase 2): the standalone Audio Preview tab.
+# [FORK] Digital-Union (R7.2 Phase 2): the Audio Review section.
+#
+# [FORK] R8 UX Refresh (Commit A): this was `LABEL_TAB_AUDIO_PREVIEW`, a top-level tab. It is now
+# a section of Media Library, and its label is `LABEL_SECTION_AUDIO_REVIEW`, declared beside the
+# other tab labels. The old constant is deleted rather than aliased -- the engine, the widgets and
+# every handler are unchanged, only the container is.
 # ---------------------------------------------------------------------------------------------
 
-LABEL_TAB_AUDIO_PREVIEW = "\U0001f3a7 Audio Preview"
 INFO_TAB_AUDIO_PREVIEW = (
     "### \U0001f3a7 Audio Preview \u2014 review and sort a folder of audio clips\n\n"
     "Point this at **any folder of audio clips** and classify them: the ones the Raw Audio Cutter "
@@ -1775,10 +1811,20 @@ AUDIO_PREVIEW_REPORT_INITIAL = (
 )
 LABEL_AUDIO_PREVIEW_LIBRARY = "\u2705 Media Library folder (where KEPT clips go)"
 LABEL_AUDIO_PREVIEW_DISCARDED = "\U0001f5d1\ufe0f Discarded folder (quarantine, never deletion)"
-LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f3a7 Open results in Audio Preview"
+# [FORK] R8 UX Refresh (Commit A): both cutters now offer the same action, worded the same way,
+# because they do the same thing into the same place -- Media Library. The Audio Cutter's goes to
+# Audio Review and the Raw Cutter's to Video Review.
+LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f4da Open results in Media Library"
 INFO_AUDIO_OPEN_IN_PREVIEW = (
-    "Loads this cut's output folder into the Audio Preview tab so you can classify it later. It "
-    "fills the folder in for you; you still press Scan Folder there."
+    "Loads this cut's output folder into **Media Library → Audio Review** so you can classify it "
+    "later. It fills the folder in for you; you still press Scan Folder there."
+)
+
+LABEL_CUT_OPEN_LIBRARY = "\U0001f4da Open results in Media Library"
+INFO_CUT_OPEN_LIBRARY = (
+    "Loads your Raw Cutter output folder into **Media Library → Video Review**, with subfolders "
+    "included — each cut writes its own timestamped subfolder. It fills the folder in for you; "
+    "you still press Scan Folder there."
 )
 
 # [R7.2] Every selector here is a CLASS, and that is a requirement rather than a tidy-up. R7.1 had

@@ -1067,18 +1067,18 @@ def test_the_accordion_is_collapsed_and_sits_in_the_advanced_tools_tab():
         source = handle.read()
     assert "gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False)" in source
 
-    tab = source.index("gr.Tab(LABEL_TAB_ADVANCED")
+    tab = source.index("gr.Tab(LABEL_TAB_AUDIO_MIX")
     position = source.index("gr.Accordion(label=LABEL_AUDIO_LAYERS")
-    assert tab < position, "Audio Layers escaped the Advanced Tools tab"
+    assert tab < position, "Audio Layers escaped the Audio Mix tab"
     assert position < source.index("gr.Accordion(label=LABEL_SMART_MIX")
 
     # Not back in the render flow: the Quick Render tab opens before Creative Studio, which opens
     # before Advanced Tools, so landing inside Quick Render would place it ahead of this tab.
-    quick = source.index("gr.Tab(LABEL_TAB_QUICK_RENDER")
-    creative = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
+    quick = source.index("gr.Tab(LABEL_TAB_RENDER")
+    creative = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
     assert quick < creative < tab, "the three tabs are not in the documented order"
     assert quick < source.index("audio_input = gr.File") < creative, \
-        "the audio picker must stay in Quick Render"
+        "the audio picker must stay on the Render tab"
 
 
 def test_the_voice_picker_accepts_exactly_the_music_formats():

@@ -7859,20 +7859,58 @@ def _on_audio_preview_destinations_change(library_folder, discarded_folder, view
     return message
 
 
-def _on_audio_open_in_preview(run_directory):
-    """"Open results in Audio Preview": hand this cut's output folder to the review tab.
+def _on_audio_open_in_library(run_directory):
+    """"Open results in Media Library": hand this cut's output folder to Audio Review.
 
-    It only fills the folder box and selects the tab. **It deliberately does not scan**, because
-    Phase 2 requires that nothing scans a folder as a side effect -- the operator presses Scan when
-    they are ready, and until then no disk is walked and no session is minted.
+    It only fills the folder box and selects the section. **It deliberately does not scan**,
+    because Phase 2 requires that nothing scans a folder as a side effect -- the operator presses
+    Scan when they are ready, and until then no disk is walked and no session is minted.
+
+    [FORK] R8 UX Refresh (Commit A): Audio Review is now a SECTION of Media Library rather than a
+    top-level tab, so reaching it takes **two** selections, not one -- the outer tab and the inner
+    section. Returning only the inner one lands the operator on whichever top-level tab they were
+    already on, with an invisible selection applied underneath; returning only the outer one shows
+    Media Library on whatever section was last open. Both halves are therefore load-bearing, and a
+    failure path must still return an update for each of the four outputs or Gradio mis-aligns them.
     """
     folder = str(run_directory or '').strip()
     if not folder:
-        return (gr.update(), gr.update(),
+        return (gr.update(), gr.update(), gr.update(),
                 "Cut some clips first — there is no output folder to open yet.")
-    return (gr.update(value=folder), gr.Tabs(selected='tab-audio-preview'),
-            f"Loaded the folder into the Audio Preview tab:\n{folder}\n"
+    return (gr.update(value=folder),
+            gr.Tabs(selected='tab-media-library'),
+            gr.Tabs(selected='tab-audio-review'),
+            f"Loaded the folder into Media Library → Audio Review:\n{folder}\n"
             f"Press Scan Folder there when you are ready to review it.")
+
+
+def _on_cut_open_in_library(output_folder):
+    """"Open results in Media Library": hand the Raw Cutter's output folder to Video Review.
+
+    The symmetric partner of :func:`_on_audio_open_in_library`, and it shares that function's two
+    properties: it selects both the outer tab and the inner section, and **it scans nothing**. The
+    operator presses Scan when they are ready; until then no disk is walked.
+
+    What it hands over is the *parent* output folder with subfolders included, because every run
+    writes its own fresh timestamped subfolder and the Raw Cutter keeps no run-directory state. So
+    the message says exactly that rather than implying this is the one run's directory -- an
+    operator who has cut three times will see all three, which is honest and usually what they
+    want.
+
+    Total by construction: a missing or blank folder is reported and changes nothing, and every
+    return path yields one update per output so Gradio's positional alignment cannot drift.
+    """
+    folder = str(output_folder or '').strip()
+    if not folder:
+        return (gr.update(), gr.update(), gr.update(), gr.update(),
+                "Set an output folder first — there is nothing to open yet.")
+    return (gr.update(value=folder),
+            gr.update(value=True),
+            gr.Tabs(selected='tab-media-library'),
+            gr.Tabs(selected='tab-video-review'),
+            f"Loaded the Raw Cutter output folder into Media Library → Video Review:\n{folder}\n"
+            f"Subfolders are included, because each cut writes its own timestamped subfolder.\n"
+            f"Press Scan Folder there when you are ready to review.")
 
 
 def _browse_audio_source(current):
@@ -8387,7 +8425,7 @@ def create_ui() -> gr.Blocks:
         # container is the whole of that capability -- `gr.Tabs(selected=...)` as a return value
         # switches tabs, and nothing else about the tab set changes.
         with gr.Tabs() as main_tabs:
-            with gr.Tab(LABEL_TAB_QUICK_RENDER, id='tab-quick-render') as tab_quick_render:
+            with gr.Tab(LABEL_TAB_RENDER, id='tab-render') as tab_render:
                 with gr.Row():
                     # [FORK] Digital-Union (GUI Refresh A): 3:2 at the top level -- the controls
                     # need the width, the preview needs enough to be watchable.
@@ -8535,7 +8573,7 @@ def create_ui() -> gr.Blocks:
                         )
                         gr.Markdown(INFO_OPEN_OUTPUT_FOLDER)
 
-            with gr.Tab(LABEL_TAB_CREATIVE_STUDIO, id='tab-creative-studio'):
+            with gr.Tab(LABEL_TAB_CREATIVE_SETTINGS, id='tab-creative-settings'):
                 # [FORK] Digital-Union (Phase A + Creative Controls Core): creative direction.
                 # Deliberately outside the Video Source group and never wired into `source_outputs`,
                 # so changing any of these cannot invalidate a confirmed source set. All four are
@@ -8544,7 +8582,7 @@ def create_ui() -> gr.Blocks:
                 # GUI Refresh A promoted that group to a tab of its own. The contract above is
                 # unchanged and is exactly why the promotion was safe: nothing in here was ever
                 # part of source identity, so no amount of moving it can reach the render gate.
-                gr.Markdown(INFO_TAB_CREATIVE_STUDIO)
+                gr.Markdown(INFO_TAB_CREATIVE_SETTINGS)
                 with gr.Group():
                     # [FORK] Digital-Union (AI Director V1): a compact group at the TOP of this
                     # block, because the order is the explanation — describe the edit, review a
@@ -9210,282 +9248,31 @@ def create_ui() -> gr.Blocks:
                                 max_lines=34,
                                 elem_id='cut-batch-summary',
                             )
+                # [FORK] R8 UX Refresh (Commit A): the Raw Cutter's half of "Open results in
+                # Media Library", the symmetric partner of the Audio Cutter's button.
+                #
+                # It sits OUTSIDE both `cut_single_readouts` and `cut_batch_readouts` on purpose,
+                # so it is available in Single and Folder Batch alike -- those two columns are
+                # mutually exclusive and a button inside either would vanish in the other mode.
+                #
+                # It hands over `cut_output` (the parent output folder) with subfolders INCLUDED,
+                # rather than the exact run directory. That is a deliberate accuracy trade and not
+                # laziness: every run writes its own fresh timestamped subfolder, and the Raw
+                # Cutter keeps no run-directory state the way the Audio Cutter's
+                # `audio_run_dir_state` does. Adding one would mean changing the Cut handler's
+                # return signature, which several suites pin positionally -- so the button reads a
+                # widget that already exists and tells the operator exactly what it did. Reviewing
+                # still never requires having run a cutter: Video Review's folder box is editable
+                # and this only ever fills it in.
+                cut_open_library_btn = gr.Button(
+                    LABEL_CUT_OPEN_LIBRARY, variant='secondary', size='sm',
+                    elem_id='cut-open-library-button')
+                gr.Markdown(INFO_CUT_OPEN_LIBRARY)
+
                 # The plan rides as a plain dict of primitives. Nothing live -- no thread, lock,
                 # handle or lifecycle -- may enter `gr.State`, and a dict is also what lets the
                 # Cut handler recompute the staleness signature and compare it.
                 cut_plan_state = gr.State(None)
-
-            with gr.Tab(LABEL_TAB_ADVANCED, id='tab-advanced-tools'):
-                gr.Markdown(INFO_TAB_ADVANCED)
-                # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed.
-                # GUI Refresh A moved it out from under the main audio input and into this tab: it
-                # is an occasional extra, and keeping it beside the audio picker cost the render
-                # flow vertical space on every single render. Staying collapsed is pinned by test.
-                #
-                # Every widget here is a render-request input read at click time: none registers a
-                # handler, none appears in `source_outputs` or `prep_outputs`, and none is part of
-                # video-source identity — so changing any of them cannot clear a confirmation.
-                with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
-                    gr.Markdown(INFO_AUDIO_LAYERS)
-                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
-                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
-                    # order is whatever the OS dialog supplies and is not the user's click order.
-                    voice_files = gr.File(
-                        label=LABEL_VOICE_FILES,
-                        file_count='multiple',
-                        file_types=['.mp3', '.wav', '.flac'],
-                        type='filepath',
-                        elem_id='voice-files-input',
-                    )
-                    voice_start_delay = gr.Number(
-                        label=LABEL_VOICE_START_DELAY,
-                        value=fork_audio_mix.DEFAULT_START_DELAY_SECONDS,
-                        minimum=fork_audio_mix.START_DELAY_MIN_SECONDS,
-                        maximum=fork_audio_mix.START_DELAY_MAX_SECONDS,
-                        info=INFO_VOICE_START_DELAY,
-                        elem_id='voice-start-delay-input',
-                    )
-                    voice_min_gap = gr.Number(
-                        label=LABEL_VOICE_MIN_GAP,
-                        value=fork_audio_mix.DEFAULT_MIN_GAP_SECONDS,
-                        minimum=fork_audio_mix.MIN_GAP_MIN_SECONDS,
-                        maximum=fork_audio_mix.MIN_GAP_MAX_SECONDS,
-                        info=INFO_VOICE_MIN_GAP,
-                        elem_id='voice-min-gap-input',
-                    )
-                    voice_avoid_drops = gr.Checkbox(
-                        label=LABEL_VOICE_AVOID_DROPS,
-                        value=True,
-                        info=INFO_VOICE_AVOID_DROPS,
-                        elem_id='voice-avoid-drops-checkbox',
-                    )
-                    music_under_voice = gr.Slider(
-                        minimum=fork_audio_mix.MUSIC_UNDER_VOICE_MIN,
-                        maximum=fork_audio_mix.MUSIC_UNDER_VOICE_MAX,
-                        step=1,
-                        value=fork_audio_mix.DEFAULT_MUSIC_UNDER_VOICE_PERCENT,
-                        label=LABEL_MUSIC_UNDER_VOICE,
-                        info=INFO_MUSIC_UNDER_VOICE,
-                        elem_id='music-under-voice-slider',
-                    )
-                    # [FORK] R7.1 (Comfort Mix): two optional controls. Both default to the legacy
-                    # behaviour, so an operator who never touches them gets the identical mix.
-                    voice_auto_balance = gr.Checkbox(
-                        label=LABEL_VOICE_AUTO_BALANCE,
-                        value=False,
-                        info=INFO_VOICE_AUTO_BALANCE,
-                        elem_id='voice-auto-balance-checkbox',
-                    )
-                    voice_music_return = gr.Number(
-                        label=LABEL_MUSIC_RETURN,
-                        value=fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
-                        minimum=0.1,
-                        maximum=fork_audio_mix.MUSIC_RETURN_MAX_SECONDS,
-                        info=INFO_MUSIC_RETURN,
-                        elem_id='music-return-input',
-                    )
-                    audio_layers_report = gr.Textbox(
-                        label=LABEL_AUDIO_LAYERS_REPORT,
-                        value='',
-                        placeholder=PLACEHOLDER_AUDIO_LAYERS_REPORT,
-                        lines=6,
-                        max_lines=12,
-                        interactive=False,
-                        elem_id='audio-layers-report-box',
-                    )
-
-                # [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents, a collapsed
-                # sibling of Audio Layers because it layers onto the same final master.
-                #
-                # Five actual components. Exactly like the Audio Layers block, every one of them is
-                # a render-request input read at click time: none registers a handler, none appears
-                # in `source_outputs` or `prep_outputs`, and none is part of video-source identity,
-                # so changing the folder, the roles, Amount or Level cannot clear a confirmation,
-                # start a scan or touch Media Library Preparation. There is deliberately no Scan
-                # button — the library is validated by the Create Music Video preflight.
-                with gr.Accordion(label=LABEL_SMART_MIX, open=False):
-                    gr.Markdown(INFO_SMART_MIX)
-                    sfx_folder = gr.Textbox(
-                        label=LABEL_SFX_FOLDER,
-                        placeholder=PLACEHOLDER_SFX_FOLDER,
-                        info=INFO_SFX_FOLDER,
-                        elem_id='sfx-folder-input',
-                    )
-                    # `(label, value)` choices, so the value Gradio returns IS the exact internal
-                    # role name. Never a lowercase/replace heuristic over the display label: the
-                    # planner keys on these strings, so a derived name would be a silent
-                    # correctness hazard the moment a label is reworded.
-                    sfx_roles = gr.CheckboxGroup(
-                        choices=list(fork_smart_mix.ROLE_CHOICES),
-                        value=[role for _label, role in fork_smart_mix.ROLE_CHOICES],
-                        label=LABEL_SFX_ROLES,
-                        info=INFO_SFX_ROLES,
-                        elem_id='sfx-roles-group',
-                    )
-                    sfx_amount = gr.Slider(
-                        minimum=fork_smart_mix.CONTROL_MIN,
-                        maximum=fork_smart_mix.CONTROL_MAX,
-                        step=1,
-                        value=fork_smart_mix.DEFAULT_AMOUNT,
-                        label=LABEL_SFX_AMOUNT,
-                        info=INFO_SFX_AMOUNT,
-                        elem_id='sfx-amount-slider',
-                    )
-                    sfx_level = gr.Slider(
-                        minimum=fork_smart_mix.CONTROL_MIN,
-                        maximum=fork_smart_mix.CONTROL_MAX,
-                        step=1,
-                        value=fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
-                        label=LABEL_SFX_LEVEL,
-                        info=INFO_SFX_LEVEL,
-                        elem_id='sfx-level-slider',
-                    )
-                    smart_mix_report = gr.Textbox(
-                        label=LABEL_SMART_MIX_REPORT,
-                        value='',
-                        placeholder=PLACEHOLDER_SMART_MIX_REPORT,
-                        lines=6,
-                        max_lines=14,
-                        interactive=False,
-                        elem_id='smart-mix-report-box',
-                    )
-
-                # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
-                # workflow, not part of the render flow. Nothing in here is wired to
-                # `source_outputs`, so it cannot touch the Create Music Video gate.
-                #
-                # It stays collapsed (pinned by test) even though it now has its own tab, and it is
-                # deliberately the LAST block in that tab: nothing containing a `gr.Slider` may sit
-                # between the sample UI and the event wiring, which is the span
-                # `test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices to prove the
-                # approved sample resource policy is not widenable from the GUI.
-                #
-                # (GUI Refresh A note: this comment used to describe the section as "rather than a
-                # restructuring of the app into tabs". That restructuring has since happened, and
-                # this block was one of the things it moved.)
-                with gr.Accordion(label=LABEL_PREP_SECTION, open=False):
-                    gr.Markdown(INFO_PREP_SECTION)
-                    prep_folder = gr.Textbox(
-                        label=LABEL_PREP_FOLDER,
-                        placeholder=PLACEHOLDER_SOURCE_FOLDER,
-                        info=INFO_PREP_FOLDER,
-                        elem_id='prep-folder-input',
-                    )
-                    prep_recursive = gr.Checkbox(
-                        value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
-                    )
-                    # No `maximum`: this bounds one analysis run, never the supported library size.
-                    # The default is the preparation module's constant, not a literal repeated here.
-                    prep_batch_size = gr.Number(
-                        value=fork_prep.DEFAULT_ANALYZE_BATCH_SIZE,
-                        precision=0,
-                        minimum=1,
-                        label=LABEL_PREP_BATCH_SIZE,
-                        info=INFO_PREP_BATCH_SIZE,
-                        elem_id='prep-batch-size',
-                    )
-                    prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
-                    prep_report = gr.Textbox(
-                        label=LABEL_PREP_REPORT,
-                        value=initial_prep_state().report_text,
-                        interactive=False,
-                        lines=10,
-                        max_lines=16,
-                        elem_id='prep-report-box',
-                    )
-                    prep_analyze_btn = gr.Button(
-                        LABEL_PREP_ANALYZE, interactive=False, elem_id='prep-analyze-button'
-                    )
-                    prep_status = gr.Markdown(
-                        initial_prep_state().notice, elem_id='prep-status'
-                    )
-
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
-                    # Inside this accordion because it asks about the same library folder, and
-                    # below Analyze because it is the "did my files change / are they still OK"
-                    # question you ask around a preparation run rather than part of one.
-                    #
-                    # Like the rest of this section it is absent from `source_outputs` and from
-                    # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
-                    # move the preparation state machine. It is also ALWAYS interactive -- the
-                    # render mutex, not a disabled button, is what prevents it running during a
-                    # render, because a button's interactivity is per-session UX while the mutex is
-                    # process-global truth.
-                    gr.Markdown(INFO_PREP_VERIFY)
-                    prep_verify_btn = gr.Button(
-                        LABEL_PREP_VERIFY, variant='secondary',
-                        elem_id='prep-verify-button',
-                    )
-                    prep_verify_report = gr.Textbox(
-                        label=LABEL_PREP_VERIFY_REPORT,
-                        value=PREP_VERIFY_INITIAL_TEXT,
-                        interactive=False,
-                        lines=12,
-                        max_lines=24,
-                        elem_id='prep-verify-report-box',
-                    )
-
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample decode.
-                    # Immediately after Verify Sources because it is the natural follow-up
-                    # question -- "the metadata reads fine, but can FFmpeg actually produce frames
-                    # here?" -- and it is deliberately a DIFFERENT question, on one file rather
-                    # than the whole library.
-                    #
-                    # Like the rest of this accordion it is absent from `source_outputs` and
-                    # `prep_outputs`: it cannot touch the Create Music Video gate and cannot move
-                    # the preparation state machine. Also ALWAYS interactive, for the same reason
-                    # Verify Sources is -- the render mutex, not a disabled button, is what
-                    # prevents it running during a render, because interactivity is per-session UX
-                    # while the mutex is process-global truth.
-                    #
-                    # One file, one position, one explicit button. No dropdown of the library (a
-                    # ~2,000-source folder on a mechanical drive would have to be enumerated to
-                    # build it), no browser upload (it would copy large media into a temp folder),
-                    # no frame-count control and no timeout control.
-                    gr.Markdown(INFO_PREP_SAMPLE)
-                    sample_path = gr.Textbox(
-                        label=LABEL_PREP_SAMPLE_PATH,
-                        placeholder=PLACEHOLDER_SAMPLE_VIDEO,
-                        elem_id='prep-sample-path',
-                    )
-                    # Seconds, never a frame number: the diagnostic's own contract forbids
-                    # frames/fps arithmetic, and the selected stream's reported duration is what
-                    # decides whether a position is out of range.
-                    #
-                    # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
-                    # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
-                    # client-side courtesy while `run_sample_check` owns the real rejection. GUI
-                    # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
-                    # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
-                    # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
-                    # `_on_sample_decode_click` was ever entered. The operator saw a framework error
-                    # toast instead of the diagnostic's own report, and the core's
-                    # finite-and-non-negative branch was unreachable from this widget.
-                    #
-                    # Removing the bound hands the decision back to the accepted core, which refuses
-                    # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
-                    # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
-                    # work. No GUI-side validation, clamping or normalisation is added here: a
-                    # second opinion about what a valid seek is would be exactly the duplication
-                    # this integration exists to avoid.
-                    sample_seek = gr.Number(
-                        value=1.0,
-                        step=0.5,
-                        label=LABEL_PREP_SAMPLE_SEEK,
-                        elem_id='prep-sample-seek',
-                    )
-                    sample_btn = gr.Button(
-                        LABEL_PREP_SAMPLE, variant='secondary',
-                        elem_id='prep-sample-button',
-                    )
-                    sample_report = gr.Textbox(
-                        label=LABEL_PREP_SAMPLE_REPORT,
-                        value=PREP_SAMPLE_INITIAL_TEXT,
-                        interactive=False,
-                        lines=14,
-                        max_lines=28,
-                        elem_id='prep-sample-report-box',
-                    )
 
             # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
             # between Advanced Tools and Clips Preview.
@@ -9695,235 +9482,547 @@ def create_ui() -> gr.Blocks:
 
                 gr.Markdown(INFO_AUDIO_LAYERS_TIP)
 
-            # [FORK] Digital-Union (R7.2 Phase 2): the SEVENTH top-level tab, 🎧 Audio Preview.
-            #
-            # Placed between Audio Cutter and Clips Preview, and that position is chosen rather
-            # than incidental. It keeps Advanced Tools at `_TABS` index 3, so every containment
-            # assertion in `test_gui_tabs.py` that counts from the front is unaffected; it keeps
-            # Clips Preview LAST, which its own suite requires; and it keeps this markup out of the
-            # Raw-Cutter-to-Advanced span that
-            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
-            #
-            # Every numeric control here is a Number widget, which is the same non-cosmetic
-            # constraint the two tabs either side of it record: a tab in this region falls inside
-            # the source span that
-            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
-            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
-            # a substring check over this whole region, so the forbidden widget type must not
-            # appear in this span even inside a comment explaining its absence -- which is why
-            # this one does not name it.
-            with gr.Tab(LABEL_TAB_AUDIO_PREVIEW, id='tab-audio-preview'):
-                gr.Markdown(INFO_TAB_AUDIO_PREVIEW)
-                gr.HTML(AUDIO_GALLERY_CSS)
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        with gr.Group():
-                            audio_preview_folder = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_FOLDER,
-                                info=INFO_AUDIO_PREVIEW_FOLDER,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_INPUT),
-                                placeholder=r"J:\New folder\CutsAudio\VOICE OVER",
-                                elem_id='audio-preview-folder')
-                            with gr.Row():
-                                audio_preview_browse = gr.Button(
-                                    LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                    elem_id='audio-preview-browse')
-                                audio_preview_recursive = gr.Checkbox(
-                                    label=LABEL_AUDIO_PREVIEW_RECURSIVE,
-                                    info=INFO_AUDIO_PREVIEW_RECURSIVE,
-                                    value=False, elem_id='audio-preview-recursive')
-                            with gr.Row():
-                                audio_preview_page_size = gr.Number(
-                                    label=LABEL_AUDIO_PREVIEW_PAGE_SIZE,
-                                    info=INFO_AUDIO_PREVIEW_PAGE_SIZE,
-                                    value=fork_audio_review.DEFAULT_PAGE_SIZE,
-                                    minimum=1, maximum=fork_audio_review.MAX_PAGE_SIZE,
-                                    step=1, elem_id='audio-preview-page-size')
-                                audio_preview_scan_btn = gr.Button(
-                                    LABEL_AUDIO_PREVIEW_SCAN, variant='primary',
-                                    elem_id='audio-preview-scan-button')
-                        with gr.Group():
-                            audio_preview_library = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_LIBRARY,
-                                info=INFO_AUDIO_LIBRARY,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
-                                placeholder=r"J:\Voice Library",
-                                elem_id='audio-preview-library')
-                            audio_preview_library_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='audio-preview-library-browse')
-                            audio_preview_discarded = gr.Textbox(
-                                label=LABEL_AUDIO_PREVIEW_DISCARDED,
-                                info=INFO_AUDIO_DISCARDED,
-                                value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
-                                placeholder=r"J:\Voice Discarded",
-                                elem_id='audio-preview-discarded')
-                            audio_preview_discarded_browse = gr.Button(
-                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                                elem_id='audio-preview-discarded-browse')
-                            audio_preview_destination_status = gr.Textbox(
-                                label=LABEL_AUDIO_DESTINATION_STATUS,
-                                value=AUDIO_DESTINATION_STATUS_INITIAL,
-                                interactive=False, lines=2, max_lines=5,
-                                elem_id='audio-preview-destination-status')
-                    with gr.Column(scale=2):
-                        audio_preview_report = gr.Textbox(
-                            label=LABEL_AUDIO_PREVIEW_REPORT,
-                            value=AUDIO_PREVIEW_REPORT_INITIAL,
-                            interactive=False, lines=10, max_lines=18,
-                            elem_id='audio-preview-report')
-
-                gr.Markdown(INFO_AUDIO_GALLERY)
-                with gr.Row():
-                    audio_preview_enable_hover = gr.Button(
-                        LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
-                        elem_id='audio-preview-enable-hover',
-                        elem_classes=['r7-enable-hover'])
-                    audio_preview_counts = gr.Textbox(
-                        label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
-                        interactive=False, elem_id='audio-preview-counts')
-                with gr.Row():
-                    audio_preview_prev_btn = gr.Button(
-                        LABEL_AUDIO_PREVIEW_PREV, variant='secondary', scale=0,
-                        elem_id='audio-preview-prev-button')
-                    audio_preview_page_label = gr.Textbox(
-                        label=LABEL_AUDIO_PREVIEW_PAGE,
-                        value=AUDIO_PREVIEW_PAGE_INITIAL,
-                        interactive=False, elem_id='audio-preview-page-label')
-                    audio_preview_next_btn = gr.Button(
-                        LABEL_AUDIO_PREVIEW_NEXT, variant='secondary', scale=0,
-                        elem_id='audio-preview-next-button')
-                audio_preview_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
-                                                elem_id='audio-preview-gallery')
-                # This tab's own hidden decision channel. The grid names it in `data-store`, so the
-                # client writes HERE and never into the Audio Cutter's field -- which is the whole
-                # reason the grid carries that attribute.
-                audio_preview_decisions = gr.Textbox(
-                    value='', label=' ', elem_id='audio-preview-decisions')
-                audio_preview_confirm_btn = gr.Button(
-                    LABEL_AUDIO_CONFIRM, variant='primary',
-                    elem_id='audio-preview-confirm-button',
-                    elem_classes=['r7-release-audio'])
-                with gr.Row():
-                    audio_preview_proceed_btn = gr.Button(
-                        LABEL_AUDIO_PROCEED, variant='stop', visible=False,
-                        elem_id='audio-preview-proceed-button',
-                        elem_classes=['r7-release-audio'])
-                    audio_preview_sweep_cancel_btn = gr.Button(
-                        LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
-                        elem_id='audio-preview-sweep-cancel-button')
-                # Per-browser-session, exactly like the cutter's. The decision and name records are
-                # keyed by file identity, which is what makes paging lossless.
-                audio_preview_state = gr.State({})
-                audio_preview_armed_state = gr.State('')
-
-            # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
-            #
-            # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
-            # It keeps Advanced Tools at tab index 3, so every existing containment assertion in
-            # `test_gui_tabs.py` needs no index change; and it keeps this tab's markup out of the
-            # Raw-Cutter-to-Advanced source span that
-            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
-            #
-            # Page size is a Number widget, and that is also not cosmetic. A tab placed last
-            # falls inside the source span that
-            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
-            # guards -- measured in R5-P0 as ~39 k characters, running past `source_outputs = [`
-            # into the event wiring. That test enforces the approved sample resource policy by
-            # OMISSION, so the forbidden widget type must not appear anywhere in this span, not
-            # even in a comment explaining why: the guard is a substring check, and prose naming
-            # the banned token trips it exactly as real code would. (It has now done so five
-            # times in this repository.) The test is right; the widget is a Number and this
-            # comment does not name the alternative.
-            with gr.Tab(LABEL_TAB_CLIPS_PREVIEW, id='tab-clips-preview'):
-                gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
-                with gr.Row():
-                    clips_input = gr.Textbox(
-                        label=LABEL_CLIPS_INPUT,
-                        info=INFO_CLIPS_INPUT,
-                        value=_pref(fork_prefs.CLIPS_INPUT),
-                        placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
-                        elem_id='clips-input-folder',
+            with gr.Tab(LABEL_TAB_AUDIO_MIX, id='tab-audio-mix'):
+                gr.Markdown(INFO_TAB_AUDIO_MIX)
+                # [FORK] Digital-Union (Audio Layers V1 / D): voice over music. Collapsed.
+                # GUI Refresh A moved it out from under the main audio input and into this tab: it
+                # is an occasional extra, and keeping it beside the audio picker cost the render
+                # flow vertical space on every single render. Staying collapsed is pinned by test.
+                #
+                # Every widget here is a render-request input read at click time: none registers a
+                # handler, none appears in `source_outputs` or `prep_outputs`, and none is part of
+                # video-source identity — so changing any of them cannot clear a confirmation.
+                with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
+                    gr.Markdown(INFO_AUDIO_LAYERS)
+                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
+                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
+                    # order is whatever the OS dialog supplies and is not the user's click order.
+                    voice_files = gr.File(
+                        label=LABEL_VOICE_FILES,
+                        file_count='multiple',
+                        file_types=['.mp3', '.wav', '.flac'],
+                        type='filepath',
+                        elem_id='voice-files-input',
                     )
-                    clips_recursive = gr.Checkbox(
+                    voice_start_delay = gr.Number(
+                        label=LABEL_VOICE_START_DELAY,
+                        value=fork_audio_mix.DEFAULT_START_DELAY_SECONDS,
+                        minimum=fork_audio_mix.START_DELAY_MIN_SECONDS,
+                        maximum=fork_audio_mix.START_DELAY_MAX_SECONDS,
+                        info=INFO_VOICE_START_DELAY,
+                        elem_id='voice-start-delay-input',
+                    )
+                    voice_min_gap = gr.Number(
+                        label=LABEL_VOICE_MIN_GAP,
+                        value=fork_audio_mix.DEFAULT_MIN_GAP_SECONDS,
+                        minimum=fork_audio_mix.MIN_GAP_MIN_SECONDS,
+                        maximum=fork_audio_mix.MIN_GAP_MAX_SECONDS,
+                        info=INFO_VOICE_MIN_GAP,
+                        elem_id='voice-min-gap-input',
+                    )
+                    voice_avoid_drops = gr.Checkbox(
+                        label=LABEL_VOICE_AVOID_DROPS,
                         value=True,
-                        label=LABEL_CLIPS_RECURSIVE,
-                        info=INFO_CLIPS_RECURSIVE,
-                        elem_id='clips-recursive',
+                        info=INFO_VOICE_AVOID_DROPS,
+                        elem_id='voice-avoid-drops-checkbox',
                     )
-                with gr.Row():
-                    clips_input_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-input-browse')
-                with gr.Row():
-                    clips_library = gr.Textbox(
-                        label=LABEL_CLIPS_LIBRARY,
-                        info=INFO_CLIPS_LIBRARY,
-                        value=_pref(fork_prefs.CLIPS_LIBRARY),
-                        placeholder=r"J:\Media Library",
-                        elem_id='clips-library-folder',
+                    music_under_voice = gr.Slider(
+                        minimum=fork_audio_mix.MUSIC_UNDER_VOICE_MIN,
+                        maximum=fork_audio_mix.MUSIC_UNDER_VOICE_MAX,
+                        step=1,
+                        value=fork_audio_mix.DEFAULT_MUSIC_UNDER_VOICE_PERCENT,
+                        label=LABEL_MUSIC_UNDER_VOICE,
+                        info=INFO_MUSIC_UNDER_VOICE,
+                        elem_id='music-under-voice-slider',
                     )
-                    clips_rejected = gr.Textbox(
-                        label=LABEL_CLIPS_REJECTED,
-                        info=INFO_CLIPS_REJECTED,
-                        value=_pref(fork_prefs.CLIPS_REJECTED),
-                        placeholder=r"J:\Discarded",
-                        elem_id='clips-rejected-folder',
+                    # [FORK] R7.1 (Comfort Mix): two optional controls. Both default to the legacy
+                    # behaviour, so an operator who never touches them gets the identical mix.
+                    voice_auto_balance = gr.Checkbox(
+                        label=LABEL_VOICE_AUTO_BALANCE,
+                        value=False,
+                        info=INFO_VOICE_AUTO_BALANCE,
+                        elem_id='voice-auto-balance-checkbox',
                     )
-                with gr.Row():
-                    clips_library_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-library-browse')
-                    clips_rejected_browse = gr.Button(
-                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
-                        elem_id='clips-rejected-browse')
-                with gr.Row():
-                    clips_page_size = gr.Number(
-                        value=100,
-                        precision=0,
-                        minimum=1,
-                        maximum=fork_clips.MAX_CLIPS_PER_PAGE,
-                        label=LABEL_CLIPS_PAGE_SIZE,
-                        info=INFO_CLIPS_PAGE_SIZE,
-                        elem_id='clips-page-size',
+                    voice_music_return = gr.Number(
+                        label=LABEL_MUSIC_RETURN,
+                        value=fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
+                        minimum=0.1,
+                        maximum=fork_audio_mix.MUSIC_RETURN_MAX_SECONDS,
+                        info=INFO_MUSIC_RETURN,
+                        elem_id='music-return-input',
                     )
-                    clips_check_btn = gr.Button(
-                        LABEL_CLIPS_CHECK, variant='secondary', elem_id='clips-check-button')
-                    clips_scan_btn = gr.Button(
-                        LABEL_CLIPS_SCAN, variant='primary', elem_id='clips-scan-button')
-                    clips_refresh_btn = gr.Button(
-                        LABEL_CLIPS_REFRESH, variant='secondary',
-                        elem_id='clips-refresh-button')
-                clips_report = gr.Textbox(
-                    label=LABEL_CLIPS_REPORT,
-                    value=CLIPS_REPORT_INITIAL_TEXT,
-                    interactive=False,
-                    lines=7,
-                    max_lines=14,
-                    elem_id='clips-report-box',
-                )
-                clips_counts = gr.Textbox(
-                    label=LABEL_CLIPS_COUNTS,
-                    value=CLIPS_COUNTS_INITIAL_TEXT,
-                    interactive=False,
-                    elem_id='clips-counts-box',
-                )
-                # The grid is server-rendered markup. The browser never receives a path, only
-                # opaque ids, and the authority for what each tile says is the decision journal.
-                clips_gallery = gr.HTML(
-                    CLIPS_GALLERY_INITIAL_HTML, elem_id='clips-gallery')
-                clips_confirm_btn = gr.Button(
-                    LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
-                    elem_id='clips-confirm-button')
-                clips_confirm_out = gr.Textbox(
-                    label=LABEL_CLIPS_CONFIRM_OUT,
-                    value=CLIPS_CONFIRM_DISABLED_TEXT,
-                    interactive=False,
-                    lines=5,
-                    max_lines=10,
-                    elem_id='clips-confirm-box',
-                )
+                    audio_layers_report = gr.Textbox(
+                        label=LABEL_AUDIO_LAYERS_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_AUDIO_LAYERS_REPORT,
+                        lines=6,
+                        max_lines=12,
+                        interactive=False,
+                        elem_id='audio-layers-report-box',
+                    )
 
+                # [FORK] Digital-Union (Smart Mix V1 / E): deterministic SFX accents, a collapsed
+                # sibling of Audio Layers because it layers onto the same final master.
+                #
+                # Five actual components. Exactly like the Audio Layers block, every one of them is
+                # a render-request input read at click time: none registers a handler, none appears
+                # in `source_outputs` or `prep_outputs`, and none is part of video-source identity,
+                # so changing the folder, the roles, Amount or Level cannot clear a confirmation,
+                # start a scan or touch Media Library Preparation. There is deliberately no Scan
+                # button — the library is validated by the Create Music Video preflight.
+                with gr.Accordion(label=LABEL_SMART_MIX, open=False):
+                    gr.Markdown(INFO_SMART_MIX)
+                    sfx_folder = gr.Textbox(
+                        label=LABEL_SFX_FOLDER,
+                        placeholder=PLACEHOLDER_SFX_FOLDER,
+                        info=INFO_SFX_FOLDER,
+                        elem_id='sfx-folder-input',
+                    )
+                    # `(label, value)` choices, so the value Gradio returns IS the exact internal
+                    # role name. Never a lowercase/replace heuristic over the display label: the
+                    # planner keys on these strings, so a derived name would be a silent
+                    # correctness hazard the moment a label is reworded.
+                    sfx_roles = gr.CheckboxGroup(
+                        choices=list(fork_smart_mix.ROLE_CHOICES),
+                        value=[role for _label, role in fork_smart_mix.ROLE_CHOICES],
+                        label=LABEL_SFX_ROLES,
+                        info=INFO_SFX_ROLES,
+                        elem_id='sfx-roles-group',
+                    )
+                    sfx_amount = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_AMOUNT,
+                        label=LABEL_SFX_AMOUNT,
+                        info=INFO_SFX_AMOUNT,
+                        elem_id='sfx-amount-slider',
+                    )
+                    sfx_level = gr.Slider(
+                        minimum=fork_smart_mix.CONTROL_MIN,
+                        maximum=fork_smart_mix.CONTROL_MAX,
+                        step=1,
+                        value=fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                        label=LABEL_SFX_LEVEL,
+                        info=INFO_SFX_LEVEL,
+                        elem_id='sfx-level-slider',
+                    )
+                    smart_mix_report = gr.Textbox(
+                        label=LABEL_SMART_MIX_REPORT,
+                        value='',
+                        placeholder=PLACEHOLDER_SMART_MIX_REPORT,
+                        lines=6,
+                        max_lines=14,
+                        interactive=False,
+                        elem_id='smart-mix-report-box',
+                    )
+
+            # [FORK] Digital-Union (R8 UX Refresh, Commit A): the Media Library tab.
+            #
+            # Three review and maintenance workflows that all answer "what is in my library?"
+            # used to be two separate top-level tabs plus an accordion buried at the bottom of
+            # Advanced Tools. They are the same job at three stages, so they are now three
+            # sections of one tab -- and nothing about their engines changed: every widget,
+            # `elem_id` and event registration below is the pre-existing one, re-parented.
+            #
+            # Prepare & Verify is deliberately LAST. The span from `INFO_PREP_SAMPLE` to
+            # `sample_btn.click(` is what
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # slices to prove the approved sample resource policy is not widenable from the GUI,
+            # and it enforces that by OMISSION of one widget type over the whole remaining
+            # source. Putting this section last keeps the Audio Mix sliders *before* it, and
+            # leaves only the Settings tab after it -- which is why every numeric control in
+            # Settings is a Number. The guard is a substring check, so this comment does not
+            # name the banned type either.
+            with gr.Tab(LABEL_TAB_MEDIA_LIBRARY, id='tab-media-library'):
+                gr.Markdown(INFO_TAB_MEDIA_LIBRARY)
+                with gr.Tabs() as library_tabs:
+                    # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
+                    #
+                    # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
+                    # It keeps Advanced Tools at tab index 3, so every existing containment assertion in
+                    # `test_gui_tabs.py` needs no index change; and it keeps this tab's markup out of the
+                    # Raw-Cutter-to-Advanced source span that
+                    # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
+                    #
+                    # Page size is a Number widget, and that is also not cosmetic. A tab placed last
+                    # falls inside the source span that
+                    # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+                    # guards -- measured in R5-P0 as ~39 k characters, running past `source_outputs = [`
+                    # into the event wiring. That test enforces the approved sample resource policy by
+                    # OMISSION, so the forbidden widget type must not appear anywhere in this span, not
+                    # even in a comment explaining why: the guard is a substring check, and prose naming
+                    # the banned token trips it exactly as real code would. (It has now done so five
+                    # times in this repository.) The test is right; the widget is a Number and this
+                    # comment does not name the alternative.
+                    with gr.Tab(LABEL_SECTION_VIDEO_REVIEW, id='tab-video-review'):
+                        gr.Markdown(INFO_TAB_CLIPS_PREVIEW)
+                        with gr.Row():
+                            clips_input = gr.Textbox(
+                                label=LABEL_CLIPS_INPUT,
+                                info=INFO_CLIPS_INPUT,
+                                value=_pref(fork_prefs.CLIPS_INPUT),
+                                placeholder=r"J:\Raw Parts\RawCutter_Batch_20261018_153000",
+                                elem_id='clips-input-folder',
+                            )
+                            clips_recursive = gr.Checkbox(
+                                value=True,
+                                label=LABEL_CLIPS_RECURSIVE,
+                                info=INFO_CLIPS_RECURSIVE,
+                                elem_id='clips-recursive',
+                            )
+                        with gr.Row():
+                            clips_input_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-input-browse')
+                        with gr.Row():
+                            clips_library = gr.Textbox(
+                                label=LABEL_CLIPS_LIBRARY,
+                                info=INFO_CLIPS_LIBRARY,
+                                value=_pref(fork_prefs.CLIPS_LIBRARY),
+                                placeholder=r"J:\Media Library",
+                                elem_id='clips-library-folder',
+                            )
+                            clips_rejected = gr.Textbox(
+                                label=LABEL_CLIPS_REJECTED,
+                                info=INFO_CLIPS_REJECTED,
+                                value=_pref(fork_prefs.CLIPS_REJECTED),
+                                placeholder=r"J:\Discarded",
+                                elem_id='clips-rejected-folder',
+                            )
+                        with gr.Row():
+                            clips_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-library-browse')
+                            clips_rejected_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='clips-rejected-browse')
+                        with gr.Row():
+                            clips_page_size = gr.Number(
+                                value=100,
+                                precision=0,
+                                minimum=1,
+                                maximum=fork_clips.MAX_CLIPS_PER_PAGE,
+                                label=LABEL_CLIPS_PAGE_SIZE,
+                                info=INFO_CLIPS_PAGE_SIZE,
+                                elem_id='clips-page-size',
+                            )
+                            clips_check_btn = gr.Button(
+                                LABEL_CLIPS_CHECK, variant='secondary', elem_id='clips-check-button')
+                            clips_scan_btn = gr.Button(
+                                LABEL_CLIPS_SCAN, variant='primary', elem_id='clips-scan-button')
+                            clips_refresh_btn = gr.Button(
+                                LABEL_CLIPS_REFRESH, variant='secondary',
+                                elem_id='clips-refresh-button')
+                        clips_report = gr.Textbox(
+                            label=LABEL_CLIPS_REPORT,
+                            value=CLIPS_REPORT_INITIAL_TEXT,
+                            interactive=False,
+                            lines=7,
+                            max_lines=14,
+                            elem_id='clips-report-box',
+                        )
+                        clips_counts = gr.Textbox(
+                            label=LABEL_CLIPS_COUNTS,
+                            value=CLIPS_COUNTS_INITIAL_TEXT,
+                            interactive=False,
+                            elem_id='clips-counts-box',
+                        )
+                        # The grid is server-rendered markup. The browser never receives a path, only
+                        # opaque ids, and the authority for what each tile says is the decision journal.
+                        clips_gallery = gr.HTML(
+                            CLIPS_GALLERY_INITIAL_HTML, elem_id='clips-gallery')
+                        clips_confirm_btn = gr.Button(
+                            LABEL_CLIPS_CONFIRM, variant='secondary', interactive=False,
+                            elem_id='clips-confirm-button')
+                        clips_confirm_out = gr.Textbox(
+                            label=LABEL_CLIPS_CONFIRM_OUT,
+                            value=CLIPS_CONFIRM_DISABLED_TEXT,
+                            interactive=False,
+                            lines=5,
+                            max_lines=10,
+                            elem_id='clips-confirm-box',
+                        )
+
+                    # [FORK] Digital-Union (R7.2 Phase 2): the SEVENTH top-level tab, 🎧 Audio Preview.
+                    #
+                    # Placed between Audio Cutter and Clips Preview, and that position is chosen rather
+                    # than incidental. It keeps Advanced Tools at `_TABS` index 3, so every containment
+                    # assertion in `test_gui_tabs.py` that counts from the front is unaffected; it keeps
+                    # Clips Preview LAST, which its own suite requires; and it keeps this markup out of the
+                    # Raw-Cutter-to-Advanced span that
+                    # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+                    #
+                    # Every numeric control here is a Number widget, which is the same non-cosmetic
+                    # constraint the two tabs either side of it record: a tab in this region falls inside
+                    # the source span that
+                    # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+                    # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+                    # a substring check over this whole region, so the forbidden widget type must not
+                    # appear in this span even inside a comment explaining its absence -- which is why
+                    # this one does not name it.
+                    with gr.Tab(LABEL_SECTION_AUDIO_REVIEW, id='tab-audio-review'):
+                        gr.Markdown(INFO_TAB_AUDIO_PREVIEW)
+                        gr.HTML(AUDIO_GALLERY_CSS)
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                with gr.Group():
+                                    audio_preview_folder = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_FOLDER,
+                                        info=INFO_AUDIO_PREVIEW_FOLDER,
+                                        value=_pref(fork_prefs.AUDIO_PREVIEW_INPUT),
+                                        placeholder=r"J:\New folder\CutsAudio\VOICE OVER",
+                                        elem_id='audio-preview-folder')
+                                    with gr.Row():
+                                        audio_preview_browse = gr.Button(
+                                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                            elem_id='audio-preview-browse')
+                                        audio_preview_recursive = gr.Checkbox(
+                                            label=LABEL_AUDIO_PREVIEW_RECURSIVE,
+                                            info=INFO_AUDIO_PREVIEW_RECURSIVE,
+                                            value=False, elem_id='audio-preview-recursive')
+                                    with gr.Row():
+                                        audio_preview_page_size = gr.Number(
+                                            label=LABEL_AUDIO_PREVIEW_PAGE_SIZE,
+                                            info=INFO_AUDIO_PREVIEW_PAGE_SIZE,
+                                            value=fork_audio_review.DEFAULT_PAGE_SIZE,
+                                            minimum=1, maximum=fork_audio_review.MAX_PAGE_SIZE,
+                                            step=1, elem_id='audio-preview-page-size')
+                                        audio_preview_scan_btn = gr.Button(
+                                            LABEL_AUDIO_PREVIEW_SCAN, variant='primary',
+                                            elem_id='audio-preview-scan-button')
+                                with gr.Group():
+                                    audio_preview_library = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_LIBRARY,
+                                        info=INFO_AUDIO_LIBRARY,
+                                        value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                                        placeholder=r"J:\Voice Library",
+                                        elem_id='audio-preview-library')
+                                    audio_preview_library_browse = gr.Button(
+                                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                        elem_id='audio-preview-library-browse')
+                                    audio_preview_discarded = gr.Textbox(
+                                        label=LABEL_AUDIO_PREVIEW_DISCARDED,
+                                        info=INFO_AUDIO_DISCARDED,
+                                        value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                                        placeholder=r"J:\Voice Discarded",
+                                        elem_id='audio-preview-discarded')
+                                    audio_preview_discarded_browse = gr.Button(
+                                        LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                        elem_id='audio-preview-discarded-browse')
+                                    audio_preview_destination_status = gr.Textbox(
+                                        label=LABEL_AUDIO_DESTINATION_STATUS,
+                                        value=AUDIO_DESTINATION_STATUS_INITIAL,
+                                        interactive=False, lines=2, max_lines=5,
+                                        elem_id='audio-preview-destination-status')
+                            with gr.Column(scale=2):
+                                audio_preview_report = gr.Textbox(
+                                    label=LABEL_AUDIO_PREVIEW_REPORT,
+                                    value=AUDIO_PREVIEW_REPORT_INITIAL,
+                                    interactive=False, lines=10, max_lines=18,
+                                    elem_id='audio-preview-report')
+
+                        gr.Markdown(INFO_AUDIO_GALLERY)
+                        with gr.Row():
+                            audio_preview_enable_hover = gr.Button(
+                                LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                                elem_id='audio-preview-enable-hover',
+                                elem_classes=['r7-enable-hover'])
+                            audio_preview_counts = gr.Textbox(
+                                label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                                interactive=False, elem_id='audio-preview-counts')
+                        with gr.Row():
+                            audio_preview_prev_btn = gr.Button(
+                                LABEL_AUDIO_PREVIEW_PREV, variant='secondary', scale=0,
+                                elem_id='audio-preview-prev-button')
+                            audio_preview_page_label = gr.Textbox(
+                                label=LABEL_AUDIO_PREVIEW_PAGE,
+                                value=AUDIO_PREVIEW_PAGE_INITIAL,
+                                interactive=False, elem_id='audio-preview-page-label')
+                            audio_preview_next_btn = gr.Button(
+                                LABEL_AUDIO_PREVIEW_NEXT, variant='secondary', scale=0,
+                                elem_id='audio-preview-next-button')
+                        audio_preview_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
+                                                        elem_id='audio-preview-gallery')
+                        # This tab's own hidden decision channel. The grid names it in `data-store`, so the
+                        # client writes HERE and never into the Audio Cutter's field -- which is the whole
+                        # reason the grid carries that attribute.
+                        audio_preview_decisions = gr.Textbox(
+                            value='', label=' ', elem_id='audio-preview-decisions')
+                        audio_preview_confirm_btn = gr.Button(
+                            LABEL_AUDIO_CONFIRM, variant='primary',
+                            elem_id='audio-preview-confirm-button',
+                            elem_classes=['r7-release-audio'])
+                        with gr.Row():
+                            audio_preview_proceed_btn = gr.Button(
+                                LABEL_AUDIO_PROCEED, variant='stop', visible=False,
+                                elem_id='audio-preview-proceed-button',
+                                elem_classes=['r7-release-audio'])
+                            audio_preview_sweep_cancel_btn = gr.Button(
+                                LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
+                                elem_id='audio-preview-sweep-cancel-button')
+                        # Per-browser-session, exactly like the cutter's. The decision and name records are
+                        # keyed by file identity, which is what makes paging lossless.
+                        audio_preview_state = gr.State({})
+                        audio_preview_armed_state = gr.State('')
+
+                    with gr.Tab(LABEL_SECTION_PREPARE_VERIFY, id='tab-prepare-verify'):
+                        # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
+                        # workflow, not part of the render flow. Nothing in here is wired to
+                        # `source_outputs`, so it cannot touch the Create Music Video gate.
+                        #
+                        # It stays collapsed (pinned by test) even though it now has its own tab, and it is
+                        # deliberately the LAST block in that tab: nothing containing a `gr.Slider` may sit
+                        # between the sample UI and the event wiring, which is the span
+                        # `test_no_frame_timeout_or_budget_control_exists_in_the_ui` slices to prove the
+                        # approved sample resource policy is not widenable from the GUI.
+                        #
+                        # (GUI Refresh A note: this comment used to describe the section as "rather than a
+                        # restructuring of the app into tabs". That restructuring has since happened, and
+                        # this block was one of the things it moved.)
+                        # [FORK] R8 UX Refresh (Commit A): OPEN, where it used to be collapsed.
+                        #
+                        # Collapsing it was right while it shared the Advanced Tools tab with
+                        # Audio Layers and Smart Mix -- three long blocks in one column, so each
+                        # one being shut is what made the tab readable. It is now the whole of its
+                        # own Media Library section, so collapsing it means an operator who
+                        # deliberately navigated to Prepare & Verify is shown a single closed
+                        # drawer and nothing else. That is precisely the discoverability problem
+                        # this refresh exists to fix, measured in the running app.
+                        with gr.Accordion(label=LABEL_PREP_SECTION, open=True):
+                            gr.Markdown(INFO_PREP_SECTION)
+                            prep_folder = gr.Textbox(
+                                label=LABEL_PREP_FOLDER,
+                                placeholder=PLACEHOLDER_SOURCE_FOLDER,
+                                info=INFO_PREP_FOLDER,
+                                elem_id='prep-folder-input',
+                            )
+                            prep_recursive = gr.Checkbox(
+                                value=True, label=LABEL_PREP_RECURSIVE, elem_id='prep-recursive'
+                            )
+                            # No `maximum`: this bounds one analysis run, never the supported library size.
+                            # The default is the preparation module's constant, not a literal repeated here.
+                            prep_batch_size = gr.Number(
+                                value=fork_prep.DEFAULT_ANALYZE_BATCH_SIZE,
+                                precision=0,
+                                minimum=1,
+                                label=LABEL_PREP_BATCH_SIZE,
+                                info=INFO_PREP_BATCH_SIZE,
+                                elem_id='prep-batch-size',
+                            )
+                            prep_scan_btn = gr.Button(LABEL_PREP_SCAN, elem_id='prep-scan-button')
+                            prep_report = gr.Textbox(
+                                label=LABEL_PREP_REPORT,
+                                value=initial_prep_state().report_text,
+                                interactive=False,
+                                lines=10,
+                                max_lines=16,
+                                elem_id='prep-report-box',
+                            )
+                            prep_analyze_btn = gr.Button(
+                                LABEL_PREP_ANALYZE, interactive=False, elem_id='prep-analyze-button'
+                            )
+                            prep_status = gr.Markdown(
+                                initial_prep_state().notice, elem_id='prep-status'
+                            )
+
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): read-only source verification.
+                            # Inside this accordion because it asks about the same library folder, and
+                            # below Analyze because it is the "did my files change / are they still OK"
+                            # question you ask around a preparation run rather than part of one.
+                            #
+                            # Like the rest of this section it is absent from `source_outputs` and from
+                            # `prep_outputs`: it cannot touch the Create Music Video gate, and it cannot
+                            # move the preparation state machine. It is also ALWAYS interactive -- the
+                            # render mutex, not a disabled button, is what prevents it running during a
+                            # render, because a button's interactivity is per-session UX while the mutex is
+                            # process-global truth.
+                            gr.Markdown(INFO_PREP_VERIFY)
+                            prep_verify_btn = gr.Button(
+                                LABEL_PREP_VERIFY, variant='secondary',
+                                elem_id='prep-verify-button',
+                            )
+                            prep_verify_report = gr.Textbox(
+                                label=LABEL_PREP_VERIFY_REPORT,
+                                value=PREP_VERIFY_INITIAL_TEXT,
+                                interactive=False,
+                                lines=12,
+                                max_lines=24,
+                                elem_id='prep-verify-report-box',
+                            )
+
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2): the one-video sample decode.
+                            # Immediately after Verify Sources because it is the natural follow-up
+                            # question -- "the metadata reads fine, but can FFmpeg actually produce frames
+                            # here?" -- and it is deliberately a DIFFERENT question, on one file rather
+                            # than the whole library.
+                            #
+                            # Like the rest of this accordion it is absent from `source_outputs` and
+                            # `prep_outputs`: it cannot touch the Create Music Video gate and cannot move
+                            # the preparation state machine. Also ALWAYS interactive, for the same reason
+                            # Verify Sources is -- the render mutex, not a disabled button, is what
+                            # prevents it running during a render, because interactivity is per-session UX
+                            # while the mutex is process-global truth.
+                            #
+                            # One file, one position, one explicit button. No dropdown of the library (a
+                            # ~2,000-source folder on a mechanical drive would have to be enumerated to
+                            # build it), no browser upload (it would copy large media into a temp folder),
+                            # no frame-count control and no timeout control.
+                            gr.Markdown(INFO_PREP_SAMPLE)
+                            sample_path = gr.Textbox(
+                                label=LABEL_PREP_SAMPLE_PATH,
+                                placeholder=PLACEHOLDER_SAMPLE_VIDEO,
+                                elem_id='prep-sample-path',
+                            )
+                            # Seconds, never a frame number: the diagnostic's own contract forbids
+                            # frames/fps arithmetic, and the selected stream's reported duration is what
+                            # decides whether a position is out of range.
+                            #
+                            # [FORK] Digital-Union (MEDIA-VERIFY-S2-B P2, runtime R1 MINOR-1): deliberately
+                            # NO `minimum`. It carried `minimum=0` on the theory that a widget bound is a
+                            # client-side courtesy while `run_sample_check` owns the real rejection. GUI
+                            # runtime acceptance measured that to be false: on the pinned gradio==6.19.0,
+                            # `Number.preprocess` calls `raise_if_out_of_bounds` SERVER-SIDE, so `-5` raised
+                            # `gradio.exceptions.Error: 'Value -5 is less than minimum value 0.'` before
+                            # `_on_sample_decode_click` was ever entered. The operator saw a framework error
+                            # toast instead of the diagnostic's own report, and the core's
+                            # finite-and-non-negative branch was unreachable from this widget.
+                            #
+                            # Removing the bound hands the decision back to the accepted core, which refuses
+                            # a negative or non-finite seek as `SAMPLE_INVALID_REQUEST` **before any stat,
+                            # FFprobe or FFmpeg child** -- so this widens no resource policy and starts no
+                            # work. No GUI-side validation, clamping or normalisation is added here: a
+                            # second opinion about what a valid seek is would be exactly the duplication
+                            # this integration exists to avoid.
+                            sample_seek = gr.Number(
+                                value=1.0,
+                                step=0.5,
+                                label=LABEL_PREP_SAMPLE_SEEK,
+                                elem_id='prep-sample-seek',
+                            )
+                            sample_btn = gr.Button(
+                                LABEL_PREP_SAMPLE, variant='secondary',
+                                elem_id='prep-sample-button',
+                            )
+                            sample_report = gr.Textbox(
+                                label=LABEL_PREP_SAMPLE_REPORT,
+                                value=PREP_SAMPLE_INITIAL_TEXT,
+                                interactive=False,
+                                lines=14,
+                                max_lines=28,
+                                elem_id='prep-sample-report-box',
+                            )
+
+            # [FORK] Digital-Union (R8 UX Refresh, Commit A): the Settings tab.
+            #
+            # The remembered-folder defaults used to sit at the bottom of the Clips Preview tab,
+            # which is where they were asked for but not where anyone looks for settings. The
+            # panel below is the pre-existing one, re-parented verbatim: the same widgets, the
+            # same `elem_id`s, the same two handlers, and the same contract -- saving writes
+            # `state/preferences.json` and nothing else, no directory is created, nothing is
+            # scanned and nothing is moved.
+            with gr.Tab(LABEL_TAB_SETTINGS, id='tab-settings'):
+                gr.Markdown(INFO_TAB_SETTINGS)
                 # [UX V4] Remembered folders. Deliberately placed here rather than in a settings
                 # tab of its own: these are the folders this tab asks for, so the operator sets
                 # them where they already are. Saving writes `state/preferences.json` and nothing
@@ -10151,13 +10250,15 @@ def create_ui() -> gr.Blocks:
             outputs=[audio_destination_status],
             concurrency_limit=None,
         )
-        # [R7.2 Phase 2] "Open results in Audio Preview" fills the other tab's folder box and
+        # [R7.2 Phase 2] "Open results in Media Library" fills Audio Review's folder box and
         # selects it. It scans nothing, which is the requirement: no folder is read as a side
         # effect of anything but a deliberate Scan.
+        # [R8 Commit A] Two tab containers in `outputs`, because the destination is now a section
+        # inside Media Library -- see the handler's docstring for why one is not enough.
         audio_open_preview_btn.click(
-            fn=_on_audio_open_in_preview,
+            fn=_on_audio_open_in_library,
             inputs=[audio_run_dir_state],
-            outputs=[audio_preview_folder, main_tabs, audio_file_report],
+            outputs=[audio_preview_folder, main_tabs, library_tabs, audio_file_report],
             concurrency_limit=None,
         )
 
@@ -10282,6 +10383,27 @@ def create_ui() -> gr.Blocks:
             inputs=[],
             outputs=[cut_report, cut_progress],
             concurrency_id=CUTTER_CANCEL_CONCURRENCY_ID,
+            concurrency_limit=None,
+        )
+        # [R8 Commit A] "Open results in Media Library". Registered HERE, among the Raw Cutter's
+        # own events, rather than beside the Video Review registrations -- deliberately, because
+        # `test_gui_tabs.py::test_the_clips_tab_writes_no_render_or_source_widget` slices the span
+        # bounded by the first Video Review registration and the first app-load hook, and pins the
+        # registration count inside it. This is a Raw Cutter action that happens to fill two Video
+        # Review widgets, so it belongs to the cutter's event block and must stay out of that span.
+        #
+        # Note the wording above avoids spelling either boundary token literally: that guard finds
+        # its span with `str.index`, so a comment naming the anchor becomes the match and silently
+        # relocates the span. This repository has now been bitten by prose tripping a substring
+        # check six times; see `prose-mentioning-a-ban-trips-substring-bans`.
+        #
+        # It is not a render and not a cut: no `_RENDER_LOCK`, no cutter lane, and its own
+        # unlimited concurrency lane for the measured R3 reason -- a lane of 1 would queue a
+        # second click instead of letting it run.
+        cut_open_library_btn.click(
+            fn=_on_cut_open_in_library,
+            inputs=[cut_output],
+            outputs=[clips_input, clips_recursive, main_tabs, library_tabs, clips_report],
             concurrency_limit=None,
         )
 
@@ -10489,7 +10611,7 @@ def create_ui() -> gr.Blocks:
         # selector is recomputed from the live sliders). Every remaining input lives in another
         # tab, so the `.select()` that fires on the way back here is sufficient to keep all of them
         # current — no creative control needs a second binding, and no event here can be stale.
-        tab_quick_render.select(
+        tab_render.select(
             fn=_on_quick_render_tab_select,
             inputs=[freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
                     sfx_amount] + freestyle_section_dropdowns,

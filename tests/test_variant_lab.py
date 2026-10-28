@@ -874,16 +874,25 @@ def test_no_cli_variant_lab_flag_was_added():
 
 def test_the_variant_lab_accordion_exists_and_is_collapsed():
     """Amended by GUI Refresh A: the bounding anchors moved from the `### 🎨 Creative Direction`
-    group heading and the `Processing Mode` heading to the Creative Studio / Advanced Tools tabs,
-    which is the same containment over a tighter span. The lab stays COLLAPSED — it is the one
-    block the refresh deliberately left shut, because it is large, detailed configuration rather
-    than an entry point someone could overlook to their cost.
+    group heading and the `Processing Mode` heading to the creative / advanced tabs, which is the
+    same containment over a tighter span. The lab stays COLLAPSED — it is the one block the
+    refresh deliberately left shut, because it is large, detailed configuration rather than an
+    entry point someone could overlook to their cost.
+
+    Amended again by R8 UX Refresh (Commit A): the tab is now `LABEL_TAB_CREATIVE_SETTINGS`, and
+    the tab that follows it is Raw Cutter rather than Advanced Tools. The upper bound is computed
+    from whichever tab actually comes next instead of being named, so the next re-order cannot
+    leave this assertion silently measuring the wrong span.
     """
     source = open(_GUI, encoding="utf-8").read()
     assert "gr.Accordion(label=LABEL_VARIANT_LAB, open=False)" in source
-    # inside Creative Studio, below the six sliders it writes
-    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_STUDIO")
-    following = source.index("gr.Tab(LABEL_TAB_ADVANCED", studio)
+    # inside Creative Settings, below the six sliders it writes
+    studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
+    following = min(p for p in (source.index(f"gr.Tab({label}")
+                                for label in ("LABEL_TAB_RAW_CUTTER", "LABEL_TAB_AUDIO_CUTTER",
+                                              "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                                              "LABEL_TAB_SETTINGS"))
+                    if p > studio)
     position = source.index("LABEL_VARIANT_LAB", studio)
     assert studio < position < following
     assert source.index("semantic_emphasis = gr.") < position, "the lab must follow the sliders"
