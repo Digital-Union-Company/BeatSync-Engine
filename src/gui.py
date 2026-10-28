@@ -240,6 +240,11 @@ from beatsync_fork import cache_admin as fork_cache
 # activity to the declaration, the SFX verdict to the caller's `plans_anything_from` result -- so
 # the render tab's summary and the selector on Creative Settings are the same computation.
 from beatsync_fork import effective_profile as fork_effective
+# [FORK] Digital-Union (R8 UX Refresh, Phase 6): the Output Video Profile table and its pure
+# geometry. `resolve` answers None for Auto and every helper returns its fallback unchanged there,
+# so the historical render path is structurally unreachable from a profile rather than merely
+# preserved alongside one.
+from beatsync_fork import render_profiles as fork_render_profiles
 # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
 # the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
 # live inside `audio_cutter` rather than here, because two suites pin this module's
@@ -1963,7 +1968,7 @@ def _publish_share_attempt(preview_source: str, share_path: str, staging_dir: st
 
 def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        output_filename: str, processing_mode: str,
-                       custom_fps: float, creative: fork_creative.CreativeProfile | None,
+                       output_profile: str, creative: fork_creative.CreativeProfile | None,
                        session_state: dict,
                        progress_callback: Callable[[str], None] | None = None,
                        console_logger: StageConsoleLogger | None = None,
@@ -2149,8 +2154,13 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         cuda_str = "CuPy CTK" if USING_CUPY_CTK else ("Portable" if USING_PORTABLE_CUDA else "System/None")
 
         # Determine FPS
-        if custom_fps is not None and custom_fps > 0:
-            output_fps = custom_fps
+        #
+        # [FORK] R8 UX Refresh (Phase 6): a fixed Output Video Profile states the frame rate.
+        # Under Auto, `target_fps` returns its fallback unchanged -- here `None` -- so the
+        # auto-detect branch below is reached exactly as it always was.
+        profile_fps = fork_render_profiles.target_fps(output_profile, None)
+        if profile_fps:
+            output_fps = profile_fps
         else:
             output_fps = get_video_fps(local_video_paths[0])
             
@@ -2343,7 +2353,10 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             output_file=temp_output, max_workers=parallel_workers,
             beat_info=beat_info, lossless_mode=is_prores,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, fps=output_fps,
-            event_callback=event_callback, lifecycle=lifecycle
+            event_callback=event_callback, lifecycle=lifecycle,
+            # [FORK] R8 Phase 6: the Output Video Profile. `None`/`auto` leaves the renderer on
+            # its historical path -- first-source resolution and a bare scale -- untouched.
+            output_profile=output_profile,
         )
 
         # [FORK] Digital-Union (H1): the ONE durable promotion, and it is a single no-replace OS
@@ -2492,7 +2505,8 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
         # Generate status message based on mode
         gpu_info = f"⚡ GPU: {GPU_INFO}" if use_gpu else "💻 CPU"
-        fps_info = f"{output_fps:.2f} FPS (custom)" if custom_fps else f"{output_fps:.2f} FPS (auto-detected)"
+        fps_info = (f"{output_fps:.2f} FPS (profile)" if fork_render_profiles.resolve(output_profile)
+                    else f"{output_fps:.2f} FPS (auto-detected)")
         audio_info = "PCM 24-bit (48kHz)"
         
         if is_prores:
@@ -2641,7 +2655,7 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
                  output_filename: str, processing_mode: str,
-                 custom_fps: float, session_state: dict,
+                 output_profile: str, session_state: dict,
                  creative: fork_creative.CreativeProfile | None = None,
                  verification_seconds: float | None = None,
                  voice_files: VideoFilesInput = None,
@@ -2697,7 +2711,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     video_files=video_files,
                     output_filename=output_filename,
                     processing_mode=processing_mode,
-                    custom_fps=custom_fps,
+                    output_profile=output_profile,
                     creative=creative,
                     session_state=session_state,
                     progress_callback=progress_callback,
@@ -3839,7 +3853,7 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     source_mode: str, source_folder: str,
                                     source_recursive: bool, video_input: VideoFilesInput,
                                     output_filename: str, processing_mode: str,
-                                    custom_fps: float, variation_seed: int,
+                                    output_profile: str, variation_seed: int,
                                     cut_density: int, energy_response: int, motion_bias: int,
                                     source_diversity: int, micro_cuts: int,
                                     semantic_emphasis: int,
@@ -4006,7 +4020,7 @@ def _process_video_guarded_unlocked(audio_file: str,
         video_files=list(decision.paths),
         output_filename=output_filename,
         processing_mode=processing_mode,
-        custom_fps=custom_fps,
+        output_profile=output_profile,
         session_state=session_state,
         creative=creative,
         verification_seconds=verification_seconds,
@@ -4603,7 +4617,7 @@ def process_video_guarded(audio_file: str,
                           source_mode: str, source_folder: str,
                           source_recursive: bool, video_input: VideoFilesInput,
                           output_filename: str, processing_mode: str,
-                          custom_fps: float, variation_seed: int,
+                          output_profile: str, variation_seed: int,
                           cut_density: int, energy_response: int, motion_bias: int,
                           source_diversity: int, micro_cuts: int, semantic_emphasis: int,
                           session_state: dict,
@@ -4668,7 +4682,7 @@ def process_video_guarded(audio_file: str,
             audio_file, voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
             music_under_voice, sfx_folder, sfx_roles, sfx_amount, sfx_level,
             source_mode, source_folder, source_recursive, video_input,
-            output_filename, processing_mode, custom_fps, variation_seed,
+            output_filename, processing_mode, output_profile, variation_seed,
             cut_density, energy_response, motion_bias, source_diversity,
             micro_cuts, semantic_emphasis, session_state, source_state,
             # One frozen tuple of exactly what the user submitted, in
@@ -4723,7 +4737,7 @@ def render_selected_variants_guarded(
         sfx_folder: str, sfx_roles,
         source_mode: str, source_folder: str,
         source_recursive: bool, video_input: VideoFilesInput,
-        output_filename: str, processing_mode: str, custom_fps: float,
+        output_filename: str, processing_mode: str, output_profile: str,
         session_state: dict, source_state,
         # [FORK] Digital-Union (Freestyle V1): the LIVE Freestyle widgets, appended LAST with
         # defaults so no existing positional argument moved. Frozen once below, before the
@@ -4840,7 +4854,7 @@ def render_selected_variants_guarded(
                         audio.music_under_voice_percent,
                         sfx_folder, sfx_roles, audio.sfx_amount, audio.sfx_level_percent,
                         source_mode, source_folder, source_recursive, video_input,
-                        candidate.output_stem, processing_mode, custom_fps,
+                        candidate.output_stem, processing_mode, output_profile,
                         recipe.seed,
                         recipe.cut_density, recipe.energy_response, recipe.motion_bias,
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
@@ -7337,8 +7351,12 @@ def _audio_tools() -> tuple:
     return FFMPEG_PATH, FFPROBE_PATH
 
 
-def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
-    """Widget values to the five resolved settings, total over anything Gradio can hand over.
+def _audio_settings(threshold, min_silence, pad, min_clip, fmt, fade_edges=False) -> dict:
+    """Widget values to the resolved settings, total over anything Gradio can hand over.
+
+    [FORK] R8 Phase 9: `fade_edges` is APPENDED with a default, so the pre-R8 five-argument
+    call every other caller makes still resolves to fades OFF -- which is the documented
+    default and keeps already-accepted exports bit-identical.
 
     A `gr.Number` legitimately arrives as `None` or as `''` when the operator clears it, so every
     read falls back to the documented default rather than raising inside an event handler.
@@ -7361,6 +7379,9 @@ def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
         # old `FLAC if fmt == FLAC else WAV` form silently mapped MP3 onto WAV, so adding a third
         # format to the widget alone would have written `.wav` files from an MP3 selection.
         'format': fork_audio.normalize_format(fmt),
+        # [FORK] R8 Phase 9: a checkbox, so `bool()` is the whole resolution. Anything Gradio
+        # could hand over that is not truthy means off, which is the safe direction.
+        'fade_edges': bool(fade_edges),
     }
 
 
@@ -7453,8 +7474,36 @@ def _audio_format_line(settings: dict) -> str:
     return f"Format: WAV - 16-bit PCM - {fork_audio.OUTPUT_SAMPLE_RATE} Hz"
 
 
+def _audio_fade_line(settings: dict, segments) -> str:
+    """What the fades ACTUALLY did, or `''` when they are off.
+
+    [FORK] R8 Phase 9. It reports the **measured range across the clips that were planned**, not
+    the setting, because the two differ whenever a clip received less padding than was requested --
+    which is the normal case in a crowded passage and is exactly what the operator needs to see.
+    A clip with no padding gets no fade and is counted as such.
+    """
+    if not settings.get('fade_edges'):
+        return ""
+    lengths = []
+    for segment in segments or ():
+        fade_in, fade_out = fork_audio.fade_lengths(segment, True)
+        lengths.extend([fade_in, fade_out])
+    if not lengths:
+        return "Soft edges: on, but nothing was planned to fade."
+    shaped = [value for value in lengths if value > 0.0]
+    if not shaped:
+        return ("Soft edges: on, but no clip had any padding to fade into, so none was applied. "
+                "Raise Padding to give the fades room.")
+    low, high = min(shaped), max(shaped)
+    span = (f"{low * 1000:.0f} ms" if abs(high - low) < 0.0005
+            else f"{low * 1000:.0f}-{high * 1000:.0f} ms")
+    silent = len(lengths) - len(shaped)
+    note = f" ({silent} edge(s) had no padding and were left sharp)" if silent else ""
+    return f"Soft edges: on - fades of {span}, bounded by each clip's own padding{note}"
+
+
 def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt,
-                  request: gr.Request = None):
+                  fade_edges=False, request: gr.Request = None):
     """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
 
     Re-analyzing rather than trusting the on-screen plan is deliberate and matches the Raw Cutter:
@@ -7466,7 +7515,7 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
     are already on disk and the report already says so, so a registry refusal costs the preview and
     nothing else.
     """
-    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt, fade_edges)
     blank = (AUDIO_GALLERY_EMPTY_HTML, AUDIO_COUNTS_INITIAL_TEXT, '', {}, '')
 
     mp3_problem = _audio_mp3_problem(settings['format'])
@@ -7507,7 +7556,8 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
         destination = os.path.join(run_directory, name)
         code, log = fork_audio.run_media_command(
             fork_audio.build_extract_command(ffmpeg, info.path, segment, destination,
-                                             settings['format']),
+                                             settings['format'],
+                                             fade_edges=settings['fade_edges']),
             timeout=fork_audio.EXTRACT_TIMEOUT_SECONDS)
         if code == 0 and os.path.isfile(destination):
             written[segment.index] = name
@@ -7535,9 +7585,14 @@ def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, 
 
     lines = [f"✅ Wrote {len(written)} of {len(segments)} clip(s).",
              f"Output folder:\n{run_directory}", '',
-             _audio_format_line(settings),
-             f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
-             "Your source file was not modified."]
+             _audio_format_line(settings)]
+    # [FORK] R8 Phase 9: the EFFECTIVE fade length, which the task asked to be shown and which
+    # differs from the setting whenever a clip had less padding than was requested.
+    fade_line = _audio_fade_line(settings, segments)
+    if fade_line:
+        lines.append(fade_line)
+    lines += [f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
+              "Your source file was not modified."]
     if failures:
         lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
     report = "\n".join(lines) + manifest_note
@@ -8811,7 +8866,27 @@ def create_ui() -> gr.Blocks:
                             with gr.Column(scale=2):
                                 with gr.Group():
                                     gr.Markdown('### ⚙️ Video Settings')
-                                    custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
+                                    # [FORK] R8 UX Refresh (Phase 6): the Output Video Profile
+                                    # REPLACES the free-text "Custom FPS" box, in the same
+                                    # position and at the same index in every handler signature
+                                    # it feeds -- so the positional alignments several suites pin
+                                    # are preserved by arity rather than by renumbering.
+                                    #
+                                    # It answers the question the FPS box could not: the render
+                                    # took its RESOLUTION from the first source video and fitted
+                                    # every other clip to it with a bare `scale=w:h`, so a
+                                    # portrait, 4:3 or anamorphic source was stretched. Auto is
+                                    # first and therefore default, and Auto is the untouched
+                                    # historical path including that behaviour -- see
+                                    # `beatsync_fork/render_profiles.py` for why it is not
+                                    # "fixed" unconditionally.
+                                    output_profile = gr.Radio(
+                                        choices=fork_render_profiles.profile_choices(),
+                                        value=fork_render_profiles.AUTO,
+                                        label=LABEL_OUTPUT_PROFILE,
+                                        info=INFO_OUTPUT_PROFILE,
+                                        elem_id='output-profile-radio',
+                                    )
 
                                 with gr.Group():
                                     gr.Markdown(f'### 🎬 Processing Mode')
@@ -9704,6 +9779,14 @@ def create_ui() -> gr.Blocks:
                                           f"smaller files, lossy", fork_audio.FORMAT_MP3)],
                                 value=fork_audio.FORMAT_WAV,
                                 elem_id='audio-format')
+                            # [FORK] R8 UX Refresh (Phase 9): optional soft edges. OFF by
+                            # default, so every export already accepted stays bit-identical
+                            # unless the operator asks for this.
+                            audio_fade_edges = gr.Checkbox(
+                                value=False,
+                                label=LABEL_AUDIO_FADE_EDGES,
+                                info=INFO_AUDIO_FADE_EDGES,
+                                elem_id='audio-fade-edges')
                         with gr.Row():
                             audio_analyze_btn = gr.Button(
                                 LABEL_AUDIO_ANALYZE, variant='secondary',
@@ -10653,8 +10736,13 @@ def create_ui() -> gr.Blocks:
         )
         audio_cut_btn.click(
             fn=_on_audio_cut,
+            # [FORK] R8 Phase 9: `audio_fade_edges` is APPENDED last, before the injected
+            # `gr.Request`, so every pre-existing positional index is unchanged. Analyze is
+            # deliberately NOT given it: fades change what is written, never where a clip begins
+            # or ends, so the plan on screen is identical either way and adding it there would
+            # imply the planner had changed.
             inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
-                    audio_pad, audio_min_clip, audio_format],
+                    audio_pad, audio_min_clip, audio_format, audio_fade_edges],
             outputs=[audio_report, audio_table, audio_gallery, audio_counts,
                      audio_decisions, audio_review_state, audio_run_dir_state],
             concurrency_limit=None,
@@ -11294,7 +11382,7 @@ def create_ui() -> gr.Blocks:
                 voice_files, voice_start_delay, voice_min_gap, voice_avoid_drops,
                 sfx_folder, sfx_roles,
                 source_mode, source_folder, source_recursive, video_input,
-                output_filename, processing_mode, custom_fps,
+                output_filename, processing_mode, output_profile,
                 session_state, source_state,
                 # [FORK] Digital-Union (Freestyle V1): the same live widgets, appended at the end
                 # and written out explicitly for the same inspectability reason. The batch freezes
@@ -11498,7 +11586,7 @@ def create_ui() -> gr.Blocks:
                 # same contract. The report is an output only and is deliberately absent here.
                 sfx_folder, sfx_roles, sfx_amount, sfx_level,
                 source_mode, source_folder, source_recursive, video_input,
-                output_filename, processing_mode, custom_fps, variation_seed,
+                output_filename, processing_mode, output_profile, variation_seed,
                 cut_density, energy_response, motion_bias,
                 source_diversity, micro_cuts, semantic_emphasis,
                 session_state, source_state,

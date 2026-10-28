@@ -317,3 +317,95 @@ An unconfigured library changes nothing and says where to set it. Clearing the b
 destroy a path the operator had already typed; inventing one would point the render at a directory
 nobody chose. A configured-but-missing folder is filled in anyway **and reported**, so it can be
 corrected — and nothing is created, the same rule the whole preference store follows.
+
+## Commit D — Output Video Profiles, and soft edges on audio clips
+
+Phases 6 and 9.
+
+### The stretching defect, and why Auto keeps it
+
+The render took its resolution from the **first source video** and fitted every other clip to it
+with a bare `scale=width:height`. A portrait phone clip in a 1920×1080 timeline came out
+*squashed*, not pillarboxed; a 4:3 or anamorphic source the same. The only video setting was a
+free-text "Custom FPS" box — a frame rate with no resolution beside it, which is half a setting,
+and the missing half is where the defect lived.
+
+The Output Video Profile **replaces** that box, in the same position and at the same index in
+every handler signature it feeds — so the positional alignments several suites pin are preserved
+by *arity* rather than by renumbering.
+
+**Auto is the untouched historical path, including the stretch.** That is deliberate: fixing the
+geometry unconditionally would silently change every render an operator has already tuned and
+compared. Auto is structurally the same code, not merely equivalent — `resolve` answers `None`,
+every helper returns its caller's fallback unchanged, and `geometry_filter` returns `""`, which
+the extractor treats as "emit what you always emitted". The corrected geometry is what *choosing*
+a profile buys.
+
+### The geometry is reused, not reimplemented
+
+The Raw Cutter already had a measured scale-and-pad chain. It was extracted as
+`raw_cutter_profiles.geometry_filter(width, height)` and `video_filter` now composes it —
+**byte-identical output for all four cutter profiles**, verified before anything else changed. The
+two workflows stay distinct (each owns its own `trim` and `fps`); only the pixel geometry is
+shared.
+
+In the extractor the chain **replaces** the bare scale rather than being appended to it: the chain
+contains its own `scale`, and running both would fit the picture twice. A test pins the `if/elif`.
+
+### FFprobe verification — 4 profiles × 5 source shapes = 20 renders
+
+Every one produced exact dimensions, exact CFR, and SAR 1:1, with the picture's own aspect ratio
+preserved inside the padded frame:
+
+| Source | → 1080p | → 720p |
+|---|---|---|
+| portrait 1080×1920 | 608×1080 picture, pillarboxed | 405×720, pillarboxed |
+| 4:3 640×480 | 1440×1080, pillarboxed | 960×720, pillarboxed |
+| **anamorphic 720×576 SAR 16:15** | **1440×1080, pillarboxed** | **960×720, pillarboxed** |
+| 720p 1280×720 | 1920×1080, exact fit | 1280×720, exact fit |
+| 1080p 1920×1080 | 1920×1080, exact fit | 1280×720, exact fit |
+
+The anamorphic row is the one that proves the SAR-squaring step: 720×576 is a **4:3** picture, not
+5:4, and fitting it by coded size would letterbox it wrongly *and* squash the content. It comes
+out as a true 4:3 1440×1080 picture.
+
+### Two signature contracts I had to respect rather than renumber
+
+* `test_every_seam_takes_lifecycle_last_and_defaulted` requires the cancellation token to be the
+  **final** parameter of every cancellable entry point. So `geometry` and `output_profile` go
+  *in front of* `lifecycle` in `extract_clip_segment_ffmpeg_detailed` and `create_music_video`.
+  Every call site passes both by keyword, so nothing shifts.
+* `test_the_extract_kwargs_bundle_carries_only_the_command_plus_the_cancellation_token` pins the
+  kwargs bundle by exact list. `geometry` **is** command-shaping, so it joined the command-shaping
+  assertion rather than sitting beside `lifecycle` — the prefix grew from eight keys to nine, and
+  the structure of the guard (exact list + explicit prefix) is unchanged.
+
+### Soft edges: a fade may consume only the padding, never the sound
+
+The distinction that makes Phase 9 safe is between the pad **setting** — a request — and the
+padding a clip **actually received**. `plan_segments` gives each side at most half the silence it
+is reaching into, so a clip in a crowded passage may get far less than asked for, or none at all.
+`Segment` now records the applied padding, and the fade is bounded by *that*. "Never attenuate a
+spoken syllable" is therefore a computation, not a hope: a clip with 10 ms of lead-in fades for at
+most 10 ms, and one with none does not fade in at all.
+
+Two further clamps protect short clips: neither fade may exceed 40 % of the clip, and the two
+together can never overlap (which would leave a clip quiet in the middle).
+
+The planner is untouched — fades change what is *written*, never where a clip begins or ends, so
+the non-overlap guarantee is preserved by construction. Off by default, and when off **no `-af`
+argument is emitted at all**, so an already-accepted export is bit-identical.
+
+Measured through real FFmpeg on a **continuous tone** (the first fixture used silence either side,
+which made the test vacuous — the head measured −91 dB whether or not a fade was applied, so both
+branches would have "passed"):
+
+| Format | hard cut | with fade |
+|---|---|---|
+| WAV | head = body, 0.00 dB | head 15.30 dB quieter |
+| FLAC | head = body, 0.00 dB | head 15.30 dB quieter |
+| MP3 | head ≈ body, −0.40 dB | head 14.80 dB quieter |
+
+The report shows the **effective** fade range across the planned clips, not the setting, and names
+how many edges had no padding and were left sharp — because those two numbers differ exactly when
+the operator needs to know.

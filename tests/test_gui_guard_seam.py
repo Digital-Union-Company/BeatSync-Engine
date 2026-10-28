@@ -48,7 +48,7 @@ class Stage1Started(AssertionError):
 
 
 def _guarded(audio_file, source_mode, source_folder, source_recursive, video_input,
-             output_filename, processing_mode, custom_fps, session_state, source_state,
+             output_filename, processing_mode, output_profile, session_state, source_state,
              pipeline):
     """A faithful stand-in for ``gui.process_video_guarded``.
 
@@ -68,7 +68,7 @@ def _guarded(audio_file, source_mode, source_folder, source_recursive, video_inp
         video_files=list(decision.paths),
         output_filename=output_filename,
         processing_mode=processing_mode,
-        custom_fps=custom_fps,
+        output_profile=output_profile,
         session_state=session_state,
     )
 
@@ -120,7 +120,7 @@ def test_stale_state_plus_changed_live_browser_list_cannot_call_process_video(tm
             video_input=[a, b, c],  # the live widget, ahead of the state
             output_filename="out",
             processing_mode="fast",
-            custom_fps=30.0,
+            output_profile=None,
             session_state={},
             source_state=state,
             pipeline=_exploding_pipeline,
@@ -149,7 +149,7 @@ def test_stale_state_plus_changed_live_folder_controls_cannot_call_process_video
             video_input=None,
             output_filename="out",
             processing_mode="fast",
-            custom_fps=30.0,
+            output_profile=None,
             session_state={},
             source_state=state,
             pipeline=_exploding_pipeline,
@@ -266,7 +266,7 @@ def test_gui_click_inputs_include_live_source_controls():
         "video_input",
         "output_filename",
         "processing_mode",
-        "custom_fps",
+        "output_profile",
         "session_state",
         "source_state",
     ):
@@ -1350,6 +1350,12 @@ def _impl_namespace(tmp_path, calls, *, rename, dest_appears_during_render):
         # feature under test in this suite is the gate, not the destination.
         "get_render_output_dir": lambda: out_dir,
         "get_output_dir": lambda: out_dir,
+        # [FORK] R8 Phase 6: the render body resolves its Output Video Profile through this
+        # module. The REAL one is injected rather than a stub, because `None`/`auto` must take
+        # the untouched historical path and that is precisely what these suites assert -- a stub
+        # could accidentally make Auto behave like a profile.
+        "fork_render_profiles": __import__(
+            "beatsync_fork.render_profiles", fromlist=["render_profiles"]),
         "get_video_fps": lambda path: 30.0,
         "get_success_message_auto": lambda *a, **k: "✅ rendered",
         "_scale_diagnostics_block": lambda *a, **k: "",
@@ -1418,7 +1424,7 @@ def _run_real_impl(tmp_path, *, existing_dest=None, rename=None,
     state = {"session_dir": session_dir}
     result = namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-        processing_mode="cpu", custom_fps=30.0, creative=None, session_state=state,
+        processing_mode="cpu", output_profile=None, creative=None, session_state=state,
     )
     produced = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
     return result, calls, produced, session_dir, out_dir
@@ -1539,7 +1545,7 @@ def test_a_variation_seed_still_names_its_own_file(tmp_path):
 
     namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-        processing_mode="cpu", custom_fps=30.0, creative=profile,
+        processing_mode="cpu", output_profile=None, creative=profile,
         session_state={"session_dir": session_dir})
 
     produced = os.listdir(str(tmp_path / "output"))

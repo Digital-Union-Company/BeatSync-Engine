@@ -126,10 +126,26 @@ class SourceInfo:
 
 @dataclass(frozen=True)
 class Segment:
-    """One planned clip, in SOURCE time. `index` is 1-based and is what the filename carries."""
+    """One planned clip, in SOURCE time. `index` is 1-based and is what the filename carries.
+
+    [FORK] R8 UX Refresh (Phase 9): `pad_before` / `pad_after` record how much padding this clip
+    **actually received**, which is not the same as the pad *setting*. `plan_segments` gives each
+    side at most half the silence it is reaching into, so a clip in a crowded passage may get far
+    less than requested, or none at all.
+
+    That distinction is the whole of the fade safety argument. A fade is allowed to consume only
+    the padding, never the sound the padding surrounds -- so a clip that got 10 ms of lead-in can
+    fade for at most 10 ms, and one that got none does not fade in at all. Recording the applied
+    padding is what makes "never attenuate a spoken syllable" a computation rather than a hope.
+
+    Both default to 0.0, so every pre-R8 construction of this record is still valid and still
+    describes a clip with no fade.
+    """
     index: int
     start: float
     end: float
+    pad_before: float = 0.0
+    pad_after: float = 0.0
 
     @property
     def duration(self) -> float:
@@ -313,9 +329,16 @@ def plan_segments(duration: float, silences, pad: float = DEFAULT_PAD,
         padded_end = min(limit, end + pad_after)
 
         if padded_end - padded_start >= min_clip:
-            planned.append(Segment(index=0, start=padded_start, end=padded_end))
+            # [FORK] R8: carry the padding that was ACTUALLY applied, which is what bounds a fade.
+            # `padded_start`/`padded_end` are clamped to the source, so these are recomputed from
+            # the clamped values rather than reusing `pad_before`/`pad_after` directly -- a clip
+            # at the very start of the recording asks for lead-in it cannot have.
+            planned.append(Segment(index=0, start=padded_start, end=padded_end,
+                                   pad_before=max(0.0, start - padded_start),
+                                   pad_after=max(0.0, padded_end - end)))
 
-    return [Segment(index=number, start=s.start, end=s.end)
+    return [Segment(index=number, start=s.start, end=s.end,
+                    pad_before=s.pad_before, pad_after=s.pad_after)
             for number, s in enumerate(planned, start=1)]
 
 
@@ -339,10 +362,88 @@ def clip_filename(stem: str, index: int, fmt: str = FORMAT_WAV) -> str:
     return f"{stem}_part_{int(index):03d}.{_EXTENSIONS[normalize_format(fmt)]}"
 
 
+# ---------------------------------------------------------------------------------------------
+# [FORK] R8 UX Refresh (Phase 9): optional soft edges.
+#
+# A hard cut into speech or an effect clicks, and clips meant to sit under music need to arrive
+# and leave rather than appear and vanish. The fade is **off by default**, so every export an
+# operator has already accepted is bit-identical unless they ask for this.
+#
+# The safety rule is one sentence: **a fade may consume only the padding, never the sound.**
+# `plan_segments` records how much padding each side actually received, and the fade is bounded by
+# that -- so a clip wedged between two others, which received little or no padding, fades for
+# little or no time instead of eating its first syllable. That is why this is computed from the
+# segment rather than from the pad *setting*, which is only ever a request.
+#
+# Two further clamps, both for very short clips:
+#   * neither fade may exceed `MAX_FADE_FRACTION` of the clip, so a 0.3 s clip with 0.2 s of
+#     padding does not spend most of its length at reduced volume; and
+#   * the two together may not exceed twice that, so they can never overlap and produce a clip
+#     that is quiet in the middle.
+#
+# The silence-detection planner is untouched: fades change what is WRITTEN, never where a clip
+# begins or ends, so segment boundaries stay exactly where the planner put them and non-overlap
+# is preserved by construction.
+# ---------------------------------------------------------------------------------------------
+
+#: The most of a clip either fade may occupy. 0.4 leaves at least 20 % of even the shortest clip
+#: at full level when both fades are at their maximum.
+MAX_FADE_FRACTION = 0.4
+
+#: Below this there is nothing audible to shape, and an FFmpeg `afade` of a few samples is noise
+#: in the argv rather than a musical decision.
+MIN_FADE_SECONDS = 0.005
+
+
+def fade_lengths(segment: Segment, enabled: bool = False) -> tuple[float, float]:
+    """`(fade_in, fade_out)` in seconds for one clip. `(0.0, 0.0)` when disabled or impossible.
+
+    Total: a malformed segment, a negative pad or a zero-length clip all answer `(0.0, 0.0)`
+    rather than raising, because this runs while assembling a command for every clip in a batch.
+    """
+    if not enabled:
+        return 0.0, 0.0
+    try:
+        duration = max(0.0, float(segment.end) - float(segment.start))
+        lead = max(0.0, float(getattr(segment, "pad_before", 0.0) or 0.0))
+        tail = max(0.0, float(getattr(segment, "pad_after", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    if duration <= 0.0:
+        return 0.0, 0.0
+
+    ceiling = duration * MAX_FADE_FRACTION
+    fade_in = min(lead, ceiling)
+    fade_out = min(tail, ceiling)
+    if fade_in < MIN_FADE_SECONDS:
+        fade_in = 0.0
+    if fade_out < MIN_FADE_SECONDS:
+        fade_out = 0.0
+    return fade_in, fade_out
+
+
+def fade_filter(segment: Segment, enabled: bool = False) -> str:
+    """The `-af` chain for one clip's soft edges, or `""` when there is nothing to do.
+
+    Standard FFmpeg `afade`, with the fade-out positioned from the clip's own duration rather than
+    from an absolute source timestamp -- the clip has already been seeked and trimmed by the time
+    the filter runs, so its timeline starts at zero.
+    """
+    fade_in, fade_out = fade_lengths(segment, enabled)
+    parts = []
+    if fade_in > 0.0:
+        parts.append(f"afade=t=in:st=0:d={fade_in:.6f}")
+    if fade_out > 0.0:
+        duration = max(0.0, float(segment.end) - float(segment.start))
+        parts.append(f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}")
+    return ",".join(parts)
+
+
 def build_extract_command(ffmpeg: str, source: str, segment: Segment, destination: str,
                           fmt: str = FORMAT_WAV,
                           sample_rate: int = OUTPUT_SAMPLE_RATE,
-                          mp3_bitrate_kbps: int = DEFAULT_MP3_BITRATE_KBPS) -> list[str]:
+                          mp3_bitrate_kbps: int = DEFAULT_MP3_BITRATE_KBPS,
+                          fade_edges: bool = False) -> list[str]:
     """One clip's argv.
 
     ``-n`` rather than ``-y``: if the destination somehow exists, FFmpeg must refuse and say so.
@@ -371,6 +472,13 @@ def build_extract_command(ffmpeg: str, source: str, segment: Segment, destinatio
                "-i", str(source),
                "-t", f"{duration:.6f}",
                "-vn", "-map", "0:a:0", "-map_metadata", "-1"]
+    # [FORK] R8 Phase 9: optional soft edges, BEFORE the codec arguments so the fade applies to
+    # the decoded samples and is then encoded -- identically for WAV, FLAC and MP3, because it is
+    # one filter on the common path rather than three codec-specific tricks. Absent entirely when
+    # fades are off or the clip has no padding to spend, so the argv is unchanged in that case.
+    fades = fade_filter(segment, fade_edges)
+    if fades:
+        command += ["-af", fades]
     if resolved == FORMAT_FLAC:
         command += ["-c:a", "flac", "-sample_fmt", "s16"]
     elif resolved == FORMAT_MP3:

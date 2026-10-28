@@ -835,7 +835,7 @@ def test_c3_generation_and_apply_write_no_render_or_gate_widget():
         for forbidden in ("video_output", "status_output", "session_state", "process_btn",
                           "source_outputs", "source_state", "source_report", "confirm_btn",
                           "prep_outputs", "prep_state", "prep_report", "prep_analyze_btn",
-                          "audio_input", "output_filename", "processing_mode", "custom_fps",
+                          "audio_input", "output_filename", "processing_mode", "output_profile",
                           "audio_layers_report", "smart_mix_report"):
             assert forbidden not in names, f"{forbidden} in {list_name}"
 
@@ -1086,7 +1086,7 @@ def test_variant_lab_writes_no_gate_or_preparation_widget():
     for forbidden in ("source_outputs", "source_report", "confirm_btn", "confirm_status",
                       "process_btn", "source_state", "prep_outputs", "prep_report", "prep_status",
                       "prep_analyze_btn", "prep_state", "session_state", "video_output",
-                      "status_output", "audio_input", "custom_fps", "processing_mode",
+                      "status_output", "audio_input", "output_profile", "processing_mode",
                       "output_filename"):
         assert forbidden not in names, forbidden
 

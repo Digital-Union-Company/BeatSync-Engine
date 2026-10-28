@@ -812,7 +812,7 @@ def test_the_real_impl_records_candidate_local_for_an_occupied_destination(tmp_p
     result = namespace["_process_video_impl"](
         audio_file=str(audio), video_files=[str(video)],
         output_filename=stem, processing_mode="h264",
-        custom_fps=30.0, creative=None, session_state=state)
+        output_profile=None, creative=None, session_state=state)
 
     assert result[0] is None, result
     assert "already exists and was preserved" in result[1], result[1]
@@ -833,7 +833,7 @@ def test_the_real_impl_records_shared_fatal_for_a_missing_audio_selection(tmp_pa
     result = namespace["_process_video_impl"](
         audio_file="", video_files=[str(tmp_path / "clip.mp4")],
         output_filename="out", processing_mode="h264",
-        custom_fps=30.0, creative=None, session_state=state)
+        output_profile=None, creative=None, session_state=state)
 
     assert result[0] is None
     assert "No audio file selected" in result[1]
@@ -856,7 +856,7 @@ def test_the_real_impl_records_success_only_after_a_clean_promotion(tmp_path):
     result = namespace["_process_video_impl"](
         audio_file=str(audio), video_files=[str(video)],
         output_filename="clean", processing_mode="h264",
-        custom_fps=30.0, creative=None, session_state=state)
+        output_profile=None, creative=None, session_state=state)
 
     assert result[0] is not None, result
     assert state["render_outcome_kind"] is KIND.SUCCESS

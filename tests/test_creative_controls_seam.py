@@ -1027,7 +1027,7 @@ def test_apply_proposal_writes_nothing_else():
                             "sfx_level", "voice_files", "voice_start_delay", "voice_min_gap",
                             "voice_avoid_drops", "sfx_folder", "sfx_roles",
                             "audio_layers_report", "smart_mix_report", "video_output",
-                            "status_output", "output_filename", "processing_mode", "custom_fps",
+                            "status_output", "output_filename", "processing_mode", "output_profile",
                             "director_instruction", "director_proposal",
                             "director_proposal_state"))
     assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)

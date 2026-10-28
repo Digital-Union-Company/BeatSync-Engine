@@ -371,7 +371,7 @@ def test_the_quick_render_controls_are_two_side_by_side_sub_columns(tree: ast.Mo
 _MOVED_WIDGETS = (
     "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
     "scan_btn", "source_report", "confirm_btn", "confirm_status",
-    "custom_fps", "creative_preset", "output_filename", "creative_profile_summary",
+    "output_profile", "creative_preset", "output_filename", "creative_profile_summary",
     "process_btn", "cancel_render_btn", "status_output", "video_output",
     "open_output_folder_btn", "open_creative_settings_btn",
     "variation_seed", "randomize_btn", "surprise_btn",
@@ -457,7 +457,7 @@ def _section_span(source: str, label: str) -> tuple[int, int]:
 
 
 @pytest.mark.parametrize("widget", [
-    "audio_input", "source_mode", "source_folder", "video_input", "custom_fps",
+    "audio_input", "source_mode", "source_folder", "video_input", "output_profile",
     "processing_mode", "output_filename", "process_btn", "cancel_render_btn",
     "status_output", "video_output", "open_output_folder_btn", "creative_profile_summary",
     "open_creative_settings_btn",

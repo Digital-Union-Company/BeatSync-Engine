@@ -1518,7 +1518,7 @@ def test_a_cancellation_during_the_prores_preview_still_reports_success(tmp_path
 
     preview_path, status, state = namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-        processing_mode="prores_proxy", custom_fps=30.0, creative=None,
+        processing_mode="prores_proxy", output_profile=None, creative=None,
         session_state=state, lifecycle=life)
 
     produced = sorted(os.listdir(out_dir))
@@ -1622,7 +1622,7 @@ def test_an_in_flight_prores_preview_child_is_cancelled_while_the_render_stays_s
     try:
         preview_path, status, state = namespace["_process_video_impl"](
             audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-            processing_mode="prores_proxy", custom_fps=30.0, creative=None,
+            processing_mode="prores_proxy", output_profile=None, creative=None,
             session_state={"session_dir": session_dir}, lifecycle=life)
     finally:
         life.request_cancel()                        # never leave a 60s child behind
@@ -1709,7 +1709,7 @@ def test_a_cancellation_before_the_promotion_reports_cancelled_and_promotes_noth
 
     preview_path, status, state = namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-        processing_mode="cpu", custom_fps=30.0, creative=None,
+        processing_mode="cpu", output_profile=None, creative=None,
         session_state={"session_dir": session_dir}, lifecycle=_live())
 
     assert calls == ["analyze_beats_auto", "create_music_video"]

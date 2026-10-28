@@ -502,7 +502,7 @@ def test_closing_process_video_early_waits_for_its_worker():
     ns = harness.extract("process_video")
     gen = ns["process_video"](audio_file="a.wav", video_files=["v.mp4"],
                               output_filename="o.mp4", processing_mode="cpu",
-                              custom_fps=None, session_state={})
+                              output_profile=None, session_state={})
     try:
         next(gen)                                        # "Starting…"
         assert harness.started.wait(5), "the worker never started"

@@ -320,7 +320,7 @@ def _run_impl(tmp_path, *, preview_result="ok", lifecycle=None, mode="cpu",
 
     preview_path, status, state = namespace["_process_video_impl"](
         audio_file=audio, video_files=[clip], output_filename="music_video.mp4",
-        processing_mode=mode, custom_fps=30.0, creative=None,
+        processing_mode=mode, output_profile=None, creative=None,
         session_state=state, lifecycle=lifecycle)
     out_dir = str(tmp_path / "output")
     # [FORK] Digital-Union (Deliverable Export V1-B-S1): `output/` now holds up to three entries --

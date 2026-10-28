@@ -653,6 +653,11 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
                                          output_file: str, fps: float,
                                          target_size: Tuple[int, int], use_nvenc: bool,
                                          gpu_encoder: str = 'h264_nvenc',
+                                         # [FORK] R8 Phase 6: BEFORE `lifecycle`. A seam test pins
+                                         # `lifecycle` as the last parameter of every cancellable
+                                         # entry point, so a new one goes in front of it. Every
+                                         # caller passes both by keyword.
+                                         geometry: str = '',
                                          lifecycle=None) -> Tuple[bool, str]:
     """[FORK] Digital-Union (Phase 3B): the same extraction, plus a bounded failure reason.
 
@@ -665,6 +670,12 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
     FFmpeg call below is the original blocking call, byte-identical to today. A matching
     cancellation raises :class:`~beatsync_fork.render_worker.RenderCancelled`, which this function's
     own ``except Exception`` must never collapse into an ordinary ``(False, reason)`` failure tuple.
+
+    [FORK] Digital-Union (R8 UX Refresh, Phase 6): ``geometry`` is the scale-and-pad filter chain
+    for a fixed Output Video Profile, and it defaults to ``''`` meaning **Auto** -- the historical
+    bare ``scale=width:height``, unchanged. The default is what makes every existing caller and
+    every existing test still describe the same command. See the comment at the filter assembly
+    for why a profile *replaces* the bare scale rather than being appended to it.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
@@ -677,12 +688,27 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
 
         # Trim first so each extracted segment has exact timing.
         filters.extend([f"trim=duration={exact_source_duration}", "setpts=PTS-STARTPTS"])
-        
+
         # Scale to target size
-        if target_size:
+        #
+        # [FORK] Digital-Union (R8 UX Refresh, Phase 6): `geometry` is the scale-and-pad chain for
+        # a fixed Output Video Profile, and `""` is Auto.
+        #
+        # The bare `scale={width}:{height}` below is the historical behaviour and is kept EXACTLY
+        # for Auto -- including its defect, deliberately. It stretches any source whose aspect
+        # ratio differs from the target, because the target is simply the first source's
+        # resolution. Fixing that unconditionally would silently change the geometry of every
+        # render an operator has already tuned and compared, so Auto is left untouched and the
+        # corrected geometry is what choosing a profile buys.
+        #
+        # When `geometry` is supplied it REPLACES the bare scale rather than being appended to it:
+        # the chain already contains its own `scale`, and running both would fit the picture twice.
+        if geometry:
+            filters.append(geometry)
+        elif target_size:
             width, height = target_size
             filters.append(f"scale={width}:{height}")
-        
+
         # FPS filter
         filters.append(f"fps={fps}")
         

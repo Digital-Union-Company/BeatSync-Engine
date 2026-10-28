@@ -439,8 +439,25 @@ PLACEHOLDER_SMART_MIX_REPORT = (
 
 LABEL_VIDEO_FILES = "🎥 Video Files (MP4/MKV)"
 
-LABEL_CUSTOM_FPS = "🎞️ Custom FPS (Frame Rate)"
-INFO_CUSTOM_FPS = "Leave empty for auto-detect, or enter value (24/30/60)"
+# [FORK] R8 UX Refresh (Phase 6): the Output Video Profile replaces the free-text FPS box.
+# `LABEL_CUSTOM_FPS` / `INFO_CUSTOM_FPS` are deleted rather than kept: a frame rate with no
+# resolution beside it was half a setting, and the half that was missing is where the real defect
+# lived -- the render took its resolution from the first source and stretched everything else
+# to match.
+# [FORK] R8 UX Refresh (Phase 9): optional soft edges on exported audio clips.
+LABEL_AUDIO_FADE_EDGES = "🌊 Smooth clip edges (fade in/out)"
+INFO_AUDIO_FADE_EDGES = (
+    "Softens the very start and end of each clip so it blends under music instead of clicking "
+    "in. The fade uses **only the Padding** around each clip, never the speech itself — so a clip "
+    "with little room gets a short fade, and one with none gets a sharp edge. Off by default."
+)
+
+LABEL_OUTPUT_PROFILE = "🎞️ Output Video Profile"
+INFO_OUTPUT_PROFILE = (
+    "The size and frame rate of the finished video. **Auto** keeps today's behaviour: the first "
+    "source video decides. A fixed profile gives you exactly those dimensions and adds black bars "
+    "where a clip's shape does not match — it never stretches the picture."
+)
 
 # GPU & Processing
 LABEL_GPU_STATUS = "⚡ GPU Acceleration Status"
