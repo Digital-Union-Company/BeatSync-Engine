@@ -561,18 +561,25 @@ def test_the_controls_live_in_the_creative_settings_tab():
         assert studio < position < following, f"{widget} is outside the Creative Settings tab"
 
 
-def test_the_preset_radio_sits_on_the_render_tab():
-    """GUI Refresh A. The preset is the only creative control on the render tab, and that is the
-    point of it: one click sets all six sliders, so a user who never opens Creative Settings can
-    still change the edit style. It is also the one creative widget the summary read-out must NOT
-    report, because its radio is on the same screen.
+def test_the_preset_radio_sits_with_the_sliders_it_writes():
+    """[FORK] R8 UX Refresh (Commit C) — this reverses GUI Refresh A's placement.
 
-    There is still exactly ONE preset radio — moving it is not duplicating it.
+    Refresh A put the selector on the render tab, arguing it is the one creative choice a user who
+    never opens the studio still wants. That argument did not survive contact. The selector is a
+    read-out of six values living on *another* tab, so a user who moved a slider saw a preset name
+    change on a screen they were not looking at, and a user on the render tab saw a name with no
+    way to see or adjust what it stood for. Worse, it was the half of a misleading pair: it could
+    read `Balanced` while Freestyle and a Variation Seed were armed.
+
+    So it now sits with its six sliders, and the render tab carries a resolved *summary* instead
+    (`creative_profile_summary`, see `test_gui_tabs.py`). There is still exactly ONE preset radio —
+    moving it is not duplicating it.
     """
     source = open(_GUI, encoding="utf-8").read()
     render = source.index("gr.Tab(LABEL_TAB_RENDER")
     studio = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
-    assert render < source.index("creative_preset = gr.") < studio
+    position = source.index("creative_preset = gr.")
+    assert render < studio < position, "the preset radio is not in Creative Settings"
     assert source.count("creative_preset = gr.") == 1, "the preset radio was duplicated"
 
 

@@ -783,6 +783,31 @@ INFO_PREF_RENDER_OUTPUT = (
     "where they are."
 )
 
+# [FORK] R8 UX Refresh (Commit C): the Media Library as a video source.
+CHOICE_SOURCE_MEDIA_LIBRARY = "Use Media Library — the folder set in Settings"
+STATUS_LIBRARY_SOURCE_UNSET = (
+    "No default video Media Library is set yet. Open Settings → Default folders, set "
+    "\"Media Library folder\", then pick this option again. Your current source folder was left "
+    "as it was."
+)
+STATUS_LIBRARY_SOURCE_MISSING = (
+    "The saved Media Library folder is not there any more: {path}. It was filled in anyway so "
+    "you can correct it — nothing was created."
+)
+
+# [FORK] R8 UX Refresh (Commit C): the one truthful creative read-out on the Render tab.
+LABEL_CREATIVE_PROFILE = "🎨 Current Creative Profile"
+CREATIVE_PROFILE_PLACEHOLDER = (
+    "The creative settings this render will use appear here."
+)
+CREATIVE_PROFILE_PLAIN_HINT = (
+    "A plain preset render — nothing else is active."
+)
+CREATIVE_PROFILE_MODIFIED_HINT = (
+    "Change any of this in Creative Settings."
+)
+LABEL_OPEN_CREATIVE_SETTINGS = "🎨 Open Creative Settings"
+
 LABEL_COLLISION_SECTION = "📄 When a destination filename already exists"
 CHOICE_COLLISION_SKIP = "Skip and report it"
 CHOICE_COLLISION_SUFFIX = "Rename automatically (clip_01, clip_02, …)"
@@ -1114,11 +1139,12 @@ INFO_TAB_AUDIO_MIX = (
     "*Library preparation and source checks moved to Media Library → Prepare & Verify.*"
 )
 
-LABEL_ACTIVE_SETTINGS = "Active optional settings"
-ACTIVE_SETTINGS_PLACEHOLDER = (
-    "Open this tab again after changing anything in Creative Studio or Advanced Tools and this "
-    "will list what is active."
-)
+# [FORK] R8 UX Refresh (Commit C): `LABEL_ACTIVE_SETTINGS` / `ACTIVE_SETTINGS_PLACEHOLDER` are
+# deleted rather than renamed. The box they titled listed optional extras but said nothing about
+# the six creative controls, because the Creative Preset radio sat on the same tab and stated that
+# part itself -- and the pair was misleading together, since the selector could read `Balanced`
+# while Freestyle, a Variation Seed and SFX were all armed. One resolved line replaces both; see
+# `LABEL_CREATIVE_PROFILE` above and `beatsync_fork/effective_profile.py`.
 
 LABEL_FREESTYLE_SECTION_PREFIX = "🎵"
 

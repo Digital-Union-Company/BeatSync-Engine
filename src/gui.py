@@ -234,6 +234,12 @@ from beatsync_fork import user_prefs as fork_prefs
 # site count stays at exactly the two that two suites pin.
 from beatsync_fork import collision as fork_collision
 from beatsync_fork import cache_admin as fork_cache
+# [FORK] Digital-Union (R8 UX Refresh, Commit C): the one composition rule for "what is this
+# render actually going to do creatively". It is a pure view over values this module already has,
+# and it delegates every verdict -- the preset name to `presets.matching_preset`, Freestyle
+# activity to the declaration, the SFX verdict to the caller's `plans_anything_from` result -- so
+# the render tab's summary and the selector on Creative Settings are the same computation.
+from beatsync_fork import effective_profile as fork_effective
 # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
 # the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
 # live inside `audio_cutter` rather than here, because two suites pin this module's
@@ -2805,9 +2811,27 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
 # State object holds the backend truth, and process_video_guarded() re-checks it against the
 # filesystem before any Stage 1 work begins.
 
+#: [FORK] R8 UX Refresh (Commit C): the radio's third choice, and the reason it is NOT a third
+#: `SourceMode`.
+#:
+#: "Use Media Library" is not a new kind of source. It is a local folder whose path the operator
+#: configured once in Settings instead of typing every time -- so it maps onto the EXISTING
+#: `LOCAL_FOLDER` mode and reuses the whole engine behind it: the same scan, the same
+#: `SourceSnapshot` identity, the same confirmation gate, the same invalidation rules, the same
+#: media analysis. Nothing about the gate needed changing, which is the point: the task asked for
+#: a convenience, and a third enum member would have been a second source concept for the
+#: snapshot, the session state and every test that enumerates modes to carry forever.
+#:
+#: The consequence an operator can observe is exactly the one required: because selecting it
+#: WRITES `source_folder`, that textbox's own `.change` fires and invalidates any previous
+#: confirmation through the established path -- identical to editing the folder by hand, because
+#: it *is* editing the folder.
+SOURCE_CHOICE_MEDIA_LIBRARY = "media_library"
+
 SOURCE_MODE_VALUES = {
     SourceMode.LOCAL_FOLDER.value: SourceMode.LOCAL_FOLDER,
     SourceMode.BROWSER_FILES.value: SourceMode.BROWSER_FILES,
+    SOURCE_CHOICE_MEDIA_LIBRARY: SourceMode.LOCAL_FOLDER,
 }
 
 
@@ -2823,12 +2847,34 @@ def _source_ui_updates(state) -> Tuple:
 
 
 def _on_source_mode_change(mode_value: str, state) -> Tuple:
+    """Switch source mode, and for "Use Media Library" also fill in the configured folder.
+
+    [FORK] R8: the folder update LEADS the returned tuple and is `gr.update()` -- change nothing --
+    for both pre-existing choices, so their behaviour is untouched.
+
+    When the library is not configured the folder is deliberately **left alone** rather than
+    cleared or invented, and the operator is told where to set it. Clearing it would silently
+    destroy a path they had already typed; inventing one would point the render at a directory
+    nobody chose.
+    """
     mode = SOURCE_MODE_VALUES.get(str(mode_value), SourceMode.LOCAL_FOLDER)
     new_state = set_mode(state, mode)
     is_folder = mode is SourceMode.LOCAL_FOLDER
-    return (gr.update(visible=is_folder), gr.update(visible=not is_folder)) + _source_ui_updates(
-        new_state
-    )
+
+    folder_update = gr.update()
+    if str(mode_value) == SOURCE_CHOICE_MEDIA_LIBRARY:
+        configured = _pref(fork_prefs.CLIPS_LIBRARY)
+        if not configured:
+            gr.Warning(STATUS_LIBRARY_SOURCE_UNSET)
+        elif not os.path.isdir(configured):
+            # Reported, never recreated -- the same rule the rest of the preference store follows.
+            gr.Warning(STATUS_LIBRARY_SOURCE_MISSING.format(path=configured))
+            folder_update = gr.update(value=configured)
+        else:
+            folder_update = gr.update(value=configured)
+
+    return (folder_update, gr.update(visible=is_folder),
+            gr.update(visible=not is_folder)) + _source_ui_updates(new_state)
 
 
 def _on_folder_path_change(folder_path: str, state) -> Tuple:
@@ -2978,26 +3024,51 @@ def _on_surprise_me(freestyle_enabled, *styles):
     return seed, preview
 
 
-def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_files_value,
-                                sfx_folder_value, sfx_roles_value, sfx_amount_value,
-                                *styles) -> str:
-    """[FORK] Digital-Union (GUI Refresh A): what optional settings will affect the next render.
+def _on_render_tab_select(cut_density_value, micro_cuts_value, semantic_emphasis_value,
+                          energy_response_value, motion_bias_value, source_diversity_value,
+                          freestyle_enabled, variation_seed_value, voice_files_value,
+                          sfx_folder_value, sfx_roles_value, sfx_amount_value,
+                          *styles) -> str:
+    """[FORK] Digital-Union (GUI Refresh A): what will actually affect the next render.
 
-    Three tabs mean a user can arm something in Creative Studio or Advanced Tools and then look at
-    a Quick Render screen that shows no sign of it. This says so in one read-only box.
+    Several tabs mean a user can arm something elsewhere and then look at a render screen that
+    shows no sign of it. This says so in one read-only box.
 
     **It is a read-out, not an authority.** It writes nothing, no render path reads it, and it
-    stores no state: it is recomputed from the LIVE widget values every time Quick Render is
+    stores no state: it is recomputed from the LIVE widget values every time the Render tab is
     selected, so it cannot drift from the controls it describes.
+
+    **R8 — it now reports the CREATIVE PROFILE, and the six sliders came back into its inputs.**
+    That is a deliberate reversal of R1's removal, and the reason R1 gave is exactly the reason it
+    is now safe to undo:
+
+    R1 dropped the creative line because the Creative Preset radio sat on *this* tab and could
+    change all six sliders while this box -- refreshed only on tab selection -- went on showing the
+    old answer. That was the one staleness hole the read-out had. R8 Commit C moved the preset to
+    Creative Settings, so **every** control this box describes now lives on another tab, and the
+    `.select()` that fires on the way back here is sufficient for all of them. The hole is closed
+    by the move rather than by the omission.
+
+    What replaced the omission is a stronger statement than either version made. The preset
+    selector and the old extras box were individually true and *jointly misleading*: the selector
+    could read `Balanced` while Freestyle rules, a Variation Seed and SFX were armed, and nothing
+    said the render would not be a plain Balanced render. One composed line fixes that, and the
+    composition rule lives in `beatsync_fork.effective_profile` rather than here, so this label and
+    the selector on the other tab are provably the same computation.
+
+    **It still constructs nothing and judges nothing.** Freestyle activity comes from the
+    declaration's own `is_active()`, the Smart Mix verdict from `plans_anything_from`, and the
+    preset name from `presets.matching_preset` -- each asked of the subsystem that owns it. The
+    two local judgements an earlier version made were both wrong in the same direction, claiming a
+    render would be changed when it would not.
 
     Bound to the tab's own `.select()` rather than to `.change()` on a dozen existing widgets: the
     creative sliders carry exactly one `.input()` registration each by contract, and the Freestyle
     widgets write only their own summary. Adding handlers to them to feed a cosmetic read-out would
     put a second binding on widgets whose single binding is itself a pinned contract.
 
-    **R1 — every claim here is now decided by the subsystem that owns it.** The first version
-    answered two of them locally and got both wrong in the same direction, claiming a render would
-    be changed when it would not:
+    **The two local judgements, kept delegated.** Both are recorded because each was a real defect
+    once, and both are still answered by the owning subsystem rather than here:
 
     * *Freestyle ON with every section on `Base`* has no overrides, so `is_active()` is False and
       the renderer takes the ordinary global path. The checkbox alone was never the gate; the gate
@@ -3005,52 +3076,28 @@ def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_f
     * *Amount 0* is a hard off-branch for Smart Mix however many roles are ticked — exactly what
       `SmartMixConfig.plans_anything` says. The first version ignored Amount entirely.
 
-    Both now go through the real record, which is the maintainable version as well as the correct
-    one: if a subsystem changes its mind about what "on" means, this follows automatically.
+    **What it still refuses to do**, and the reason is unchanged from R1: it adds no second
+    registration to any creative widget. An earlier draft rebuilt this string from a
+    `creative_preset` event, which needed `sfx_folder`, `sfx_roles` and `sfx_amount` wired into
+    that event — forbidden outright by
+    `test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring` — and pushed the
+    selector to two registrations against a pin that exists to keep it at one. A fix that has to
+    relax two guards is the wrong fix. The tab's own `.select()` remains the only trigger.
 
-    **R1 also removed the "Creative Controls away from neutral" line, and removing it was the fix
-    rather than a simplification.** That line was the one thing here the *Quick Render tab itself*
-    could invalidate: the Creative Preset writes all six sliders, so picking `Cinematic` moved them
-    off neutral while this box — refreshed only on tab selection — still read "Nothing optional is
-    active". It was also redundant, and provably so rather than approximately: `PRESETS["Balanced"]`
-    is `(50, 50, 50, 50, 50, 50)`, which is `DEFAULT_CONTROL` six times, and `matching_preset`
-    recomputes the selector from the live sliders on every write. So "some control is off neutral"
-    is *exactly* "the selector does not read Balanced", and that selector sits on this tab, two
-    inches away, permanently correct.
-
-    Deleting the line therefore loses no information and closes the staleness hole at the source --
-    strictly better than keeping it and adding a second `creative_preset` registration to refresh
-    it, which is what an earlier draft of R1 did. That draft had to wire `sfx_folder`, `sfx_roles`
-    and `sfx_amount` into a `creative_preset` event to rebuild the whole string, which
-    `test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring` forbids outright, and it
-    pushed the selector to two registrations against a pin that exists to keep it at one. A fix
-    that has to relax two guards to describe a value already on screen is the wrong fix.
-
-    What remains is exactly the set of things that live in *other* tabs, every one of which is
-    refreshed by the `.select()` that fires on the way back here.
-
-    Total: never raises, so selecting a tab can never fail.
+    Total: never raises, so selecting a tab can never fail. Every value here arrives straight from
+    a widget, and `effective_profile` is total by contract for exactly that reason.
     """
-    notes: list[str] = []
+    # The six live control values, in `CREATIVE_CONTROL_FIELDS` order -- the same order
+    # `creative_control_sliders` uses, because Gradio matches `inputs` positionally and the
+    # preset label is computed from the tuple as a whole.
+    controls = (cut_density_value, micro_cuts_value, semantic_emphasis_value,
+                energy_response_value, motion_bias_value, source_diversity_value)
 
     # Freestyle: the declaration decides, not the checkbox. The live seed is passed because it is
     # already in scope, but activity cannot depend on it -- a `Random` section yields a rule for
-    # every seed, so this asks only whether any rule exists at all.
+    # every seed, so the question asked is only whether any rule exists at all.
     declaration = fork_freestyle_random.declaration_from_styles(
         freestyle_enabled, dict(zip(_FREESTYLE_WIDGET_ORDER, styles)), variation_seed_value)
-    if declaration.is_active():
-        ruled = len(declaration.ruled_types())
-        notes.append(f"Freestyle: {ruled} section type(s) edited differently (Creative Studio)")
-
-    try:
-        if int(variation_seed_value) != 0:
-            notes.append(f"Variation Seed: {int(variation_seed_value)} (Creative Studio)")
-    except (TypeError, ValueError):
-        pass
-
-    if voice_files_value:
-        count = len(voice_files_value) if isinstance(voice_files_value, (list, tuple)) else 1
-        notes.append(f"Audio Layers: {count} voice clip(s) (Advanced Tools)")
 
     # Smart Mix: `plans_anything_from` is the authority on Amount 0 and on an empty role set.
     #
@@ -3069,13 +3116,25 @@ def _on_quick_render_tab_select(freestyle_enabled, variation_seed_value, voice_f
     roles = fork_smart_mix.normalize_roles(sfx_roles_value) if sfx_roles_value else frozenset()
     amount = fork_smart_mix.normalize_control(sfx_amount_value)
     has_folder = isinstance(sfx_folder_value, str) and bool(sfx_folder_value.strip())
-    if has_folder and fork_smart_mix.plans_anything_from(roles, amount):
-        notes.append(f"Smart Mix: {len(roles)} SFX role(s) at Amount "
-                     f"{amount} (Advanced Tools)")
+    smart_mix_on = has_folder and fork_smart_mix.plans_anything_from(roles, amount)
 
-    if not notes:
-        return ("Nothing optional is active — this render uses the defaults shown on this tab.")
-    return "This render will also use:\n" + "\n".join(f"  • {n}" for n in notes)
+    # [FORK] R8: the one resolved line. The composition rule lives in the fork module so that the
+    # preset label here and the selector on Creative Settings are provably the same computation --
+    # both end at `presets.matching_preset` over the same six live values.
+    line = fork_effective.summary(
+        controls,
+        freestyle_declaration=declaration,
+        variation_seed=variation_seed_value,
+        voice_clips=voice_files_value,
+        smart_mix_active=smart_mix_on)
+    if fork_effective.is_modified(
+            controls,
+            freestyle_declaration=declaration,
+            variation_seed=variation_seed_value,
+            voice_clips=voice_files_value,
+            smart_mix_active=smart_mix_on):
+        return f"{line}\n{CREATIVE_PROFILE_MODIFIED_HINT}"
+    return f"{line}\n{CREATIVE_PROFILE_PLAIN_HINT}"
 
 
 # [FORK] Digital-Union (AI Director — V1 introduced the split; V2 added the media step): two thin
@@ -8703,6 +8762,10 @@ def create_ui() -> gr.Blocks:
                                     source_mode = gr.Radio(
                                         choices=[
                                             (CHOICE_SOURCE_LOCAL_FOLDER, SourceMode.LOCAL_FOLDER.value),
+                                            # [FORK] R8: the configured Media Library as a local
+                                            # folder. Not a third SourceMode -- see
+                                            # `SOURCE_CHOICE_MEDIA_LIBRARY`.
+                                            (CHOICE_SOURCE_MEDIA_LIBRARY, SOURCE_CHOICE_MEDIA_LIBRARY),
                                             (CHOICE_SOURCE_BROWSER_FILES, SourceMode.BROWSER_FILES.value),
                                         ],
                                         value=SourceMode.LOCAL_FOLDER.value,
@@ -8750,24 +8813,6 @@ def create_ui() -> gr.Blocks:
                                     gr.Markdown('### ⚙️ Video Settings')
                                     custom_fps = gr.Number(label=LABEL_CUSTOM_FPS, value=None, precision=2, info=INFO_CUSTOM_FPS)
 
-                                # [FORK] Digital-Union (GUI Refresh A): the preset selector is the one
-                                # creative control on Quick Render, because it is the single choice that
-                                # sets all six sliders at once. The sliders themselves live in Creative
-                                # Studio; the `.input()` graph between them is unchanged and crosses tabs
-                                # perfectly well.
-                                # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
-                                # directly above the six sliders it writes, and below the seed — the layout is
-                                # the first statement that a preset moves those six and nothing else. It is NOT
-                                # a `process_btn` input: the sliders already are, and they stay the only thing
-                                # the render request carries. `Custom` is the last choice because it is a state
-                                # the selector reports, not a recipe a user picks.
-                                creative_preset = gr.Radio(
-                                    choices=list(fork_presets.PRESET_NAMES),
-                                    value=fork_presets.BALANCED_PRESET,
-                                    label=LABEL_CREATIVE_PRESET,
-                                    info=INFO_CREATIVE_PRESET,
-                                    elem_id='creative-preset-radio',
-                                )
                                 with gr.Group():
                                     gr.Markdown(f'### 🎬 Processing Mode')
                                     if NVENC_AVAILABLE:
@@ -8800,14 +8845,39 @@ def create_ui() -> gr.Blocks:
                                 # measured rather than assumed: heading the column pushed Create Music
                                 # Video from y=1032 down to y=1177, because this box is 145 px tall and
                                 # the button sits below it either way.
-                                active_settings_summary = gr.Textbox(
-                                    label=LABEL_ACTIVE_SETTINGS,
-                                    value=ACTIVE_SETTINGS_PLACEHOLDER,
-                                    lines=3,
-                                    max_lines=8,
+                                #
+                                # [FORK] R8 UX Refresh (Commit C): this replaces `active_settings_summary`
+                                # and answers a different question.
+                                #
+                                # The old box listed optional extras but said nothing about the six
+                                # creative controls, because the Creative Preset radio sat on this very
+                                # tab and stated that part itself. The preset has moved to Creative
+                                # Settings, and more importantly the pair was *misleading together*: the
+                                # selector could read `Balanced` while Freestyle rules, a Variation Seed
+                                # and SFX were all armed, and nothing on screen said the render would not
+                                # be a plain Balanced render.
+                                #
+                                # So this box now carries ONE resolved line -- the base recipe plus every
+                                # active override -- built by `beatsync_fork.effective_profile`. It is
+                                # still a read-out: it writes nothing, no render path reads it, and it is
+                                # recomputed from the live widgets on every tab selection, which is
+                                # sufficient *because* every control it describes now lives on another
+                                # tab. That was not true before the preset moved, and is exactly why the
+                                # six sliders could not be reported from here until now.
+                                creative_profile_summary = gr.Textbox(
+                                    label=LABEL_CREATIVE_PROFILE,
+                                    value=CREATIVE_PROFILE_PLACEHOLDER,
+                                    lines=2,
+                                    max_lines=6,
                                     interactive=False,
-                                    elem_id='active-settings-summary',
+                                    elem_id='creative-profile-summary',
                                 )
+                                # A one-click way to go and change it, which the old layout lacked:
+                                # the summary named settings on other tabs without offering a route
+                                # to them. Selecting a tab is not a render and writes no setting.
+                                open_creative_settings_btn = gr.Button(
+                                    LABEL_OPEN_CREATIVE_SETTINGS, variant='secondary', size='sm',
+                                    elem_id='open-creative-settings-button')
                     with gr.Column(scale=2):
                         gr.Markdown('### 📺 Output')
                         status_output = gr.Textbox(label='Status', interactive=False, value=get_ready_status(python_status, cuda_status, MAX_THREADS, CPU_COUNT, ffmpeg_status, GPU_AVAILABLE, gpu_info, NVENC_AVAILABLE), lines=4, max_lines=4, elem_id='status-output-box')
@@ -8906,6 +8976,32 @@ def create_ui() -> gr.Blocks:
                         elem_id='variation-seed-input',
                     )
                     randomize_btn = gr.Button(LABEL_RANDOMIZE_SEED, elem_id='randomize-seed-button')
+
+                    # [FORK] Digital-Union (Creative Controls Extra PR3): the preset selector sits
+                    # directly above the six sliders it writes, and below the seed — the layout is
+                    # the first statement that a preset moves those six and nothing else. It is NOT
+                    # a `process_btn` input: the sliders already are, and they stay the only thing
+                    # the render request carries. `Custom` is the last choice because it is a state
+                    # the selector reports, not a recipe a user picks.
+                    #
+                    # [FORK] R8 UX Refresh (Commit C): MOVED here from the render tab.
+                    #
+                    # GUI Refresh A put it on the render tab on the argument that it is the one
+                    # creative choice a user who never opens the studio still wants. That argument
+                    # did not survive contact: the selector is a read-out of six values that live
+                    # on *another* tab, so a user who changed a slider saw a preset name change on
+                    # a screen they were not looking at, and a user on the render tab saw a name
+                    # with no way to see or adjust what it stood for. The `.input()` graph between
+                    # the seven widgets is completely unchanged -- it always crossed tabs and still
+                    # does -- so this is a pure re-parenting, and the render tab now carries a
+                    # truthful resolved *summary* instead of one of the controls.
+                    creative_preset = gr.Radio(
+                        choices=list(fork_presets.PRESET_NAMES),
+                        value=fork_presets.BALANCED_PRESET,
+                        label=LABEL_CREATIVE_PRESET,
+                        info=INFO_CREATIVE_PRESET,
+                        elem_id='creative-preset-radio',
+                    )
                     # Randomize stays seed-only on purpose; these three have no randomizer and no
                     # reset. 50 is current BeatSync behaviour in every one of them, and the default
                     # is the fork module's constant rather than a literal repeated here.
@@ -10833,10 +10929,14 @@ def create_ui() -> gr.Blocks:
 
         source_outputs = [source_report, confirm_btn, confirm_status, process_btn, source_state]
 
+        # [FORK] R8 Commit C: `source_folder` is PREPENDED to the outputs so "Use Media Library"
+        # can fill it in. Prepended rather than appended purely so the two group-visibility
+        # updates stay adjacent to each other; the handler's return tuple matches this order
+        # positionally, as every handler on this gate must.
         source_mode.change(
             fn=_on_source_mode_change,
             inputs=[source_mode, source_state],
-            outputs=[folder_group, browser_group] + source_outputs,
+            outputs=[source_folder, folder_group, browser_group] + source_outputs,
         )
         source_folder.change(
             fn=_on_folder_path_change,
@@ -10974,11 +11074,26 @@ def create_ui() -> gr.Blocks:
         # selector is recomputed from the live sliders). Every remaining input lives in another
         # tab, so the `.select()` that fires on the way back here is sufficient to keep all of them
         # current — no creative control needs a second binding, and no event here can be stale.
+        # [FORK] R8 Commit C: the six sliders LEAD the input list, in `creative_control_sliders`
+        # order so the handler's six named parameters line up positionally with the one tuple the
+        # preset label is computed from. The ten Freestyle dropdowns still ride LAST and are still
+        # collected by `*styles`, so every other parameter keeps a fixed index.
         tab_render.select(
-            fn=_on_quick_render_tab_select,
-            inputs=[freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
-                    sfx_amount] + freestyle_section_dropdowns,
-            outputs=[active_settings_summary])
+            fn=_on_render_tab_select,
+            inputs=creative_control_sliders
+            + [freestyle_enabled, variation_seed, voice_files, sfx_folder, sfx_roles,
+               sfx_amount] + freestyle_section_dropdowns,
+            outputs=[creative_profile_summary])
+
+        # [FORK] R8 Commit C: a one-click route to the tab the summary talks about. Selecting a
+        # tab is not a render: no `_RENDER_LOCK`, no lane, and it writes no setting -- `outputs`
+        # is exactly the tab container, which is what `gr.Tabs(selected=...)` needs.
+        open_creative_settings_btn.click(
+            fn=lambda: gr.Tabs(selected='tab-creative-settings'),
+            inputs=[],
+            outputs=[main_tabs],
+            concurrency_limit=None,
+        )
 
         # Each widget refreshes the summary and writes NOTHING else. `.change()` is correct here
         # (unlike the preset/slider graph, which needs `.input()` to stay acyclic): nothing ever

@@ -726,17 +726,32 @@ def test_its_help_text_describes_a_preset_honestly():
         assert overclaim not in info, f"INFO_CREATIVE_PRESET claims {overclaim!r}"
 
 
-def test_the_selector_lives_in_the_creative_direction_group():
+def test_the_selector_lives_directly_above_the_sliders_it_writes():
     """Grouped with the controls it writes, not inside Video Source: placement is the first
-    statement that this is render-request creative state."""
-    source = open(_GUI, encoding="utf-8").read()
-    heading = source.index("Creative Direction")
-    following = source.index("Processing Mode", heading)
-    position = source.index("creative_preset = gr.", heading)
+    statement that this is render-request creative state.
 
-    assert heading < position < following
-    # and directly above the six sliders it writes
-    assert position < source.index("cut_density = gr.", heading)
+    [FORK] R8 UX Refresh (Commit C). The old anchors were the `Creative Direction` group heading
+    and the `Processing Mode` heading that followed it -- a span that stopped meaning anything
+    when GUI Refresh A turned that group into a tab and R8 moved the selector into it.
+
+    The property being protected never depended on those headings: the selector belongs
+    immediately above the six sliders, below the Variation Seed, in the tab that holds all of
+    them. That is asserted directly now, so it survives the next re-layout.
+    """
+    source = open(_GUI, encoding="utf-8").read()
+    tab = source.index("gr.Tab(LABEL_TAB_CREATIVE_SETTINGS")
+    following = min(p for p in (source.index(f"gr.Tab({label}")
+                                for label in ("LABEL_TAB_RAW_CUTTER", "LABEL_TAB_AUDIO_CUTTER",
+                                              "LABEL_TAB_AUDIO_MIX", "LABEL_TAB_MEDIA_LIBRARY",
+                                              "LABEL_TAB_SETTINGS"))
+                    if p > tab)
+    position = source.index("creative_preset = gr.")
+
+    assert tab < position < following, "the selector is outside the Creative Settings tab"
+    # below the seed, which it never writes...
+    assert source.index("variation_seed = gr.") < position
+    # ...and directly above the six sliders it does write.
+    assert position < source.index("cut_density = gr.", tab)
 
 
 # ===========================================================================

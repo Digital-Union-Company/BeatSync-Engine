@@ -11,9 +11,10 @@ the same technique as the other GUI seam suites.
 Every one of these re-layouts was a **pure re-parenting**: every component definition and every
 event registration moved verbatim inside new `with` blocks, which R8 proved mechanically by
 comparing the complete set of `name = gr.X(` assignments before and after (233 names, unchanged).
-So the interesting assertions are mostly about what did *not* change, and the one genuinely new
-seam is the active-settings read-out. In particular this suite exists to catch the two ways a
-cosmetic re-layout can quietly break the app:
+So the interesting assertions are mostly about what did *not* change. The one genuinely new seam
+is the Creative Profile read-out, which R8 Commit C rebuilt around a different question -- see the
+section comment there. In particular this suite exists to catch the two ways a cosmetic re-layout
+can quietly break the app:
 
 * a widget **duplicated** instead of moved, giving one execution setting two sources of truth;
 * a widget moved into a tab while its event registration still names the old object, or a handler's
@@ -370,9 +371,9 @@ def test_the_quick_render_controls_are_two_side_by_side_sub_columns(tree: ast.Mo
 _MOVED_WIDGETS = (
     "audio_input", "source_mode", "source_folder", "source_recursive", "video_input",
     "scan_btn", "source_report", "confirm_btn", "confirm_status",
-    "custom_fps", "creative_preset", "output_filename",
+    "custom_fps", "creative_preset", "output_filename", "creative_profile_summary",
     "process_btn", "cancel_render_btn", "status_output", "video_output",
-    "open_output_folder_btn",
+    "open_output_folder_btn", "open_creative_settings_btn",
     "variation_seed", "randomize_btn", "surprise_btn",
     "cut_density", "micro_cuts", "semantic_emphasis", "energy_response", "motion_bias",
     "source_diversity",
@@ -457,10 +458,14 @@ def _section_span(source: str, label: str) -> tuple[int, int]:
 
 @pytest.mark.parametrize("widget", [
     "audio_input", "source_mode", "source_folder", "video_input", "custom_fps",
-    "creative_preset", "processing_mode", "output_filename", "process_btn", "cancel_render_btn",
-    "status_output", "video_output", "open_output_folder_btn", "active_settings_summary",
+    "processing_mode", "output_filename", "process_btn", "cancel_render_btn",
+    "status_output", "video_output", "open_output_folder_btn", "creative_profile_summary",
+    "open_creative_settings_btn",
 ])
 def test_the_render_workflow_is_on_the_render_tab(source: str, widget: str):
+    """[FORK] R8 Commit C: `creative_preset` left this list and joined the Creative Settings one,
+    and `active_settings_summary` was replaced by `creative_profile_summary`. The render tab now
+    carries a resolved SUMMARY of the creative state rather than one of its controls."""
     """Everything needed for one ordinary render, and nothing that needs another tab. This is the
     whole point of the refresh: Create Music Video used to sit below six collapsed accordions.
     """
@@ -472,6 +477,8 @@ def test_the_render_workflow_is_on_the_render_tab(source: str, widget: str):
     "variation_seed", "randomize_btn", "cut_density", "micro_cuts", "semantic_emphasis",
     "energy_response", "motion_bias", "source_diversity", "freestyle_enabled",
     "freestyle_summary", "surprise_btn",
+    # [FORK] R8 Commit C: the preset selector moved here, beside the six sliders it writes.
+    "creative_preset",
 ])
 def test_the_creative_state_is_on_the_creative_settings_tab(source: str, widget: str):
     start, end = _tab_span(source, "LABEL_TAB_CREATIVE_SETTINGS")
@@ -587,16 +594,40 @@ def test_library_preparation_is_open_now_that_it_owns_a_section(source: str):
 
 
 # ---------------------------------------------------------------------------------------------
-# The one new seam: the active-settings read-out
+# The Creative Profile read-out
+#
+# [FORK] R8 UX Refresh (Commit C). This section replaces the "active-settings read-out" block.
+# The widget, the handler and the question all changed, so the tests did too -- but the two
+# properties the old block existed to protect are carried forward verbatim and are still the
+# majority of what is asserted here:
+#
+#   1. it is a READ-OUT, not an authority -- writes nothing, stores nothing, reaches no render
+#      path, and cannot invalidate a confirmed source set;
+#   2. it never claims a render will be changed when it will not -- the over-reporting direction,
+#      which an earlier version got wrong twice.
+#
+# What is new is the under-reporting direction, which is the defect the owner actually reported:
+# the Creative Preset selector could read `Balanced` while Freestyle, a Variation Seed and SFX
+# were all armed. The composition rule now lives in `beatsync_fork.effective_profile` and has its
+# own suite (`test_effective_profile.py`); what is tested HERE is the GUI seam -- that the handler
+# delegates to it, is fed the right widgets, and writes only the one box.
 # ---------------------------------------------------------------------------------------------
 
 def test_the_summary_is_read_only(tree: ast.Module):
     assignment = next(n for n in ast.walk(tree)
                       if isinstance(n, ast.Assign) and len(n.targets) == 1
-                      and getattr(n.targets[0], "id", None) == "active_settings_summary")
+                      and getattr(n.targets[0], "id", None) == "creative_profile_summary")
     kwargs = {kw.arg: ast.unparse(kw.value) for kw in assignment.value.keywords}
     assert ast.unparse(assignment.value.func) == "gr.Textbox"
     assert kwargs["interactive"] == "False", "the read-out must not be editable"
+
+
+def test_the_old_active_settings_box_is_gone(tree: ast.Module, source: str):
+    """It is replaced, not kept alongside. Two boxes describing one render is how they start
+    disagreeing, and the old one's silence about the six creative controls was half the defect."""
+    assert "active_settings_summary" not in _code_only(tree), \
+        "the superseded read-out is still wired"
+    assert "LABEL_ACTIVE_SETTINGS" not in _code_only(tree)
 
 
 def test_the_summary_has_exactly_one_writer_and_it_is_the_tab(tree: ast.Module):
@@ -608,7 +639,7 @@ def test_the_summary_has_exactly_one_writer_and_it_is_the_tab(tree: ast.Module):
         if not isinstance(call, ast.Call):
             continue
         for keyword in call.keywords:
-            if keyword.arg == "outputs" and "active_settings_summary" in ast.unparse(keyword.value):
+            if keyword.arg == "outputs" and "creative_profile_summary" in ast.unparse(keyword.value):
                 writers.append(ast.unparse(call.func))
     assert writers == ["tab_render.select"], f"unexpected writers: {writers}"
 
@@ -620,67 +651,61 @@ def test_the_tab_select_writes_nothing_else(tree: ast.Module):
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                 and ast.unparse(n.func) == "tab_render.select")
     outputs = next(kw for kw in call.keywords if kw.arg == "outputs")
-    assert ast.unparse(outputs.value) == "[active_settings_summary]"
+    assert ast.unparse(outputs.value) == "[creative_profile_summary]"
 
 
 def test_the_tab_select_inputs_match_the_handler_signature(tree: ast.Module):
-    """Gradio passes handler arguments POSITIONALLY. This is the alignment every other GUI seam
-    suite pins for its own handler, asserted here for the new one.
+    """Gradio passes handler arguments POSITIONALLY.
 
-    Since R1 the ten Freestyle section dropdowns ride last and are collected by `*styles`, so the
-    named parameters must match the leading inputs exactly and the dropdowns must make up the
-    whole tail — a dropdown landing anywhere but the tail would be read as a named parameter.
-    """
-    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "tab_render.select")
-    inputs = next(kw for kw in call.keywords if kw.arg == "inputs")
-    # `[...] + freestyle_section_dropdowns`
-    assert isinstance(inputs.value, ast.BinOp), "the dropdowns must be appended as a whole list"
-    assert ast.unparse(inputs.value.right) == "freestyle_section_dropdowns"
-    names = [ast.unparse(element) for element in inputs.value.left.elts]
-
-    handler = _func(tree, "_on_quick_render_tab_select")
-    parameters = [argument.arg for argument in handler.args.args]
-    assert handler.args.vararg is not None and handler.args.vararg.arg == "styles", \
-        "the section dropdowns must be collected by *styles"
-    assert len(names) == len(parameters), (
-        f"{len(names)} named inputs for {len(parameters)} parameters: {names} vs {parameters}")
-
-    # Each parameter is named after its widget plus a suffix, except the checkbox which Gradio
-    # hands over under the same name.
-    for widget, parameter in zip(names, parameters):
-        assert parameter.startswith(widget), f"{parameter!r} is not fed by {widget!r}"
-
-
-def test_the_six_creative_sliders_are_not_inputs_of_the_read_out(tree: ast.Module):
-    """R1. The sliders were removed from this registration, and that removal IS the fix for the
-    one staleness hole the read-out had.
-
-    The Creative Preset writes all six sliders and sits on the Quick Render tab, so it could change
-    what the read-out reported while the read-out was already on screen and had no reason to
-    refresh. Everything still listed here lives in another tab, which means the `.select()` that
-    fires on the way back is sufficient to keep every one of them current — the read-out cannot be
-    stale about anything it still reports.
+    R8 shape: the six sliders LEAD (as the `creative_control_sliders` list, so the one contract
+    ordering is reused rather than restated), a fixed middle section follows, and the ten
+    Freestyle dropdowns ride LAST collected by `*styles`. A dropdown landing anywhere but the tail
+    would be read as a named parameter.
     """
     call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                 and ast.unparse(n.func) == "tab_render.select")
     inputs = next(kw for kw in call.keywords if kw.arg == "inputs")
     rendered = ast.unparse(inputs.value)
-    for slider in ("cut_density", "micro_cuts", "semantic_emphasis", "energy_response",
-                   "motion_bias", "source_diversity"):
-        assert slider not in rendered, f"{slider} is back in the read-out's inputs"
-    assert "creative_preset" not in rendered
+    assert rendered.startswith("creative_control_sliders +"), (
+        "the six sliders must be contributed as the existing ordered list, not re-listed: "
+        + rendered)
+    assert rendered.endswith("+ freestyle_section_dropdowns"), rendered
+
+    handler = _func(tree, "_on_render_tab_select")
+    parameters = [argument.arg for argument in handler.args.args]
+    assert handler.args.vararg is not None and handler.args.vararg.arg == "styles", \
+        "the section dropdowns must be collected by *styles"
+    # six sliders + the six middle inputs
+    assert len(parameters) == 12, parameters
+
+
+def test_the_six_creative_sliders_ARE_inputs_of_the_read_out(tree: ast.Module):
+    """R8 — the deliberate reversal of R1's removal, and the reason it is now safe.
+
+    R1 removed the sliders because the Creative Preset radio sat on the render tab and could
+    change all six while this box, refreshed only on tab selection, went on showing the old
+    answer. That was the one staleness hole the read-out had.
+
+    Commit C moved the preset to Creative Settings, so EVERY control this box describes now lives
+    on another tab and the `.select()` that fires on the way back is sufficient for all of them.
+    The hole is closed by the move, not by the omission -- and the omission was what made the
+    screen able to claim a plain `Balanced` render while Freestyle was armed.
+    """
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "tab_render.select")
+    inputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "inputs").value)
+    assert "creative_control_sliders" in inputs
+
+    # and the preset radio is genuinely NOT on the render tab any more, which is what makes the
+    # tab-selection refresh sufficient rather than merely convenient.
+    source = open(_GUI, encoding="utf-8").read()
+    render_start, render_end = _tab_span(source, "LABEL_TAB_RENDER")
+    assert not (render_start < source.index("creative_preset = gr.") < render_end), \
+        "the preset is back on the render tab, which reopens the staleness hole R1 closed"
 
 
 def test_the_preset_still_registers_exactly_one_handler(tree: ast.Module):
-    """R1 considered refreshing the read-out from `creative_preset.input` and rejected it.
-
-    Rebuilding the whole string needs `sfx_folder`, `sfx_roles` and `sfx_amount`, which
-    `test_audio_layers_seam.py::test_smart_mix_widgets_are_absent_from_source_and_preparation_wiring`
-    forbids on a `creative_preset` event outright, and it would have taken the selector to two
-    registrations against a pin that exists to keep it at one. Deleting the redundant line instead
-    needed neither guard relaxed. This asserts the guard stayed un-relaxed.
-    """
+    """Unchanged by R8: moving the selector to another tab is a re-parenting, not a rewiring."""
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Attribute)
              and getattr(n.func.value, "id", None) == "creative_preset"
@@ -691,9 +716,7 @@ def test_the_preset_still_registers_exactly_one_handler(tree: ast.Module):
 
 
 def test_the_summary_handler_writes_nothing_and_reads_no_state(tree: ast.Module):
-    handler = _func(tree, "_on_quick_render_tab_select")
-    # `_code_only` for the same reason as below: these bans are about machinery, and the docstring
-    # is free to name any of them while explaining their absence.
+    handler = _func(tree, "_on_render_tab_select")
     rendered = _code_only(handler)
     for forbidden in ("gr.update", "session_state", "gr.State", "_RENDER_LOCK", "subprocess",
                       "os.", "open(", "LAST_OUTPUT_PATH_KEY", "RENDER_OUTCOME_KEY"):
@@ -701,161 +724,162 @@ def test_the_summary_handler_writes_nothing_and_reads_no_state(tree: ast.Module)
     assert handler.returns is not None and ast.unparse(handler.returns) == "str"
 
 
-def test_the_summary_handler_is_total(tree: ast.Module):
-    """Selecting a tab must never raise. Every numeric read is guarded, because a Gradio Number can
-    legitimately arrive as None or as an empty string.
+def test_the_summary_builds_no_config_or_declaration_judgement_of_its_own(tree: ast.Module):
+    """Every verdict is delegated to the subsystem that owns it. Two places collapsing widgets
+    into a judgement is two chances to disagree about what the widgets mean, and both of this
+    handler's historical defects were exactly that.
     """
-    handler = _func(tree, "_on_quick_render_tab_select")
-    handlers = [n for n in ast.walk(handler) if isinstance(n, ast.ExceptHandler)]
-    assert handlers, "no exception handling at all in a function that parses widget values"
-    for node in handlers:
-        caught = ast.unparse(node.type)
-        assert "BaseException" not in caught, "BaseException must never be swallowed"
-        assert "TypeError" in caught and "ValueError" in caught, caught
+    rendered = _code_only(_func(tree, "_on_render_tab_select"))
+    assert "SmartMixConfig" not in rendered, "the read-out constructs its own Smart Mix config"
+    assert "plans_anything_from" in rendered, "the SFX verdict must come from the fork module"
+    assert "fork_effective.summary" in rendered, "the line must come from the fork module"
+    assert "matching_preset" not in rendered, \
+        "the preset label must come through effective_profile, not be recomputed here"
 
 
-def test_the_summary_reports_no_creative_preset(tree: ast.Module):
-    """The preset radio is on the Quick Render tab itself. Echoing it in the read-out would be the
-    one line that duplicates something already on screen — and a duplicated read-out is exactly
-    the stale-preview problem the Freestyle summary already had to be fixed for.
+def test_the_summary_is_absent_from_the_gate_and_prep_output_lists(source: str):
+    """Looking at a tab cannot invalidate a confirmed source set or move the preparation state
+    machine.
     """
-    rendered = _code_only(_func(tree, "_on_quick_render_tab_select"))
-    assert "creative_preset" not in rendered
-    assert "BALANCED_PRESET" not in rendered
-
-
-def test_the_summary_no_longer_judges_the_creative_controls(tree: ast.Module):
-    """R1 — replaces `test_the_summary_compares_against_the_fork_neutral_constant`.
-
-    That test pinned the "away from neutral" comparison to `fork_creative.DEFAULT_CONTROL` rather
-    than a restated `50`, which was right for as long as the line existed. The line is gone,
-    because the Creative Preset selector on the same tab already states the identical fact and
-    cannot go stale — `PRESETS["Balanced"]` is six 50s, and `matching_preset` recomputes the
-    selector from the live sliders — whereas this box refreshes only on tab selection.
-
-    So the handler must not re-acquire a creative-control opinion by any route: not the constant,
-    not a literal 50, and not the slider names.
-    """
-    rendered = _code_only(_func(tree, "_on_quick_render_tab_select"))
-    assert "DEFAULT_CONTROL" not in rendered
-    assert "50" not in rendered, "the neutral value must not be restated as a literal either"
-    for slider in ("cut_density", "micro_cuts", "semantic_emphasis", "energy_response",
-                   "motion_bias", "source_diversity"):
-        assert slider not in rendered, f"{slider} is back in the read-out"
+    for list_name in ("source_outputs = [", "prep_outputs = ["):
+        start = source.index(list_name)
+        end = source.index("]", start)
+        assert "creative_profile_summary" not in source[start:end], list_name
 
 
 def test_balanced_really_is_the_all_neutral_recipe():
-    """The equivalence the removal above rests on, asserted rather than assumed.
+    """Still asserted, for a different reason than before.
 
-    If a future retune moved `Balanced` off neutral, "the selector reads Balanced" would stop
-    meaning "every control is at its default" and dropping the line would start hiding something.
-    This fails loudly if that ever happens.
+    R1 relied on this equivalence to DELETE a line. R8 relies on it for the summary's honesty: an
+    untouched screen must read as the named default rather than as `Custom`, and that is only true
+    while `Balanced` is six times `DEFAULT_CONTROL`.
     """
     from beatsync_fork import creative as fork_creative
     from beatsync_fork import presets as fork_presets
 
     balanced = fork_presets.preset_values(fork_presets.BALANCED_PRESET)
     assert balanced is not None
-    assert set(balanced) == {fork_creative.DEFAULT_CONTROL}, (
-        "Balanced is no longer the all-neutral recipe, so the Creative Preset selector no longer "
-        "tells the user whether the six controls are at their defaults — the read-out line that "
-        "said so was removed on exactly that equivalence")
+    assert set(balanced) == {fork_creative.DEFAULT_CONTROL}
 
 
 # ---------------------------------------------------------------------------------------------
-# R1: the read-out's actual answers, executed
+# The read-out's actual answers, executed
 #
 # `gui.py` cannot be imported here, so the real handler body is AST-extracted and executed against
 # a namespace holding the real fork modules. These are behavioural assertions about the shipped
-# source, not assertions that some widget exists — the three R1 scenarios were all cases where the
-# structure was perfectly fine and the *answer* was wrong.
+# source, not assertions that some widget exists.
 # ---------------------------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def read_out(tree: ast.Module):
+    from beatsync_fork import effective_profile as fork_effective
     from beatsync_fork import freestyle as fork_freestyle
     from beatsync_fork import freestyle_random as fork_freestyle_random
+    from beatsync_fork import presets as fork_presets
     from beatsync_fork import smart_mix as fork_smart_mix
+    import ui_content
 
     namespace = {
         "fork_freestyle_random": fork_freestyle_random,
         "fork_smart_mix": fork_smart_mix,
+        "fork_effective": fork_effective,
         "_FREESTYLE_WIDGET_ORDER": fork_freestyle.SECTION_TYPES,
+        "CREATIVE_PROFILE_PLAIN_HINT": ui_content.CREATIVE_PROFILE_PLAIN_HINT,
+        "CREATIVE_PROFILE_MODIFIED_HINT": ui_content.CREATIVE_PROFILE_MODIFIED_HINT,
     }
-    exec(ast.unparse(_func(tree, "_on_quick_render_tab_select")), namespace)
-    handler = namespace["_on_quick_render_tab_select"]
+    exec(ast.unparse(_func(tree, "_on_render_tab_select")), namespace)
+    handler = namespace["_on_render_tab_select"]
 
-    def call(freestyle_enabled=False, seed=0, voice=None, sfx_folder="", sfx_roles=(),
-             sfx_amount=50, styles=None):
+    balanced = fork_presets.preset_values(fork_presets.BALANCED_PRESET)
+
+    def call(controls=None, freestyle_enabled=False, seed=0, voice=None, sfx_folder="",
+             sfx_roles=(), sfx_amount=50, styles=None):
         order = fork_freestyle.SECTION_TYPES
         resolved = styles or {}
-        return handler(freestyle_enabled, seed, voice, sfx_folder, sfx_roles, sfx_amount,
+        six = tuple(balanced if controls is None else controls)
+        return handler(*six, freestyle_enabled, seed, voice, sfx_folder, sfx_roles, sfx_amount,
                        *[resolved.get(section) for section in order])
 
     return call
 
 
-_NOTHING = "Nothing optional is active"
+def _first_line(answer: str) -> str:
+    return answer.splitlines()[0]
 
 
-def test_a_default_screen_reports_nothing_active(read_out):
-    assert read_out().startswith(_NOTHING)
+def test_an_untouched_screen_reads_as_the_named_default(read_out):
+    from beatsync_fork import presets as fork_presets
+
+    assert _first_line(read_out()) == fork_presets.BALANCED_PRESET
 
 
-# -- scenario 1: Freestyle ON but every section on Base ----------------------------------------
-
-def test_freestyle_on_with_every_section_base_is_not_reported(read_out):
-    """R1 scenario 1. The checkbox is ON, but `Base` means "inherit the live global value", so the
-    declaration has no overrides, `is_active()` is False, and the renderer takes the ordinary
-    global path. Claiming the sections are edited differently would be false.
-    """
+def test_a_named_preset_with_freestyle_armed_is_not_presented_as_unmodified(read_out):
+    """The defect the owner reported, asserted through the real shipped handler."""
     from beatsync_fork import freestyle as fork_freestyle
-
-    styles = {section: fork_freestyle.BASE_STYLE for section in fork_freestyle.SECTION_TYPES}
-    answer = read_out(freestyle_enabled=True, styles=styles)
-    assert answer.startswith(_NOTHING), answer
-    assert "Freestyle" not in answer
-
-
-def test_freestyle_on_with_one_real_rule_is_reported(read_out):
-    """The positive control for the above — the correction must not simply silence Freestyle."""
-    from beatsync_fork import freestyle as fork_freestyle
+    from beatsync_fork import presets as fork_presets
 
     styles = {section: fork_freestyle.BASE_STYLE for section in fork_freestyle.SECTION_TYPES}
     styles[fork_freestyle.SECTION_TYPES[0]] = "Cinematic"
+    answer = _first_line(read_out(freestyle_enabled=True, styles=styles))
+    assert answer != fork_presets.BALANCED_PRESET, answer
+    assert fork_presets.BALANCED_PRESET in answer and "Freestyle" in answer, answer
+
+
+def test_moving_a_slider_off_a_recipe_reads_as_custom(read_out):
+    from beatsync_fork import effective_profile as fork_effective
+
+    assert _first_line(read_out(controls=(7, 7, 7, 7, 7, 7))) == fork_effective.CUSTOM_LABEL
+
+
+def test_selecting_another_recipe_reads_as_that_recipe(read_out):
+    from beatsync_fork import presets as fork_presets
+
+    cinematic = fork_presets.preset_values("Cinematic")
+    assert _first_line(read_out(controls=cinematic)) == "Cinematic"
+
+
+# -- the over-reporting direction, preserved from the previous block ---------------------------
+
+def test_freestyle_on_with_every_section_base_is_not_reported(read_out):
+    """The checkbox is ON, but `Base` means "inherit the live global value", so the declaration
+    has no overrides, `is_active()` is False, and the renderer takes the ordinary global path.
+    """
+    from beatsync_fork import freestyle as fork_freestyle
+    from beatsync_fork import presets as fork_presets
+
+    styles = {section: fork_freestyle.BASE_STYLE for section in fork_freestyle.SECTION_TYPES}
     answer = read_out(freestyle_enabled=True, styles=styles)
-    assert "Freestyle: 1 section type(s)" in answer, answer
+    assert _first_line(answer) == fork_presets.BALANCED_PRESET, answer
+    assert "Freestyle" not in answer
 
 
 def test_freestyle_on_with_random_sections_is_reported(read_out):
     """`Random` is not a preset name, so V1's resolver answers `None` for it. The read-out must go
     through the V2 builder — reading ten Random sections as ten Base sections is the exact defect
-    that made PR #66 need an R1 of its own, and this is the same trap one layer up.
+    that made PR #66 need an R1 of its own.
     """
     from beatsync_fork import freestyle as fork_freestyle
     from beatsync_fork import freestyle_random as fork_freestyle_random
 
     styles = {section: fork_freestyle_random.RANDOM_STYLE
               for section in fork_freestyle.SECTION_TYPES}
-    answer = read_out(freestyle_enabled=True, styles=styles)
-    assert f"Freestyle: {len(fork_freestyle.SECTION_TYPES)} section type(s)" in answer, answer
+    assert "Freestyle" in read_out(freestyle_enabled=True, styles=styles)
 
 
 def test_freestyle_off_is_never_reported_whatever_the_sections_say(read_out):
     from beatsync_fork import freestyle as fork_freestyle
     from beatsync_fork import freestyle_random as fork_freestyle_random
+    from beatsync_fork import presets as fork_presets
 
     styles = {section: fork_freestyle_random.RANDOM_STYLE
               for section in fork_freestyle.SECTION_TYPES}
-    answer = read_out(freestyle_enabled=False, styles=styles)
-    assert answer.startswith(_NOTHING), answer
+    assert _first_line(read_out(freestyle_enabled=False, styles=styles)) \
+        == fork_presets.BALANCED_PRESET
 
 
 def test_the_freestyle_verdict_does_not_depend_on_the_seed(read_out):
-    """The seed is passed because it is in scope, but a `Random` section yields a rule for every
-    seed, so activity must be seed-independent. If this ever stopped being true the read-out would
-    start flickering as the Variation Seed changed.
-    """
+    """A `Random` section yields a rule for every seed, so activity must be seed-independent or
+    the read-out would flicker as the Variation Seed changed."""
     from beatsync_fork import freestyle as fork_freestyle
     from beatsync_fork import freestyle_random as fork_freestyle_random
 
@@ -866,56 +890,31 @@ def test_the_freestyle_verdict_does_not_depend_on_the_seed(read_out):
     assert verdicts == {True}
 
 
-# -- scenario 2: Smart Mix with Amount 0 --------------------------------------------------------
-
 def test_smart_mix_at_amount_zero_is_not_reported(read_out):
-    """R1 scenario 2. `SmartMixConfig.plans_anything` is `amount > 0 and enabled_roles`, so Amount
-    0 is a hard off-branch however many roles are ticked. The first version ignored Amount and
-    claimed SFX would be used.
-    """
+    """`plans_anything` is `amount > 0 and enabled_roles`, so Amount 0 is a hard off-branch
+    however many roles are ticked."""
+    from beatsync_fork import presets as fork_presets
+
     answer = read_out(sfx_folder=r"C:\sfx", sfx_roles=("impact", "transition"), sfx_amount=0)
-    assert answer.startswith(_NOTHING), answer
+    assert _first_line(answer) == fork_presets.BALANCED_PRESET, answer
     assert "Smart Mix" not in answer
 
 
 def test_smart_mix_with_roles_and_amount_is_reported(read_out):
-    answer = read_out(sfx_folder=r"C:\sfx", sfx_roles=("impact", "transition"), sfx_amount=60)
-    assert "Smart Mix: 2 SFX role(s) at Amount 60" in answer, answer
+    assert "Smart Mix" in read_out(sfx_folder=r"C:\sfx", sfx_roles=("impact",), sfx_amount=60)
 
 
 def test_smart_mix_with_no_roles_is_not_reported(read_out):
-    """The other documented way to mean off, and it was already handled — pinned so the Amount fix
-    cannot regress it.
-    """
-    answer = read_out(sfx_folder=r"C:\sfx", sfx_roles=(), sfx_amount=60)
-    assert answer.startswith(_NOTHING), answer
+    assert "Smart Mix" not in read_out(sfx_folder=r"C:\sfx", sfx_roles=(), sfx_amount=60)
 
 
 def test_smart_mix_without_a_folder_is_not_reported(read_out):
     """`plans_anything` cannot know this — the config carries no folder — so the handler checks it
-    separately. Without a library there is nothing to place whatever the three controls say.
-    """
-    answer = read_out(sfx_folder="   ", sfx_roles=("impact",), sfx_amount=60)
-    assert answer.startswith(_NOTHING), answer
-
-
-def test_the_read_out_builds_no_smart_mix_config_of_its_own(tree: ast.Module):
-    """`gui.py` must contain exactly one `SmartMixConfig` construction from widget values — the
-    render boundary's — because two places collapsing widgets into a config is two chances to
-    disagree about what the widgets mean. `test_audio_layers_seam.py` pins the count; this pins
-    the reason the read-out is not the second one, next to the code that would be tempted.
-    """
-    handler = _func(tree, "_on_quick_render_tab_select")
-    rendered = _code_only(handler)
-    assert "SmartMixConfig" not in rendered, "the read-out constructs its own Smart Mix config"
-    assert "plans_anything_from" in rendered, "the verdict must come from the fork module"
+    separately. Without a library there is nothing to place whatever the three controls say."""
+    assert "Smart Mix" not in read_out(sfx_folder="   ", sfx_roles=("impact",), sfx_amount=60)
 
 
 def test_the_amount_verdict_follows_the_fork_record_not_a_local_rule(read_out):
-    """The authority check: for every amount, the read-out's answer must equal
-    `SmartMixConfig.plans_anything`. A local `> 0` that happened to agree today would drift the
-    moment the record changed its mind.
-    """
     from beatsync_fork import smart_mix as fork_smart_mix
 
     for amount in (0, 1, 25, 50, 99, 100):
@@ -925,12 +924,10 @@ def test_the_amount_verdict_follows_the_fork_record_not_a_local_rule(read_out):
         assert ("Smart Mix" in answer) is expected, f"amount={amount}: {answer}"
 
 
-# -- the remaining reports, and totality --------------------------------------------------------
-
 def test_the_seed_and_voice_clips_are_still_reported(read_out):
-    assert "Variation Seed: 7" in read_out(seed=7)
+    assert "Variation Seed 7" in read_out(seed=7)
     assert "Variation Seed" not in read_out(seed=0)
-    assert "Audio Layers: 2 voice clip(s)" in read_out(voice=["a.wav", "b.wav"])
+    assert "Audio Layers" in read_out(voice=["a.wav", "b.wav"])
 
 
 def test_several_active_settings_are_all_listed(read_out):
@@ -940,9 +937,16 @@ def test_several_active_settings_are_all_listed(read_out):
     styles[fork_freestyle.SECTION_TYPES[0]] = "Dynamic"
     answer = read_out(freestyle_enabled=True, seed=99, voice=["v.wav"],
                       sfx_folder=r"C:\sfx", sfx_roles=("impact",), sfx_amount=40, styles=styles)
-    assert answer.startswith("This render will also use:")
-    for fragment in ("Freestyle: 1", "Variation Seed: 99", "Audio Layers: 1", "Smart Mix: 1"):
+    for fragment in ("Freestyle", "Variation Seed 99", "Audio Layers", "Smart Mix"):
         assert fragment in answer, f"{fragment} missing from {answer}"
+
+
+def test_a_modified_profile_says_where_to_change_it(read_out):
+    """Phase 2's "a clear way to open Creative Settings", in words as well as in the button."""
+    import ui_content
+
+    assert ui_content.CREATIVE_PROFILE_MODIFIED_HINT in read_out(seed=7)
+    assert ui_content.CREATIVE_PROFILE_PLAIN_HINT in read_out()
 
 
 @pytest.mark.parametrize("junk", [None, "", "abc", [], {}, object()])
@@ -950,9 +954,8 @@ def test_junk_widget_values_never_raise(read_out, junk):
     """Selecting a tab must never fail. Gradio can hand over `None` for an emptied Number, and the
     styles arrive straight from ten dropdowns.
     """
-    answer = read_out(freestyle_enabled=junk, seed=junk, voice=junk, sfx_folder=junk,
-                      sfx_roles=junk, sfx_amount=junk,
-                      styles=None)
+    answer = read_out(controls=(junk,) * 6, freestyle_enabled=junk, seed=junk, voice=junk,
+                      sfx_folder=junk, sfx_roles=junk, sfx_amount=junk, styles=None)
     assert isinstance(answer, str) and answer
 
 
@@ -962,6 +965,62 @@ def test_junk_section_styles_never_raise(read_out):
     styles = {section: object() for section in fork_freestyle.SECTION_TYPES}
     answer = read_out(freestyle_enabled=True, styles=styles)
     assert isinstance(answer, str) and answer
+
+
+# ---------------------------------------------------------------------------------------------
+# The Media Library video source (Phase 4)
+# ---------------------------------------------------------------------------------------------
+
+def test_the_media_library_choice_is_not_a_third_source_mode(tree: ast.Module, source: str):
+    """It is a local folder whose path was configured once instead of typed every time, so it maps
+    onto the EXISTING `LOCAL_FOLDER` mode and reuses the whole gate behind it. A third enum member
+    would have been a second source concept for the snapshot, the session state and every test
+    that enumerates modes.
+    """
+    assert "SOURCE_CHOICE_MEDIA_LIBRARY" in source
+    mapping = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.Assign) and len(n.targets) == 1
+                   and getattr(n.targets[0], "id", None) == "SOURCE_MODE_VALUES")
+    rendered = ast.unparse(mapping)
+    assert "SOURCE_CHOICE_MEDIA_LIBRARY: SourceMode.LOCAL_FOLDER" in rendered, rendered
+    # and no new SourceMode member was invented
+    from beatsync_fork.input_confirmation import SourceMode
+    assert {m.value for m in SourceMode} == {"local_folder", "browser_files"}
+
+
+def test_choosing_the_library_fills_the_folder_box_so_the_existing_gate_invalidates(
+        tree: ast.Module):
+    """The required behaviour is "changing the selected library must invalidate the previous
+    source confirmation exactly as changing the local folder already does". It is obtained by
+    construction rather than by a new rule: the handler WRITES `source_folder`, and that textbox's
+    own `.change` already invalidates.
+    """
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "source_mode.change")
+    outputs = ast.unparse(next(kw for kw in call.keywords if kw.arg == "outputs").value)
+    assert outputs.startswith("[source_folder,"), outputs
+    assert "source_outputs" in outputs
+
+    handler = _func(tree, "_on_source_mode_change")
+    assert "SOURCE_CHOICE_MEDIA_LIBRARY" in ast.unparse(handler)
+    assert "fork_prefs.CLIPS_LIBRARY" in ast.unparse(handler), \
+        "it must read the configured default video Media Library"
+
+
+def test_an_unconfigured_library_changes_nothing_and_says_so(tree: ast.Module):
+    """Clearing the box would silently destroy a path the operator had already typed; inventing
+    one would point the render at a directory nobody chose."""
+    handler = ast.unparse(_func(tree, "_on_source_mode_change"))
+    assert "STATUS_LIBRARY_SOURCE_UNSET" in handler
+    assert "gr.Warning" in handler
+
+
+def test_the_source_mode_handler_creates_no_directory(tree: ast.Module):
+    """A remembered path is a suggestion, not an action -- the same rule the whole preference
+    store follows."""
+    handler = _code_only(_func(tree, "_on_source_mode_change"))
+    for forbidden in ("makedirs", "mkdir", "scan_folder_action", "discover"):
+        assert forbidden not in handler, f"selecting a source mode reaches {forbidden}"
 
 
 # ---------------------------------------------------------------------------------------------

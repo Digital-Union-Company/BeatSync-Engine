@@ -234,3 +234,86 @@ that is preserved exactly: the retirement writes under `input/`, writes neither
 `RENDER_OUTCOME_KEY` nor `LAST_OUTPUT_PATH_KEY`, is unreachable from the render body, and the two
 publication renames are still asserted to be exactly two. The test now says all of that instead
 of counting to two.
+
+## Commit C — one truthful Creative Profile, and the Media Library as a source
+
+Phases 4 and 5. These are one commit because they are one change: the preset selector could only
+leave the Render tab once something truthful replaced it.
+
+### The defect, precisely
+
+The Creative Preset selector is an honest read-out of the six sliders — `matching_preset`
+recomputes it from their live values, so it is never wrong *about them*. The "Active optional
+settings" box was an honest list of the extras. Each was individually true, and **together they
+were misleading**: the screen could say `Balanced` while Freestyle rules, a Variation Seed and SFX
+were armed, and nothing anywhere said the render would not be a plain Balanced render.
+
+### What replaced them
+
+One resolved line on the Render tab, built by `beatsync_fork/effective_profile.py`:
+
+```
+Balanced                                 an untouched screen
+Cinematic                                a different recipe, nothing else on
+Custom                                   the six match no recipe
+Balanced + Freestyle (1 section rule)    the reported defect, fixed
+Custom + Variation Seed 7                measured live in the running app
+```
+
+### Why there is no "Custom — based on Balanced"
+
+The task's examples included it. It is **not implementable truthfully**, and the reason is a
+deliberate pre-existing decision rather than an oversight: this application stores no "last
+selected preset" anywhere, by rule (`.claude/rules/creative-presets.md`) and by test. Six integers
+describe a render completely, so a preset name is recomputed from them and then stops existing —
+which is what lets an old render reproduce from *its recorded values* rather than from a label
+whose recipe may since have been retuned.
+
+A remembered base would reintroduce exactly the second source of truth that decision removed, and
+would then be able to **disagree with the sliders** — the same class of defect this commit exists
+to remove. So a base is named only when it is verifiable: when the six live values match a recipe,
+that recipe *is* the base and is named; when they match none, there is no base to name and the
+answer is `Custom`. Both are recomputed from live state, so neither can go stale. A test asserts
+the module acquired no remembered-base state.
+
+### Why the six sliders came back into the read-out's inputs
+
+R1 had deliberately removed them, and the reason it gave is exactly the reason it is now safe to
+undo. R1 removed them because the preset radio sat on the Render tab and could change all six
+while the box — refreshed only on tab selection — went on showing the old answer. That was the one
+staleness hole the read-out had.
+
+Commit C moves the preset to Creative Settings, so **every** control the box describes now lives
+on another tab, and the `.select()` that fires on the way back is sufficient for all of them. The
+hole is closed by the move, not by the omission — and the omission was what let the screen claim a
+plain `Balanced` render while Freestyle was armed. No creative widget gained a second
+registration, which is the guard R1 refused to relax and this commit also does not.
+
+### "Reset Creative Overrides" was deliberately NOT added
+
+Phase 5 offered it as optional ("if useful"). It is **forbidden**:
+`.claude/rules/creative-presets.md` carries a standing prohibition on "a preset *button*,
+randomiser or reset for the six global controls", unchanged through four features. Selecting the
+`Balanced` preset already resets the six to neutral, which is the same action under a name that
+cannot be mistaken for a second authority. Adding a reset would have extended three writer
+matrices to duplicate an existing control.
+
+### "Use Media Library" is not a third source mode
+
+It is a local folder whose path the operator configured once instead of typing every time, so it
+maps onto the **existing** `LOCAL_FOLDER` mode and reuses the whole engine: the same scan, the
+same `SourceSnapshot` identity, the same confirmation gate, the same invalidation, the same media
+analysis. A third `SourceMode` member would have been a second source concept for the snapshot,
+the session state and every test that enumerates modes to carry forever — for a convenience.
+
+The required invalidation behaviour then comes **by construction rather than by a new rule**:
+selecting it *writes* `source_folder`, and that textbox's own `.change` already invalidates a
+confirmation. Measured in the running app with a configured library: selecting the option filled
+the folder in and the report immediately read `Folder changed. Press Scan Folder.` with Create
+Music Video disabled and the status `NOT CONFIRMED` — identical to editing the folder by hand,
+because it *is* editing the folder.
+
+An unconfigured library changes nothing and says where to set it. Clearing the box would silently
+destroy a path the operator had already typed; inventing one would point the render at a directory
+nobody chose. A configured-but-missing folder is filled in anyway **and reported**, so it can be
+corrected — and nothing is created, the same rule the whole preference store follows.
