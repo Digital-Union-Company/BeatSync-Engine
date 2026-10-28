@@ -286,14 +286,26 @@ class ClipRegistry:
             page.clips.clear()          # drop the path map: a revoked page holds no identities
 
     def publish_page(self, owner: Any, session_id: str, page_index: int,
-                     files: Iterable[tuple[int, str, int, int, int, int]]
+                     files: Iterable[tuple[int, str, int, int, int, int]],
+                     servable: Iterable[str] = SERVABLE_SUFFIXES
                      ) -> tuple[str, list[ClipEntry]]:
         """Mint one page of clip ids, revoking the session's previous page.
 
         ``files`` is ``[(index, abs_path, size, mtime_ns, dev, ino)]`` in the caller's already
         frozen enumeration order. This function never scans, sorts or re-reads the filesystem.
+
+        ``servable`` is the **allowlist** of suffixes a page may contain, and it is a parameter
+        rather than a constant because R7.2's Audio Preview authorizes audio through this same
+        registry. It defaults to :data:`SERVABLE_SUFFIXES`, so every R5 call site is unchanged and
+        a video page still cannot contain anything but the Raw Cutter's own output suffixes. It is
+        an allowlist in both uses -- never widened to "anything", and never derived from the
+        request -- so the defence below keeps meaning what it meant: a manifest, a sidecar or a
+        decision journal can never enter a page whatever discovery handed over.
         """
         key = _require_owner(owner)
+        allowed = tuple(str(s).casefold() for s in servable)
+        if not allowed:
+            raise Refusal(403, "no_servable_suffixes")
         with self._lock:
             session = self._session(key, session_id)
             if session.active_page_token:
@@ -306,7 +318,7 @@ class ClipRegistry:
             entries: list[ClipEntry] = []
             for index, path, size, mtime_ns, dev, ino in files:
                 suffix = os.path.splitext(path)[1].casefold()
-                if suffix not in SERVABLE_SUFFIXES:
+                if suffix not in allowed:
                     # Defence in depth. Discovery already filters, but a servable set must never
                     # be able to contain a manifest, a sidecar or anything else non-media.
                     continue
@@ -1334,6 +1346,73 @@ def validate_roots(input_folder: Any, library_folder: Any, rejected_folder: Any,
             if _is_within(root.real, protected) or _is_within(protected, root.real):
                 return Verdict(False, "protected_runtime_destination",
                                f"{root.role}: {root.real} vs {protected}"), ids
+
+    return Verdict(True), ids
+
+
+def compare_destinations(library_folder: Any, rejected_folder: Any) -> Verdict:
+    """Just the LIBRARY-versus-DISCARDED relationship: identical, or one inside the other.
+
+    Exists because that question is answerable **without knowing the input folder**, and R7.2's
+    Audio Preview has to answer it while the operator is still typing -- before anything has been
+    scanned. `validate_roots` identifies all three roots and returns on the first failure, so with
+    no input folder yet it refuses with `empty_path` and never reaches the comparison the operator
+    actually needs to see.
+
+    This is a strict subset of `validate_roots` and uses the same helpers, so the two cannot drift
+    into disagreeing about what "the same folder" means. It is **not** a substitute for it: it says
+    nothing about the input folder or the protected runtime list, so a caller that is about to move
+    a file must still run the full check.
+    """
+    left, verdict = identify_root(ROLE_LIBRARY, library_folder)
+    if not verdict.ok:
+        return verdict
+    right, verdict = identify_root(ROLE_REJECTED, rejected_folder)
+    if not verdict.ok:
+        return verdict
+
+    if _same_location(left, right):                        # type: ignore[arg-type]
+        return Verdict(False, "destinations_identical", f"{left.real} == {right.real}")
+    if _is_within(left.real, right.real) or _is_within(right.real, left.real):
+        return Verdict(False, "destinations_nested", f"{left.real} / {right.real}")
+    return Verdict(True)
+
+
+def validate_one_destination(input_folder: Any, destination: Any, role: str = ROLE_LIBRARY,
+                             app_root: str = "") -> tuple[Verdict, dict[str, RootIdentity]]:
+    """The subset of :func:`validate_roots` that applies when only ONE destination will be written.
+
+    Exists for R7.2's audio review, where an operator who keeps everything and discards nothing
+    should not have to name a quarantine folder to file a clip. Every rule that can be stated about
+    a single destination is applied **through the same helpers** `validate_roots` uses -- real-path
+    resolution, `commonpath` containment, the Windows `(st_dev, st_ino)` alias cross-check and the
+    protected-runtime list -- so the two cannot drift into disagreeing about what "inside" means.
+
+    What it deliberately cannot check is the destination *pair*: identical and nested destinations
+    are relationships between two folders, so a caller that will write both must use
+    :func:`validate_roots` instead. :func:`beatsync_fork.audio_review.validate_destinations` is the
+    one place that decides which of the two applies.
+    """
+    ids: dict[str, RootIdentity] = {}
+    for which, typed in ((ROLE_INPUT, input_folder), (role, destination)):
+        ident, verdict = identify_root(which, typed)
+        if not verdict.ok:
+            return verdict, ids
+        ids[which] = ident                                 # type: ignore[assignment]
+
+    inp, dest = ids[ROLE_INPUT], ids[role]
+
+    if _same_location(inp, dest):
+        return Verdict(False, f"{role}_is_input", f"{dest.real} == {inp.real}"), ids
+    if _is_within(dest.real, inp.real):
+        return Verdict(False, "destination_inside_input", f"{role}: {dest.real}"), ids
+    if _is_within(inp.real, dest.real):
+        return Verdict(False, "input_inside_destination", f"{role}: {dest.real}"), ids
+
+    for protected in protected_destinations(app_root):
+        if _is_within(dest.real, protected) or _is_within(protected, dest.real):
+            return Verdict(False, "protected_runtime_destination",
+                           f"{role}: {dest.real} vs {protected}"), ids
 
     return Verdict(True), ids
 
@@ -3394,5 +3473,7 @@ __all__ = [
     "io_detail",
     "parse_range",
     "protected_destinations",
+    "compare_destinations",
+    "validate_one_destination",
     "validate_roots",
 ]

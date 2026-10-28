@@ -113,21 +113,38 @@ def _registrations(tree: ast.Module, suffix: str) -> list[ast.Call]:
 #: containment assertion below needs no index change, and the new tab's markup stays OUT of the
 #: `source[cutter:advanced]` block that
 #: `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans for `gr.Accordion`.
+#: Amended by R7: a SIXTH top-level tab, the Raw Audio Cutter, placed between Advanced Tools and
+#: Clips Preview. That slot keeps Advanced Tools at index 3 -- so every containment assertion here
+#: that counts from the front is unaffected -- and keeps Clips Preview LAST, which its own
+#: assertion below requires.
+#: Amended by R7.2: a SEVENTH, the standalone Audio Preview review tab, in the same slot and for
+#: exactly the same two reasons -- between Audio Cutter and Clips Preview, so Advanced Tools stays
+#: at index 3 and Clips Preview stays last.
 _TABS = ("LABEL_TAB_QUICK_RENDER", "LABEL_TAB_CREATIVE_STUDIO", "LABEL_TAB_RAW_CUTTER",
-         "LABEL_TAB_ADVANCED", "LABEL_TAB_CLIPS_PREVIEW")
+         "LABEL_TAB_ADVANCED", "LABEL_TAB_AUDIO_CUTTER", "LABEL_TAB_AUDIO_PREVIEW",
+         "LABEL_TAB_CLIPS_PREVIEW")
 
 
-def test_there_are_exactly_five_tabs(tree: ast.Module):
+def test_the_tab_set_is_exactly_the_documented_one(tree: ast.Module):
+    """Asserted by IDENTITY, not by a bare count.
+
+    The count alone used to do double duty -- it kept the topology fixed *and* incidentally banned
+    any further tab. R7 legitimately adds one, and renumbering a count would let any mistaken tab
+    satisfy it. So the set itself is the assertion: these labels, nothing else.
+    """
     items = [i for i in _with_items(tree) if i.startswith("gr.Tab(")]
-    assert len(items) == 5, f"expected five tabs, found {len(items)}: {items}"
+    assert len(items) == len(_TABS), f"expected {len(_TABS)} tabs, found {len(items)}: {items}"
+    for label in _TABS:
+        assert any(i.startswith(f"gr.Tab({label}") for i in items), f"{label} is not a tab"
     assert len([i for i in _with_items(tree) if i.startswith("gr.Tabs(")]) == 1
 
 
 def test_the_tabs_are_the_documented_five_in_order(source: str):
     positions = [source.index(f"gr.Tab({label}") for label in _TABS]
     assert positions == sorted(positions), (
-        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools, then Clips "
-        "Preview — the order is load-bearing for several containment assertions in other suites")
+        "Quick Render, then Creative Studio, then Raw Cutter, then Advanced Tools, then Audio "
+        "Cutter, then Clips Preview — the order is load-bearing for several containment "
+        "assertions in other suites")
 
 
 def test_the_raw_cutter_is_a_top_level_tab_not_an_accordion(source: str, tree: ast.Module):

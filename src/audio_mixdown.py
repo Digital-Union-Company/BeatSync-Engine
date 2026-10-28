@@ -89,6 +89,9 @@ from ffmpeg_processing import FFMPEG_PATH, FFPROBE_PATH
 
 from beatsync_fork import audio_mix as fork_audio_mix
 from beatsync_fork import smart_mix as fork_smart_mix
+# [FORK] R7.1 (Comfort Mix): EBU R128 measurement and the bounded gains it implies. Pure
+# stdlib fork module; its one process launch lives there, not here.
+from beatsync_fork import loudness as fork_loudness
 # [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module). This
 # module keeps its own small cancellable runner below rather than importing
 # ffmpeg_processing._run_media_command -- the process handle always belongs to the call frame that
@@ -396,7 +399,8 @@ def escape_filter_expression(expression: str) -> str:
 
 
 def build_mix_command(music_path: str, plan, output_path: str,
-                      sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT) -> list:
+                      sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
+                      balance=None) -> list:
     """The complete argv for one mixdown. One list, no shell — the filtergraph never meets a shell.
 
     Input order is fixed and positional, never derived from a dict: **0 is always the music**, voice
@@ -407,7 +411,26 @@ def build_mix_command(music_path: str, plan, output_path: str,
     plan data. :class:`SfxPlacement` is frozen and deliberately carries no gain, and ``AudioMixPlan``
     gained only ``sfx_placements`` — so the one global linear SFX gain is threaded here instead. The
     default exists for direct/test callers; the production path always passes the resolved value.
+
+    [FORK] R7.1 (Comfort Mix): ``balance`` is a :class:`fork_loudness.GainPlan` or ``None``, and is
+    an execution argument for the same reason. **``None``, or a plan that was not applied, emits
+    exactly the pre-R7.1 filtergraph** — not a unity ``volume`` filter, not a re-derived "legacy
+    balance", simply the original chain with nothing inserted. That is what makes Auto Balance OFF
+    byte-identical rather than merely equivalent, and a seam test compares the two argv directly.
+
+    When it IS applied the two gains are inserted *before* ``amix``: on the music input ahead of
+    the duck envelope, and on each voice input ahead of its ``adelay``. Applying them before the
+    mix is the whole point — correcting afterwards could only change the master's overall level,
+    never the relationship between the two things in it. Smart Mix SFX are deliberately **not**
+    touched: their level is already the operator's own slider.
     """
+    # Each insert is a LEADING-COMMA fragment or the empty string, so with no balance every
+    # f-string below collapses to exactly the text it produced before R7.1 -- no `volume=1.0`, no
+    # `anull`, nothing.
+    applied = bool(balance is not None and getattr(balance, "applied", False))
+    music_volume = (f",volume={float(balance.music_gain):.6f}" if applied else "")
+    voice_volume = (f",volume={float(balance.voice_gain):.6f}" if applied else "")
+
     command = [FFMPEG_PATH, "-y", "-i", music_path]
     for placement in plan.placements:
         command += ["-i", placement.path]
@@ -426,7 +449,7 @@ def build_mix_command(music_path: str, plan, output_path: str,
             f"d={plan.music_duration:.6f},"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo[env]",
             f"[0:a]aresample={MASTER_SAMPLE_RATE},"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[mus]",
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo{music_volume}[mus]",
             "[mus][env]amultiply[music]",
         ]
     else:
@@ -435,14 +458,14 @@ def build_mix_command(music_path: str, plan, output_path: str,
         # and `amultiply` by it is an exact no-op — generating a full-length 48 kHz stereo stream to
         # multiply by one is pure waste on an SFX-only or music-only mix.
         chain.append(f"[0:a]aresample={MASTER_SAMPLE_RATE},"
-                     f"aformat=sample_fmts=fltp:channel_layouts=stereo[music]")
+                     f"aformat=sample_fmts=fltp:channel_layouts=stereo{music_volume}[music]")
 
     labels = ["[music]"]
     stream = 0
     for stream, placement in enumerate(plan.placements, start=1):
         chain.append(
             f"[{stream}:a]aresample={MASTER_SAMPLE_RATE},"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo{voice_volume},"
             f"adelay={int(round(placement.start * 1000))}:all=1[v{stream}]")
         labels.append(f"[v{stream}]")
 
@@ -479,6 +502,48 @@ def build_mix_command(music_path: str, plan, output_path: str,
     return command
 
 
+def measure_balance(music_path: str, plan, lifecycle=None):
+    """Measure the music and the voice, and answer the gains to apply. Never raises.
+
+    **Returns `(GainPlan, report_text)`.** The caller passes the plan straight to
+    :func:`build_mix_command`, where an unapplied plan contributes nothing at all.
+
+    Which voice clip is measured: the **longest placed one**, as the representative of the set.
+    Measuring every clip and averaging was considered and rejected for V1 — it multiplies the
+    analysis passes by the clip count for a number that a single short "mm-hm" can still skew, and
+    the longest clip is the one whose level the listener actually forms an impression from. The
+    report names the file, so an operator can see what was measured rather than guess.
+
+    A cancellation propagates: `raise_if_cancelled` is checked before each pass, and these are
+    ordinary bounded FFmpeg reads that a Stop should not have to wait out.
+    """
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
+
+    music = fork_loudness.measure(FFMPEG_PATH, music_path)
+
+    representative = None
+    for placement in plan.placements:
+        if representative is None or placement.duration > representative.duration:
+            representative = placement
+    if representative is None:
+        return (fork_loudness.GainPlan(
+            applied=False,
+            notes=("Auto Balance did nothing: there are no voice clips to balance against.",)),
+            "Auto Balance: no voice clips, so the music was left exactly as it is.")
+
+    if lifecycle is not None:
+        lifecycle.raise_if_cancelled()
+    voice = fork_loudness.measure(FFMPEG_PATH, representative.path)
+
+    gains = fork_loudness.plan_gains(music, voice)
+    name = os.path.basename(representative.path)
+    report = ("Auto Balance (EBU R128)\n"
+              + fork_loudness.describe_plan(music, voice, gains)
+              + f"\nVoice reading taken from the longest clip: {name}")
+    return gains, report
+
+
 def master_path_for(session_dir: str) -> str:
     """A fresh master path per render, so a stale mix can never be picked up by a later one."""
     return os.path.join(session_dir, f"beatsync_mix_{uuid.uuid4().hex}.wav")
@@ -491,7 +556,7 @@ def master_path_for(session_dir: str) -> str:
 
 def render_mixed_master(music_path: str, plan, output_path: str,
                         sfx_level_percent: int = fork_smart_mix.DEFAULT_SFX_LEVEL_PERCENT,
-                        lifecycle=None) -> str:
+                        balance=None, lifecycle=None) -> str:
     """Produce the mixed master and verify it. Raises :class:`AudioMixError` on any failure.
 
     [FORK] Digital-Union (C3-R1A): ``lifecycle`` defaults to ``None`` (unchanged behaviour). A
@@ -509,7 +574,7 @@ def render_mixed_master(music_path: str, plan, output_path: str,
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
     command = build_mix_command(music_path, plan, output_path,
-                                sfx_level_percent=sfx_level_percent)
+                                sfx_level_percent=sfx_level_percent, balance=balance)
     try:
         result = _run(command, _MIX_TIMEOUT_SECONDS, lifecycle=lifecycle)
     except subprocess.TimeoutExpired:
@@ -602,10 +667,18 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     if sfx_placements:
         plan = dataclasses.replace(plan, sfx_placements=sfx_placements)
 
+    # [FORK] R7.1: measure ONLY when the operator asked for it. With Auto Balance off this is not
+    # merely a no-op gain -- no analysis pass runs at all, so an ordinary render costs exactly what
+    # it cost before.
+    balance, balance_report = None, ""
+    if getattr(config, "auto_balance", False):
+        balance, balance_report = measure_balance(music_path, plan, lifecycle=lifecycle)
+
     output_path = master_path_for(session_dir)
     try:
         render_mixed_master(music_path, plan, output_path,
-                            sfx_level_percent=sfx_level_percent, lifecycle=lifecycle)
+                            sfx_level_percent=sfx_level_percent, lifecycle=lifecycle,
+                            balance=balance)
     except AudioMixError:
         discard_master(output_path)
         raise
@@ -615,6 +688,10 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
         # still escape unchanged so the caller sees a typed cancellation, not an AudioMixError.
         discard_master(output_path)
         raise
+    # The report rides on the plan so the GUI can show what was measured without this function
+    # growing a third return value that every existing caller would have to unpack.
+    if balance_report:
+        plan = dataclasses.replace(plan, balance_report=balance_report)
     return output_path, plan
 
 

@@ -226,9 +226,22 @@ from beatsync_fork import clips_review as fork_clips
 # suites pin this module's `subprocess.run` site count at exactly two.
 from beatsync_fork import desktop_folders as fork_folders
 from beatsync_fork import user_prefs as fork_prefs
+# [FORK] Digital-Union (R7 Raw Audio Cutter V1): the silence planner, the FFmpeg argv builders and
+# the filing rules. Stdlib-only fork modules, so they import at module scope; both process launches
+# live inside `audio_cutter` rather than here, because two suites pin this module's
+# `subprocess.run` site count at exactly two.
+from beatsync_fork import audio_cutter as fork_audio
+from beatsync_fork import audio_library as fork_audio_library
+# [FORK] Digital-Union (R7.2): the ONE audio review core — enumeration, paging, the tile markup,
+# the decision vocabulary, the sort plan and the destination rules — shared by the Raw Audio
+# Cutter's review half and the standalone Audio Preview tab. Stdlib-only like its siblings.
+from beatsync_fork import audio_review as fork_audio_review
 # [FORK] Digital-Union (R5): the ASGI media endpoint and Starlette's middleware wrapper. The
 # wrapper is a Gradio dependency already, so this adds nothing to requirements.
 from clips_media_server import ClipMediaMiddleware
+# [FORK] Digital-Union (R7.2): the audio sibling of that endpoint. One route, GET/HEAD, range
+# capable, reusing R5's registry and its six authorization gates unmodified.
+from audio_media_server import AudioMediaMiddleware
 from starlette.middleware import Middleware
 # [FORK] Digital-Union (Raw Cutter Batch V1): the pure batch bookkeeping — the outcome vocabulary,
 # the collision-safe output layout, the totals, the manifest payload and every line of report text.
@@ -536,6 +549,356 @@ CLIPS_GALLERY_CSS = """
 #
 # A tile is repainted ONLY from a server response. The DOM is a rendering of the decision record,
 # never the record itself.
+# [FORK] Digital-Union (R7.1, rebuilt in R7.2): the audio galleries' interaction layer.
+#
+# Deliberately independent of CLIPS_GALLERY_JS rather than a generalisation of it. That one talks
+# to a durable decision journal and posts every classification to the server; these galleries keep
+# their decisions in the page until Confirm. They now share an authorised media endpoint, but that
+# is one URL in a dataset attribute, not shared behaviour -- merging the two clients would make
+# both harder to reason about for no gain.
+#
+# The hidden field named by the grid's `data-store` is the whole server contract: every decision and
+# every edited name lives in it as JSON, and Confirm reads nothing else from the browser.
+#
+# R7.2 changed three things, all of them consequences of the audio no longer being in the page:
+#
+# 1. **ONE <audio> element exists for the whole document**, created on first hover and re-pointed
+#    at whichever tile the pointer is over. R7.1 had one per tile, pre-loaded with base64 bytes; a
+#    page of 60 clips therefore carried 60 decoded buffers and was capped by a byte budget that made
+#    valid clips unplayable. Now the page holds markup only and the bytes arrive on demand.
+# 2. **Tiles are addressed per grid.** Two galleries exist in R7.2 and both render a `.r7-grid`, so
+#    every lookup starts from the grid the tile belongs to and the hidden field and counts box are
+#    read off that grid's `data-store` / `data-counts`. A document-wide `#audio-decisions` lookup
+#    would make the Audio Preview tab write the Audio Cutter's decisions.
+# 3. **A failure to play is reported as what it is.** There is no loading limit any more, so the
+#    only remaining failures are real ones -- the fetch was refused, or the browser cannot decode
+#    the bytes -- and `MediaError` distinguishes them. A clip that will not play stays classifiable.
+AUDIO_GALLERY_JS = r"""
+() => {
+  if (window.__r7Installed) { return; }
+  window.__r7Installed = true;
+
+  const PENDING = 'PENDING', SELECTED = 'SELECTED', REJECTED = 'REJECTED';
+  const CLS = {PENDING: 'r7-pending', SELECTED: 'r7-selected', REJECTED: 'r7-rejected'};
+  const BADGE = {PENDING: '?', SELECTED: '\u2713', REJECTED: '\u2717'};
+
+  let armed = true;          // false once the browser has refused an audible play()
+  let player = null;         // the ONE <audio> in the document, created on first hover
+  let holder = null;         // the tile `player` is currently pointed at, if any
+
+  // Seconds per wheel notch, scaled to the clip -- the same convention the Clips Preview uses, so
+  // the two galleries do not behave differently under the same gesture. 1s under 20s, 2s up to and
+  // including 90s, 5s beyond.
+  function seekStep(duration) {
+    if (!isFinite(duration) || duration <= 0) { return 2; }
+    if (duration < 20) { return 1; }
+    if (duration <= 90) { return 2; }
+    return 5;
+  }
+
+  function gridOf(tile) { return tile && tile.closest ? tile.closest('.r7-grid') : null; }
+  function tilesIn(grid) {
+    return grid ? Array.from(grid.querySelectorAll('.r7-tile')) : [];
+  }
+  function grids() { return Array.from(document.querySelectorAll('.r7-grid')); }
+  function stateOf(tile) { return tile ? tile.querySelector('.r7-state') : null; }
+
+  function fieldIn(elemId) {
+    if (!elemId) { return null; }
+    const host = document.getElementById(elemId);
+    return host ? (host.querySelector('textarea') || host.querySelector('input')) : null;
+  }
+
+  // Gradio tracks a textbox's value from the native setter plus an `input` event. Setting
+  // `.value` directly does NOT update its internal store, which is why the prototype descriptor
+  // is used -- measured in R7.1 and unchanged.
+  function writeField(box, text) {
+    if (!box || box.value === text) { return; }
+    const proto = box.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(box, text);
+    box.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+
+  // ---- the hidden field is the only thing the server reads -----------------------------------
+  function publish(grid) {
+    if (!grid) { return; }
+    const field = fieldIn(grid.dataset.store);
+    if (!field) { return; }
+    const decisions = {}, names = {};
+    tilesIn(grid).forEach(tile => {
+      const key = tile.dataset.idx;
+      decisions[key] = tile.dataset.decision || PENDING;
+      const box = tile.querySelector('input.r7-name');
+      if (box) { names[key] = box.value; }
+    });
+    writeField(field, JSON.stringify({decisions: decisions, names: names}));
+    paintCounts(grid);
+  }
+
+  function paintCounts(grid) {
+    if (!grid) { return; }
+    const box = fieldIn(grid.dataset.counts);
+    if (!box) { return; }
+    let keep = 0, drop = 0, pend = 0;
+    const all = tilesIn(grid);
+    all.forEach(tile => {
+      const d = tile.dataset.decision || PENDING;
+      if (d === SELECTED) { keep++; } else if (d === REJECTED) { drop++; } else { pend++; }
+    });
+    let text = 'Keep ' + keep + '   \u00b7   Discard ' + drop
+             + '   \u00b7   Undecided ' + pend + '   \u00b7   Total ' + all.length;
+    // [R7.2] Confirm needs one kept clip, not a fully decided page. Saying so here is display
+    // text only: it enables nothing, and the server re-derives the whole plan from its own
+    // record before it moves anything.
+    if (keep === 0) { text += '   \u2014   mark at least one clip to Keep'; }
+    else if (pend > 0) {
+      text += '   \u2014   ' + pend + ' unmarked will be Discarded unless you mark them';
+    }
+    writeField(box, text);
+  }
+
+  function classify(tile, decision) {
+    if (!tile) { return; }
+    tile.dataset.decision = decision;
+    Object.keys(CLS).forEach(key => tile.classList.remove(CLS[key]));
+    tile.classList.add(CLS[decision]);
+    const badge = tile.querySelector('.r7-badge');
+    if (badge) { badge.textContent = BADGE[decision]; }
+    publish(gridOf(tile));
+  }
+
+  // ---- playback: ONE element, created on demand, pointed at one tile at a time ---------------
+  function ensurePlayer() {
+    if (player) { return player; }
+    player = document.createElement('audio');
+    player.className = 'r7-audio';
+    // `metadata` is enough to answer `duration`, which Shift+wheel needs; the endpoint serves
+    // byte ranges, so seeking fetches only the part it needs rather than the whole clip.
+    player.preload = 'metadata';
+    player.loop = true;
+    player.style.display = 'none';
+    // A failure now means something real: the page no longer declines to load anything.
+    player.addEventListener('error', () => {
+      const tile = holder;
+      if (!tile) { return; }
+      tile.classList.remove('r7-playing');
+      tile.classList.add('r7-failed');
+      const label = stateOf(tile);
+      const code = player.error ? player.error.code : 0;
+      let why = 'cannot be played';
+      if (code === 2) { why = 'the server refused it \u2014 rescan'; }
+      else if (code === 3) { why = 'the audio could not be decoded'; }
+      else if (code === 4) { why = 'this format is not playable here'; }
+      if (label) { label.textContent = why; }
+    }, true);
+    document.body.appendChild(player);
+    return player;
+  }
+
+  function stop() {
+    if (!player) { holder = null; return; }
+    try {
+      player.pause();
+      player.currentTime = 0;
+    } catch (e) {}
+    // Releasing the source matters twice over: it ends the HTTP fetch, and on Windows it releases
+    // the handle the server opened -- `os.rename` will not move a file another handle still has
+    // open, so the clip the operator just listened to is exactly the one that would refuse to
+    // sort. `removeAttribute` then `load()` is what actually drops it; setting src='' re-requests
+    // the page URL in Chrome.
+    try {
+      player.removeAttribute('src');
+      player.load();
+    } catch (e) {}
+    if (holder) {
+      holder.classList.remove('r7-playing');
+      const label = stateOf(holder);
+      if (label && !holder.classList.contains('r7-failed')) {
+        label.textContent = armed ? 'hover to play' : 'click Enable hover audio';
+      }
+    }
+    holder = null;
+  }
+
+  function play(tile) {
+    const url = tile ? tile.dataset.audio : '';
+    if (!url) { return; }
+    stop();                                   // never two at once
+    const audio = ensurePlayer();
+    holder = tile;
+    tile.classList.remove('r7-failed');
+    tile.classList.add('r7-playing');
+    audio.muted = false;                      // the operator needs to HEAR it; never a silent fake
+    audio.volume = 1.0;
+    audio.src = url;
+    const label = stateOf(tile);
+    if (label) { label.textContent = 'loading\u2026'; }
+    const started = audio.play();
+    if (started && typeof started.catch === 'function') {
+      started.catch(error => {
+        if (holder !== tile) { return; }                 // the pointer already moved on
+        if (error && error.name === 'AbortError') { return; }
+        if (error && error.name === 'NotAllowedError') {
+          // Chrome refuses audible autoplay before a user gesture. Say so and offer the one click
+          // that fixes it -- deliberately NOT falling back to muted playback, which would look
+          // like it worked while the operator heard nothing.
+          armed = false;
+          tile.classList.remove('r7-playing');
+          if (label) { label.textContent = 'click Enable hover audio'; }
+          document.querySelectorAll('.r7-enable-hover').forEach(b => {
+            b.classList.add('r7-needed');
+          });
+          return;
+        }
+        // Anything else is a genuine load or decode failure; the `error` listener names it.
+        tile.classList.remove('r7-playing');
+        tile.classList.add('r7-failed');
+        if (label && label.textContent === 'loading\u2026') {
+          label.textContent = 'cannot be played';
+        }
+      });
+    }
+    if (label) {
+      audio.addEventListener('playing', () => {
+        if (holder === tile && label) { label.textContent = 'playing\u2026'; }
+      }, {once: true});
+    }
+  }
+
+  // ---- events ---------------------------------------------------------------------------------
+  document.addEventListener('mouseover', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile || !gridOf(tile)) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    if (holder === tile) { return; }
+    play(tile);
+  }, true);
+
+  document.addEventListener('mouseout', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    const to = event.relatedTarget;
+    if (to && to.closest && to.closest('.r7-tile') === tile) { return; }   // still inside
+    if (holder === tile) { stop(); }
+  }, true);
+
+  document.addEventListener('click', event => {
+    const banner = event.target.closest
+      ? event.target.closest('.r7-enable-hover') : null;
+    if (banner) {
+      // This click IS the gesture Chrome wanted.
+      armed = true;
+      document.querySelectorAll('.r7-enable-hover').forEach(b => {
+        b.classList.remove('r7-needed');
+      });
+      const first = tilesIn(grids()[0])[0];
+      if (first) { play(first); setTimeout(stop, 400); }
+      return;
+    }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    classify(tile, SELECTED);
+  }, true);
+
+  document.addEventListener('contextmenu', event => {
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (event.target.classList && event.target.classList.contains('r7-name')) { return; }
+    event.preventDefault();
+    classify(tile, REJECTED);
+  }, true);
+
+  document.addEventListener('auxclick', event => {
+    if (event.button !== 1) { return; }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    event.preventDefault();
+    classify(tile, PENDING);
+  }, true);
+
+  document.addEventListener('keydown', event => {
+    const tile = document.activeElement && document.activeElement.closest
+      ? document.activeElement.closest('.r7-tile') : null;
+    if (!tile) { return; }
+    if (document.activeElement.classList
+        && document.activeElement.classList.contains('r7-name')) { return; }
+    const key = event.key.toLowerCase();
+    if (key === 's') { event.preventDefault(); classify(tile, SELECTED); }
+    else if (key === 'r') { event.preventDefault(); classify(tile, REJECTED); }
+    else if (key === 'p') { event.preventDefault(); classify(tile, PENDING); }
+    else if (key === 'arrowright' || key === 'arrowleft'
+             || key === 'arrowdown' || key === 'arrowup') {
+      const all = tilesIn(gridOf(tile));
+      const at = all.indexOf(tile);
+      if (at < 0) { return; }
+      event.preventDefault();
+      const step = (key === 'arrowright' || key === 'arrowdown') ? 1 : -1;
+      const next = all[Math.min(all.length - 1, Math.max(0, at + step))];
+      if (next) { next.focus(); play(next); }
+    }
+  }, true);
+
+  // Shift+wheel seeks the tile under the pointer, which is by construction the one holding the
+  // player. `{passive:false}` is needed or preventDefault is ignored; Chrome re-routes a shifted
+  // wheel to deltaX on some devices, so whichever axis moved is read.
+  document.addEventListener('wheel', event => {
+    if (!event.shiftKey) { return; }
+    const tile = event.target.closest ? event.target.closest('.r7-tile') : null;
+    if (!tile || holder !== tile || !player) { return; }
+    const moved = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (!moved) { return; }
+    event.preventDefault();
+    // `duration` is NaN until metadata lands; fall back to the length the SERVER measured, which
+    // the tile carries, so a seek works on the first notch instead of being silently dropped.
+    let duration = player.duration;
+    if (!isFinite(duration) || duration <= 0) {
+      duration = parseFloat(tile.dataset.dur || '0');
+    }
+    if (!isFinite(duration) || duration <= 0) { return; }
+    const step = seekStep(duration) * (moved > 0 ? 1 : -1);
+    try {
+      player.currentTime = Math.min(duration, Math.max(0, player.currentTime + step));
+    } catch (e) {}
+  }, {passive: false, capture: true});
+
+  document.addEventListener('input', event => {
+    if (event.target.classList && event.target.classList.contains('r7-name')) {
+      publish(gridOf(event.target));
+    }
+  }, true);
+
+  // A repaint replaces a grid, so its hidden field is re-published from whatever the server
+  // rendered. Keyed on the NONCE rather than a seen-flag: a repaint that happens to produce the
+  // same tiles (a Cancel, or a partial sort) still carries a fresh nonce and must still
+  // re-publish, because the server's idea of the decisions may have moved.
+  const observer = new MutationObserver(() => {
+    const live = grids();
+    if (!live.length) { stop(); return; }
+    live.forEach(grid => {
+      if (grid.dataset.r7Nonce === grid.dataset.nonce) { return; }
+      grid.dataset.r7Nonce = grid.dataset.nonce;
+      if (holder && !document.body.contains(holder)) { stop(); }
+      tilesIn(grid).forEach(tile => {
+        if (!tile.dataset.decision) { tile.dataset.decision = PENDING; }
+      });
+      publish(grid);
+    });
+  });
+  observer.observe(document.body, {childList: true, subtree: true});
+
+  // Releasing the player before a move is the difference between a clip filing and a winerror 32.
+  // Capture phase, so it runs before Gradio sends the click. Matched by CLASS, so every button
+  // that can cause a move -- both tabs' Confirm, and Proceed -- is covered without this list
+  // having to be kept in step with the markup.
+  document.addEventListener('pointerdown', event => {
+    const button = event.target.closest ? event.target.closest('.r7-release-audio') : null;
+    if (button) { stop(); }
+  }, true);
+}
+"""
+
 CLIPS_GALLERY_JS = r"""
 () => {
   if (window.__r5Installed) { return; }
@@ -3421,6 +3784,15 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # (`process_video_guarded` / `render_selected_variants_guarded`)
                                     # -- this core only threads it down and reads its invocation_id
                                     # to publish on every yield.
+                                    # [FORK] R7.1: appended with legacy defaults -- no existing
+                                    # caller or positional index moves, and omitting them
+                                    # reproduces the previous behaviour exactly. Placed BEFORE
+                                    # `lifecycle` because the C3-R1A cancellation seam requires
+                                    # `lifecycle` to remain the LAST parameter of every seam it
+                                    # threads through; both of these are keyword-passed, so the
+                                    # ordering costs nothing.
+                                    voice_auto_balance: bool = False,
+                                    voice_music_return: float = 0.4,
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -3526,6 +3898,11 @@ def _process_video_guarded_unlocked(audio_file: str,
         min_gap_seconds=voice_min_gap,
         avoid_drops=voice_avoid_drops,
         music_under_voice_percent=music_under_voice,
+        # [FORK] R7.1: both normalised on construction like every other field. With Auto Balance
+        # off, `normalize_music_return` leaves the value alone, so the legacy 0.4s release — and
+        # therefore the legacy filtergraph — is what reaches the executor.
+        auto_balance=voice_auto_balance,
+        music_return_seconds=voice_music_return,
     )
 
     # [FORK] Digital-Union (Smart Mix V1 / E): the three raw Smart Mix widget values become one
@@ -4174,6 +4551,11 @@ def process_video_guarded(audio_file: str,
                           freestyle_breakdown: str | None = None,
                           freestyle_verse: str | None = None,
                           freestyle_body: str | None = None,
+                          # [FORK] R7.1 (Comfort Mix): appended at the END with legacy defaults,
+                          # exactly as Freestyle was, so every existing positional index in the
+                          # `process_btn.click(inputs=...)` contract is unchanged.
+                          voice_auto_balance: bool = False,
+                          voice_music_return: float = fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
                           ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
@@ -4228,6 +4610,8 @@ def process_video_guarded(audio_file: str,
              freestyle_finale, freestyle_drop, freestyle_chorus, freestyle_bridge,
              freestyle_breakdown, freestyle_verse, freestyle_body),
             lifecycle=lifecycle,
+            voice_auto_balance=voice_auto_balance,
+            voice_music_return=voice_music_return,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -6380,6 +6764,21 @@ _CLIPS_REGISTRY = fork_clips.ClipRegistry()
 _CLIPS_STORE_LOCK = threading.Lock()
 _CLIPS_STORE = None
 
+# [FORK] Digital-Union (R7.2): the two audio review registries.
+#
+# **Separate instances, and separate from `_CLIPS_REGISTRY`, for one measured structural reason:**
+# `ClipRegistry.new_session` revokes every previous session that owner holds. That is correct
+# within one review surface -- an operator rescanning has finished with the old page -- and wrong
+# across two, because scanning a folder in Audio Preview would then revoke the Raw Audio Cutter's
+# just-cut gallery and leave every tile in it answering 403 with nothing on screen to explain it.
+#
+# Each registry is paired with its own URL prefix at middleware construction time, so a token
+# minted for one surface is simply not in the other's map. They hold no decisions and no operator
+# state: a registry maps opaque ids to file identities and nothing else, and every decision lives
+# in the owning tab's own `gr.State`.
+_AUDIO_CUT_REGISTRY = fork_clips.ClipRegistry()
+_AUDIO_PREVIEW_REGISTRY = fork_clips.ClipRegistry()
+
 #: [R5-P3 / F1] Per-owner scan generations AND the authoritative per-owner view, in one object so
 #: that "is my scan still the newest?" and "change the authoritative state" cannot drift apart.
 #: Replaces the bare `_CLIPS_PAGES` dict, whose unconditional writes let a slow older scan
@@ -6564,8 +6963,17 @@ def _pref(key: str) -> str:
 
 
 def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw_input_folder,
-                          render_source):
-    """Persist the folder defaults. Writes a file; creates no media directory."""
+                          render_source,
+                          audio_library_folder, audio_discarded_folder, audio_output_folder,
+                          audio_source_file,
+                          audio_preview_input_folder, audio_preview_library_folder,
+                          audio_preview_discarded_folder):
+    """Persist the folder defaults. Writes a file; creates no media directory.
+
+    [FORK] R7 appended its four fields at the END of the signature, and R7.2 appended its three
+    after those, for the reason the fork appends everywhere else: Gradio passes handler arguments
+    POSITIONALLY, so every pre-existing index stays exactly where the registration already put it.
+    """
     values = {
         fork_prefs.CLIPS_LIBRARY: library,
         fork_prefs.CLIPS_REJECTED: rejected,
@@ -6573,6 +6981,13 @@ def _on_save_folder_prefs(library, rejected, raw_output, clips_input_folder, raw
         fork_prefs.CLIPS_INPUT: clips_input_folder,
         fork_prefs.RAW_CUTTER_INPUT: raw_input_folder,
         fork_prefs.QUICK_RENDER_SOURCE: render_source,
+        fork_prefs.AUDIO_LIBRARY: audio_library_folder,
+        fork_prefs.AUDIO_DISCARDED: audio_discarded_folder,
+        fork_prefs.AUDIO_CUTTER_OUTPUT: audio_output_folder,
+        fork_prefs.AUDIO_CUTTER_INPUT: audio_source_file,
+        fork_prefs.AUDIO_PREVIEW_INPUT: audio_preview_input_folder,
+        fork_prefs.AUDIO_PREVIEW_LIBRARY: audio_preview_library_folder,
+        fork_prefs.AUDIO_PREVIEW_DISCARDED: audio_preview_discarded_folder,
     }
     failure = fork_prefs.save_preferences(PREFS_PATH, values)
     if failure:
@@ -6587,9 +7002,896 @@ def _on_reset_folder_prefs():
     """Clear the saved defaults. Removes no folder and no media -- only the remembered choices."""
     failure = fork_prefs.save_preferences(PREFS_PATH, fork_prefs.empty_preferences())
     if failure:
-        return ('', '', '', f"❌ {failure}")
+        return ('', '', '', '', '', '', '', '', f"❌ {failure}")
     _FOLDER_PREFS.update(fork_prefs.empty_preferences())
-    return ('', '', '', "✅ Defaults cleared. No folder or file was deleted.")
+    return ('', '', '', '', '', '', '', '',
+            "✅ Defaults cleared. No folder or file was deleted.")
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R7): Raw Audio Cutter V1.
+#
+# The whole feature is "FFmpeg's silencedetect says where the quiet is, and the clips are what is
+# left over". Every decision -- the argv, the log parsing, the segment arithmetic, the filing rules
+# -- lives in `beatsync_fork.audio_cutter` and `beatsync_fork.audio_library`, which are stdlib-only
+# and directly testable. These handlers are a view: they read widgets, call the fork core, and turn
+# its answers into text.
+#
+# BOTH process launches are in the fork core, not here. Two suites pin this module's
+# `subprocess.run` site count at exactly two, and R7 adds none.
+#
+# The review list rides on a `gr.State`, so it is per-browser-session and this module keeps no
+# mutable record of one operator's clips that another could reach.
+# =============================================================================================
+
+def _audio_tools() -> tuple:
+    """`(ffmpeg, ffprobe)` from the runtime module, imported locally so no module-level import is
+    added to a file whose import order is load-bearing."""
+    from ffmpeg_processing import FFMPEG_PATH, FFPROBE_PATH
+    return FFMPEG_PATH, FFPROBE_PATH
+
+
+def _audio_settings(threshold, min_silence, pad, min_clip, fmt) -> dict:
+    """Widget values to the five resolved settings, total over anything Gradio can hand over.
+
+    A `gr.Number` legitimately arrives as `None` or as `''` when the operator clears it, so every
+    read falls back to the documented default rather than raising inside an event handler.
+    """
+    def number(value, default):
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if resolved != resolved:                      # NaN
+            return float(default)
+        return resolved
+
+    return {
+        'threshold_db': number(threshold, fork_audio.DEFAULT_THRESHOLD_DB),
+        'min_silence': max(0.0, number(min_silence, fork_audio.DEFAULT_MIN_SILENCE)),
+        'pad': max(0.0, number(pad, fork_audio.DEFAULT_PAD)),
+        'min_clip': max(0.0, number(min_clip, fork_audio.DEFAULT_MIN_CLIP)),
+        # [R7.2] One total resolver in the fork core rather than a chain of comparisons here. The
+        # old `FLAC if fmt == FLAC else WAV` form silently mapped MP3 onto WAV, so adding a third
+        # format to the widget alone would have written `.wav` files from an MP3 selection.
+        'format': fork_audio.normalize_format(fmt),
+    }
+
+
+def _audio_probe(source: str):
+    """`(SourceInfo, refusal_text)`. A refusal is prose for the operator, never an exception."""
+    text = (source or '').strip().strip('"')
+    if not text:
+        return None, "❌ Choose a recording first — press Browse file… or paste a full path."
+    if not os.path.isfile(text):
+        return None, f"❌ That file does not exist:\n{text}"
+    try:
+        ffmpeg, ffprobe = _audio_tools()
+    except Exception as failure:                      # noqa: BLE001 - reported, never raised
+        return None, f"❌ FFmpeg is not available: {failure}"
+    probe = fork_audio.run_probe_command(fork_audio.build_probe_command(ffprobe, text))
+    info = fork_audio.parse_probe(probe, path=text)
+    if not info.has_audio:
+        return None, fork_audio.plan_summary(info, (), (), {})
+    return info, ""
+
+
+def _audio_plan(info, settings) -> tuple:
+    """Run the detector and plan the segments. `(silences, segments, failure_text)`."""
+    ffmpeg, _ = _audio_tools()
+    code, log = fork_audio.run_media_command(
+        fork_audio.build_silence_command(ffmpeg, info.path,
+                                         settings['threshold_db'], settings['min_silence']))
+    # A non-zero code with no parsable silence is a real failure; a non-zero code that still
+    # produced a usable log is not worth refusing over, so the log is read either way.
+    silences = fork_audio.parse_silence_log(log, info.duration)
+    segments = fork_audio.plan_segments(info.duration, silences,
+                                        settings['pad'], settings['min_clip'])
+    if code != 0 and not silences and not segments:
+        detail = (log or '').strip().splitlines()
+        return (), (), ("❌ FFmpeg could not read that file.\n"
+                        + (detail[-1] if detail else 'No further detail.'))
+    return silences, segments, ""
+
+
+def _on_audio_analyze(source, threshold, min_silence, pad, min_clip, fmt):
+    """Analyze: detect silence and show the plan. **Writes nothing at all.**"""
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    info, refusal = _audio_probe(source)
+    if refusal:
+        return refusal, []
+    try:
+        silences, segments, failure = _audio_plan(info, settings)
+    except Exception as failure:                      # noqa: BLE001 - analysis is never fatal
+        return f"❌ Analysis failed: {failure}", []
+    if failure:
+        return failure, []
+    stem = fork_audio.safe_stem(info.path)
+    return (fork_audio.plan_summary(info, silences, segments, settings),
+            fork_audio.segment_rows(segments, stem, settings['format']))
+
+
+def _audio_mp3_problem(fmt) -> str:
+    """`""` unless MP3 was asked for and the installed FFmpeg cannot encode it.
+
+    [R7.2] Asked once per cut rather than discovered as every clip failing with an FFmpeg error
+    the operator has no way to read. The portable build this app installs does carry
+    `libmp3lame`, but the installer can be pointed at another FFmpeg, so the check is real rather
+    than ceremonial. Any failure to *run* the probe is treated as "cannot confirm", which refuses:
+    writing nothing is better than writing a folder of unplayable files.
+    """
+    if fork_audio.normalize_format(fmt) != fork_audio.FORMAT_MP3:
+        return ''
+    try:
+        ffmpeg, _ = _audio_tools()
+    except Exception as failure:                      # noqa: BLE001 - reported, never raised
+        return f"FFmpeg is not available: {failure}"
+    listing = fork_audio.run_probe_command(fork_audio.build_encoders_command(ffmpeg))
+    if fork_audio.encoder_available(listing, fork_audio.MP3_ENCODER):
+        return ''
+    return (f"this FFmpeg build has no {fork_audio.MP3_ENCODER} encoder, so it cannot write MP3. "
+            f"Choose WAV or FLAC, or reinstall the portable FFmpeg.")
+
+
+def _audio_format_line(settings: dict) -> str:
+    """One honest sentence about what was written, including the MP3 caveat the owner asked for."""
+    fmt = fork_audio.normalize_format(settings.get('format'))
+    if fmt == fork_audio.FORMAT_FLAC:
+        return f"Format: FLAC - lossless - {fork_audio.OUTPUT_SAMPLE_RATE} Hz"
+    if fmt == fork_audio.FORMAT_MP3:
+        return (f"Format: MP3 - {fork_audio.DEFAULT_MP3_BITRATE_KBPS} kbps CBR "
+                f"({fork_audio.MP3_ENCODER}) - {fork_audio.OUTPUT_SAMPLE_RATE} Hz\n"
+                f"         MP3 is a LOSSY re-encode, including from an MP3 source: this tool "
+                f"decodes the audio to find the silences, so there is no stream copy.\n"
+                f"         What you gain is much smaller files, not better audio.")
+    return f"Format: WAV - 16-bit PCM - {fork_audio.OUTPUT_SAMPLE_RATE} Hz"
+
+
+def _on_audio_cut(source, output_folder, threshold, min_silence, pad, min_clip, fmt,
+                  request: gr.Request = None):
+    """Cut: re-analyze, then write each planned clip into a fresh timestamped run folder.
+
+    Re-analyzing rather than trusting the on-screen plan is deliberate and matches the Raw Cutter:
+    the file or a setting may have changed since Analyze, and writing a stale plan would export
+    clips that do not correspond to anything the operator was shown.
+
+    [R7.2] The clips it wrote are then published into the audio registry, so the gallery can fetch
+    them on hover instead of carrying their bytes. **Publication cannot fail the cut**: the files
+    are already on disk and the report already says so, so a registry refusal costs the preview and
+    nothing else.
+    """
+    settings = _audio_settings(threshold, min_silence, pad, min_clip, fmt)
+    blank = (AUDIO_GALLERY_EMPTY_HTML, AUDIO_COUNTS_INITIAL_TEXT, '', {}, '')
+
+    mp3_problem = _audio_mp3_problem(settings['format'])
+    if mp3_problem:
+        return (f"❌ Nothing was written — {mp3_problem}", [], *blank)
+
+    info, refusal = _audio_probe(source)
+    if refusal:
+        return (refusal, [], *blank)
+
+    folder = (output_folder or '').strip().strip('"')
+    if not folder:
+        return ("❌ Choose an output folder first.", [], *blank)
+    try:
+        silences, segments, failure = _audio_plan(info, settings)
+    except Exception as failure:                      # noqa: BLE001
+        return (f"❌ Analysis failed: {failure}", [], *blank)
+    if failure:
+        return (failure, [], *blank)
+
+    stem = fork_audio.safe_stem(info.path)
+    rows = fork_audio.segment_rows(segments, stem, settings['format'])
+    if not segments:
+        return (fork_audio.plan_summary(info, silences, segments, settings), rows, *blank)
+
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_directory = os.path.join(folder, fork_audio.run_directory_name(stem, stamp))
+    try:
+        os.makedirs(run_directory, exist_ok=False)
+    except OSError as failure:
+        return (f"❌ Could not create the output folder:\n{run_directory}\n{failure}",
+                rows, *blank)
+
+    ffmpeg, _ = _audio_tools()
+    written, failures, paths, spans = {}, [], [], {}
+    for segment in segments:
+        name = fork_audio.clip_filename(stem, segment.index, settings['format'])
+        destination = os.path.join(run_directory, name)
+        code, log = fork_audio.run_media_command(
+            fork_audio.build_extract_command(ffmpeg, info.path, segment, destination,
+                                             settings['format']),
+            timeout=fork_audio.EXTRACT_TIMEOUT_SECONDS)
+        if code == 0 and os.path.isfile(destination):
+            written[segment.index] = name
+            paths.append(destination)
+            # Keyed by the decision identity so the span survives paging exactly as a decision
+            # does. It is the one thing the Audio Preview tab cannot know and this one can: where
+            # in the original recording the clip came from.
+            spans[fork_clips.decision_identity(destination, os.path.getsize(destination),
+                                               os.stat(destination).st_mtime_ns)] = (
+                f"{fork_audio.format_timecode(segment.start)}"
+                f"→{fork_audio.format_timecode(segment.end)}")
+        else:
+            detail = (log or '').strip().splitlines()
+            failures.append(f"clip {segment.index}: {detail[-1] if detail else 'failed'}")
+
+    encoding = fork_audio.encoding_record(settings['format'])
+    manifest = fork_audio.manifest_payload(info, segments, settings, written, encoding)
+    manifest_note = ''
+    try:
+        with open(os.path.join(run_directory, fork_audio.MANIFEST_NAME), 'w',
+                  encoding='utf-8') as handle:
+            json.dump(manifest, handle, indent=2)
+    except OSError as failure:
+        manifest_note = f"\n⚠️  The manifest could not be written: {failure}"
+
+    lines = [f"✅ Wrote {len(written)} of {len(segments)} clip(s).",
+             f"Output folder:\n{run_directory}", '',
+             _audio_format_line(settings),
+             f"A machine-readable record is in {fork_audio.MANIFEST_NAME}.",
+             "Your source file was not modified."]
+    if failures:
+        lines += ['', "Not written:"] + [f"  • {line}" for line in failures]
+    report = "\n".join(lines) + manifest_note
+
+    # [R7.2] The review surface is the gallery, now backed by the registry. Decisions start empty
+    # -- every clip is undecided until the operator says otherwise -- and Confirm needs at least
+    # one KEEP before it will move anything.
+    view, publish_note = _audio_load_view(
+        _AUDIO_SURFACE_CUT, request, paths, run_directory, recursive=False,
+        page_index=1, page_size=fork_audio_review.DEFAULT_PAGE_SIZE, spans=spans)
+    gallery, counts = _audio_render(_AUDIO_SURFACE_CUT, view)
+    return (report + publish_note, rows, gallery, counts, '', view, run_directory)
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R7.2): ONE audio review core, two surfaces.
+#
+# The Raw Audio Cutter's review half and the standalone Audio Preview tab do the same job on
+# different inputs: publish an ordered list of audio files into an authorized registry, draw the
+# hover gallery, collect decisions in the page, then sort on Confirm. Everything here is written
+# once and parameterised by an `_AudioSurface`, so a behaviour that is wrong is wrong in one place.
+#
+# Gradio needs distinct callables with distinct signatures, so each surface has thin handlers that
+# do nothing but name their surface and their widgets.
+#
+# **No module-level mutable record of an operator's clips exists.** Every view rides on that tab's
+# own `gr.State`, so it is per-browser-session; the registries hold opaque-id-to-file-identity maps
+# and nothing else.
+# =============================================================================================
+
+class _AudioSurface:
+    """Which registry, which URL prefix, which grid, and what to call an empty one."""
+
+    def __init__(self, name, registry, media_prefix, grid_id, store_id, counts_id,
+                 empty_message):
+        self.name = name
+        self.registry = registry
+        self.media_prefix = media_prefix
+        self.grid_id = grid_id
+        self.store_id = store_id
+        self.counts_id = counts_id
+        self.empty_message = empty_message
+
+
+_AUDIO_SURFACE_CUT = _AudioSurface(
+    'cutter', _AUDIO_CUT_REGISTRY, fork_audio_review.MEDIA_PREFIX_CUTTER,
+    fork_audio_review.GRID_CUTTER, 'audio-decisions', 'audio-counts',
+    'No clips to review. Cut a recording first.')
+
+_AUDIO_SURFACE_PREVIEW = _AudioSurface(
+    'preview', _AUDIO_PREVIEW_REGISTRY, fork_audio_review.MEDIA_PREFIX_PREVIEW,
+    fork_audio_review.GRID_PREVIEW, 'audio-preview-decisions', 'audio-preview-counts',
+    'No audio clips loaded. Choose a folder and press Scan Folder.')
+
+
+def _audio_owner(request):
+    """The per-browser scoping key, injected by Gradio and never listed in a click's `inputs`.
+
+    Same provenance caveat as the Clips Preview, restated because it is easy to over-read: the
+    value originates in the Gradio **client** (`Math.random().toString(36)`), so it scopes one
+    browser's review against another's and is **not** an authenticated identity. Absent identity
+    fails closed -- there is deliberately no shared anonymous registry to fall into.
+    """
+    return fork_clips._require_owner(
+        getattr(request, 'session_hash', None) if request is not None else None)
+
+
+def _audio_publish(surface, owner, paths, page_index, page_size):
+    """Mint a fresh session and one page of opaque clip ids for `paths`.
+
+    Returns `(session_id, page_token, entries, start)`. This revokes the owner's previous session
+    **on this surface only**, which is correct -- they have finished with the page it served -- and
+    is why the two surfaces hold separate registries.
+    """
+    total = len(paths)
+    start, count = fork_audio_review.page_slice(page_index, total, page_size)
+    frozen = fork_audio_review.freeze_paths(paths, start, count)
+    session_id = surface.registry.new_session(owner)
+    page_token, entries = surface.registry.publish_page(
+        owner, session_id, int(fork_audio_review.resolve_page(page_index, total, page_size)),
+        frozen, servable=fork_audio_review.SERVABLE_SUFFIXES)
+    return session_id, page_token, entries, start
+
+
+def _audio_identities(entries) -> dict:
+    """`clip_id -> stable decision identity`.
+
+    The identity is `sha256(realpath | size | mtime_ns)`, and it is what makes a decision survive
+    **paging** and stop applying when the bytes change. The browser never sees it: it holds the
+    per-page `clip_id`, and this map is how the server translates. Re-recording a clip therefore
+    does not inherit the old one's decision, structurally rather than by a check somebody has to
+    remember to run.
+    """
+    return {entry.clip_id: fork_clips.decision_identity(entry.path, entry.size, entry.mtime_ns)
+            for entry in entries}
+
+
+def _audio_durations(entries) -> dict:
+    """Real clip lengths for the tile labels, from the portable FFprobe.
+
+    Cached inside `ensure_durations` on the clip's identity, so a scan pays for a page once. The
+    command and the process launch both live in the fork core, exactly like the poster pass,
+    because two suites pin this module's `subprocess.run` site count at two. A failure is never
+    fatal: a tile shows an honest dash rather than a guessed length.
+    """
+    try:
+        from ffmpeg_processing import FFPROBE_PATH    # local: no module-level import is added
+        return fork_clips.ensure_durations(entries, FFPROBE_PATH,
+                                           fork_clips.run_duration_command)
+    except Exception:                                 # noqa: BLE001 - labels are never fatal
+        return {}
+
+
+def _audio_tiles(view) -> list:
+    """The page's tiles, built from the server's own entry list and decision state."""
+    durations = view.get('durations') or {}
+    names = view.get('names') or {}
+    spans = view.get('spans') or {}
+    identity = view.get('identity') or {}
+    tiles = []
+    for offset, entry in enumerate(view.get('entries') or (), start=1):
+        key = identity.get(entry.clip_id, entry.clip_id)
+        tiles.append(fork_audio_review.AudioTile(
+            clip_id=entry.clip_id,
+            number=int(view.get('start', 0)) + offset,
+            name=names.get(key) or os.path.basename(entry.path),
+            duration=durations.get(entry.clip_id),
+            span=spans.get(key, '')))
+    return tiles
+
+
+def _audio_page_decisions(view) -> dict:
+    """`clip_id -> decision` for this page, projected from the identity-keyed record."""
+    stored = view.get('decisions') or {}
+    identity = view.get('identity') or {}
+    return {clip_id: stored.get(key, fork_audio_review.PENDING)
+            for clip_id, key in identity.items()}
+
+
+def _audio_render(surface, view) -> tuple:
+    """`(gallery_html, counts_line)` for a view. The one place either is produced."""
+    tiles = _audio_tiles(view)
+    decisions = _audio_page_decisions(view)
+    grid = fork_audio_review.gallery_html(
+        tiles, decisions, view.get('session', ''), view.get('page', ''),
+        grid_id=surface.grid_id, store_id=surface.store_id, counts_id=surface.counts_id,
+        media_prefix=surface.media_prefix, empty_message=surface.empty_message)
+    return grid, fork_audio_review.counts_line(
+        fork_audio_review.decision_counts(tiles, decisions))
+
+
+def _audio_load_view(surface, request, paths, root, recursive, page_index, page_size,
+                     spans=None, decisions=None, names=None):
+    """Publish one page of `paths` and build the view. Returns `(view, note)`.
+
+    `note` is prose for the caller's report when publication failed -- never an exception, because
+    every caller is a Gradio event handler and a failed preview must not discard a cut that
+    actually wrote files.
+
+    `decisions` and `names` are carried in **by identity**, which is the whole of Phase 2's "keep
+    review decisions stable while changing pages": the record is keyed by the file, so turning to
+    page 3 and back preserves page 1 exactly, with no per-page bookkeeping at all.
+    """
+    resolved_size = fork_audio_review.resolve_page_size(page_size)
+    empty = {'entries': (), 'identity': {}, 'decisions': dict(decisions or {}),
+             'names': dict(names or {}), 'root': root, 'recursive': bool(recursive),
+             'total': len(paths), 'paths': list(paths), 'page': '', 'session': '',
+             'page_index': 1, 'page_size': resolved_size, 'start': 0,
+             'spans': dict(spans or {}), 'durations': {}, 'armed': ''}
+    if not paths:
+        return empty, ''
+    try:
+        owner = _audio_owner(request)
+    except fork_clips.Refusal as refusal:
+        return empty, (f"\n\u26a0\ufe0f  The preview gallery needs a browser session identity "
+                       f"({refusal.reason}). Reload the page.")
+    try:
+        session_id, page_token, entries, start = _audio_publish(
+            surface, owner, paths, page_index, resolved_size)
+    except fork_clips.Refusal as refusal:
+        return empty, (f"\n\u26a0\ufe0f  The preview gallery could not be opened ({refusal.reason}). "
+                       f"The files are on disk either way.")
+
+    view = dict(empty)
+    view.update({
+        'session': session_id, 'page': page_token, 'entries': entries,
+        'identity': _audio_identities(entries), 'start': start,
+        'page_index': int(fork_audio_review.resolve_page(page_index, len(paths), resolved_size)),
+    })
+    view['durations'] = _audio_durations(entries)
+    return view, ''
+
+
+def _audio_merge_payload(view, payload) -> dict:
+    """Fold the page's hidden field into the view's identity-keyed decision and name records.
+
+    The browser is not trusted to be well-formed, only to be the operator's own page. An
+    unreadable payload merges **nothing**, which leaves the previous server state standing rather
+    than clearing it -- the opposite choice would let one malformed update silently discard a page
+    of real decisions.
+
+    **A clip id that is not on this page is ignored**, so a payload cannot reach a clip the
+    operator is not looking at, and nothing is ever keyed by a path the page sent.
+    """
+    identity = view.get('identity') or {}
+    decisions = dict(view.get('decisions') or {})
+    names = dict(view.get('names') or {})
+    try:
+        parsed = json.loads(payload or '{}')
+    except (ValueError, TypeError):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    sent_decisions = parsed.get('decisions')
+    if isinstance(sent_decisions, dict):
+        for clip_id, decision in sent_decisions.items():
+            key = identity.get(str(clip_id))
+            if key is None:
+                continue
+            text = str(decision)
+            decisions[key] = (text if text in fork_audio_review.DECISIONS
+                              else fork_audio_review.PENDING)
+
+    sent_names = parsed.get('names')
+    if isinstance(sent_names, dict):
+        for clip_id, name in sent_names.items():
+            key = identity.get(str(clip_id))
+            if key is None:
+                continue
+            names[key] = str(name)
+
+    updated = dict(view)
+    updated['decisions'] = decisions
+    updated['names'] = names
+    return updated
+
+
+def _audio_resolved_destinations(library, discarded, plan):
+    """The real paths a sort will write, resolved the way validation resolved them.
+
+    Resolving rather than reusing the typed strings matters for the report: the operator may have
+    typed a junction, a relative path or a different letter case, and the report must name the
+    folder the files actually went to. A destination this plan will not write resolves to `''`.
+    """
+    def real(role, typed):
+        identified, verdict = fork_clips.identify_root(role, typed)
+        return identified.real if (verdict.ok and identified) else str(typed or '').strip()
+
+    return (real(fork_clips.ROLE_LIBRARY, library) if plan.needs_library else '',
+            real(fork_clips.ROLE_REJECTED, discarded) if plan.needs_discarded else '')
+
+
+def _audio_sort(surface, view, library, discarded, sweep_unmarked):
+    """Perform the sort and return `(message, refreshed_view)`.
+
+    Nothing about where a file goes comes from the browser: the entries are the registry's frozen
+    page, each decision is read from the view's identity-keyed record, and the destinations are the
+    already-validated real paths. `sweep_unmarked` is an explicit parameter so an unmarked clip can
+    only be discarded by a caller that obtained the operator's one-time confirmation.
+    """
+    identity = view.get('identity') or {}
+    decisions = view.get('decisions') or {}
+    names = view.get('names') or {}
+
+    def decision_of(entry):
+        return decisions.get(identity.get(entry.clip_id, ''), fork_audio_review.PENDING)
+
+    def name_of(entry):
+        return names.get(identity.get(entry.clip_id, ''), '')
+
+    outcomes = fork_audio_review.sort_clips(
+        view.get('entries') or (), decision_of, name_of,
+        {fork_audio_review.SELECTED: library, fork_audio_review.REJECTED: discarded},
+        unmarked_as=(fork_audio_review.REJECTED if sweep_unmarked
+                     else fork_audio_review.PENDING))
+
+    message = "\n".join(fork_audio_review.sorted_report_lines(outcomes, library, discarded))
+    moved = {o.clip_id for o in outcomes if o.ok}
+
+    # Repaint from what is genuinely still on disk. Showing the old page would leave already-moved
+    # clips on screen, and pressing Confirm again would then report them as missing.
+    remaining = [entry for entry in (view.get('entries') or ()) if entry.clip_id not in moved]
+    survivor_ids = {entry.clip_id for entry in remaining}
+    refreshed = dict(view)
+    refreshed['entries'] = remaining
+    refreshed['identity'] = {clip: key for clip, key in identity.items()
+                             if clip in survivor_ids}
+    # A clip that moved keeps no decision. Its identity is gone from this page, and a later scan of
+    # the DESTINATION folder must not inherit a decision made about it here.
+    survivors = set(refreshed['identity'].values())
+    refreshed['decisions'] = {k: v for k, v in decisions.items() if k in survivors}
+    refreshed['names'] = {k: v for k, v in names.items() if k in survivors}
+    refreshed['armed'] = ''
+    return message, refreshed
+
+
+def _audio_confirm_core(surface, view, payload, library, discarded, armed_signature,
+                        app_root=''):
+    """The whole of Confirm, for either surface.
+
+    Returns `(message, view, gallery, counts, arm_signature, show_gate, sorted_any)`. `show_gate`
+    asks the caller to reveal Proceed/Cancel; `arm_signature` is what a later Proceed must still
+    match; `sorted_any` says whether the sort was actually *attempted*.
+
+    **`sorted_any` is returned rather than inferred, and that matters.** The Audio Preview tab
+    re-enumerates its folder after a sort, and every other path here -- nothing loaded, no clip
+    kept, a refused destination pair, the sweep gate -- moves nothing at all. Deriving "did
+    anything happen?" from an empty signature would have conflated the refusals with the success,
+    making a refused Confirm trigger a pointless folder walk and replace the refusal's own view.
+
+    The order of the gates is the contract:
+
+    1. **nothing loaded** -- nothing to do, and nothing is said about folders;
+    2. **the page's own decisions are folded in first**, so Confirm acts on what is on screen;
+    3. **at least one clip must be kept.** This is R7.2's admission rule, replacing R7.1's
+       "nothing may be undecided": the operator marks the good clips and presses Confirm;
+    4. **the destinations are re-validated here**, not trusted from the change handler. The folder
+       that was checked and the folder that is written must be the same one, and a folder can be
+       renamed between the two events;
+    5. **unmarked clips need an explicit, batch-specific confirmation.** Without it nothing moves
+       and the counts are *shown*; with a signature that still matches, the sweep proceeds.
+    """
+    view = dict(view or {})
+    if not view.get('entries'):
+        gallery, counts = _audio_render(surface, view)
+        return ("Nothing has been loaded to review yet.", view, gallery, counts, '', False, False)
+
+    view = _audio_merge_payload(view, payload)
+    plan = fork_audio_review.plan_sort(_audio_tiles(view), _audio_page_decisions(view),
+                                       library, discarded)
+    gallery, counts = _audio_render(surface, view)
+
+    if not plan.can_sort:
+        return (f"\u274c {AUDIO_CONFIRM_DISABLED_TEXT}", view, gallery, counts, '', False, False)
+
+    verdict = fork_audio_review.validate_destinations(
+        view.get('root', ''), library, discarded, app_root=app_root,
+        need_library=plan.needs_library, need_discarded=plan.needs_discarded)
+    if not verdict.ok:
+        detail = f"\n{verdict.detail}" if verdict.detail else ''
+        return (f"\u274c Nothing was moved \u2014 {fork_audio_review.refusal_text(verdict)}{detail}",
+                view, gallery, counts, '', False, False)
+
+    resolved_library, resolved_discarded = _audio_resolved_destinations(library, discarded, plan)
+
+    if plan.has_unmarked and str(armed_signature or '') != plan.signature:
+        # Show the consequence and STOP. Nothing has moved, and the operator is told exactly what
+        # pressing Proceed would do, which is the whole point of the gate.
+        preview = fork_audio_review.plan_preview_lines(plan, resolved_library, resolved_discarded)
+        message = "\n".join([AUDIO_SWEEP_GATE_HEADING, ''] + preview
+                            + ['', AUDIO_SWEEP_GATE_PROMPT])
+        return (message, view, gallery, counts, plan.signature, True, False)
+
+    message, refreshed = _audio_sort(surface, view, resolved_library, resolved_discarded,
+                                     sweep_unmarked=plan.has_unmarked)
+    gallery, counts = _audio_render(surface, refreshed)
+    return (message, refreshed, gallery, counts, '', False, True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Surface 1: the Raw Audio Cutter's review half
+# ---------------------------------------------------------------------------------------------
+
+def _on_audio_confirm(payload, library_folder, discarded_folder, view, armed):
+    """Sort the cutter's page: KEEP into the voice library, everything else into quarantine.
+
+    The gallery releases the player on `pointerdown` of this button, before Gradio sends the click.
+    That is not decoration: Windows will not rename a file a player still holds open, and the clip
+    the operator just listened to is exactly the one that would refuse to move.
+    """
+    message, view, gallery, counts, signature, gate, _ = _audio_confirm_core(
+        _AUDIO_SURFACE_CUT, view, payload, library_folder, discarded_folder, armed,
+        app_root=ROOT_DIR)
+    return (message, gallery, counts, view, signature,
+            gr.update(visible=gate), gr.update(visible=gate))
+
+
+def _on_audio_proceed(payload, library_folder, discarded_folder, view, armed):
+    """Proceed: the operator agreed to sweep the unmarked clips in THIS batch.
+
+    It re-runs the whole of Confirm rather than acting on anything the gate computed. The signature
+    is a change detector, not a credential: the plan is re-derived, the destinations are
+    re-validated, and if any of it moved since the gate was shown the sweep is refused and the new
+    counts are presented instead.
+    """
+    return _on_audio_confirm(payload, library_folder, discarded_folder, view, armed)
+
+
+def _on_audio_cancel(view):
+    """Cancel the sweep. Nothing has moved, nothing was decided on the operator's behalf, and the
+    batch stays exactly as it was -- which is what makes agreeing to a sweep safe to try.
+
+    It writes the **same seven outputs as Confirm**, including a repainted gallery. That is not
+    symmetry for its own sake: the grid nonce is what makes a `gr.HTML` update deliverable, so a
+    Cancel that changed no markup would not reach the browser and the hidden field would never be
+    re-published from the server's state.
+    """
+    updated = dict(view or {})
+    updated['armed'] = ''
+    gallery, counts = _audio_render(_AUDIO_SURFACE_CUT, updated)
+    return (AUDIO_SWEEP_CANCELLED_TEXT, gallery, counts, updated, '',
+            gr.update(visible=False), gr.update(visible=False))
+
+
+def _on_audio_destinations_change(library_folder, discarded_folder, view):
+    """[R7.2 Phase 4] The live read-out beside the two destination boxes.
+
+    Runs on every edit of either field, so the operator's reported problem -- both boxes pointing
+    at the same folder -- is visible while they are still typing rather than only when Confirm
+    refuses. **It validates and reports; it never sorts, never writes a folder and never touches
+    the gallery**, so a half-typed configuration leaves the page fully reviewable.
+    """
+    _, message = fork_audio_review.destination_feedback(
+        (view or {}).get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+    return message
+
+
+# ---------------------------------------------------------------------------------------------
+# Surface 2: the standalone Audio Preview tab  [R7.2 Phase 2]
+#
+# The owner's reason for it, in their words: they often cut recordings but want to classify the
+# results later. R7.1 could only review the clips the current browser session had just produced, so
+# "later" meant "never" -- closing the tab lost the review surface even though every clip was still
+# on disk. This tab reads a folder, so it works after a restart and on clips this app did not make.
+# ---------------------------------------------------------------------------------------------
+
+def _audio_preview_scan_report(found, view, page_size) -> str:
+    """What the scan found, including what it deliberately did not enumerate."""
+    total = int(view.get('total', 0))
+    pages = fork_audio_review.page_count(total, page_size)
+    lines = [
+        f"Found {total} audio clip(s) under:\n{found.root}",
+        f"Subfolders: {'included' if view.get('recursive') else 'excluded'}",
+        f"Not reviewable (unsupported, empty or unreadable): {len(found.rejected)}",
+        f"Showing page {view.get('page_index', 1)} of {pages} "
+        f"({len(view.get('entries') or ())} on this page).",
+        '',
+        f"Playable formats: {', '.join(fork_audio_review.SERVABLE_SUFFIXES)}",
+        "Read-only: lengths and names only. No file was moved, renamed or deleted.",
+    ]
+    return "\n".join(lines)
+
+
+def _audio_preview_page_label(view) -> str:
+    """`Page 2 of 7   ·   412 clips`, or an honest empty statement."""
+    total = int(view.get('total', 0))
+    if not total:
+        return "No clips loaded."
+    pages = fork_audio_review.page_count(total, view.get('page_size'))
+    return (f"Page {view.get('page_index', 1)} of {pages}   ·   {total} clip(s)   ·   "
+            f"{len(view.get('entries') or ())} on this page")
+
+
+#: Every Audio Preview handler writes exactly these nine, in this order. Declared once so the
+#: positional contract between the handlers and the wiring lives in one place.
+_AUDIO_PREVIEW_OUTPUT_ORDER = (
+    'report', 'gallery', 'counts', 'view', 'page_label', 'armed', 'proceed', 'cancel',
+    'destinations')
+
+
+def _audio_preview_outputs(report, view, dest_message, gate=False, signature=''):
+    """The nine outputs every Audio Preview handler writes, assembled in one place.
+
+    Assembling them here rather than at each `return` keeps the positional contract in one
+    function: a handler that grew a tenth output would have to come through here to get it, which
+    is the only way a nine-output `outputs=` list and six handlers stay in step.
+    """
+    gallery, counts = _audio_render(_AUDIO_SURFACE_PREVIEW, view)
+    return (report, gallery, counts, view, _audio_preview_page_label(view), signature,
+            gr.update(visible=gate), gr.update(visible=gate), dest_message)
+
+
+def _on_audio_preview_scan(folder, recursive, page_size, library_folder, discarded_folder,
+                           view, request: gr.Request = None):
+    """Enumerate a folder of audio clips and publish its first page.
+
+    **This is the only thing that walks the folder**, and it runs only when the operator presses
+    Scan. Turning a page re-uses the list this captured, which is what keeps page numbering stable
+    while a review is in progress; a sort re-enumerates, because files have genuinely moved.
+
+    Decisions already made are carried forward **by file identity**, so re-scanning the same folder
+    after sorting part of it does not forget what the operator decided about the rest.
+    """
+    previous = dict(view or {})
+    found = fork_audio_review.discover_audio(folder, recursive)
+    _, dest_message = fork_audio_review.destination_feedback(
+        found.root or folder, library_folder, discarded_folder, app_root=ROOT_DIR)
+
+    if found.error:
+        empty = {'entries': (), 'identity': {}, 'decisions': {}, 'names': {},
+                 'root': found.root, 'recursive': bool(recursive), 'total': 0, 'paths': [],
+                 'page': '', 'session': '', 'page_index': 1,
+                 'page_size': fork_audio_review.resolve_page_size(page_size), 'start': 0,
+                 'spans': {}, 'durations': {}, 'armed': ''}
+        return _audio_preview_outputs(f"❌ {found.error}", empty, dest_message)
+
+    paths = [media.path for media in found.files]
+    new_view, note = _audio_load_view(
+        _AUDIO_SURFACE_PREVIEW, request, paths, found.root, recursive=bool(recursive),
+        page_index=1, page_size=page_size,
+        decisions=previous.get('decisions'), names=previous.get('names'))
+    if not paths:
+        return _audio_preview_outputs(
+            "No audio clips found in that folder.\n"
+            f"Playable formats: {', '.join(fork_audio_review.SERVABLE_SUFFIXES)}",
+            new_view, dest_message)
+    report = _audio_preview_scan_report(found, new_view, page_size) + note
+    return _audio_preview_outputs(report, new_view, dest_message)
+
+
+def _audio_preview_turn(payload, step, page_size, view, request):
+    """Move `step` pages through the list this view already captured. `(report, view)`.
+
+    The page's decisions are folded in **before** the page changes, which is the whole of "keep
+    review decisions stable while changing pages": the record is keyed by file identity, so what
+    the operator marked on page 1 is still marked when they come back to it.
+
+    No folder is walked here. Re-enumerating on every page turn would renumber the pages under the
+    operator whenever a file appeared or vanished, and it would charge a disk walk for a keystroke.
+    """
+    current = _audio_merge_payload(dict(view or {}), payload)
+    paths = list(current.get('paths') or ())
+    if not paths:
+        return ("Nothing is loaded. Press Scan Folder first.", current)
+
+    resolved_size = fork_audio_review.resolve_page_size(page_size)
+    pages = fork_audio_review.page_count(len(paths), resolved_size)
+    target = fork_audio_review.resolve_page(
+        int(current.get('page_index', 1)) + int(step), len(paths), resolved_size)
+    if target == int(current.get('page_index', 1)) and resolved_size == current.get('page_size'):
+        edge = "first" if step < 0 else "last"
+        return (f"Already on the {edge} page ({target} of {pages}).", current)
+
+    turned, note = _audio_load_view(
+        _AUDIO_SURFACE_PREVIEW, request, paths, current.get('root', ''),
+        recursive=current.get('recursive', True), page_index=target, page_size=resolved_size,
+        spans=current.get('spans'), decisions=current.get('decisions'),
+        names=current.get('names'))
+    return (f"Page {turned.get('page_index', 1)} of "
+            f"{fork_audio_review.page_count(len(paths), resolved_size)}." + note, turned)
+
+
+def _on_audio_preview_prev(payload, page_size, library_folder, discarded_folder, view,
+                           request: gr.Request = None):
+    report, turned = _audio_preview_turn(payload, -1, page_size, view, request)
+    _, dest_message = fork_audio_review.destination_feedback(
+        turned.get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+    return _audio_preview_outputs(report, turned, dest_message)
+
+
+def _on_audio_preview_next(payload, page_size, library_folder, discarded_folder, view,
+                           request: gr.Request = None):
+    report, turned = _audio_preview_turn(payload, 1, page_size, view, request)
+    _, dest_message = fork_audio_review.destination_feedback(
+        turned.get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+    return _audio_preview_outputs(report, turned, dest_message)
+
+
+def _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_size, view, armed,
+                              request: gr.Request = None):
+    """Sort this page, then **re-scan** so the operator sees what is genuinely left.
+
+    Re-scanning after a successful sort is Phase 2's explicit requirement and is also the only
+    honest page to show: the clips that moved are no longer in the folder, and leaving them on
+    screen would let a second Confirm report them as missing.
+    """
+    message, sorted_view, gallery, counts, signature, gate, did_sort = _audio_confirm_core(
+        _AUDIO_SURFACE_PREVIEW, view, payload, library_folder, discarded_folder, armed,
+        app_root=ROOT_DIR)
+    _, dest_message = fork_audio_review.destination_feedback(
+        sorted_view.get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+
+    if not did_sort or not sorted_view.get('root'):
+        # The gate is showing, or Confirm refused. Nothing moved, so nothing is re-enumerated and
+        # the refusal keeps its own view and its own message.
+        return _audio_preview_outputs(message, sorted_view, dest_message, gate=gate,
+                                      signature=signature)
+
+    # Re-enumerate. A sort genuinely changed the folder, so the cached path list is stale and the
+    # page count may have shrunk.
+    found = fork_audio_review.discover_audio(sorted_view.get('root'),
+                                             sorted_view.get('recursive', True))
+    if found.error:
+        return _audio_preview_outputs(
+            message + f"\n\n⚠️  The folder could not be re-read: {found.error}",
+            sorted_view, dest_message)
+    paths = [media.path for media in found.files]
+    rescanned, note = _audio_load_view(
+        _AUDIO_SURFACE_PREVIEW, request, paths, found.root,
+        recursive=sorted_view.get('recursive', True),
+        page_index=sorted_view.get('page_index', 1), page_size=page_size,
+        decisions=sorted_view.get('decisions'), names=sorted_view.get('names'))
+    remaining = (f"\n\n{len(paths)} clip(s) still in the review folder."
+                 if paths else "\n\nThe review folder is now empty.")
+    return _audio_preview_outputs(message + remaining + note, rescanned, dest_message)
+
+
+def _on_audio_preview_proceed(payload, library_folder, discarded_folder, page_size, view, armed,
+                              request: gr.Request = None):
+    """Proceed with the sweep this batch was armed for. Re-derives everything; see
+    `_on_audio_proceed` for why the signature is a change detector rather than a credential."""
+    return _on_audio_preview_confirm(payload, library_folder, discarded_folder, page_size,
+                                     view, armed, request)
+
+
+def _on_audio_preview_cancel(library_folder, discarded_folder, view):
+    """Cancel the sweep. Nothing moved, and every clip is exactly as the operator left it.
+
+    It repaints the gallery rather than leaving it alone, because the grid nonce is what makes a
+    `gr.HTML` update deliverable: a Cancel that produced byte-identical markup would not reach the
+    browser at all, so the hidden field would never be re-published from the server's state.
+    """
+    updated = dict(view or {})
+    updated['armed'] = ''
+    _, dest_message = fork_audio_review.destination_feedback(
+        updated.get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+    return _audio_preview_outputs(AUDIO_SWEEP_CANCELLED_TEXT, updated, dest_message)
+
+
+def _on_audio_preview_destinations_change(library_folder, discarded_folder, view):
+    """The same live validation the cutter's review half gets, for the same reason."""
+    _, message = fork_audio_review.destination_feedback(
+        (view or {}).get('root', ''), library_folder, discarded_folder, app_root=ROOT_DIR)
+    return message
+
+
+def _on_audio_open_in_preview(run_directory):
+    """"Open results in Audio Preview": hand this cut's output folder to the review tab.
+
+    It only fills the folder box and selects the tab. **It deliberately does not scan**, because
+    Phase 2 requires that nothing scans a folder as a side effect -- the operator presses Scan when
+    they are ready, and until then no disk is walked and no session is minted.
+    """
+    folder = str(run_directory or '').strip()
+    if not folder:
+        return (gr.update(), gr.update(),
+                "Cut some clips first — there is no output folder to open yet.")
+    return (gr.update(value=folder), gr.Tabs(selected='tab-audio-preview'),
+            f"Loaded the folder into the Audio Preview tab:\n{folder}\n"
+            f"Press Scan Folder there when you are ready to review it.")
+
+
+def _browse_audio_source(current):
+    """The native file dialog for the one source recording.
+
+    Identical contract to `_browse_folder`: cancel, timeout and any failure to show the dialog all
+    leave the operator's existing value untouched, so Browse can only ever add a choice.
+    """
+    existing = current if isinstance(current, str) else ''
+    try:
+        status, chosen = fork_folders.pick_file(
+            existing or _pref(fork_prefs.AUDIO_CUTTER_INPUT) or None,
+            filter_text=fork_folders.file_filter('Audio and video',
+                                                 fork_audio.SOURCE_SUFFIXES))
+    except Exception:                                  # noqa: BLE001 - browsing is never fatal
+        return gr.update()
+    if status == fork_folders.PICKED and chosen:
+        return chosen
+    return gr.update()
 
 
 def _clips_durations(entries) -> dict:
@@ -7081,7 +8383,10 @@ def create_ui() -> gr.Blocks:
         # Why it was needed: the render workflow shared one scrolling column with six
         # collapsed accordions, so Create Music Video sat far below the fold and the two
         # newest features (Random Freestyle and Shot Variety) were the easiest to miss.
-        with gr.Tabs():
+        # [FORK] R7.2: named so "Open results in Audio Preview" can select another tab. Naming the
+        # container is the whole of that capability -- `gr.Tabs(selected=...)` as a return value
+        # switches tabs, and nothing else about the tab set changes.
+        with gr.Tabs() as main_tabs:
             with gr.Tab(LABEL_TAB_QUICK_RENDER, id='tab-quick-render') as tab_quick_render:
                 with gr.Row():
                     # [FORK] Digital-Union (GUI Refresh A): 3:2 at the top level -- the controls
@@ -7963,6 +9268,22 @@ def create_ui() -> gr.Blocks:
                         info=INFO_MUSIC_UNDER_VOICE,
                         elem_id='music-under-voice-slider',
                     )
+                    # [FORK] R7.1 (Comfort Mix): two optional controls. Both default to the legacy
+                    # behaviour, so an operator who never touches them gets the identical mix.
+                    voice_auto_balance = gr.Checkbox(
+                        label=LABEL_VOICE_AUTO_BALANCE,
+                        value=False,
+                        info=INFO_VOICE_AUTO_BALANCE,
+                        elem_id='voice-auto-balance-checkbox',
+                    )
+                    voice_music_return = gr.Number(
+                        label=LABEL_MUSIC_RETURN,
+                        value=fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
+                        minimum=0.1,
+                        maximum=fork_audio_mix.MUSIC_RETURN_MAX_SECONDS,
+                        info=INFO_MUSIC_RETURN,
+                        elem_id='music-return-input',
+                    )
                     audio_layers_report = gr.Textbox(
                         label=LABEL_AUDIO_LAYERS_REPORT,
                         value='',
@@ -8166,6 +9487,336 @@ def create_ui() -> gr.Blocks:
                         elem_id='prep-sample-report-box',
                     )
 
+            # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
+            # between Advanced Tools and Clips Preview.
+            #
+            # That position is chosen, not incidental. Placing it here keeps Advanced Tools at
+            # index 3, so every containment assertion in `test_gui_tabs.py` that counts from the
+            # front is unaffected; it keeps Clips Preview LAST, which its own suite requires; and
+            # it keeps this markup out of the Raw-Cutter-to-Advanced span that
+            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+            #
+            # Every numeric control here is a Number widget, and that is the same non-cosmetic
+            # constraint the Clips Preview tab records: a tab in this region falls inside the
+            # source span that
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+            # a substring check, so the forbidden widget type must not appear in this span even
+            # inside a comment explaining its absence -- which is why this one does not name it.
+            with gr.Tab(LABEL_TAB_AUDIO_CUTTER, id='tab-audio-cutter'):
+                gr.Markdown(INFO_TAB_AUDIO_CUTTER)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        with gr.Group():
+                            audio_source = gr.Textbox(
+                                label=LABEL_AUDIO_SOURCE,
+                                info=INFO_AUDIO_SOURCE,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_INPUT),
+                                placeholder=r"J:\Recordings\interview_take2.wav",
+                                elem_id='audio-source')
+                            audio_source_browse = gr.Button(
+                                LABEL_BROWSE_FILE, variant='secondary', scale=0,
+                                elem_id='audio-source-browse')
+                        with gr.Group():
+                            audio_output = gr.Textbox(
+                                label=LABEL_AUDIO_OUTPUT,
+                                info=INFO_AUDIO_OUTPUT,
+                                value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                                placeholder=r"J:\Voice Parts",
+                                elem_id='audio-output')
+                            audio_output_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='audio-output-browse')
+                        with gr.Group():
+                            with gr.Row():
+                                audio_threshold = gr.Number(
+                                    label=LABEL_AUDIO_THRESHOLD,
+                                    info=INFO_AUDIO_THRESHOLD,
+                                    value=fork_audio.DEFAULT_THRESHOLD_DB,
+                                    elem_id='audio-threshold')
+                                audio_min_silence = gr.Number(
+                                    label=LABEL_AUDIO_MIN_SILENCE,
+                                    info=INFO_AUDIO_MIN_SILENCE,
+                                    value=fork_audio.DEFAULT_MIN_SILENCE, minimum=0,
+                                    elem_id='audio-min-silence')
+                            with gr.Row():
+                                audio_pad = gr.Number(
+                                    label=LABEL_AUDIO_PAD,
+                                    info=INFO_AUDIO_PAD,
+                                    value=fork_audio.DEFAULT_PAD, minimum=0,
+                                    elem_id='audio-pad')
+                                audio_min_clip = gr.Number(
+                                    label=LABEL_AUDIO_MIN_CLIP,
+                                    info=INFO_AUDIO_MIN_CLIP,
+                                    value=fork_audio.DEFAULT_MIN_CLIP, minimum=0,
+                                    elem_id='audio-min-clip')
+                            # [R7.2] One choice per entry in `fork_audio.FORMATS`, APPENDED so
+                            # WAV stays the default and the two existing values keep their
+                            # positions. A test pins this list against `FORMATS` by value,
+                            # because the first browser smoke test of Phase 5 found the core, the
+                            # handler, the manifest and the argv all supporting MP3 while the
+                            # selector still offered only two options -- the one place an operator
+                            # could actually choose it.
+                            audio_format = gr.Radio(
+                                label=LABEL_AUDIO_FORMAT,
+                                info=INFO_AUDIO_FORMAT,
+                                choices=[("WAV · 16-bit PCM · 48 kHz", fork_audio.FORMAT_WAV),
+                                         ("FLAC · lossless · 48 kHz", fork_audio.FORMAT_FLAC),
+                                         (f"MP3 · {fork_audio.DEFAULT_MP3_BITRATE_KBPS} kbps · "
+                                          f"smaller files, lossy", fork_audio.FORMAT_MP3)],
+                                value=fork_audio.FORMAT_WAV,
+                                elem_id='audio-format')
+                        with gr.Row():
+                            audio_analyze_btn = gr.Button(
+                                LABEL_AUDIO_ANALYZE, variant='secondary',
+                                elem_id='audio-analyze-button')
+                            audio_cut_btn = gr.Button(
+                                LABEL_AUDIO_CUT, variant='primary',
+                                elem_id='audio-cut-button')
+                        gr.Markdown(INFO_AUDIO_BUTTONS)
+                    with gr.Column(scale=2):
+                        audio_plan = gr.Textbox(
+                            label=LABEL_AUDIO_PLAN,
+                            value=AUDIO_PLAN_INITIAL_TEXT,
+                            interactive=False, lines=12, max_lines=20,
+                            elem_id='audio-plan-box')
+                        audio_table = gr.Dataframe(
+                            headers=["Clip", "Start", "End", "Length", "Output name"],
+                            datatype=["number", "str", "str", "str", "str"],
+                            value=[], interactive=False, wrap=True,
+                            label=LABEL_AUDIO_TABLE,
+                            elem_id='audio-table')
+                        audio_report = gr.Textbox(
+                            label=LABEL_AUDIO_REPORT,
+                            value=AUDIO_REPORT_INITIAL_TEXT,
+                            interactive=False, lines=8, max_lines=16,
+                            elem_id='audio-report-box')
+
+                # The review half: listen to what was actually written, then file it.
+                with gr.Group():
+                    gr.Markdown(f"### {LABEL_AUDIO_REVIEW}\n\n{INFO_AUDIO_REVIEW}")
+                    with gr.Row():
+                        audio_library_folder = gr.Textbox(
+                            label=LABEL_AUDIO_LIBRARY,
+                            info=INFO_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='audio-library-folder')
+                        audio_discarded_folder = gr.Textbox(
+                            label=LABEL_AUDIO_DISCARDED,
+                            info=INFO_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='audio-discarded-folder')
+                    with gr.Row():
+                        audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-library-browse')
+                        audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='audio-discarded-browse')
+                    # [R7.2 Phase 4] The live destination read-out. Written by the two folder
+                    # `.change()` handlers and by Confirm, so "these two folders are the same" is
+                    # visible while the operator is still typing rather than only when a sort is
+                    # refused -- which is the defect reported from real use.
+                    audio_destination_status = gr.Textbox(
+                        label=LABEL_AUDIO_DESTINATION_STATUS,
+                        value=AUDIO_DESTINATION_STATUS_INITIAL,
+                        interactive=False, lines=2, max_lines=5,
+                        elem_id='audio-destination-status')
+                    gr.Markdown(INFO_AUDIO_GALLERY)
+                    gr.HTML(AUDIO_GALLERY_CSS)
+                    with gr.Row():
+                        audio_enable_hover = gr.Button(
+                            LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                            elem_id='audio-enable-hover',
+                            elem_classes=['r7-enable-hover'])
+                        audio_counts = gr.Textbox(
+                            label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                            interactive=False, elem_id='audio-counts')
+                    audio_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
+                                            elem_id='audio-gallery')
+                    # The ONE server contract with the page: every decision and every edited name
+                    # as JSON. Hidden because it is machinery, not a control -- but a real widget,
+                    # so Gradio carries it with the click like any other input.
+                    # NOT `visible=False`: Gradio drops an invisible component from the DOM
+                    # entirely, and the page has to be able to write into this one. It is hidden
+                    # with CSS instead -- present, carried with the click, and off screen.
+                    audio_decisions = gr.Textbox(
+                        value='', label=' ', elem_id='audio-decisions')
+                    audio_confirm_btn = gr.Button(
+                        LABEL_AUDIO_CONFIRM, variant='primary',
+                        elem_id='audio-confirm-button',
+                        # The client releases the player on `pointerdown` of anything carrying
+                        # this class. Windows will not rename a file a player still holds open.
+                        elem_classes=['r7-release-audio'])
+                    # [R7.2 Phase 3] The sweep gate. Hidden until Confirm finds unmarked clips, and
+                    # hidden again the moment the batch is resolved either way, so the screen never
+                    # offers a Proceed that is not attached to a specific set of counts.
+                    with gr.Row():
+                        audio_proceed_btn = gr.Button(
+                            LABEL_AUDIO_PROCEED, variant='stop', visible=False,
+                            elem_id='audio-proceed-button',
+                            elem_classes=['r7-release-audio'])
+                        audio_sweep_cancel_btn = gr.Button(
+                            LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
+                            elem_id='audio-sweep-cancel-button')
+                    audio_open_preview_btn = gr.Button(
+                        LABEL_AUDIO_OPEN_IN_PREVIEW, variant='secondary',
+                        elem_id='audio-open-preview-button')
+                    gr.Markdown(INFO_AUDIO_OPEN_IN_PREVIEW)
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            audio_clip_name = gr.Textbox(
+                                label=LABEL_AUDIO_CLIP_NAME,
+                                info=INFO_AUDIO_CLIP_NAME,
+                                value='', visible=False, elem_id='audio-clip-name')
+                        with gr.Column(scale=3):
+                            # [R7.1] Kept as a fallback player for a single clip, hidden by
+                            # default: the gallery's hover playback is the review surface now.
+                            audio_player = gr.HTML(
+                                value='', visible=False, elem_id='audio-player')
+                    audio_file_report = gr.Textbox(
+                        label=LABEL_AUDIO_FILE_REPORT,
+                        value=AUDIO_FILE_REPORT_INITIAL_TEXT,
+                        interactive=False, lines=4, max_lines=10,
+                        elem_id='audio-file-report')
+                    # Per-browser-session, so one operator's review list is not reachable from
+                    # another tab. Nothing about the clips lives in a module-level record.
+                    #
+                    # [R7.2] Holds the whole view: the registry session and page tokens, the frozen
+                    # entries, and the decision/name records keyed by FILE IDENTITY so they survive
+                    # paging. `audio_armed_state` holds the sweep signature of the batch the
+                    # operator confirmed, and only that batch -- a plain string, never a live
+                    # object.
+                    audio_review_state = gr.State({})
+                    audio_armed_state = gr.State('')
+                    audio_run_dir_state = gr.State('')
+
+                gr.Markdown(INFO_AUDIO_LAYERS_TIP)
+
+            # [FORK] Digital-Union (R7.2 Phase 2): the SEVENTH top-level tab, 🎧 Audio Preview.
+            #
+            # Placed between Audio Cutter and Clips Preview, and that position is chosen rather
+            # than incidental. It keeps Advanced Tools at `_TABS` index 3, so every containment
+            # assertion in `test_gui_tabs.py` that counts from the front is unaffected; it keeps
+            # Clips Preview LAST, which its own suite requires; and it keeps this markup out of the
+            # Raw-Cutter-to-Advanced span that
+            # `test_the_raw_cutter_is_a_top_level_tab_not_an_accordion` scans.
+            #
+            # Every numeric control here is a Number widget, which is the same non-cosmetic
+            # constraint the two tabs either side of it record: a tab in this region falls inside
+            # the source span that
+            # `test_media_sample.py::test_no_frame_timeout_or_budget_control_exists_in_the_ui`
+            # guards, which enforces the approved sample resource policy by OMISSION. The guard is
+            # a substring check over this whole region, so the forbidden widget type must not
+            # appear in this span even inside a comment explaining its absence -- which is why
+            # this one does not name it.
+            with gr.Tab(LABEL_TAB_AUDIO_PREVIEW, id='tab-audio-preview'):
+                gr.Markdown(INFO_TAB_AUDIO_PREVIEW)
+                gr.HTML(AUDIO_GALLERY_CSS)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        with gr.Group():
+                            audio_preview_folder = gr.Textbox(
+                                label=LABEL_AUDIO_PREVIEW_FOLDER,
+                                info=INFO_AUDIO_PREVIEW_FOLDER,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_INPUT),
+                                placeholder=r"J:\New folder\CutsAudio\VOICE OVER",
+                                elem_id='audio-preview-folder')
+                            with gr.Row():
+                                audio_preview_browse = gr.Button(
+                                    LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                    elem_id='audio-preview-browse')
+                                audio_preview_recursive = gr.Checkbox(
+                                    label=LABEL_AUDIO_PREVIEW_RECURSIVE,
+                                    info=INFO_AUDIO_PREVIEW_RECURSIVE,
+                                    value=False, elem_id='audio-preview-recursive')
+                            with gr.Row():
+                                audio_preview_page_size = gr.Number(
+                                    label=LABEL_AUDIO_PREVIEW_PAGE_SIZE,
+                                    info=INFO_AUDIO_PREVIEW_PAGE_SIZE,
+                                    value=fork_audio_review.DEFAULT_PAGE_SIZE,
+                                    minimum=1, maximum=fork_audio_review.MAX_PAGE_SIZE,
+                                    step=1, elem_id='audio-preview-page-size')
+                                audio_preview_scan_btn = gr.Button(
+                                    LABEL_AUDIO_PREVIEW_SCAN, variant='primary',
+                                    elem_id='audio-preview-scan-button')
+                        with gr.Group():
+                            audio_preview_library = gr.Textbox(
+                                label=LABEL_AUDIO_PREVIEW_LIBRARY,
+                                info=INFO_AUDIO_LIBRARY,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                                placeholder=r"J:\Voice Library",
+                                elem_id='audio-preview-library')
+                            audio_preview_library_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='audio-preview-library-browse')
+                            audio_preview_discarded = gr.Textbox(
+                                label=LABEL_AUDIO_PREVIEW_DISCARDED,
+                                info=INFO_AUDIO_DISCARDED,
+                                value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                                placeholder=r"J:\Voice Discarded",
+                                elem_id='audio-preview-discarded')
+                            audio_preview_discarded_browse = gr.Button(
+                                LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                                elem_id='audio-preview-discarded-browse')
+                            audio_preview_destination_status = gr.Textbox(
+                                label=LABEL_AUDIO_DESTINATION_STATUS,
+                                value=AUDIO_DESTINATION_STATUS_INITIAL,
+                                interactive=False, lines=2, max_lines=5,
+                                elem_id='audio-preview-destination-status')
+                    with gr.Column(scale=2):
+                        audio_preview_report = gr.Textbox(
+                            label=LABEL_AUDIO_PREVIEW_REPORT,
+                            value=AUDIO_PREVIEW_REPORT_INITIAL,
+                            interactive=False, lines=10, max_lines=18,
+                            elem_id='audio-preview-report')
+
+                gr.Markdown(INFO_AUDIO_GALLERY)
+                with gr.Row():
+                    audio_preview_enable_hover = gr.Button(
+                        LABEL_AUDIO_ENABLE_HOVER, variant='secondary', scale=0,
+                        elem_id='audio-preview-enable-hover',
+                        elem_classes=['r7-enable-hover'])
+                    audio_preview_counts = gr.Textbox(
+                        label=LABEL_AUDIO_COUNTS, value=AUDIO_COUNTS_INITIAL_TEXT,
+                        interactive=False, elem_id='audio-preview-counts')
+                with gr.Row():
+                    audio_preview_prev_btn = gr.Button(
+                        LABEL_AUDIO_PREVIEW_PREV, variant='secondary', scale=0,
+                        elem_id='audio-preview-prev-button')
+                    audio_preview_page_label = gr.Textbox(
+                        label=LABEL_AUDIO_PREVIEW_PAGE,
+                        value=AUDIO_PREVIEW_PAGE_INITIAL,
+                        interactive=False, elem_id='audio-preview-page-label')
+                    audio_preview_next_btn = gr.Button(
+                        LABEL_AUDIO_PREVIEW_NEXT, variant='secondary', scale=0,
+                        elem_id='audio-preview-next-button')
+                audio_preview_gallery = gr.HTML(value=AUDIO_GALLERY_EMPTY_HTML,
+                                                elem_id='audio-preview-gallery')
+                # This tab's own hidden decision channel. The grid names it in `data-store`, so the
+                # client writes HERE and never into the Audio Cutter's field -- which is the whole
+                # reason the grid carries that attribute.
+                audio_preview_decisions = gr.Textbox(
+                    value='', label=' ', elem_id='audio-preview-decisions')
+                audio_preview_confirm_btn = gr.Button(
+                    LABEL_AUDIO_CONFIRM, variant='primary',
+                    elem_id='audio-preview-confirm-button',
+                    elem_classes=['r7-release-audio'])
+                with gr.Row():
+                    audio_preview_proceed_btn = gr.Button(
+                        LABEL_AUDIO_PROCEED, variant='stop', visible=False,
+                        elem_id='audio-preview-proceed-button',
+                        elem_classes=['r7-release-audio'])
+                    audio_preview_sweep_cancel_btn = gr.Button(
+                        LABEL_AUDIO_SWEEP_CANCEL, variant='secondary', visible=False,
+                        elem_id='audio-preview-sweep-cancel-button')
+                # Per-browser-session, exactly like the cutter's. The decision and name records are
+                # keyed by file identity, which is what makes paging lossless.
+                audio_preview_state = gr.State({})
+                audio_preview_armed_state = gr.State('')
+
             # [FORK] Digital-Union (R5 Clips Preview Selector, P1): the FIFTH top-level tab.
             #
             # Placed LAST, after Advanced Tools, and that position is load-bearing twice over.
@@ -8309,6 +9960,55 @@ def create_ui() -> gr.Blocks:
                         pref_raw_output_browse = gr.Button(
                             LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
                             elem_id='pref-raw-output-browse')
+                    # [FORK] R7: the Audio Cutter's three destinations, remembered the same way.
+                    with gr.Row():
+                        pref_audio_library = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='pref-audio-library')
+                        pref_audio_discarded = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='pref-audio-discarded')
+                    with gr.Row():
+                        pref_audio_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-library-browse')
+                        pref_audio_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-discarded-browse')
+                    with gr.Row():
+                        pref_audio_output = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_OUTPUT,
+                            value=_pref(fork_prefs.AUDIO_CUTTER_OUTPUT),
+                            placeholder=r"J:\Voice Parts",
+                            elem_id='pref-audio-output')
+                        pref_audio_output_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-output-browse')
+                    # [FORK] R7.2: the Audio Preview tab's two destinations. Separate keys from the
+                    # cutter's, because the folder a later review sorts into is a different
+                    # decision from the folder a fresh cut files into.
+                    with gr.Row():
+                        pref_audio_preview_library = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_PREVIEW_LIBRARY,
+                            value=_pref(fork_prefs.AUDIO_PREVIEW_LIBRARY),
+                            placeholder=r"J:\Voice Library",
+                            elem_id='pref-audio-preview-library')
+                        pref_audio_preview_discarded = gr.Textbox(
+                            label=LABEL_PREF_AUDIO_PREVIEW_DISCARDED,
+                            value=_pref(fork_prefs.AUDIO_PREVIEW_DISCARDED),
+                            placeholder=r"J:\Voice Discarded",
+                            elem_id='pref-audio-preview-discarded')
+                    with gr.Row():
+                        pref_audio_preview_library_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-preview-library-browse')
+                        pref_audio_preview_discarded_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='pref-audio-preview-discarded-browse')
                     with gr.Row():
                         pref_save_btn = gr.Button(
                             LABEL_PREF_SAVE, variant='primary', elem_id='pref-save-button')
@@ -8333,20 +10033,204 @@ def create_ui() -> gr.Blocks:
                 (source_folder_browse, source_folder),
                 (pref_library_browse, pref_library),
                 (pref_rejected_browse, pref_rejected),
-                (pref_raw_output_browse, pref_raw_output)):
+                (pref_raw_output_browse, pref_raw_output),
+                # [FORK] R7: the Audio Cutter's folder fields use the same self-contained helper.
+                (audio_output_browse, audio_output),
+                (audio_library_browse, audio_library_folder),
+                (audio_discarded_browse, audio_discarded_folder),
+                (pref_audio_library_browse, pref_audio_library),
+                (pref_audio_discarded_browse, pref_audio_discarded),
+                (pref_audio_output_browse, pref_audio_output),
+                # [FORK] R7.2: the Audio Preview tab's folder fields, including its native
+                # Browse Folder button, reach the same self-contained helper. Browsing still
+                # scans nothing -- it only fills a box.
+                (audio_preview_browse, audio_preview_folder),
+                (audio_preview_library_browse, audio_preview_library),
+                (audio_preview_discarded_browse, audio_preview_discarded),
+                (pref_audio_preview_library_browse, pref_audio_preview_library),
+                (pref_audio_preview_discarded_browse, pref_audio_preview_discarded)):
             _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
                                  concurrency_limit=None)
+
+        # [FORK] R7: the one FILE field, which needs the file dialog rather than the folder one.
+        audio_source_browse.click(fn=_browse_audio_source, inputs=[audio_source],
+                                  outputs=[audio_source], concurrency_limit=None)
 
         pref_save_btn.click(
             fn=_on_save_folder_prefs,
             inputs=[pref_library, pref_rejected, pref_raw_output,
-                    clips_input, cut_batch_folder, source_folder],
+                    clips_input, cut_batch_folder, source_folder,
+                    # [FORK] R7: appended at the END so no existing positional index moves.
+                    pref_audio_library, pref_audio_discarded, pref_audio_output, audio_source,
+                    # [FORK] R7.2: appended after those, for the same reason.
+                    audio_preview_folder, pref_audio_preview_library,
+                    pref_audio_preview_discarded],
             outputs=[pref_status],
         )
         pref_reset_btn.click(
             fn=_on_reset_folder_prefs,
             inputs=None,
-            outputs=[pref_library, pref_rejected, pref_raw_output, pref_status],
+            outputs=[pref_library, pref_rejected, pref_raw_output,
+                     pref_audio_library, pref_audio_discarded, pref_audio_output,
+                     pref_audio_preview_library, pref_audio_preview_discarded, pref_status],
+        )
+
+        # [FORK] Digital-Union (R7 Raw Audio Cutter V1): five registrations, all isolated.
+        #
+        # None of them writes `status_output`, `video_output`, `process_btn`, `source_state`, any
+        # element of `source_outputs` or `prep_outputs`, any creative widget, any Raw Cutter widget
+        # or any render state -- so cutting audio cannot clear a confirmed source set, change what
+        # a render would do, or disturb a cutter job.
+        #
+        # `concurrency_limit=None` on every one, for the same measured S2-A R3 reason the Clips
+        # Preview registrations carry: on the pinned gradio 6.19.0 a full concurrency group leaves
+        # the event QUEUED rather than delivering it. None of these takes `_RENDER_LOCK` either --
+        # cutting a voice memo is not a render.
+        audio_analyze_btn.click(
+            fn=_on_audio_analyze,
+            inputs=[audio_source, audio_threshold, audio_min_silence, audio_pad,
+                    audio_min_clip, audio_format],
+            outputs=[audio_plan, audio_table],
+            concurrency_limit=None,
+        )
+        audio_cut_btn.click(
+            fn=_on_audio_cut,
+            inputs=[audio_source, audio_output, audio_threshold, audio_min_silence,
+                    audio_pad, audio_min_clip, audio_format],
+            outputs=[audio_report, audio_table, audio_gallery, audio_counts,
+                     audio_decisions, audio_review_state, audio_run_dir_state],
+            concurrency_limit=None,
+        )
+        # [R7.1] ONE filing action, as the Clips Preview has. The browser contributes a decision
+        # and a name per clip id through `audio_decisions`; every path comes from the server's own
+        # frozen page, so the page cannot name a file to move.
+        #
+        # [R7.2] Confirm, Proceed and Cancel all write the SAME seven outputs through the same
+        # core, which is what keeps the sweep gate honest: there is no path on which Proceed can
+        # move a file that Confirm would not have moved, because Proceed *is* Confirm with the
+        # batch's signature supplied.
+        _audio_confirm_inputs = [audio_decisions, audio_library_folder, audio_discarded_folder,
+                                 audio_review_state, audio_armed_state]
+        _audio_confirm_outputs = [audio_file_report, audio_gallery, audio_counts,
+                                  audio_review_state, audio_armed_state,
+                                  audio_proceed_btn, audio_sweep_cancel_btn]
+        audio_confirm_btn.click(
+            fn=_on_audio_confirm,
+            inputs=_audio_confirm_inputs,
+            outputs=_audio_confirm_outputs,
+            concurrency_limit=None,
+        )
+        audio_proceed_btn.click(
+            fn=_on_audio_proceed,
+            inputs=_audio_confirm_inputs,
+            outputs=_audio_confirm_outputs,
+            concurrency_limit=None,
+        )
+        audio_sweep_cancel_btn.click(
+            fn=_on_audio_cancel,
+            inputs=[audio_review_state],
+            outputs=_audio_confirm_outputs,
+            concurrency_limit=None,
+        )
+        # [R7.2 Phase 4] Immediate destination validation. Both fields reach the same handler and
+        # it writes ONE read-only textbox -- never the gallery, never a decision, never a folder.
+        #
+        # Registered explicitly per widget rather than in a loop, which is the convention the
+        # Freestyle dropdowns already follow and for the same reason: a loop body produces
+        # `_field.change(...)` in the syntax tree, so every per-widget seam assertion in the suite
+        # becomes unable to find the binding and the guard silently stops guarding.
+        audio_library_folder.change(
+            fn=_on_audio_destinations_change,
+            inputs=[audio_library_folder, audio_discarded_folder, audio_review_state],
+            outputs=[audio_destination_status],
+            concurrency_limit=None,
+        )
+        audio_discarded_folder.change(
+            fn=_on_audio_destinations_change,
+            inputs=[audio_library_folder, audio_discarded_folder, audio_review_state],
+            outputs=[audio_destination_status],
+            concurrency_limit=None,
+        )
+        # [R7.2 Phase 2] "Open results in Audio Preview" fills the other tab's folder box and
+        # selects it. It scans nothing, which is the requirement: no folder is read as a side
+        # effect of anything but a deliberate Scan.
+        audio_open_preview_btn.click(
+            fn=_on_audio_open_in_preview,
+            inputs=[audio_run_dir_state],
+            outputs=[audio_preview_folder, main_tabs, audio_file_report],
+            concurrency_limit=None,
+        )
+
+        # [FORK] Digital-Union (R7.2 Phase 2): the Audio Preview tab's six registrations.
+        #
+        # Same isolation as the Audio Cutter's: none of them writes `status_output`,
+        # `video_output`, `process_btn`, `source_state`, any element of `source_outputs` or
+        # `prep_outputs`, any creative widget, any Raw Cutter widget or any render state. None
+        # takes `_RENDER_LOCK` and none joins a concurrency group, for the measured S2-A R3 reason
+        # the Clips Preview registrations carry.
+        #
+        # All six write the same nine outputs, assembled by `_audio_preview_outputs`, so the
+        # positional contract between six handlers and this list lives in one function.
+        _audio_preview_outputs_list = [
+            audio_preview_report, audio_preview_gallery, audio_preview_counts,
+            audio_preview_state, audio_preview_page_label, audio_preview_armed_state,
+            audio_preview_proceed_btn, audio_preview_sweep_cancel_btn,
+            audio_preview_destination_status,
+        ]
+        audio_preview_scan_btn.click(
+            fn=_on_audio_preview_scan,
+            inputs=[audio_preview_folder, audio_preview_recursive, audio_preview_page_size,
+                    audio_preview_library, audio_preview_discarded, audio_preview_state],
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        audio_preview_prev_btn.click(
+            fn=_on_audio_preview_prev,
+            inputs=[audio_preview_decisions, audio_preview_page_size, audio_preview_library,
+                    audio_preview_discarded, audio_preview_state],
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        audio_preview_next_btn.click(
+            fn=_on_audio_preview_next,
+            inputs=[audio_preview_decisions, audio_preview_page_size, audio_preview_library,
+                    audio_preview_discarded, audio_preview_state],
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        _audio_preview_confirm_inputs = [
+            audio_preview_decisions, audio_preview_library, audio_preview_discarded,
+            audio_preview_page_size, audio_preview_state, audio_preview_armed_state]
+        audio_preview_confirm_btn.click(
+            fn=_on_audio_preview_confirm,
+            inputs=_audio_preview_confirm_inputs,
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        audio_preview_proceed_btn.click(
+            fn=_on_audio_preview_proceed,
+            inputs=_audio_preview_confirm_inputs,
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        audio_preview_sweep_cancel_btn.click(
+            fn=_on_audio_preview_cancel,
+            inputs=[audio_preview_library, audio_preview_discarded, audio_preview_state],
+            outputs=_audio_preview_outputs_list,
+            concurrency_limit=None,
+        )
+        # Explicitly per widget, for the seam-visibility reason recorded above the cutter's pair.
+        audio_preview_library.change(
+            fn=_on_audio_preview_destinations_change,
+            inputs=[audio_preview_library, audio_preview_discarded, audio_preview_state],
+            outputs=[audio_preview_destination_status],
+            concurrency_limit=None,
+        )
+        audio_preview_discarded.change(
+            fn=_on_audio_preview_destinations_change,
+            inputs=[audio_preview_library, audio_preview_discarded, audio_preview_state],
+            outputs=[audio_preview_destination_status],
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union: source-mode / scan / confirm wiring.
@@ -9030,6 +10914,11 @@ def create_ui() -> gr.Blocks:
                 freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
                 freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
                 freestyle_verse, freestyle_body,
+                # [FORK] R7.1 (Comfort Mix): appended at the END of the list, matching the two
+                # parameters appended at the end of `process_video_guarded`. Gradio passes these
+                # positionally, so list order and signature order are one contract -- a seam test
+                # pins them name-for-name.
+                voice_auto_balance, voice_music_return,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or
@@ -9093,6 +10982,10 @@ def create_ui() -> gr.Blocks:
         # The gallery's interaction layer. `fn=None` means this registers no server call: it only
         # installs the listeners once per page load.
         app.load(fn=None, inputs=None, outputs=None, js=CLIPS_GALLERY_JS)
+        # [R7.1] The Audio Cutter gallery's own listeners. A separate registration rather than a
+        # merged script: the two galleries share no behaviour beyond being grids of tiles, and one
+        # combined blob would make either harder to change safely.
+        app.load(fn=None, inputs=None, outputs=None, js=AUDIO_GALLERY_JS)
 
     return app
 
@@ -9136,6 +11029,21 @@ if __name__ == '__main__':
                     poster_resolver=_clips_poster_resolver,
                     decide_handler=_clips_decide,
                     state_handler=_clips_state,
+                ),
+                # [FORK] R7.2: the two audio review surfaces, each bound to its own registry at
+                # construction time. The prefix-to-registry pairing is therefore a structural fact
+                # rather than a lookup, so a token minted for one surface is simply not in the
+                # other's map. Each claims one prefix and passes everything else through, so the
+                # R5 middleware above and Gradio's own routes are untouched.
+                Middleware(
+                    AudioMediaMiddleware,
+                    registry=_AUDIO_CUT_REGISTRY,
+                    prefix=fork_audio_review.MEDIA_PREFIX_CUTTER,
+                ),
+                Middleware(
+                    AudioMediaMiddleware,
+                    registry=_AUDIO_PREVIEW_REGISTRY,
+                    prefix=fork_audio_review.MEDIA_PREFIX_PREVIEW,
                 ),
             ],
         },

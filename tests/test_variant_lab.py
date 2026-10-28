@@ -2788,14 +2788,44 @@ def test_both_render_wrappers_take_the_same_freestyle_widgets():
     assert single_fs[1:] == [f"freestyle_{name}" for name in fork_freestyle.SECTION_TYPES]
 
 
+#: Parameters appended AFTER the Freestyle block by a later feature. R7.1's Comfort Mix controls
+#: ride here, with legacy defaults, for the same reason Freestyle itself rode at the end: it keeps
+#: every pre-existing positional index exactly where it was.
+_APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return")
+
+
 def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():
     """Gradio matches positionally. Appending keeps every pre-existing parameter at its own index,
-    which is why the pre-Freestyle seam alignments still hold."""
+    which is why the pre-Freestyle seam alignments still hold.
+
+    **Amended for R7.1.** The original assertion was `everything from the first freestyle parameter
+    onwards is a freestyle parameter` — an accurate proxy for the real claim for exactly as long as
+    Freestyle was the most recently appended feature. The claim in the docstring is the one that
+    matters, and it is unchanged: nothing is ever *inserted*, so no pre-existing index moves.
+
+    So the invariant is now asserted directly, in two halves:
+
+    * the Freestyle block is **contiguous** — nothing is interleaved into it, which is what lets
+      `process_video_guarded` collect the eleven values by name into one ordered tuple; and
+    * anything after it is a **known later append** carrying a default, never a parameter that was
+      once in front of the block and has been moved behind it.
+    """
     tree = _tree(_GUI)
     for handler in ("process_video_guarded", "render_selected_variants_guarded"):
-        names = [a.arg for a in _func(tree, handler).args.args]
-        first = next(i for i, n in enumerate(names) if n.startswith("freestyle"))
-        assert all(n.startswith("freestyle") for n in names[first:]), (handler, names[first:])
+        node = _func(tree, handler)
+        names = [a.arg for a in node.args.args]
+        freestyle = [i for i, n in enumerate(names) if n.startswith("freestyle")]
+        assert freestyle, handler
+        assert freestyle == list(range(freestyle[0], freestyle[-1] + 1)), (
+            handler, "the Freestyle block is no longer contiguous", names)
+
+        trailing = names[freestyle[-1] + 1:]
+        assert all(n in _APPENDED_AFTER_FREESTYLE for n in trailing), (handler, trailing)
+
+        # Whatever rides at the end must be optional, or an existing caller that omits it breaks.
+        defaulted = names[len(names) - len(node.args.defaults):] if node.args.defaults else []
+        for name in trailing:
+            assert name in defaulted, (handler, name, "appended without a default")
 
 
 def test_generating_variants_still_writes_no_freestyle_widget():

@@ -1522,3 +1522,302 @@ INFO_CUT_OUTPUT_PROFILE = (
     "plays at normal speed either way. It changes only the exported file — never where a cut is "
     "placed. One profile applies to a whole Folder Batch."
 )
+
+# =============================================================================================
+# [FORK] Digital-Union (R7): Raw Audio Cutter V1 — split one recording on its silences.
+# =============================================================================================
+
+LABEL_TAB_AUDIO_CUTTER = "🎙️ Audio Cutter"
+
+INFO_TAB_AUDIO_CUTTER = (
+    "**Pull reusable audio clips out of one recording.** Point it at a voice memo, an interview, "
+    "a take of dialogue or any video with an audio track, press Analyze to see where it would "
+    "cut, then press Cut Audio to write the clips. The source file is read in place and is never "
+    "modified.\n\n"
+    "**It cuts on silence, and only on silence.** It does not recognise words or sentences, and "
+    "it cannot tell speech from music — a continuous passage stays one clip however long it is, "
+    "and a long enough pause splits one whether or not that is a sensible place to break. The "
+    "four settings below are how you tune that."
+)
+
+LABEL_AUDIO_SOURCE = "🎙️ Source recording (full path to one file)"
+INFO_AUDIO_SOURCE = (
+    "Read in place — nothing is uploaded or copied. WAV, MP3, FLAC, M4A and any video whose "
+    "audio track is still present (MP4, MKV, MOV…). The file is accepted on whether FFprobe "
+    "finds an audio stream in it, not on its extension."
+)
+LABEL_BROWSE_FILE = "🎙️ Browse file…"
+
+LABEL_AUDIO_OUTPUT = "📁 Output folder"
+INFO_AUDIO_OUTPUT = (
+    "Each cut creates its own fresh, timestamped subfolder here, so a second run can never "
+    "overwrite the first. Existing files are never replaced."
+)
+
+LABEL_AUDIO_THRESHOLD = "🔉 Silence threshold (dB)"
+INFO_AUDIO_THRESHOLD = (
+    "Anything quieter than this counts as silence. The number is negative and lower is stricter: "
+    "-50 keeps only near-total silence, -20 will treat ordinary room tone as a gap. -35 is a "
+    "sensible starting point for spoken recordings."
+)
+LABEL_AUDIO_MIN_SILENCE = "⏸️ Minimum silence (seconds)"
+INFO_AUDIO_MIN_SILENCE = (
+    "Quiet shorter than this is not a gap, so it will not split a clip. This is the control that "
+    "decides whether the breath between two words separates them: at 0.5s an ordinary inter-word "
+    "pause does not, a deliberate beat does."
+)
+LABEL_AUDIO_PAD = "➕ Padding (seconds)"
+INFO_AUDIO_PAD = (
+    "Kept on each side of every detected sound, so a clip does not begin on the attack of the "
+    "first syllable or cut off the tail of the last. Padding never reaches into a neighbouring "
+    "clip: each side takes at most half the gap it is growing into, so two clips can meet but "
+    "never overlap."
+)
+LABEL_AUDIO_MIN_CLIP = "✂️ Minimum clip length (seconds)"
+INFO_AUDIO_MIN_CLIP = (
+    "Results shorter than this are dropped rather than written. A 0.1s fragment is a click, not "
+    "a clip."
+)
+LABEL_AUDIO_FORMAT = "💾 Export format"
+# [R7.2 Phase 5] The MP3 sentence is deliberately blunt. Offering MP3 beside two lossless formats
+# invites the reading that it is simply "the small one", and from an MP3 source it invites the
+# worse reading that the original frames are being copied. Neither is true: the cutter decodes the
+# audio to find the silences, so MP3 output is always a fresh lossy encode. Saying so is the
+# honest version of a feature whose real benefit is file size.
+INFO_AUDIO_FORMAT = (
+    "**WAV** is 16-bit PCM at 48 kHz — what Audio Layers and every editor accept without "
+    "negotiation. **FLAC** is the same audio losslessly compressed, for a smaller library. "
+    "**MP3** at 192 kbps is about **a quarter** of the WAV size for a mono recording, or about an "
+    "eighth for stereo, and works in Audio Layers too — but it is a **lossy re-encode**, "
+    "including when your source is already an MP3, because the silences are found by decoding the "
+    "audio and there is no stream copy. Choose MP3 for smaller files, not for better quality."
+)
+
+LABEL_AUDIO_ANALYZE = "🔎 Analyze Audio"
+LABEL_AUDIO_CUT = "✂️ Cut Audio"
+LABEL_AUDIO_PLAN = "Plan summary"
+LABEL_AUDIO_TABLE = "Planned clips"
+LABEL_AUDIO_REPORT = "Cut report"
+AUDIO_PLAN_INITIAL_TEXT = (
+    "Choose a recording and press Analyze Audio to see where it would cut. Analyze writes nothing."
+)
+AUDIO_REPORT_INITIAL_TEXT = "Nothing has been cut yet."
+INFO_AUDIO_BUTTONS = (
+    "Analyze never writes anything. Cut Audio re-checks the file and your settings first and "
+    "refuses a plan that no longer matches them."
+)
+
+LABEL_AUDIO_REVIEW = "🎧 Exported clips"
+INFO_AUDIO_REVIEW = (
+    "Pick a clip to hear it. Keep files it into your voice library under the name in the box; "
+    "Discard moves it to the Discarded folder. Discarding is quarantine, never deletion, and an "
+    "existing name is refused rather than overwritten."
+)
+LABEL_AUDIO_PLAYER = "Listen"
+LABEL_AUDIO_CLIP_NAME = "✏️ Save as"
+INFO_AUDIO_CLIP_NAME = (
+    "Edit the name before you keep it if you like — the extension is always taken from the real "
+    "file. Audio Layers plays files in filename order, so a leading number keeps a sequence in "
+    "order."
+)
+LABEL_AUDIO_KEEP = "✅ Keep → voice library"
+LABEL_AUDIO_DISCARD = "🗑️ Discard → quarantine"
+LABEL_AUDIO_FILE_REPORT = "Filing report"
+AUDIO_FILE_REPORT_INITIAL_TEXT = "Nothing has been filed yet."
+
+LABEL_AUDIO_LIBRARY = "✅ Voice library folder (where KEPT clips go)"
+INFO_AUDIO_LIBRARY = (
+    "Validated when you file a clip, never written to before that. It must not be inside the "
+    "folder of clips being reviewed."
+)
+LABEL_AUDIO_DISCARDED = "🗑️ Discarded folder (quarantine, never deletion)"
+INFO_AUDIO_DISCARDED = (
+    "A discarded clip is moved here intact, for you to deal with outside this tool. There is no "
+    "retention expiry and no permanent delete."
+)
+
+LABEL_PREF_AUDIO_LIBRARY = "Default voice library"
+LABEL_PREF_AUDIO_DISCARDED = "Default Audio Cutter Discarded folder"
+LABEL_PREF_AUDIO_OUTPUT = "Default Audio Cutter output"
+LABEL_PREF_AUDIO_PREVIEW_LIBRARY = "Default Audio Preview Media Library"
+LABEL_PREF_AUDIO_PREVIEW_DISCARDED = "Default Audio Preview Discarded folder"
+
+INFO_AUDIO_LAYERS_TIP = (
+    "**Using these clips with Audio Layers.** Open **Advanced Tools → 🎤 Audio Layers (Voice & "
+    "SFX)** and choose the exported clips as the voice files. They are played **in filename "
+    "order**, which is why the clips are numbered. **Start Delay** sets how far into the track "
+    "speech may begin, **Minimum Gap** separates one clip from the next, and **Music Under "
+    "Voice** controls how far the music is ducked while a clip plays. Nothing about Audio Layers "
+    "changes in R7 — these files are ordinary WAV/FLAC and it already accepts them."
+)
+
+
+# [FORK] Digital-Union (R7.1): Audio Layers Comfort Mix. OPTIONAL and OFF by default.
+LABEL_VOICE_AUTO_BALANCE = "\u2696\ufe0f Auto Balance Voice & Music"
+INFO_VOICE_AUTO_BALANCE = (
+    "Off by default, and off means the mix is exactly what it has always been. "
+    "On, BeatSync measures how loud the music and your voice clips actually are (EBU R128) and "
+    "evens them out BEFORE mixing, so the speech does not have to be rescued by ducking the music "
+    "harder. Corrections are bounded and a near-silent clip is never amplified. It is a more "
+    "comfortable balance, not a louder master."
+)
+LABEL_MUSIC_RETURN = "\u23f3 Music return / fade back (seconds)"
+INFO_MUSIC_RETURN = (
+    "How long the music takes to come back up to full after a voice clip ends. The original "
+    "behaviour is 0.4s, which on a loud track can feel like the music jumps back in. With Auto "
+    "Balance on, around 2s is a good starting point. This changes only how the music returns \u2014 "
+    "it never moves a voice clip or a video cut."
+)
+LABEL_BALANCE_REPORT = "Auto Balance measurement"
+
+
+# [FORK] Digital-Union (R7.1, extended in R7.2): the audio review gallery.
+INFO_AUDIO_GALLERY = (
+    "**Hover a tile to hear it** \u2014 it loops until you move away, and only one clip ever plays "
+    "at a time. Audio is fetched **when you hover**, so clip size and page size no longer limit "
+    "what will play. **Left-click keeps**, **right-click discards**, **middle-click** (or **P**) "
+    "puts a clip back to undecided. With a tile focused, **S** / **R** / **P** do the same and the "
+    "**arrow keys** move between clips. **Shift+wheel** scrubs inside a tile. Edit a name in its "
+    "box before confirming if you want to.\n\n"
+    "**Nothing moves until you press Confirm and Sort.** Classifying is just a decision.\n\n"
+    "**You only have to mark the clips you want to KEEP.** Anything you leave unmarked is treated "
+    "as discarded \u2014 but never without asking you first, and never deleted."
+)
+LABEL_AUDIO_ENABLE_HOVER = "\U0001f50a Enable hover audio"
+INFO_AUDIO_ENABLE_HOVER = (
+    "Chrome blocks sound until you have interacted with the page. If a tile says "
+    "\u201cclick Enable hover audio\u201d, press this once."
+)
+LABEL_AUDIO_CONFIRM = "\u2705 Confirm and Sort"
+LABEL_AUDIO_COUNTS = "Decisions"
+AUDIO_COUNTS_INITIAL_TEXT = "Keep 0   \u00b7   Discard 0   \u00b7   Undecided 0   \u00b7   Total 0"
+
+# [R7.2 Phase 3] The admission rule changed, so this text had to. R7.1 refused Confirm while
+# anything was undecided, which made the operator click Reject on every clip they did not want.
+# Confirm now needs one KEPT clip and sweeps the rest -- after asking.
+AUDIO_CONFIRM_DISABLED_TEXT = (
+    "Nothing was moved \u2014 mark at least one clip to KEEP first.\n\n"
+    "Left-click a tile (or press S with it focused) to keep it. You do not have to reject the "
+    "others: anything you leave unmarked is offered for discarding when you press Confirm."
+)
+
+# The empty grid, as markup rather than an empty string. `gr.HTML('')` renders nothing at all,
+# which looks like a broken page rather than an empty one.
+AUDIO_GALLERY_EMPTY_HTML = (
+    '<div class="r7-empty">No clips to review yet.</div>'
+)
+
+AUDIO_SWEEP_GATE_HEADING = (
+    "\u26a0\ufe0f  Some clips are still unmarked. Nothing has moved yet \u2014 here is what "
+    "Confirm would do:"
+)
+AUDIO_SWEEP_GATE_PROMPT = (
+    "Press **Proceed** to sort it exactly as listed above, or **Cancel** to go back and mark more "
+    "clips. Nothing is deleted either way: discarding moves a file into your Discarded folder.\n"
+    "This confirmation applies to THIS batch only. If you change a decision or a folder "
+    "afterwards, you will be asked again."
+)
+AUDIO_SWEEP_CANCELLED_TEXT = (
+    "Cancelled. Nothing was moved and every clip is exactly as you left it.\n"
+    "Mark the clips you want to keep, then press Confirm and Sort again."
+)
+LABEL_AUDIO_PROCEED = "\u27a1\ufe0f Proceed \u2014 sort it as listed"
+LABEL_AUDIO_SWEEP_CANCEL = "\u21a9\ufe0f Cancel \u2014 go back and mark more"
+
+# [R7.2 Phase 4] The live destination read-out. It is a report, not a gate: the gallery stays
+# usable while the folders are being corrected, and only sorting is withheld.
+LABEL_AUDIO_DESTINATION_STATUS = "Destination folders"
+AUDIO_DESTINATION_STATUS_INITIAL = (
+    "Set a Media Library folder and a Discarded folder. They are checked as you type, and again "
+    "before anything is moved."
+)
+
+# ---------------------------------------------------------------------------------------------
+# [FORK] Digital-Union (R7.2 Phase 2): the standalone Audio Preview tab.
+# ---------------------------------------------------------------------------------------------
+
+LABEL_TAB_AUDIO_PREVIEW = "\U0001f3a7 Audio Preview"
+INFO_TAB_AUDIO_PREVIEW = (
+    "### \U0001f3a7 Audio Preview \u2014 review and sort a folder of audio clips\n\n"
+    "Point this at **any folder of audio clips** and classify them: the ones the Raw Audio Cutter "
+    "made earlier, or clips from anywhere else. It does **not** need the Audio Cutter to have run "
+    "in this browser session, so you can cut today and sort next week.\n\n"
+    "Supported: **WAV**, **FLAC**, **MP3**, M4A, AAC, OGG and Opus. Large folders are paged, and "
+    "**your decisions are remembered as you move between pages**.\n\n"
+    "Nothing is scanned until you press **Scan Folder**, nothing moves until you press "
+    "**Confirm and Sort**, and discarding always means *moved to your Discarded folder* \u2014 "
+    "never deleted."
+)
+LABEL_AUDIO_PREVIEW_FOLDER = "\U0001f4c2 Folder of audio clips to review"
+INFO_AUDIO_PREVIEW_FOLDER = (
+    "The folder holding the clips. An Audio Cutter output folder "
+    "(\u201cAudioCutter_\u2026\u201d) is the usual one, but any folder of audio works."
+)
+LABEL_AUDIO_PREVIEW_RECURSIVE = "Include subfolders"
+INFO_AUDIO_PREVIEW_RECURSIVE = (
+    "Off by default, so one Audio Cutter run is one review batch. Turn it on to sweep a whole "
+    "tree of recordings in one pass."
+)
+LABEL_AUDIO_PREVIEW_SCAN = "\U0001f50d Scan Folder"
+LABEL_AUDIO_PREVIEW_PAGE_SIZE = "Clips per page"
+INFO_AUDIO_PREVIEW_PAGE_SIZE = (
+    "How many tiles to draw at once. Decisions are kept per file, not per page, so paging never "
+    "loses one."
+)
+LABEL_AUDIO_PREVIEW_PREV = "\u25c0 Previous page"
+LABEL_AUDIO_PREVIEW_NEXT = "Next page \u25b6"
+LABEL_AUDIO_PREVIEW_PAGE = "Position"
+AUDIO_PREVIEW_PAGE_INITIAL = "No clips loaded."
+LABEL_AUDIO_PREVIEW_REPORT = "Scan report"
+AUDIO_PREVIEW_REPORT_INITIAL = (
+    "Choose a folder and press Scan Folder.\n"
+    "Nothing is read until you do \u2014 loading your saved folders does not scan anything."
+)
+LABEL_AUDIO_PREVIEW_LIBRARY = "\u2705 Media Library folder (where KEPT clips go)"
+LABEL_AUDIO_PREVIEW_DISCARDED = "\U0001f5d1\ufe0f Discarded folder (quarantine, never deletion)"
+LABEL_AUDIO_OPEN_IN_PREVIEW = "\U0001f3a7 Open results in Audio Preview"
+INFO_AUDIO_OPEN_IN_PREVIEW = (
+    "Loads this cut's output folder into the Audio Preview tab so you can classify it later. It "
+    "fills the folder in for you; you still press Scan Folder there."
+)
+
+# [R7.2] Every selector here is a CLASS, and that is a requirement rather than a tidy-up. R7.1 had
+# one gallery and keyed its whole stylesheet on `#r7-grid`; R7.2 adds the Audio Preview tab's grid,
+# whose id is different, so an id-keyed rule would leave the second gallery completely unstyled --
+# tiles with no borders, no decision colours and no hover highlight. `.r7-empty` is also a SIBLING
+# of the grid rather than a child (the empty state replaces the grid entirely), so the old
+# `#r7-grid .r7-empty` descendant rule never matched anything at all.
+AUDIO_GALLERY_CSS = """
+<style>
+.r7-grid { display:flex; flex-wrap:wrap; gap:10px; }
+.r7-grid .r7-tile { width:190px; border:2px solid #3a3a3a; border-radius:8px; padding:8px;
+  background:#1f1f1f; cursor:pointer; user-select:none; transition:border-color .12s,
+  box-shadow .12s; }
+.r7-grid .r7-tile:focus { outline:none; box-shadow:0 0 0 2px #6ea8fe; }
+.r7-grid .r7-tile.r7-playing { border-color:#6ea8fe; box-shadow:0 0 10px rgba(110,168,254,.55); }
+.r7-grid .r7-tile.r7-selected { border-color:#2ea043; background:#132b18; }
+.r7-grid .r7-tile.r7-rejected { border-color:#d14; background:#2b1316; }
+.r7-grid .r7-tile.r7-pending { border-color:#3a3a3a; }
+.r7-grid .r7-head { display:flex; justify-content:space-between; align-items:center;
+  font-weight:600; font-size:13px; }
+.r7-grid .r7-badge { font-size:15px; }
+.r7-grid .r7-time { font-size:12px; opacity:.85; margin:3px 0; }
+.r7-grid .r7-src { opacity:.6; }
+.r7-grid .r7-wave { height:26px; display:flex; align-items:center; justify-content:center;
+  border-radius:4px; background:#161616; font-size:11px; opacity:.7; margin-bottom:6px;
+  text-align:center; padding:0 4px; }
+.r7-grid .r7-tile.r7-playing .r7-wave { background:#16263d; opacity:1; }
+/* A clip the browser genuinely could not fetch or decode. Amber, not red: red is the Discard
+   decision, and "I could not play this" must not look like "you rejected this". The tile stays
+   fully classifiable -- an unplayable clip is still one the operator may want to keep. */
+.r7-grid .r7-tile.r7-failed { border-color:#e3b341; }
+.r7-grid .r7-tile.r7-failed .r7-wave { background:#2b2410; opacity:1; color:#e3b341; }
+.r7-grid .r7-name { width:100%; box-sizing:border-box; font-size:11px; padding:3px 4px;
+  border-radius:4px; border:1px solid #3a3a3a; background:#141414; color:inherit; }
+.r7-empty { opacity:.7; padding:12px; }
+.r7-enable-hover.r7-needed button { outline:2px solid #e3b341 !important; }
+/* The hidden decision channels. NOT `visible=False`: Gradio drops an invisible component from the
+   DOM entirely, and the page has to be able to write into these. */
+#audio-decisions, #audio-preview-decisions { display:none !important; }
+</style>
+"""

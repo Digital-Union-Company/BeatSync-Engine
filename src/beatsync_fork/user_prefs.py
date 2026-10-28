@@ -25,18 +25,39 @@ import json
 import os
 import tempfile
 
-#: The remembered fields. Every one is a folder path, and every one may legitimately be empty.
+#: The remembered fields. Every one may legitimately be empty, and all but one are folder paths —
+#: `AUDIO_CUTTER_INPUT` holds the last source *file*, because the Raw Audio Cutter's input is one
+#: recording rather than a directory. It is used only to reopen the Browse dialog where the
+#: operator last was, so a stale or deleted path costs nothing.
 CLIPS_LIBRARY = "clips_library"
 CLIPS_REJECTED = "clips_rejected"
 CLIPS_INPUT = "clips_input"
 RAW_CUTTER_OUTPUT = "raw_cutter_output"
 RAW_CUTTER_INPUT = "raw_cutter_input"
 QUICK_RENDER_SOURCE = "quick_render_source"
+# [FORK] R7 Raw Audio Cutter. APPENDED, never reordered: `load_preferences` fills a missing key
+# with "", so a `preferences.json` written before R7 still loads and simply has these blank.
+AUDIO_LIBRARY = "audio_library"
+AUDIO_DISCARDED = "audio_discarded"
+AUDIO_CUTTER_OUTPUT = "audio_cutter_output"
+AUDIO_CUTTER_INPUT = "audio_cutter_input"
+# [FORK] R7.2 Audio Preview. APPENDED for the same reason, and with its own keys rather than
+# reusing the cutter's: the folder an operator reviews and the folder the cutter writes into are
+# different questions, and a review session months later should not overwrite the cutter's output
+# default just because the operator browsed somewhere else. The two destinations are separate for
+# the same reason -- an operator may well sort reviewed clips somewhere other than where a fresh
+# cut files them.
+AUDIO_PREVIEW_INPUT = "audio_preview_input"
+AUDIO_PREVIEW_LIBRARY = "audio_preview_library"
+AUDIO_PREVIEW_DISCARDED = "audio_preview_discarded"
 
 #: Destinations the operator deliberately configures, versus the merely-convenient last-used
 #: inputs. Both are remembered; only the first group is presented as "defaults" in the UI.
-DESTINATION_KEYS = (CLIPS_LIBRARY, CLIPS_REJECTED, RAW_CUTTER_OUTPUT)
-LAST_USED_KEYS = (CLIPS_INPUT, RAW_CUTTER_INPUT, QUICK_RENDER_SOURCE)
+DESTINATION_KEYS = (CLIPS_LIBRARY, CLIPS_REJECTED, RAW_CUTTER_OUTPUT,
+                    AUDIO_LIBRARY, AUDIO_DISCARDED, AUDIO_CUTTER_OUTPUT,
+                    AUDIO_PREVIEW_LIBRARY, AUDIO_PREVIEW_DISCARDED)
+LAST_USED_KEYS = (CLIPS_INPUT, RAW_CUTTER_INPUT, QUICK_RENDER_SOURCE, AUDIO_CUTTER_INPUT,
+                  AUDIO_PREVIEW_INPUT)
 KEYS = DESTINATION_KEYS + LAST_USED_KEYS
 
 SCHEMA = "beatsync-folder-preferences-1"
@@ -138,6 +159,9 @@ def unavailable_notice(preferences: dict, labels: dict) -> str:
 
 
 __all__ = ["CLIPS_LIBRARY", "CLIPS_REJECTED", "CLIPS_INPUT", "RAW_CUTTER_OUTPUT",
-           "RAW_CUTTER_INPUT", "QUICK_RENDER_SOURCE", "DESTINATION_KEYS", "LAST_USED_KEYS",
+           "RAW_CUTTER_INPUT", "QUICK_RENDER_SOURCE",
+           "AUDIO_LIBRARY", "AUDIO_DISCARDED", "AUDIO_CUTTER_OUTPUT", "AUDIO_CUTTER_INPUT",
+           "AUDIO_PREVIEW_INPUT", "AUDIO_PREVIEW_LIBRARY", "AUDIO_PREVIEW_DISCARDED",
+           "DESTINATION_KEYS", "LAST_USED_KEYS",
            "KEYS", "SCHEMA", "empty_preferences", "preferences_path", "load_preferences",
            "save_preferences", "missing_folders", "unavailable_notice"]

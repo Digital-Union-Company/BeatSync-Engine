@@ -1046,7 +1046,12 @@ _RENDER_CLICK_INPUTS = [
     "semantic_emphasis",
     "session_state", "source_state",
     "freestyle_enabled",
-] + [f"freestyle_{name}" for name in fork_freestyle.SECTION_TYPES]
+] + [f"freestyle_{name}" for name in fork_freestyle.SECTION_TYPES] + [
+    # [R7.1] Comfort Mix. Appended at the end of the click list and of the handler signature
+    # together, so no pre-existing positional index moved -- which is the property these two
+    # assertions actually protect.
+    "voice_auto_balance", "voice_music_return",
+]
 
 
 def test_i_the_render_click_inputs_carry_no_preparation_state():

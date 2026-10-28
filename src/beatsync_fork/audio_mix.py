@@ -112,6 +112,20 @@ DEFAULT_MUSIC_UNDER_VOICE_PERCENT = 35
 MUSIC_UNDER_VOICE_MIN = 0
 MUSIC_UNDER_VOICE_MAX = 100
 
+# [FORK] R7.1 -- Comfort Mix. Two additions, both OFF/legacy by default.
+#
+# `music_return_seconds` IS the duck release. It defaults to `DUCK_RELEASE_SECONDS`, so a config
+# built the old way produces the identical envelope and the identical filtergraph -- the legacy
+# path is not re-derived from a "legacy profile", it is simply not touched.
+#
+# The owner's report is the reason it is adjustable at all: with a 0.4 s release the music does not
+# so much return as reappear, and the louder the track the more that reads as a jump. 2.0 s is the
+# suggested comfort value, not a new default.
+DEFAULT_MUSIC_RETURN_SECONDS = DUCK_RELEASE_SECONDS
+COMFORT_MUSIC_RETURN_SECONDS = 2.0
+MUSIC_RETURN_MIN_SECONDS = 0.5
+MUSIC_RETURN_MAX_SECONDS = 5.0
+
 #: Anchor labels, reported so a shifted clip can explain itself.
 ANCHOR_PREFERRED_SECTION = "preferred section start"
 ANCHOR_SECTION = "section start"
@@ -168,6 +182,29 @@ def normalize_music_under_voice(value: Any) -> int:
     return DEFAULT_MUSIC_UNDER_VOICE_PERCENT
 
 
+def normalize_music_return(value: Any, auto_balance: Any = False) -> float:
+    """The duck release, in seconds.
+
+    **With Auto Balance off this answers exactly `DUCK_RELEASE_SECONDS` unless the caller asked
+    for something else**, which is what keeps the legacy mix bit-for-bit what it was. With it on,
+    an unusable value falls back to the comfort suggestion rather than to the legacy 0.4 s, because
+    a comfort mix with a legacy release is the one combination that would quietly do nothing.
+    """
+    fallback = COMFORT_MUSIC_RETURN_SECONDS if normalize_avoid_drops(auto_balance) \
+        else DEFAULT_MUSIC_RETURN_SECONDS
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if seconds != seconds:                                  # NaN
+        return fallback
+    if not normalize_avoid_drops(auto_balance):
+        # Legacy mode clamps nothing and invents nothing: whatever the caller passed, including the
+        # historical default, is used as-is once it is a finite positive number.
+        return seconds if seconds > 0 else DEFAULT_MUSIC_RETURN_SECONDS
+    return max(MUSIC_RETURN_MIN_SECONDS, min(MUSIC_RETURN_MAX_SECONDS, seconds))
+
+
 def normalize_avoid_drops(value: Any) -> bool:
     """Only a real ``bool`` is honoured; anything else is the protective default (``True``)."""
     return value if isinstance(value, bool) else True
@@ -210,6 +247,10 @@ class AudioMixConfig:
     min_gap_seconds: float = DEFAULT_MIN_GAP_SECONDS
     avoid_drops: bool = True
     music_under_voice_percent: int = DEFAULT_MUSIC_UNDER_VOICE_PERCENT
+    # [FORK] R7.1: APPENDED with legacy defaults, so every existing construction -- positional or
+    # keyword -- builds exactly the config it built before and no existing index moves.
+    auto_balance: bool = False
+    music_return_seconds: float = DEFAULT_MUSIC_RETURN_SECONDS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "start_delay_seconds",
@@ -218,6 +259,9 @@ class AudioMixConfig:
         object.__setattr__(self, "avoid_drops", normalize_avoid_drops(self.avoid_drops))
         object.__setattr__(self, "music_under_voice_percent",
                            normalize_music_under_voice(self.music_under_voice_percent))
+        object.__setattr__(self, "auto_balance", normalize_avoid_drops(self.auto_balance))
+        object.__setattr__(self, "music_return_seconds",
+                           normalize_music_return(self.music_return_seconds, self.auto_balance))
 
     @property
     def music_floor(self) -> float:
@@ -301,6 +345,11 @@ class AudioMixPlan:
     duck_events: tuple
     config: AudioMixConfig
     sfx_placements: tuple = ()
+    # [FORK] R7.1: what Auto Balance measured, as operator-readable prose. LAST and defaulted for
+    # the same reason `sfx_placements` is, so every positional construction stays valid. Empty
+    # string means no measurement was taken -- which is the truthful state whenever Auto Balance
+    # is off, and must never be rendered as "normalised".
+    balance_report: str = ""
 
     @property
     def voice_count(self) -> int:
@@ -326,7 +375,8 @@ class AudioMixPlan:
             f"Music under voice: {self.config.music_under_voice_percent}%",
             f"Duck events: {len(self.duck_events)}",
             f"Attack / release: {int(DUCK_ATTACK_SECONDS * 1000)} / "
-            f"{int(DUCK_RELEASE_SECONDS * 1000)} ms",
+            f"{int(self.config.music_return_seconds * 1000)} ms"
+            + ("  (comfort)" if self.config.auto_balance else ""),
             "",
         ]
         rows = []
@@ -491,15 +541,20 @@ def build_duck_events(placements: Sequence, music_duration: float,
                       config: AudioMixConfig) -> tuple:
     """One envelope per placement. Windows are clamped to the music, ramps are not rescaled."""
     floor = config.music_floor
+    # [FORK] R7.1: the RELEASE is now the configured music-return time. Its default is
+    # `DUCK_RELEASE_SECONDS`, so a legacy config yields the identical envelope. The ATTACK is
+    # deliberately unchanged: the complaint was about the music coming BACK, and lengthening the
+    # attack would start ducking earlier and bury the lead-in instead of fixing anything.
+    release = getattr(config, "music_return_seconds", DUCK_RELEASE_SECONDS)
     return tuple(
         DuckEvent(
             voice_start=p.start,
             voice_end=p.end,
             start=max(0.0, p.start - DUCK_ATTACK_SECONDS),
-            end=min(music_duration, p.end + DUCK_RELEASE_SECONDS),
+            end=min(music_duration, p.end + release),
             floor=floor,
             attack=DUCK_ATTACK_SECONDS,
-            release=DUCK_RELEASE_SECONDS,
+            release=release,
         )
         for p in placements
     )
@@ -538,6 +593,11 @@ __all__ = [
     "DEFAULT_START_DELAY_SECONDS",
     "DUCK_ATTACK_SECONDS",
     "DUCK_RELEASE_SECONDS",
+    "DEFAULT_MUSIC_RETURN_SECONDS",
+    "COMFORT_MUSIC_RETURN_SECONDS",
+    "MUSIC_RETURN_MIN_SECONDS",
+    "MUSIC_RETURN_MAX_SECONDS",
+    "normalize_music_return",
     "MIN_GAP_MAX_SECONDS",
     "MIN_GAP_MIN_SECONDS",
     "MUSIC_UNDER_VOICE_MAX",
