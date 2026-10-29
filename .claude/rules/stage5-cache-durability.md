@@ -164,6 +164,30 @@ their Qwen tags completed, **0** durable cache entries. The rules that replaced 
   the D1-era figures and the pre-D2 `int(st_mtime)` identity are recorded in
   `docs/claude/stage5-cache-history.md`. Current identity behaviour is
   `.claude/rules/stage5-cache-identity.md`.
+- **A cancellation adds no write path, and nothing already durable is lost (FUN Stage-5 Cancel).**
+  Stage 5 became cancellable *during* the pass, and the durability contract above is untouched by
+  that — which is a structural claim, not a behavioural hope:
+
+  ```
+  checkpointed before the Stop   stays on disk. Cancellation deletes NOTHING.
+  interrupted mid-analysis       never written. `_cache_entry_is_complete` is unchanged, so an
+                                 incomplete or `ai_deferred` record is declined exactly as always.
+  an A1 per-job partial          not deleted; simply not consumed this run.
+  ```
+
+  `_checkpoint_cache` is still the only thing that may start a write and still consults the one
+  completion rule. `tests/test_stage5_cancellation.py` walks **every** `except RenderCancelled` in
+  `video_analysis.py` and forbids `_checkpoint_cache`, `_save_cache`, `os.remove`, `os.unlink`,
+  `shutil` and `open(` inside one; a second test asserts `_cache_entry_is_complete`,
+  `_qwen_job_completed`, `_checkpoint_cache`, `_stored_ai_cache_is_consistent`,
+  `_deterministic_analysis_completed` and `_save_cache` mention cancellation nowhere at all.
+
+  Two Stage-5 shapes exist specifically to protect this. A cancelled identity task returns `None`
+  for cheapness, but per source `None` is a *verdict* ("identity unprovable"), so the phase
+  **raises** afterwards rather than handing the list back. And a cancelled window pass raises
+  rather than returning empty metrics, because a source whose windows all came back empty is a
+  legitimately candidate-less source that this rule accepts as reusable — persisting "this video has
+  no good moments" for a video nobody finished looking at would be permanent.
 - **Never run a destructive cache test against the real runtime cache.** Mutation tests belong in an
   **exclusively claimed HOT task workspace** —
   `<HOT>\Projects\BeatSync-Engine-DigitalUnion\Tasks\<TASK_ID>`, where `<HOT>` is this machine's

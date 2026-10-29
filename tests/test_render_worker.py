@@ -513,8 +513,19 @@ def test_the_module_owns_nothing_that_runs_and_no_identity():
         "subprocess", "popen", "os.", "open(", "shutil", "tempfile", "signal",
         "multiprocessing", "concurrent", "ffmpeg", "nvenc", "qwen", "llama",
         # pipeline reach
-        "video_processor", "video_analysis", "auto_mode", "create_music_video",
+        #
+        # [FUN Stage-5 Cancel] `video_analysis` left this list, and the replacement is narrower
+        # rather than weaker. The module now carries `PHASE_VIDEO_ANALYSIS = 'video_analysis'` --
+        # an opaque label a raiser attaches so the status panel can say "cancelled during video
+        # analysis" without parsing a message. The ban's purpose was that this module must not
+        # *reach* the pipeline, and a four-word string cannot: there is no import, no call and no
+        # attribute access. So the import and the call are banned directly below, which is the
+        # property that was actually meant, and a test immediately after this one proves the
+        # module still imports nothing but `threading`, `dataclasses`, `enum` and `typing`.
+        "video_processor", "auto_mode", "create_music_video",
         "analyze_beats_auto", "process_video", "stage",
+        "import video_analysis", "from video_analysis", "video_analysis.",
+        "analyze_video_sources",
         # identity / persistence
         "cache_contract_version", "analysis_version", "l2_cache_version",
         "hashlib", "blake2", "json", "pickle", "mtime", "st_size",

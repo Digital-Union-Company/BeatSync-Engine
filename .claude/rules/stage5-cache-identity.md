@@ -9,8 +9,13 @@ paths:
 
 # Stage 5 analysis cache: identity and the contract generation
 
-`input/video_analysis_cache/*.json` is the Stage-5 record store. The exact identity contract is
-below; it is the authority, and there is deliberately no second summary of it anywhere.
+The Stage-5 record store is `<cache dir>/*.json`. The exact identity contract is below; it is the
+authority, and there is deliberately no second summary of it anywhere.
+
+**Since FUN Shared Analysis Cache, `<cache dir>` is resolved per invocation rather than fixed.**
+`input/video_analysis_cache` is the **local default**; a per-user setting may point every
+installation on the machine at one shared folder. See *The directory is not identity* below — it is
+the property that makes sharing work at all.
 
 `ANALYSIS_VERSION` keeps its own narrower job and does **not** own cache-generation semantics: **bump
 it in `video_analysis.py` whenever candidate scoring, window building, or the candidate schema
@@ -41,6 +46,47 @@ fingerprint is what catches that, which is why mtime_ns alone was not enough. Th
 in identity on purpose: identity is *location + content*, so a moved file re-keys, preserving the
 pre-D2 contract. Content-only identity would deduplicate copies; that is a semantic change D2 does not
 make.
+
+### The directory is not identity (FUN Shared Analysis Cache)
+
+**The resolved cache directory is absent from the signature, and that absence is the whole feature.**
+`_cache_path` gained a trailing `cache_dir=None` (defaulting to `VIDEO_ANALYSIS_CACHE_DIR`) that
+chooses the **folder** and nothing else; `_video_signature` does not receive it and was not modified.
+So the same source, under the same backend and config, produces the identical
+`{prefix}_{signature}.json` filename in every installation — identical identity, different folder.
+Two app roots therefore share records with no migration, no rewriting and no compatibility loader.
+
+Making the directory a signature component would re-key every record the moment the folder changed,
+which is precisely the opposite of the intent. `tests/test_analysis_cache_sharing.py` asserts the
+absence across `_video_signature`, `_qwen_config_token`, `_qwen_backend_signature_token`,
+`_bounded_fingerprint`, `_cache_entry_is_complete`, `_stored_ai_cache_is_consistent`,
+`_checkpoint_cache` and `_save_cache`, and that `_cache_path` does not forward it to the signature.
+`CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched: **no record was invalidated.**
+
+**Resolution is once per invocation, by one resolver.** `video_analysis.resolve_cache_location()` is
+the single resolver and both Stage-5 entry points call it exactly once —
+`analyze_video_sources` and `classify_library_sources`. That is load-bearing twice over: a
+per-source resolution would let a Settings change relocate the cache mid-analysis, and two
+*different* resolutions would let Scan classify against one folder while Analyze wrote into another,
+reporting every source prepared and then re-analysing all of them. It is invocation-scoped rather
+than module-cached, for the same reason the D2 backend token is: a later call in the same process
+must observe a changed setting.
+
+**The retained Qwen worker artifacts stay local, always.** `_run_qwen_worker` and
+`_run_qwen_worker_batch` keep writing their request/response JSON into `VIDEO_ANALYSIS_CACHE_DIR`,
+never into the resolved directory. Records are installation-independent; worker scratch is not — it
+is this installation's debugging material, anchored to one invocation's response path, and pooling
+several installations' invocations into one folder would make the A2-S1 same-invocation recovery
+anchor meaningless. A test pins both halves.
+
+**A configured-but-unreachable folder is reported, never silently substituted.** The parent folder
+must already exist: a mistyped or new leaf on a live disk is created (like every other cache
+directory here), while a missing ancestor means the drive or share is not there and the run falls
+back to the **local** cache with an explicit warning on the console and the progress channel. That
+asymmetry is the safety argument — creating the folder unconditionally would turn an offline drive
+into a silent hour of re-analysis against an unexpected empty location, which is exactly the outcome
+the owner asked to be told about rather than subjected to. Full contract for the setting file, the
+resolution and the additive import: `.claude/rules/shared-analysis-cache.md`.
 
 **Bounded fingerprint**: BLAKE2b, 16-byte digest, over `str(size)` then content. Files ≤ 3 MiB are read
 whole; larger files contribute exactly three non-overlapping 1 MiB windows — `[0, 1 MiB)`,

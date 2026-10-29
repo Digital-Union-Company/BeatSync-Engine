@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Sequence
 
 import pytest
 
+from beatsync_fork.render_worker import PHASE_VIDEO_ANALYSIS, RenderCancelled
+
 _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
 
@@ -32,6 +34,12 @@ _FUNCS = (
     "_cache_identity_workers", "_compute_cache_paths_parallel",
     "_is_count", "_stored_ai_cache_is_consistent", "_deterministic_analysis_completed",
     "_cache_entry_is_complete",
+    # [FUN Stage-5 Cancel] The two cancellation seams. Not identity primitives — they are here
+    # only because `_compute_cache_paths_parallel` now calls them, and an extracted body resolves
+    # every name from this namespace. `_cancelled` answers `False` for the `lifecycle=None` every
+    # test in this suite passes, so identity behaviour is unchanged; the point of listing them is
+    # that the extracted body is still the REAL production body, cancellation checks included.
+    "_cancelled", "_check_cancelled",
 )
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_FINGERPRINT_CHUNK",
            "_FINGERPRINT_WHOLE_FILE_LIMIT", "_FINGERPRINT_DIGEST_SIZE", "_NO_AI_CONFIG_TOKEN",
@@ -64,6 +72,12 @@ def _load(root: str, cache_dir: str) -> Dict[str, Any]:
         "DEFAULT_LLAMA_CPP_DIR": llama,
         "VIDEO_ANALYSIS_CACHE_DIR": cache_dir,
         "_LLAMA_VERSION_TOKENS": {},
+        # [FUN Stage-5 Cancel] The real exception class and the real phase constant, imported from
+        # the stdlib-only fork module rather than stubbed: `_check_cancelled` must raise the thing
+        # production raises, or a test that asserts cancellation behaviour would be asserting
+        # against a fake.
+        "RenderCancelled": RenderCancelled,
+        "PHASE_VIDEO_ANALYSIS": PHASE_VIDEO_ANALYSIS,
     }
     found = {}
     for node in tree.body:
@@ -631,7 +645,14 @@ def test_no_worker_recomputes_the_backend_or_config_identity(va):
             f"{forbidden} must be computed once per invocation, never inside a worker task")
 
     # the tokens arrive as explicit keyword-only parameters and are handed to `_cache_path` verbatim
-    assert {a.arg for a in helper.args.kwonlyargs} == {"backend_token", "config_token"}
+    #
+    # [FUN] `lifecycle` and `cache_dir` joined them, and both are execution policy rather than
+    # identity: `lifecycle` decides only WHETHER the phase keeps going, and `cache_dir` only WHICH
+    # DIRECTORY the resulting filename sits in — `_video_signature` receives neither, which the
+    # dedicated tests below assert directly. The point of pinning the exact set is that a THIRD
+    # kind of argument cannot arrive here unnoticed.
+    assert {a.arg for a in helper.args.kwonlyargs} == {
+        "backend_token", "config_token", "lifecycle", "cache_dir"}
     calls = _calls_named(helper, "_cache_path")
     assert calls, "the helper must call the real identity primitive"
     for call in calls:
@@ -1118,10 +1139,22 @@ def test_l1b_the_helper_owns_only_cache_path(va):
                       "multiprocessing", "ProcessPoolExecutor", "async", "await"):
         assert forbidden not in body, f"the identity phase must not reach {forbidden}"
 
-    # exactly one submission, and it submits the real identity primitive
+    # exactly one submission, and what it submits reaches the real identity primitive
+    #
+    # [FUN Stage-5 Cancel] The submitted callable is now the nested `_identity` closure rather than
+    # `_cache_path` itself, because a queued task must be able to return early once Cancel has
+    # landed. The property being protected is unchanged and is asserted more directly than before:
+    # the closure's ONLY call is the real `_cache_path`, so one submitted position is still exactly
+    # one real identity computation and nothing else has crept into the task.
     submits = _calls_named(helper, "submit")
     assert len(submits) == 1, f"one submission site; found {len(submits)}"
-    assert getattr(submits[0].args[0], "id", None) == "_cache_path", ast.unparse(submits[0])
+    submitted = getattr(submits[0].args[0], "id", None)
+    assert submitted == "_identity", ast.unparse(submits[0])
+    task = next(n for n in ast.walk(helper) if isinstance(n, ast.FunctionDef)
+                and n.name == "_identity")
+    assert len(_calls_named(task, "_cache_path")) == 1, ast.unparse(task)
+    assert {getattr(call.func, "id", None) for call in ast.walk(task)
+            if isinstance(call, ast.Call)} == {"_cache_path", "_cancelled"}, ast.unparse(task)
 
     # bounded by the policy, never one thread per source
     pools = _calls_named(helper, "ThreadPoolExecutor")

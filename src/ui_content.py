@@ -992,6 +992,121 @@ PLACEHOLDER_CACHE_REPORT = (
     "Press Inspect cache to see how much space each category is using. Nothing is deleted until "
     "you select categories, tick the confirmation and press Clear."
 )
+#: [FORK] Digital-Union (FUN Shared Analysis Cache): the warning the Clear panel must carry once a
+#: shared folder is in use. Clearing a *local* cache costs one installation some re-analysis;
+#: clearing a *shared* one costs every installation on the machine, including the production
+#: install the operator is not currently looking at. That is a materially different decision and
+#: the panel has to say so before it is made, not after.
+INFO_CACHE_ANALYSIS_SHARED = (
+    "⚠️ This is a SHARED analysis cache at {path}. Other BeatSync installations on this computer "
+    "read the same folder, so clearing it makes every one of them re-analyse from scratch — not "
+    "just this one."
+)
+
+# =============================================================================================
+# [FORK] Digital-Union (FUN Shared Analysis Cache): Settings -> Video Analysis Cache.
+#
+# The owner's second problem: every isolated playtest got its own cold cache, because the cache
+# directory is derived from the checkout's own root. The analysis records were always portable --
+# identity is the source file plus the AI backend, and the folder is not part of it -- so this
+# panel does not migrate anything. It points several installations at one folder.
+# =============================================================================================
+
+LABEL_SHARED_CACHE_SECTION = "🗂️ Video analysis cache"
+INFO_SHARED_CACHE_SECTION = (
+    "Where BeatSync keeps what it learned about your source videos. Analysing a large library "
+    "from scratch takes a long time, and by default each BeatSync version keeps its own copy — so "
+    "a new version starts over.\n\n"
+    "Point this at one folder and every BeatSync version you run as this Windows user will share "
+    "it, including future ones. The setting is stored outside the program folder, so a new version "
+    "finds it on its own with no setup."
+)
+LABEL_SHARED_CACHE_FOLDER = "Shared cache folder"
+INFO_SHARED_CACHE_FOLDER = (
+    "Pick a folder on a disk with room to spare, and leave it there. It does not have to be "
+    "inside BeatSync."
+)
+LABEL_SHARED_CACHE_ENABLED = "Use the shared cache folder"
+INFO_SHARED_CACHE_ENABLED = (
+    "Off means each BeatSync version keeps its own cache, exactly as before."
+)
+LABEL_SHARED_CACHE_SAVE = "💾 Save cache setting"
+LABEL_SHARED_CACHE_INSPECT = "🔍 Check cache folder"
+LABEL_SHARED_CACHE_STATUS = "Cache location"
+PLACEHOLDER_SHARED_CACHE_STATUS = (
+    "Press Check cache folder to see where the analysis cache is and how much is in it."
+)
+#: Said plainly, because the limits are the part an operator will otherwise discover the hard way.
+#: Every claim here is a property of the existing identity contract, not a new restriction:
+#: identity is `abspath + size + mtime_ns + content fingerprint + AI backend + AI settings`.
+INFO_SHARED_CACHE_LIMITS = (
+    "**What is reused, and what is not.** A source video is recognised by its full path, its size, "
+    "its modification time and a sample of its contents — so:\n\n"
+    "- moving or renaming a video means it is analysed again, even though nothing about it "
+    "changed;\n"
+    "- editing or re-encoding a video means it is analysed again, which is the point;\n"
+    "- analysis done with AI tagging on and analysis done with it off are kept separately, so "
+    "neither is used in place of the other;\n"
+    "- changing the AI model, or the three AI detail settings, starts a fresh set of records. The "
+    "old ones are left alone, not deleted."
+)
+STATUS_SHARED_CACHE_SAVED_ON = (
+    "✅ Saved. BeatSync will use the shared analysis cache at {path}.\n"
+    "This takes effect on the next analysis — a render already running keeps the folder it "
+    "started with."
+)
+STATUS_SHARED_CACHE_SAVED_OFF = (
+    "✅ Saved. Sharing is off, so this BeatSync version will use its own analysis cache at "
+    "{path}.\nThe shared folder was not changed or deleted."
+)
+STATUS_SHARED_CACHE_SAVE_NEEDS_FOLDER = (
+    "Pick a folder first — nothing was saved. Sharing cannot be switched on without somewhere to "
+    "share to."
+)
+STATUS_SHARED_CACHE_SAVE_FAILED = "❌ {reason}"
+#: The one report both the Check button and the Save button render, so the screen cannot show two
+#: different answers to "where is the cache?".
+STATUS_SHARED_CACHE_REPORT = (
+    "{kind} analysis cache\n"
+    "  Folder:        {path}\n"
+    "  Analysed videos: {records}\n"
+    "  Records size:  {record_bytes}\n"
+    "  Other files:   {others} ({other_bytes})  — retained AI worker logs, kept on purpose\n"
+    "  Settings file: {config}"
+)
+STATUS_SHARED_CACHE_MISSING = (
+    "{kind} analysis cache\n"
+    "  Folder:        {path}\n"
+    "  This folder does not exist yet. It is created the first time an analysis runs.\n"
+    "  Settings file: {config}"
+)
+STATUS_SHARED_CACHE_UNREADABLE = (
+    "{kind} analysis cache\n"
+    "  Folder:        {path}\n"
+    "  ⚠️ Could not be read: {error}\n"
+    "  Nothing was created or changed.\n"
+    "  Settings file: {config}"
+)
+
+LABEL_CACHE_IMPORT_SOURCE = "Import records from this folder"
+INFO_CACHE_IMPORT_SOURCE = (
+    r"An existing BeatSync version's cache folder, for example I:\BeatSync\input\video_analysis_cache. "
+    "Copying is one-way and additive: nothing in the folder you copy FROM is changed, and a record "
+    "already in the shared folder is kept as it is."
+)
+LABEL_CACHE_IMPORT = "📥 Import existing cache"
+STATUS_CACHE_IMPORT_REFUSED = "Nothing was copied. {reason}"
+STATUS_CACHE_IMPORT_DONE = (
+    "📥 Import finished.\n"
+    "  From: {source}\n"
+    "  To:   {destination}\n"
+    "  Copied:          {copied} ({copied_bytes})\n"
+    "  Already there:   {already_present}  — kept exactly as they were\n"
+    "  Not reusable:    {incompatible}  — written by a different analysis version\n"
+    "  Failed:          {failed}\n"
+    "  Skipped:         {skipped} other file(s) — media, logs and worker files are never copied\n"
+    "Nothing was deleted from either folder."
+)
 
 CLIPS_REFRESH_TO_ENABLE_HINT = (
     "At least one clip kept — Confirm is being enabled from the server's record."
@@ -1500,13 +1615,23 @@ LABEL_CANCEL_RENDER = "⏹️ Cancel Active Render"
 # Everything it said is still true and still worth saying; it is said in one line, with the
 # qualifications that only matter once Cancel has been pressed moved into the status panel's own
 # wording, which is where someone actually reads them.
+# [FORK] Digital-Union (FUN Stage-5 Cancel): both strings below were CORRECTED, not just reworded.
+# They promised that "an AI scene-analysis step finishes its current call first", which was an
+# honest description of `BOUNDARY_ONLY_CANCEL` and is now false: video analysis stops during the
+# pass. Leaving the old copy in place would be the worse kind of stale text — it would tell the
+# owner to expect the exact wait the fix removed.
+#
+# What is still true and still said: it is not instant. A native decoder call cannot be interrupted
+# once entered, so cancellation lands at the next frame, window or source boundary — moments, not
+# the rest of the library.
 INFO_CANCEL_RENDER = (
-    "Stops the render in progress. Not instant: encoding stops within moments, and an "
-    "AI scene-analysis step finishes its current call first. Anything already finished is kept."
+    "Stops the render in progress. Not instant, but close: encoding and video analysis both stop "
+    "within moments. Anything already finished is kept, including source videos that finished "
+    "analysing."
 )
 STATUS_CANCEL_REQUESTED = (
-    "⏹️ Cancel requested — stopping at the next safe point. This is not instant: an in-progress "
-    "AI scene-analysis step finishes naturally first; video encoding stops within moments."
+    "⏹️ Cancel requested — stopping at the next safe point. Encoding and video analysis both stop "
+    "within moments; source videos that already finished analysing keep their cache entries."
 )
 STATUS_CANCEL_NOTHING_ACTIVE = "Nothing is currently rendering."
 
@@ -1551,6 +1676,23 @@ STATUS_OPEN_FOLDER_FAILED = (
 #: that is how batch state would start leaking toward the renderer. The batch wrapper adds its own
 #: "Rendering candidate N / 2" prefix above this line, which is where that context belongs.
 STATUS_RENDER_CANCELLED = "⏹️ Cancelled. Nothing was rendered."
+
+#: [FORK] Digital-Union (FUN Stage-5 Cancel): the same cancellation, when it happened during the
+#: source-video analysis pass.
+#:
+#: It is a separate string because the two situations leave the user in different positions, and a
+#: real incident proved it: an entire library was selected by accident against a cold cache, and the
+#: generic "Nothing was rendered" would not have told the owner that the hour of work they had just
+#: stopped was *analysis*, nor that the part of it that finished is kept and will not be repeated.
+#: Both of those are the facts that decide what they do next.
+#:
+#: It is selected from the exception's structured `phase` field, never by inspecting this text or
+#: the exception's message.
+STATUS_RENDER_CANCELLED_ANALYSIS = (
+    "⏹️ Render cancelled during video analysis. Nothing was rendered.\n"
+    "Source videos that finished analysing keep their cache entries, so they will not be "
+    "analysed again. The rest were left untouched."
+)
 
 INFO_VARIANT_APPLY = (
     "**Apply Selected Variant** writes that candidate's Variation Seed, six sliders and three "

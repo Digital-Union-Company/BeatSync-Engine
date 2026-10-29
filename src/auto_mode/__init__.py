@@ -118,6 +118,12 @@ from beatsync_fork import freestyle_random as fork_freestyle_random
 # normalize + HPSS + Stages 1-3); Stage 4 measured ~0.0076 s and is deliberately NOT cached.
 # Contract: .claude/rules/l2-stage-cache.md
 from beatsync_fork import stage_cache as fork_stage_cache
+# [FORK] Digital-Union (FUN Stage-5 Cancel): the cancellation exception, imported so the Stage-5
+# `except Exception` below can name it FIRST. Without that clause a cancellation observed inside
+# `analyze_video_sources` would be caught there, reported as "video analysis failed", and the
+# render would continue into Stage 6 on fallback sampling -- which is a worse outcome than not
+# making Stage 5 cancellable at all. This module still constructs no lifecycle and holds no state.
+from beatsync_fork.render_worker import PHASE_VIDEO_ANALYSIS, RenderCancelled
 
 # ---------------------------------------------------------------------------
 # Shared numerical helpers
@@ -647,12 +653,25 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
 
     [FORK] Digital-Union (C3-R1A): ``lifecycle`` is an optional
     ``beatsync_fork.render_worker.RenderLifecycle``, defaulting to ``None`` -- every existing caller,
-    headless CLI included, is unaffected. Checked only at safe boundaries (before Stage 1, after the
+    headless CLI included, is unaffected. Checked at safe boundaries (before Stage 1, after the
     reusable Stage 1-3 region, before Stage 5, and immediately after Stage 5 returns) -- never
-    inside Stage 1-3/5's own work, and never passed into ``video_analysis.py``. The post-Stage-5
-    check sits OUTSIDE the existing broad Stage-5 ``except Exception`` below on purpose: a
-    cancellation must never be read as "video analysis failed" and continue toward fallback
-    sampling.
+    inside Stage 1-3's own work. The post-Stage-5 check sits OUTSIDE the existing broad Stage-5
+    ``except Exception`` below on purpose: a cancellation must never be read as "video analysis
+    failed" and continue toward fallback sampling.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): the token is now ALSO passed into
+    ``analyze_video_sources``, which C3-R1A's ``BOUNDARY_ONLY_CANCEL`` explicitly refused to do.
+    That refusal is superseded by a real owner incident: an entire library was selected against a
+    cold cache, Cancel was pressed, and Stage 5 ran for about an hour because the surrounding
+    boundaries were the *only* ones. The two checks bracketing Stage 5 below are retained exactly
+    as they were -- they still cost nothing and they still catch the cheap cases -- so this is an
+    addition rather than a replacement, and the post-Stage-5 check is doubly load-bearing now:
+    Stage 5's own `RenderCancelled` must reach it without the broad handler in between seeing it,
+    which is why that handler names `RenderCancelled` first.
+
+    Stages 1-3 remain deliberately uncancellable mid-stage. They are seconds of work (~15.7 s
+    measured end to end, and process-locally cached), their boundaries already bracket them, and
+    making librosa cooperative would buy nothing a user could perceive.
     """
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
@@ -944,9 +963,12 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
     )
     # [FORK] Digital-Union (C3-R1A): the safe boundary before Stage 5 begins -- a cancellation
     # requested earlier must prevent Stage 5 (and any Qwen work it might launch) from ever
-    # starting. Deliberately OUTSIDE the try/except below, and video_analysis.py never receives
-    # this token: BOUNDARY_ONLY_CANCEL means an already-running Stage-5 call always runs to its
-    # own natural completion.
+    # starting. Deliberately OUTSIDE the try/except below.
+    #
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): retained unchanged, and still the cheapest of all
+    # the boundaries -- it refuses to start the work rather than stopping it. What changed is that
+    # it is no longer the LAST line of defence: the token now goes into `analyze_video_sources`,
+    # so a Stop arriving after this point is observed during the analysis instead of an hour later.
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
     if should_analyze_video:
@@ -969,7 +991,26 @@ def analyze_beats_auto(audio_file: str, start_time: float = 0.0,
                 enable_ai=qwen_enabled,
                 qwen_model_path=model_path,
                 event_callback=event_callback,
+                # [FORK] Digital-Union (FUN Stage-5 Cancel): the one line that retires
+                # BOUNDARY_ONLY_CANCEL for Stage 5. `lifecycle=None` on every other caller --
+                # the headless CLI included -- is unchanged behaviour.
+                lifecycle=lifecycle,
             )
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST, and this clause is the whole reason the
+        # feature is safe. `RenderCancelled` is an ordinary `Exception`, so the handler below would
+        # catch it, print "Video analysis failed", emit a warning, and let the render continue into
+        # Stage 6 with fallback sampling -- producing a video from random clips for a user who had
+        # just pressed Cancel. Re-raising reaches the post-Stage-5 boundary, which is outside this
+        # try/except by design.
+        except RenderCancelled as cancel:
+            # The phase is stamped HERE as the backstop, because this `try` contains exactly one
+            # call and nothing else: anything cancelled inside it was cancelled during video
+            # analysis, by construction rather than by inspection. `video_analysis.py` stamps its
+            # own boundaries directly, but the FFmpeg scene-detection pass raises from
+            # `ffmpeg_processing._run_media_command`, which is shared with clip extraction and must
+            # not learn what stage called it. `or` so an already-stamped phase is never overwritten.
+            cancel.phase = getattr(cancel, "phase", "") or PHASE_VIDEO_ANALYSIS
+            raise
         except Exception as e:
             print(f"   ⚠️  Video analysis failed; renderer will use fallback sampling: {e}")
             _notify_console(console_callback, 5, f"Video analysis failed; fallback sampling: {e}")

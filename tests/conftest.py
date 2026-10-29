@@ -20,6 +20,37 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 
+# [FORK] Digital-Union (FUN Shared Analysis Cache): a SUITE-WIDE safety net, autouse and session
+# scoped.
+#
+# `beatsync_fork.analysis_cache` reads a per-user configuration file outside every checkout —
+# `%LOCALAPPDATA%\BeatSync\shared-config.json` — because that is the whole point of the feature: a
+# new playtest tree has to find the same shared cache on its own. The consequence for testing is
+# that, left alone, this suite would read and write the **operator's real** configuration: the one
+# their production install and every playtest depend on. A test that saved a cache folder would
+# silently re-point production at a temporary directory that pytest then deletes.
+#
+# So the override is pinned once, for the whole session, before any test runs. It is deliberately
+# NOT a per-test fixture a suite has to remember to request: forgetting it would be invisible on a
+# machine with no shared config set up, and destructive on the owner's. The pinned path is inside
+# pytest's own tmp area and nothing creates it unless a test actually saves.
+@pytest.fixture(scope="session", autouse=True)
+def isolated_shared_config(tmp_path_factory):
+    """Point `BEATSYNC_SHARED_CONFIG` at a throwaway path for the entire test session."""
+    from beatsync_fork import analysis_cache
+
+    directory = tmp_path_factory.mktemp("shared-config")
+    previous = os.environ.get(analysis_cache.ENV_CONFIG_PATH)
+    os.environ[analysis_cache.ENV_CONFIG_PATH] = str(directory / "shared-config.json")
+    try:
+        yield os.environ[analysis_cache.ENV_CONFIG_PATH]
+    finally:
+        if previous is None:
+            os.environ.pop(analysis_cache.ENV_CONFIG_PATH, None)
+        else:
+            os.environ[analysis_cache.ENV_CONFIG_PATH] = previous
+
+
 def write_file(path: str, content: bytes) -> str:
     """Create a file (and its parents) with exact byte content. Returns the absolute path."""
     os.makedirs(os.path.dirname(path), exist_ok=True)

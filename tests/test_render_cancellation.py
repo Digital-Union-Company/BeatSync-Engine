@@ -91,6 +91,36 @@ def _executable_source(path: str) -> str:
     return ast.unparse(tree)
 
 
+def _identifiers(tree: ast.Module) -> set[str]:
+    """Every name the module actually USES — references, attributes, imports and parameters.
+
+    [FUN Stage-5 Cancel] A substring scan over the source cannot tell a ban from an explanation of
+    a ban, and `qwen_progress.py`'s docstring now explains precisely why it holds no lifecycle. So
+    the fork-isolation assertion works from identifiers instead: prose is free to be accurate, and
+    an actual use is still caught.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.keyword) and node.arg:
+            names.add(node.arg)
+        elif isinstance(node, ast.FunctionDef):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module)
+            for alias in node.names:
+                names.add(alias.name)
+                if alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
 def _func(path: str, name: str) -> ast.FunctionDef:
     for node in ast.walk(_tree(path)):
         if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -406,21 +436,102 @@ def test_a_real_timeout_is_still_a_timeout_and_never_reported_as_cancellation(la
 # ===========================================================================
 
 
-@pytest.mark.parametrize("path", [_ANALYSIS, _QWEN_WORKER, _QWEN_PROGRESS],
-                         ids=["video_analysis", "stage5_qwen_scene_worker", "qwen_progress"])
-def test_the_token_never_reaches_stage_five(path):
-    """**A contract, not an omission.** An in-flight Qwen call is never hard-killed.
+def test_the_qwen_worker_process_itself_is_still_cancellation_free():
+    """**The surviving half of `BOUNDARY_ONLY_CANCEL`, and it is the half that matters.**
 
-    Stage 5 can hold GPU minutes in one call. Terminating it mid-inference would abandon a model
-    process and throw away work already paid for, and a cancellable Stage 5 would also need a
-    cancellation token inside the persisted-semantics layer, where nothing creative or
-    session-scoped is allowed to exist. So the token simply does not go there: cancellation becomes
-    effective at the next boundary *after* Stage 5 returns normally.
+    `BOUNDARY_ONLY_CANCEL` originally kept the token out of three files. The FUN Stage-5 Cancel
+    milestone retired that for two of them — `video_analysis.py` and `qwen_progress.py` — on the
+    strength of a real owner incident: a whole library was selected against a cold cache, Cancel
+    was pressed, and Stage 5 ran for about an hour because the only boundaries were before and
+    after the entire call. The original rationale (one call can hold GPU minutes; killing it
+    abandons paid-for work) turned out to argue for *stopping it properly*, not for not stopping it.
+
+    What did **not** change is this file. The Qwen worker is a separate process that writes
+    persisted semantic records, and it stays completely unaware of cancellation:
+
+    * it holds no token, so no session-scoped or creative state can enter the persisted-semantics
+      layer through one — the media-neutral boundary in `.claude/rules/stage5-worker.md`;
+    * it needs none. The **parent** owns the child, and stopping it is the parent's job: the parent
+      terminates the worker and its own `llama-server` grandchild, then reaps both.
+
+    A cooperative worker would be a second, redundant cancellation path inside the one process this
+    repository least wants extra state in.
     """
-    source = _source(path)
+    source = _source(_QWEN_WORKER)
     for forbidden in ("lifecycle", "RenderCancelled", "render_worker", "request_cancel",
                       "raise_if_cancelled", "cancel_requested"):
-        assert forbidden not in source, f"{os.path.basename(path)} references {forbidden}"
+        assert forbidden not in source, (
+            f"stage5_qwen_scene_worker.py references {forbidden}")
+
+
+def test_stage_five_now_receives_the_token_and_the_fork_module_stays_lifecycle_free():
+    """The two halves of how Stage 5 became cancellable without widening the fork package.
+
+    `video_analysis.py` is upstream-adjacent runtime code and may hold the typed exception, so it
+    imports `RenderCancelled` and takes a `lifecycle`. `qwen_progress.py` is a **fork** module and
+    is stdlib-only by CLAUDE.md's hard rule, so it must not learn that a `RenderLifecycle` exists
+    at all — it observes cancellation through a plain zero-argument predicate and answers in
+    booleans. That asymmetry is the design, so it is pinned rather than left to inspection.
+    """
+    analysis = _source(_ANALYSIS)
+    assert "RenderCancelled" in analysis
+    assert "lifecycle" in analysis
+
+    # Checked over the IDENTIFIERS the module actually uses, not over its characters. A substring
+    # scan of the source would be tripped by the docstring that *explains* this very boundary --
+    # prose describing a ban is not a violation of it, and a test that cannot tell the difference
+    # forces the explanation to be deleted to make the test pass.
+    used = _identifiers(_tree(_QWEN_PROGRESS))
+    for forbidden in ("lifecycle", "RenderCancelled", "render_worker", "raise_if_cancelled",
+                      "RenderLifecycle", "beatsync_fork.render_worker"):
+        assert forbidden not in used, f"qwen_progress.py uses {forbidden}"
+    # It DOES carry the predicate parameter -- that is the seam, and it is a callable, not a token.
+    assert "cancel_requested" in used, "the streaming runner must accept a cancel predicate"
+
+
+def test_the_cancellable_stage_five_boundaries_are_the_documented_ones():
+    """The five classes of boundary, asserted positively rather than by a forbidden name.
+
+    A cancellation feature's real risk is a boundary that is *missing*, which no ban test can
+    detect. Each of these is a place the owner incident would otherwise have waited at.
+    """
+    tree = _tree(_ANALYSIS)
+
+    def body(name):
+        return ast.unparse(_func(_ANALYSIS, name))
+
+    # the identity phase, per source, and it RAISES rather than returning Nones as verdicts
+    identity = body("_compute_cache_paths_parallel")
+    assert "_check_cancelled" in identity
+    assert "cancel_futures=True" in identity, "pending identity reads must be cancelled"
+
+    # the orchestrator: before the scan, the record loop, the Qwen stage, and after analysis
+    orchestrator = body("analyze_video_sources")
+    assert orchestrator.count("_check_cancelled") >= 4, orchestrator.count("_check_cancelled")
+    assert "cancel_futures=True" in orchestrator, "pending analysis jobs must be cancelled"
+
+    # one source's own work: frame decode and the metric loops
+    assert "_check_cancelled" in body("_read_ordered_frames")
+    assert "_check_cancelled" in body("_measure_windows")
+
+    # and the token reaches the FFmpeg scene pass, which decodes the whole file
+    assert "lifecycle=lifecycle" in body("_analyze_single_video")
+    _ = tree
+
+
+def test_a_cancelled_analysis_job_is_never_retried_serially():
+    """The single most dangerous interaction in the whole feature, pinned by handler order.
+
+    `analyze_video_sources`'s parallel block catches a failed source and *re-runs it serially*.
+    `RenderCancelled` is an ordinary `Exception`, so without a typed clause ahead of that handler a
+    Cancel would have restarted the very work it was stopping — once per remaining source.
+    """
+    node = _func(_ANALYSIS, "analyze_video_sources")
+    retrying = [n for n in ast.walk(node) if isinstance(n, ast.Try)
+                and "Retrying that video safely in serial mode" in ast.unparse(n)]
+    assert len(retrying) == 1, "the parallel retry try/except was not found"
+    kinds = [getattr(handler.type, "id", None) for handler in retrying[0].handlers]
+    assert kinds.index("RenderCancelled") < kinds.index("Exception"), kinds
 
 
 def test_the_post_stage_five_boundary_sits_outside_that_stage_s_broad_except():
@@ -480,13 +591,33 @@ def test_stage_five_is_also_bracketed_from_before():
 #: without someone revisiting this number — which is the only moment anybody would notice it needs
 #: an `except RenderCancelled` of its own.
 EXPECTED_HANDLER_COUNT = {
-    _FFMPEG: 2,        # convert_to_prores_proxy, extract_clip_segment_ffmpeg_detailed
+    # [FUN Stage-5 Cancel] 3: the two pre-existing ones (convert_to_prores_proxy,
+    # extract_clip_segment_ffmpeg_detailed) plus `detect_video_scene_changes`. That last one is
+    # the whole-file FFmpeg scene pass, whose contract is to swallow failures and return `[]` --
+    # so a cancellation reaching its generic handler would have been reported as "no scene changes
+    # found" and the analysis would have carried on building windows for the next source.
+    _FFMPEG: 3,
     _MIXDOWN: 1,       # build_mixed_master
     _PROCESSOR: 4,     # create_clip_parallel, the clip loop, and both assembly call sites
     # [R2] 3: _process_video_impl's translation boundary, process_video.worker's defensive one, and
     # the new post-commit ProRes preview handler -- the only one in the codebase that may swallow.
     _GUI: 3,
-    _AUTO: 0,          # boundary checks only; it catches nothing
+    # [FUN Stage-5 Cancel] 1, up from 0. `analyze_beats_auto` still *catches* nothing it did not
+    # catch before -- what it has now is a typed clause AHEAD of the Stage-5 `except Exception`,
+    # which is the one place a cancellation would otherwise have become "video analysis failed"
+    # and let the render continue into Stage 6 on fallback sampling. It re-raises; it does not
+    # swallow. See `test_a_stage_five_cancellation_is_not_an_analysis_failure`.
+    _AUTO: 1,
+    # [FUN Stage-5 Cancel] Stage 5's own module. Six, and each is placed ahead of a broad handler
+    # whose recovery path would otherwise have continued the run:
+    #
+    #   1. the parallel serial-retry        DEFERRED  -- stores it, re-raises once the pool is quiet
+    #   2. the capture release              re-raise  -- releases cv2's file handle first
+    #   3. the inline Qwen block            re-raise
+    #   4. the deferred Qwen block          re-raise
+    #   5. `_run_qwen_worker`               re-raise
+    #   6. `_run_qwen_worker_batch`         re-raise
+    _ANALYSIS: 6,
 }
 
 
@@ -569,9 +700,21 @@ def test_a_cancellation_handler_never_swallows_and_never_substitutes():
             rendered = ast.unparse(handler)
             bare_reraise = any(isinstance(s, ast.Raise) and s.exc is None
                                for s in ast.walk(handler))
-            # the one deferred case: the clip loop stores the exception and re-raises it after the
-            # executor is quiescent (section 6), which is strictly stronger than re-raising here
-            deferred = "cancelled_exc = exc" in rendered
+            # the deferred cases: a handler that stores the exception and re-raises it after its
+            # executor is quiescent, which is strictly STRONGER than re-raising here -- leaving the
+            # `with` body is what runs `shutdown(wait=True)`, so an immediate raise would propagate
+            # while worker threads still held live handles.
+            #
+            # [FUN Stage-5 Cancel] Two of them now: `video_processor`'s clip loop (section 6) and
+            # Stage 5's parallel analysis pool, which holds `cv2.VideoCapture` handles and a live
+            # FFmpeg scene-detection child. Each is recognised by its OWN store statement rather
+            # than by a shared opt-out token, so neither can be applied to an unrelated handler.
+            deferred = ("cancelled_exc = exc" in rendered
+                        or "cancelled_during_analysis = cancel" in rendered)
+            if deferred and "cancelled_during_analysis = cancel" in rendered:
+                # The store is worthless without the matching re-raise, so prove it exists.
+                assert "raise cancelled_during_analysis" in _source(path), (
+                    "the deferred Stage-5 cancellation is stored but never re-raised")
             # the two GUI translation boundaries return a truthful typed status instead
             translated = "RenderOutcomeKind.CANCELLED" in rendered
             # the one post-commit case, identified by position in gui.py
@@ -1695,6 +1838,11 @@ def test_a_cancellation_before_the_promotion_reports_cancelled_and_promotes_noth
     namespace["RenderOutcomeKind"] = rw.RenderOutcomeKind
     namespace["RENDER_OUTCOME_KEY"] = "render_outcome_kind"
     namespace["STATUS_RENDER_CANCELLED"] = "⏹️ Cancelled. Nothing was rendered."
+    # [FUN Stage-5 Cancel] The handler now picks its wording from the exception's structured
+    # `phase`. The real constant, not a stand-in: `cancel_mid_render` above raises with no phase,
+    # which is what a clip-extraction cancellation looks like, so the generic string must win here.
+    namespace["PHASE_VIDEO_ANALYSIS"] = rw.PHASE_VIDEO_ANALYSIS
+    namespace["STATUS_RENDER_CANCELLED_ANALYSIS"] = "⏹️ Render cancelled during video analysis."
 
     nodes = [n for n in _gui_tree().body
              if isinstance(n, ast.FunctionDef)

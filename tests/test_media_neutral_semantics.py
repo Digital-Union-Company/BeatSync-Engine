@@ -323,6 +323,13 @@ class _Outcome:
     launch_error = ""
     returncode = 0
     stderr_tail = ""
+    # [FUN Stage-5 Cancel] The launchers check `outcome.cancelled` BEFORE the timeout and
+    # return-code branches, so a cancelled worker is never reported as a timeout or a crash. These
+    # suites launch with no lifecycle, so the honest stub value is `False` on every field.
+    cancelled = False
+    killed = False
+    tree_terminated = False
+    tree_terminate_error = ""
 
 
 class _Result:

@@ -459,5 +459,6 @@ automatically.
 | voice clips, Smart Mix folder/roles/Amount/Level, the report panels | `.claude/rules/audio-mixdown.md` |
 | Media Library Preparation scan/analyze, batch size | `.claude/rules/library-preparation.md` |
 | the **Verify Sources** button, its report box, the FFprobe metadata probe, or render↔verification exclusion (S2-A) | `.claude/rules/source-verification.md` **+** `.claude/rules/library-preparation.md` (the cache question goes through `classify_library_sources`) **+** `.claude/rules/pipeline-core.md` (the probe shares `_run_media_command` and `FFPROBE_PATH`) |
+| Settings → **Video Analysis Cache**, the shared cache folder, the Import button, or Cache Management's analysis category | `.claude/rules/shared-analysis-cache.md` **+** `.claude/rules/stage5-cache-identity.md` (the directory is deliberately not part of identity) |
 | Stage 0 / scan / planner timings surfaced in the UI | `.claude/rules/scale-diagnostics.md` |
 | render modes, encoder branches, frame lock | `.claude/rules/pipeline-core.md` |

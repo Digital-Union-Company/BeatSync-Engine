@@ -20,6 +20,77 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Changed — 2026-10-29 (Stage-5 Cancel: Cancel actually interrupts video analysis)
+
+**This supersedes C3-R1A's `BOUNDARY_ONLY_CANCEL` contract for Stage 5**, after a real owner
+incident: an entire video library was selected by accident against a cold cache, Cancel was
+pressed, and Stage 5 kept working for about an hour because the only boundaries were *before* and
+*after* the whole `analyze_video_sources` call. The original argument — one Stage-5 call can hold
+GPU minutes, so killing it mid-inference abandons a model process and discards paid-for work —
+turned out to argue for stopping it *properly*.
+
+- `src/video_analysis.py` — gains an optional trailing `lifecycle=None` on `analyze_video_sources`,
+  `_analyze_single_video`, `_measure_windows`, `_read_ordered_frames` and the Qwen seams, matching
+  the position every other C3-R1A seam uses. `None` is byte-for-byte today's behaviour. Checks
+  fire during the cache-identity phase, the record scan, between sources, every 32 decoded frames
+  and every 16 scored windows. Six `except RenderCancelled` clauses sit ahead of broad handlers
+  whose recovery paths would otherwise have continued the run — most importantly the parallel
+  block's serial retry, which would have re-run the cancelled source once per remaining source.
+- `src/auto_mode/__init__.py` — passes the token into Stage 5, and names `RenderCancelled` **first**
+  in the Stage-5 `except Exception`. Without that clause a cancellation became "video analysis
+  failed" and the render continued into Stage 6 on fallback sampling, producing a video from random
+  clips for someone who had just pressed Cancel.
+- `src/ffmpeg_processing.py` — `detect_video_scene_changes` gains the same optional `lifecycle`, so
+  the FFmpeg pass that decodes the whole source file is cancellable mid-child.
+- `src/beatsync_fork/qwen_progress.py` — `stream_worker_process` takes an optional zero-argument
+  **cancel predicate** (never a lifecycle object; this module is stdlib-only by rule) and, on
+  cancellation, terminates the invocation's own **process tree** so the worker's `llama-server`
+  grandchild does not survive. New `terminate_process_tree(pid)`: containment is the pid argument,
+  not a filter. Timeout behaviour, orphan included, is deliberately unchanged.
+- `src/beatsync_fork/render_worker.py` — `RenderCancelled` gains an optional structured `phase`,
+  and the one value `PHASE_VIDEO_ANALYSIS`, so the status panel can say **"Render cancelled during
+  video analysis"** without parsing a message. It names a phase, never an outcome.
+- `src/gui.py`, `src/ui_content.py` — the new status wording, and a correction: the Cancel copy
+  used to promise that "an AI scene-analysis step finishes its current call first", which was true
+  of the old design and is now false.
+
+Measured in an isolated playtest on real media: **0.016 s** when the Stop landed inside frame
+decode, **0.037 s** between sources, **0.451 s** on the 7-worker parallel path, **0.204 s** during
+a stand-in Qwen worker (whose grandchild was confirmed gone). A cancelled cold run kept 16 of 48
+records; the next run reported exactly 16 cache hits and the survivors were byte-identical.
+Cancellation adds **no cache write path and no delete path**, and the completion rule is unchanged.
+
+### Added — 2026-10-29 (Shared Analysis Cache: one Stage-5 cache across BeatSync versions)
+
+The Stage-5 cache directory was derived from `logger.ROOT_DIR`, so every checkout kept its own and
+a new playtest started cold against a library production had already analysed.
+
+**A location change, never a migration.** Stage-5 identity never contained the directory, so a
+record written by one installation was always lookupable by another under the identical filename.
+`CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and no record was invalidated.
+
+- `src/beatsync_fork/analysis_cache.py` — new, stdlib-only: the per-user configuration at
+  `%LOCALAPPDATA%\BeatSync\shared-config.json` (**outside every checkout**, which is the feature)
+  with a mandatory `BEATSYNC_SHARED_CONFIG` test override; the per-invocation `resolve_location`,
+  whose parent-must-exist rule separates "a new folder on a live disk → create it" from "the drive
+  is unplugged → report it and use the local cache"; the record-filename *shape* test; a flat
+  `measure`; and an additive `import_records` whose no-replace guarantee is an `O_CREAT | O_EXCL`
+  create. It computes **no cache identity** and **deletes nothing**.
+- `src/video_analysis.py` — `resolve_cache_location()` resolves once per invocation and both
+  Stage-5 entry points thread the directory into `_cache_path`. `_video_signature` does not receive
+  it. The retained Qwen worker request/response JSON stays local. A new pre-flight line reports
+  total sources, cached, needing analysis, whether AI is on, and the resolved folder — the five
+  facts that make an accidentally cold library obvious before the expensive part starts.
+- `src/gui.py`, `src/ui_content.py` — Settings → **Video analysis cache**: folder + native Browse,
+  a switch, Check, Save, the reuse limitations stated plainly, and a one-time **Import existing
+  cache**. Cache Management now acts on the resolved folder and warns, by name, that a shared cache
+  is read by other installations before it is cleared.
+
+Measured across two app roots sharing one folder: the first analysed 8 sources cold in 3.243 s; a
+different root, in a fresh process, reported **8/8 cache hits in 0.053 s**. Import against the real
+production cache copied 2,086 current-generation records, skipped 3,985 older-generation ones and
+920 worker files, failed 0 — and production came out byte-identical.
+
 ### Added — 2026-10-17 (Raw Cutter Batch V1: a whole folder, one press)
 
 A second input mode inside the existing **✂️ Raw Cutter** tab — not a fifth tab. **Single Video**

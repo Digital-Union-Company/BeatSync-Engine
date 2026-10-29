@@ -27,6 +27,7 @@ import pytest
 # A2-S1: the real artifact contract, so an extracted `_recover_jobs_from_partials` reads real
 # partials rather than a stand-in. Stdlib-only by rule, so importing it here costs nothing.
 from beatsync_fork import qwen_partials
+from beatsync_fork.render_worker import PHASE_VIDEO_ANALYSIS, RenderCancelled
 
 _VIDEO_ANALYSIS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "video_analysis.py")
@@ -65,7 +66,13 @@ _CACHE_CONTRACT = _cache_contract_version()
 
 # Functions that need a few pipeline collaborators stubbed. Their own bodies are still the real
 # production bodies, so the Qwen-completion and candidate-analysis logic under test is genuine.
-_PIPELINE_FUNCS = ("_fmt_seconds", "_annotate_candidates_with_qwen", "_analyze_single_video")
+_PIPELINE_FUNCS = ("_fmt_seconds", "_annotate_candidates_with_qwen", "_analyze_single_video",
+                   # [FUN Stage-5 Cancel] The two cancellation seams `_analyze_single_video` now
+                   # calls. Inert in this suite -- every call here passes no `lifecycle`, so
+                   # `_cancelled` answers `False` and no check ever fires -- but listed because an
+                   # extracted body resolves every name from this namespace, and the body executed
+                   # must stay the REAL one.
+                   "_cancelled", "_check_cancelled")
 
 
 def _extract(names):
@@ -141,7 +148,8 @@ def _load_pipeline(worker_response, *, capture_opens=True, window_count=3, max_w
         "_make_candidate_windows": lambda boundaries, duration: [
             {"start": i * 2.0, "end": i * 2.0 + 2.0} for i in range(window_count)],
         "_open_video_capture": lambda path: _Capture(),
-        "_measure_windows": lambda cap, fps, windows, use_gpu=False: [
+        # [FUN Stage-5 Cancel] `lifecycle=None` absorbs the keyword the real call site now passes.
+        "_measure_windows": lambda cap, fps, windows, use_gpu=False, lifecycle=None: [
             {"quality": 0.6} for _ in windows],
         "_build_candidate": lambda video_file, name, duration, i, window, metrics: {
             "id": f"{name}-{i}", "start": window["start"], "end": window["end"],
@@ -156,6 +164,10 @@ def _load_pipeline(worker_response, *, capture_opens=True, window_count=3, max_w
             candidate.update({"semantic_action": semantic.get("action", 0.0),
                               "ai_analyzed": True}))[1],
         "fork_progress": None,
+        # [FUN Stage-5 Cancel] The real exception class, so the typed clauses ahead of the broad
+        # handlers compile and are reachable rather than being asserted against a fake.
+        "RenderCancelled": RenderCancelled,
+        "PHASE_VIDEO_ANALYSIS": PHASE_VIDEO_ANALYSIS,
     }
     namespace.update(consts)
     _exec_into(namespace, found, _FUNCS + _PIPELINE_FUNCS)

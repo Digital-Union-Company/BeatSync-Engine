@@ -650,10 +650,15 @@ boundaries are frame-quantised to 1152 samples with the delay and padding record
 Xing/LAME header — close, and **not** sample-exact, which is why WAV remains the default. The two
 Comfort Mix limitations above are untouched.
 
-### R7.3 — Voice clips that exceed the music duration · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
+### R7.3 — Voice clips that exceed the music duration · **OWNER-ACCEPTED, NOT YET DEPLOYED**
 
 Branch `feat/fun-audio-overflow-r7-3`, cut from `main` at `d98fb55a`. **Modes 1–3 are implemented**;
 mode 4 is still blocked on R10 and is deliberately **not offered**, rather than offered and refused.
+
+**The owner has personally tested Strict / Skip / Trim and accepted them.** That moves this item
+past "local candidate" on the *validation* axis only — it is still on a branch, still in a draft
+PR, still not merged and still not running in production, and it has had no independent review.
+Do not read acceptance as deployment.
 
 Raised while testing R7.2: Audio Layers **failed the whole render** when the voice clips it was
 given could not all be placed before the music ended — the owner hit
@@ -754,6 +759,97 @@ file can be lost in the sort — `prepare_voice_inputs` still re-checks the coun
 R7.1's two Comfort Mix controls were not. It is placement configuration, so the batch freezes it
 from its own submitted arguments exactly as it freezes `voice_avoid_drops`; no `AudioRecipe` field
 resolves it and Variant Lab must never vary it (it is a sixth zero-writer Audio Layers widget).
+
+### Stage-5 Cancel — Cancel actually stops video analysis · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
+
+Branch `feat/fun-stage5-cancel-shared-cache`, stacked on `feat/fun-audio-overflow-r7-3`.
+
+Raised by a real owner incident, not by code review: an entire video library was selected by
+accident in a fresh playtest with no warm cache, Stage 5 began, Cancel was pressed — and Stage 5
+kept working for **about an hour**. That was the documented design. C3-R1A's `BOUNDARY_ONLY_CANCEL`
+deliberately kept the cancellation token out of `video_analysis.py`, on the argument that one
+Stage-5 call can hold GPU minutes and killing it mid-inference abandons a model process and
+discards paid-for work. The incident showed that argument points at *stopping it properly*, not at
+not stopping it.
+
+Cancellation is now observed at every boundary that costs real time:
+
+| where | what it costs to reach the next one |
+|---|---|
+| before the cache scan | nothing — an already-landed Stop never starts the work |
+| the cache-identity phase | one source's bounded fingerprint read (H2/D0 measured ~100–116 s cold over 1,815 sources, so this is not free) |
+| the record scan, and between sources | one record lookup / one source |
+| the FFmpeg scene pass | it decodes the **whole** file, and is stopped mid-child |
+| frame decode | 32 target frames |
+| window scoring | 16 windows |
+| the Qwen worker wait | one 0.2 s poll — and the worker's own `llama-server` grandchild goes with it |
+
+**Measured on real media in an isolated playtest** (48 cold synthetic sources, one app root):
+`0.0160 s` when the Stop landed inside frame decode, `0.0370 s` between sources on the serial path,
+`0.4511 s` on the 7-worker parallel path (the time for the in-flight workers to reach their next
+boundary and the pool to drain), and `0.2040 s` during a deliberately slow stand-in Qwen worker.
+
+Three properties make it safe rather than merely responsive, and all three are tested:
+
+- **Completed work survives and is reused.** A cancelled cold run kept 16 of 48 records; the next
+  run reported exactly 16 cache hits, analysed the other 32, and the survivors were byte-identical.
+  Cancellation deletes nothing — there is no delete path in it at all.
+- **Nothing incomplete becomes durable.** `_cache_entry_is_complete` is unchanged and is still the
+  only completion rule; a source interrupted mid-analysis is simply never written.
+- **No render begins.** `RenderCancelled` is an ordinary `Exception`, so Stage 5's own broad
+  handler would have caught it, reported "video analysis failed" and continued into Stage 6 on
+  **fallback sampling** — a video built from random clips for someone who had just pressed Cancel.
+  A typed clause ahead of every such handler stops that; a pipeline-level test asserts Stage 6 is
+  never entered and that no fallback warning is emitted.
+
+The Qwen worker **process** is still completely cancellation-free, and that is the surviving half
+of `BOUNDARY_ONLY_CANCEL`: it writes persisted semantic records, so nothing session-scoped may
+enter it, and it needs no token because the parent owns and stops the child.
+
+**Honest limits.** A native decoder call cannot be interrupted once entered, so the claim is
+"cancellation takes effect at the next frame, window or source boundary" — never "immediately".
+Stages 1–3 stay uncancellable mid-stage on purpose (~15.7 s measured, process-locally cached).
+Timeout behaviour is unchanged, orphan included.
+
+### Shared Analysis Cache — one Stage-5 cache for every BeatSync version · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
+
+Same branch, same owner session. The cache directory was derived from the checkout's own root, so
+every playtest tree started cold while production held thousands of records.
+
+**It was never a migration problem.** Stage-5 identity is
+`contract | version | abspath | size | mtime_ns | fingerprint | backend | qwen-config`, and the
+directory is not one of those components — so a record written by one installation was always
+lookupable by another under the identical filename. Only its *location* was installation-specific.
+`CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**.
+
+Settings → **Video analysis cache**: a folder with the existing native Browse, a switch, a Check
+button reporting the resolved location and what is in it, Save, the reuse limitations stated
+plainly, and a one-time **Import existing cache**.
+
+The setting lives at `%LOCALAPPDATA%\BeatSync\shared-config.json` — **outside every checkout**,
+which is the whole feature. A path in `state/preferences.json` would leave the next playtest blind,
+which is the problem rather than the fix.
+
+**Measured across two app roots sharing one folder:** the first analysed 8 sources cold in
+`3.243 s` and wrote 8 records to the shared folder; a *different* app root, in a fresh process that
+discovered the setting on its own, reported **8/8 cache hits and 0 sources analysed in `0.053 s`**.
+Flipping the AI identity correctly produced 8 misses. With sharing off, each root used its own local
+cache exactly as before. Clearing the three unrelated cache categories left the Stage-5 records
+untouched.
+
+**Import**, run against the real production cache: 2,086 current-generation records copied
+(27.8 MB), 3,985 older-generation records correctly **not** copied (their filenames could never be
+looked up again), 920 retained Qwen worker files skipped, 0 failures — and production came out
+**byte-identical**, verified by a directory digest taken before and after. A second import copied 0
+and reported 2,086 already present, byte-for-byte unchanged. A fresh app root then classified 41
+real sources against the imported records as **41 prepared, 0 needing analysis**.
+
+**Honest limits.** A moved or renamed video re-keys and is analysed again — path is part of
+identity, by the existing contract. Most of the production cache's records point at source folders
+that no longer exist on disk, so importing it helps only for material still at its original paths.
+A configured-but-unreachable folder (an offline drive) falls back to the local cache and **says
+so**, loudly, rather than starting a silent cold re-analysis. Clearing a shared cache costs every
+installation on the machine, and the Cache Management panel now says that before it is done.
 
 ### R10 — Quick Render music repeat · **PLANNED, NOT IMPLEMENTED**
 
@@ -1018,7 +1114,9 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not independently reviewed** |
 | **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. Owner-tested and **accepted** |
 | **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. Owner-tested and **accepted**. **Not independently reviewed** |
-| **R7.3** — "When voice clips do not fit" modes | **LOCAL CANDIDATE, IN DRAFT PR** — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) still blocked on R10 and **not offered**. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **Not merged, not deployed, not independently reviewed** |
+| **R7.3** — "When voice clips do not fit" modes | **OWNER-ACCEPTED, IN DRAFT PR, NOT DEPLOYED** — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) still blocked on R10 and **not offered**. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **The owner has personally tested Strict / Skip / Trim and accepted them** — which is a validation milestone, not a deployment one: **still not merged, still not deployed, still not independently reviewed** |
+| **Stage-5 Cancel** — Cancel actually interrupts video analysis | **LOCAL CANDIDATE, IN DRAFT PR** — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not merged, not deployed, not independently reviewed** |
+| **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **LOCAL CANDIDATE, IN DRAFT PR** — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. **Not merged, not deployed, not independently reviewed** |
 | **R10** — Quick Render **Repeat Music 1×–30×** | **PLANNED, NOT IMPLEMENTED** — 1× must be the existing path unchanged; cuts must cover the whole extended timeline rather than repeating the rendered sequence; analysis reused rather than re-run; cancellable with an estimated duration |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
@@ -1046,9 +1144,16 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 5a. **UX Refresh** — **DONE**, merged as PR #78 and deployed at the same `d98fb55a`, owner-tested
    and accepted. It changed no R7 engine: the Audio Cutter, the review galleries and Comfort Mix
    are the same code in different containers, plus one opt-in fade.
-6. **R7.3 — "When voice clips do not fit"** — **IMPLEMENTED as a local candidate** on
+6. **R7.3 — "When voice clips do not fit"** — **OWNER-ACCEPTED, NOT DEPLOYED**, on
    `feat/fun-audio-overflow-r7-3`. Modes 1–3 ship (Strict / Skip / Trim-then-skip); mode 4 waits
-   on R10. Awaiting the owner test.
+   on R10. The owner test is **done and passed**; what remains is merge and deploy, which are
+   separate authorizations.
+6a. **Stage-5 Cancel + Shared Analysis Cache** — **LOCAL CANDIDATES** on
+   `feat/fun-stage5-cancel-shared-cache`, stacked on R7.3's branch. Two usability fixes that come
+   from the same owner session: Cancel now actually interrupts video analysis (measured
+   0.016–0.45 s, against an incident where it took about an hour), and one shared cache folder
+   serves every BeatSync version under the same Windows user (measured 8/8 reuse across two app
+   roots). Awaiting the owner test; neither merged nor deployed.
 7. **R10 — Repeat Music 1×–30× — THE NEXT PRIORITY.** It unblocks R7.3's fourth mode
    (Repeat Music to Fit) and the later Auto-Repeat-to-Fit, and it is the one remaining answer to
    "my voice material is longer than my song" that drops and shortens nothing at all.

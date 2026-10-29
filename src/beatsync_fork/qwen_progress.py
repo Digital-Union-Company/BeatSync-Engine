@@ -443,11 +443,22 @@ class WorkerOutcome:
     protocol_lines: int = 0
     seconds: float = 0.0
     reader_threads_alive: int = 0
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): a cancellation request was observed while the
+    # worker ran, and this call stopped it. Deliberately a SEPARATE field from `timed_out`: a
+    # cancellation is the operator asking, a timeout is the worker failing, and the two must never
+    # be reported as each other. `killed` keeps its own meaning (the escalation was needed) on
+    # either path.
+    cancelled: bool = False
+    # Whether the invocation-owned process-tree terminator was invoked, and whether it reported
+    # success. Diagnostics only -- nothing branches on these.
+    tree_terminated: bool = False
+    tree_terminate_error: str = ""
 
     @property
     def ok(self) -> bool:
         return (
             not self.timed_out
+            and not self.cancelled
             and not self.launch_error
             and self.returncode == 0
         )
@@ -479,6 +490,60 @@ def _drain(stream, handler: Callable[[str], None]) -> None:
             pass
 
 
+CANCEL_POLL_SECONDS = 0.2
+"""[FORK] Digital-Union (FUN Stage-5 Cancel): how often the waiting thread asks whether the
+operator has cancelled. Deliberately coarse — the worker it watches is a GPU job measured in
+minutes, so a fifth of a second of latency is invisible while a tighter loop would be a busy wait
+for nothing. Only used when a cancel predicate is supplied; the no-predicate path still blocks in
+one `wait(timeout=…)` exactly as before."""
+
+
+def terminate_process_tree(pid: int, *, run=None, timeout: float = 15.0) -> str:
+    """Terminate ONE process and its descendants. Returns ``""`` on success, else a short reason.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel). This exists for exactly one measured gap: the Qwen
+    worker starts its own `llama-server` child, and killing only the direct Python child **orphans
+    that server** (the pre-existing timeout behaviour, recorded in `.claude/rules/stage5-worker.md`).
+    A cancelled analysis that leaves a GPU server resident is not cancelled in any sense the
+    operator cares about.
+
+    **The pid is the only input, and it must be the pid of a child the caller itself created.**
+    There is no name matching, no image-name sweep and no enumeration: nothing here can reach a
+    `python.exe`, a `llama-server.exe` or a BeatSync process that this invocation did not spawn.
+    That property comes from the argument, not from a filter, which is why there is no filter to
+    get wrong.
+
+    `run` is injectable so the whole branch is testable on a bare interpreter without spawning
+    anything; it defaults to `subprocess.run`. The command itself is Windows-only (`taskkill`), and
+    a platform without it simply reports a reason — this function never raises.
+    """
+    runner = run if run is not None else subprocess.run
+    try:
+        resolved = int(pid)
+    except (TypeError, ValueError):
+        return "no usable process id"
+    if resolved <= 0:
+        return "no usable process id"
+    try:
+        completed = runner(
+            ["taskkill", "/F", "/T", "/PID", str(resolved)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(0.1, float(timeout)),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    code = getattr(completed, "returncode", None)
+    if code in (0, None):
+        return ""
+    # 128 is taskkill's "process not found", which after a terminate/kill race is the *desired*
+    # outcome rather than a failure worth reporting as one.
+    if code == 128:
+        return ""
+    return f"taskkill exited {code}"
+
+
 def stream_worker_process(
     argv: Sequence[str],
     *,
@@ -490,6 +555,9 @@ def stream_worker_process(
     terminate_grace: float = 5.0,
     reader_join_timeout: float = 10.0,
     clock: Callable[[], float] = time.perf_counter,
+    cancel_requested: Callable[[], bool] | None = None,
+    poll_seconds: float = CANCEL_POLL_SECONDS,
+    tree_terminator: Callable[[int], str] | None = None,
 ) -> WorkerOutcome:
     """Run a child process, streaming its stdout lines while they happen.
 
@@ -506,6 +574,25 @@ def stream_worker_process(
     ``on_stdout_line`` receives each line with its trailing newline stripped, from the reader thread.
     Handing it ``queue.put`` (or :func:`beatsync_fork.progress.emit`, which cannot raise) is safe; a
     Gradio component must never be touched from here — that is the generator's job, as in Phase 2A.
+
+    **[FORK] Digital-Union (FUN Stage-5 Cancel): ``cancel_requested`` is optional and
+    ``cancel_requested is None`` is byte-for-byte the pre-existing behaviour** — the main thread
+    blocks in one ``process.wait(timeout=timeout)`` and no clock, poll or extra statement runs ahead
+    of it. Supplying a predicate replaces that single blocking wait with a bounded poll loop, and
+    nothing else about the function changes: the timeout is still measured against the caller's
+    ``timeout`` and still reported as ``timed_out``, and ``terminate -> grace -> kill -> reap`` is
+    the same escalation either way.
+
+    The predicate is a plain zero-argument callable rather than a lifecycle object, deliberately:
+    this module is stdlib-only by CLAUDE.md's hard rule, so it observes cancellation without
+    knowing that a ``RenderLifecycle`` exists. It is called from the waiting thread only, is
+    expected to be cheap and total, and a predicate that raises is treated as "not cancelled" — a
+    broken status check must not be able to kill a GPU run that is making progress.
+
+    ``tree_terminator`` is likewise injected. On the cancellation path it is given **this call's own
+    child pid** so the worker's own ``llama-server`` grandchild goes with it; see
+    :func:`terminate_process_tree` for why a pid argument is the whole containment argument. It is
+    called only on the cancellation path, so the existing timeout behaviour is untouched.
     """
     started = clock()
     counters = {"stdout": 0, "protocol": 0}
@@ -548,18 +635,23 @@ def stream_worker_process(
 
     timed_out = False
     killed = False
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        # Same guarantee subprocess.run(timeout=…) gave: the caller never waits forever. Terminate
-        # first, escalate only if the worker ignores it.
+    cancelled = False
+    tree_terminated = False
+    tree_error = ""
+
+    def _stop_child() -> int | None:
+        """terminate -> bounded grace -> kill -> REAP. Returns the reaped code, or `None`.
+
+        Shared by the timeout and the cancellation paths so the two can never diverge in how
+        thoroughly they stop a child. `killed` is set by whichever path had to escalate.
+        """
+        nonlocal killed
         try:
             process.terminate()
         except Exception:
             pass
         try:
-            returncode = process.wait(timeout=max(0.0, terminate_grace))
+            return process.wait(timeout=max(0.0, terminate_grace))
         except subprocess.TimeoutExpired:
             killed = True
             try:
@@ -567,9 +659,55 @@ def stream_worker_process(
             except Exception:
                 pass
             try:
-                returncode = process.wait(timeout=max(0.0, terminate_grace))
+                return process.wait(timeout=max(0.0, terminate_grace))
             except subprocess.TimeoutExpired:
-                returncode = process.poll()
+                return process.poll()
+
+    try:
+        if cancel_requested is None:
+            # The untouched pre-R-FUN path: ONE blocking wait, nothing ahead of it.
+            returncode = process.wait(timeout=timeout)
+        else:
+            # [FORK] Digital-Union (FUN Stage-5 Cancel): the same wait, in bounded slices, so the
+            # operator's Stop is observed while the worker runs instead of after it finishes. The
+            # caller's `timeout` is measured against the real clock and remains the authority on a
+            # genuine timeout -- the poll interval is not a second deadline.
+            deadline = None if timeout is None else started + max(0.0, float(timeout))
+            slice_seconds = max(0.01, float(poll_seconds))
+            while True:
+                remaining = None if deadline is None else deadline - clock()
+                if remaining is not None and remaining <= 0.0:
+                    raise subprocess.TimeoutExpired(list(argv), timeout)
+                wait_for = slice_seconds if remaining is None else min(slice_seconds, remaining)
+                try:
+                    returncode = process.wait(timeout=wait_for)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    asked = bool(cancel_requested())
+                except Exception:
+                    # A broken predicate is not a reason to kill a run that is making progress.
+                    asked = False
+                if not asked:
+                    continue
+                cancelled = True
+                # The tree goes FIRST, while the direct child is still alive and therefore still
+                # the documented parent of its own `llama-server`: terminating the Python worker
+                # first would leave the server with no ancestor to find it by.
+                if tree_terminator is not None and process.pid:
+                    try:
+                        tree_error = tree_terminator(process.pid) or ""
+                    except Exception as exc:
+                        tree_error = f"{type(exc).__name__}: {exc}"
+                    tree_terminated = True
+                returncode = _stop_child()
+                break
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        # Same guarantee subprocess.run(timeout=…) gave: the caller never waits forever. Terminate
+        # first, escalate only if the worker ignores it.
+        returncode = _stop_child()
     finally:
         # Join against ONE shared deadline, not a per-thread bound. A surviving grandchild (the
         # worker's llama-server inherits these pipe handles) keeps both pipes open after the direct
@@ -596,6 +734,9 @@ def stream_worker_process(
         returncode=returncode,
         timed_out=timed_out,
         killed=killed,
+        cancelled=cancelled,
+        tree_terminated=tree_terminated,
+        tree_terminate_error=tree_error,
         stderr_tail=tail.text().strip()[-stderr_char_limit:] if stderr_char_limit > 0 else "",
         stdout_lines=counters["stdout"],
         protocol_lines=counters["protocol"],
@@ -627,12 +768,21 @@ def run_qwen_worker(
     on_human_line: Callable[[str], None] | None = None,
     translator: QwenProgressTranslator | None = None,
     stderr_char_limit: int = 2400,
+    cancel_requested: Callable[[], bool] | None = None,
+    tree_terminator: Callable[[int], str] | None = None,
 ) -> QwenWorkerResult:
     """Launch the Qwen worker, stream its progress, then load its response JSON.
 
     The response JSON remains the **only** source of semantic truth: nothing is reconstructed from
     stdout, and no tag is ever parsed out of a progress line. The protocol is observability, so a run
     with ``event_callback=None`` must return exactly what the old capture path returned.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): ``cancel_requested``/``tree_terminator`` are
+    forwarded verbatim and both default to ``None``, which is the unchanged path. A cancelled run
+    takes the same early return an unusable outcome already took, so **the response file of a
+    cancelled worker is never opened** — a worker stopped mid-loop has written no response, and
+    reading whatever happens to be at that path is exactly how a partial result would become
+    semantic authority.
     """
     from beatsync_fork.progress import emit as emit_event
 
@@ -651,6 +801,8 @@ def run_qwen_worker(
         timeout=timeout,
         on_stdout_line=handle_line,
         stderr_char_limit=stderr_char_limit,
+        cancel_requested=cancel_requested,
+        tree_terminator=tree_terminator,
     )
     if not outcome.ok:
         return QwenWorkerResult(response={}, outcome=outcome)
@@ -673,6 +825,7 @@ def run_qwen_worker(
 
 
 __all__ = [
+    "CANCEL_POLL_SECONDS",
     "KIND_JOB_END",
     "KIND_JOB_PROGRESS",
     "KIND_JOB_START",
@@ -690,4 +843,5 @@ __all__ = [
     "is_protocol_line",
     "run_qwen_worker",
     "stream_worker_process",
+    "terminate_process_tree",
 ]
