@@ -163,10 +163,86 @@ def test_music_floor_is_linear_gain_not_decibels(percent: int, floor: float):
 # ===========================================================================
 
 
-def test_voice_order_delegates_to_the_projects_existing_total_order():
-    """One path-sorting rule in the fork, not two subtly different ones."""
+def test_voice_order_is_filename_first_not_whole_path():
+    """[R7.3.1] The UI's promise, asserted as the promise rather than as an implementation.
+
+    This used to assert equality with `input_manager.order_key`, which orders the **whole** path.
+    That is right for a folder scan and wrong for the browser picker: Gradio gives every uploaded
+    file its own randomly-named temp directory, so the parent dominated the sort. Measured in the
+    R7.3 playtest, `01_a 02_b 03_long 04_c 05_long` played `04_c 05_long 01_a 03_long 02_b`.
+
+    The two keys must therefore now DISAGREE on a selection whose parents are shuffled, which is
+    what makes this test non-vacuous — and `order_key` must still be the whole-path order it always
+    was, because video sources and the Smart Mix pools still use it.
+    """
     paths = ["b/02.wav", "b/10.wav", "b/01.wav", "B/03.WAV"]
-    assert am.order_voice_paths(paths) == tuple(sorted(paths, key=fork_input_manager.order_key))
+    assert [p.rsplit("/", 1)[-1] for p in am.order_voice_paths(paths)] == \
+        ["01.wav", "02.wav", "03.WAV", "10.wav"]
+
+    # Gradio-style: each file under its own random parent, deliberately anti-sorted.
+    random_parents = ["t/zz9/01_a.wav", "t/0b2/02_b.wav", "t/9f3/03_long.wav",
+                      "t/a1/04_c.wav", "t/m00/05_long.wav"]
+    assert [p.rsplit("/", 1)[-1] for p in am.order_voice_paths(random_parents)] == \
+        ["01_a.wav", "02_b.wav", "03_long.wav", "04_c.wav", "05_long.wav"]
+    assert am.order_voice_paths(random_parents) != \
+        tuple(sorted(random_parents, key=fork_input_manager.order_key)), \
+        "the two keys agree here, so this test proves nothing about the fix"
+
+
+def test_the_shared_order_key_was_not_changed_globally():
+    """[R7.3.1] The fix is a second rule for a different input, not a rewrite of the shared one.
+
+    `order_key` still orders video sources (`input_manager.scan_folder`) and the Smart Mix SFX
+    pools, where whole-path ordering is the documented and wanted behaviour. Changing it would have
+    silently reordered both.
+    """
+    paths = ["t/zz9/01_a.wav", "t/0b2/02_b.wav"]
+    assert sorted(paths, key=fork_input_manager.order_key) == \
+        ["t/0b2/02_b.wav", "t/zz9/01_a.wav"], "order_key is no longer whole-path"
+
+
+def test_voice_order_breaks_ties_on_the_full_path_deterministically():
+    """[R7.3.1] Duplicate filenames keep BOTH entries, in a defined order.
+
+    Two clips with the same basename in different folders are a real selection (a user picking
+    `take1/intro.wav` and `take2/intro.wav`), so the filename key alone is not total. The full
+    normalised path decides, and nothing is dropped.
+    """
+    assert am.order_voice_paths(["b/01.wav", "a/01.wav"]) == ("a/01.wav", "b/01.wav")
+    assert am.order_voice_paths(["a/01.wav", "b/01.wav"]) == ("a/01.wav", "b/01.wav")
+    # Three copies of one name, shuffled -> three results, same order every time.
+    shuffled = ["m/x.wav", "a/x.wav", "z/x.wav"]
+    assert am.order_voice_paths(shuffled) == ("a/x.wav", "m/x.wav", "z/x.wav")
+    assert len(am.order_voice_paths(shuffled)) == 3
+
+
+def test_voice_order_is_case_insensitive_on_the_filename_and_still_total():
+    """[R7.3.1] `02_B.WAV` sorts between `01` and `03`, not after every lowercase name."""
+    assert [p.rsplit("/", 1)[-1] for p in
+            am.order_voice_paths(["t/1/03_c.wav", "t/2/02_B.WAV", "t/3/01_a.wav"])] == \
+        ["01_a.wav", "02_B.WAV", "03_c.wav"]
+    # Same basename differing only in case: case-folded ties, so the raw path decides. Total, and
+    # the same answer whichever way the selection arrives.
+    one = am.order_voice_paths(["y/a.WAV", "z/A.wav"])
+    two = am.order_voice_paths(["z/A.wav", "y/a.WAV"])
+    assert one == two == ("y/a.WAV", "z/A.wav")
+
+
+def test_voice_order_key_is_a_total_order_on_the_playtest_selection():
+    """[R7.3.1] The key itself, so a future caller cannot reimplement half of it."""
+    key = am.voice_order_key(r"C:\Users\x\AppData\Local\Temp\gradio\9f3a1\03_long.wav")
+    assert key[0] == "03_long.wav"
+    assert key[1] == "c:/users/x/appdata/local/temp/gradio/9f3a1/03_long.wav"
+    assert key[2] == "C:/Users/x/AppData/Local/Temp/gradio/9f3a1/03_long.wav"
+    # Separator normalisation is a plain `str.replace`, deliberately NOT `os.path.normpath`: this
+    # module imports no `os`, and the replace is the host-independent half anyway. So the key is
+    # identical whichever platform the suite runs on.
+    assert am.voice_order_key(r"a\b\01.wav") == am.voice_order_key("a/b/01.wav")
+    # A Windows path, a forward-slash path and a mixed one all split at the right place.
+    assert am.voice_order_key(r"a\b\01.wav")[0] == "01.wav"
+    assert am.voice_order_key("a/b/01.wav")[0] == "01.wav"
+    assert am.voice_order_key(r"a/b\01.wav")[0] == "01.wav"
+    assert am.voice_order_key("01.wav")[0] == "01.wav"
 
 
 def test_voice_order_ignores_the_given_sequence_order():
@@ -177,8 +253,10 @@ def test_voice_order_ignores_the_given_sequence_order():
 
 
 def test_voice_order_normalises_separators():
-    assert am.order_voice_paths([r"x\02.wav", "x/01.wav"]) == (
-        tuple(sorted([r"x\02.wav", "x/01.wav"], key=fork_input_manager.order_key)))
+    """[R7.3.1] A Windows path and a forward-slash path sort together by filename, and the original
+    string is returned untouched — the normalisation is for comparison only, never for output."""
+    assert am.order_voice_paths([r"x\02.wav", "y/01.wav"]) == ("y/01.wav", r"x\02.wav")
+    assert am.order_voice_paths([r"x\01.wav", "y/02.wav"]) == (r"x\01.wav", "y/02.wav")
 
 
 @pytest.mark.parametrize("value", [None, "", "a/01.wav", 7, object(), b"x"])

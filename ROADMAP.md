@@ -726,6 +726,30 @@ report "Audio Layers" as though something had happened, so `build_mixed_master` 
 classification is unchanged — `SHARED_FATAL` — and `voice_overflow` joins the exact set of
 batch-frozen fields the placement-feasibility guard re-derives from source on every run.
 
+#### R7.3.1 — voice clips now really do play in filename order
+
+The R7.3 browser playtest surfaced a **pre-existing** defect in the feature's own input: a selection
+named `01_a 02_b 03_long 04_c 05_long` actually played **`04_c 05_long 01_a 03_long 02_b`**.
+
+`order_voice_paths` delegated to `input_manager.order_key`, which sorts the **whole** normalised
+path. That is correct for a folder scan — every file shares a parent, so path order *is* filename
+order — and wrong for the browser picker the help text is attached to, because Gradio stores each
+uploaded file under its own randomly-named temporary directory and that random component dominated
+the sort.
+
+It mattered more once R7.3 existed than it had before: **the play order decides which clip
+overflows**, and therefore which clip `skip` drops and which one `trim` shortens. An operator
+numbering their files could neither predict nor control what they lost.
+
+Voice now sorts with its own `audio_mix.voice_order_key` — `(filename case-folded, path case-folded,
+path)`. `input_manager.order_key` is **unchanged**: it still orders video sources and the Smart Mix
+SFX pools, where whole-path ordering is the documented and wanted behaviour. Two rules because the
+two inputs genuinely differ, and a test asserts the two keys **disagree** on shuffled parents so the
+fix cannot be proven by a vacuous assertion. Separators are normalised to `/` before the basename is
+taken (Windows, forward-slash and mixed paths all split correctly on any host), the original string
+is what gets returned, duplicate basenames keep both entries ordered by full path, and no selected
+file can be lost in the sort — `prepare_voice_inputs` still re-checks the count.
+
 **`voice_overflow` is threaded into the Variant Lab batch path as well as the single render**, which
 R7.1's two Comfort Mix controls were not. It is placement configuration, so the batch freezes it
 from its own submitted arguments exactly as it freezes `voice_avoid_drops`; no `AudioRecipe` field

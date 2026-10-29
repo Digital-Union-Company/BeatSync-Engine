@@ -38,10 +38,26 @@ test asserts this against the real call — it is the most important test in D.
 - **`video_processor.py` and `ffmpeg_processing.py` are untouched** and must stay that way: the
   renderer already accepts an arbitrary audio path, and the CPU/NVENC/HEVC/ProRes branches all
   consume it. Audio Layers terminates *before* the renderer.
-- **Deterministic filename order, never the browser's.** Voice clips are sorted with
-  `input_manager.order_key` — the project's existing documented total order — because the HTML File
-  API returns whatever the OS dialog supplies, which is not the user's click order. The help text
-  says so and recommends `01_`, `02_`, `03_`.
+- **Deterministic filename order, never the browser's** — and since **R7.3.1** that is literally
+  true rather than approximately true. The HTML File API returns whatever the OS dialog supplies,
+  which is not the user's click order, so the selection is always sorted; the help text says so and
+  recommends `01_`, `02_`, `03_`.
+  **Voice uses `audio_mix.voice_order_key`, not `input_manager.order_key`.** The key is
+  `(filename case-folded, path case-folded, path)`. `order_key` sorts the **whole** normalised path,
+  which is right for a folder scan — every file shares a parent, so path order *is* filename order —
+  and wrong for the browser picker the help text is attached to: Gradio stores each uploaded file
+  under its own randomly-named temporary directory, so the parent component is noise that dominates
+  the sort. Measured in the R7.3 playtest, a selection named `01_a 02_b 03_long 04_c 05_long`
+  actually played **`04_c 05_long 01_a 03_long 02_b`**. That is not cosmetic: the play order decides
+  which clip overflows, and therefore which clip `skip` drops and which one `trim` shortens, so an
+  operator numbering their files could neither predict nor control what they lost.
+  **`order_key` was deliberately NOT changed** — it still orders video sources (`scan_folder`) and
+  the Smart Mix SFX pools, where whole-path ordering is the documented and wanted behaviour. Two
+  rules because the two inputs genuinely differ; a test asserts `order_key` is still whole-path, and
+  another asserts the two keys **disagree** on shuffled parents so the fix's test cannot go vacuous.
+  Separators are normalised to `/` before the basename is taken, so Windows, forward-slash and mixed
+  paths all split correctly on any host, and the **original string is what gets returned** — the
+  normalisation is for comparison only. Duplicate basenames keep both entries, ordered by full path.
 - **The preflight validates the WHOLE selection and never returns a subset (R1-A).**
   `prepare_voice_inputs` receives the raw widget value, keeps every entry
   (`_selected_voice_paths` normalises a scalar/`PathLike`/iterable into a list and drops *nothing*),

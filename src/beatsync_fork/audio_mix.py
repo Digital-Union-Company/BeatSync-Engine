@@ -23,8 +23,14 @@ What V1 decides
 
 Voice clips play in **deterministic filename order**, never in browser multi-select order — the
 HTML File API hands back whatever the OS dialog supplies, which is not the order the user clicked.
-Ordering therefore reuses :func:`input_manager.order_key`, the project's existing documented total
-order, so there is one path-sorting rule in the fork rather than two subtly different ones.
+
+**R7.3.1 made that literally true.** Until then the sort delegated to
+:func:`input_manager.order_key`, which orders the *whole* normalised path — correct for a folder
+scan, where every file shares a parent, and wrong for the browser picker, where Gradio gives each
+uploaded file its own randomly-named temporary directory. Measured in the R7.3 playtest, a selection
+named ``01_a 02_b 03_long 04_c 05_long`` played ``04_c 05_long 01_a 03_long 02_b``. Ordering is now
+:func:`voice_order_key` — filename first, full path only as a tie-break — and ``order_key`` is
+unchanged for video sources and the Smart Mix SFX pools.
 
 Placement is deterministic and seedless. There is no RNG, no Variation Seed and no Master Creative
 Seed: the same music structure, voice durations and :class:`AudioMixConfig` always produce the same
@@ -106,7 +112,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from beatsync_fork import input_manager as fork_input_manager
+# [FORK] R7.3.1: `input_manager` is no longer imported here, and nothing replaced it. The voice
+# order is filename-first (`voice_order_key`), which `order_key`'s whole-path ordering cannot
+# express -- see that function for the measured reason. `order_key` is untouched and still orders
+# video sources and the Smart Mix SFX pools, so this is a second rule for a genuinely different
+# input, not a replacement.
+#
+# This module deliberately imports **no `os`** either. `test_the_module_imports_nothing_that_could
+# _make_it_nondeterministic` holds the import set to `{__future__, collections, dataclasses,
+# typing, beatsync_fork}` on the stated grounds of "no RNG, no clock, no uuid, no process" -- and
+# `os` supplies all four (`urandom`, `times`, `getpid`, `system`), so importing the whole module to
+# reach one pure path helper would weaken a guard that exists to keep placement a pure function of
+# its inputs. Separator normalisation is two `str` operations; see `voice_order_key`.
 
 # ---------------------------------------------------------------------------
 # Fixed V1 constants — deliberately NOT user controls
@@ -316,21 +333,75 @@ def format_clock(seconds: Any) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def voice_order_key(path: str) -> tuple:
+    """[FORK] R7.3.1: the voice play order — **filename first**, full path only as a tie-break.
+
+    The UI promises "clips play in filename order — name them ``01_intro.wav``, ``02_quote.wav``",
+    and until R7.3.1 this delegated to :func:`input_manager.order_key`, which sorts the **whole**
+    normalised path. That is right for a folder scan, where every file shares a parent and the path
+    order *is* the filename order. It is wrong for the browser picker the help text is attached to:
+    Gradio stores each uploaded file under its own randomly-named temporary directory, so the parent
+    component is random noise that dominates the sort. Measured in the R7.3 playtest, a selection
+    named ``01_a 02_b 03_long 04_c 05_long`` actually played::
+
+        04_c  ->  05_long  ->  01_a  ->  03_long  ->  02_b
+
+    which is not a cosmetic problem: it decides which clip overflows, and therefore which clip the
+    ``skip``/``trim`` policies drop or shorten.
+
+    So the key is ``(filename case-folded, path case-folded, path)``:
+
+    * **filename, case-folded** is the promise, and the only thing an operator can control by
+      naming their files;
+    * **path case-folded** then **path raw** make the order *total* rather than merely stable — two
+      clips with the same basename in different folders, and two paths differing only in case, each
+      get a defined position instead of inheriting whatever order the widget happened to supply.
+
+    ``order_key`` itself is deliberately **not** changed: it still orders video sources and the Smart
+    Mix SFX pools, where whole-path ordering is the documented and wanted behaviour. This is a second
+    rule because the two inputs genuinely differ, not because one of them was wrong.
+
+    Separators are normalised to ``/`` before the basename is taken, so a Windows path, a
+    forward-slash path and a mix of the two all split at the right place. That is a plain
+    ``str.replace`` rather than ``os.path.normpath`` for two reasons, and the second is the stronger
+    one:
+
+    * ``normpath`` is **host-dependent** — on Windows it rewrites ``/`` to ``\\``, on POSIX it
+      leaves a ``\\`` alone — so ``order_key`` has always had to follow it with the same explicit
+      ``replace`` anyway. Doing only the replace is the portable half, and the half that matters.
+    * reaching ``normpath`` means importing ``os``, which supplies randomness, a clock, the pid and
+      ``system``. A test holds this module's import set down on exactly those grounds, and widening
+      it to borrow one pure path helper would weaken a guard that keeps placement a pure function of
+      its inputs.
+
+    What is given up is ``..``/``.`` collapsing *inside the tie-break component only*, which can
+    matter solely when two selected clips share a basename AND one of their paths is written
+    non-canonically. The order stays total and reproducible either way.
+
+    Pure string work: no ``stat``, no filesystem access, and the **original string is what gets
+    sorted and returned** — normalisation is for comparison only.
+    """
+    normalised = path.replace("\\", "/")
+    name = normalised.rsplit("/", 1)[-1]
+    return (name.casefold(), normalised.casefold(), normalised)
+
+
 def order_voice_paths(paths: Any) -> tuple:
-    """Voice clips in deterministic path order — the V1 answer to "what order do these play in?".
+    """Voice clips in deterministic **filename** order — the answer to "what order do these play
+    in?".
 
-    Browser multi-select order is not trustworthy, so it is not used. This delegates to
-    :func:`input_manager.order_key`, already documented there as a *total* order (separator
-    normalised, case-folded, with the normalised path as tie-break so two paths differing only in
-    case still order deterministically). Reusing it keeps one path-sorting rule in the fork.
+    Browser multi-select order is not trustworthy, so it is not used; see :func:`voice_order_key`
+    for why the sort is filename-first rather than whole-path.
 
-    Pure string work: no ``stat``, no filesystem access. Non-string entries are dropped rather than
-    raising, because this runs on a widget value.
+    **Every usable entry survives.** Non-string and empty entries are dropped rather than raising,
+    because this runs on a raw widget value — but that is the only thing ever removed, and
+    ``prepare_voice_inputs`` re-checks the count afterwards so a shrunken selection can never be
+    mistaken for a deliberate one. Duplicate filenames are kept, both of them, in a defined order.
     """
     if isinstance(paths, (str, bytes)) or not isinstance(paths, Iterable):
         return ()
     usable = [p for p in paths if isinstance(p, str) and p]
-    return tuple(sorted(usable, key=fork_input_manager.order_key))
+    return tuple(sorted(usable, key=voice_order_key))
 
 
 def has_supported_voice_extension(path: Any) -> bool:
@@ -985,6 +1056,7 @@ __all__ = [
     "normalize_seconds",
     "normalize_start_delay",
     "order_voice_paths",
+    "voice_order_key",
     "plan_voice_placements",
     "project_beat_times",
     "project_sections",

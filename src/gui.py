@@ -10334,9 +10334,17 @@ def create_ui() -> gr.Blocks:
                 # video-source identity — so changing any of them cannot clear a confirmation.
                 with gr.Accordion(label=LABEL_AUDIO_LAYERS, open=False):
                     gr.Markdown(INFO_AUDIO_LAYERS)
-                    # Order comes from `audio_mix.order_voice_paths` (the project's existing
-                    # `input_manager.order_key`), NOT from this picker: the browser's multi-select
-                    # order is whatever the OS dialog supplies and is not the user's click order.
+                    # Order comes from `audio_mix.order_voice_paths`, NOT from this picker: the
+                    # browser's multi-select order is whatever the OS dialog supplies and is not
+                    # the user's click order.
+                    #
+                    # [FORK] R7.3.1: that sort is `audio_mix.voice_order_key` -- filename first --
+                    # and deliberately NOT `input_manager.order_key`, which orders the whole path.
+                    # THIS widget is why: Gradio stores each uploaded file under its own randomly
+                    # named temp directory, so whole-path ordering let the random parent decide the
+                    # play order (measured: `01_a 02_b 03_long 04_c 05_long` played
+                    # `04_c 05_long 01_a 03_long 02_b`). `order_key` still orders the video sources
+                    # and the Smart Mix pools, which are scanned from one real folder.
                     voice_files = gr.File(
                         label=LABEL_VOICE_FILES,
                         file_count='multiple',

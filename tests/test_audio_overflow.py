@@ -790,6 +790,91 @@ def test_the_status_panel_reports_the_accounting_from_the_plans_own_formatter():
             f"gui.py formats {invented!r} itself instead of using the plan's line"
 
 
+# ===========================================================================
+# 8b. R7.3.1 — the ordering fix, and why it belongs in THIS file too
+#
+# Which clip overflows is decided by the play order, so a wrong order silently changes which clip
+# `skip` drops and which one `trim` shortens. The R7.3 playtest found exactly that: Gradio's random
+# per-file temp directories dominated the whole-path sort, and the selection
+# `01_a 02_b 03_long 04_c 05_long` played `04_c 05_long 01_a 03_long 02_b`.
+# ===========================================================================
+
+
+#: The five playtest clips, each under its own randomly-named Gradio-style parent, in an order
+#: that is deliberately wrong under BOTH the supplied sequence and the whole-path sort.
+GRADIO_UPLOADS = [
+    r"C:\Users\x\AppData\Local\Temp\gradio\m00f2\05_long.wav",
+    r"C:\Users\x\AppData\Local\Temp\gradio\a1b7c\04_c.wav",
+    r"C:\Users\x\AppData\Local\Temp\gradio\zz941\01_a.wav",
+    r"C:\Users\x\AppData\Local\Temp\gradio\0b2e8\02_b.wav",
+    r"C:\Users\x\AppData\Local\Temp\gradio\9f3a1\03_long.wav",
+]
+UPLOAD_SECONDS = {"01_a.wav": 4.0, "02_b.wav": 4.0, "03_long.wav": 25.0,
+                  "04_c.wav": 3.0, "05_long.wav": 20.0}
+
+
+def _upload_voices():
+    ordered = M.order_voice_paths(GRADIO_UPLOADS)
+    return tuple(M.VoiceInput(index=i, path=p,
+                              duration=UPLOAD_SECONDS[p.replace("\\", "/").rsplit("/", 1)[-1]])
+                 for i, p in enumerate(ordered))
+
+
+def test_gradio_style_uploads_reach_the_planner_in_filename_order():
+    """[R7.3.1] The fix, measured at the seam the defect actually surfaced at."""
+    ordered = M.order_voice_paths(GRADIO_UPLOADS)
+    assert [p.replace("\\", "/").rsplit("/", 1)[-1] for p in ordered] == \
+        ["01_a.wav", "02_b.wav", "03_long.wav", "04_c.wav", "05_long.wav"]
+    assert len(ordered) == len(GRADIO_UPLOADS), "no selected file may be lost in the sort"
+
+
+def test_the_selection_order_the_widget_supplies_cannot_change_playback_order():
+    """[R7.3.1] The HTML File API hands back whatever the OS dialog supplies. Six shufflings of the
+    same five uploads must all play the same way."""
+    import itertools
+    seen = set()
+    for i, perm in enumerate(itertools.permutations(GRADIO_UPLOADS)):
+        if i >= 6:
+            break
+        seen.add(M.order_voice_paths(list(perm)))
+    assert len(seen) == 1, "playback order depends on the order the widget supplied them"
+
+
+@pytest.mark.parametrize("policy,expect_whole,expect_trimmed,expect_skipped", [
+    (M.OVERFLOW_SKIP, ["01_a.wav", "02_b.wav", "04_c.wav"], [], ["03_long.wav", "05_long.wav"]),
+    (M.OVERFLOW_TRIM, ["01_a.wav", "02_b.wav"], ["03_long.wav"], ["04_c.wav", "05_long.wav"]),
+])
+def test_each_policy_now_acts_on_the_clips_the_filenames_say(
+        policy, expect_whole, expect_trimmed, expect_skipped):
+    """[R7.3.1] The reason the ordering bug mattered, pinned per policy.
+
+    With the cursor at 12.0 s after `01_a` and `02_b`, `03_long` (25 s) is the clip that cannot fit
+    in a 35 s song — so it is the one `skip` drops and the one `trim` shortens, and `04_c` (3 s) is
+    the shorter later clip that `skip` still places. Under the old whole-path order the overflowing
+    clip was whichever one the random temp directory happened to put there, so an operator numbering
+    their files could not predict, or control, which clip they would lose.
+    """
+    config = M.AudioMixConfig(start_delay_seconds=2.0, min_gap_seconds=1.0,
+                              avoid_drops=True, voice_overflow=policy)
+    p = M.plan_voice_placements(MUSIC, BEATS, PLAIN_SECTIONS, _upload_voices(), config)
+    base = lambda s: s.replace("\\", "/").rsplit("/", 1)[-1]        # noqa: E731
+    assert sorted(base(x.path) for x in p.placements if not x.trimmed) == sorted(expect_whole)
+    assert sorted(base(x.path) for x in p.trimmed_placements) == sorted(expect_trimmed)
+    assert sorted(base(s.path) for s in p.skipped) == sorted(expect_skipped)
+
+
+def test_the_report_names_the_right_files_after_the_ordering_fix():
+    """[R7.3.1] The accounting and the named files must agree with the filename order, because the
+    report is the only way an operator learns which clip they lost."""
+    config = M.AudioMixConfig(start_delay_seconds=2.0, min_gap_seconds=1.0,
+                              voice_overflow=M.OVERFLOW_TRIM)
+    text = "\n".join(M.plan_voice_placements(
+        MUSIC, BEATS, PLAIN_SECTIONS, _upload_voices(), config).report_lines())
+    assert "5 clips supplied, 2 used in full, 1 trimmed, 2 skipped" in text
+    assert "03_long.wav" in text and "TRIMMED" in text
+    assert "04_c.wav" in text and "05_long.wav" in text
+
+
 def test_the_pure_module_stays_stdlib_only():
     """CLAUDE.md's hard rule, re-asserted locally because R7.3 touched this file."""
     tree = ast.parse(open(_AUDIO_MIX, encoding="utf-8").read())
