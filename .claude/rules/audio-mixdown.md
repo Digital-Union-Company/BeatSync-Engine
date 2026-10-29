@@ -75,9 +75,10 @@ test asserts this against the real call — it is the most important test in D.
   it**. Avoided types are exactly `drop` and `finale`, read from Stage 3's own vocabulary; `hook`
   and `chorus` are deliberately not avoided. Intervals are half-open `[start, end)` throughout, so
   boundary-touching is legal.
-- **Never drop, truncate, overlap or overrun.** No legal placement is an explicit failure naming the
-  clip, its duration and the cursor — raised before any video clip is extracted. A silent fallback
-  to music-only would look deliberate and be wrong.
+- **Never drop, truncate, overlap or overrun *silently*.** Which clips may be dropped or shortened
+  at all is now the operator's choice (`voice_overflow`, R7.3 below); what has never been
+  negotiable is that it is reported by filename. Overlapping and overrunning remain flatly
+  forbidden in every mode. A silent fallback to music-only would look deliberate and be wrong.
 - **Music under voice is a linear gain.** 35 % means gain 0.35, *never* −35 dB, and the help text
   must keep saying "percent of the normal music level". Attack/release are fixed at 250/400 ms, so
   the music is already at the floor when the first syllable lands.
@@ -114,6 +115,81 @@ test asserts this against the real call — it is the most important test in D.
 - Seconds controls deliberately do **not** reuse `creative.normalize_control` (`2.5` is a valid
   delay) but keep its explicit type boundary; NaN/inf fall back to the default rather than clamping,
   so an infinite delay cannot become an enormous `adelay`.
+
+## R7.3: what happens when a voice clip does not fit (`voice_overflow`)
+
+One control, `When voice clips do not fit`, a `gr.Radio` with `(label, value)` choices so the stored
+value **is** the internal policy name. Three policies; `strict` is the default and **is** V1.
+
+```
+strict   the historical PlacementFailure, identical message, nothing rendered      <- DEFAULT
+skip     drop the clip, record a VoiceSkip, carry on with the cursor UNCHANGED
+trim     skip, plus ONE partial clip, after which everything remaining is skipped
+```
+
+- **The whole-clip search is the untouched V1 code.** The earliest-legal-beat scan and the bounded
+  anchor preference are byte-for-byte what they were, so all three policies place an
+  everything-fits selection identically, with identical duck envelopes. "Changing this setting
+  cannot change a render that never overflowed" is therefore structural, not merely tested.
+- **A skip does not advance the cursor**, and this is the rule the policy exists for. The cursor is
+  the end of the last *placed* clip plus the gap; a clip that was never placed has no end.
+  Advancing it would mean a 17.9 s clip that did not fit also pushed the 3 s clip behind it out of
+  the song. Order is never rearranged.
+- **`trim` spends itself once.** The owner's rule is "trim final usable clip, **then** skip
+  remaining", and a trim is evidence the music ran out. A trim that could not retain
+  `MIN_TRIMMED_VOICE_SECONDS = 0.5` is a *skip* and does **not** consume the allowance — otherwise
+  one tight moment early in the track would silently disable the feature.
+- **A trimmed clip gets no anchor preference, deliberately.** Inside a span the legal room shrinks
+  as the start moves later, so "the earliest beat with at least 0.5 s of room" is already the
+  maximal answer; preferring a nicer section start could only throw speech away to buy a label.
+- **`_legal_room_from` is the exact complement of `_is_legal`**, which is what makes a trim respect
+  *Avoid drops* rather than merely the music length: a start inside an avoided span has **no** room
+  (not "room to the span's end"), and otherwise the room runs to the music end or the next avoided
+  span, whichever comes first. Half-open throughout, so ending exactly where a drop begins is legal.
+- **`duration` stays the PLAYED length**; `source_duration` (appended, defaulting to `duration`) is
+  what the file is. That direction is load-bearing: `end`, the duck envelope, `adelay` and the
+  balance measurement all derive from `duration`, so a trimmed clip is correct everywhere without a
+  single arithmetic change.
+- **Updating the plan is only half of `trim`.** `build_mix_command` emits
+  `atrim=end=<played>` on a trimmed voice input, **before** its `volume`/`adelay` — the leading-
+  fragment idiom R7.1's balance gains use, so an untrimmed input emits the identical text it emitted
+  before R7.3 and `strict` produces the **byte-identical legacy filtergraph**. Without the filter
+  the music would return on schedule while the untrimmed file talked over it to the end of the song.
+- **A trim is only *observable* when `Avoid drops` bounds the room.** When the music end is the
+  bound, the master's own `apad` + `atrim=end=<music>` already cut an overrunning voice, so trimmed
+  and untrimmed mixes are acoustically equivalent. The real-FFmpeg test therefore bounds the room
+  with a `drop` span and asserts voice-level silence after the planned end, with a control proving
+  the same file *would* have kept talking. **Do not "simplify" that test to use the music end** — it
+  would then pass whether or not the `atrim` was ever emitted.
+- **Zero placed clips stays FATAL.** "Some clips did not fit" is survivable; "none of them fit" is
+  not. `build_mixed_master` raises `AudioMixPlanError` naming the count, the music length and what
+  the operator can change, because a plan with no placements would mix a master byte-identical to
+  the music and then report "Audio Layers" as though something had happened.
+- **Reporting is unconditional and names files.** `overflow_summary_line()` always states supplied /
+  used in full / trimmed / skipped / music length, and the counts are **exclusive** so they add up;
+  `report_lines()` lists every skipped and trimmed filename with its reason, and marks a trimmed row
+  `[TRIMMED: 23.0s of 25.0s played]`. The *detail* lines appear only when non-empty (the Smart Mix
+  diagnostics convention), so a clean render gains no `Skipped 0 clips` noise. `summary_line()` is
+  **unchanged character for character** — the accounting is a second line, not a rewrite.
+  `gui.py` formats none of it, asserted by test.
+- **`voice_overflow` is batch-frozen and `AudioMixPlanError` is still `SHARED_FATAL`.** It joins the
+  *exact* set the placement-feasibility guard re-derives from source on every run, and it is read as
+  a **plain attribute** — never `getattr(config, "...")`, which the AST guard cannot see. A second
+  test forbids that idiom in `plan_voice_placements` precisely because R7.3's first draft used it
+  and the guard passed silently.
+- **Unlike R7.1's two Comfort Mix controls, it reaches the Variant Lab batch path too.** It is
+  placement configuration, so `render_selected_variants_guarded` freezes it from its own submitted
+  arguments exactly as it freezes `voice_avoid_drops`; no `AudioRecipe` field resolves it. A batch
+  that refused candidate 1 on overflow while a single render of the same screen skipped and finished
+  would make the setting untrustworthy.
+- **It is a sixth zero-writer Audio Layers widget.** Variant Lab must never vary it, and nothing in
+  the app may set it programmatically.
+- **The two inner handlers default it to the string literal `'strict'`, not the constant.** Several
+  suites AST-extract `_process_video_guarded_unlocked` and `render_selected_variants_guarded` and
+  exec them against a namespace where `fork_audio_mix` is a stub, so a default that dereferences the
+  real module raises at def-time. The literal is pinned equal to `DEFAULT_OVERFLOW_POLICY` by test.
+- **Mode 4, Repeat Music to Fit, is deliberately absent** — it is blocked on R10 and is not offered
+  at all rather than offered and refused.
 
 ## Cancellation reaches the mixdown executor, and nothing else (C3-R1A)
 
@@ -373,15 +449,16 @@ execution widget at all, which is what makes candidate chaining structurally imp
 than merely avoided. See `.claude/rules/variant-lab.md`.
 
 **It writes nothing else.** `voice_files`, `voice_start_delay`, `voice_min_gap`,
-`voice_avoid_drops`, `sfx_folder` and `sfx_roles` remain **zero-writer** configuration values that
-no event in the app may set programmatically, and `audio_layers_report` / `smart_mix_report` keep
+`voice_avoid_drops`, `voice_overflow` (R7.3), `sfx_folder` and `sfx_roles` remain **zero-writer**
+configuration values that no event in the app may set programmatically, and `audio_layers_report` / `smart_mix_report` keep
 `process_btn.click` as their single writer. Those are the user's decisions and the render's
 diagnostics respectively; neither is a value to vary.
 
-Why those six are excluded is in `.claude/rules/variant-lab.md` — in short: files and folders are
-resource identity, `avoid_drops` is a measured protective rule, roles are structural intent, and the
-two seconds controls are deferred placement controls. **Do not add them here without reading that
-rule first.**
+Why those **seven** are excluded is in `.claude/rules/variant-lab.md` — in short: files and folders
+are resource identity, `avoid_drops` is a measured protective rule, roles are structural intent, the
+two seconds controls are deferred placement controls, and `voice_overflow` (R7.3) is the operator's
+decision about whether their speech may be dropped or shortened at all, which is not a thing to
+randomise. **Do not add them here without reading that rule first.**
 
 Load-bearing test detail, because this is where a future change would go wrong quietly:
 

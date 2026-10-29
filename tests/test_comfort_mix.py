@@ -472,12 +472,26 @@ def test_both_controls_exist_and_default_to_legacy(gui_source: str):
         "the music-return control must start at the legacy value"
 
 
+#: The two Comfort Mix controls, in the order they were appended.
+_COMFORT_PAIR = ["voice_auto_balance", "voice_music_return"]
+
+
 def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.Module):
     """Gradio matches `inputs` to parameters positionally, so appending at the end of both is what
-    keeps every pre-existing index where it was."""
+    keeps every pre-existing index where it was.
+
+    **Amended for R7.3.** The original form asserted `[-2:] == the pair`, which was an accurate
+    proxy for the real claim for exactly as long as Comfort Mix was the most recently appended
+    feature. R7.3 appended `voice_overflow` *after* the pair — which is the same discipline, not a
+    violation of it — so `[-2:]` would now fail while the invariant it stands for still holds.
+
+    The invariant is therefore asserted directly: the pair is **contiguous**, sits at the **same
+    index in the signature and in the click list**, and everything behind it is a later append. A
+    pre-existing parameter moved behind the pair would still fail, which is the property worth
+    keeping.
+    """
     handler = _func(gui_tree, "process_video_guarded")
     names = [a.arg for a in handler.args.args]
-    assert names[-2:] == ["voice_auto_balance", "voice_music_return"]
 
     for call in ast.walk(gui_tree):
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
@@ -489,8 +503,15 @@ def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.M
             break
     else:
         raise AssertionError("process_btn.click not found")
-    assert inputs[-2:] == ["voice_auto_balance", "voice_music_return"]
+
     assert len(inputs) == len(names)
+    # `audio_input` -> `audio_file` is the one deliberate widget/parameter rename.
+    start = names.index(_COMFORT_PAIR[0])
+    assert names[start:start + 2] == _COMFORT_PAIR, names
+    assert inputs[start:start + 2] == _COMFORT_PAIR, inputs
+    # Nothing was INSERTED in front of the pair: whatever follows it is a known later append.
+    assert names[start + 2:] == ["voice_overflow"], names[start + 2:]
+    assert inputs[start + 2:] == ["voice_overflow"], inputs[start + 2:]
 
 
 def test_the_config_carries_both_controls(gui_tree: ast.Module):

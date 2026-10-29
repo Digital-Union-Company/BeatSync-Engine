@@ -51,8 +51,11 @@ def _executable_source(path: str) -> str:
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
 
 #: The five user-settable controls. These are render-request inputs and must NEVER be written back.
+#: [R7.3] `voice_overflow` joins them as a sixth zero-writer configuration value. It is the user's
+#: decision about whether their speech may be dropped or shortened, so nothing in the app may set
+#: it programmatically -- least of all Variant Lab, which must not vary it.
 AUDIO_CONFIG_WIDGETS = ("voice_files", "voice_start_delay", "voice_min_gap",
-                        "voice_avoid_drops", "music_under_voice")
+                        "voice_avoid_drops", "music_under_voice", "voice_overflow")
 
 #: The read-only placement read-out. It is an output of the render event and of nothing else.
 AUDIO_REPORT_WIDGET = "audio_layers_report"

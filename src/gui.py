@@ -2638,6 +2638,13 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # actually used — a render without voice keeps the existing panel character for character.
         if audio_plan is not None and prepared_voices:
             status_msg = f"{status_msg}\n\n{audio_plan.summary_line()}"
+            # [FORK] R7.3: the accounting line, unconditionally, from the plan's own formatter.
+            # Unconditional rather than "only when something overflowed" because the two states
+            # must look different: a user who supplied 30 clips has to be able to read how many
+            # actually played WITHOUT having to notice the absence of a warning. The names of the
+            # skipped and trimmed files are in the Voice placement read-out beside it, which the
+            # same plan already wrote; nothing is reformatted here.
+            status_msg = f"{status_msg}\n{audio_plan.overflow_summary_line()}"
         # [FORK] Digital-Union (Smart Mix V1 / E): a separate concise line, and ONLY when at least
         # one SFX was actually placed. An active Smart Mix that resolved zero placements keeps its
         # explanatory report but adds no summary, because no SFX was used.
@@ -4000,6 +4007,20 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # ordering costs nothing.
                                     voice_auto_balance: bool = False,
                                     voice_music_return: float = 0.4,
+                                    # [FORK] R7.3: appended after R7.1's pair, with the legacy
+                                    # policy as its default, for the identical reason -- nothing is
+                                    # inserted, so no pre-existing positional index moves and a
+                                    # caller that omits it plans exactly as it planned before.
+                                    #
+                                    # A STRING LITERAL, not `fork_audio_mix.DEFAULT_OVERFLOW_POLICY`
+                                    # -- the same reason R7.1's `voice_music_return` default above
+                                    # is the literal `0.4`. Several suites AST-extract this function
+                                    # and exec it against a synthesised namespace in which
+                                    # `fork_audio_mix` is a stub, so a default that dereferences the
+                                    # real module raises at def-time and takes every batch-behaviour
+                                    # test down with it. The literal cannot drift: a test asserts it
+                                    # equals `audio_mix.DEFAULT_OVERFLOW_POLICY`.
+                                    voice_overflow: str = 'strict',
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -4110,6 +4131,10 @@ def _process_video_guarded_unlocked(audio_file: str,
         # therefore the legacy filtergraph — is what reaches the executor.
         auto_balance=voice_auto_balance,
         music_return_seconds=voice_music_return,
+        # [FORK] R7.3: normalised on construction like every other field, and unrecognised values
+        # resolve to `strict` -- so a broken widget value can never silently authorise dropping or
+        # shortening the user's speech.
+        voice_overflow=voice_overflow,
     )
 
     # [FORK] Digital-Union (Smart Mix V1 / E): the three raw Smart Mix widget values become one
@@ -4765,6 +4790,8 @@ def process_video_guarded(audio_file: str,
                           # `process_btn.click(inputs=...)` contract is unchanged.
                           voice_auto_balance: bool = False,
                           voice_music_return: float = fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
+                          # [FORK] R7.3: appended last, same discipline again.
+                          voice_overflow: str = fork_audio_mix.DEFAULT_OVERFLOW_POLICY,
                           ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
@@ -4821,6 +4848,7 @@ def process_video_guarded(audio_file: str,
             lifecycle=lifecycle,
             voice_auto_balance=voice_auto_balance,
             voice_music_return=voice_music_return,
+            voice_overflow=voice_overflow,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -4876,6 +4904,19 @@ def render_selected_variants_guarded(
         freestyle_breakdown: str | None = None,
         freestyle_verse: str | None = None,
         freestyle_body: str | None = None,
+        # [FORK] R7.3: the voice-overflow policy, appended LAST with the legacy default so no
+        # existing positional index moves. It is threaded here as well as into the single-render
+        # path on purpose: it is an Audio Layers *placement* control, so it belongs with
+        # `voice_start_delay` / `voice_min_gap` / `voice_avoid_drops` -- frozen once from this
+        # handler's own submitted arguments, identical for every candidate, and never read from a
+        # candidate recipe. A batch that refused candidate 1 on overflow while a single render of
+        # the same screen skipped and finished would be the kind of inconsistency that makes a
+        # setting untrustworthy.
+        #
+        # A string literal for the same reason the core's is, and pinned by the same test: this
+        # function is AST-extracted and exec'd by the batch-behaviour suites against a namespace
+        # where `fork_audio_mix` is a stub.
+        voice_overflow: str = 'strict',
         ) -> Iterator[Tuple]:
     """Render the 2-4 selected candidates, one after the other. C3-R0 -> C3-R1B-b.
 
@@ -4983,6 +5024,7 @@ def render_selected_variants_guarded(
                         recipe.source_diversity, recipe.micro_cuts, recipe.semantic_emphasis,
                         session_state, source_state,
                         batch_freestyle,
+                        voice_overflow=voice_overflow,
                         lifecycle=lifecycle)
             try:
                 for video, status, state, _a_report, _s_report, _invocation_id in candidate_stream:
@@ -10349,6 +10391,25 @@ def create_ui() -> gr.Blocks:
                         info=INFO_MUSIC_RETURN,
                         elem_id='music-return-input',
                     )
+                    # [FORK] R7.3 (voice overflow): ONE control, defaulting to the historical
+                    # refusal, so an operator who never opens this gets byte-identical behaviour.
+                    #
+                    # `(label, value)` choices, like the Smart Mix role group: the stored value IS
+                    # the internal policy name, so no handler ever has to map display prose back to
+                    # a policy and the two can never drift. A Radio rather than a Dropdown because
+                    # all three options and their consequences should be readable at a glance --
+                    # this is a decision about losing the user's speech.
+                    voice_overflow = gr.Radio(
+                        label=LABEL_VOICE_OVERFLOW,
+                        choices=[
+                            (CHOICE_VOICE_OVERFLOW_STRICT, fork_audio_mix.OVERFLOW_STRICT),
+                            (CHOICE_VOICE_OVERFLOW_SKIP, fork_audio_mix.OVERFLOW_SKIP),
+                            (CHOICE_VOICE_OVERFLOW_TRIM, fork_audio_mix.OVERFLOW_TRIM),
+                        ],
+                        value=fork_audio_mix.DEFAULT_OVERFLOW_POLICY,
+                        info=INFO_VOICE_OVERFLOW,
+                        elem_id='voice-overflow-radio',
+                    )
                     audio_layers_report = gr.Textbox(
                         label=LABEL_AUDIO_LAYERS_REPORT,
                         value='',
@@ -11862,6 +11923,11 @@ def create_ui() -> gr.Blocks:
                 freestyle_intro, freestyle_hook, freestyle_outro, freestyle_finale,
                 freestyle_drop, freestyle_chorus, freestyle_bridge, freestyle_breakdown,
                 freestyle_verse, freestyle_body,
+                # [FORK] R7.3: the voice-overflow policy, appended after the Freestyle block for
+                # the same reason and frozen the same way — one value for the whole batch, read
+                # from this click and never from a candidate recipe, so the batch and a single
+                # render of the same screen agree about what happens when a clip does not fit.
+                voice_overflow,
             ],
             outputs=[video_output, status_output, session_state, render_batch_summary,
                      render_invocation_state],
@@ -12076,6 +12142,9 @@ def create_ui() -> gr.Blocks:
                 # positionally, so list order and signature order are one contract -- a seam test
                 # pins them name-for-name.
                 voice_auto_balance, voice_music_return,
+                # [FORK] R7.3: appended after R7.1's pair, in both the click list and the handler
+                # signature together, so no pre-existing positional index moved.
+                voice_overflow,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or

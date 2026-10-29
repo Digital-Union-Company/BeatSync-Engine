@@ -416,12 +416,28 @@ def test_a_placement_failure_becomes_a_plan_error(tmp_path):
             session_dir=str(tmp_path))
 
 
+#: Every `AudioMixConfig` field `plan_voice_placements` is allowed to read. Each one must be frozen
+#: for a whole C3 batch, which is what keeps `AudioMixPlanError` -> SHARED_FATAL true.
+#:
+#: [R7.3] `voice_overflow` joined the set. It qualifies for the identical reason
+#: `avoid_drops` does: it is a live Audio Layers widget that the batch handler freezes from its own
+#: submitted arguments before the candidate loop, and **no `AudioRecipe` field resolves it** -- the
+#: three generated audio levels are `music_under_voice_percent`, `sfx_amount` and `sfx_level`, and
+#: a separate guard asserts Variant Lab writes no other audio widget. So no candidate's recipe can
+#: change the policy, and therefore none can rescue a refusal under it.
+_PLACEMENT_CONFIG_READS = {"avoid_drops", "start_delay_seconds", "min_gap_seconds",
+                           "voice_overflow"}
+
+
 def test_placement_feasibility_reads_only_batch_frozen_configuration():
     """The source proof for SHARED_FATAL, re-derived from `audio_mix.py` on every run.
 
-    `plan_voice_placements` may read only the three frozen placement fields. The one field a C3
+    `plan_voice_placements` may read only batch-frozen placement fields. The one field a C3
     candidate varies, `music_under_voice_percent`, must NOT appear -- if it ever did, a different
     candidate could rescue a placement failure and the class would have to become CANDIDATE_LOCAL.
+
+    **This is an exact set, deliberately**, so a new placement input has to arrive through a review
+    that re-answers "is this frozen for a batch?" rather than slipping in under a subset check.
     """
     path = os.path.join(os.path.dirname(_MIXDOWN), "beatsync_fork", "audio_mix.py")
     fn = next(n for n in ast.walk(ast.parse(open(path, encoding="utf-8").read()))
@@ -429,10 +445,30 @@ def test_placement_feasibility_reads_only_batch_frozen_configuration():
     read = {node.attr for node in ast.walk(fn)
             if isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name) and node.value.id == "config"}
-    assert read == {"avoid_drops", "start_delay_seconds", "min_gap_seconds"}, read
+    assert read == _PLACEMENT_CONFIG_READS, read
     assert "music_under_voice_percent" not in read
     assert "music_floor" not in read, \
         "the duck floor must stay out of placement; it is the one candidate-varied value"
+
+
+def test_the_placement_config_guard_cannot_be_evaded_by_getattr():
+    """The guard above walks `ast.Attribute`, so `getattr(config, "new_field", ...)` would be
+    invisible to it — a new placement input could reach production without ever being asked whether
+    it is batch-frozen. Nothing in `plan_voice_placements` may read `config` that way.
+
+    This is not hypothetical: R7.3's first draft read the policy with exactly that idiom and the
+    guard passed silently.
+    """
+    path = os.path.join(os.path.dirname(_MIXDOWN), "beatsync_fork", "audio_mix.py")
+    fn = next(n for n in ast.walk(ast.parse(open(path, encoding="utf-8").read()))
+              if isinstance(n, ast.FunctionDef) and n.name == "plan_voice_placements")
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr" and node.args
+                and isinstance(node.args[0], ast.Name) and node.args[0].id == "config"):
+            raise AssertionError(
+                "plan_voice_placements reads `config` through getattr, which hides the read from "
+                "test_placement_feasibility_reads_only_batch_frozen_configuration")
 
 
 def test_a_placement_failure_cannot_fire_with_an_empty_voice_selection(tmp_path):

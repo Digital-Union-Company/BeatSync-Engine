@@ -1051,6 +1051,9 @@ _RENDER_CLICK_INPUTS = [
     # together, so no pre-existing positional index moved -- which is the property these two
     # assertions actually protect.
     "voice_auto_balance", "voice_music_return",
+    # [R7.3] The voice-overflow policy, appended after R7.1's pair in both places together, for
+    # the same reason.
+    "voice_overflow",
 ]
 
 

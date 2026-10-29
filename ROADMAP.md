@@ -525,7 +525,7 @@ a real browser. Audio Layers itself is unchanged by R7; the tab carries a short 
 **Known limitations.** Single file per run (no Folder Batch); same-volume filing only; fixed
 export rate of 48 kHz.
 
-#### R7.1 — hover gallery and Comfort Mix · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+#### R7.1 — hover gallery and Comfort Mix · **MERGED AND DEPLOYED (PR #77, main `d98fb55a`)**
 
 Two owner-requested improvements on top of R7, after a hands-on test that accepted the silence
 cutting as-is. **The cutter itself is unchanged.**
@@ -559,7 +559,7 @@ wired to the single-render click only.
 > **Three of those limitations were closed by R7.2 below** — the byte budget, the one-page gallery
 > and the Cutter-session-only review. The two Comfort Mix ones are still open.
 
-#### R7.2 — lazy audio preview, a review tab, keep-only sorting, MP3 · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+#### R7.2 — lazy audio preview, a review tab, keep-only sorting, MP3 · **MERGED AND DEPLOYED (PR #77, main `d98fb55a`)**
 
 Five owner-requested improvements after a hands-on R7.1 test on real footage and a rendered music
 video. **The silence planner is unchanged, and so is every WAV/FLAC behaviour.** What the owner
@@ -650,13 +650,19 @@ boundaries are frame-quantised to 1152 samples with the delay and padding record
 Xing/LAME header — close, and **not** sample-exact, which is why WAV remains the default. The two
 Comfort Mix limitations above are untouched.
 
-### R7.3 — Voice clips that exceed the music duration · **PLANNED, NOT IMPLEMENTED**
+### R7.3 — Voice clips that exceed the music duration · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
 
-Raised while testing R7.2: Audio Layers currently **fails the whole render** when the voice clips
-it was given cannot all be placed before the music ends. That is the safe default and must remain
-available, but it is not always the behaviour the operator wants.
+Branch `feat/fun-audio-overflow-r7-3`, cut from `main` at `d98fb55a`. **Modes 1–3 are implemented**;
+mode 4 is still blocked on R10 and is deliberately **not offered**, rather than offered and refused.
 
-A future Audio Layers setting — **"When voice clips do not fit"** — with four modes:
+Raised while testing R7.2: Audio Layers **failed the whole render** when the voice clips it was
+given could not all be placed before the music ended — the owner hit
+`Voice 24 (17.9s) has no legal placement after 187.6s` on real material and lost an otherwise
+finished music video to clip 24 of 30. That refusal is the safe default and remains available; it
+is no longer the only answer.
+
+The Audio Layers setting **"When voice clips do not fit"** (`gr.Radio`, Audio Mix → Audio Layers),
+with four modes:
 
 1. **Strict / Error** — the historical behaviour. Refuse the render and name the clip, its duration
    and the cursor position, exactly as today. **This stays available and stays the thing an
@@ -674,14 +680,56 @@ its start), and looks ahead at most `PLACEMENT_LOOKAHEAD_SECONDS` for a preferre
 clip can therefore fail to fit with minutes of music left, and a naive duration sum would report
 the opposite. The mode must be evaluated against the real planner, by the planner.
 
-Acceptance goals:
+Acceptance goals, and what the implementation actually did about each:
 
-- every mode **always reports clips used, trimmed and skipped**, by name;
-- **no silent truncation and no silent dropping**, in any mode;
-- Strict remains selectable and remains the default until the owner says otherwise;
-- the placement rules above are unchanged — this chooses what to do when placement fails, it does
-  not relax placement;
-- deterministic and seedless, like the rest of Audio Layers.
+- every mode **always reports clips used, trimmed and skipped**, by name — **met**.
+  `AudioMixPlan.overflow_summary_line()` is unconditional (`N supplied, N used in full, N trimmed,
+  N skipped. Music length: MM:SS.`) and `report_lines()` lists every skipped and trimmed **filename
+  with its reason**. One formatter, in the pure module; `gui.py` reformats nothing, and a test
+  asserts the GUI does not contain the phrases itself;
+- **no silent truncation and no silent dropping**, in any mode — **met**. A trimmed row is marked
+  `[TRIMMED: 23.0s of 25.0s played]`, and `VoicePlacement` carries `source_duration` beside the
+  played `duration`;
+- Strict remains selectable and remains the **default** — **met**. `DEFAULT_OVERFLOW_POLICY =
+  "strict"`, appended last on `AudioMixConfig` so every pre-existing positional and keyword
+  construction is unchanged, and any unrecognised value **resolves to strict** rather than to
+  something permissive;
+- the placement rules above are unchanged — **met structurally**, not merely by test: the
+  whole-clip search and the bounded anchor preference are the untouched V1 code, so all three modes
+  place an everything-fits selection identically, with identical duck envelopes;
+- deterministic and seedless — **met**. No RNG was added and the planner still reads nothing but
+  its config.
+
+Three implementation facts worth recording, because each one is a place a future change goes wrong
+quietly:
+
+1. **A skip does not advance the cursor.** The cursor is the end of the last *placed* clip plus the
+   gap; a clip that was never placed has no end. Advancing it would mean a 17.9 s clip that did not
+   fit also pushed the 3 s clip behind it out of the song — the opposite of the point. This is why
+   mode 2 can place a later, shorter clip at the exact instant the long one was refused.
+2. **The planned number is only half of Trim.** `atrim=end=<played>` is emitted on the trimmed
+   voice *input*, before its `volume`/`adelay`, and on no other voice input — so Strict still
+   produces the byte-identical legacy filtergraph. Shortening only the plan would have left the
+   duck envelope correct while the untrimmed file talked over it to the end of the song.
+3. **A trim is only *observable* when `Avoid drops` bounds the room.** When the **music end** is the
+   bound, the master's own `apad` + `atrim=end=<music>` already cut an overrunning voice, so a
+   trimmed mix and an untrimmed one are acoustically equivalent. The decisive real-FFmpeg test
+   therefore bounds the room with a `drop` span and asserts voice-level silence after the planned
+   end, with a control proving the same file *would* have kept talking. A test bounded by the music
+   end would have passed whether or not the `atrim` was ever emitted.
+
+**One behaviour not in the original plan, added deliberately: zero placed clips stays fatal.**
+"Some clips did not fit" is now survivable; "**none** of them fit" is not. A plan with no
+placements out of a non-empty selection would mix a master byte-identical to the music and then
+report "Audio Layers" as though something had happened, so `build_mixed_master` raises an
+`AudioMixPlanError` naming the count, the music length and what the operator can change. The
+classification is unchanged — `SHARED_FATAL` — and `voice_overflow` joins the exact set of
+batch-frozen fields the placement-feasibility guard re-derives from source on every run.
+
+**`voice_overflow` is threaded into the Variant Lab batch path as well as the single render**, which
+R7.1's two Comfort Mix controls were not. It is placement configuration, so the batch freezes it
+from its own submitted arguments exactly as it freezes `voice_avoid_drops`; no `AudioRecipe` field
+resolves it and Variant Lab must never vary it (it is a sixth zero-writer Audio Layers widget).
 
 ### R10 — Quick Render music repeat · **PLANNED, NOT IMPLEMENTED**
 
@@ -725,7 +773,7 @@ No new model, dependency or inference pipeline is to be added for this now.
 
 ### R9 — Audio Layers usability · **PARTLY IMPLEMENTED (R7.1 Comfort Mix), REST STILL PLANNED**
 
-#### Comfort Mix — optional, OFF by default · **LOCAL CANDIDATE, IN DRAFT PR #77, NOT DEPLOYED**
+#### Comfort Mix — optional, OFF by default · **MERGED AND DEPLOYED (PR #77, main `d98fb55a`)**
 
 The owner made a music video with voice layers and reported a real problem: the music is far
 louder than the speech, so heavy ducking is the only way to hear the voice — and then the music
@@ -769,7 +817,7 @@ The documentation half of R9 is unchanged and unstarted. This is explanation, **
 
 ---
 
-### Housekeeping note — `input/gradio_uploads` loses newer files on restart · **IMPLEMENTED as a LOCAL CANDIDATE (UX Refresh, Phase 8)**
+### Housekeeping note — `input/gradio_uploads` loses newer files on restart · **MERGED AND DEPLOYED (UX Refresh Phase 8, PR #78, main `d98fb55a`)**
 
 Observed during the 2026-10-27 production deploy: starting the app ran `cleanup_on_startup()`,
 which deleted three files from `input/gradio_uploads` that existed nowhere else. The function was
@@ -803,7 +851,7 @@ lives in `input/gradio_uploads`.
 
 ---
 
-### UX Refresh — one coherent application rather than a pile of tools · **LOCAL CANDIDATE, NOT MERGED, NOT DEPLOYED**
+### UX Refresh — one coherent application rather than a pile of tools · **MERGED AND DEPLOYED (PR #78, main `d98fb55a`)**
 
 > **Naming, stated plainly to prevent a real confusion.** The branch and task identifier for this
 > work are `feat/fun-ux-refresh-r8` and `R8-UX-REFRESH`, and its source comments say "R8 UX
@@ -943,14 +991,14 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R5** — Clips Preview Selector (post-cut triage tab) | **P1 IMPLEMENTED** — the fifth tab reviews and classifies clips, read-only and measured; **moving files is NOT implemented**. Specification: `docs/claude/clips-preview-selector-v1.md`; contract: `.claude/rules/clips-preview.md` |
 | **R5-UX** — Clips Preview usability V1–V4 (auto-Confirm, durations, adaptive seek, same-volume sorting, native folder picker, saved defaults) | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Owner-accepted after a hands-on test; whole suite 7,912 passed / 9 skipped at the merge. Not independently reviewed |
 | **R6** — Raw Cutter output video profiles | **DONE** — merged in PR #76, **deployed** at `25c4db3b`. Four profiles + Same as source; Same as source proven byte-identical; FFprobe-verified on both encoders in production |
-| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **IN DRAFT PR #77** — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not merged, not deployed, not independently reviewed** |
-| **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **LOCAL CANDIDATE, IN DRAFT PR #77** — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. **Not merged, not deployed** |
-| **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **LOCAL CANDIDATE, IN DRAFT PR #77** — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. **Not merged, not deployed, not independently reviewed** |
-| **R7.3** — "When voice clips do not fit" modes | **PLANNED, NOT IMPLEMENTED** — Strict (today's behaviour, retained) / Skip / Trim-then-skip / Repeat-music (blocked on R10). Must be decided by real placement feasibility, not by summing durations |
+| **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not independently reviewed** |
+| **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. Owner-tested and **accepted** |
+| **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. Owner-tested and **accepted**. **Not independently reviewed** |
+| **R7.3** — "When voice clips do not fit" modes | **LOCAL CANDIDATE, IN DRAFT PR** — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) still blocked on R10 and **not offered**. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **Not merged, not deployed, not independently reviewed** |
 | **R10** — Quick Render **Repeat Music 1×–30×** | **PLANNED, NOT IMPLEMENTED** — 1× must be the existing path unchanged; cuts must cover the whole extended timeline rather than repeating the rendered sequence; analysis reused rather than re-run; cancellable with an estimated duration |
-| **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **LOCAL CANDIDATE, DRAFT PR stacked on #77** — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. **Not merged, not deployed, not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
+| **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
-| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is a local candidate in PR #77; the documentation half is unstarted. R7.3 above is the next Audio Layers item |
+| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is merged and deployed at `d98fb55a`, and R7.3's overflow policy is a local candidate; the documentation half is unstarted. **R10** is the next Audio Layers-adjacent item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
@@ -969,16 +1017,17 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 4. **R6 — Raw Cutter output video profiles.** The recommended next build: it is bounded, it has a
    default that cannot regress anything (*Same as source*), and it makes the clip library usable
    as a whole rather than as a pile of mismatched formats.
-5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI. **R7 / R7.1 / R7.2 are all local
-   candidates in draft PR #77**, owner-tested through R7.1 and awaiting an owner test of R7.2.
-5a. **UX Refresh** — inserted here rather than appended, because it is **stacked on R7.2** and an
-   owner test of it is also an owner test of R7.2's features in their new locations. It changes
-   no R7 engine: the Audio Cutter, the review galleries and Comfort Mix are the same code in
-   different containers, plus one opt-in fade. Awaiting the owner test.
-6. **R7.3 — "When voice clips do not fit"**, the next Audio Layers behaviour change. Modes 1–3 are
-   implementable now; mode 4 waits on R10.
-7. **R10 — Repeat Music 1×–30×**, which also unblocks R7.3's fourth mode and the later
-   Auto-Repeat-to-Fit.
+5. **R7 — Raw Audio Cutter V1**, mechanical only, no AI. **DONE** — R7 / R7.1 / R7.2 are
+   **merged (PR #77) and deployed at main `d98fb55a`**, owner-tested and accepted.
+5a. **UX Refresh** — **DONE**, merged as PR #78 and deployed at the same `d98fb55a`, owner-tested
+   and accepted. It changed no R7 engine: the Audio Cutter, the review galleries and Comfort Mix
+   are the same code in different containers, plus one opt-in fade.
+6. **R7.3 — "When voice clips do not fit"** — **IMPLEMENTED as a local candidate** on
+   `feat/fun-audio-overflow-r7-3`. Modes 1–3 ship (Strict / Skip / Trim-then-skip); mode 4 waits
+   on R10. Awaiting the owner test.
+7. **R10 — Repeat Music 1×–30× — THE NEXT PRIORITY.** It unblocks R7.3's fourth mode
+   (Repeat Music to Fit) and the later Auto-Repeat-to-Fit, and it is the one remaining answer to
+   "my voice material is longer than my song" that drops and shortens nothing at all.
 8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing

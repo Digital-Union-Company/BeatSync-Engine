@@ -47,6 +47,12 @@ The graph, and why each piece is there
 ``aresample`` on every input is what lets voice clips be any sample rate; ``adelay`` is
 sample-exact (measured shift 0).
 
+[FORK] R7.3: a voice input whose placement is ``trimmed`` additionally carries
+``atrim=end=<played>`` **before** its ``volume``/``adelay`` — the same shape the Smart Mix
+atmosphere bed already uses. Every untrimmed voice input emits exactly the text it emitted before
+R7.3, so the ``strict`` policy (the default) still produces the legacy filtergraph rather than an
+equivalent one.
+
 ===============================================================================
 Failure is loud, never silent
 ===============================================================================
@@ -463,9 +469,24 @@ def build_mix_command(music_path: str, plan, output_path: str,
     labels = ["[music]"]
     stream = 0
     for stream, placement in enumerate(plan.placements, start=1):
+        # [FORK] R7.3: a REAL trim for a trimmed placement, and nothing at all for every other one.
+        #
+        # This is the half of "Trim final usable clip" that the plan alone cannot deliver. The
+        # planner shortening `duration` already fixes `end`, the duck envelope and the master's
+        # length -- but the voice *input* is still the whole file, so without this the music would
+        # come back up on schedule while the speech kept talking over it to the end of the song.
+        #
+        # Placed BEFORE `volume` and `adelay` for two reasons: trimming is about the source, so it
+        # belongs next to the source; and `adelay` must shift the already-shortened stream, not the
+        # other way round. The leading-fragment idiom is the same one the R7.1 balance gains use, so
+        # an untrimmed clip emits the identical text it emitted before R7.3 -- no `atrim`, no
+        # `anull`, nothing -- which is what keeps Strict's filtergraph the legacy one.
+        voice_trim = (f"atrim=end={placement.duration:.6f},"
+                      if getattr(placement, "trimmed", False) else "")
         chain.append(
             f"[{stream}:a]aresample={MASTER_SAMPLE_RATE},"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo{voice_volume},"
+            f"{voice_trim}"
             f"adelay={int(round(placement.start * 1000))}:all=1[v{stream}]")
         labels.append(f"[v{stream}]")
 
@@ -653,6 +674,10 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     """
     if lifecycle is not None:
         lifecycle.raise_if_cancelled()
+    # [FORK] R7.3: materialised once, before planning, because the zero-placement check below has
+    # to ask "was the selection non-empty?" *after* the planner has already iterated it. A
+    # generator would be consumed by then and would read as truthy-but-empty.
+    voices = tuple(voices or ())
     plan = fork_audio_mix.plan_voice_placements(
         music_duration=music_duration,
         beat_times=fork_audio_mix.project_beat_times(beat_times),
@@ -662,6 +687,24 @@ def build_mixed_master(music_path: str, music_duration: float, beat_times, secti
     )
     if isinstance(plan, fork_audio_mix.PlacementFailure):
         raise AudioMixPlanError(plan.reason)
+
+    # [FORK] R7.3: "some clips did not fit" is now survivable; "NONE of them fit" is not, and that
+    # asymmetry is the whole design. The owner's goal was to stop losing a finished music video
+    # over clip 24 of 30 -- not to accept a render that quietly contains no speech at all. A plan
+    # with zero placements out of a non-empty selection would mix a master byte-identical to the
+    # music and then report "Audio Layers" as if it had done something, so it fails loudly instead,
+    # naming the count and the first reason so the user can act on it.
+    #
+    # `AudioMixPlanError`, and therefore SHARED_FATAL, for exactly the reasons the docstring below
+    # already gives: reachable only with a non-empty frozen selection, and decided only by
+    # batch-frozen configuration.
+    if voices and not plan.placements:
+        first = plan.skipped[0].reason if plan.skipped else "no legal placement exists"
+        raise AudioMixPlanError(
+            f"None of the {len(voices)} voice clips fit inside the music "
+            f"({fork_audio_mix.format_clock(music_duration)}) — first clip "
+            f"{first}. Nothing was added: shorten the clips, lower Start delay, "
+            f"reduce Minimum gap, or turn off Avoid drops.")
 
     sfx_placements = tuple(sfx_placements or ())
     if sfx_placements:
