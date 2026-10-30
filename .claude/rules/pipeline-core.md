@@ -124,9 +124,18 @@ raising `RenderCancelled`; `create_music_video`'s clip executor is shut down wit
 `shutdown(wait=True, cancel_futures=True)` and the exception re-raised only after the `with` block
 exits, so no FFmpeg child outlives the call; and `analyze_beats_auto` checks at four boundaries, one
 of them deliberately **after** the Stage-5 `try/except` so a cancellation cannot be reinterpreted as
-"video analysis failed". `video_analysis.py` and `stage5_qwen_scene_worker.py` are **untouched by
-contract** — an in-flight Qwen call is never hard-killed. Full contract:
-`.claude/rules/variant-lab.md` (C3-R1A).
+"video analysis failed". Full contract: `.claude/rules/variant-lab.md` (C3-R1A).
+
+**The FUN Stage-5 Cancel milestone retired C3-R1A's "`video_analysis.py` is untouched by contract"
+clause.** That clause said an in-flight Qwen call is never hard-killed and the token never reaches
+Stage 5; a real owner incident — a whole library selected against a cold cache, Cancel pressed,
+Stage 5 running on for about an hour — established that the surrounding boundaries were not enough.
+`video_analysis.py` and `ffmpeg_processing.detect_video_scene_changes` now take the same optional
+trailing `lifecycle=None`, and `beatsync_fork/qwen_progress.py` takes a stdlib-only cancel
+*predicate*. `auto_mode/stage5_qwen_scene_worker.py` is **still untouched** and still holds no
+token — the parent owns the child and stops it, including its `llama-server` grandchild. The whole
+contract, including what a cancellation may and may not write, is
+`.claude/rules/render-worker.md`.
 
 **C3-R0 changed no pipeline file.** It renders two candidates by calling the existing path twice,
 sequentially; `video_processor.py`, `ffmpeg_processing.py`, `video_analysis.py` and

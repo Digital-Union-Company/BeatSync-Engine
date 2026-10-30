@@ -1071,9 +1071,20 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
 def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
                                use_gpu: bool = False,
                                analysis_fps: float = 8.0,
-                               analysis_width: int = 384) -> List[float]:
+                               analysis_width: int = 384,
+                               lifecycle=None) -> List[float]:
     """
     Detect likely montage/scene changes using FFmpeg's scene score.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended last with a default of
+    ``None``, which is byte-for-byte the pre-existing behaviour — `_run_media_command` falls
+    straight through to its original blocking `subprocess.run`. Supplied, it makes the one
+    genuinely long FFmpeg pass in Stage 5 cancellable: this filter graph decodes the **whole**
+    source video, so on a large library it is where most of an uncancellable hour was actually
+    spent. The `except RenderCancelled: raise` below sits ahead of both broad handlers on purpose —
+    this function's contract is to swallow failures and return `[]`, and a cancellation collapsing
+    into "no scene changes found" would let the analysis carry on building windows for a render
+    nobody asked for.
 
     GPU note:
     FFmpeg's `scene` comparison itself is a CPU video filter, but when GPU mode
@@ -1144,7 +1155,7 @@ def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
                     print("   💻 CPU scene analysis")
 
             command_started = time.perf_counter()
-            result = _run_media_command(cmd, timeout=300)
+            result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
             command_elapsed = time.perf_counter() - command_started
             if result.returncode == 0:
                 cleaned = _extract_scene_times(result.stderr)
@@ -1162,6 +1173,12 @@ def detect_video_scene_changes(video_path: str, threshold: float = 0.28,
         print(f"   ⚠️  Warning: Scene detection failed: {last_error}")
         return []
 
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST, ahead of both broad handlers below.
+    # `RenderCancelled` is an ordinary `Exception`, so the generic handler would otherwise catch it
+    # and return `[]` -- reporting the operator's Stop as "could not analyze scene changes" and
+    # letting Stage 5 continue into window building for the next source.
+    except RenderCancelled:
+        raise
     except subprocess.TimeoutExpired:
         print(f"   ⚠️  Warning: Scene detection timeout")
         return []

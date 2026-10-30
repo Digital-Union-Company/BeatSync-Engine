@@ -136,13 +136,28 @@ These apply in almost every session. Each has a scoped rule with the full contra
 - **Creative state is a render request, never source or media identity.** The seven resolved controls
   ride on `beat_info["creative"]`; changing one re-plans and never re-analyses. →
   `.claude/rules/creative-controls.md`
-- **Cancellation is boundary-only (C3-R1A).** Exactly one `RenderLifecycle` per top-level render
-  event — one Create Music Video click, or the **whole** 2–4-candidate batch. FFmpeg-class children
-  are terminated *and reaped* before `RenderCancelled` propagates; an in-flight Stage-5/Qwen call is
-  never hard-killed. `RenderCancelled` is an ordinary `Exception`, so every broad `except Exception`
-  on the render path must name it **before** the generic handler. Abandoning a stream is **not** a
+- **Cancellation (C3-R1A, extended into Stage 5 by FUN Stage-5 Cancel).** Exactly one
+  `RenderLifecycle` per top-level render event — one Create Music Video click, or the **whole**
+  2–4-candidate batch. FFmpeg-class children are terminated *and reaped* before `RenderCancelled`
+  propagates. **Stage 5 is cancellable during the pass**: the token now reaches `video_analysis.py`
+  and the Qwen worker wait, which tree-terminates the worker *and* its `llama-server` grandchild;
+  C3-R1A's `BOUNDARY_ONLY_CANCEL` clause for Stage 5 is superseded, after an owner incident in which
+  a cold library kept analysing for about an hour after Cancel. The worker **process** still holds no
+  token, Stages 1–3 are still uncancellable mid-stage, a cancellation adds **no cache write path**,
+  and completed records survive. `RenderCancelled` is an ordinary `Exception`, so every broad
+  `except Exception` on the render path must name it **before** the generic handler — the two that
+  matter most are Stage 5's serial retry and `analyze_beats_auto`'s Stage-5 handler, which would
+  otherwise have continued into Stage 6 on fallback sampling. Abandoning a stream is **not** a
   Cancel, only a plain string enters `gr.State`, and the durable promotion is the one SUCCESS commit
-  point. → `.claude/rules/variant-lab.md` (C3-R1A), `.claude/rules/pipeline-core.md`
+  point. → `.claude/rules/render-worker.md`, `.claude/rules/variant-lab.md` (C3-R1A),
+  `.claude/rules/pipeline-core.md`
+- **The Stage-5 cache directory is resolved per invocation, and is not part of identity.**
+  `input/video_analysis_cache` is the local default; a per-user setting at
+  `%LOCALAPPDATA%\BeatSync\shared-config.json` — deliberately outside every checkout — can point
+  every installation at one shared folder. Records are portable *because* the directory was never a
+  signature component, so this is a location change, never a migration: `CACHE_CONTRACT_VERSION` and
+  `ANALYSIS_VERSION` are untouched. Retained Qwen worker request/response JSON stays local. →
+  `.claude/rules/shared-analysis-cache.md`, `.claude/rules/stage5-cache-identity.md`
 - **Progress is structured, not printed.** In GUI runs stdout/stderr go to a discarded `QuietConsole`,
   so a plain `print()` inside the pipeline is invisible in the UI — emit a `ProgressEvent`. Never
   touch a Gradio component from a worker thread, and never invent an ETA. →
@@ -188,7 +203,11 @@ The non-negotiables, restated here deliberately because getting one wrong is exp
 - **`input/video_analysis_cache/` and `output/` are preserved by policy**, `.gitignore`
   notwithstanding — the cache is deliberately retained (including the retained Qwen request/response
   JSON) and `output/` holds the user's rendered videos. Never clear either as housekeeping, and never
-  destroy audit / acceptance / verification evidence because a milestone completed.
+  destroy audit / acceptance / verification evidence because a milestone completed. **A configured
+  *shared* analysis cache carries the same protection and more**: it is read by several
+  installations, so clearing it costs every one of them — including the production install nobody is
+  currently looking at. The only path that may ever delete from it is the operator's own Cache
+  Management button, behind its confirmation, and it warns that the folder is shared first.
 - **Clean up only what your own task created.** Never infer staleness from age, never disturb another
   session's files, and never remove, prune or reset a git worktree or clone as housekeeping.
 - **Waiting on an external result**: after at most **20 minutes** without a surfaced terminal state,

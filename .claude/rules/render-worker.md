@@ -3,6 +3,7 @@ paths:
   - "src/beatsync_fork/render_worker.py"
   - "tests/test_render_worker.py"
   - "tests/test_render_cancellation.py"
+  - "tests/test_stage5_cancellation.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
 > `.claude/rules/operating-policies.md`.
@@ -21,12 +22,37 @@ the module's own contract, not a second copy of the implementation.
 ## What the module owns
 
 ```
-RenderCancelled        an ordinary Exception, raised at a safe boundary
+RenderCancelled        an ordinary Exception, raised at a safe boundary; carries an optional phase
+PHASE_VIDEO_ANALYSIS   the ONE named cancellation phase (FUN Stage-5 Cancel)
 RenderOutcomeKind      the five typed terminal causes
 RenderLifecycleState   seven states + a monotonic transition table
 RenderOutcome          one frozen typed truth (kind + display message)
 RenderLifecycle        one cancellation Event, one state machine, one invocation id
 ```
+
+### `RenderCancelled.phase` is a structured field, and there is exactly one value
+
+`PHASE_VIDEO_ANALYSIS = "video_analysis"`, defaulting to `""`, set by the raiser and read **by
+attribute** — never recovered by parsing `str(exc)`, which is display text. Every pre-existing raise
+site is unchanged, and a reader that ignores the field behaves exactly as before.
+
+**It names a phase, not an outcome.** `RenderOutcomeKind` is still the only typed terminal cause and
+is still assigned explicitly; the phase decides *wording* only, and `gui._process_video_impl` writes
+`RenderOutcomeKind.CANCELLED` regardless of which status string it picks. That separation is what
+keeps `tests/test_render_failure_classification.py`'s "no status-text inspection" rule intact.
+
+**One value, and it stays one.** A phase exists only where the operator-visible wording genuinely
+differs. Stage 5 is the one place that qualifies — it is the only part of a render that can run for
+an hour with nothing to show, so "cancelled" and "cancelled while analysing your videos" are
+different facts to the person reading them. Do not grow this into a per-boundary vocabulary; that
+would make the status panel a second description of the pipeline.
+
+The FFmpeg scene pass raises from `ffmpeg_processing._run_media_command`, which is shared with clip
+extraction and must not learn which stage called it. Its phase is therefore stamped by **one
+backstop** in `auto_mode.analyze_beats_auto`, whose Stage-5 `try` contains exactly one call — so
+anything cancelled inside it was cancelled during video analysis *by construction*. It uses
+`cancel.phase = getattr(cancel, "phase", "") or PHASE_VIDEO_ANALYSIS`, so an already-stamped phase
+is never overwritten.
 
 **Owns nothing that runs.** No Gradio object, no `Popen`, no thread handle, no filesystem path, no
 FFmpeg command, no Qwen model or process, no stage data, and **no media or cache identity**. It also
@@ -49,24 +75,134 @@ store the exception to re-raise once quiescent, or translate it into a truthful 
 exactly one may **swallow** it, the post-commit delivery preview (see below) — which covers all four
 processing modes, not only ProRes.
 
-## BOUNDARY_ONLY_CANCEL
+## BOUNDARY_ONLY_CANCEL — superseded for Stage 5 (FUN Stage-5 Cancel)
 
 ```
 FFmpeg-class subprocess   terminate -> bounded grace -> kill if needed -> REAP -> then raise
-in-flight Stage 5 / Qwen  never hard-killed; effective at the next boundary after it returns
+Stage 5 deterministic     cancellable DURING the pass, at frame/window/source boundaries
+Stage 5 Qwen worker       cancellable DURING the wait: tree-terminate -> grace -> kill -> REAP
+the Qwen worker PROCESS   still holds no token and knows nothing about cancellation
+Stages 1-3                still uncancellable mid-stage; their boundaries already bracket them
 ```
 
 An FFmpeg-class child may be stopped mid-call, and `RenderCancelled` is raised **only once the reap
 has returned** — never while a child might still be alive, because an orphan would keep writing into
 the process-global processing directory the next render is about to clear.
 
-A Stage-5/Qwen call is different and the asymmetry is deliberate: one call can hold GPU minutes, and
-killing it mid-inference abandons a model process and discards work already paid for. A cancellable
-Stage 5 would also need a cancellation token inside the persisted-semantics layer, where nothing
-session-scoped or creative is allowed to exist at all. So the token is simply **not passed into**
-`video_analysis.py` — a contract, not an omission, and `tests/test_render_cancellation.py` asserts
-that `video_analysis.py`, `stage5_qwen_scene_worker.py` and `qwen_progress.py` never mention
-`lifecycle`, `RenderCancelled` or `render_worker`.
+**C3-R1A kept the token out of Stage 5 entirely, and that is retired.** The original argument — one
+call can hold GPU minutes, so killing it mid-inference abandons a model process and discards work
+already paid for — turned out to argue for *stopping it properly*, not for not stopping it. A real
+owner incident settled it: an entire video library was selected by accident against a cold cache,
+Cancel was pressed, and Stage 5 kept working for about **an hour**, because the only boundaries were
+before and after the whole `analyze_video_sources` call.
+
+What the token can now reach, and what it still cannot:
+
+| | before | now |
+|---|---|---|
+| `video_analysis.py` | no token | takes `lifecycle=None`, appended last |
+| `beatsync_fork/qwen_progress.py` | no token | takes a zero-argument **predicate**, never a token |
+| `auto_mode/stage5_qwen_scene_worker.py` | no token | **unchanged — still no token** |
+
+**The worker process staying cancellation-free is the surviving half, and it is the half that
+mattered.** It writes persisted semantic records, so nothing session-scoped or creative may enter it
+— the media-neutral boundary in `.claude/rules/stage5-worker.md`. It also needs no token: the
+**parent** owns the child, so stopping it is the parent's job. A cooperative worker would be a
+second, redundant cancellation path inside the one process this repository least wants extra state
+in. `tests/test_render_cancellation.py` still asserts the worker mentions none of
+`lifecycle`/`RenderCancelled`/`render_worker`/`cancel_requested`.
+
+**`qwen_progress.py` observes cancellation without knowing a lifecycle exists.** It is a fork module
+and stdlib-only by CLAUDE.md's hard rule, so `stream_worker_process` takes
+`cancel_requested: Callable[[], bool] | None` and answers in booleans. That ban is now checked over
+the module's **identifiers**, not its characters: its docstring explains the boundary, and a
+substring scan cannot tell an explanation from a violation.
+
+**The token itself stays opaque in Stage 5.** `video_analysis.py` imports `RenderCancelled` and
+`PHASE_VIDEO_ANALYSIS` and calls exactly `cancel_requested()`; it constructs no `RenderLifecycle`,
+keeps no registry, and no creative, session or render state enters Stage-5 identity, a Qwen request,
+the prompt or a record. The invariant the old omission protected is now enforced by what the token
+*can do* rather than by its absence.
+
+### The five classes of Stage-5 boundary
+
+```
+before the cache scan     an already-landed Stop costs nothing at all
+the identity phase        per source, inside _compute_cache_paths_parallel
+the record-lookup loop    per source
+between analysis jobs     per source, serial and parallel alike
+inside one source's work  scene detection (FFmpeg child), frame decode every 32 frames,
+                          metric math every 16 windows, and the Qwen worker wait
+```
+
+Three properties hold on all of them, and they are what make the feature safe rather than merely
+responsive:
+
+- **Nothing already durable is lost.** Records checkpointed before the Stop stay on disk;
+  cancellation deletes nothing, and the next run finds them as ordinary cache hits.
+- **Nothing incomplete becomes durable.** `_cache_entry_is_complete` is still the one completion
+  rule and is **unchanged** — a test asserts it, `_qwen_job_completed`, `_checkpoint_cache` and
+  `_save_cache` never mention cancellation at all. Cancellation adds **no write path**: a test walks
+  every `except RenderCancelled` in `video_analysis.py` and forbids `_checkpoint_cache`,
+  `_save_cache`, `os.remove`, `os.unlink`, `shutil` and `open(` inside one.
+- **A cancellation is never reported as an analysis failure.** Every broad handler on the path names
+  `RenderCancelled` first. Two mattered most: the parallel block's serial retry, which would have
+  *re-run* the cancelled source once per remaining source; and `analyze_beats_auto`'s Stage-5
+  `except Exception`, which would have printed "video analysis failed" and continued into Stage 6 on
+  **fallback sampling** — producing a video from random clips for a user who had just pressed Cancel.
+
+Two shapes inside Stage 5 are worth naming because they look like over-engineering and are not:
+
+- **A cancelled identity task returns `None`, and the phase then raises.** `None` is cheap for a
+  queued task, but per source it is a *verdict* ("identity unprovable, no cache for this source").
+  The `raise` after the pool closes the only path by which a cancellation could be read as one.
+- **A cancelled window pass raises rather than returning empty metrics.** An empty metric means
+  "this window yielded nothing usable", and a source whose windows all came back empty is a
+  *legitimately* candidate-less source, which the completion rule accepts as reusable. Returning
+  empties would persist "this video has no good moments" for a video nobody finished looking at.
+
+**Stages 1-3 stay uncancellable mid-stage, deliberately.** ~15.7 s measured end to end,
+process-locally cached, already bracketed by boundaries; making librosa cooperative would buy nothing
+a user could perceive. A test pins that `stage1_audio.py`, `stage2_features.py` and
+`stage3_sections.py` mention no cancellation at all.
+
+### The worker-owned `llama-server` goes with the worker
+
+The Qwen worker starts its own `llama-server`, and killing only the direct Python child **orphans
+it** — the pre-existing timeout behaviour recorded in `.claude/rules/stage5-worker.md`. A cancelled
+analysis that leaves a GPU server resident is not cancelled in any sense the operator cares about, so
+the cancellation path terminates the **process tree**:
+
+```
+tree_terminator(child.pid)   FIRST, while the direct child is still its server's live ancestor
+terminate -> grace -> kill -> REAP   the same escalation the timeout path uses
+```
+
+`qwen_progress.terminate_process_tree(pid, run=...)` runs `taskkill /F /T /PID <pid>` and nothing
+else. **Containment is the pid argument, not a filter**: there is no image-name sweep and no
+enumeration, so an unrelated `python.exe`, `llama-server.exe` or BeatSync process is unreachable from
+here. `taskkill`'s exit 128 ("not found") is treated as success — after a terminate/kill race that is
+the desired outcome. The function never raises; `run` is injectable so both branches are testable on
+a bare interpreter.
+
+**Timeout behaviour is untouched.** The terminator is wired only to the cancellation path, `timeout`
+is still measured against the real clock and still reported as `timed_out`, and `outcome.cancelled`
+is checked **before** the timeout and return-code branches so the two are never reported as each
+other. A timeout still orphans exactly what it always did; that gap is pre-existing and this feature
+does not widen it.
+
+**A cancelled worker's response file is never opened.** A worker stopped mid-loop has written no
+response, and reading whatever is at that path is how a partial result would become semantic
+authority. The A1 per-job partials are *not deleted* either — they are simply not consumed, because
+recovery is reachable only from a usable-but-empty response.
+
+### `cancel_requested=None` is today's behaviour, byte-for-byte
+
+A test extracts the `cancel_requested is None` branch and asserts its body is exactly
+`returncode = process.wait(timeout=timeout)` — one blocking call, no loop, no clock, nothing ahead of
+it. Likewise `_cancelled(None)` is `False` and `_check_cancelled(None, …)` does nothing, so the
+headless CLI and every pre-FUN caller are unaffected. A predicate that *raises* is treated as "not
+cancelled": a broken status check must not be able to kill a run that is making progress.
 
 ## One lifecycle per top-level render event
 

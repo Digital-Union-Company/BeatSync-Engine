@@ -38,9 +38,11 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import pytest
 
+from beatsync_fork import analysis_cache as fork_analysis_cache
 from beatsync_fork import freestyle as fork_freestyle
 from beatsync_fork import library_prep as lp
 from beatsync_fork import progress as fork_progress
+from beatsync_fork.render_worker import PHASE_VIDEO_ANALYSIS, RenderCancelled
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _VA = os.path.join(_REPO, "src", "video_analysis.py")
@@ -58,6 +60,12 @@ _FUNCS = (
     "_cache_identity_workers", "_compute_cache_paths_parallel",
     "_same_source", "_is_count", "_stored_ai_cache_is_consistent",
     "_deterministic_analysis_completed", "_cache_entry_is_complete", "_load_cache",
+    # [FUN Stage-5 Cancel / Shared Analysis Cache] Three more names the classifier reaches
+    # transitively, listed for exactly the reason stated above. `_cancelled`/`_check_cancelled` are
+    # inert in this suite (`lifecycle` is never supplied, so `_cancelled` answers `False`);
+    # `resolve_cache_location` resolves to this harness's own `VIDEO_ANALYSIS_CACHE_DIR` because
+    # the tests run under an isolated `BEATSYNC_SHARED_CONFIG` with no shared folder configured.
+    "_cancelled", "_check_cancelled", "resolve_cache_location",
     "classify_library_sources",
 )
 _CONSTS = ("ANALYSIS_VERSION", "CACHE_CONTRACT_VERSION", "_FINGERPRINT_CHUNK",
@@ -131,6 +139,11 @@ def _load(root: str, cache_dir: str) -> Dict[str, Any]:
         # the status strings the classifier writes must be the ones the state module reads.
         "fork_progress": fork_progress,
         "fork_prep": lp,
+        # [FUN] Same rule: the real stdlib-only modules, never stubbed. `fork_analysis_cache`
+        # resolves the cache directory and `RenderCancelled` is the exception production raises.
+        "fork_analysis_cache": fork_analysis_cache,
+        "RenderCancelled": RenderCancelled,
+        "PHASE_VIDEO_ANALYSIS": PHASE_VIDEO_ANALYSIS,
     }
 
     found: Dict[str, str] = {}

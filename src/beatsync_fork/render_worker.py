@@ -42,6 +42,18 @@ from enum import Enum
 from typing import Optional
 
 
+#: [FORK] Digital-Union (FUN Stage-5 Cancel): the one named cancellation phase, used so a caller
+#: can say *where* a render stopped without re-reading the exception's message.
+#:
+#: There is deliberately exactly one value and no enum. A phase exists only where the operator-
+#: visible wording genuinely differs, and Stage 5 is the one place that qualifies: it is the only
+#: part of a render that can run for an hour with nothing to show, so "cancelled" and "cancelled
+#: while analysing your videos" are different facts to the person reading them. Every other
+#: boundary keeps the unnamed default and the unchanged message. Do not grow this into a
+#: per-boundary vocabulary — that would make the status panel a second description of the pipeline.
+PHASE_VIDEO_ANALYSIS = "video_analysis"
+
+
 class RenderCancelled(Exception):
     """Raised when a safe boundary observes a matching cancellation request.
 
@@ -49,7 +61,17 @@ class RenderCancelled(Exception):
     typed outcome of normal control flow, not an interpreter-level escape; every catch site on the
     render path must name it explicitly rather than rely on it skipping broad handlers it has no
     business skipping.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): carries an optional ``phase``, a **structured
+    field** set by the raiser and read by attribute — never recovered by parsing ``str(exc)``,
+    which is display text. It defaults to ``""``, so every pre-existing raise site is unchanged and
+    every reader that ignores it behaves exactly as before. It names a *phase*, not an outcome:
+    the typed terminal cause is still :class:`RenderOutcomeKind` and is still assigned explicitly.
     """
+
+    def __init__(self, message: str = "", phase: str = "") -> None:
+        super().__init__(message)
+        self.phase = str(phase or "")
 
 
 class RenderOutcomeKind(Enum):
@@ -225,6 +247,7 @@ class RenderLifecycle:
 
 
 __all__ = [
+    "PHASE_VIDEO_ANALYSIS",
     "RenderCancelled",
     "RenderLifecycle",
     "RenderLifecycleState",

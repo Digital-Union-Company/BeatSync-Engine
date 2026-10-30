@@ -31,7 +31,8 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `freestyle.md` | `src/beatsync_fork/freestyle.py`, `tests/test_freestyle.py` |
 | `director.md` | `src/beatsync_fork/director.py`, `tests/test_director.py` |
 | `variant-lab.md` | `src/beatsync_fork/{variant_lab,creative_recipe}.py` + their tests |
-| `render-worker.md` | `src/beatsync_fork/render_worker.py`, `tests/test_render_{worker,cancellation}.py` |
+| `render-worker.md` | `src/beatsync_fork/render_worker.py`, `tests/test_render_{worker,cancellation}.py`, `tests/test_stage5_cancellation.py` |
+| `shared-analysis-cache.md` | `src/beatsync_fork/analysis_cache.py`, `tests/test_analysis_cache_sharing.py` |
 | `audio-mixdown.md` | `src/audio_mixdown.py`, `src/beatsync_fork/{audio_mix,smart_mix}.py` + their tests |
 | `progress-events.md` | `src/beatsync_fork/{progress,progress_view,qwen_progress}.py`, `tests/test_progress_*.py`, `tests/test_gui_progress_seam.py` |
 | `input-gate.md` | `src/beatsync_fork/{input_manager,input_report,input_confirmation,input_session}.py`, `tests/test_input_*.py`, `tests/test_gui_guard_seam.py` |

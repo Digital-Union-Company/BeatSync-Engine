@@ -637,9 +637,12 @@ def test_only_cache_and_the_audio_overrides_are_collapsible(source: str):
     """[FORK] R8 Owner Fixes (P1): the exact set, by label, rather than a count.
 
     A bare count said "Settings hides one block" and would be satisfied by hiding the wrong one.
-    Two blocks now collapse and each earns it differently: Cache Management is occasional
-    maintenance, and the Audio Review overrides are a setting most operators never touch -- four
-    near-identically named audio folders is what the owner read as duplication.
+    Three blocks now collapse and each earns it differently: Cache Management is occasional
+    maintenance, the Audio Review overrides are a setting most operators never touch (four
+    near-identically named audio folders is what the owner read as duplication), and
+    [FUN Shared Analysis Cache] the Video Analysis Cache is pointed at a folder once and then left
+    alone for good -- it is deliberately a set-and-forget setting, which is the whole reason it
+    lives outside the checkout.
 
     Everything else stays visible: the folder defaults and the collision policy are what an
     operator comes to this tab to read.
@@ -648,7 +651,8 @@ def test_only_cache_and_the_audio_overrides_are_collapsible(source: str):
     block = source[start:end]
     collapsible = {line.split("label=")[1].split(",")[0].split(")")[0]
                    for line in block.splitlines() if "gr.Accordion(" in line}
-    assert collapsible == {"LABEL_CACHE_SECTION", "LABEL_PREF_AUDIO_OVERRIDES"}, collapsible
+    assert collapsible == {"LABEL_CACHE_SECTION", "LABEL_PREF_AUDIO_OVERRIDES",
+                           "LABEL_SHARED_CACHE_SECTION"}, collapsible
 
 
 def test_the_audio_overrides_panel_opens_when_an_override_is_actually_set(source: str):

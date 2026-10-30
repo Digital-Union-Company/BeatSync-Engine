@@ -45,6 +45,33 @@ from beatsync_fork import qwen_partials as fork_partials
 # status/reason VALUES only, so the runtime classifier and the stdlib-only state module cannot drift
 # apart on a string. The dependency runs one way: the fork module never imports this one.
 from beatsync_fork import library_prep as fork_prep
+# [FORK] Digital-Union (FUN Stage-5 Cancel): the cancellation exception, and ONLY that.
+#
+# This import SUPERSEDES the C3-R1A `BOUNDARY_ONLY_CANCEL` contract for Stage 5, which deliberately
+# kept `lifecycle` out of this module so that an in-flight analysis always ran to completion. A real
+# owner incident retired that trade-off: an entire video library was selected by accident against a
+# cold cache, Cancel was pressed, and Stage 5 kept working for about an hour because the only
+# boundaries were *before* and *after* the whole `analyze_video_sources` call.
+#
+# What is imported stays minimal on purpose. `RenderCancelled` is a typed exception and nothing
+# else; this module still constructs no `RenderLifecycle`, keeps no registry of one, and treats the
+# token it is handed as opaque -- it calls exactly `cancel_requested()` and `raise_if_cancelled()`.
+# No creative, session or render state enters Stage-5 identity, a request, a prompt or a record,
+# which is the invariant the old omission was protecting and which is now enforced by what the
+# token can do rather than by its absence.
+#
+# `PHASE_VIDEO_ANALYSIS` rides on every cancellation raised here so the GUI can say "cancelled
+# while analysing your source videos" from a structured field rather than by parsing a message.
+from beatsync_fork.render_worker import PHASE_VIDEO_ANALYSIS, RenderCancelled
+# [FORK] Digital-Union (FUN Shared Analysis Cache): where the Stage-5 record store lives.
+#
+# The per-user shared configuration, the per-invocation resolution, the record-filename shape, the
+# folder measurement and the additive import all live in the stdlib-only fork module. This module
+# keeps the one thing it already owned: cache IDENTITY. The resolved directory is **not** a
+# signature component -- `_video_signature` is untouched, so a record written by one installation
+# is looked up under exactly the same filename by another, which is what makes sharing work at all
+# rather than a migration.
+from beatsync_fork import analysis_cache as fork_analysis_cache
 
 
 setup_environment()
@@ -54,6 +81,19 @@ DEFAULT_QWEN_MODEL_DIR = os.path.join(ROOT_DIR, "bin", "models")
 DEFAULT_QWEN_GGUF_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "Qwen3VL-2B-Instruct-Q8_0.gguf")
 DEFAULT_QWEN_MMPROJ_MODEL = os.path.join(DEFAULT_QWEN_MODEL_DIR, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
 DEFAULT_LLAMA_CPP_DIR = os.path.join(ROOT_DIR, "bin", "llama-bin-win-vulkan-x64")
+# [FORK] Digital-Union (FUN Shared Analysis Cache): this is now the **local default**, not
+# necessarily the directory in use. It keeps its name and its value, so every existing reference
+# is unchanged and a run with no shared folder configured behaves exactly as before.
+#
+# Two kinds of file live in this directory and they are treated differently on purpose:
+#
+#   RECORDS                    may live in a shared folder -- they are installation-independent
+#                              (identity is contract|version|abspath|size|mtime_ns|fingerprint|
+#                              backend|qwen-config, and the directory is not part of it)
+#   QWEN WORKER REQUEST /      stay HERE, always. They are this installation's debugging
+#   RESPONSE / PARTIALS        artifacts, retained deliberately, anchored to one invocation's
+#                              response path, and pooling several installations' invocations into
+#                              one shared folder would make that anchoring meaningless.
 VIDEO_ANALYSIS_CACHE_DIR = os.path.join(ROOT_DIR, "input", "video_analysis_cache")
 _LLAMA_VERSION_TOKENS: Dict[str, str] = {}
 
@@ -148,6 +188,45 @@ _DETERMINISTIC_SCORING_KEY = "candidate_scoring_seconds"
 # `ProgressView` enforces monotonicity per `(stage, phase)` and Stage 0 already carries the L0
 # source-verification END event in a render run.
 _PREP_PHASE = "library_classify"
+
+# [FORK] Digital-Union (FUN Stage-5 Cancel): how often the cooperative deterministic loops ask
+# whether the operator has cancelled.
+#
+# These are counts of units of work, not seconds, because that is what the loops actually have in
+# scope. They are chosen so a check costs nothing measurable while the worst-case wait stays small:
+# one `cap.grab()`/`cap.read()` on a 4K source is a few milliseconds, so 32 frames is tens of
+# milliseconds, and one window's metric math is sub-millisecond, so 16 windows is well under one.
+#
+# A native decoder call cannot be interrupted once entered, so the honest claim is "cancellation
+# takes effect at the next frame or window boundary", never "immediately".
+_CANCEL_CHECK_FRAMES = 32
+_CANCEL_CHECK_WINDOWS = 16
+
+
+def _cancelled(lifecycle) -> bool:
+    """Has cancellation been requested? ``False`` for every caller that passes no token.
+
+    Total by construction: a token that cannot answer is treated as "not cancelled", because a
+    broken status object must not be able to abort an analysis that is making progress. The
+    *raising* decision is always the caller's, at a boundary it chose.
+    """
+    if lifecycle is None:
+        return False
+    try:
+        return bool(lifecycle.cancel_requested())
+    except Exception:
+        return False
+
+
+def _check_cancelled(lifecycle, where: str) -> None:
+    """Raise :class:`RenderCancelled` at a safe boundary. The one call every check site makes.
+
+    ``where`` names the boundary and reaches only the exception message, so a cancelled render can
+    say *which* part of Stage 5 it stopped in rather than just that it stopped.
+    """
+    if _cancelled(lifecycle):
+        raise RenderCancelled(f"video analysis cancelled: {where}",
+                              phase=PHASE_VIDEO_ANALYSIS)
 
 
 def _clamp(value: Any, lo: float = 0.0, hi: float = 1.0, default: float = 0.0) -> float:
@@ -454,22 +533,67 @@ def _video_signature(video_file: str, enable_ai: bool, qwen_model_path: str | No
     return _hash_text(raw, length=24)
 
 
+def resolve_cache_location(local_default: str | None = None):
+    """[FORK] Digital-Union (FUN Shared Analysis Cache): which cache directory to use, resolved once.
+
+    Returns a frozen `beatsync_fork.analysis_cache.CacheLocation`. Call it **once per invocation**
+    and thread the resolved `.path` down — both Stage-5 entry points do exactly that. Resolving per
+    source, or re-reading the configuration mid-run, would let a Settings change relocate the cache
+    while an analysis was writing into it.
+
+    It is invocation-scoped rather than module-cached, for the same reason the D2 backend token is:
+    a later call in the same process must observe a changed setting. The two together mean the
+    location is stable *within* a render and current *between* renders.
+
+    Total: a missing, unreadable or malformed shared configuration resolves to the local default,
+    with the reason carried on the result for the caller to report rather than swallowed here.
+    """
+    base = VIDEO_ANALYSIS_CACHE_DIR if local_default is None else local_default
+    try:
+        config, notice = fork_analysis_cache.load_config(fork_analysis_cache.config_path())
+        location = fork_analysis_cache.resolve_location(base, config)
+    except Exception as exc:
+        # Nothing about reading a settings file may be able to fail an analysis run.
+        return fork_analysis_cache.CacheLocation(
+            path=base, source=fork_analysis_cache.SOURCE_LOCAL,
+            notice=(f"The shared cache setting could not be read ({type(exc).__name__}); "
+                    f"using the local analysis cache at {base}."))
+    if notice and not location.notice:
+        location = fork_analysis_cache.CacheLocation(
+            path=location.path, source=location.source, configured=location.configured,
+            requested=location.requested, available=location.available, notice=notice)
+    return location
+
+
 def _cache_path(video_file: str, enable_ai: bool, qwen_model_path: str | None,
                 backend_token: str | None = None,
-                config_token: str | None = None) -> str | None:
+                config_token: str | None = None,
+                cache_dir: str | None = None) -> str | None:
     """[FORK] Digital-Union (D2): the cache filename, or None when identity cannot be proven.
 
     A ``None`` return is the fail-closed path: the caller performs no lookup and no write for that
     source, so nothing is ever stored under an unprovable identity. `_checkpoint_cache` already
     treats a ``None`` cache file as a no-op, which is the seam this uses.
+
+    [FORK] Digital-Union (FUN Shared Analysis Cache): ``cache_dir`` chooses the **directory** and
+    nothing else. It is appended last, defaults to ``None``, and ``None`` means
+    `VIDEO_ANALYSIS_CACHE_DIR` — so an unthreaded caller is unchanged.
+
+    **The directory is deliberately not part of identity.** `_video_signature` above is untouched
+    and does not receive this argument, so the same source under the same backend and config
+    produces the same `{prefix}_{signature}.json` filename in every installation. That is the whole
+    mechanism by which two app roots share records: identical identity, different folder. Making
+    the directory a signature component would re-key every record the moment the folder changed,
+    which is the opposite of the feature.
     """
     signature = _video_signature(video_file, enable_ai, qwen_model_path,
                                  backend_token=backend_token, config_token=config_token)
     if signature is None:
         return None
-    os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
+    directory = cache_dir or VIDEO_ANALYSIS_CACHE_DIR
+    os.makedirs(directory, exist_ok=True)
     name = os.path.splitext(_safe_name(video_file))[0]
-    return os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"{_hash_text(name, 8)}_{signature}.json")
+    return os.path.join(directory, f"{_hash_text(name, 8)}_{signature}.json")
 
 
 def _same_source(cached_video_file: Any, expected_video_file: str) -> bool:
@@ -1023,6 +1147,8 @@ def _compute_cache_paths_parallel(
     *,
     backend_token: str | None = None,
     config_token: str | None = None,
+    lifecycle=None,
+    cache_dir: str | None = None,
 ) -> List[str | None]:
     """[FORK] Digital-Union (L1B): one `_cache_path` per source, computed concurrently, in input order.
 
@@ -1040,28 +1166,58 @@ def _compute_cache_paths_parallel(
     (never a weak key, never a failed pass), while an *unexpected* exception is surfaced through
     `future.result()` rather than being laundered into ``None``: a weaker success state is exactly
     what must not be invented here. There are no retries.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is optional and ``None`` is the
+    unchanged path. The identity phase is worth making cancellable because it is not free — H2/D0
+    measured ~100-116 s cold over 1815 sources, i.e. a minute and a half of bounded fingerprint
+    reads before a single frame is decoded, and an operator who has just realised they selected the
+    wrong folder should not have to sit through it.
+
+    **A cancelled phase raises; it never returns a short or partially-``None`` list.** The
+    per-source task answers ``None`` immediately once cancellation is requested, so a queued task
+    costs nothing — but that ``None`` is indistinguishable from "identity unprovable", which is a
+    *verdict*, so the function must not hand it back. The `raise` after the pool therefore closes
+    the only path by which a cancellation could be read as 'this source has no cache'. Pending
+    futures are cancelled and the pool is drained before it fires, so no identity read outlives the
+    call.
     """
     ordered = list(sources)
     if not ordered:
         return []
+    _check_cancelled(lifecycle, "before computing source cache identity")
     workers = _cache_identity_workers(len(ordered))
     if workers <= 1:
-        return [
-            _cache_path(video_file, enable_ai, qwen_model_path,
-                        backend_token=backend_token, config_token=config_token)
-            for video_file in ordered
-        ]
+        serial: List[str | None] = []
+        for video_file in ordered:
+            _check_cancelled(lifecycle, "computing source cache identity")
+            serial.append(_cache_path(video_file, enable_ai, qwen_model_path,
+                                      backend_token=backend_token, config_token=config_token,
+                                      cache_dir=cache_dir))
+        return serial
     results: List[str | None] = [None] * len(ordered)
+
+    def _identity(video_file: str) -> str | None:
+        # Cooperative: a task still queued when Cancel lands returns without reading the file at
+        # all, which is what bounds the cost to the tasks already in flight.
+        if _cancelled(lifecycle):
+            return None
+        return _cache_path(video_file, enable_ai, qwen_model_path,
+                           backend_token=backend_token, config_token=config_token,
+                           cache_dir=cache_dir)
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(
-                _cache_path, video_file, enable_ai, qwen_model_path,
-                backend_token=backend_token, config_token=config_token,
-            ): index
+            executor.submit(_identity, video_file): index
             for index, video_file in enumerate(ordered)
         }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
+            if _cancelled(lifecycle):
+                # Stop consuming AND stop the queue: `cancel_futures=True` discards everything not
+                # yet started, `wait=True` means the started ones are finished before we leave.
+                executor.shutdown(wait=True, cancel_futures=True)
+                break
+    _check_cancelled(lifecycle, "computing source cache identity")
     return results
 
 
@@ -1101,6 +1257,7 @@ def analyze_video_sources(
     enable_ai: bool = True,
     qwen_model_path: str | None = None,
     event_callback=None,
+    lifecycle=None,
 ) -> Dict:
     """Analyze all source videos and return candidate moments for Auto Mode.
 
@@ -1110,8 +1267,37 @@ def analyze_video_sources(
     (and in any future creative/director layer). It is kept as a parameter only so existing callers -
     `auto_mode.analyze_beats_auto` above all - need no change, and tests assert that two arbitrarily
     different profiles produce the identical cache key. Do not reintroduce a use for it here.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended **last** with a default of
+    ``None``, matching the position every other C3-R1A seam uses, so the headless CLI and every
+    pre-existing caller are unaffected and no positional argument moved. ``None`` means no check
+    anywhere fires.
+
+    Supplied, cancellation becomes effective at five classes of boundary, and the list is the whole
+    contract:
+
+    ====================================  =====================================================
+    before the cache scan                 an already-landed Stop costs nothing at all
+    the identity phase                    per source, inside `_compute_cache_paths_parallel`
+    the record-lookup loop                per source
+    between analysis jobs                 per source, serial and parallel alike
+    inside one source's own work           scene detection (FFmpeg child), frame decode,
+                                          metric math, and the Qwen worker wait
+    ====================================  =====================================================
+
+    Three properties hold on every one of those paths:
+
+    * **Nothing already durable is lost.** Records checkpointed before the Stop stay on disk —
+      cancellation deletes nothing, and the next run finds them as ordinary cache hits.
+    * **Nothing incomplete becomes durable.** `_cache_entry_is_complete` is still the one
+      completion rule and is unchanged, so a source interrupted mid-analysis is simply never
+      written. Cancellation adds no write path.
+    * **A cancellation is never reported as an analysis failure.** Every broad handler on this path
+      now names `RenderCancelled` first; the one that mattered most is the retry in the parallel
+      block, which would otherwise have re-run a cancelled source serially.
     """
     total_started = time.perf_counter()
+    _check_cancelled(lifecycle, "before Stage 5 began")
     requested_qwen_model_path = qwen_model_path or DEFAULT_QWEN_MODEL_DIR
     qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
     existing = [os.path.abspath(p) for p in video_files if p and os.path.exists(p)]
@@ -1130,9 +1316,23 @@ def analyze_video_sources(
     ai_available = bool(enable_ai and _qwen_backend_available(requested_qwen_model_path))
     if ai_available:
         qwen_model_path = _qwen_backend_model_path(requested_qwen_model_path)
+    # [FORK] Digital-Union (FUN Shared Analysis Cache): resolved ONCE here, before any identity is
+    # computed, and threaded into every `_cache_path` below. Nothing re-reads the setting after
+    # this point, so a Settings change during a render cannot relocate the cache under it.
+    cache_location = resolve_cache_location()
+    cache_dir = cache_location.path
     print("\n   VIDEO ANALYSIS - Auto Mode visual library")
     print(f"   Source videos: {len(existing)}")
     print(f"   Qwen semantic tags: {'enabled' if ai_available else 'disabled/fallback'}")
+    print(f"   {cache_location.describe()}")
+    # A configured-but-unreachable shared folder is the one failure the owner asked to be TOLD
+    # about rather than subjected to: silently using the local cache there means an hour of
+    # re-analysis with nothing on screen to explain it. It is a warning, not a refusal -- the run
+    # still works, into the local cache.
+    if cache_location.notice:
+        print(f"   Warning: {cache_location.notice}")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            5, cache_location.notice, cache_source=cache_location.source))
 
     # [FORK] Digital-Union: structured progress. `total` is the real source count, and cache hits
     # count as already-completed deterministic analysis, so the counter reflects work actually done
@@ -1200,10 +1400,17 @@ def analyze_video_sources(
                    else _compute_cache_paths_parallel(
                        existing, ai_available, qwen_model_path,
                        backend_token=invocation_backend_token,
-                       config_token=invocation_config_token))
+                       config_token=invocation_config_token,
+                       lifecycle=lifecycle,
+                       cache_dir=cache_dir))
     cache_identity_seconds = time.perf_counter() - identity_started
 
     for idx, video_file in enumerate(existing, 1):
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): per source. A record lookup is cheap
+        # individually and this loop is not where an hour goes, but it is the only thing between a
+        # Stop and the start of real decoding on a large library, and nothing here is durable, so
+        # abandoning it costs nothing.
+        _check_cancelled(lifecycle, "checking the analysis cache")
         # Position is the authority: `cache_files` is in `existing` order, so `idx` still owns the
         # same (video_file, cache_file) pair it did when identity was computed serially.
         cache_file = cache_files[idx - 1]
@@ -1252,6 +1459,30 @@ def analyze_video_sources(
         f"records {_fmt_seconds(cache_lookup_seconds)} "
         f"({cache_lookups} lookup(s), {cache_hits} hit(s))"
     )
+    # [FORK] Digital-Union (FUN Stage-5 pre-flight): the five facts that make an accidentally cold
+    # library obvious BEFORE the expensive part starts.
+    #
+    # This is the owner incident restated as a UI problem: a whole library was selected against a
+    # cold cache and nothing on screen said so until an hour had passed. Everything here was
+    # already known at this exact point in the function and was simply never put in one sentence.
+    #
+    # It is a STATE event, not a counter: the deterministic source counter owns Stage 5's
+    # count/total and a second counted event under the same phase would fight `ProgressView`'s
+    # per-(stage, phase) monotonicity. It carries no ETA -- per-source cost varies with clip
+    # length, so any number here would be invented.
+    preflight = (
+        f"{len(existing)} source video(s): {cache_hits} already analysed, "
+        f"{len(jobs)} need analysis. "
+        f"AI tagging {'on' if ai_available else 'off'}. "
+        f"{'Shared' if cache_location.shared else 'Local'} cache: {cache_dir}"
+    )
+    print(f"   {preflight}")
+    fork_progress.emit(event_callback, fork_progress.state(
+        5, preflight,
+        sources=len(existing), cached=int(cache_hits), to_analyze=len(jobs),
+        ai_enabled=bool(ai_available),
+        cache_dir=str(cache_dir), cache_source=cache_location.source,
+    ))
     # Always publish the post-cache count, even when nothing needs analyzing.
     fork_progress.emit(event_callback, source_counter.snapshot(
         "cache scan complete", cache_hits=cache_hits, unit="sources"))
@@ -1275,9 +1506,18 @@ def analyze_video_sources(
                         job["index"],
                         len(existing),
                         event_callback,
+                        None,
+                        lifecycle,
                     ): job
                     for job in jobs
                 }
+                # [FORK] Digital-Union (FUN Stage-5 Cancel): set once, consumed after the `with`
+                # block exits. The exception cannot be raised from inside the loop: leaving the
+                # `with` body is what runs the executor's own `shutdown(wait=True)`, so raising
+                # here would let `RenderCancelled` propagate while worker threads still held open
+                # `cv2.VideoCapture` handles and a live FFmpeg scene-detection child. Same shape as
+                # `create_music_video`'s clip executor, and for the same reason.
+                cancelled_during_analysis = None
                 for future in as_completed(futures):
                     job = futures[future]
                     try:
@@ -1287,6 +1527,15 @@ def analyze_video_sources(
                         # declines it here and the Qwen stage checkpoints it instead.
                         _checkpoint_cache(job["cache_file"], results_by_index[job["index"]],
                                           require_ai=ai_available)
+                    # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST, ahead of the retry. A
+                    # cancelled source re-analysed "safely in serial mode" is the exact defect this
+                    # clause exists to prevent -- `RenderCancelled` is an ordinary `Exception`, so
+                    # the handler below would have caught it and started the work again, once per
+                    # remaining source.
+                    except RenderCancelled as cancel:
+                        cancelled_during_analysis = cancel
+                        executor.shutdown(wait=True, cancel_futures=True)
+                        break
                     except Exception as exc:
                         print(
                             f"   ⚠️  Parallel analysis failed for "
@@ -1307,6 +1556,8 @@ def analyze_video_sources(
                             job["index"],
                             len(existing),
                             event_callback,
+                            None,
+                            lifecycle,
                         )
                         _checkpoint_cache(job["cache_file"], results_by_index[job["index"]],
                                           require_ai=ai_available)
@@ -1315,9 +1566,20 @@ def analyze_video_sources(
                     fork_progress.emit(event_callback, source_counter.advance(
                         1, "analyzed", cache_hits=cache_hits, unit="sources",
                         rate_unit="analyzed sources"))
+            # [FORK] Digital-Union (FUN Stage-5 Cancel): outside the `with`, so every worker thread
+            # is provably finished and every capture handle and FFmpeg child is released before the
+            # cancellation escapes. Sources that completed before the Stop have already been
+            # checkpointed above, so they survive; the rest are simply never written.
+            if cancelled_during_analysis is not None:
+                print("   Video analysis cancelled; completed sources keep their cache entries.")
+                raise cancelled_during_analysis
         else:
             print("   CPU visual analysis workers: 1 (serial)")
             for job in jobs:
+                # [FORK] Digital-Union (FUN Stage-5 Cancel): between jobs. The previous source has
+                # already been checkpointed, so this is the cheapest possible place to stop -- the
+                # next source's scene detection has not started.
+                _check_cancelled(lifecycle, "between source videos")
                 # [FORK] Digital-Union (R1): only this call passes `defer_ai=False`, so it is the
                 # one that runs Qwen inline and must feed the current-run accounting. The parallel
                 # submissions above defer Qwen and never record, which also keeps `run_stats`
@@ -1332,6 +1594,7 @@ def analyze_video_sources(
                     len(existing),
                     event_callback,
                     run_stats,
+                    lifecycle,
                 )
                 # [FORK] Digital-Union (D1): serial mode runs Qwen inline (defer_ai=False), so this
                 # source is genuinely finished here - make it durable before starting the next one.
@@ -1344,6 +1607,12 @@ def analyze_video_sources(
     # When the deterministic CPU-heavy pass ran in parallel, run Qwen after it in
     # original video order. A single multi-video Qwen worker is used by default so
     # the llama.cpp model loads once, not once per source video.
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): before the Qwen stage. This is the single most
+    # valuable boundary in the whole function -- a shared Qwen worker over a cold library is GPU
+    # minutes to hours, and refusing to *start* it costs nothing. The deterministic records that
+    # exist at this point are `ai_deferred`, so the completion rule has already declined to
+    # checkpoint them: they are retried next run exactly as an interrupted run always was.
+    _check_cancelled(lifecycle, "before semantic tagging")
     deferred_jobs = [
         job for job in jobs
         if results_by_index.get(job["index"], {}).get("ai_deferred") and ai_available
@@ -1370,9 +1639,14 @@ def analyze_video_sources(
             total_video_count=len(existing),
             event_callback=event_callback,
             run_stats=run_stats,
+            lifecycle=lifecycle,
         )
     else:
         for job in deferred_jobs:
+            # [FORK] Digital-Union (FUN Stage-5 Cancel): between Qwen jobs. Each completed job was
+            # checkpointed by `_complete_deferred_qwen` itself, so stopping here keeps every tag
+            # already paid for and declines only the work not yet started.
+            _check_cancelled(lifecycle, "between semantic tagging jobs")
             idx = job["index"]
             video_data = results_by_index.get(idx)
             if not video_data:
@@ -1385,6 +1659,7 @@ def analyze_video_sources(
                 event_callback=event_callback,
                 cache_file=job["cache_file"],
                 run_stats=run_stats,
+                lifecycle=lifecycle,
             )
 
     if deferred_jobs:
@@ -1420,6 +1695,13 @@ def analyze_video_sources(
         video_data = results_by_index.get(job["index"])
         if video_data:
             _checkpoint_cache(job["cache_file"], video_data, require_ai=ai_available)
+
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): the last boundary, deliberately AFTER the backstop
+    # loop above rather than before it. The backstop only ever checkpoints records the unchanged
+    # completion rule already accepts, so letting it run is how a Stop arriving during the final
+    # merge still keeps every finished source -- and raising here is what stops Stage 6 from ever
+    # receiving the half-built candidate library this run would otherwise return.
+    _check_cancelled(lifecycle, "after video analysis")
 
     videos: List[Dict] = [results_by_index[i] for i in range(1, len(existing) + 1) if i in results_by_index]
     all_candidates: List[Dict] = []
@@ -1519,6 +1801,13 @@ def analyze_video_sources(
         "cache_identity_seconds": float(cache_identity_seconds),
         "cache_lookup_seconds": float(cache_lookup_seconds),
         "cache_lookups": int(cache_lookups),
+        # [FORK] Digital-Union (FUN Shared Analysis Cache): which directory this invocation
+        # actually used, as ephemeral invocation metadata exactly like the figures above. It is
+        # returned so a caller can report it truthfully; it enters no cache payload, no signature
+        # and no completion rule, and it is a plain string so nothing live rides on it.
+        "cache_dir": str(cache_dir),
+        "cache_source": str(cache_location.source),
+        "cache_shared": bool(cache_location.shared),
         # [FORK] Digital-Union (R1): CURRENT-RUN execution facts. Computed from the uncached `jobs`
         # set and the Qwen requests those jobs actually issued - never from `videos`, which contains
         # every cache hit. On a fully warm run they are all zero while the library aggregates below
@@ -1598,11 +1887,23 @@ def classify_library_sources(
     sources = [os.path.abspath(path) for path in video_files if path]
 
     ai_available = bool(enable_ai and _qwen_backend_available(requested_qwen_model_path))
+    # [FORK] Digital-Union (FUN Shared Analysis Cache): resolved once for this scan, mirroring
+    # `analyze_video_sources`. It MUST be the same resolution, or Scan would classify against one
+    # folder while Analyze wrote into another -- a scan that reports every source prepared and an
+    # analysis that re-does all of them. Both go through `resolve_cache_location`, which is the one
+    # resolver, so they cannot disagree.
+    cache_location = resolve_cache_location()
+    cache_dir = cache_location.path
 
     fork_progress.emit(event_callback, fork_progress.start(
         0, f"Classifying {len(sources)} library source(s)",
         current=0, total=len(sources), unit="sources", phase=_PREP_PHASE,
     ))
+    if cache_location.notice:
+        print(f"   Warning: {cache_location.notice}")
+        fork_progress.emit(event_callback, fork_progress.warning(
+            0, cache_location.notice, phase=_PREP_PHASE,
+            cache_source=cache_location.source))
 
     # Mirrors `analyze_video_sources`: computed ONCE for the whole scan, then threaded into every
     # `_cache_path`. Per source this would be N backend fingerprints - measured at 61.7 minutes for
@@ -1629,6 +1930,11 @@ def classify_library_sources(
         # Present even on the `ai_cache_disabled` early return, so the caller never has to tell
         # "no counts" apart from "key absent": an empty mapping summarises to UNAVAILABLE.
         "source_candidate_counts": {},
+        # [FORK] Digital-Union (FUN Shared Analysis Cache): reported so the preparation screen can
+        # name the folder it classified against. Plain strings; no identity, no payload, no rule.
+        "cache_dir": str(cache_dir),
+        "cache_source": str(cache_location.source),
+        "cache_shared": bool(cache_location.shared),
     }
 
     if ai_cache_disabled:
@@ -1663,7 +1969,8 @@ def classify_library_sources(
     cache_files = _compute_cache_paths_parallel(
         sources, ai_available, qwen_model_path,
         backend_token=invocation_backend_token,
-        config_token=invocation_config_token)
+        config_token=invocation_config_token,
+        cache_dir=cache_dir)
     cache_identity_seconds = time.perf_counter() - identity_started
 
     for index, video_file in enumerate(sources):
@@ -1757,7 +2064,22 @@ def _analyze_single_video(
     total: int | None = None,
     event_callback=None,
     run_stats: Dict[str, Any] | None = None,
+    lifecycle=None,
 ) -> Dict:
+    """[FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended last, default ``None``.
+
+    One source's deterministic pass is where an uncancellable Stage 5 actually spent its time, and
+    it has three distinct costs, each cancellable at its own natural boundary: the FFmpeg scene
+    pass decodes the whole file (cancelled mid-child by `_run_media_command`), frame decode reads
+    the sampled frames (cancelled every `_CANCEL_CHECK_FRAMES`), and the metric math scores the
+    windows (cancelled every `_CANCEL_CHECK_WINDOWS`).
+
+    **This function never writes a record.** It builds one and returns it; `_checkpoint_cache` in
+    the caller is the only writer, and it consults the unchanged completion rule. So a cancellation
+    escaping from anywhere in here cannot leave a partial analysis in the cache -- there is no path
+    by which it could.
+    """
+    _check_cancelled(lifecycle, "before analysing a source video")
     started = time.perf_counter()
     timings: Dict[str, float] = {}
     name = _safe_name(video_file)
@@ -1785,6 +2107,7 @@ def _analyze_single_video(
         use_gpu=scene_use_gpu,
         analysis_fps=6.0,
         analysis_width=384,
+        lifecycle=lifecycle,
     )
     timings["scene_detection_seconds"] = time.perf_counter() - step_started
     print(
@@ -1810,7 +2133,17 @@ def _analyze_single_video(
         else:
             print("      Candidate scoring: CPU metrics")
         step_started = time.perf_counter()
-        window_metrics = _measure_windows(cap, fps, windows, use_gpu=gpu_candidate_metrics)
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): `_measure_windows` owns the frame decode and
+        # the metric math, so the cooperative checks live inside it rather than around it -- a
+        # check here would only fire once the whole source had been scored. It is wrapped so the
+        # capture is released on the cancellation path too: an unreleased `cv2.VideoCapture` holds
+        # the source file open, which on Windows is enough to make a later move or delete fail.
+        try:
+            window_metrics = _measure_windows(cap, fps, windows, use_gpu=gpu_candidate_metrics,
+                                              lifecycle=lifecycle)
+        except RenderCancelled:
+            cap.release()
+            raise
         timings["candidate_scoring_seconds"] = time.perf_counter() - step_started
         valid_metrics = 0
         for i, (window, metrics) in enumerate(zip(windows, window_metrics)):
@@ -1844,6 +2177,7 @@ def _analyze_single_video(
                 use_gpu=use_gpu,
                 event_callback=event_callback,
                 run_stats=run_stats,
+                lifecycle=lifecycle,
             )
             qwen_seconds = time.perf_counter() - step_started
             # Pop before the update: the private flag must never reach timings or the cache payload.
@@ -1854,6 +2188,12 @@ def _analyze_single_video(
             if not inline_qwen_completed:
                 print(f"      Qwen did not complete for {name}; deterministic visual tags retained "
                       f"and AI analysis will retry on the next run.")
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST. The handler below exists to keep a
+        # source's deterministic candidates when Qwen fails, and it returns a usable record -- so
+        # swallowing a cancellation here would hand Stage 6 a half-tagged library and report the
+        # render as finished.
+        except RenderCancelled:
+            raise
         except Exception as e:
             print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
             inline_qwen_completed = False
@@ -1908,6 +2248,7 @@ def _complete_deferred_qwen(
     event_callback=None,
     cache_file: str | None = None,
     run_stats: Dict[str, Any] | None = None,
+    lifecycle=None,
 ) -> Dict:
     candidates = video_data.get("candidates") or []
     if not candidates:
@@ -1933,11 +2274,17 @@ def _complete_deferred_qwen(
             use_gpu=use_gpu,
             event_callback=event_callback,
             run_stats=run_stats,
+            lifecycle=lifecycle,
         )
         # [FORK] Digital-Union (D1): completion comes from the facade's explicit signal, never from
         # "no exception was raised". The facade applies `_qwen_job_completed`, so a worker process
         # that merely *finished* is not the same as one whose submitted candidates were all tagged.
         qwen_completed = bool((qwen_info or {}).pop(_QWEN_COMPLETED_KEY, False))
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST. The handler below keeps this source's
+    # deterministic candidates and carries on; a cancellation taking that path would leave the
+    # remaining deferred jobs to run and then hand Stage 6 a library.
+    except RenderCancelled:
+        raise
     except Exception as e:
         print(f"      Warning: Qwen semantic analysis failed for {name}: {e}")
         qwen_completed = False
@@ -2157,7 +2504,15 @@ def _complete_deferred_qwen_batch(
     total_video_count: int,
     event_callback=None,
     run_stats: Dict[str, Any] | None = None,
+    lifecycle=None,
 ) -> None:
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): `lifecycle` is appended last, default `None`, and
+    # is FORWARDED rather than inspected -- the same rule as `_annotate_candidates_with_qwen`, and
+    # for the same reason: three suites AST-extract and execute this body against a stubbed
+    # `_run_qwen_worker_batch`, whose stubs take `**kwargs` and absorb this keyword. The wait that
+    # has to be cancellable is inside `_run_qwen_worker_batch`, and a `RenderCancelled` raised
+    # there propagates straight out of this function -- past no handler, because this body has
+    # none.
     # [FORK] Digital-Union (R1): `request_jobs` below is the authoritative set of sources that reach
     # the shared worker. Candidate-less sources `continue` before it and a configured skip returns
     # earlier still, so counting from the per-job merge loop - not from `video_items` or
@@ -2224,6 +2579,7 @@ def _complete_deferred_qwen_batch(
         use_gpu=use_gpu,
         event_callback=event_callback,
         artifact_sink=worker_artifacts,
+        lifecycle=lifecycle,
     )
     batch_seconds = time.perf_counter() - batch_started
     # [FORK] Digital-Union (R2): SUBMISSION truth, recorded the moment the shared worker returns and
@@ -2419,6 +2775,35 @@ def _qwen_worker_stdout_printer(indent: str = "      "):
     return printer
 
 
+def _report_cancelled_qwen_worker(outcome, event_callback) -> None:
+    """[FORK] Digital-Union (FUN Stage-5 Cancel): say what was actually stopped, truthfully.
+
+    Shared by the batch and single worker paths so the two cannot describe the same event
+    differently. It states the facts the outcome carries and nothing more:
+
+    * whether the escalation to a kill was needed (`killed`);
+    * whether the invocation-owned process tree was terminated, **and whether that reported a
+      problem** -- a failed `taskkill` is surfaced rather than hidden, because the one thing an
+      operator would want to know is that a GPU server may still be resident.
+
+    It never claims the worker exited cleanly and never claims the llama-server is gone when the
+    terminator said otherwise.
+    """
+    detail = "terminated" if not getattr(outcome, "killed", False) else "killed after a grace period"
+    tree_error = getattr(outcome, "tree_terminate_error", "") or ""
+    if getattr(outcome, "tree_terminated", False) and not tree_error:
+        tree = "; its llama-server child tree was terminated with it"
+    elif tree_error:
+        tree = (f"; the process-tree termination reported a problem ({tree_error}), so a "
+                f"worker-owned llama-server may still be running")
+    else:
+        tree = ""
+    message = f"Semantic tagging cancelled: the Qwen worker was {detail}{tree}."
+    print(f"      {message}")
+    fork_progress.emit(event_callback, fork_progress.warning(
+        5, message, phase="qwen", qwen_cancelled=True))
+
+
 def _short_qwen_error(text: str, limit: int = 200) -> str:
     """One short line for the status panel. The full bounded tail still goes to the console."""
     collapsed = " ".join((text or "").split())
@@ -2434,8 +2819,33 @@ def _run_qwen_worker_batch(
     event_callback=None,
     *,
     artifact_sink: Dict[str, str] | None = None,
+    lifecycle=None,
 ) -> Dict:
     """[FORK] Digital-Union: run the shared Qwen worker. ``{}`` on any failure, as before.
+
+    [FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is keyword-only here, matching
+    ``artifact_sink``, and ``None`` is the unchanged path. This is the one place in Stage 5 that
+    can hold GPU **hours**, so it is the boundary the owner incident was really about.
+
+    Three decisions are load-bearing:
+
+    * **The predicate is a closure, not the token.** `beatsync_fork.qwen_progress` is stdlib-only
+      and must not learn that a `RenderLifecycle` exists, so it receives `lambda: _cancelled(...)`
+      and answers in booleans.
+    * **The process TREE is terminated, not just the child.** The worker starts its own
+      `llama-server`, and killing only the direct Python child orphans it -- the pre-existing
+      timeout behaviour. A cancelled analysis that leaves a GPU server resident is not cancelled in
+      any sense the operator cares about. `terminate_process_tree` is given **this call's own child
+      pid** and nothing else, so no unrelated `python.exe`, `llama-server.exe` or BeatSync process
+      is reachable from here.
+    * **Timeout behaviour is untouched.** The tree terminator is wired only to the cancellation
+      path, `timeout` is still measured and still raises `TimeoutExpired`, and `cancelled` is
+      checked before the timeout branch so the two are never reported as each other.
+
+    Jobs the worker had already finished are **not** discarded by a cancellation: the A2-S1 partial
+    artifacts it published are still on disk, and nothing here deletes one. They are simply not
+    *consumed* this run -- recovery is reachable only from a usable-but-empty response, and a
+    cancelled run never gets that far.
 
     ``artifact_sink`` (A2-S1) is an **out-parameter**, and the only reason it exists is that the
     invocation token below embeds ``time.time()``: the caller cannot re-derive ``response_path``, and
@@ -2492,7 +2902,17 @@ def _run_qwen_worker_batch(
             event_callback=event_callback,
             on_human_line=_qwen_worker_stdout_printer(),
             stderr_char_limit=2400,
+            cancel_requested=(None if lifecycle is None
+                              else lambda: _cancelled(lifecycle)),
+            tree_terminator=(None if lifecycle is None
+                             else fork_qwen.terminate_process_tree),
         )
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): checked BEFORE the timeout and return-code
+        # branches, so a cancelled worker is never reported as a timeout or a crash.
+        if result.outcome.cancelled:
+            _report_cancelled_qwen_worker(result.outcome, event_callback)
+            raise RenderCancelled("semantic tagging cancelled",
+                                  phase=PHASE_VIDEO_ANALYSIS)
         if result.outcome.timed_out:
             raise subprocess.TimeoutExpired(worker_path, timeout)
         if result.outcome.launch_error:
@@ -2510,6 +2930,10 @@ def _run_qwen_worker_batch(
         if result.response_error:
             raise RuntimeError(result.response_error)
         return result.response
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST, ahead of both broad handlers, for the same
+    # reason as the single path -- each returns `{}`, and `{}` means "carry on without semantics".
+    except RenderCancelled:
+        raise
     except subprocess.TimeoutExpired:
         print("      Qwen batch worker timed out; deterministic visual tags remain active.")
         fork_progress.emit(event_callback, fork_progress.warning(
@@ -2586,7 +3010,22 @@ def _make_candidate_windows(boundaries: Sequence[float], duration: float) -> Lis
 
 
 def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
-                     use_gpu: bool = False) -> List[Dict]:
+                     use_gpu: bool = False, lifecycle=None) -> List[Dict]:
+    """[FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended last, default ``None``.
+
+    This is the deterministic hot loop, and all three of its paths are made cooperative rather than
+    just the one: ordered decode (`_read_ordered_frames`), the serial metric loop, and the
+    random-seek fallback. The parallel metric map is the exception and is deliberately left alone —
+    it only runs for >= 80 windows of pure arithmetic over already-decoded frames, which completes
+    in well under a second, so a cancellation lands at the boundary immediately after it.
+
+    **Cancellation raises out of here; it never returns an empty metric.** An empty metric means
+    "this window yielded nothing usable", and a source whose windows all came back empty is a
+    *legitimately* candidate-less source -- which, with `candidate_scoring_seconds` written, the
+    completion rule accepts as a reusable record. Converting a Stop into empty metrics would
+    therefore persist "this video has no good moments" for a video nobody finished looking at.
+    """
+    _check_cancelled(lifecycle, "before scoring candidate windows")
     plans = [_window_sample_plan(fps, float(w["start"]), float(w["end"])) for w in windows]
     targets = sorted({idx for plan in plans for idx in plan["frame_indices"]})
     if not targets:
@@ -2622,7 +3061,7 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
             f"(span/target={seek_ratio:.1f}, limit={sequential_limit:g})"
         )
         read_started = time.perf_counter()
-        frame_map = _read_ordered_frames(cap, targets)
+        frame_map = _read_ordered_frames(cap, targets, lifecycle=lifecycle)
         read_elapsed = time.perf_counter() - read_started
         approx_ram_mb = sum(getattr(frame, "nbytes", 0) for frame in frame_map.values()) / (1024 * 1024)
         print(
@@ -2637,7 +3076,11 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
             with ThreadPoolExecutor(max_workers=metric_workers) as executor:
                 metrics = list(executor.map(lambda plan: build_metric(plan, frame_map), plans))
         else:
-            metrics = [build_metric(plan, frame_map) for plan in plans]
+            metrics = []
+            for position, plan in enumerate(plans):
+                if position and position % _CANCEL_CHECK_WINDOWS == 0:
+                    _check_cancelled(lifecycle, "scoring candidate windows")
+                metrics.append(build_metric(plan, frame_map))
         metric_elapsed = time.perf_counter() - metrics_started
         usable = sum(1 for metric in metrics if metric)
         print(
@@ -2651,10 +3094,16 @@ def _measure_windows(cap: cv2.VideoCapture, fps: float, windows: Sequence[Dict],
         f"(span/target={seek_ratio:.1f} > limit {sequential_limit:g})"
     )
     fallback_started = time.perf_counter()
-    metrics = [
-        _measure_window(cap, fps, float(w["start"]), float(w["end"]), use_gpu=use_gpu)
-        for w in windows
-    ]
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): the random-seek fallback is the SLOWER of the two
+    # sampling paths -- it is chosen precisely when the sample span is too scattered to read
+    # sequentially, so each window pays a real seek. It therefore needs the cooperative check more
+    # than the ordered path does, not less.
+    metrics = []
+    for position, w in enumerate(windows):
+        if position and position % _CANCEL_CHECK_WINDOWS == 0:
+            _check_cancelled(lifecycle, "scoring candidate windows (random-seek sampling)")
+        metrics.append(
+            _measure_window(cap, fps, float(w["start"]), float(w["end"]), use_gpu=use_gpu))
     fallback_elapsed = time.perf_counter() - fallback_started
     usable = sum(1 for metric in metrics if metric)
     print(
@@ -2680,7 +3129,18 @@ def _window_sample_plan(fps: float, start: float, end: float) -> Dict:
     }
 
 
-def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int]) -> Dict[int, np.ndarray]:
+def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int],
+                         lifecycle=None) -> Dict[int, np.ndarray]:
+    """[FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended last, default ``None``.
+
+    The cooperative check is per *target* frame rather than per `grab()` — a target can be many
+    grabs away from the previous one — and it fires every `_CANCEL_CHECK_FRAMES` targets.
+
+    **One native decode call cannot be interrupted once entered**, so a Stop lands at the next
+    target boundary, not instantly. On a pathological source whose single `grab()` takes seconds
+    that is still a wait; the claim this makes is "cancellation takes effect at the next frame
+    boundary", and the thing it rules out is waiting for the rest of the library.
+    """
     frames: Dict[int, np.ndarray] = {}
     if not frame_indices:
         return frames
@@ -2689,7 +3149,9 @@ def _read_ordered_frames(cap: cv2.VideoCapture, frame_indices: Sequence[int]) ->
     cap.set(cv2.CAP_PROP_POS_FRAMES, first)
     current = first
 
-    for frame_idx in frame_indices:
+    for position, frame_idx in enumerate(frame_indices):
+        if position and position % _CANCEL_CHECK_FRAMES == 0:
+            _check_cancelled(lifecycle, "decoding sample frames")
         frame_idx = int(frame_idx)
         if frame_idx < current:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -3008,7 +3470,14 @@ def _annotate_candidates_with_qwen(
     use_gpu: bool,
     event_callback=None,
     run_stats: Dict[str, Any] | None = None,
+    lifecycle=None,
 ) -> Dict[str, Any]:
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): `lifecycle` is appended last, default `None`, and
+    # is FORWARDED rather than inspected -- this body takes no cancellation decision of its own.
+    # That is deliberate: three suites AST-extract and execute this function against a stubbed
+    # `_run_qwen_worker`, so a check here would need `RenderCancelled` and the check helper in
+    # every one of their synthesised namespaces. The wait itself is what has to be cancellable, and
+    # the wait lives in `_run_qwen_worker`.
     # [FORK] Digital-Union (R1): `run_stats` is the optional current-run accounting sink. It stays
     # `None` for every pre-existing caller, and a job is recorded only on the branch below that
     # actually calls `_run_qwen_worker` - so a configured skip and a candidate-less source, neither
@@ -3038,6 +3507,7 @@ def _annotate_candidates_with_qwen(
         qwen_model_path=qwen_model_path,
         use_gpu=use_gpu,
         event_callback=event_callback,
+        lifecycle=lifecycle,
     )
     # [FORK] Digital-Union (D1 R4): the response envelope locates this job's timings; whether the
     # job's AI work actually *completed* is then decided by `_qwen_job_completed`, which requires
@@ -3132,7 +3602,14 @@ def _run_qwen_worker(
     qwen_model_path: str,
     use_gpu: bool,
     event_callback=None,
+    lifecycle=None,
 ) -> Dict:
+    """[FORK] Digital-Union (FUN Stage-5 Cancel): ``lifecycle`` is appended last, default ``None``.
+
+    See `_run_qwen_worker_batch` for the whole cancellation argument; this is the same seam for the
+    single/inline path, so live Qwen cancellation cannot silently become batch-only in the way live
+    Qwen *progress* once nearly did.
+    """
     os.makedirs(VIDEO_ANALYSIS_CACHE_DIR, exist_ok=True)
     token = _hash_text(f"{video_file}|{time.time()}", 12)
     request_path = os.path.join(VIDEO_ANALYSIS_CACHE_DIR, f"qwen_request_{token}.json")
@@ -3169,7 +3646,17 @@ def _run_qwen_worker(
             event_callback=event_callback,
             on_human_line=_qwen_worker_stdout_printer(),
             stderr_char_limit=1800,
+            cancel_requested=(None if lifecycle is None
+                              else lambda: _cancelled(lifecycle)),
+            tree_terminator=(None if lifecycle is None
+                             else fork_qwen.terminate_process_tree),
         )
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): checked BEFORE the timeout and return-code
+        # branches, so a cancelled worker is never reported as a timeout or a crash.
+        if result.outcome.cancelled:
+            _report_cancelled_qwen_worker(result.outcome, event_callback)
+            raise RenderCancelled("semantic tagging cancelled",
+                                  phase=PHASE_VIDEO_ANALYSIS)
         if result.outcome.timed_out:
             raise subprocess.TimeoutExpired(worker_path, timeout)
         if result.outcome.launch_error:
@@ -3187,6 +3674,12 @@ def _run_qwen_worker(
         if result.response_error:
             raise RuntimeError(result.response_error)
         return result.response
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): FIRST, ahead of both broad handlers. Each of them
+    # returns `{}`, which this function's contract reads as "no semantics, carry on with
+    # deterministic tags" -- a cancellation collapsing into that is precisely how the run would
+    # continue to Stage 6.
+    except RenderCancelled:
+        raise
     except subprocess.TimeoutExpired:
         print("      Qwen worker timed out; deterministic visual tags remain active.")
         fork_progress.emit(event_callback, fork_progress.warning(

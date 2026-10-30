@@ -315,7 +315,10 @@ def test_a_the_runner_keeps_its_signature_contract():
     kwonly = [a.arg for a in runner.args.kwonlyargs]
 
     assert "event_callback" in args, "progress forwarding must be untouched"
-    assert kwonly == ["artifact_sink"], "the sink is keyword-only"
+    # [FUN Stage-5 Cancel] `lifecycle` joined it, keyword-only for the same reason: both are
+    # out-of-band plumbing rather than part of what gets analysed. The sink is still first and
+    # still keyword-only, which is what the three stubbing suites depend on.
+    assert kwonly == ["artifact_sink", "lifecycle"], "the sink is keyword-only"
     assert runner.returns is not None and ast.unparse(runner.returns) == "Dict", (
         "the return type must stay the response mapping - two suites stub this call")
 

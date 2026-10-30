@@ -51,9 +51,37 @@ Timeout and failure semantics are unchanged from `subprocess.run`: bounded wait,
 short grace → `kill()`; a non-zero exit prints the bounded stderr tail and returns `{}`; deterministic
 visual tags stay active either way. Measured process-tree boundary on a timeout: the direct Python worker
 is killed, and an already-started `llama-server` is **orphaned** — identically to the pre-Phase-2B path,
-because both kill only the direct child and neither runs the worker's `finally: client.close()`. That gap
-is pre-existing; do not "fix" it with `taskkill /T` or a process-group redesign as a side effect of
-unrelated work.
+because both kill only the direct child and neither runs the worker's `finally: client.close()`.
+
+**That orphan gap still applies to a TIMEOUT, and it is now closed on the CANCELLATION path only
+(FUN Stage-5 Cancel).** The note above used to end "do not fix it with `taskkill /T` … as a side
+effect of unrelated work", and that instruction stands for a timeout. Cancellation is a different
+case and was not unrelated work: it was the work. An operator who presses Cancel and is left with a
+resident GPU server has not had their request honoured in any sense they care about, so the
+cancellation path terminates the **process tree** —
+`qwen_progress.terminate_process_tree(child.pid)`, called *first*, while the direct child is still
+its server's live ancestor, then the same terminate → grace → kill → reap escalation.
+
+Containment is the **pid argument**, not a filter: the only pid it is ever given is the one that call
+created, so there is no image-name sweep and no unrelated `python.exe`, `llama-server.exe` or
+BeatSync process is reachable. The terminator is wired to the cancellation branch alone, `timeout` is
+still measured and still reported as `timed_out`, and `outcome.cancelled` is checked **before** the
+timeout and return-code branches so the two are never reported as each other. So a timeout orphans
+exactly what it always did — do not widen that as a side effect either. Full contract:
+`.claude/rules/render-worker.md`.
+
+**A cancelled worker's response file is never opened.** A worker stopped mid-loop has written no
+response, and reading whatever happens to sit at that path is how a partial result would become
+semantic authority. Its A1 per-job partials are **not deleted** — they are simply not consumed,
+because recovery is reachable only from a usable-but-empty response (see below).
+
+**The worker process itself is still completely cancellation-free, and that is deliberate.** It
+writes persisted semantic records, so nothing session-scoped or creative may enter it — the
+media-neutral boundary below. It also needs no token: the parent owns the child and stopping it is
+the parent's job. A cooperative worker would be a second, redundant cancellation path inside the one
+process this repository least wants extra state in. A test still asserts
+`stage5_qwen_scene_worker.py` mentions none of `lifecycle`, `RenderCancelled`, `render_worker` or
+`cancel_requested`.
 
 **The response JSON is the PRIMARY semantic authority, and the progress stream is never any kind of
 authority.** Nothing is reconstructed from stdout and no tag is ever parsed out of a progress line, so

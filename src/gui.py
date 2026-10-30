@@ -177,6 +177,11 @@ from beatsync_fork import render_batch as fork_render_batch
 # Gradio-free, owns no Gradio object, Popen, filesystem path or media/cache identity -- see
 # src/beatsync_fork/render_worker.py's own docstring.
 from beatsync_fork.render_worker import (
+    # [FORK] Digital-Union (FUN Stage-5 Cancel): the one named cancellation phase, so the status
+    # panel can distinguish "cancelled" from "cancelled during video analysis" without reading the
+    # exception's message. It names a phase, never an outcome -- `RenderOutcomeKind` is still the
+    # only typed terminal cause and is still assigned explicitly.
+    PHASE_VIDEO_ANALYSIS,
     RenderCancelled,
     RenderLifecycle,
     RenderLifecycleState,
@@ -234,6 +239,11 @@ from beatsync_fork import user_prefs as fork_prefs
 # site count stays at exactly the two that two suites pin.
 from beatsync_fork import collision as fork_collision
 from beatsync_fork import cache_admin as fork_cache
+# [FORK] Digital-Union (FUN Shared Analysis Cache): the per-user shared-cache configuration, the
+# per-invocation resolution, the record-filename shape, the folder measurement and the additive
+# import. Stdlib-only, so every branch is testable without a disk or a model. It owns no cache
+# identity: that stays entirely in `video_analysis.py`.
+from beatsync_fork import analysis_cache as fork_analysis_cache
 # [FORK] Digital-Union (R8 UX Refresh, Commit C): the one composition rule for "what is this
 # render actually going to do creatively". It is a pure view over values this module already has,
 # and it delegates every verdict -- the preset name to `presets.matching_preset`, Freestyle
@@ -2708,11 +2718,18 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # Return preview path for display, keep session_state intact
         return preview_path, status_msg, session_state
 
-    except RenderCancelled:
+    except RenderCancelled as cancel:
         # [FORK] Digital-Union (C3-R1A): never collapse into "❌ Error: ...". The typed cause rides
         # on RENDER_OUTCOME_KEY so process_video's worker can publish CANCELLED without parsing
         # this string; the string itself stays truthful on its own.
         session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.CANCELLED
+        # [FORK] Digital-Union (FUN Stage-5 Cancel): the wording follows the exception's own
+        # structured `phase` field, which the raiser set. This is NOT status-text inspection and
+        # NOT message parsing -- nothing reads `str(cancel)`, and the typed terminal cause above is
+        # still an explicitly named enum member, unchanged and independent of which string is
+        # chosen. A phase this reader does not know, or none at all, keeps the original wording.
+        if getattr(cancel, 'phase', '') == PHASE_VIDEO_ANALYSIS:
+            return None, STATUS_RENDER_CANCELLED_ANALYSIS, session_state
         return None, STATUS_RENDER_CANCELLED, session_state
     except Exception as e:
         # [FORK] Digital-Union (C3-R1A): conservative by construction -- this generic handler
@@ -7285,6 +7302,21 @@ _FOLDER_PREFS, _FOLDER_PREFS_NOTICE = _load_folder_prefs()
 #: and a policy string appearing in one would be a path.
 _FOLDER_OPTIONS = fork_prefs.load_options(PREFS_PATH)
 
+#: [FORK] Digital-Union (FUN Shared Analysis Cache): the per-user shared-cache setting, read once
+#: at startup so the Settings panel opens showing what is actually in force.
+#:
+#: It is a **separate file** from `preferences.json` and that is the whole feature, not a tidiness
+#: choice: `preferences.json` lives inside the checkout's own `state/`, so a path stored there
+#: would be invisible to the next playtest tree — which is precisely the problem being solved. This
+#: one lives under `%LOCALAPPDATA%\BeatSync\`, outside every version.
+#:
+#: Read for DISPLAY only. The authority on which folder an analysis uses is
+#: `video_analysis.resolve_cache_location`, resolved per invocation; this value is never threaded
+#: into a render, and a stale one can therefore only make the panel's initial text out of date,
+#: never the cache wrong.
+_SHARED_CACHE_CONFIG, _SHARED_CACHE_NOTICE = fork_analysis_cache.load_config(
+    fork_analysis_cache.config_path())
+
 
 def _pref(key: str) -> str:
     return _FOLDER_PREFS.get(key, '')
@@ -7483,12 +7515,50 @@ def _folder_prefs_status(headline: str) -> str:
 # BESIDE the poster cache and are why the poster subdirectory is named rather than its parent).
 # =============================================================================================
 
+def _analysis_cache_location():
+    """[FORK] Digital-Union (FUN Shared Analysis Cache): the resolved Stage-5 cache location.
+
+    One resolver for the whole GUI, and it is the **same** one Stage 5 itself uses —
+    `video_analysis.resolve_cache_location`, reached through a local import so no module-level
+    import is added to a file whose import order is load-bearing. That matters more than it looks:
+    a Settings panel that computed the location independently could show one folder while the
+    renderer used another, which is the single most misleading thing this feature could do.
+
+    Total: anything that goes wrong resolving the configuration falls back to this installation's
+    own local folder, which is the pre-feature behaviour.
+    """
+    local = os.path.join(get_input_dir(), 'video_analysis_cache')
+    try:
+        from video_analysis import resolve_cache_location
+        return resolve_cache_location(local)
+    except Exception:
+        return fork_analysis_cache.CacheLocation(
+            path=local, source=fork_analysis_cache.SOURCE_LOCAL)
+
+
 def _cache_categories() -> list:
     """The four clearable caches, built fresh so a changed Render output folder is reflected.
 
     `CLIPS_POSTER_DIR` rather than `CLIPS_STATE_DIR`: the journals live in the parent, and a
     category pointed at the parent would delete the operator's review decisions.
+
+    [FORK] Digital-Union (FUN Shared Analysis Cache): the analysis category now points at the
+    **resolved** folder rather than always at this checkout's own, so Inspect reports what is
+    really being used and Clear acts on it. Two consequences, both deliberate:
+
+    * when a shared folder is in force, the category's description says so and names it, because
+      clearing a shared cache costs *every* installation on the machine and not just this one;
+    * the other three categories are untouched and stay installation-local. They hold this app's
+      own transient files, which are not shareable and must never follow a cache setting.
+
+    Containment is unchanged and still `cache_admin`'s: it proves by `realpath` + `commonpath`
+    that nothing outside the directory it is handed is touched. Handing it a different directory
+    does not weaken that — it is still exactly one named root, never a discovered one.
     """
+    location = _analysis_cache_location()
+    analysis_info = (
+        INFO_CACHE_ANALYSIS_SHARED.format(path=location.path) if location.shared
+        else INFO_CACHE_ANALYSIS)
     return [
         fork_cache.Category(
             fork_cache.POSTERS, LABEL_CACHE_POSTERS, INFO_CACHE_POSTERS, CLIPS_POSTER_DIR),
@@ -7499,15 +7569,62 @@ def _cache_categories() -> list:
             fork_cache.RETIRED_UPLOADS, LABEL_CACHE_UPLOADS, INFO_CACHE_UPLOADS,
             RETIRED_UPLOADS_DIR),
         fork_cache.Category(
-            fork_cache.ANALYSIS, LABEL_CACHE_ANALYSIS, INFO_CACHE_ANALYSIS,
-            os.path.join(get_input_dir(), 'video_analysis_cache'), expensive=True),
+            fork_cache.ANALYSIS, LABEL_CACHE_ANALYSIS, analysis_info,
+            location.path, expensive=True),
     ]
+
+
+def _analysis_cache_notes() -> list:
+    """[FORK] Digital-Union (FUN Shared Analysis Cache): the lines Cache Management must add.
+
+    `cache_admin.report_lines` and `cleared_lines` print each category's **label** and sizes; they
+    do not print its `info`. So setting a shared-cache description on the category was not enough
+    on its own -- a real browser smoke of the live panel found the warning never reached the
+    screen, which is the whole reason this helper exists rather than relying on the category text.
+
+    It names the folder and says other installations read it, because clearing a *local* cache
+    costs one installation some re-analysis while clearing a *shared* one costs every installation
+    on the machine -- including the production install the operator is not currently looking at.
+    An unreachable shared folder is reported too, for the same reason Stage 5 reports it: an
+    operator about to clear a cache should know they are looking at the fallback.
+    """
+    location = _analysis_cache_location()
+    notes = []
+    if location.shared:
+        notes.extend(['', INFO_CACHE_ANALYSIS_SHARED.format(path=location.path)])
+    else:
+        notes.extend(['', f'Video analysis cache folder: {location.path}'])
+    if location.notice:
+        notes.extend(['', f'⚠️ {location.notice}'])
+    return notes
+
+
+def _analysis_category_explanation() -> str:
+    """[FORK] Digital-Union (FUN Shared Analysis Cache): the analysis category's description.
+
+    Read off the BUILT category rather than from the constant, so a configured shared folder is
+    named in the Cache Management list on load.
+
+    It goes through the real `Category` record -- whose description field is `explanation`, not
+    `info` -- and falls back to the constant on any failure. That guard is not defensive padding:
+    a first version of this line reached for `.info`, and because it ran at UI-construction time
+    the whole app failed to start. A read-out for a cache must never be able to do that, and the
+    source-inspecting unit tests could not catch it, which is why a live launch is part of this
+    feature's acceptance.
+    """
+    try:
+        for category in _cache_categories():
+            if category.key == fork_cache.ANALYSIS:
+                return category.explanation
+    except Exception:
+        pass
+    return INFO_CACHE_ANALYSIS
 
 
 def _on_inspect_cache():
     """Measure every category. Reads only -- creates nothing, deletes nothing, moves nothing."""
     measurements = [fork_cache.measure(category) for category in _cache_categories()]
-    return "\n".join(fork_cache.report_lines(measurements))
+    return "\n".join(fork_cache.report_lines(measurements) + _analysis_cache_notes())
 
 
 def _on_clear_cache(selected, confirmed):
@@ -7524,14 +7641,138 @@ def _on_clear_cache(selected, confirmed):
     chosen = [str(value) for value in (selected or [])]
     if not chosen:
         return "Nothing was selected, so nothing was cleared."
+    # [FORK] Digital-Union (FUN Shared Analysis Cache): the shared-folder warning is shown on the
+    # REFUSAL as well, so it is read BEFORE anything is deleted rather than only afterwards. The
+    # refusal is the one moment the operator is certainly still looking at this panel with the
+    # analysis category ticked.
+    analysis_notes = (_analysis_cache_notes()
+                      if fork_cache.ANALYSIS in chosen else [])
     if not confirmed:
-        return ("Tick the confirmation box as well — nothing has been deleted.\n"
-                "Clearing a cache cannot be undone.")
+        return "\n".join(
+            ["Tick the confirmation box as well — nothing has been deleted.",
+             "Clearing a cache cannot be undone."] + analysis_notes)
     wanted = [category for category in _cache_categories() if category.key in chosen]
     if not wanted:
         return "Those categories are not recognised, so nothing was cleared."
     outcomes = [fork_cache.clear(category) for category in wanted]
-    return "\n".join(fork_cache.cleared_lines(outcomes))
+    return "\n".join(fork_cache.cleared_lines(outcomes) + analysis_notes)
+
+
+# =============================================================================================
+# [FORK] Digital-Union (FUN Shared Analysis Cache): Settings -> Video Analysis Cache.
+#
+# Every decision lives in `beatsync_fork.analysis_cache`, which is stdlib-only and directly
+# testable: the per-user configuration file and its test override, the per-invocation resolution,
+# the record-filename shape, the folder measurement and the additive import. These handlers are a
+# view -- they read widgets, call the fork core, and turn its answers into text.
+#
+# Three absences are load-bearing:
+#
+#   * no deletion. Nothing in this block removes a file, and the fork module contains no delete at
+#     all. Clearing a cache is the existing Cache Management panel's job, behind its own
+#     confirmation -- and it now warns when the folder is shared.
+#   * no migration. Saving a folder copies nothing and moves nothing; records are portable because
+#     Stage-5 identity never contained the directory. Import is a separate, explicit button.
+#   * no render, source or preparation widget is written. Changing where the cache lives cannot
+#     invalidate a confirmed source set or alter what the next render would do.
+# =============================================================================================
+
+def _shared_cache_config_path() -> str:
+    """The per-user settings file this process reads. Honours the isolated-test override."""
+    return fork_analysis_cache.config_path()
+
+
+def _shared_cache_report(location) -> str:
+    """One report for a resolved location, rendered from a real measurement of the folder.
+
+    Both the Check button and the Save button return this, so the screen cannot end up showing two
+    different answers to "where is the cache, and what is in it?".
+    """
+    measurement = fork_analysis_cache.measure(location.path)
+    kind = 'Shared' if location.shared else 'Local'
+    config = _shared_cache_config_path() or '(unavailable on this system)'
+    if measurement.error:
+        return STATUS_SHARED_CACHE_UNREADABLE.format(
+            kind=kind, path=location.path, error=measurement.error, config=config)
+    if not measurement.exists:
+        return STATUS_SHARED_CACHE_MISSING.format(
+            kind=kind, path=location.path, config=config)
+    body = STATUS_SHARED_CACHE_REPORT.format(
+        kind=kind, path=location.path, records=measurement.records,
+        record_bytes=fork_analysis_cache.format_bytes(measurement.record_bytes),
+        others=measurement.other_files,
+        other_bytes=fork_analysis_cache.format_bytes(measurement.other_bytes),
+        config=config)
+    # A configured-but-unreachable folder is reported here too, not only at render time: the whole
+    # point of the Check button is to find that out before an hour of re-analysis, not after.
+    if location.notice:
+        body = f"{body}\n\n⚠️ {location.notice}"
+    return body
+
+
+def _on_inspect_shared_cache():
+    """Measure the resolved cache folder. Reads only — creates nothing, deletes nothing."""
+    return _shared_cache_report(_analysis_cache_location())
+
+
+def _on_save_shared_cache(folder, enabled):
+    """Persist the shared-cache setting to the per-user file, then report the new location.
+
+    Refuses rather than guessing when sharing is switched on with no folder: writing
+    `enabled=True` with a blank path would silently resolve back to the local cache, and the
+    operator would believe sharing was on.
+
+    **The new setting applies to the next analysis, not to one in flight.** Stage 5 resolves its
+    directory once per invocation, so a render already running keeps the folder it started with —
+    and the status text says so rather than leaving it to be discovered.
+    """
+    path = (folder or '').strip()
+    wanted = bool(enabled)
+    if wanted and not path:
+        return STATUS_SHARED_CACHE_SAVE_NEEDS_FOLDER
+    failure = fork_analysis_cache.save_config(
+        _shared_cache_config_path(),
+        {fork_analysis_cache.CACHE_FOLDER: path,
+         fork_analysis_cache.CACHE_ENABLED: wanted})
+    if failure:
+        return STATUS_SHARED_CACHE_SAVE_FAILED.format(reason=failure)
+    location = _analysis_cache_location()
+    header = (STATUS_SHARED_CACHE_SAVED_ON.format(path=location.path) if location.shared
+              else STATUS_SHARED_CACHE_SAVED_OFF.format(path=location.path))
+    return f"{header}\n\n{_shared_cache_report(location)}"
+
+
+def _on_import_analysis_cache(source_folder):
+    """Copy reusable records from an existing cache folder into the one in use.
+
+    Additive and one-way by construction: the fork core reads the source folder and writes only
+    records that are not already at the destination, with an exclusive create as the no-replace
+    guarantee. Nothing in either folder is deleted, and the source is never written to.
+
+    The contract generation is passed **in** from `video_analysis` rather than restated, so a
+    record of an older generation is reported as not reusable instead of being copied into a
+    shared folder where its filename could never be looked up again.
+    """
+    try:
+        from video_analysis import CACHE_CONTRACT_VERSION
+    except Exception as exc:
+        return STATUS_CACHE_IMPORT_REFUSED.format(
+            reason=f'The analysis contract version could not be read ({exc}).')
+    location = _analysis_cache_location()
+    outcome = fork_analysis_cache.import_records(
+        (source_folder or '').strip(), location.path, CACHE_CONTRACT_VERSION)
+    if outcome.refusal:
+        return STATUS_CACHE_IMPORT_REFUSED.format(reason=outcome.refusal)
+    report = STATUS_CACHE_IMPORT_DONE.format(
+        source=outcome.source, destination=outcome.destination,
+        copied=outcome.copied,
+        copied_bytes=fork_analysis_cache.format_bytes(outcome.copied_bytes),
+        already_present=outcome.already_present, incompatible=outcome.incompatible,
+        failed=outcome.failed, skipped=outcome.skipped_other_files)
+    if outcome.first_errors:
+        report = report + '\n\nFirst few:\n' + '\n'.join(
+            f'  {line}' for line in outcome.first_errors)
+    return f'{report}\n\n{_shared_cache_report(location)}'
 
 
 def _on_reset_folder_prefs():
@@ -11071,6 +11312,72 @@ def create_ui() -> gr.Blocks:
                         show_label=False,
                         elem_id='pref-collision-policy')
 
+                # [FORK] Digital-Union (FUN Shared Analysis Cache): Settings -> Video Analysis
+                # Cache. Placed immediately BEFORE Cache Management, because it answers "where is
+                # the analysis cache?" and that panel's most expensive button acts on the answer.
+                #
+                # Collapsed by default for the same reason Cache Management is: this is set up
+                # once and then left alone. It opens on load when a shared folder is already
+                # configured, so an operator who does use it is never shown a shut drawer hiding a
+                # setting that is actually in force.
+                #
+                # Note the widget types: text, a checkbox and buttons. No numeric control, matching
+                # the surrounding span's deliberate omission.
+                with gr.Accordion(label=LABEL_SHARED_CACHE_SECTION,
+                                  open=bool(_SHARED_CACHE_CONFIG.get(
+                                      fork_analysis_cache.CACHE_FOLDER))):
+                    gr.Markdown(INFO_SHARED_CACHE_SECTION)
+                    with gr.Row():
+                        shared_cache_folder = gr.Textbox(
+                            label=LABEL_SHARED_CACHE_FOLDER,
+                            value=str(_SHARED_CACHE_CONFIG.get(
+                                fork_analysis_cache.CACHE_FOLDER) or ''),
+                            info=INFO_SHARED_CACHE_FOLDER,
+                            placeholder=r"J:\BeatSync Analysis Cache",
+                            elem_id='shared-cache-folder')
+                        shared_cache_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='shared-cache-folder-browse')
+                    shared_cache_enabled = gr.Checkbox(
+                        value=bool(_SHARED_CACHE_CONFIG.get(
+                            fork_analysis_cache.CACHE_ENABLED)),
+                        label=LABEL_SHARED_CACHE_ENABLED,
+                        info=INFO_SHARED_CACHE_ENABLED,
+                        elem_id='shared-cache-enabled')
+                    with gr.Row():
+                        shared_cache_save_btn = gr.Button(
+                            LABEL_SHARED_CACHE_SAVE, variant='primary',
+                            elem_id='shared-cache-save-button')
+                        shared_cache_inspect_btn = gr.Button(
+                            LABEL_SHARED_CACHE_INSPECT, variant='secondary',
+                            elem_id='shared-cache-inspect-button')
+                    gr.Markdown(INFO_SHARED_CACHE_LIMITS)
+                    with gr.Row():
+                        cache_import_source = gr.Textbox(
+                            label=LABEL_CACHE_IMPORT_SOURCE,
+                            value='',
+                            info=INFO_CACHE_IMPORT_SOURCE,
+                            placeholder=r"I:\BeatSync\input\video_analysis_cache",
+                            elem_id='cache-import-source')
+                        cache_import_browse = gr.Button(
+                            LABEL_BROWSE_FOLDER, variant='secondary', scale=0,
+                            elem_id='cache-import-source-browse')
+                    cache_import_btn = gr.Button(
+                        LABEL_CACHE_IMPORT, variant='secondary',
+                        elem_id='cache-import-button')
+                    shared_cache_status = gr.Textbox(
+                        label=LABEL_SHARED_CACHE_STATUS,
+                        # An unreadable settings file is surfaced on LOAD, not only once somebody
+                        # presses Check. `load_config` reports exactly that case and nothing else
+                        # (a missing file is a first run and says nothing), so the box is normally
+                        # empty and shows its placeholder — but an operator whose shared setting
+                        # has been lost learns it immediately rather than after an hour of
+                        # re-analysis they did not expect.
+                        value=f'⚠️ {_SHARED_CACHE_NOTICE}' if _SHARED_CACHE_NOTICE else '',
+                        placeholder=PLACEHOLDER_SHARED_CACHE_STATUS,
+                        interactive=False, lines=9, max_lines=24,
+                        elem_id='shared-cache-status-box')
+
                 # [FORK] R8 UX Refresh: Cache Management.
                 #
                 # Every numeric read-out here is text, and the one interactive numeric control
@@ -11100,11 +11407,17 @@ def create_ui() -> gr.Blocks:
                         value=[],
                         label=LABEL_CACHE_SELECT,
                         elem_id='cache-select')
+                    # [FORK] Digital-Union (FUN Shared Analysis Cache): the analysis category's
+                    # description is taken from the built category list rather than from the
+                    # constant, so a configured shared folder is named here on load. It is
+                    # resolved once at UI construction (a `gr.Markdown` value is static), which
+                    # is why the Inspect and Clear handlers re-resolve and re-state it live --
+                    # between them, the warning is readable both before and after a decision.
                     gr.Markdown(
                         f"- **{LABEL_CACHE_POSTERS}** — {INFO_CACHE_POSTERS}\n"
                         f"- **{LABEL_CACHE_PROCESSING}** — {INFO_CACHE_PROCESSING}\n"
                         f"- **{LABEL_CACHE_UPLOADS}** — {INFO_CACHE_UPLOADS}\n"
-                        f"- **{LABEL_CACHE_ANALYSIS}** — {INFO_CACHE_ANALYSIS}")
+                        f"- **{LABEL_CACHE_ANALYSIS}** — {_analysis_category_explanation()}")
                     cache_confirm = gr.Checkbox(
                         value=False, label=LABEL_CACHE_CONFIRM, info=INFO_CACHE_CONFIRM,
                         elem_id='cache-confirm')
@@ -11148,7 +11461,13 @@ def create_ui() -> gr.Blocks:
                 (pref_audio_preview_discarded_browse, pref_audio_preview_discarded),
                 # [FORK] R8: the Render output destination uses the identical helper, so Browse
                 # behaves the same here as on every other folder field in the app.
-                (pref_render_output_browse, pref_render_output)):
+                (pref_render_output_browse, pref_render_output),
+                # [FORK] Digital-Union (FUN Shared Analysis Cache): the shared cache folder and
+                # the import source reach the same self-contained native Browse helper, so Browse
+                # behaves identically here too. Browsing still only fills a box: it reads no
+                # cache, copies nothing and saves nothing.
+                (shared_cache_browse, shared_cache_folder),
+                (cache_import_browse, cache_import_source)):
             _browse_button.click(fn=_browse_folder, inputs=[_target], outputs=[_target],
                                  concurrency_limit=None)
 
@@ -11202,6 +11521,35 @@ def create_ui() -> gr.Blocks:
         # Both write only `cache_report`. Neither touches a source, preparation, creative or
         # render widget, so inspecting or clearing a cache cannot invalidate a confirmed source
         # set or change what the next render would do.
+        # [FORK] Digital-Union (FUN Shared Analysis Cache): three registrations, all of which write
+        # ONLY `shared_cache_status`. None is a render, none takes `_RENDER_LOCK`, none joins a
+        # render lane, and `concurrency_limit=None` for the same measured R3 reason every other
+        # non-render registration here carries -- on the pinned gradio 6.19.0 a full concurrency
+        # group leaves an event QUEUED rather than refusing it.
+        #
+        # None of them appears in `source_outputs` or `prep_outputs`, so changing where the cache
+        # lives cannot clear a confirmed source set, disable Create Video or trigger a scan. None
+        # writes a creative, audio or render widget either: the cache's location is not part of a
+        # render request.
+        shared_cache_inspect_btn.click(
+            fn=_on_inspect_shared_cache,
+            inputs=[],
+            outputs=[shared_cache_status],
+            concurrency_limit=None,
+        )
+        shared_cache_save_btn.click(
+            fn=_on_save_shared_cache,
+            inputs=[shared_cache_folder, shared_cache_enabled],
+            outputs=[shared_cache_status],
+            concurrency_limit=None,
+        )
+        cache_import_btn.click(
+            fn=_on_import_analysis_cache,
+            inputs=[cache_import_source],
+            outputs=[shared_cache_status],
+            concurrency_limit=None,
+        )
+
         cache_inspect_btn.click(
             fn=_on_inspect_cache,
             inputs=[],
