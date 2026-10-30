@@ -2805,7 +2805,11 @@ def test_both_render_wrappers_take_the_same_freestyle_widgets():
 #: Parameters appended AFTER the Freestyle block by a later feature. R7.1's Comfort Mix controls
 #: ride here, with legacy defaults, for the same reason Freestyle itself rode at the end: it keeps
 #: every pre-existing positional index exactly where it was.
-_APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return")
+#: [R7.3] `voice_overflow` joins them -- appended, never inserted, and in BOTH handlers this time:
+#: it is an Audio Layers placement control, so the batch has to freeze it exactly as it freezes
+#: `voice_avoid_drops`, or a batch and a single render of the same screen could disagree about
+#: what happens when a clip does not fit.
+_APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return", "voice_overflow")
 
 
 def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():

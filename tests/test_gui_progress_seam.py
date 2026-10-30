@@ -466,7 +466,10 @@ class _RenderHarness:
             "fork_creative": type("X", (), {"CreativeProfile": object}),
             "fork_audio_mix": type("X", (), {"AudioMixConfig": object,
                                              "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
-                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0,
+                                             # [R7.3] `process_video_guarded`'s voice-overflow
+                                             # default dereferences this at def-time.
+                                             "DEFAULT_OVERFLOW_POLICY": "strict"}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": object}),
         }
 
@@ -551,7 +554,10 @@ def test_the_render_mutex_is_held_until_the_worker_exits():
                     "from_widgets": staticmethod(lambda **_k: object())})}),
             "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object(),
                                              "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
-                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0,
+                                             # [R7.3] `process_video_guarded`'s voice-overflow
+                                             # default dereferences this at def-time.
+                                             "DEFAULT_OVERFLOW_POLICY": "strict"}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": lambda **_k: object()}),
             "GuardedResult": __import__("typing").Tuple,
         })
@@ -634,7 +640,10 @@ def test_closing_the_batch_mid_candidate_waits_for_that_candidate_worker():
                     "from_widgets": staticmethod(lambda **_k: object())})}),
             "fork_audio_mix": type("X", (), {"AudioMixConfig": lambda **_k: object(),
                                              "DEFAULT_MUSIC_RETURN_SECONDS": 0.4,
-                                             "MUSIC_RETURN_MAX_SECONDS": 5.0}),
+                                             "MUSIC_RETURN_MAX_SECONDS": 5.0,
+                                             # [R7.3] `process_video_guarded`'s voice-overflow
+                                             # default dereferences this at def-time.
+                                             "DEFAULT_OVERFLOW_POLICY": "strict"}),
             "fork_smart_mix": type("X", (), {"SmartMixConfig": lambda **_k: object()}),
             "GuardedResult": __import__("typing").Tuple,
             "Tuple": __import__("typing").Tuple,

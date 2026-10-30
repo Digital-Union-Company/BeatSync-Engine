@@ -380,6 +380,27 @@ INFO_MUSIC_UNDER_VOICE = (
     "down and back up smoothly around each clip."
 )
 
+# [FORK] R7.3 (voice overflow): what to do when the music runs out before the clips do. The
+# default is the historical behaviour, so an operator who never touches this sees no change.
+LABEL_VOICE_OVERFLOW = "🧩 When voice clips do not fit"
+INFO_VOICE_OVERFLOW = (
+    "What to do when a clip has nowhere legal left to play — the music ends first, or *Avoid "
+    "drops* blocks the only remaining room.\n\n"
+    "• **Strict / Error** (default) — refuse the render and name the clip. Nothing is dropped or "
+    "shortened behind your back. This is how BeatSync has always behaved.\n\n"
+    "• **Skip clips that do not fit** — leave that clip out and carry on. A shorter clip later in "
+    "the sequence can still land, because skipping one clip does not move the position the next "
+    "one starts looking from. The order is never rearranged and nothing is shortened.\n\n"
+    "• **Trim final usable clip, then skip remaining** — the same, except **one** clip may be cut "
+    "short to use up the room that is actually left (at least 0.5 s of it, on a beat, still "
+    "respecting *Avoid drops*). Everything after that is skipped.\n\n"
+    "Skipped and trimmed clips are always listed by filename in **Voice placement** below — "
+    "nothing is dropped silently. Your audio files are never modified."
+)
+CHOICE_VOICE_OVERFLOW_STRICT = "Strict / Error (refuse the render)"
+CHOICE_VOICE_OVERFLOW_SKIP = "Skip clips that do not fit"
+CHOICE_VOICE_OVERFLOW_TRIM = "Trim final usable clip, then skip remaining"
+
 LABEL_AUDIO_LAYERS_REPORT = "Voice placement"
 PLACEHOLDER_AUDIO_LAYERS_REPORT = (
     "No voice clips selected. Add clips above and render to see where they land."
