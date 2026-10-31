@@ -336,6 +336,26 @@ def get_startup_header(cpu_count, max_threads, parallel_workers, python_status,
 LABEL_AUDIO_FILE = "🎵 Audio File (MP3/WAV/FLAC)"
 
 # ============================================================================
+# [FORK] Digital-Union (FUN R10 Repeat Music)
+# Play the selected song 1 to 30 times and render a full-length music video. The repetitions get
+# NEWLY PLANNED shots -- the music repeats, the edit does not -- so the info text must not promise
+# or imply a looped video.
+# ============================================================================
+
+LABEL_REPEAT_MUSIC = "🔁 Repeat Music"
+INFO_REPEAT_MUSIC = (
+    "How many times to play the song, 1 to 30. **1x is a normal render.** Above that the video "
+    "gets longer and every repetition is given **freshly planned shots** — it is not a looped "
+    "copy of the first pass. The music itself is never slowed, stretched or re-pitched, and your "
+    "music file is never modified."
+)
+#: Shown under the slider before a render. Content comes from
+#: `beatsync_fork.music_repeat.estimate_markdown`; this is only the empty state.
+REPEAT_MUSIC_ESTIMATE_INITIAL = (
+    "**Repeat Music: 1x** - load a music track to see the estimated output length."
+)
+
+# ============================================================================
 # [FORK] Digital-Union: Audio Layers V1 (D)
 # See src/beatsync_fork/audio_mix.py for the placement rules and src/audio_mixdown.py for the
 # mixdown. Voice changes the final audio only — the video edit is still decided entirely by the

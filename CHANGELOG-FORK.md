@@ -20,6 +20,56 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-10-31 (FUN R10: Repeat Music 1x-30x)
+
+Play the selected song up to thirty times and render a full-length music video whose later
+repetitions contain **newly planned shots**. Concatenating repeated copies of one render is
+explicitly not the feature.
+
+- `src/beatsync_fork/music_repeat.py` — **new, stdlib-only**: the 1..30 control and its
+  `normalize_repeat` type boundary (mirroring `creative.normalize_control`), the repeated geometry,
+  the pre-render `00:20 x 5 = 01:40` read-out with its long-render / temporary-disk warning, and
+  the whole timeline extension. Its one sibling import is `audio_mix.format_clock`, so there is a
+  single clock formatter rather than two that can disagree.
+- `src/music_repeater.py` — **new, runtime**: one FFmpeg decode of the first audio stream to
+  `pcm_s24le` / 48 kHz / stereo, a concat-demuxer stream copy of that exact byte run `N` times, and
+  a duration verification against `N x cycle` that **fails the render** rather than letting a
+  mis-sized master shift every later cut. `-stream_loop` was rejected: it loops the compressed
+  *input*, so the decoder's delay/padding handling becomes part of the result. Its own small
+  cancellable runner, its own `MusicRepeatError` (deliberately not an `AudioMixError`), and scratch
+  that lives in `session_dir` and is discarded on success, failure and cancellation alike.
+- `src/gui.py` — a `gr.Slider` (1-30, step 1, default 1) directly below the Audio File control plus
+  a live Markdown estimate; one `.change` handler writing only that read-out, registered on both the
+  slider and the audio input. `repeat_music` is appended **last** to both render click lists and to
+  all three handler signatures, so no pre-existing positional index moved. Normalised once at the
+  render boundary. **Every statement the feature adds to `_process_video_impl` sits behind a repeat
+  guard**, so a 1x render resolves neither new module — a test walks the real AST and asserts it.
+- `src/video_processor.py` — `--repeat-music`, with the six creative flags' no-`type=` discipline.
+  It refuses to combine with `-s`/`-e`: trimming the analysis window and repeating it have two
+  incompatible readings, and `create_music_video` would re-apply the window to the repeated master.
+  `main()`'s unchanged tail moved verbatim into `_main_render` so the master's lifetime can be a
+  `try/finally` around it. `create_music_video` itself is **untouched** by this feature.
+- `src/ui_content.py` — `LABEL_REPEAT_MUSIC`, `INFO_REPEAT_MUSIC` and the read-out's empty state.
+- `tests/test_music_repeat.py` — **new**: the control boundary, 30x geometry exactness, the tiling
+  rules, the extended bus against the **real** `smart_mix.project_structure` and
+  `audio_mix.project_sections` / `plan_voice_placements`, the **real** frame-locked timeline over
+  1/2/3/5/30 cycles at three frame rates, the **real** Stage 6 planner proving later cycles differ,
+  the runtime argv builders, and the GUI/CLI wiring contracts.
+
+**1x is verified content-identical to pristine `main`** (`b90c265f`, a clone, the same interpreter,
+a hash-identical FFmpeg, the identical argv): one `framemd5` digest, one audio PCM hash, and an
+empty diff over 83 normalised pipeline-fact lines. The container hash differs, and a same-code
+control shows why — Matroska writes a random SegmentUID, so two runs of pristine `main` differ too.
+
+**Measured:** 2x / 3x / 5x produce exactly 1200 / 1800 / 3000 frames and 40 / 60 / 100 s at 30 fps;
+30x of a 4 s fixture produces 3600 frames and 120.000000 s with peak memory 482 MB against 475 MB at
+1x. The three cycles of a 3x master are byte-identical PCM. Over a 3x timeline the real planner
+changes 10 of 11 and 11 of 11 cuts against cycle 0, deterministically.
+
+**No cache change whatsoever.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION`
+stays `auto_av_analysis_v8_llama_vulkan_batched`, no payload gained a field, and the repeat count
+does not exist as a value in the render body until after Stage 5 has returned.
+
 ### Changed — 2026-10-29 (Stage-5 Cancel: Cancel actually interrupts video analysis)
 
 **This supersedes C3-R1A's `BOUNDARY_ONLY_CANCEL` contract for Stage 5**, after a real owner

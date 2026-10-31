@@ -55,6 +55,8 @@ pipeline — same `analyze_beats_auto` → `create_music_video` path as the UI, 
 instead of routing through the UI's quiet console. It also exposes every creative control as a flag
 (`--seed`, `--cut-density`, `--micro-cuts`, `--semantic-emphasis`, `--energy-response`,
 `--motion-bias`, `--source-diversity`); those seven values are the reproducible execution contract.
+`--repeat-music 1..30` rides alongside them under the same no-`type=` discipline, but is **not** one of
+the seven: it changes how long the video is, not how it is edited.
 
 ### Tests
 
@@ -136,6 +138,15 @@ These apply in almost every session. Each has a scoped rule with the full contra
 - **Creative state is a render request, never source or media identity.** The seven resolved controls
   ride on `beat_info["creative"]`; changing one re-plans and never re-analyses. →
   `.claude/rules/creative-controls.md`
+- **Repeat Music (FUN R10) extends the timeline AFTER the analysis, never during it.** The music is
+  analysed **once**, on the operator's own file; a repeated `pcm_s24le` master is then built, its
+  cycle length **measured**, and each cycle's beats, sections and beat-synchronous series re-stamped
+  at `k × cycle`. So Stages 1–5 cost the same at 30× as at 1×, and the repeat count has no route to
+  Stage-5 identity, a Qwen request or a persisted record — it does not exist as a value in the render
+  body until Stage 5 has returned. **1× is the legacy path structurally**: every statement the
+  feature adds sits behind a repeat guard, so at 1× neither new module is resolved. Musical cut
+  positions repeat; the shots do not — Stage 6 plans one continuous timeline and carries its running
+  state across cycle boundaries. → `.claude/rules/music-repeat.md`
 - **Cancellation (C3-R1A, extended into Stage 5 by FUN Stage-5 Cancel).** Exactly one
   `RenderLifecycle` per top-level render event — one Create Music Video click, or the **whole**
   2–4-candidate batch. FFmpeg-class children are terminated *and reaped* before `RenderCancelled`
