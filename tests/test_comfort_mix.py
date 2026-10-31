@@ -510,8 +510,11 @@ def test_the_controls_ride_at_the_end_of_the_positional_contract(gui_tree: ast.M
     assert names[start:start + 2] == _COMFORT_PAIR, names
     assert inputs[start:start + 2] == _COMFORT_PAIR, inputs
     # Nothing was INSERTED in front of the pair: whatever follows it is a known later append.
-    assert names[start + 2:] == ["voice_overflow"], names[start + 2:]
-    assert inputs[start + 2:] == ["voice_overflow"], inputs[start + 2:]
+    # [FUN R10] `repeat_music` is the second such append, after R7.3's `voice_overflow` and under the
+    # same discipline — appended at the end of both the signature and the click list together, so
+    # the pair's own index is still exactly the one it had at R7.1.
+    assert names[start + 2:] == ["voice_overflow", "repeat_music"], names[start + 2:]
+    assert inputs[start + 2:] == ["voice_overflow", "repeat_music"], inputs[start + 2:]
 
 
 def test_the_config_carries_both_controls(gui_tree: ast.Module):

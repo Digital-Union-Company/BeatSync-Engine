@@ -2809,7 +2809,11 @@ def test_both_render_wrappers_take_the_same_freestyle_widgets():
 #: it is an Audio Layers placement control, so the batch has to freeze it exactly as it freezes
 #: `voice_avoid_drops`, or a batch and a single render of the same screen could disagree about
 #: what happens when a clip does not fit.
-_APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return", "voice_overflow")
+#: [FUN R10] `repeat_music` joins them for the identical reason, and in BOTH handlers again: a
+#: repeat count is shared render intent, so the batch freezes one value for every candidate exactly
+#: as it freezes the audio file, the source set and the encoder.
+_APPENDED_AFTER_FREESTYLE = ("voice_auto_balance", "voice_music_return", "voice_overflow",
+                             "repeat_music")
 
 
 def test_freestyle_widgets_are_appended_last_so_existing_alignment_is_untouched():

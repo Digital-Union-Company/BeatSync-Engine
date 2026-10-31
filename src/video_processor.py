@@ -14,6 +14,7 @@ setup_environment()
 import argparse
 import random
 import shutil
+import tempfile
 from typing import TypeAlias, List, Dict, Tuple
 import numpy as np
 from pathlib import Path
@@ -67,6 +68,13 @@ from beatsync_fork import creative as fork_creative
 # unchanged in that case, so the historical path is not merely preserved but structurally
 # unreachable from a profile.
 from beatsync_fork import render_profiles as fork_render_profiles
+# [FORK] Digital-Union (FUN R10 Repeat Music): the two halves of "play the song N times" —
+# `--repeat-music` is the headless parity for the Render tab's slider. Only `main()` uses them:
+# `create_music_video` itself is untouched by this feature and still simply renders whatever audio
+# file it is handed over whatever beat array it is handed, which is exactly why no second render
+# engine was needed.
+from beatsync_fork import music_repeat as fork_music_repeat
+import music_repeater
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -312,6 +320,19 @@ def parse_arguments() -> argparse.Namespace:
     # is the same normalisation the UI uses, so a malformed or out-of-range value falls back or
     # clamps identically instead of aborting the run inside argparse. Omitting all three leaves the
     # profile neutral, which is exactly today's behaviour.
+    # [FORK] Digital-Union (FUN R10 Repeat Music): headless parity with the Render tab's slider.
+    # No argparse `type=` and no custom type, exactly like the six creative flags above: the value
+    # goes through `music_repeat.normalize_repeat`, which is the same normalisation the UI uses, so
+    # a malformed or out-of-range value clamps or falls back identically instead of aborting the
+    # run inside argparse. Omitting it is byte-for-byte today's run.
+    parser.add_argument(
+        '--repeat-music',
+        default=None,
+        help=(f'Play the music N times and render a full-length video '
+              f'({fork_music_repeat.MIN_REPEAT}-{fork_music_repeat.MAX_REPEAT}); '
+              f'{fork_music_repeat.DEFAULT_REPEAT} = current BeatSync behaviour (default). '
+              f'Later repetitions get newly planned shots, not a looped copy.')
+    )
     for flag, control in (
         ('--cut-density', 'Sparse .. dense'),
         ('--energy-response', 'Weak .. strong target matching'),
@@ -1334,6 +1355,62 @@ def main() -> None:
 
     print(f'✓ Selected {len(selected_beats)} cuts for video')
 
+    # [FORK] Digital-Union (FUN R10 Repeat Music): the headless half of the feature, and the same
+    # three steps the GUI takes, in the same order and for the same reasons.
+    #
+    # It is deliberately AFTER `analyze_beats_auto`: the music is analysed ONCE, on the original
+    # file, so Stages 1-5 and the whole Qwen pass cost the same at 30x as at 1x and the repeat count
+    # has no route to Stage-5 cache identity. The repeated master is then built, and the analysis is
+    # extended against its MEASURED cycle length.
+    #
+    # The temporary master goes in the system temporary directory, which is this application's own
+    # scratch and is explicitly permitted for it. It is NOT `get_processing_dir()`, which
+    # `create_music_video` clears at the start of every render and would therefore delete moments
+    # after it was written, and it is never inside the repository, the operator's Media Library or
+    # anywhere near their music file — which is opened read-only and left exactly as it was.
+    repeat_music = fork_music_repeat.normalize_repeat(args.repeat_music)
+    # The CLI's `-s`/`-e` trim the ANALYSIS window, and combining that with a repeat has two
+    # incompatible readings: repeat the trimmed excerpt, or repeat the file and then trim the
+    # result. `create_music_video` would additionally re-apply the same window to the repeated
+    # master and clamp it straight back to one excerpt. Rather than pick a meaning the owner never
+    # asked for, the combination is REFUSED — loudly, before any work. The GUI has no trim controls,
+    # so Repeat Music is fully available there.
+    if repeat_music > fork_music_repeat.MIN_REPEAT and (args.start_time or args.end_time):
+        raise SystemExit(
+            '--repeat-music cannot be combined with -s/--start-time or -e/--end-time. '
+            'Trim the track to its own file first, then repeat that.')
+    repeat_dir = None
+    repeated_master = None
+    try:
+        if repeat_music > fork_music_repeat.MIN_REPEAT:
+            repeat_dir = tempfile.mkdtemp(prefix='beatsync_repeat_')
+            repeated_master = music_repeater.build_repeated_music(
+                music_path=args.mp3_file, repeat=repeat_music, session_dir=repeat_dir)
+            selected_beats, beat_info = fork_music_repeat.extend_beat_info(
+                selected_beats, beat_info, repeated_master.repeat,
+                repeated_master.cycle_seconds)
+            print(f'🔁 Repeat Music: {repeated_master.describe()} — '
+                  f'{len(selected_beats)} cuts over {repeat_music} repetitions '
+                  f'(prepared in {repeated_master.prepare_seconds:.1f}s)')
+        _main_render(args, video_files, selected_beats, beat_info, cli_creative,
+                     render_audio_path=(repeated_master.path if repeated_master
+                                        else args.mp3_file))
+    finally:
+        if repeated_master is not None:
+            music_repeater.discard_repeated_master(repeated_master.path)
+        if repeat_dir:
+            shutil.rmtree(repeat_dir, ignore_errors=True)
+
+
+def _main_render(args, video_files, selected_beats, beat_info, cli_creative,
+                 render_audio_path: str) -> None:
+    """[FORK] Digital-Union (FUN R10): the unchanged tail of `main()`, lifted verbatim.
+
+    Extracted only so the repeated master's lifetime can be a `try/finally` around it; the body
+    below is the original code with exactly one substitution — the audio file handed to
+    `create_music_video` is the repeated master when there is one, and `args.mp3_file` when there
+    is not, in which case it is the same string the original passed.
+    """
     output_file = args.output
     # [FORK] Digital-Union (Phase A): a variation render is identifiable by its filename; a legacy
     # (seed 0) render keeps exactly the name it has today. The three newer controls deliberately
@@ -1353,7 +1430,7 @@ def main() -> None:
  
     print(f'\n🎬 Starting video creation (frame-accurate)...\n')
     output_file = create_music_video(
-        args.mp3_file,
+        render_audio_path,
         video_files,
         selected_beats,  # Pass pre-processed beats
         output_file=output_file,

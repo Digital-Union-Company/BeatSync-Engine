@@ -661,10 +661,15 @@ def test_the_fallback_hoist_preserves_the_short_circuit_and_adds_no_lifecycle():
     # the old inline form is gone
     assert "or audio_mixdown.probe_duration(local_audio_path)" not in body
     # and cancellation behaviour is untouched: this call never took a lifecycle and still does not
+    #
+    # [FUN R10] The argument is now `render_audio_path`, which is the `local_audio_path` OBJECT
+    # itself at 1x and the repeated master above it. That is a correctness fix for this defensive
+    # fallback rather than a change to it: probing the original would have trimmed a repeated mix
+    # back to ONE repetition. The call still takes no lifecycle, which is what this test is about.
     calls = [ast.unparse(n) for n in ast.walk(_gui_func("_process_video_impl"))
              if isinstance(n, ast.Call)
              and ast.unparse(n.func) == "audio_mixdown.probe_duration"]
-    assert calls == ["audio_mixdown.probe_duration(local_audio_path)"], calls
+    assert calls == ["audio_mixdown.probe_duration(render_audio_path)"], calls
 
 
 # ===========================================================================

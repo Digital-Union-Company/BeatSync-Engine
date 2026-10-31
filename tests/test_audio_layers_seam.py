@@ -237,13 +237,24 @@ def test_the_same_beats_and_beat_info_are_handed_to_the_renderer():
 
 
 def test_render_audio_path_starts_as_the_original_and_only_voice_changes_it():
+    """**Amended by FUN R10 (Repeat Music).** The render's starting audio is now the repeated master
+    when one was built and the operator's own file when one was not, so the first assignment is an
+    expression rather than a bare name. The property this test exists for is unchanged and is
+    asserted more precisely below: with **no repeat** the expression resolves to the
+    `local_audio_path` OBJECT itself — not an equal copy — and voice is still the only thing that
+    reassigns the name afterwards.
+    """
     source = body_source("_process_video_impl")
-    assert "render_audio_path = local_audio_path" in source
-    # the only reassignment is inside the voice branch
+    assert "render_audio_path = repeated_master_path or local_audio_path" in source
+    # still exactly two assignments, and the second one is still the voice/SFX mixdown's
     assignments = [line.strip() for line in source.splitlines()
                    if line.strip().startswith("render_audio_path =")]
-    assert assignments == ["render_audio_path = local_audio_path",
+    assert assignments == ["render_audio_path = repeated_master_path or local_audio_path",
                            "render_audio_path = mixed_master_path"]
+    # `repeated_master_path` is `None` on a 1x render, which is what makes the expression above
+    # identity-preserving rather than merely equal. Evaluated, not reasoned about.
+    original = object()
+    assert (None or original) is original
 
 
 def test_every_audio_layer_step_is_behind_a_voice_guard():
@@ -342,13 +353,20 @@ def test_no_silent_fallback_to_the_original_music_on_failure():
 
 
 def test_the_master_is_written_into_the_session_dir():
-    """Never `get_processing_dir()`, which `create_music_video` clears at startup."""
+    """Never `get_processing_dir()`, which `create_music_video` clears at startup.
+
+    **Amended by FUN R10 (Repeat Music):** the mixdown layers onto `render_audio_path`, which is the
+    repeated master above 1x and the `local_audio_path` object itself at 1x. The claim this test
+    carries is "voice is layered onto the MUSIC BEING RENDERED, never onto a mixed master", and
+    `render_audio_path` is exactly that name — the test above pins its only two assignments, so it
+    can never silently become the mixed master here.
+    """
     impl = func("_process_video_impl")
     for node in ast.walk(impl):
         if isinstance(node, ast.Call) and "build_mixed_master" in ast.unparse(node.func):
             kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
             assert kwargs["session_dir"] == "session_dir"
-            assert kwargs["music_path"] == "local_audio_path"
+            assert kwargs["music_path"] == "render_audio_path"
             break
     else:
         raise AssertionError("build_mixed_master is not called")
@@ -602,7 +620,11 @@ def _audio_region_statements() -> list:
                 and getattr(node.value, "value", None) == ""):
             picked.append(node)
         elif isinstance(node, ast.Assign) and ast.unparse(node) in (
-                "prepared_voices = ()", "render_audio_path = local_audio_path",
+                "prepared_voices = ()",
+                # [FUN R10] the render's starting audio is now an expression; `repeated_master_path`
+                # is bound to `None` in the prologue below, so the extracted region still exercises
+                # the 1x path these report-lifecycle cases are about.
+                "render_audio_path = repeated_master_path or local_audio_path",
                 "sfx_placements = ()"):
             picked.append(node)
         elif isinstance(node, ast.If) and ast.unparse(node.test) in (
@@ -632,6 +654,9 @@ def _compile_audio_block():
     statements = _audio_region_statements()
     prologue = ast.parse(
         "mixed_master_path = None\naudio_plan = None\n"
+        # [FUN R10] `None` means "this render did not repeat the music", which is the path every
+        # case in this suite is about: the report lifecycle is identical at every repeat count.
+        "repeated_master_path = None\n"
         "smart_mix_plan = None\nsmart_mix_active = False\nprepared_voices = ()").body
     epilogue = ast.parse(
         "return render_audio_path, session_state[AUDIO_LAYERS_REPORT_KEY], audio_plan").body

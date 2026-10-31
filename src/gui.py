@@ -278,6 +278,13 @@ from starlette.middleware import Middleware
 # deferred into the handlers.
 from beatsync_fork import raw_cutter_batch as fork_cutter_batch
 import audio_mixdown
+# [FORK] Digital-Union (FUN R10 Repeat Music): the two halves of "play the song N times". The pure
+# one owns the control, the repeated geometry and the whole timeline extension; the runtime one owns
+# the single FFmpeg decode-and-concatenate that produces the temporary repeated master. Imported
+# here at module scope beside `audio_mixdown`, which is its closest structural sibling — same
+# pure/runtime split, same `session_dir` scratch ownership, same loud-failure discipline.
+from beatsync_fork import music_repeat as fork_music_repeat
+import music_repeater
 
 #: [FORK] Digital-Union (Audio Layers V1 / D): where the placement read-out rides between the
 #: worker and the generator. It lives in `session_state` as ordinary render bookkeeping — the
@@ -2066,6 +2073,19 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
                        # existing caller — production and test — stays valid and no positional
                        # argument moved. `None` means no section rules, i.e. today's render.
                        freestyle: object | None = None,
+                       # [FORK] Digital-Union (FUN R10 Repeat Music): an ALREADY-NORMALISED 1..30
+                       # repeat count, resolved at the render boundary in
+                       # `_process_video_guarded_unlocked` exactly as the creative profile and both
+                       # mix configs are. Appended with the legacy default, and placed BEFORE
+                       # `lifecycle` because the C3-R1A cancellation seam requires `lifecycle` to
+                       # stay the LAST parameter of every seam it threads through.
+                       #
+                       # `1` is not a neutral value of a new code path -- it is the ONLY value for
+                       # which none of the repeat code below runs at all. Every statement this
+                       # feature adds sits behind `if music_repeat > 1:`, so a 1x render resolves no
+                       # new module, builds no file, rebuilds no array and takes exactly the
+                       # statements it took before.
+                       music_repeat: int = 1,
                        # [FORK] Digital-Union (C3-R1A): appended LAST with a default, same reasoning.
                        # `None` preserves today's exact behaviour -- no boundary check anywhere
                        # below ever fires, and RENDER_OUTCOME_KEY is still written truthfully.
@@ -2081,6 +2101,12 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
     # early-return paths.
     mixed_master_path = None
     audio_plan = None
+    # [FORK] Digital-Union (FUN R10 Repeat Music): declared before the `try` for exactly the reason
+    # `mixed_master_path` is -- the `finally` below discards it on every path, including the early
+    # returns -- and it doubles as the "did this render repeat the music?" fact the render-audio
+    # expression below reads. `None` on a 1x render, which is what keeps that expression resolve to
+    # the original path OBJECT rather than to an equal copy of it.
+    repeated_master_path = None
     # [FORK] Digital-Union (Smart Mix V1 / E): same lifetime, same reason — the success panel asks
     # afterwards whether any SFX was actually used.
     smart_mix_plan = None
@@ -2301,8 +2327,77 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             freestyle=freestyle,
             lifecycle=lifecycle,
         )
-        beat_times = beat_info.get('times', selected_beats)
         _stage5_summary(console_logger, beat_info.get("video_analysis"))
+
+        # [FORK] Digital-Union (FUN R10 Repeat Music): the ONE place the music becomes longer.
+        #
+        # Note what has already happened above: `analyze_beats_auto` was handed `local_audio_path`
+        # — the ORIGINAL music, once — so the beat grid, the features, the sections, the cut
+        # selection, Stage 5 and the whole Qwen pass were all decided before a repeat count existed
+        # as a value anywhere in this function. That ordering is the feature's architecture:
+        #
+        #   * Stages 1-5 run ONCE however many repetitions were asked for;
+        #   * the repeat count therefore cannot reach a Qwen request, the Stage-5 prompt, a
+        #     persisted record or any cache signature -- there is no route, not merely no call;
+        #   * `audio_visual_profile` is already finished and is deliberately left describing the
+        #     TRACK, which is what it has always described.
+        #
+        # The audio master is built FIRST and the analysis is extended against its MEASURED cycle
+        # length, never against the analysis window's own `len(y) / sr`. The two differ by well
+        # under a millisecond, but `create_music_video` derives the frame-locked timeline from the
+        # rendered file's duration, so stamping 30 cycles from the other number would accumulate
+        # that difference into real drift.
+        if music_repeat > 1:
+            if event_callback is not None:
+                event_callback(ProgressEvent(
+                    stage=6, kind=EventKind.STATE,
+                    message=f"Preparing repeated music ({music_repeat}x)",
+                    data={"phase": "music_repeat", "repeat": int(music_repeat)}))
+            try:
+                repeated = music_repeater.build_repeated_music(
+                    music_path=local_audio_path,
+                    repeat=music_repeat,
+                    session_dir=session_dir,
+                    lifecycle=lifecycle,
+                )
+            except music_repeater.MusicRepeatError as exc:
+                # UNKNOWN_FATAL, and fail-closed on purpose. A repeat failure is a timeout, a
+                # non-zero FFmpeg, a missing/empty master or a duration mismatch on this render's
+                # OWN generated artifact, and this repository has no structured FFmpeg diagnostic
+                # classification able to tell "the binary is broken" from "this disk is full". The
+                # inputs are batch-frozen (the music file and one repeat count), so nothing here is
+                # candidate-local either -- but SHARED_FATAL would be a claim that every remaining
+                # candidate must fail, and a transient disk condition is not that. Conservative
+                # wins; a C3 batch stops and reports rather than guessing.
+                #
+                # There is deliberately NO fallback to one repetition: finishing a three-minute
+                # video for an operator who asked for fifteen minutes is a plausible-looking render
+                # that silently ignored the request, which is precisely what Audio Layers refuses
+                # to do for voice.
+                session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
+                return None, f'❌ Repeat Music: {exc}', session_state
+            repeated_master_path = repeated.path
+            # The extension is pure and returns NEW containers: `beat_info` is rebound rather than
+            # mutated, so the analysis result the pipeline produced (and the process-local Stage-3
+            # cache entry behind it) stays exactly as it was.
+            selected_beats, beat_info = fork_music_repeat.extend_beat_info(
+                selected_beats, beat_info, repeated.repeat, repeated.cycle_seconds)
+            if console_logger:
+                console_logger.line(
+                    f"Repeat Music: {repeated.describe()} "
+                    f"({len(selected_beats)} cuts over {music_repeat} repetitions, "
+                    f"prepared in {repeated.prepare_seconds:.1f}s)")
+            if event_callback is not None:
+                event_callback(ProgressEvent(
+                    stage=6, kind=EventKind.STATE,
+                    message=(f"Repeated music ready: {repeated.describe()} · "
+                             f"{len(selected_beats)} planned cuts"),
+                    data={"phase": "music_repeat", "repeat": int(repeated.repeat),
+                          "cycle_seconds": float(repeated.cycle_seconds),
+                          "total_seconds": float(repeated.total_seconds),
+                          "planned_cuts": int(len(selected_beats))}))
+
+        beat_times = beat_info.get('times', selected_beats)
 
         # [FORK] Digital-Union (Audio Layers V1 / D): the ONE audio substitution, and the only
         # place voice touches the render.
@@ -2315,7 +2410,14 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # With no voice clips and no SFX this branch does nothing at all: no planner, no FFmpeg, no
         # temporary file, and `render_audio_path` is still the exact original path. That is a
         # structural branch, not a mixed-but-equivalent WAV.
-        render_audio_path = local_audio_path
+        #
+        # [FORK] Digital-Union (FUN R10 Repeat Music): the music the render starts from is the
+        # repeated master when there is one and the operator's own file when there is not. At 1x
+        # `repeated_master_path` is `None`, so this resolves to the `local_audio_path` OBJECT
+        # itself — not an equal copy — which is what keeps "no voice, no repeat" the exact legacy
+        # path at the render boundary rather than an equivalent one. Voice/SFX then layer onto
+        # whichever of the two this is, which is why the mixdown's `music_path` is this name.
+        render_audio_path = repeated_master_path or local_audio_path
 
         # [FORK] Digital-Union (Smart Mix V1 / E): SFX are planned HERE, from the finished
         # `beat_info` — after the analysis, never before it and never fed back into it. The pure
@@ -2366,13 +2468,21 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
             music_duration = float(beat_info.get('audio_duration') or 0.0)
             if not music_duration:
                 try:
-                    music_duration = audio_mixdown.probe_duration(local_audio_path)
+                    # [FORK] FUN R10: the repeated master when there is one, so a fallback that did
+                    # somehow fire would trim the mix to the WHOLE music rather than to one
+                    # repetition of it. At 1x this is the `local_audio_path` object itself.
+                    music_duration = audio_mixdown.probe_duration(render_audio_path)
                 except audio_mixdown.AudioProbeError as exc:
                     session_state[RENDER_OUTCOME_KEY] = RenderOutcomeKind.UNKNOWN_FATAL
                     return None, f'❌ Audio Layers: {exc}', session_state
             try:
                 mixed_master_path, audio_plan = audio_mixdown.build_mixed_master(
-                    music_path=local_audio_path,
+                    # [FORK] FUN R10: the music being layered onto — the repeated master above 1x,
+                    # the operator's own file at 1x (the same object). `music_duration` and
+                    # `beat_times`/`sections` above come from the same extended bus, so voice and
+                    # SFX are placed against the FULL timeline rather than against the first
+                    # repetition, which is the whole of requirement 7.
+                    music_path=render_audio_path,
                     music_duration=music_duration,
                     beat_times=beat_times,
                     sections=fork_audio_mix.project_sections(beat_info.get('sections')),
@@ -2644,6 +2754,23 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         diagnostics = _scale_diagnostics_block(verification_seconds, beat_info)
         if diagnostics:
             status_msg = f"{status_msg}\n\n{diagnostics}"
+        # [FORK] Digital-Union (FUN R10 Repeat Music): one line, and ONLY when the music was
+        # actually repeated — a 1x render's panel is character for character what it was.
+        #
+        # It is read back off the bus the pipeline just returned, through the pure module's single
+        # reader/formatter, rather than from `music_repeat` or any widget value: the panel must
+        # report what the render DID, and the measured cycle length is a fact only the prepared
+        # master knows. Nothing is recomputed, re-probed or re-derived here. Duck-typed access is
+        # deliberately not needed — `summary_line` answers `''` for every shape it does not
+        # recognise, including a pre-R10 bus.
+        #
+        # Behind the same `repeated_master_path` guard as every other statement this feature adds,
+        # so a 1x render resolves neither fork module; the LINE's content still comes only from the
+        # bus, never from the guard.
+        if repeated_master_path:
+            repeat_summary = fork_music_repeat.summary_line(beat_info)
+            if repeat_summary:
+                status_msg = f"{status_msg}\n\n{repeat_summary}"
         # [FORK] Digital-Union (Audio Layers V1 / D): one concise line, and ONLY when voice was
         # actually used — a render without voice keeps the existing panel character for character.
         if audio_plan is not None and prepared_voices:
@@ -2749,6 +2876,17 @@ def _process_video_impl(audio_file: str, video_files: VideoFilesInput,
         # audio cache in V1 and a fresh uuid path per render, so nothing stale can be picked up
         # later. The original music and the user's voice files are never touched.
         audio_mixdown.discard_master(mixed_master_path)
+        # [FORK] Digital-Union (FUN R10 Repeat Music): the repeated master has the same lifetime
+        # and the same reasoning — invocation-owned scratch in `session_dir`, discarded on success,
+        # on failure and on cancellation. The operator's own music file is never touched, and
+        # nothing is ever written into their Media Library.
+        #
+        # Guarded rather than relying on the helper's own `if not path: return`, so that a 1x render
+        # does not resolve this module at all: EVERY statement this feature adds to this function
+        # sits behind a repeat guard, which is what makes "1x is the legacy path" a structural
+        # property instead of a value coincidence. The helper stays total for its CLI caller.
+        if repeated_master_path:
+            music_repeater.discard_repeated_master(repeated_master_path)
 
 
 def process_video(audio_file: str, video_files: VideoFilesInput,
@@ -2764,6 +2902,12 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                  # render intent only — this function's worker thread, its synchronous join on
                  # generator close, the render mutex and the concurrency group are all untouched.
                  freestyle: object | None = None,
+                 # [FORK] Digital-Union (FUN R10 Repeat Music): an already-normalised 1..30 count,
+                 # threaded through untouched. This generator's worker thread, its synchronous join
+                 # on generator close, the render mutex and the concurrency group are all unchanged
+                 # — a longer render is a longer render, not a different lifecycle. Placed before
+                 # `lifecycle`, which the cancellation seam requires to stay last.
+                 music_repeat: int = 1,
                  # [FORK] Digital-Union (C3-R1A): appended last with a default, same reasoning.
                  # `None` preserves today's exact behaviour.
                  lifecycle: "RenderLifecycle | None" = None
@@ -2821,6 +2965,7 @@ def process_video(audio_file: str, video_files: VideoFilesInput,
                     sfx_root=sfx_root,
                     smart_mix=smart_mix,
                     freestyle=freestyle,
+                    music_repeat=music_repeat,
                     lifecycle=lifecycle,
                 )
         except RenderCancelled:
@@ -2945,6 +3090,35 @@ SOURCE_MODE_VALUES = {
     SourceMode.BROWSER_FILES.value: SourceMode.BROWSER_FILES,
     SOURCE_CHOICE_MEDIA_LIBRARY: SourceMode.LOCAL_FOLDER,
 }
+
+
+def _on_repeat_music_change(audio_file, repeat_value) -> str:
+    """[FORK] Digital-Union (FUN R10 Repeat Music): the pre-render "03:30 x 5 = 17:30" read-out.
+
+    Writes **one** read-only Markdown and nothing else. It is deliberately not a source or
+    preparation handler: the music file is not a video source, so this cannot clear a confirmation,
+    disable Create Music Video, start a scan or touch Media Library Preparation — and it writes no
+    execution widget either, so it cannot change what a render would do. The slider itself remains
+    the only execution authority for the repeat count.
+
+    The duration is probed, never guessed. `music_repeater.probe_duration` raises rather than
+    answering a fallback, and that is exactly what is wanted here: an unreadable file yields `None`
+    and the read-out says "load a music track" instead of multiplying an invented 10 seconds by 30
+    and showing the operator a confident wrong figure. Every failure is swallowed — a status line
+    must never be the thing that breaks the Render tab — and the probe is one short bounded ffprobe
+    read of a file the operator just selected.
+
+    Totality is the pure module's job: `estimate_markdown` handles `None`, 1x and 2x..30x itself,
+    so there is no formatting logic here.
+    """
+    duration = None
+    path = _as_existing_source_path(audio_file)
+    if path:
+        try:
+            duration = music_repeater.probe_duration(path)
+        except Exception:
+            duration = None
+    return fork_music_repeat.estimate_markdown(duration, repeat_value)
 
 
 def _source_ui_updates(state) -> Tuple:
@@ -4038,6 +4212,20 @@ def _process_video_guarded_unlocked(audio_file: str,
                                     # test down with it. The literal cannot drift: a test asserts it
                                     # equals `audio_mix.DEFAULT_OVERFLOW_POLICY`.
                                     voice_overflow: str = 'strict',
+                                    # [FORK] Digital-Union (FUN R10 Repeat Music): the LIVE Repeat
+                                    # Music widget value, appended after R7.3's policy with the
+                                    # legacy default, for the identical reason — nothing is
+                                    # inserted, so no pre-existing positional index moves and a
+                                    # caller that omits it renders exactly as it did before.
+                                    #
+                                    # The literal `1` rather than
+                                    # `fork_music_repeat.DEFAULT_REPEAT` for the same reason
+                                    # `voice_overflow`'s default is the literal `'strict'`: several
+                                    # suites AST-extract this function and exec it against a
+                                    # synthesised namespace where the fork modules are stubs, so a
+                                    # default that dereferences a real module raises at def-time. A
+                                    # test pins the literal equal to the real constant.
+                                    repeat_music=1,
                                     lifecycle: "RenderLifecycle | None" = None
                                     ) -> Iterator[GuardedResult]:
     """Re-verify the confirmed source set against the LIVE controls, then delegate to the pipeline.
@@ -4166,6 +4354,24 @@ def _process_video_guarded_unlocked(audio_file: str,
         sfx_level_percent=sfx_level,
     )
 
+    # [FORK] Digital-Union (FUN R10 Repeat Music): the raw Repeat Music widget value is normalised
+    # HERE, at the same render boundary the creative profile and both mix configs use, so nothing
+    # downstream ever sees an untrusted widget value and `_process_video_impl` branches on a plain
+    # int it can trust. Nothing here can raise: `normalize_repeat` is total.
+    #
+    # The `!= 1` pre-check is the explicit legacy branch this repository prefers over "the new code
+    # with a neutral value" — at exactly 1 nothing is resolved, nothing is normalised and the value
+    # threaded onward is the integer `1`. Every other value, valid or malformed, goes through the
+    # ONE normaliser, so there is no second interpretation of what a repeat count means.
+    #
+    # Like the creative controls and the audio levels this is a render-request input and NOT video
+    # source identity: it is wired into no source handler, so changing it cannot clear a
+    # confirmation, start a scan or touch Media Library Preparation. It is likewise not analysis
+    # input — see `_process_video_impl`, where it is first read *after* Stage 5 has returned.
+    music_repeat = 1
+    if repeat_music != 1:
+        music_repeat = fork_music_repeat.normalize_repeat(repeat_music)
+
     # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): `process_video` keeps its
     # existing 3-value streaming contract — video, status, session_state — and this handler projects
     # each yield onto the five Gradio outputs by appending the two read-outs that
@@ -4194,6 +4400,7 @@ def _process_video_guarded_unlocked(audio_file: str,
         sfx_root=sfx_folder,
         smart_mix=smart_mix,
         freestyle=freestyle,
+        music_repeat=music_repeat,
         lifecycle=lifecycle,
     )
     try:
@@ -4809,6 +5016,17 @@ def process_video_guarded(audio_file: str,
                           voice_music_return: float = fork_audio_mix.DEFAULT_MUSIC_RETURN_SECONDS,
                           # [FORK] R7.3: appended last, same discipline again.
                           voice_overflow: str = fork_audio_mix.DEFAULT_OVERFLOW_POLICY,
+                          # [FORK] Digital-Union (FUN R10 Repeat Music): appended last, same
+                          # discipline again — so every pre-existing positional index in the
+                          # `process_btn.click(inputs=...)` contract is unchanged.
+                          #
+                          # An integer LITERAL, not `fork_music_repeat.DEFAULT_REPEAT`. This
+                          # function is AST-extracted and exec'd by the progress-seam suite against
+                          # a synthesised namespace in which the fork modules are stubs, so a
+                          # default that dereferenced the real module raises at def-time — measured,
+                          # not assumed: the first draft used the constant and took that suite down.
+                          # A test pins the literal equal to the real constant so it cannot drift.
+                          repeat_music=1,
                           ) -> Iterator[GuardedResult]:
     """The single-render entry point: take the render mutex, then run the shared gated core.
 
@@ -4866,6 +5084,8 @@ def process_video_guarded(audio_file: str,
             voice_auto_balance=voice_auto_balance,
             voice_music_return=voice_music_return,
             voice_overflow=voice_overflow,
+            # [FORK] FUN R10: the live Repeat Music value, normalised inside the core.
+            repeat_music=repeat_music,
         )
         # [FORK] Digital-Union (C3-R1A): the ONE place this single render's lifecycle reaches a
         # terminal state -- derived from the typed outcome `_process_video_impl` recorded, not from
@@ -4934,6 +5154,21 @@ def render_selected_variants_guarded(
         # function is AST-extracted and exec'd by the batch-behaviour suites against a namespace
         # where `fork_audio_mix` is a stub.
         voice_overflow: str = 'strict',
+        # [FORK] Digital-Union (FUN R10 Repeat Music): the repeat count, appended LAST with the
+        # legacy default so no existing positional index moves. It is threaded here as well as into
+        # the single-render path on purpose: a repeat count is *shared render intent*, exactly like
+        # the audio file, the source set, the encoder and the output profile — not a candidate
+        # value. So it is read from THIS handler's own submitted arguments once, before the
+        # candidate loop, and never from a `CreativeRecipe` or an `AudioRecipe`. Every selected
+        # candidate therefore renders the same number of repetitions while keeping its own creative
+        # settings, and an operator who nudges the slider mid-batch cannot reach candidate 3.
+        #
+        # An integer LITERAL, for the same reason `voice_overflow`'s default is the literal
+        # `'strict'`: this function is AST-extracted and exec'd by the batch-behaviour suites
+        # against a namespace where the fork modules are stubs, so a default that dereferenced
+        # `fork_music_repeat` would raise at def-time. A test pins it equal to
+        # `music_repeat.DEFAULT_REPEAT`.
+        repeat_music=1,
         ) -> Iterator[Tuple]:
     """Render the 2-4 selected candidates, one after the other. C3-R0 -> C3-R1B-b.
 
@@ -5042,6 +5277,11 @@ def render_selected_variants_guarded(
                         session_state, source_state,
                         batch_freestyle,
                         voice_overflow=voice_overflow,
+                        # [FORK] FUN R10: this handler's OWN frozen argument, never a recipe field.
+                        # A batch that rendered candidate 1 at 5x and candidate 2 at whatever the
+                        # slider had drifted to would make the comparison meaningless — the whole
+                        # point of comparing candidates is that only the creative settings differ.
+                        repeat_music=repeat_music,
                         lifecycle=lifecycle)
             try:
                 for video, status, state, _a_report, _s_report, _invocation_id in candidate_stream:
@@ -9374,6 +9614,34 @@ def create_ui() -> gr.Blocks:
                                 # button is worth. The measurement, the exact exception and the
                                 # rejected options are in `tests/test_render_music_input.py`.
                                 audio_input = gr.File(label=LABEL_AUDIO_FILE, file_types=['.mp3', '.wav', '.flac'], type='filepath', height=110, elem_id='audio-file-input')
+                                # [FORK] Digital-Union (FUN R10 Repeat Music): directly below the
+                                # Audio File control it modifies, because it is a property of the
+                                # MUSIC and not of the video settings in the next column.
+                                #
+                                # A `gr.Slider` with `step=1` rather than a `gr.Number`: the range
+                                # is small, closed and fully meaningful end to end, so dragging is
+                                # the natural gesture and no value outside 1..30 can be typed in
+                                # the first place. (`normalize_repeat` still clamps, because a
+                                # queued event or an API call can supply anything.) It stays one
+                                # row high, which matters here — Create Music Video has to remain
+                                # above the fold at 1440x900.
+                                repeat_music = gr.Slider(
+                                    minimum=fork_music_repeat.MIN_REPEAT,
+                                    maximum=fork_music_repeat.MAX_REPEAT,
+                                    step=1,
+                                    value=fork_music_repeat.DEFAULT_REPEAT,
+                                    label=LABEL_REPEAT_MUSIC,
+                                    info=INFO_REPEAT_MUSIC,
+                                    elem_id='repeat-music-slider',
+                                )
+                                # Read-only estimate: "03:30 x 5 = 17:30", plus the long-render and
+                                # temporary-disk warning. A Markdown rather than a Textbox so the
+                                # figures can be emphasised and so it occupies no input slot the
+                                # operator could type into.
+                                repeat_music_estimate = gr.Markdown(
+                                    REPEAT_MUSIC_ESTIMATE_INITIAL,
+                                    elem_id='repeat-music-estimate',
+                                )
                                 # [FORK] Digital-Union: local-folder mode + authoritative confirmation gate.
                                 with gr.Group():
                                     # [FORK] R8 Phase 10: the group heading names the control,
@@ -12284,6 +12552,11 @@ def create_ui() -> gr.Blocks:
                 # from this click and never from a candidate recipe, so the batch and a single
                 # render of the same screen agree about what happens when a clip does not fit.
                 voice_overflow,
+                # [FORK] Digital-Union (FUN R10 Repeat Music): appended after the policy for the
+                # same reason and frozen the same way — one repeat count for the whole batch, read
+                # from this click and never from a candidate recipe. Comparing candidates is only
+                # meaningful when the thing that differs between them is their creative settings.
+                repeat_music,
             ],
             outputs=[video_output, status_output, session_state, render_batch_summary,
                      render_invocation_state],
@@ -12462,6 +12735,31 @@ def create_ui() -> gr.Blocks:
             outputs=[sample_report],
         )
 
+        # [FORK] Digital-Union (FUN R10 Repeat Music): the estimate read-out, from the two values
+        # it describes. Two registrations of ONE handler, because either input changes the answer.
+        #
+        # `outputs` is exactly `[repeat_music_estimate]` and that is the contract: these handlers
+        # write no execution widget, no source widget, no confirmation widget and no state object,
+        # so neither selecting a music file nor moving the slider can clear a confirmed source set
+        # or change what a render would do. No `concurrency_id` — one bounded ffprobe read is not a
+        # render and must never queue behind one. `concurrency_limit=None` for the measured S2-A R3
+        # reason: on the pinned gradio a full concurrency group leaves the event QUEUED rather than
+        # delivering it.
+        repeat_music.change(
+            fn=_on_repeat_music_change,
+            inputs=[audio_input, repeat_music],
+            outputs=[repeat_music_estimate],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+        audio_input.change(
+            fn=_on_repeat_music_change,
+            inputs=[audio_input, repeat_music],
+            outputs=[repeat_music_estimate],
+            show_progress='hidden',
+            concurrency_limit=None,
+        )
+
         # [FORK] Digital-Union: the live source controls are inputs to the render request, so the
         # gate validates what the widgets currently declare rather than possibly-stale gr.State.
         process_btn.click(
@@ -12501,6 +12799,13 @@ def create_ui() -> gr.Blocks:
                 # [FORK] R7.3: appended after R7.1's pair, in both the click list and the handler
                 # signature together, so no pre-existing positional index moved.
                 voice_overflow,
+                # [FORK] Digital-Union (FUN R10 Repeat Music): appended after R7.3's policy, in
+                # both places together, for the identical reason. It is a LIVE input for the same
+                # reason the source controls are — the click must act on the repeat count that is
+                # on screen, not on a `gr.State` that a queued slider event may not have reached
+                # yet. The estimate read-out is an output of its own handler and is deliberately
+                # absent here.
+                repeat_music,
             ],
             # [FORK] Digital-Union (Audio Layers V1 / D, R1-B; Smart Mix V1 / E): both read-outs are
             # written here and nowhere else. They are outputs only — never inputs, never source or

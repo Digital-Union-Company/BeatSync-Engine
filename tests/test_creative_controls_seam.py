@@ -1284,10 +1284,17 @@ def test_the_cli_builds_one_profile_and_hands_it_to_analyze_beats_auto():
 
 
 def test_the_cli_filename_rule_is_still_the_seed_rule():
-    """`--seed 101` keeps adding `_seed101`; the three new flags add nothing to the name."""
-    body = _body_code(_func(_tree(_VP), "main"))
+    """`--seed 101` keeps adding `_seed101`; the three new flags add nothing to the name.
+
+    **Amended for FUN R10.** The naming block now lives in `_main_render`, the unchanged tail of
+    `main()` lifted verbatim so the repeated master's lifetime can be a `try/finally` around it. The
+    rule itself is byte-for-byte what it was, and `--repeat-music` deliberately contributes nothing
+    to the filename — only the Variation Seed ever has.
+    """
+    body = _body_code(_func(_tree(_VP), "_main_render"))
 
     assert "cli_creative.filename_suffix()" in body
+    assert "repeat" not in body
     for control in _NEW_CONTROLS:
         assert f"{control}_suffix" not in body
     for density in (0, 50, 100):
@@ -1297,12 +1304,19 @@ def test_the_cli_filename_rule_is_still_the_seed_rule():
 
 
 def test_no_new_cli_mode_was_added():
-    """Three optional creative flags, and nothing else: no new subcommand, no new mode."""
+    """Optional flags only: no new subcommand, no new mode.
+
+    **Amended for FUN R10**, which added `--repeat-music` under the identical discipline the six
+    creative flags follow: optional, `default=None`, **no argparse `type=`** so the value goes
+    through the feature's own normaliser instead of aborting the run inside argparse. It is a flag,
+    not a mode — there is still exactly one CLI invocation shape, and the list is extended by review
+    rather than relaxed to a containment check.
+    """
     flags = {flag for flag in _cli_flag_literals() if flag.startswith("--")}
     expected = {"--seed", "--cut-density", "--energy-response", "--motion-bias",
                 "--source-diversity", "--micro-cuts", "--semantic-emphasis",
                 "--output", "--start-time", "--end-time", "--lossless", "--gpu",
-                "--gpu-encoder", "--fps"}
+                "--gpu-encoder", "--fps", "--repeat-music"}
 
     assert flags == expected, (
         f"unexpected: {sorted(flags - expected)}; missing: {sorted(expected - flags)}")

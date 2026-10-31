@@ -1067,6 +1067,10 @@ _RENDER_CLICK_INPUTS = [
     # [R7.3] The voice-overflow policy, appended after R7.1's pair in both places together, for
     # the same reason.
     "voice_overflow",
+    # [FUN R10] Repeat Music, appended after R7.3's policy in both places together, again for the
+    # same reason. It is render-request state in exactly the sense this list is about: it is read at
+    # click time and describes the video to produce, not which library has been prepared.
+    "repeat_music",
 ]
 
 
