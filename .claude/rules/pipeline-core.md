@@ -12,7 +12,9 @@ paths:
   - "src/paths.py"
   - "src/gpu_cpu_utils.py"
   - "src/beatsync_fork/ffmpeg_diagnostics.py"
+  - "src/beatsync_fork/frame_lock.py"
   - "tests/test_ffmpeg_diagnostics.py"
+  - "tests/test_frame_lock.py"
   - "tests/test_stage6_diagnostic_seam.py"
   - "tests/test_stage6_score_precompute.py"
 ---
@@ -263,6 +265,164 @@ never with floating-point `-t` alone.
 Corollary, in `create_music_video`: if any clip fails to extract, it **raises** rather than concatenating
 a short timeline. Dropping one segment silently desynchronizes every later cut. Don't "fix" this by skipping.
 
+### A segment requesting N frames produces N, or fails (FUN R10 Final Frame Fix)
+
+The invariant above was the *plan*. It was not enforced on the *result*: `rc=0` plus a non-empty MP4
+was the whole acceptance test, so a short segment reported success. One did, for as long as the
+extractor existed — **a clip flush against the end of its source lost its last frame**, which a
+3× / 720p25 render showed as 1499 frames instead of 1500. Pre-existing, reproduced on pristine
+`main` with its own extractor; Repeat Music only meets the case more often, because a longer
+timeline draws more clips from the same sources.
+
+**The cause is the seek, not the `fps` filter**, and that distinction cost measurements to
+establish. Accurate `-ss` snaps the window start *forward* to the first frame at or after the seek
+point, costing up to one **source** frame. Mid-file that is invisible — the window reaches one
+source frame further in and the frame is there. At the end of the source there is nothing past EOF
+to make it up with, so the shortfall survives the rate conversion. Given 35 input frames the `fps`
+filter produced 29 output frames every time; given 34 it produced 28. A smaller contributor rides
+along: the planner clamps `start_time` with the **unquantised** duration while the extractor extends
+the window to `frame_count / fps`, which can already overhang the source before the seek rounds.
+
+`beatsync_fork/frame_lock.py` owns the pure decisions — stdlib-only, so the arithmetic and the
+wording are testable on a bare interpreter. Load-bearing details:
+
+- **`-progress pipe:1` is the evidence, and it is free.** Both `_run_media_command` paths already
+  capture stdout, the extraction writes to a file so stdout is otherwise unused, and **stderr is
+  untouched** — it is `summarize_ffmpeg_failure`'s input and must stay that. `frame=` counts frames
+  *written to the output*, which is exactly what `-vframes` bounds. Do not move this to `pipe:2`.
+- **The parse is delegated to `media_sample.parse_progress_output`, not re-implemented.** Its
+  block-terminator semantics are the hardened ones: evidence comes from the **last completed block
+  alone**, so `frame=29 / progress=continue / progress=end` reports no count rather than inheriting
+  an earlier one. A stream whose final block is not `progress=end` is a truncated record, not a
+  smaller valid one, and yields **UNMEASURED**.
+- **Nothing acts on a single reading.** A non-exact progress count is confirmed against
+  `_probe_output_frame_count` — `stream=nb_frames`, **header only, never a decode** — before any
+  retry or refusal. Measured on the bundled build, that header agreed exactly with both the progress
+  count and a full `-count_frames` decode on every case in the defect matrix, which is why the cheap
+  read is allowed on a render path at all. It is consulted **only** when a clip is already suspect,
+  so the happy path costs zero extra processes.
+- **One corrected re-seek, bounded by `MAX_EXTRACTION_ATTEMPTS = 2`.** `recovery_seek` anchors on the
+  **end** of the source (`min(start, duration - needed)`, which undoes the overhang and never moves
+  a window that already fits) and then steps back **one source frame**. The margin is `1/source_fps`
+  and deliberately not `1/output_fps`: a 24 fps source feeding a 30 fps render needs 1/24 s of room.
+  `-vframes` still bounds the output, so a corrected window — which deliberately carries *more*
+  content than the segment needs — can never come back long.
+- **`None` from `recovery_seek` means report, never retry.** No earlier position exists when the
+  source is genuinely shorter than the segment or the window already starts at zero. Retrying the
+  same window is not a recovery, and a second extraction spent pretending it might be is waste.
+- **A re-seek is the remedy for a shortfall only.** A *long* segment is impossible under `-vframes`,
+  so it is evidence the output is not the planned segment; it is reported immediately, without
+  spending a retry, and the count is rendered **verbatim** rather than clamped to the request.
+- **An unmeasured count is not a failure.** If neither mechanism yields a number the segment keeps
+  its historical behaviour. Refusing on absent evidence would fail renders that are fine — a worse
+  outcome than the defect. Absence of evidence is not evidence, here as everywhere else in this repo.
+- **The repeated-frame answer was rejected on principle, not cost.** A real frame *can* be decoded
+  at EOF, so holding or duplicating the last one would manufacture a frame-exact timeline out of
+  content the source never contained. Do not add `tpad`, a `fps` fill mode or a CFR duplicate here.
+- **No parameter was added.** The measured shortfall *is* the trigger, so the extractor needs to be
+  told nothing in advance; a `source_duration` parameter would be a second source of truth for a
+  number the call site already probes. `extract_clip_segment_ffmpeg_detailed`'s signature is pinned
+  exactly by three suites, and `lifecycle` stays last.
+- **The first attempt's argv is unchanged apart from `-progress`.** `seek_time` starts at
+  `start_time`, so every previously-correct clip is extracted by the same command from the same
+  position. Verified: the 1× ordinary render's 600 coded frame checksums are identical to both the
+  accepted R10 baseline and pristine `main`, and its audio PCM SHA-256 matches to the byte.
+- **`extract_prores_segment_random` carried the identical defect** — same `-ss`, same
+  `trim=duration=exact_duration`, same `-vframes`, and the same `rc == 0` plus non-empty acceptance.
+  It verifies each attempt and gets the same single re-seek; its two pre-existing attempts (fast
+  intra-frame seek, then the safe accurate-seek fallback) are unchanged in order, argv and timeout.
+- **`create_clip_parallel` refuses a source too short for its planned segment.** Both branches clamp
+  the read to the source's real duration, which also shrank the *segment* — the extractor derives
+  its frame count from the duration handed to it, so such a clip was frame-exact for the window it
+  got and short for the slot it was planned into. The guard is **arithmetic only**: no probe, no
+  subprocess, no loop and no module-level helper, because that body is executed against a hand-built
+  namespace by `test_extraction_failure_context.py`, `test_render_cancellation.py` and
+  `test_frame_lock.py`, and a new name would be a `NameError` in all three. The ProRes path's
+  equivalent *can* call the shared `describe_truncated_plan`, and does; that asymmetry is deliberate.
+
+### And the timeline may not end PAST the audio (FUN R10 A/V End Alignment)
+
+The section above enforced the per-segment contract. The *timeline* was still asking for a frame it
+could never keep. `end_frame = seconds_to_frame_count(audio_duration, fps)` **rounds**, so music whose
+length is not a whole number of output frames produces a plan ending up to half a frame past the
+audio — and final assembly muxes with `-shortest`, which discards the overhang. Found in the owner's
+real 3× render: **20852 planned, 20850 published**, ending at 834.000000s under an audio master of
+834.063688s.
+
+**How much `-shortest` discards depends on the encoder, and that is the part worth not relearning:**
+
+```
+cpu        (libx264 ultrafast, no B-frames)   plan 501 / 1502  ->  500 / 1501   ONE frame
+h264_nvenc (B-frames, has_b_frames=2)         plan 501 / 1502  ->  499 / 1500   TWO frames
+```
+
+NVENC is the UI default, so the owner's render lost two. **Extraction was not at fault** — the same
+NVENC render on frame-aligned music published 500 of 500, so the per-segment guarantee held. Do not
+reach for the extractor when the end of a render is short; measure the plan against the audio first.
+
+**The correction is in two places, because the clamp alone only moved the problem.**
+`build_frame_aligned_cut_timeline` steps `end_frame` back by one frame when, and only when, it would
+otherwise end past the audio — and that flipped the sign of the gap rather than closing it, because
+`-shortest` then undercut the **audio** instead, by an inconsistent 0, 1 or 2 PCM packets (50.7 ms on
+a 60 s render, **77.3 ms** on a 14-minute one). So `create_music_video` also hands the plan's own
+length to `concatenate_videos_ffmpeg` as `timeline_seconds`, which becomes an output-side `-t` on each
+of the three audio-muxing branches:
+
+```
+before                 1500 frames   v 60.000000   a 60.063688   -63.7 ms
+clamp only             1501 frames   v 60.040000   a 59.989333   +50.7 ms
+clamp + -t at the plan 1501 frames   v 60.040000   a 60.040000     0.0 ms
+```
+
+Load-bearing details:
+
+- **`-shortest` is KEPT, not replaced.** It still covers the one case `-t` cannot — an audio file
+  shorter than the plan — and whichever is shorter wins. Dropping it measures *better* (see the
+  residual below) and is still not done here: the plan is derived from the probed audio duration, so
+  a container that over-reports (a CBR MP3 with no Xing header can be off by seconds) would give a
+  video with a silent tail instead of a truncated one, and truncating is the safer failure.
+- **The frame given up is exactly the one `-shortest` was discarding**, so a render on the previously
+  correct path publishes the same frames from the same segments; an NVENC render regains the one it
+  was losing. Verified with the whole correction in place: the 1× control's 600 coded frame checksums
+  are identical to the accepted baseline and its audio PCM SHA-256 is unchanged.
+- **Measured: `plan == published` at every rate and repeat count**, and at 25 fps video duration
+  equals audio duration across {cpu, nvenc} × {1×, 2×, 3×}. The clamp also makes
+  `render_info["timeline_frames"]` truthful; before it, the reported plan was a number the file never
+  carried.
+- **`timeline_seconds` sits before `lifecycle`**, which C3-R1A pins last, and defaults to `None` —
+  the previous behaviour exactly, so no other caller changed. It is `sum(segment_frames) / fps`, the
+  plan itself, never a re-probed duration: a second source of truth for the output length is how the
+  two ends drifted apart in the first place.
+- **Residual, measured and deliberately open: ~36 ms at 720p30.** At 30 fps the assembled segments'
+  mp4 `stts` deltas are not uniformly 512 ticks, so the concatenated video's container duration lands
+  ~125 ticks (8 ms) *below* `frames / fps`; `-t` then sits above the real video end, stops governing,
+  and `-shortest`'s audio undercut reappears — 1801 of 1801 frames but V−A = +35.7 ms, i.e. 1.07
+  frames. 25 fps does not show it. Dropping `-shortest` gives −8.3 ms and is the owner's call, per
+  the first bullet. Do not "fix" this by nudging `-t` below the plan: that discards the last frame
+  whenever the concat *is* exact, which is the defect this section opened with.
+- **It is arithmetic only, and calls nothing.** `tests/test_music_repeat.py` AST-extracts this
+  function and executes it against a namespace holding **only** `np` and `seconds_to_frame_count`, so
+  a `beatsync_fork.frame_lock` call or a module-level tolerance constant would be a `NameError` over
+  thirty parametrised cases. The epsilon is a literal for that reason, and a test pins the function's
+  free-name set rather than an allowlist of unparsed call text — which a chained call like
+  `np.asarray(...).reshape(-1)` defeats while saying nothing about the dependency.
+- **Inert whenever the audio is frame-aligned**, which is *every* fixture in this repository
+  (`music_20s.wav`, `music_4s.wav`, the 60 s control) at every profile rate. That, plus every profile
+  render having used the `cpu` path, is why nothing caught this: the condition needs music that does
+  not divide into frames **and** the default encoder. `media/music_overshoot.wav` in the R10 workspace
+  — the owner's music trimmed to 961 019 samples — reproduces it at 20 s.
+- **`-shortest` is kept.** Removing it would publish a video that outlasts its own music, which is
+  worse than the clamp and is not what "aligned" means. No frame is padded or duplicated and no audio
+  is re-timed; the audio tail `-shortest` trims is under one frame.
+- **The quantisation is untouched** — `np.rint` on absolute positions, segment lengths as frame
+  differences. Only the end boundary moved, and it can only ever move by one frame.
+
+**Known, measured, and deliberately not changed by this milestone:** `stage6_av_planner` floors
+`final_duration` at 0.05 s, so a 1-frame slot (0.033 s at 30 fps) arrives as 0.05 s and extracts as
+**2** frames. The extractor is exact for what it was asked; the surplus is absorbed by final
+assembly's `-shortest`, and measured final frame counts are exact at 1×/2×/3×/5×. Correcting the
+floor would change content in renders that are currently correct, so it is a separate item.
+
 ## Rendering modes
 
 `prores_proxy` takes a separate branch in `create_music_video`: sources are transcoded to intra-frame
@@ -270,7 +430,9 @@ ProRes 422 Proxy first, segments are cut serially, then concatenated with stream
 branch extracts clips in a `ThreadPoolExecutor` — capped by `_effective_clip_workers()` because
 simultaneous NVENC sessions contend for one hardware encoder. Final assembly tries concat stream-copy
 first and falls back to a full re-encode (`BEATSYNC_FAST_CONCAT_COPY`). Audio is always re-laid as
-`pcm_s24le` @ 48 kHz with `-shortest`, audio as master timeline.
+`pcm_s24le` @ 48 kHz with `-shortest` **plus an explicit `-t` at the frame-locked plan's own length**
+(FUN R10 A/V End Alignment, above — `-shortest` alone is imprecise by an inconsistent 0–2 PCM packets
+with stream copy, so it cannot be the only bound on where the output ends).
 
 **NVENC clips decode in software on purpose (Phase 3C).** `extract_clip_segment_ffmpeg_detailed` adds
 **no** input `-hwaccel` when `use_nvenc=True`; the CPU-encode branch keeps `-hwaccel auto`. So the NVENC

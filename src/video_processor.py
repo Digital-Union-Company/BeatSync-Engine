@@ -14,6 +14,7 @@ setup_environment()
 import argparse
 import random
 import shutil
+import tempfile
 from typing import TypeAlias, List, Dict, Tuple
 import numpy as np
 from pathlib import Path
@@ -67,6 +68,13 @@ from beatsync_fork import creative as fork_creative
 # unchanged in that case, so the historical path is not merely preserved but structurally
 # unreachable from a profile.
 from beatsync_fork import render_profiles as fork_render_profiles
+# [FORK] Digital-Union (FUN R10 Repeat Music): the two halves of "play the song N times" —
+# `--repeat-music` is the headless parity for the Render tab's slider. Only `main()` uses them:
+# `create_music_video` itself is untouched by this feature and still simply renders whatever audio
+# file it is handed over whatever beat array it is handed, which is exactly why no second render
+# engine was needed.
+from beatsync_fork import music_repeat as fork_music_repeat
+import music_repeater
 
 # Import mode modules
 from auto_mode import analyze_beats_auto
@@ -312,6 +320,19 @@ def parse_arguments() -> argparse.Namespace:
     # is the same normalisation the UI uses, so a malformed or out-of-range value falls back or
     # clamps identically instead of aborting the run inside argparse. Omitting all three leaves the
     # profile neutral, which is exactly today's behaviour.
+    # [FORK] Digital-Union (FUN R10 Repeat Music): headless parity with the Render tab's slider.
+    # No argparse `type=` and no custom type, exactly like the six creative flags above: the value
+    # goes through `music_repeat.normalize_repeat`, which is the same normalisation the UI uses, so
+    # a malformed or out-of-range value clamps or falls back identically instead of aborting the
+    # run inside argparse. Omitting it is byte-for-byte today's run.
+    parser.add_argument(
+        '--repeat-music',
+        default=None,
+        help=(f'Play the music N times and render a full-length video '
+              f'({fork_music_repeat.MIN_REPEAT}-{fork_music_repeat.MAX_REPEAT}); '
+              f'{fork_music_repeat.DEFAULT_REPEAT} = current BeatSync behaviour (default). '
+              f'Later repetitions get newly planned shots, not a looped copy.')
+    )
     for flag, control in (
         ('--cut-density', 'Sparse .. dense'),
         ('--energy-response', 'Weak .. strong target matching'),
@@ -386,7 +407,24 @@ def build_frame_aligned_cut_timeline(beat_times: BeatTimes, audio_duration: floa
 
     # Quantize ABSOLUTE cut positions, not per-segment durations. This removes
     # cumulative drift caused by round((beat[i+1] - beat[i]) * fps) on each clip.
+    #
+    # [FORK] Digital-Union (FUN R10 A/V End Alignment): the timeline may not end PAST the audio.
+    # `seconds_to_frame_count` ROUNDS, so music whose length is not a whole number of output frames
+    # yields an end up to half a frame beyond the audio -- and final assembly's `-shortest` then
+    # discards the overhang. Measured: ONE frame on a stream without B-frames, TWO on an NVENC
+    # stream carrying them, which is how a 3x/720p25 render of 834.063688s music planned 20852
+    # frames and published 20850. Planning that frame buys nothing (its extraction is thrown away)
+    # and leaves the published video up to 80ms short of its own music. Stepping the end back to the
+    # last frame that still ENDS within the audio makes the plan achievable while leaving the
+    # published frames identical. Arithmetic only, bounded to a single frame, and inert whenever the
+    # audio already is a whole number of frames -- which is every synthetic fixture, so this is not
+    # reachable from the existing acceptance renders. The epsilon absorbs float error at rates like
+    # 23.976 rather than knocking an exact multiple down a frame; it is a literal because this
+    # function is AST-extracted and executed against a two-name namespace by
+    # `tests/test_music_repeat.py`, where a module-level constant would be a `NameError`.
     end_frame = max(1, seconds_to_frame_count(audio_duration, fps))
+    if end_frame > 1 and end_frame / fps > audio_duration + 1e-9:
+        end_frame -= 1
     cut_frames = np.rint(raw_cut_times * fps).astype(int)
     cut_frames = np.clip(cut_frames, 0, end_frame)
     cut_frames[0] = 0
@@ -562,8 +600,36 @@ def create_clip_parallel(args):
             else:
                 clip_start = 0
                 source_duration = video_duration
-            
-        
+
+
+        # [FORK] Digital-Union (FUN R10 Final Frame Fix): the planned segment is never silently
+        # shortened.
+        #
+        # Both branches above clamp the read to the source's REAL probed duration, which is
+        # correct as far as it goes -- you cannot read content a file does not contain. What was
+        # missing is that the clamp also quietly shrinks the SEGMENT: the extractor derives its
+        # frame count from the duration handed to it, so a source shorter than its slot produced a
+        # clip that was frame-exact for the window it was given and short for the timeline it was
+        # planned into. `build_frame_aligned_cut_timeline` has already allocated that slot, so the
+        # shortfall shifts every later cut -- the exact failure the frame-lock invariant exists to
+        # prevent, arriving by the one route that reported success.
+        #
+        # So it is refused here, where both numbers are in scope, rather than absorbed. The
+        # extractor cannot make this call: it is handed the clamped duration and has no way to
+        # know what the plan wanted. Arithmetic only -- no probe, no subprocess, no retry and no
+        # loop, because `tests/test_extraction_failure_context.py` executes this body against a
+        # namespace holding only the names it uses and pins all four of those absences.
+        planned_frames = int(round(float(final_duration) * float(fps)))
+        available_frames = int(round(float(source_duration) * float(fps)))
+        if available_frames < planned_frames:
+            elapsed = time.perf_counter() - clip_started
+            detail = describe_failure(
+                f"Source is too short for its planned segment: it can supply {available_frames} "
+                f"of the {planned_frames} output frames the frame-locked timeline allocated "
+                f"(source duration {video_duration:.3f}s). Extracting the shorter clip would "
+                f"desynchronise every later cut, so it is refused rather than truncated.")
+            return (i, None, target_size, None, detail, elapsed)
+
         # Output file
         temp_clip_path = os.path.join(temp_dir, f"temp_clip_{i}_{uuid.uuid4().hex}.mp4")
         
@@ -929,6 +995,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 end_time=end_time,
                 use_nvenc=False,  # ProRes uses stream copy
                 temp_dir=session_temp_dir,
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): the frame-locked plan is the
+                # authority on the output's length, so the mux cuts both streams there instead of
+                # leaving it to `-shortest`, which is imprecise by an inconsistent 0-2 units.
+                timeline_seconds=float(sum(segment_frames)) / float(fps),
                 lifecycle=lifecycle
             )
         except RenderCancelled:
@@ -1215,6 +1285,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 gpu_encoder=gpu_encoder,
                 fps=fps,
                 temp_dir=session_temp_dir,
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): see the ProRes assembly above.
+                timeline_seconds=float(sum(segment_frames)) / float(fps),
                 lifecycle=lifecycle
             )
         except RenderCancelled:
@@ -1334,6 +1406,62 @@ def main() -> None:
 
     print(f'✓ Selected {len(selected_beats)} cuts for video')
 
+    # [FORK] Digital-Union (FUN R10 Repeat Music): the headless half of the feature, and the same
+    # three steps the GUI takes, in the same order and for the same reasons.
+    #
+    # It is deliberately AFTER `analyze_beats_auto`: the music is analysed ONCE, on the original
+    # file, so Stages 1-5 and the whole Qwen pass cost the same at 30x as at 1x and the repeat count
+    # has no route to Stage-5 cache identity. The repeated master is then built, and the analysis is
+    # extended against its MEASURED cycle length.
+    #
+    # The temporary master goes in the system temporary directory, which is this application's own
+    # scratch and is explicitly permitted for it. It is NOT `get_processing_dir()`, which
+    # `create_music_video` clears at the start of every render and would therefore delete moments
+    # after it was written, and it is never inside the repository, the operator's Media Library or
+    # anywhere near their music file — which is opened read-only and left exactly as it was.
+    repeat_music = fork_music_repeat.normalize_repeat(args.repeat_music)
+    # The CLI's `-s`/`-e` trim the ANALYSIS window, and combining that with a repeat has two
+    # incompatible readings: repeat the trimmed excerpt, or repeat the file and then trim the
+    # result. `create_music_video` would additionally re-apply the same window to the repeated
+    # master and clamp it straight back to one excerpt. Rather than pick a meaning the owner never
+    # asked for, the combination is REFUSED — loudly, before any work. The GUI has no trim controls,
+    # so Repeat Music is fully available there.
+    if repeat_music > fork_music_repeat.MIN_REPEAT and (args.start_time or args.end_time):
+        raise SystemExit(
+            '--repeat-music cannot be combined with -s/--start-time or -e/--end-time. '
+            'Trim the track to its own file first, then repeat that.')
+    repeat_dir = None
+    repeated_master = None
+    try:
+        if repeat_music > fork_music_repeat.MIN_REPEAT:
+            repeat_dir = tempfile.mkdtemp(prefix='beatsync_repeat_')
+            repeated_master = music_repeater.build_repeated_music(
+                music_path=args.mp3_file, repeat=repeat_music, session_dir=repeat_dir)
+            selected_beats, beat_info = fork_music_repeat.extend_beat_info(
+                selected_beats, beat_info, repeated_master.repeat,
+                repeated_master.cycle_seconds)
+            print(f'🔁 Repeat Music: {repeated_master.describe()} — '
+                  f'{len(selected_beats)} cuts over {repeat_music} repetitions '
+                  f'(prepared in {repeated_master.prepare_seconds:.1f}s)')
+        _main_render(args, video_files, selected_beats, beat_info, cli_creative,
+                     render_audio_path=(repeated_master.path if repeated_master
+                                        else args.mp3_file))
+    finally:
+        if repeated_master is not None:
+            music_repeater.discard_repeated_master(repeated_master.path)
+        if repeat_dir:
+            shutil.rmtree(repeat_dir, ignore_errors=True)
+
+
+def _main_render(args, video_files, selected_beats, beat_info, cli_creative,
+                 render_audio_path: str) -> None:
+    """[FORK] Digital-Union (FUN R10): the unchanged tail of `main()`, lifted verbatim.
+
+    Extracted only so the repeated master's lifetime can be a `try/finally` around it; the body
+    below is the original code with exactly one substitution — the audio file handed to
+    `create_music_video` is the repeated master when there is one, and `args.mp3_file` when there
+    is not, in which case it is the same string the original passed.
+    """
     output_file = args.output
     # [FORK] Digital-Union (Phase A): a variation render is identifiable by its filename; a legacy
     # (seed 0) render keeps exactly the name it has today. The three newer controls deliberately
@@ -1353,7 +1481,7 @@ def main() -> None:
  
     print(f'\n🎬 Starting video creation (frame-accurate)...\n')
     output_file = create_music_video(
-        args.mp3_file,
+        render_audio_path,
         video_files,
         selected_beats,  # Pass pre-processed beats
         output_file=output_file,

@@ -226,16 +226,29 @@ def test_the_failure_tuple_carries_the_reason(processor_tree):
         and n.value.elts[1].value is None
     ]
     assert failure_returns, "the (i, None, ...) failure tuple must still exist"
-    error_field = ast.unparse(failure_returns[0].value.elts[4])
-    assert error_field == "detail", error_field
+    # EVERY failure exit carries the describer's output, not just the first one. FUN R10 added a
+    # second refusal (a source too short for its planned segment), so this is asserted over all of
+    # them rather than over `failure_returns[0]` -- which was only ever the extraction failure
+    # because it happened to come first in source order.
+    for node in failure_returns:
+        assert ast.unparse(node.value.elts[4]) == "detail", ast.unparse(node)
 
     # `detail` keeps the historical wording as a prefix and appends the reason.
     assigns = [ast.unparse(n) for n in ast.walk(fn)
                if isinstance(n, ast.Assign)
                and any(isinstance(t, ast.Name) and t.id == "detail" for t in n.targets)]
     assert assigns, "detail must be built explicitly"
-    assert "FFmpeg extraction failed" in assigns[0]
-    assert "reason" in assigns[0]
+    # Located by its content, not by its position: the extraction-failure detail is the one that
+    # wraps FFmpeg's own reason, and that pairing is the property Phase 3B bought.
+    extraction = [a for a in assigns if "FFmpeg extraction failed" in a]
+    assert len(extraction) == 1, assigns
+    assert "reason" in extraction[0]
+    # [FUN R10 Final Frame Fix] and the new refusal is a DISTINCT detail, not a reworded reuse of
+    # the extraction one: a source too short for its slot never reached FFmpeg, so describing it as
+    # an extraction failure would name a cause that did not happen.
+    truncated = [a for a in assigns if "too short for its planned segment" in a]
+    assert len(truncated) == 1, assigns
+    assert "FFmpeg" not in truncated[0], truncated[0]
 
 
 def test_the_extract_kwargs_bundle_carries_only_the_command_plus_the_cancellation_token(

@@ -33,6 +33,11 @@ from gpu_cpu_utils import MAX_THREADS
 from beatsync_fork import ffmpeg_diagnostics as fork_diagnostics
 # [FORK] Digital-Union (C3-R1A): the pure cancellation contract (stdlib-only fork module).
 from beatsync_fork.render_worker import RenderCancelled
+# [FORK] Digital-Union (FUN R10 Final Frame Fix): the frame-exact segment contract (stdlib-only
+# fork module). Same one-way direction as every fork import here. It owns the pure decisions --
+# what the progress stream said, where to re-seek, how a shortfall is worded -- while this module
+# keeps the one thing it must not have: a child process.
+from beatsync_fork import frame_lock as fork_frame_lock
 # [FORK] Digital-Union (MEDIA-VERIFY-S2-A): the read-only verification contract (stdlib-only fork
 # module). Imported for the probe's result record and its bound only; the hard rule is one-way --
 # a runtime module may import the fork package, never the reverse.
@@ -261,6 +266,44 @@ def get_video_duration(video_file: str) -> float:
     except Exception as e:
         print(f"   ⚠️  Could not get video duration with ffprobe: {e}")
         return 10.0  # Default fallback
+
+
+def _probe_output_frame_count(output_file: str):
+    """[FORK] Digital-Union (FUN R10 Final Frame Fix): frames a segment we just wrote declares.
+
+    **Metadata only -- this never decodes a picture.** ``-show_entries stream=nb_frames`` reads the
+    container header, so it costs one short child process rather than a full decode of the clip,
+    which is why it is allowed to sit on the render path at all.
+
+    Measured on the bundled FFmpeg build, over the whole reported-defect matrix: for the CFR
+    MP4/MOV segments :func:`extract_clip_segment_ffmpeg_detailed` and
+    :func:`extract_prores_segment_random` write, ``nb_frames`` agreed **exactly** with both
+    FFmpeg's own ``-progress`` count and a full ``-count_frames`` decode (28/28, 34/34, 29/29,
+    35/35). So the cheap read is the reliable one here; it is not a weaker approximation of the
+    expensive one.
+
+    Returns ``None`` when the value cannot be read, which the caller reports as *unmeasured* and
+    never as zero. The handler is deliberately a **narrow** tuple rather than ``except
+    Exception``: a broad one here would be a fourth generic handler in a module whose count is
+    pinned precisely so a new one cannot arrive unnoticed, and these are the only failures a
+    header read actually has -- a missing binary, a timed-out child, an unparseable value.
+    """
+    try:
+        probe_cmd = [
+            FFPROBE_PATH,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=nb_frames',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            output_file
+        ]
+        result = _run_media_command(probe_cmd, timeout=20)
+        if result.returncode != 0:
+            return None
+        counted = int(result.stdout.strip())
+        return counted if counted >= 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def get_video_fps(video_file: str) -> float:
@@ -676,6 +719,26 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
     bare ``scale=width:height``, unchanged. The default is what makes every existing caller and
     every existing test still describe the same command. See the comment at the filter assembly
     for why a profile *replaces* the bare scale rather than being appended to it.
+
+    [FORK] Digital-Union (FUN R10 Final Frame Fix): **a segment requesting N output frames now
+    produces N, or fails.** Three things changed, and no parameter did:
+
+    * ``-progress pipe:1`` is appended, so FFmpeg's own count of frames written to the output is
+      captured for free alongside the stderr that was already being captured;
+    * a measured shortfall buys **one** corrected re-seek (`frame_lock.recovery_seek`), anchored
+      on the end of the source with one source frame of lead-in for accurate ``-ss`` to round
+      forward into -- bounded by ``frame_lock.MAX_EXTRACTION_ATTEMPTS``, never a loop;
+    * a shortfall that survives the re-seek returns ``(False, reason)``, so it becomes an ordinary
+      clip failure carrying the full MEDIA-VERIFY-S1 context and ``create_music_video`` refuses the
+      render rather than concatenating a short timeline.
+
+    **The first attempt's argv is unchanged apart from ``-progress``**, because ``seek_time``
+    starts at ``start_time`` -- so every clip that was already correct is extracted by the same
+    command from the same position and is bit-identical. Only a clip that was measurably short
+    takes the second attempt, and the only clips that were short are the ones flush against the
+    end of their source. An **unmeasured** count is not a failure: if neither the progress stream
+    nor the container header yields a number, the segment keeps the historical behaviour rather
+    than being refused on the strength of a missing measurement.
     """
     try:
         # ✅ FRAME-ACCURATE: Calculate exact source and output frame counts.
@@ -713,67 +776,133 @@ def extract_clip_segment_ffmpeg_detailed(video_file: str, start_time: float, dur
         filters.append(f"fps={fps}")
         
         filter_complex = ",".join(filters)
-        
-        # Build FFmpeg command
-        cmd = [FFMPEG_PATH]
-        
-        # Hardware acceleration
-        # [FORK] Digital-Union (Phase 3C): the NVENC branch asks for no input hwaccel at all.
-        # Measured on RTX 3080 / driver 617.14: '-hwaccel cuda' failed to initialise on most
-        # sampled sources (33 > 32 nvdec decode surfaces) and FFmpeg fell back to software decode
-        # anyway; where real NVDEC did engage it was ~20% slower, because this CPU filter chain
-        # (trim/setpts/scale/fps) has to pull the frames back to system memory. A/B outputs were
-        # byte-identical on 20/20 clips. Encoding is still h264_nvenc — only the decode request
-        # is gone. The CPU-encode branch was not part of that measurement and is unchanged.
-        if not use_nvenc:
-            cmd.extend(['-hwaccel', 'auto'])
-        
-        # ✅ FRAME-ACCURATE INPUT SEEKING
-        # Use -ss BEFORE -i for faster seeking (keyframe-based)
-        # Then use -ss AFTER -i for frame-accurate positioning
-        cmd.extend([
-            '-ss', str(start_time),
-            '-t', str(exact_source_duration),
-            '-i', video_file
-        ])
-        
-        # Video filters
-        cmd.extend(['-vf', filter_complex])
-        
-        # ✅ FRAME-ACCURATE DURATION: Use -vframes instead of -t
-        cmd.extend(['-vframes', str(output_frame_count)])
-        
-        # Video encoding
-        if use_nvenc:
-            cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
-        else:
-            cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
-        
-        # No audio, frame-accurate settings
-        cmd.extend([
-            '-an',
-            '-fps_mode', 'cfr',  # Constant frame rate
-            '-r', str(fps),   # Exact output FPS
-            '-fflags', '+genpts',
-            '-movflags', '+faststart',
-            '-y',
-            output_file
-        ])
-        
-        result = _run_media_command(cmd, timeout=120, lifecycle=lifecycle)
 
-        if result.returncode != 0:
-            print(f"   ⚠️  FFmpeg error: {result.stderr}")
-            # [FORK] The full text still goes to the console exactly as before; only a bounded
-            # summary travels onward, because ProgressView is a status line, not a log sink.
-            reason = fork_diagnostics.summarize_ffmpeg_failure(result.stderr)
-            return False, reason or f"FFmpeg exited with code {result.returncode}"
+        # [FORK] Digital-Union (FUN R10 Final Frame Fix): the seek is a RESOLVED value now, not the
+        # argument itself. A window flush against the end of a source needs an earlier one -- see
+        # `beatsync_fork/frame_lock.py` for the measurement. `seek_time` starts as `start_time`, so
+        # the first attempt's argv is byte-identical to the historical one for every clip.
+        seek_time = float(start_time)
+        attempts = 0
+        verdict = None
 
-        # Verify output exists and has content
-        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            exists = os.path.exists(output_file)
-            size = os.path.getsize(output_file) if exists else 0
-            return False, fork_diagnostics.describe_output_problem(exists, size)
+        while True:
+            attempts += 1
+
+            # Build FFmpeg command
+            cmd = [FFMPEG_PATH]
+
+            # Hardware acceleration
+            # [FORK] Digital-Union (Phase 3C): the NVENC branch asks for no input hwaccel at all.
+            # Measured on RTX 3080 / driver 617.14: '-hwaccel cuda' failed to initialise on most
+            # sampled sources (33 > 32 nvdec decode surfaces) and FFmpeg fell back to software
+            # decode anyway; where real NVDEC did engage it was ~20% slower, because this CPU
+            # filter chain (trim/setpts/scale/fps) has to pull the frames back to system memory.
+            # A/B outputs were byte-identical on 20/20 clips. Encoding is still h264_nvenc — only
+            # the decode request is gone. The CPU-encode branch was not part of that measurement
+            # and is unchanged.
+            if not use_nvenc:
+                cmd.extend(['-hwaccel', 'auto'])
+
+            # ✅ FRAME-ACCURATE INPUT SEEKING
+            # Use -ss BEFORE -i for faster seeking (keyframe-based)
+            # Then use -ss AFTER -i for frame-accurate positioning
+            cmd.extend([
+                '-ss', str(seek_time),
+                '-t', str(exact_source_duration),
+                '-i', video_file
+            ])
+
+            # Video filters
+            cmd.extend(['-vf', filter_complex])
+
+            # ✅ FRAME-ACCURATE DURATION: Use -vframes instead of -t
+            #
+            # [FORK] FUN R10: this is also what makes the re-seek below safe in the one direction
+            # that matters. A corrected window deliberately carries MORE content than the segment
+            # needs, and `-vframes` bounds the output at exactly the requested count, so a
+            # recovery can never produce a long segment.
+            cmd.extend(['-vframes', str(output_frame_count)])
+
+            # Video encoding
+            if use_nvenc:
+                cmd.extend(get_nvenc_quality_args(gpu_encoder, include_pix_fmt=True))
+            else:
+                cmd.extend(get_cpu_h264_quality_args(include_pix_fmt=True))
+
+            # No audio, frame-accurate settings
+            #
+            # [FORK] FUN R10: `-progress pipe:1` is the frame-count evidence, and it is free --
+            # both `_run_media_command` paths already capture stdout, the output goes to a file so
+            # stdout is otherwise unused, and stderr (which the failure summariser reads) is
+            # untouched. FFmpeg's `frame=` counts frames WRITTEN to the output, which is exactly
+            # the quantity `-vframes` bounds, so no separate probe is needed on the happy path.
+            cmd.extend([
+                '-an',
+                '-fps_mode', 'cfr',  # Constant frame rate
+                '-r', str(fps),   # Exact output FPS
+                '-fflags', '+genpts',
+                '-movflags', '+faststart',
+                '-y',
+                '-progress', 'pipe:1',
+                output_file
+            ])
+
+            result = _run_media_command(cmd, timeout=120, lifecycle=lifecycle)
+
+            if result.returncode != 0:
+                print(f"   ⚠️  FFmpeg error: {result.stderr}")
+                # [FORK] The full text still goes to the console exactly as before; only a bounded
+                # summary travels onward, because ProgressView is a status line, not a log sink.
+                reason = fork_diagnostics.summarize_ffmpeg_failure(result.stderr)
+                return False, reason or f"FFmpeg exited with code {result.returncode}"
+
+            # Verify output exists and has content
+            if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+                exists = os.path.exists(output_file)
+                size = os.path.getsize(output_file) if exists else 0
+                return False, fork_diagnostics.describe_output_problem(exists, size)
+
+            # [FORK] Digital-Union (FUN R10 Final Frame Fix): exit code 0 plus a non-empty file is
+            # NOT proof of a correct segment, and that is precisely how a one-frame-short clip
+            # reached final assembly for as long as it did. Count what was actually written.
+            verdict = fork_frame_lock.frames_from_progress(output_frame_count, result.stdout)
+            if not verdict.exact:
+                # Never act on a single reading. The container header is an independent
+                # measurement of the same file, so a progress stream this build happened not to
+                # emit -- or emitted oddly -- cannot on its own fail a good clip or trigger a
+                # pointless re-extraction.
+                confirmation = fork_frame_lock.from_container_count(
+                    output_frame_count, _probe_output_frame_count(output_file))
+                if confirmation.measured:
+                    verdict = confirmation
+
+            if verdict.exact or not verdict.measured:
+                # Exact, or no evidence either way. An unmeasured segment keeps the historical
+                # behaviour rather than being refused on the strength of a missing number.
+                break
+
+            # A re-seek is the remedy for a SHORTFALL and nothing else. `-vframes` makes a long
+            # segment impossible, so one is evidence the output is not the segment that was asked
+            # for -- re-seeking would not address that, and would spend an extraction pretending
+            # it might. Report it instead.
+            if attempts >= fork_frame_lock.MAX_EXTRACTION_ATTEMPTS or not verdict.short_by:
+                break
+
+            # The window came back short. Ask for a corrected one -- anchored on the end of the
+            # source, one source frame of lead-in for accurate `-ss` to round forward into. `None`
+            # means there is no honest earlier position, so the shortfall is reported instead.
+            recovered = fork_frame_lock.recovery_seek(
+                seek_time, exact_source_duration,
+                get_video_duration(video_file), get_video_fps(video_file))
+            if recovered is None:
+                break
+            print(f"   🔁 Segment short at {seek_time:.6f}s "
+                  f"({verdict.produced}/{output_frame_count} frames); "
+                  f"re-seeking to {recovered:.6f}s for frame completion")
+            seek_time = recovered
+
+        if verdict is not None and verdict.measured and not verdict.exact:
+            return False, fork_frame_lock.describe_shortfall(verdict, attempts)
 
         return True, ""
 
@@ -798,6 +927,17 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
       ProRes, which is unnecessary for ProRes and can fail on some Windows GPU
       driver combinations.
     - Use a CPU-native ProRes path, exact frame count, and a safe retry command.
+
+    [FORK] Digital-Union (FUN R10 Final Frame Fix): this path carried the **same** end-of-source
+    frame loss as :func:`extract_clip_segment_ffmpeg_detailed` -- identical structure (``-ss`` at a
+    start clamped with the *unquantised* duration, ``trim=duration=exact_duration``,
+    ``-vframes frame_count``) and an acceptance test of exactly what the milestone forbids:
+    ``returncode == 0`` plus a non-empty file. Each attempt's frame count is now verified, and a
+    measured shortfall buys one corrected re-seek through the same
+    :func:`beatsync_fork.frame_lock.recovery_seek`. The two pre-existing attempts (fast intra-frame
+    seek, then the safe accurate-seek fallback) are **unchanged** in order, argv and timeout; the
+    re-seek is appended as a third, and only a short segment ever reaches it. A shortfall that
+    survives raises, exactly as every other failure on this path already does.
     """
     output_file = os.path.join(temp_dir, f"segment_{segment_index:05d}.mov")
 
@@ -812,6 +952,19 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
         else:
             start_time = max(0.0, min(float(start_time), max_start))
     else:
+        # [FORK] Digital-Union (FUN R10 Final Frame Fix): this branch shortened `duration` to the
+        # source's real length, which also shortened the SEGMENT -- `frame_count` below is derived
+        # from it, so a source smaller than its slot produced a frame-exact clip for the window it
+        # was given and a short one for the timeline it was planned into. The NVENC/CPU path refuses
+        # the same case in `create_clip_parallel`; this is its ProRes counterpart, and the same
+        # pure sentence describes it.
+        planned_frames = max(1, seconds_to_frame_count(duration, fps))
+        available_frames = max(1, seconds_to_frame_count(video_duration, fps))
+        if available_frames < planned_frames:
+            raise Exception(
+                f"ProRes segment extraction error: "
+                f"{fork_frame_lock.describe_truncated_plan(planned_frames, available_frames, video_duration)} "
+                f"Source: {video_file}")
         start_time = 0.0
         duration = video_duration
 
@@ -822,16 +975,16 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
     filters.append(f"fps={fps}")
     filter_complex = ",".join(filters)
 
-    def build_cmd(fast_seek: bool) -> List[str]:
+    def build_cmd(fast_seek: bool, seek: float) -> List[str]:
         cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner']
         if fast_seek:
             # ProRes proxy is intra-frame, so input-side seeking remains accurate
             # while being much faster for long sources.
-            cmd.extend(['-ss', f'{start_time:.6f}', '-i', video_file])
+            cmd.extend(['-ss', f'{seek:.6f}', '-i', video_file])
         else:
             # Ultra-safe fallback. Slower on long sources, but avoids muxer/seek
             # edge cases if a specific FFmpeg build rejects the fast path.
-            cmd.extend(['-i', video_file, '-ss', f'{start_time:.6f}'])
+            cmd.extend(['-i', video_file, '-ss', f'{seek:.6f}'])
 
         cmd.extend([
             '-map', '0:v:0',
@@ -854,14 +1007,41 @@ def extract_prores_segment_random(video_file: str, duration: float, fps: float,
         return cmd
 
     last_error = ""
-    for attempt_name, fast_seek, timeout in [
+    seek_time = float(start_time)
+    # [FORK] FUN R10: the two pre-existing attempts, plus at most one corrected re-seek appended
+    # below. A list rather than a literal `for` target only so that third entry can exist; the
+    # first two are byte-identical to the historical pair and are always tried first.
+    plan = [
         ('fast intra-frame seek', True, 180),
         ('safe accurate seek retry', False, 360),
-    ]:
+    ]
+    reseek_spent = False
+    index = 0
+    while index < len(plan):
+        attempt_name, fast_seek, timeout = plan[index]
+        index += 1
         _safe_remove_file(output_file)
-        result = _run_media_command(build_cmd(fast_seek), timeout=timeout, lifecycle=lifecycle)
+        result = _run_media_command(build_cmd(fast_seek, seek_time),
+                                    timeout=timeout, lifecycle=lifecycle)
         if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            return output_file
+            # [FORK] FUN R10: exit code 0 and a non-empty file are not proof of a correct segment.
+            verdict = fork_frame_lock.from_container_count(
+                frame_count, _probe_output_frame_count(output_file))
+            if verdict.exact or not verdict.measured:
+                return output_file
+            last_error = fork_frame_lock.describe_shortfall(verdict, index)
+            print(f"   ⚠️  ProRes {attempt_name} produced "
+                  f"{verdict.produced}/{frame_count} frames")
+            if not reseek_spent:
+                recovered = fork_frame_lock.recovery_seek(
+                    seek_time, exact_duration, video_duration, get_video_fps(video_file))
+                if recovered is not None:
+                    reseek_spent = True
+                    print(f"   🔁 Re-seeking {seek_time:.6f}s -> {recovered:.6f}s "
+                          f"for frame completion")
+                    seek_time = recovered
+                    plan.append(('frame-completion re-seek', True, 180))
+            continue
         last_error = _short_ffmpeg_error(result.stderr)
         print(f"   ⚠️  ProRes extraction failed on {attempt_name}: {last_error}")
 
@@ -871,7 +1051,8 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
                               gpu_encoder: str = 'h264_nvenc', fps: float = 30.0,
-                              temp_dir: str = None, lifecycle=None) -> str:
+                              temp_dir: str = None, timeline_seconds: float = None,
+                              lifecycle=None) -> str:
     """
     Concatenate video files using FFmpeg concat demuxer.
 
@@ -881,6 +1062,23 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
     threaded to every ``_run_media_command`` call below. This function's own ``finally`` only
     cleans up temp files -- it has no ``except Exception``, so a ``RenderCancelled`` raised from any
     branch already propagates unchanged; nothing here may add a catch that would swallow it.
+
+    [FORK] Digital-Union (FUN R10 A/V End Alignment): ``timeline_seconds`` is the frame-locked
+    plan's own length, ``sum(segment_frames) / fps``, and it becomes an output-side ``-t`` on each
+    of the three audio-muxing branches. ``None`` is the previous behaviour exactly, so every other
+    caller is unchanged; it is placed before ``lifecycle`` because the C3-R1A seam contract requires
+    ``lifecycle`` to stay the LAST parameter.
+
+    **Why ``-shortest`` alone is not enough, measured rather than assumed.** ``-shortest`` ends the
+    output when the first stream ends, but with stream copy it is imprecise by a small and
+    inconsistent amount -- it cut 0, 1 and 2 PCM packets off the audio of three otherwise identical
+    renders, and 77.3 ms off a 14-minute one. So the published video and its music did not end
+    together even once the timeline stopped planning past the audio. An explicit ``-t`` at the plan
+    cuts both streams at exactly the planned position: measured 20851 frames / 834.040000 s video
+    against 834.040000 s audio, a 0.0 ms difference, where ``-shortest`` alone gave 833.962667 s.
+
+    ``-shortest`` is **kept** rather than replaced. It still protects the case ``-t`` cannot: an
+    audio file shorter than the plan. The two are belt and braces, and whichever is shorter wins.
     """
     if temp_dir is None:
         temp_dir = os.path.dirname(output_file)
@@ -955,9 +1153,14 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     '-c:a', 'pcm_s24le',
                     '-ar', '48000',
                     '-shortest',  # Use shortest stream (audio)
+                ]
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                if timeline_seconds:
+                    cmd.extend(['-t', str(timeline_seconds)])
+                cmd.extend([
                     '-y',
                     output_file
-                ]
+                ])
                 
                 result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
                 
@@ -1005,6 +1208,9 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 cmd.extend(['-c:v', 'copy'])
                 if audio_file:
                     cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
+                    # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                    if timeline_seconds:
+                        cmd.extend(['-t', str(timeline_seconds)])
                 cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
 
                 result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
@@ -1047,7 +1253,10 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     '-ar', '48000',
                     '-shortest',
                 ])
-            
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                if timeline_seconds:
+                    cmd.extend(['-t', str(timeline_seconds)])
+
             cmd.extend([
                 '-fps_mode', 'cfr',
                 '-r', str(fps),

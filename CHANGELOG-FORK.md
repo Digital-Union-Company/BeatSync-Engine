@@ -20,6 +20,218 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-31 (FUN R10 A/V End Alignment: the timeline no longer plans past the audio)
+
+**The published video could end up to two frames before its own music.** Found in the owner's real
+3x render: the frame-locked timeline planned **20852** frames and the file carried **20850**, ending
+at 834.000000s under an audio master of 834.063688s — a 63.7 ms gap, more than one frame interval at
+25 fps.
+
+**Not a Repeat Music defect, and no frames were lost in extraction.** `build_frame_aligned_cut_timeline`
+derives its end from `seconds_to_frame_count`, which **rounds**, so music whose length is not a whole
+number of output frames yields a timeline ending up to half a frame *past* the audio. Final assembly
+muxes with `-shortest`, which then discards the overhang. Measured on the real render body, at both
+1x and 3x:
+
+| encoder | planned | published | discarded |
+|---|---|---|---|
+| `cpu` (libx264 `ultrafast`, no B-frames) | 501 / 1502 | 500 / 1501 | **1 frame** |
+| `h264_nvenc` (B-frames, `has_b_frames=2`) | 501 / 1502 | 499 / 1500 | **2 frames** |
+
+The owner's render was NVENC — the UI default — which is why it lost two. Extraction was exact
+throughout: the same NVENC render on music that *is* a whole number of frames published 500 of 500,
+so the FUN R10 Final Frame Fix's per-segment guarantee held and nothing under-delivered.
+
+**Why no existing test or acceptance render caught it.** Every R10 fixture (`music_20s.wav`,
+`music_4s.wav`, the 60 s control) is an exact multiple of the output frame interval at every profile
+rate, so `round` landed exactly on the audio end and `-shortest` had nothing to discard; and every
+profile render used the `cpu` path, which loses one frame rather than two. The condition needs music
+that does not divide into frames **and** the default encoder. `media/music_overshoot.wav` —
+the owner's own music trimmed to 961 019 samples (20.021229 s) — reproduces it at 20 s.
+
+**The correction has two parts, because the clamp alone only moved the problem.** Stepping the
+timeline's end back fixed the frame count but flipped the sign of the gap: `-shortest` then
+undercut the *audio* instead, by an inconsistent 0, 1 or 2 PCM packets — 50.7 ms on a 60 s render and
+**77.3 ms** on a 14-minute one. So the frame-locked plan is also passed to final assembly and becomes
+an explicit output-side `-t`, which cuts both streams at exactly the planned position.
+
+| | frames | video | audio | V−A |
+|---|---|---|---|---|
+| before, nvenc 3x | 1500 | 60.000000 | 60.063688 | −63.7 ms |
+| clamp only, nvenc 3x | 1501 | 60.040000 | 59.989333 | +50.7 ms |
+| clamp + `-t`, nvenc 3x | **1501** | **60.040000** | **60.040000** | **0.0 ms** |
+
+Properties:
+
+- **The published frames do not change on the path that was already correct.** The frame the clamp
+  gives up is precisely the one `-shortest` was discarding, so a `cpu` render publishes the same
+  count from the same segments; an NVENC render regains the extra frame it was losing.
+- **`plan == published` at every rate and repeat count measured**, and at 25 fps — the owner's
+  profile and the reported defect — video and audio durations are **equal**, across
+  {cpu, nvenc} × {1x, 2x, 3x} and for both frame-aligned and non-aligned music.
+- **Bounded to a single frame, and the clamp is inert when the audio is frame-aligned** — so every
+  existing fixture, and the accepted 1x baseline, are untouched. Verified with the whole correction
+  in place: the 1x control's **600** coded frame checksums are identical to the accepted R10 baseline
+  and its audio PCM SHA-256 still matches `efec99d1…6465143` to the byte.
+- **`-shortest` is kept**, no frame is padded or duplicated, no audio is resampled, re-timed or
+  pitch-shifted, and the beat grid, Stage-5 analysis and cache identity are untouched.
+- **`timeline_seconds` is a defaulted parameter placed before `lifecycle`**, which C3-R1A's seam
+  contract pins last. `None` is the previous behaviour exactly.
+
+**One residual, measured and deliberately not closed: ~36 ms at 720p30.** At 30 fps the assembled
+segments' mp4 `stts` deltas are not uniformly 512 ticks, so the concatenated video's container
+duration lands ~125 ticks (8 ms) *below* `frames / fps`. `-t` therefore sits above the real video end
+and stops governing, `-shortest` governs instead, and its audio undercut reappears: 1801 of 1801
+frames, but V−A = +35.7 ms (1.07 frames at 30 fps). 25 fps does not show it — the concat lands exactly
+on the plan there. Dropping `-shortest` when a plan is supplied was measured and gives **−8.3 ms**,
+but it removes the protection against a container that over-reports its audio duration (a CBR MP3
+with no Xing header can be off by seconds, and the timeline is built from that same figure, so
+truncating the video is the safer failure). That trade is an owner decision, not one to take inside
+this fix.
+- **No module-level name was added to the builder.** `tests/test_music_repeat.py` AST-extracts that
+  function and executes it against a namespace holding only `np` and `seconds_to_frame_count`, so the
+  tolerance is a literal and the clamp calls nothing — a test now pins that dependency set directly
+  instead of an allowlist of unparsed call text.
+
+Two test claims were **amended because measurement falsified them**, not because they were
+inconvenient: `test_the_extended_timeline_quantises_without_accumulating_drift` asserted the timeline
+ends exactly at `round(total * fps)` (its `cycle = 7.3` fixture is deliberately not frame-aligned, so
+many of its thirty cases rounded past the audio), and `test_the_frame_locked_timeline_builder_is_untouched`
+asserted the builder "gained nothing; it was already correct".
+
+### Fixed — 2026-10-31 (FUN R10 Final Frame Fix: a segment asking for N frames gets N)
+
+**A clip positioned flush against the end of its source lost its last frame.** Pre-existing, and
+reproduced identically on pristine `main` (`b90c265f`) with its own extractor, so Repeat Music
+neither caused it nor was required to expose it — a longer timeline simply draws more clips from the
+same sources and so meets the flush-at-EOF case more often. The visible symptom was a 3x / 720p25
+render measuring **1499 frames instead of 1500**.
+
+**Cause, measured rather than inferred.** `src_b_1080p.mp4` is 30.000000 s at 30 fps (900 frames,
+last PTS 29.966667). The plan asked for 29 output frames from `start=28.840000` for `1.160000` —
+exactly the source's remaining content:
+
+```
+-ss 28.84 -t 1.16 -i src                      ->  34 source frames   (not 35)
+  ... -vf trim,setpts                         ->  34
+  ... -vf trim,setpts,fps=25                  ->  28   SHORT
+-ss 27.84 -t 1.16 -i src   (1.0 s earlier)    ->  35 source frames
+  ... -vf trim,setpts,fps=25                  ->  29   OK
+```
+
+So the `fps` filter is **innocent**: given 35 input frames it yields 29 every time. Accurate `-ss`
+snaps the window start *forward* to the first frame at or after the seek point (28.840000 →
+28.866667, frame 866), costing up to one source frame. Anywhere else in the file that is invisible,
+because the window reaches 1/30 s further in and the 35th frame is there; at the end of the source
+there is nothing past EOF to make it up with. A second, smaller contributor rides along: the start
+is clamped with the *unquantised* duration while the extractor extends the window to
+`frame_count / fps`, which at 30 fps is 1.166667 s — already 0.006667 s past the source end.
+
+- `src/beatsync_fork/frame_lock.py` — **new, stdlib-only**: the whole contract as pure decisions.
+  What the progress stream said (`frames_from_progress`, delegating the parse to `media_sample`'s
+  hardened block-terminator semantics, so evidence comes from the last *completed* block alone),
+  where to seek instead (`recovery_seek`), and how a shortfall is worded. `MAX_EXTRACTION_ATTEMPTS`
+  is 2 — one planned window, at most one corrected one.
+- `src/ffmpeg_processing.py` — `extract_clip_segment_ffmpeg_detailed` appends `-progress pipe:1`
+  (free: both runner paths already captured stdout, the output goes to a file, and stderr — the
+  failure summariser's input — is untouched), verifies the written count, and on a measured
+  shortfall takes **one** corrected re-seek anchored on the end of the source with one *source*
+  frame of lead-in. `-vframes` still bounds the output, so a corrected window can never come back
+  long. A shortfall that survives returns `(False, reason)`, becoming an ordinary clip failure that
+  `create_music_video` already refuses the render on. `_probe_output_frame_count` is the
+  independent second reading — `stream=nb_frames`, header only, **no decode** — consulted only when
+  a clip is already suspect, so the happy path costs nothing. `extract_prores_segment_random`
+  carried the identical defect and the identical insufficient acceptance test (`returncode == 0`
+  plus a non-empty file); it now verifies each attempt and gets the same single re-seek.
+- `src/video_processor.py` — `create_clip_parallel` refuses a source too short for its planned
+  segment instead of quietly shortening it. Both branches clamp the read to the source's real
+  duration, which also shrank the *segment*, since the extractor derives its frame count from the
+  duration handed to it. Arithmetic only — no probe, no subprocess, no loop, because that body is
+  executed against a hand-built namespace by three suites.
+- `tests/test_frame_lock.py` — **new**: the pure contract; the real extractor and worker bodies
+  AST-extracted and executed over a recording runner (exact/short/long/unmeasured, the single
+  confirmation probe, the attempt bound, cancellation from *both* attempts, the lifecycle reaching
+  the retry); and an opt-in real-FFmpeg tier that re-measures the reported case, mid-file controls,
+  flush-at-EOF, a too-short source, four source/output rate pairs, 29.97 fps, both fixed output
+  profiles, consecutive segments and source immutability.
+
+**The repeated-frame answer was rejected.** A real frame *can* be decoded here, so holding or
+duplicating the last one would make a frame-exact timeline out of content the source never
+contained. The correction moves the window; every frame in the result is a decoded source frame.
+
+**Deliberately NOT refused: an unmeasured count.** If neither the progress stream nor the container
+header yields a number, the segment keeps its historical behaviour. Refusing on absent evidence
+would fail renders that are fine, which is worse than the defect.
+
+**1x compatibility is exact, not approximate.** The 1x ordinary render's 600 coded frame checksums
+are identical to both the accepted R10 baseline and pristine `main`, and its audio PCM SHA-256
+matches to the byte — no clip in it sits flush against EOF, so no re-seek fires. **Measured after
+the fix:** 3x / 720p25 = **1500** frames / 60.000000 s (was 1499 / 59.960000), 3x / 720p30 = 1800,
+2x / 720p25 = 1000, 1x / 720p25 = 500 — every one exact, with audio and video durations equal.
+Per-clip accounting over 1x / 3x / 5x timelines reports *every* clip producing exactly the frames
+the timeline asked for.
+
+**No cache change.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`, and the correction reaches no musical timeline, no
+creative planner and no Stage-5 identity.
+
+**Still open, measured and deliberately not changed here.** `stage6_av_planner` floors
+`final_duration` at 0.05 s, so a 1-frame slot (0.033 s at 30 fps) is handed to the extractor as
+0.05 s and extracted as **2** frames. The extractor is exact for what it was asked, the surplus is
+absorbed by final assembly's `-shortest` (all four renders above are exact), and correcting the
+floor would change content in renders that are currently correct — so it is recorded as a separate
+item rather than folded into this fix.
+
+### Added — 2026-10-31 (FUN R10: Repeat Music 1x-30x)
+
+Play the selected song up to thirty times and render a full-length music video whose later
+repetitions contain **newly planned shots**. Concatenating repeated copies of one render is
+explicitly not the feature.
+
+- `src/beatsync_fork/music_repeat.py` — **new, stdlib-only**: the 1..30 control and its
+  `normalize_repeat` type boundary (mirroring `creative.normalize_control`), the repeated geometry,
+  the pre-render `00:20 x 5 = 01:40` read-out with its long-render / temporary-disk warning, and
+  the whole timeline extension. Its one sibling import is `audio_mix.format_clock`, so there is a
+  single clock formatter rather than two that can disagree.
+- `src/music_repeater.py` — **new, runtime**: one FFmpeg decode of the first audio stream to
+  `pcm_s24le` / 48 kHz / stereo, a concat-demuxer stream copy of that exact byte run `N` times, and
+  a duration verification against `N x cycle` that **fails the render** rather than letting a
+  mis-sized master shift every later cut. `-stream_loop` was rejected: it loops the compressed
+  *input*, so the decoder's delay/padding handling becomes part of the result. Its own small
+  cancellable runner, its own `MusicRepeatError` (deliberately not an `AudioMixError`), and scratch
+  that lives in `session_dir` and is discarded on success, failure and cancellation alike.
+- `src/gui.py` — a `gr.Slider` (1-30, step 1, default 1) directly below the Audio File control plus
+  a live Markdown estimate; one `.change` handler writing only that read-out, registered on both the
+  slider and the audio input. `repeat_music` is appended **last** to both render click lists and to
+  all three handler signatures, so no pre-existing positional index moved. Normalised once at the
+  render boundary. **Every statement the feature adds to `_process_video_impl` sits behind a repeat
+  guard**, so a 1x render resolves neither new module — a test walks the real AST and asserts it.
+- `src/video_processor.py` — `--repeat-music`, with the six creative flags' no-`type=` discipline.
+  It refuses to combine with `-s`/`-e`: trimming the analysis window and repeating it have two
+  incompatible readings, and `create_music_video` would re-apply the window to the repeated master.
+  `main()`'s unchanged tail moved verbatim into `_main_render` so the master's lifetime can be a
+  `try/finally` around it. `create_music_video` itself is **untouched** by this feature.
+- `src/ui_content.py` — `LABEL_REPEAT_MUSIC`, `INFO_REPEAT_MUSIC` and the read-out's empty state.
+- `tests/test_music_repeat.py` — **new**: the control boundary, 30x geometry exactness, the tiling
+  rules, the extended bus against the **real** `smart_mix.project_structure` and
+  `audio_mix.project_sections` / `plan_voice_placements`, the **real** frame-locked timeline over
+  1/2/3/5/30 cycles at three frame rates, the **real** Stage 6 planner proving later cycles differ,
+  the runtime argv builders, and the GUI/CLI wiring contracts.
+
+**1x is verified content-identical to pristine `main`** (`b90c265f`, a clone, the same interpreter,
+a hash-identical FFmpeg, the identical argv): one `framemd5` digest, one audio PCM hash, and an
+empty diff over 83 normalised pipeline-fact lines. The container hash differs, and a same-code
+control shows why — Matroska writes a random SegmentUID, so two runs of pristine `main` differ too.
+
+**Measured:** 2x / 3x / 5x produce exactly 1200 / 1800 / 3000 frames and 40 / 60 / 100 s at 30 fps;
+30x of a 4 s fixture produces 3600 frames and 120.000000 s with peak memory 482 MB against 475 MB at
+1x. The three cycles of a 3x master are byte-identical PCM. Over a 3x timeline the real planner
+changes 10 of 11 and 11 of 11 cuts against cycle 0, deterministically.
+
+**No cache change whatsoever.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION`
+stays `auto_av_analysis_v8_llama_vulkan_batched`, no payload gained a field, and the repeat count
+does not exist as a value in the render body until after Stage 5 has returned.
+
 ### Changed — 2026-10-29 (Stage-5 Cancel: Cancel actually interrupts video analysis)
 
 **This supersedes C3-R1A's `BOUNDARY_ONLY_CANCEL` contract for Stage 5**, after a real owner

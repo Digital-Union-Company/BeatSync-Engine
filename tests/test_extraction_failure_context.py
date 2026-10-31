@@ -489,13 +489,29 @@ def test_no_new_subprocess_or_retry_appeared_in_the_worker(processor_tree):
 
 
 def test_the_extraction_timeout_and_command_are_untouched():
-    """S1 is diagnostics-only: the 120s bound and the argv stay exactly as they were."""
+    """The 120 s bound and the frame arithmetic stay exactly as they were.
+
+    **Amended by FUN R10 Final Frame Fix, and the amendment is the whole milestone.** S1 was
+    diagnostics-only and this test said so by pinning the literal ``'-ss', str(start_time)``. R10
+    deliberately changes that one argument: a window flush against the end of its source came back
+    one frame short, because accurate ``-ss`` snaps the start FORWARD to the next source frame and
+    at EOF there is no content past the end to make it up with (measured in
+    ``beatsync_fork/frame_lock.py``'s module docstring and in ``tests/test_frame_lock.py``).
+
+    So the seek is now a resolved local. What this test protects instead is the property that
+    actually matters for compatibility: the resolved value **starts** as ``start_time``, so the
+    first attempt's seek position -- the only one any previously-correct clip ever reaches -- is
+    unchanged. Everything else about the command that was frozen stays frozen.
+    """
     ffmpeg = _tree(_FFMPEG)
     fn = _func(ffmpeg, "extract_clip_segment_ffmpeg_detailed")
     source = ast.unparse(fn)
 
     assert "timeout=120" in source
-    assert "'-ss', str(start_time)" in source
+    # the seek is a resolved local now ...
+    assert "'-ss', str(seek_time)" in source
+    # ... whose initial value is the caller's argument, unchanged. That is the compatibility claim.
+    assert "seek_time = float(start_time)" in source
     assert "'-t', str(exact_source_duration)" in source
     assert "'-vframes', str(output_frame_count)" in source
     assert "'-fps_mode', 'cfr'" in source

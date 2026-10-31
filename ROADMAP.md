@@ -650,15 +650,14 @@ boundaries are frame-quantised to 1152 samples with the delay and padding record
 Xing/LAME header — close, and **not** sample-exact, which is why WAV remains the default. The two
 Comfort Mix limitations above are untouched.
 
-### R7.3 — Voice clips that exceed the music duration · **OWNER-ACCEPTED, NOT YET DEPLOYED**
+### R7.3 — Voice clips that exceed the music duration · **MERGED AND DEPLOYED (PR #79, main `eb3839cb`)**
 
 Branch `feat/fun-audio-overflow-r7-3`, cut from `main` at `d98fb55a`. **Modes 1–3 are implemented**;
-mode 4 is still blocked on R10 and is deliberately **not offered**, rather than offered and refused.
+mode 4 is deliberately **not offered**, rather than offered and refused — R10 now exists as a local
+candidate, so what it waits on is the Auto-Repeat-to-Fit resolver rather than the repeat mechanism.
 
-**The owner has personally tested Strict / Skip / Trim and accepted them.** That moves this item
-past "local candidate" on the *validation* axis only — it is still on a branch, still in a draft
-PR, still not merged and still not running in production, and it has had no independent review.
-Do not read acceptance as deployment.
+**The owner personally tested Strict / Skip / Trim and accepted them**, and it has since been
+merged as PR #79 and deployed. It has had no independent review.
 
 Raised while testing R7.2: Audio Layers **failed the whole render** when the voice clips it was
 given could not all be placed before the music ended — the owner hit
@@ -675,8 +674,10 @@ with four modes:
 2. **Skip clips that cannot fit** — place what fits, skip the rest, report which.
 3. **Trim the final usable clip at the music end, then skip the rest** — the only mode that
    deliberately shortens a clip, so it must say so per clip rather than in aggregate.
-4. **Repeat Music to Fit** — extend the music instead of dropping speech. **Activate only after
-   R10 exists**; until then the mode is not offered at all rather than offered and refused.
+4. **Repeat Music to Fit** — extend the music instead of dropping speech. R10's repeat mechanism
+   now exists as a local candidate, but choosing the count still needs the Auto-Repeat-to-Fit
+   resolver (R10's own "next" item); until that exists the mode is not offered at all rather than
+   offered and refused.
 
 **The decision is a placement question, not an arithmetic one, and that is the part worth getting
 right.** Whether a clip fits is not `sum(durations) <= music_duration`: placement already walks the
@@ -760,9 +761,11 @@ R7.1's two Comfort Mix controls were not. It is placement configuration, so the 
 from its own submitted arguments exactly as it freezes `voice_avoid_drops`; no `AudioRecipe` field
 resolves it and Variant Lab must never vary it (it is a sixth zero-writer Audio Layers widget).
 
-### Stage-5 Cancel — Cancel actually stops video analysis · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
+### Stage-5 Cancel — Cancel actually stops video analysis · **MERGED AND DEPLOYED (PR #80, main `b90c265f`)**
 
-Branch `feat/fun-stage5-cancel-shared-cache`, stacked on `feat/fun-audio-overflow-r7-3`.
+Branch `feat/fun-stage5-cancel-shared-cache`, stacked on `feat/fun-audio-overflow-r7-3`. Both PRs
+are in: **PR #79** (R7.3 voice overflow, main `eb3839cb`) and **PR #80** (this plus the Shared
+Analysis Cache, main `b90c265f`), and `b90c265f` is the deployed production head.
 
 Raised by a real owner incident, not by code review: an entire video library was selected by
 accident in a fresh playtest with no warm cache, Stage 5 began, Cancel was pressed — and Stage 5
@@ -811,7 +814,7 @@ enter it, and it needs no token because the parent owns and stops the child.
 Stages 1–3 stay uncancellable mid-stage on purpose (~15.7 s measured, process-locally cached).
 Timeout behaviour is unchanged, orphan included.
 
-### Shared Analysis Cache — one Stage-5 cache for every BeatSync version · **LOCAL CANDIDATE, IN DRAFT PR, NOT DEPLOYED**
+### Shared Analysis Cache — one Stage-5 cache for every BeatSync version · **MERGED AND DEPLOYED (PR #80, main `b90c265f`)**
 
 Same branch, same owner session. The cache directory was derived from the checkout's own root, so
 every playtest tree started cold while production held thousands of records.
@@ -851,32 +854,146 @@ A configured-but-unreachable folder (an offline drive) falls back to the local c
 so**, loudly, rather than starting a silent cold re-analysis. Clearing a shared cache costs every
 installation on the machine, and the Cache Management panel now says that before it is done.
 
-### R10 — Quick Render music repeat · **PLANNED, NOT IMPLEMENTED**
+### R10 — Repeat Music 1×–30× · **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**
 
-A control beside the main music selector: **Repeat Music: 1×–30×**.
+Branch `feat/fun-repeat-music-r10`, cut from `main` at `b90c265f`, head `005951c8` in **draft
+PR #81**. Every bullet this section planned is implemented, and **the owner has personally rendered
+2× and 3× against a real 2,476-video library, watched the results and accepted the visual and
+musical outcome.** Merge, deploy and independent review are three separate things and none of them
+is done.
 
-- **1× preserves the existing render path exactly** — same analysis, same planner, same output.
-  Not "equivalent": the same path, so a non-repeating render cannot regress.
-- **2×–30× repeats the selected song sequentially** and the **video duration extends with the
-  audio**.
-- **Cuts and source choices must cover the whole extended timeline.** Re-showing the
-  already-rendered visual sequence is explicitly *not* acceptable — the point is a longer video,
-  not a looped one.
-- **Original speed and pitch preserved**; no time-stretch, no resampling.
-- **Audio/video frame synchronisation maintained** across every repeat boundary, which is where
-  this will actually be hard: the frame-lock invariant quantises absolute cut positions once over
-  the whole timeline, so the repeat has to be part of that timeline rather than a concatenation of
-  separately locked renders.
-- **Reuse the analysis rather than repeating it.** Beat grid, sections and energy for repeat *n*
-  are the first pass shifted by `n × duration`; re-running Stages 1–3 thirty times would be the
-  obvious implementation and the wrong one.
-- **Progress and an estimated output duration** before the render starts, and **cancellable**,
-  through the existing `RenderLifecycle` rather than a second mechanism.
-- Later, **Auto Repeat to Fit Voice Layers**: choose the smallest repeat count up to 30 that makes
-  the voice selection placeable, decided by **actual placement feasibility** rather than by summing
-  durations — the same correction R7.3 records above.
+**🔁 Repeat Music** is a `gr.Slider` (1–30, step 1, default 1) directly below the Audio File
+control, with a live read-out beneath it — `00:20 × 5 = 01:40 of finished video.` — that warns
+about the length and the temporary disk space once the output passes fifteen minutes.
 
-**Not in PR #77 and not started.** R7.3's mode 4 is blocked on this.
+What was planned, and what it actually does:
+
+- **1× is the legacy render, structurally.** Every statement the feature adds to
+  `_process_video_impl` sits behind a repeat guard, so at 1× neither new module is even resolved —
+  a test walks the real AST and asserts it. Verified against a pristine `b90c265f` clone running the
+  identical command: **identical decoded video (600 frames, one `framemd5` digest) and identical
+  decoded audio (2.88 MB of PCM), and an empty `diff` over 83 normalised pipeline-fact lines.** The
+  *container* hash differs, and a same-code control proves why: Matroska writes a random SegmentUID,
+  so two runs of pristine `main` differ from each other too.
+- **2×–30× repeats the song sequentially and the video extends with it.** Measured: 2× / 3× / 5×
+  produce exactly 1200 / 1800 / 3000 frames and 40.000000 / 60.000000 / 100.000000 s at 30 fps;
+  30× of a 4 s fixture produces 3600 frames and 120.000000 s. Exactly `repeat ×` the 1× figures.
+- **The repetitions are sample-identical, with no boundary gap.** The 3× output's audio split at the
+  cycle boundaries gives three byte-identical PCM runs (`892a2370…`), so each repetition is the
+  complete song at its original speed and pitch — the master is one decode to `pcm_s24le`/48 kHz
+  stream-copied `N` times, never a `-stream_loop` of a compressed input, and the produced duration
+  is verified against `N × cycle` before the render continues.
+- **Later cycles get newly planned shots.** Measured on the real planner over a 3× timeline: cycle 1
+  differs from cycle 0 in 10 of 11 cuts, cycle 2 in 11 of 11, 21 distinct candidate moments across
+  34 cuts. The musical cut positions repeat; the edit does not. With a one-candidate library the
+  cycles *are* identical, and a test pins that too — the variety comes from the library, not from
+  randomness.
+- **Frame-lock is unchanged and holds across cycles.** The repeat is part of one timeline:
+  `build_frame_aligned_cut_timeline` quantises the extended absolute positions once, exactly as
+  before, and there is no concatenation of separately locked renders.
+- **Stages 1–5 run once at every repeat count.** The analysis is extended arithmetically — each
+  cycle's beats, sections and beat-synchronous series re-stamped at `k × cycle` — so a 30× render
+  costs one beat grid, one feature pass, one section pass, one cut selection and one Stage-5
+  library. Peak working set measured at **482.3 MB at 30× against 475.3 MB at 1×**.
+- **The repeat count cannot reach Stage-5 identity**, and not merely by policy: it does not exist as
+  a value in the render body until *after* Stage 5 has returned. `CACHE_CONTRACT_VERSION` and
+  `ANALYSIS_VERSION` are untouched and no cache payload gained a field.
+- **Audio Layers and Smart Mix are planned against the extended timeline.** Measured at 5×: five
+  6 s voice clips placed at 1.3 / 10.7 / 20.0 / 30.7 / 40.0 s — three of them past the first
+  repetition — none skipped, none trimmed, with Comfort Mix and five SFX spread over all 100 s.
+- **Progress and cancellation use the existing mechanisms.** Two `stage 6 / music_repeat` STATE
+  events report the preparation, and Stage 6 then counts against the whole timeline
+  (`Rendering 331 frame-locked cuts` at 30×). Cancel works during the audio preparation (verified:
+  the partial master, the decoded cycle and the list file are all discarded) and during clip
+  extraction (verified in the browser at 29 / 331 — nothing published).
+- **The Variant Lab batch honours it**, frozen once from the click like the audio file and the
+  encoder, never from a recipe: both candidates of a 2× batch rendered 1200 frames / 40.000000 s
+  with different visual content.
+- **`--repeat-music` gives the headless CLI parity**, with the same no-`type=` discipline the six
+  creative flags use. It refuses to combine with `-s`/`-e`, because trimming the analysis window and
+  repeating it have two incompatible readings and neither was asked for.
+
+**Two pre-existing defects were found while measuring this, and both are now fixed on this branch —
+in the extractor and frame-lock contract they belong to, not in R10's feature code.** Neither was
+caused by Repeat Music; a longer timeline simply meets both conditions more often.
+
+- **A clip flush against the end of its source lost its last frame.** `start=28.84s`, `dur=1.16s`
+  on a 30.00 s source yielded 28 frames instead of 29 at 25 fps, and 34 instead of 35 at 30 fps —
+  **identically on pristine `main`** — which is how a 3× 720p25 render came out 1499 frames instead
+  of 1500. The cause was accurate `-ss` snapping the window start *forward* by up to one source
+  frame: invisible mid-file, unrecoverable at EOF. Fixed at `c0d64cbe`. A segment that asks for N
+  output frames now produces N or fails clearly: the extractor reads FFmpeg's own written-frame
+  count and takes at most **one** corrected re-seek anchored on the source's end. No frame is ever
+  repeated or padded where a real one can be decoded.
+- **The timeline could end one frame PAST the audio, and `-shortest` discarded the overhang.**
+  `end_frame` rounds, so music that is not a whole number of output frames planned up to half a
+  frame beyond its own audio — and final assembly's `-shortest` threw that away: **one** frame on a
+  stream without B-frames, **two** on an NVENC stream, which is the UI default. That is exactly why
+  the owner's accepted 3× render planned **20,852** frames and published **20,850**, ending 63.7 ms
+  before its own music. Extraction was *not* at fault — the same NVENC render on frame-aligned music
+  published 500 of 500. Fixed at `005951c8` in two parts: the builder steps the end back one frame
+  only when it would overrun, and the plan's own length reaches the mux as an output-side `-t`.
+  `-shortest` is deliberately **kept**, because it still covers an audio file shorter than the plan.
+  1× stays frame-checksum for frame-checksum identical to the accepted baseline, with the audio PCM
+  digest unchanged.
+
+**Known observation, not a feature project: a ~36 ms audio/video end gap at 720p30.** The frame
+count is exact there (1801 of 1801) and 25 fps is exact end-to-end. At 30 fps the assembled
+segments' MP4 timestamp deltas are not uniformly 512 ticks, so the concatenation's container
+duration lands ~8 ms below `frames / fps`, `-t` stops governing and the `-shortest` audio undercut
+reappears. Dropping `-shortest` measures −8.3 ms and is **an owner decision, deliberately not
+taken** — and nudging `-t` below the plan is specifically wrong, because it discards the last frame
+whenever the concatenation *is* exact, which is the original defect. The contract for both fixes is
+in [`.claude/rules/pipeline-core.md`](.claude/rules/pipeline-core.md).
+
+**Next: Auto Repeat to Fit Voice Layers** — choose the smallest repeat count up to 30 that makes the
+voice selection placeable, decided by **actual placement feasibility** rather than by summing
+durations, which is the correction R7.3 records above. R7.3's mode 4 is no longer blocked on R10
+existing; it is blocked on that resolver being written, and is still deliberately not offered.
+
+### R11 — Raw Cutter → "Review these clips" · **PLANNED — small UX improvement**
+
+The workflow the owner wants is one line: **cut video → finish → review the exported clips → keep or
+discard.** Today the last arrow is the operator's own navigation.
+
+**A related feature already exists, and this is not a second one.** `cut_open_library_btn` →
+`_on_cut_open_in_library` (label `LABEL_CUT_OPEN_LIBRARY`) already selects Media Library → Video
+Review, fills in the Video Review folder box, turns **Include subfolders** on, and deliberately
+scans nothing — the operator presses Scan Folder when they are ready. **Do not plan a duplicate
+feature, a second review engine, a new top-level tab or another folder selector.** What is missing
+is the handoff *from a finished job*, and it is four small things:
+
+1. **Offer it when a job finishes.** After Single Video or Folder Batch completes with exported
+   clips, **"Review these clips"** should be clearly offered as the next step. The button exists
+   today but sits beside the cutter controls, equally available before the first cut and after the
+   tenth — honest, and silent about the job that just ran.
+2. **Hand over the job's exact output directory, not the parent folder.** The button reads the
+   `cut_output` widget, which is the parent folder, because the Raw Cutter keeps no run-directory
+   state the way the Audio Cutter's `audio_run_dir_state` does. The directories themselves already
+   exist inside the handlers: a single-video run has `run_directory` from
+   `cutter_export.prepare_run_directory`, and a batch has `batch_directory` plus one
+   `cutter_export.prepare_item_directory` per source. The work is carrying one of them *out* of the
+   handler, which means touching the Cut handler's return signature — several suites pin it
+   positionally. That is the real cost of this item, and the reason it is small rather than free.
+3. **Recursion follows the shape of the job.** A batch writes one subfolder per source, so Include
+   subfolders stays on; a single-video run writes its clips directly into one folder and does not
+   need it.
+4. **Clear the handoff when a new cut begins**, so a newer failed or cancelled job can never present
+   the previous run's directory as its own result.
+
+Unchanged, and deliberately so:
+
+- **Scan Folder stays the operator's action.** Nothing expensive starts by itself. Walking a clip
+  library is exactly the cost `_on_cut_open_in_library` already refuses to pay unasked, and this
+  item must not start paying it.
+- **Nothing is moved, deleted, sorted or overwritten.** The handoff fills in a folder box. Keep /
+  discard remains R5's read-only review plus the separately reviewed transfer work, and nothing here
+  grants that any new authority.
+- **A partial or cancelled job may offer the button only if clips actually reached disk**, with
+  wording that says what really happened. On those paths `written` is the truth, not the plan.
+
+Reuse the existing handler, the existing button and the existing Video Review widgets. The change is
+*which* directory arrives and *when* it is offered — not a new review surface.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -1114,13 +1231,14 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R7** — Raw Audio Cutter V1 (mechanical, no AI) | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — silence-based cutting with the four controls exposed, WAV/FLAC export, a manifest, and in-page review. Owner-tested on real audio and **accepted**: cuts good, 0.5–0.6 s silence ideal, no truncated words. **Not independently reviewed** |
 | **R7.1** — hover audio gallery + Audio Layers Comfort Mix | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — Clips-Preview-style gallery with hover playback and Confirm-and-Sort; optional Auto Balance (EBU R128) and an adjustable music return. Legacy mix proven byte-identical with Auto Balance off. Browser-verified on port 7864. Owner-tested and **accepted** |
 | **R7.2** — lazy audio preview, 🎧 Audio Preview tab, keep-only sorting, folder validation, MP3 | **MERGED AND DEPLOYED** (PR #77, main `d98fb55a`) — the base64 page budget is **removed** (not raised) in favour of an authorized range-capable endpoint reusing R5's registry; a standalone review tab that works after a restart; Confirm admitted by one kept clip with a counted, batch-bound confirmation before unmarked clips are swept; identical/nested destinations refused as typed and again at Confirm; MP3 at 192 kbps with the lossy trade stated plainly. Owner-tested and **accepted**. **Not independently reviewed** |
-| **R7.3** — "When voice clips do not fit" modes | **OWNER-ACCEPTED, IN DRAFT PR, NOT DEPLOYED** — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) still blocked on R10 and **not offered**. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **The owner has personally tested Strict / Skip / Trim and accepted them** — which is a validation milestone, not a deployment one: **still not merged, still not deployed, still not independently reviewed** |
-| **Stage-5 Cancel** — Cancel actually interrupts video analysis | **LOCAL CANDIDATE, IN DRAFT PR** — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not merged, not deployed, not independently reviewed** |
-| **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **LOCAL CANDIDATE, IN DRAFT PR** — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. **Not merged, not deployed, not independently reviewed** |
-| **R10** — Quick Render **Repeat Music 1×–30×** | **PLANNED, NOT IMPLEMENTED** — 1× must be the existing path unchanged; cuts must cover the whole extended timeline rather than repeating the rendered sequence; analysis reused rather than re-run; cancellable with an estimated duration |
+| **R7.3** — "When voice clips do not fit" modes | **MERGED AND DEPLOYED** (PR #79, main `eb3839cb`) — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) is still **not offered**: R10 now exists as a local candidate, so what it waits on is the Auto-Repeat-to-Fit resolver rather than the repeat mechanism. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **The owner has personally tested Strict / Skip / Trim and accepted them**, and it is now merged and deployed. **Not independently reviewed** |
+| **Stage-5 Cancel** — Cancel actually interrupts video analysis | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not independently reviewed** |
+| **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. It is **operational**: the configured folder on this machine holds 4,580 records. **Not independently reviewed** |
+| **R10** — **Repeat Music 1×–30×** | **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED** — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Not merged, not deployed, not independently reviewed** |
+| **R11** — Raw Cutter → **"Review these clips"** output handoff | **PLANNED — small UX improvement**, after the R10 release work. The navigation half already ships: `cut_open_library_btn` → `_on_cut_open_in_library` selects Media Library → Video Review, prefills the folder, enables Include subfolders and scans nothing. Planned is handing over the finished job's **exact** output directory instead of the parent folder, offering it when Single Video or Folder Batch completes with clips on disk, and clearing the handoff when a new cut begins. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement** |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
-| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) is merged and deployed at `d98fb55a`, and R7.3's overflow policy is a local candidate; the documentation half is unstarted. **R10** is the next Audio Layers-adjacent item |
+| **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
 | **R2** — Transition Detection + Edge Cleaner | **DEFERRED** — measured as unreliable on real footage; no detector exists, and it does not block R4 |
 | **R3** — Smart Passages / AI Director Cutter (Qwen-guided) | **PLANNED** for future consideration — **opt-in by design**; no Qwen in the Raw Cutter today |
 | **R4** — remaining usability and scale ideas | **PLANNED** |
@@ -1144,19 +1262,28 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
 5a. **UX Refresh** — **DONE**, merged as PR #78 and deployed at the same `d98fb55a`, owner-tested
    and accepted. It changed no R7 engine: the Audio Cutter, the review galleries and Comfort Mix
    are the same code in different containers, plus one opt-in fade.
-6. **R7.3 — "When voice clips do not fit"** — **OWNER-ACCEPTED, NOT DEPLOYED**, on
-   `feat/fun-audio-overflow-r7-3`. Modes 1–3 ship (Strict / Skip / Trim-then-skip); mode 4 waits
-   on R10. The owner test is **done and passed**; what remains is merge and deploy, which are
-   separate authorizations.
-6a. **Stage-5 Cancel + Shared Analysis Cache** — **LOCAL CANDIDATES** on
-   `feat/fun-stage5-cancel-shared-cache`, stacked on R7.3's branch. Two usability fixes that come
-   from the same owner session: Cancel now actually interrupts video analysis (measured
-   0.016–0.45 s, against an incident where it took about an hour), and one shared cache folder
-   serves every BeatSync version under the same Windows user (measured 8/8 reuse across two app
-   roots). Awaiting the owner test; neither merged nor deployed.
-7. **R10 — Repeat Music 1×–30× — THE NEXT PRIORITY.** It unblocks R7.3's fourth mode
-   (Repeat Music to Fit) and the later Auto-Repeat-to-Fit, and it is the one remaining answer to
-   "my voice material is longer than my song" that drops and shortens nothing at all.
+6. ~~**R7.3 — "When voice clips do not fit"**.~~ **Done** — merged as PR #79 and deployed at main
+   `eb3839cb`. Modes 1–3 ship (Strict / Skip / Trim-then-skip); mode 4 is still not offered.
+6a. ~~**Stage-5 Cancel + Shared Analysis Cache**.~~ **Done** — merged as PR #80 and deployed at main
+   `b90c265f`, which is the current production head. Cancel really interrupts video analysis
+   (measured 0.016–0.45 s, against an incident where it took about an hour), and one shared cache
+   folder now serves every BeatSync version under the same Windows user — it is operational, with
+   4,580 records in the configured folder on this machine.
+7. **R10 — Repeat Music 1×–30×** — **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**, on
+   `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. 1× is verified content-identical to
+   pristine `main`; 2×–30× are FFprobe-verified to the frame; later cycles get newly planned shots;
+   voice, SFX, profiles, Cancel and the Variant Lab batch all exercised at repeat counts above one.
+   **The owner has rendered 2× and 3× on a real 2,476-video library and accepted the result.** What
+   remains is an independent review, merge and deploy — three separate things, none of them done —
+   plus one owner decision on the 720p30 `-shortest` gap recorded in the section above.
+7a. **Auto Repeat to Fit Voice Layers — the next small integration.** Pick the smallest repeat count
+   up to 30 that makes the voice selection placeable, decided by **actual placement feasibility**
+   rather than by summing durations. This, not the repeat mechanism, is what R7.3's fourth mode is
+   now waiting on. Deliberately **not** part of R10.
+7b. **R11 — Raw Cutter → "Review these clips".** A small UX improvement, after the R10 release
+   work: hand the finished job's exact output directory to the review surface that already exists,
+   and offer it at the moment a job completes. Explicitly **not** a new feature — no extra tab, no
+   second review engine, no automatic scanning and no file movement.
 8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing

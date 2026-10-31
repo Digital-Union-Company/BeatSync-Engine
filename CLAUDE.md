@@ -55,6 +55,8 @@ pipeline — same `analyze_beats_auto` → `create_music_video` path as the UI, 
 instead of routing through the UI's quiet console. It also exposes every creative control as a flag
 (`--seed`, `--cut-density`, `--micro-cuts`, `--semantic-emphasis`, `--energy-response`,
 `--motion-bias`, `--source-diversity`); those seven values are the reproducible execution contract.
+`--repeat-music 1..30` rides alongside them under the same no-`type=` discipline, but is **not** one of
+the seven: it changes how long the video is, not how it is edited.
 
 ### Tests
 
@@ -122,6 +124,37 @@ These apply in almost every session. Each has a scoped rule with the full contra
   positions to output frames once; segment lengths are frame *differences*. Never reintroduce
   per-segment `round(duration * fps)`. If a clip fails to extract, `create_music_video` **raises**
   rather than concatenating a short timeline. → `.claude/rules/pipeline-core.md`
+- **And the invariant is now enforced on the RESULT, not just the plan (FUN R10 Final Frame Fix).**
+  **A segment requesting N output frames produces N, or fails clearly** — `rc=0` plus a non-empty
+  MP4 is explicitly *not* proof of a correct segment, which is how a clip flush against the end of
+  its source silently lost its last frame (3× / 720p25 measured 1499 frames instead of 1500;
+  pre-existing, reproduced on pristine `main`). The cause is accurate `-ss` snapping the window
+  start **forward** by up to one source frame, invisible mid-file and unrecoverable at EOF — *not*
+  the `fps` filter, which produced 29 output frames from 35 input frames every time. The extractor
+  captures FFmpeg's own written-frame count via `-progress pipe:1` (free; stderr untouched),
+  confirms a suspect count against a **header-only** `nb_frames` read, and takes at most **one**
+  corrected re-seek anchored on the source's end with one *source* frame of lead-in. A repeated or
+  padded frame is never substituted where a real frame can be decoded; an **unmeasured** count is
+  never a refusal. The first attempt's argv is unchanged apart from `-progress`, and 1× is verified
+  identical to the accepted baseline frame-checksum for frame-checksum. →
+  `.claude/rules/pipeline-core.md`
+- **And the timeline may not end PAST the audio (FUN R10 A/V End Alignment).** `end_frame` is
+  `seconds_to_frame_count(audio_duration, fps)`, which **rounds**, so music that is not a whole
+  number of output frames planned up to half a frame beyond the audio — and final assembly's
+  `-shortest` discarded the overhang: **one** frame without B-frames, **two** on an NVENC stream,
+  which is the UI default. Hence the owner's real 3× render planning 20852 frames and publishing
+  20850, ending 63.7 ms before its own music. **Extraction was never at fault** — the same NVENC
+  render on frame-aligned music published 500 of 500 — so measure the plan against the audio before
+  suspecting the extractor. The builder now steps the end back one frame only when it would overrun —
+  exactly the frame `-shortest` was throwing away, so previously-correct output is unchanged and
+  `plan == published`. **The clamp alone only flipped the sign**, because `-shortest` then undercut
+  the *audio* by an inconsistent 0–2 PCM packets (77.3 ms on a 14-minute render), so the plan's own
+  length is also passed to `concatenate_videos_ffmpeg` as `timeline_seconds` and becomes an
+  output-side `-t` on all three audio-muxing branches. `-shortest` is **kept** — it still covers an
+  audio file shorter than the plan. The clamp is **arithmetic only and calls nothing** (the builder is
+  AST-exec'd against a two-name namespace), bounded to one frame, and inert for every frame-aligned
+  fixture in the repo — which is why no existing test saw it. A ~36 ms residual at 720p30 is measured
+  and deliberately left open. → `.claude/rules/pipeline-core.md`
 - **Stage 5 runs out-of-process** and never loads a model in-process; the response JSON is the only
   semantic authority. The retained request/response JSON files are **intentionally** left behind for
   debugging. → `.claude/rules/stage5-worker.md`
@@ -136,6 +169,15 @@ These apply in almost every session. Each has a scoped rule with the full contra
 - **Creative state is a render request, never source or media identity.** The seven resolved controls
   ride on `beat_info["creative"]`; changing one re-plans and never re-analyses. →
   `.claude/rules/creative-controls.md`
+- **Repeat Music (FUN R10) extends the timeline AFTER the analysis, never during it.** The music is
+  analysed **once**, on the operator's own file; a repeated `pcm_s24le` master is then built, its
+  cycle length **measured**, and each cycle's beats, sections and beat-synchronous series re-stamped
+  at `k × cycle`. So Stages 1–5 cost the same at 30× as at 1×, and the repeat count has no route to
+  Stage-5 identity, a Qwen request or a persisted record — it does not exist as a value in the render
+  body until Stage 5 has returned. **1× is the legacy path structurally**: every statement the
+  feature adds sits behind a repeat guard, so at 1× neither new module is resolved. Musical cut
+  positions repeat; the shots do not — Stage 6 plans one continuous timeline and carries its running
+  state across cycle boundaries. → `.claude/rules/music-repeat.md`
 - **Cancellation (C3-R1A, extended into Stage 5 by FUN Stage-5 Cancel).** Exactly one
   `RenderLifecycle` per top-level render event — one Create Music Video click, or the **whole**
   2–4-candidate batch. FFmpeg-class children are terminated *and reaped* before `RenderCancelled`
