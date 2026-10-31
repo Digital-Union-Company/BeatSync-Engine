@@ -854,10 +854,13 @@ A configured-but-unreachable folder (an offline drive) falls back to the local c
 so**, loudly, rather than starting a silent cold re-analysis. Clearing a shared cache costs every
 installation on the machine, and the Cache Management panel now says that before it is done.
 
-### R10 — Repeat Music 1×–30× · **IMPLEMENTED LOCALLY, IN A DRAFT PR, PENDING OWNER TEST**
+### R10 — Repeat Music 1×–30× · **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**
 
-Branch `feat/fun-repeat-music-r10`, cut from `main` at `b90c265f`. Every bullet this section planned
-is implemented; nothing is merged and nothing is deployed, and it has had no independent review.
+Branch `feat/fun-repeat-music-r10`, cut from `main` at `b90c265f`, head `005951c8` in **draft
+PR #81**. Every bullet this section planned is implemented, and **the owner has personally rendered
+2× and 3× against a real 2,476-video library, watched the results and accepted the visual and
+musical outcome.** Merge, deploy and independent review are three separate things and none of them
+is done.
 
 **🔁 Repeat Music** is a `gr.Slider` (1–30, step 1, default 1) directly below the Audio File
 control, with a live read-out beneath it — `00:20 × 5 = 01:40 of finished video.` — that warns
@@ -910,19 +913,87 @@ What was planned, and what it actually does:
   creative flags use. It refuses to combine with `-s`/`-e`, because trimming the analysis window and
   repeating it have two incompatible readings and neither was asked for.
 
-**One pre-existing defect was found while measuring this, and deliberately not fixed here.** A clip
-positioned flush against the end of a source loses its last frame: `start=28.84s`, `dur=1.16s` on a
-30.00 s source yields 28 frames instead of 29 at 25 fps, and 34 instead of 35 at 30 fps —
-**identically on pristine `main`**. A longer timeline draws more clips and so meets the case more
-often (a 3× 720p25 render came out 1499 frames instead of 1500), but the cause is
-`extract_clip_segment_ffmpeg_detailed` plus a planner start clamped to `video_duration -
-source_duration`, and `create_music_video` not verifying the frames a clip actually produced. It
-belongs to the extractor / frame-lock contract.
+**Two pre-existing defects were found while measuring this, and both are now fixed on this branch —
+in the extractor and frame-lock contract they belong to, not in R10's feature code.** Neither was
+caused by Repeat Music; a longer timeline simply meets both conditions more often.
+
+- **A clip flush against the end of its source lost its last frame.** `start=28.84s`, `dur=1.16s`
+  on a 30.00 s source yielded 28 frames instead of 29 at 25 fps, and 34 instead of 35 at 30 fps —
+  **identically on pristine `main`** — which is how a 3× 720p25 render came out 1499 frames instead
+  of 1500. The cause was accurate `-ss` snapping the window start *forward* by up to one source
+  frame: invisible mid-file, unrecoverable at EOF. Fixed at `c0d64cbe`. A segment that asks for N
+  output frames now produces N or fails clearly: the extractor reads FFmpeg's own written-frame
+  count and takes at most **one** corrected re-seek anchored on the source's end. No frame is ever
+  repeated or padded where a real one can be decoded.
+- **The timeline could end one frame PAST the audio, and `-shortest` discarded the overhang.**
+  `end_frame` rounds, so music that is not a whole number of output frames planned up to half a
+  frame beyond its own audio — and final assembly's `-shortest` threw that away: **one** frame on a
+  stream without B-frames, **two** on an NVENC stream, which is the UI default. That is exactly why
+  the owner's accepted 3× render planned **20,852** frames and published **20,850**, ending 63.7 ms
+  before its own music. Extraction was *not* at fault — the same NVENC render on frame-aligned music
+  published 500 of 500. Fixed at `005951c8` in two parts: the builder steps the end back one frame
+  only when it would overrun, and the plan's own length reaches the mux as an output-side `-t`.
+  `-shortest` is deliberately **kept**, because it still covers an audio file shorter than the plan.
+  1× stays frame-checksum for frame-checksum identical to the accepted baseline, with the audio PCM
+  digest unchanged.
+
+**Known observation, not a feature project: a ~36 ms audio/video end gap at 720p30.** The frame
+count is exact there (1801 of 1801) and 25 fps is exact end-to-end. At 30 fps the assembled
+segments' MP4 timestamp deltas are not uniformly 512 ticks, so the concatenation's container
+duration lands ~8 ms below `frames / fps`, `-t` stops governing and the `-shortest` audio undercut
+reappears. Dropping `-shortest` measures −8.3 ms and is **an owner decision, deliberately not
+taken** — and nudging `-t` below the plan is specifically wrong, because it discards the last frame
+whenever the concatenation *is* exact, which is the original defect. The contract for both fixes is
+in [`.claude/rules/pipeline-core.md`](.claude/rules/pipeline-core.md).
 
 **Next: Auto Repeat to Fit Voice Layers** — choose the smallest repeat count up to 30 that makes the
 voice selection placeable, decided by **actual placement feasibility** rather than by summing
 durations, which is the correction R7.3 records above. R7.3's mode 4 is no longer blocked on R10
 existing; it is blocked on that resolver being written, and is still deliberately not offered.
+
+### R11 — Raw Cutter → "Review these clips" · **PLANNED — small UX improvement**
+
+The workflow the owner wants is one line: **cut video → finish → review the exported clips → keep or
+discard.** Today the last arrow is the operator's own navigation.
+
+**A related feature already exists, and this is not a second one.** `cut_open_library_btn` →
+`_on_cut_open_in_library` (label `LABEL_CUT_OPEN_LIBRARY`) already selects Media Library → Video
+Review, fills in the Video Review folder box, turns **Include subfolders** on, and deliberately
+scans nothing — the operator presses Scan Folder when they are ready. **Do not plan a duplicate
+feature, a second review engine, a new top-level tab or another folder selector.** What is missing
+is the handoff *from a finished job*, and it is four small things:
+
+1. **Offer it when a job finishes.** After Single Video or Folder Batch completes with exported
+   clips, **"Review these clips"** should be clearly offered as the next step. The button exists
+   today but sits beside the cutter controls, equally available before the first cut and after the
+   tenth — honest, and silent about the job that just ran.
+2. **Hand over the job's exact output directory, not the parent folder.** The button reads the
+   `cut_output` widget, which is the parent folder, because the Raw Cutter keeps no run-directory
+   state the way the Audio Cutter's `audio_run_dir_state` does. The directories themselves already
+   exist inside the handlers: a single-video run has `run_directory` from
+   `cutter_export.prepare_run_directory`, and a batch has `batch_directory` plus one
+   `cutter_export.prepare_item_directory` per source. The work is carrying one of them *out* of the
+   handler, which means touching the Cut handler's return signature — several suites pin it
+   positionally. That is the real cost of this item, and the reason it is small rather than free.
+3. **Recursion follows the shape of the job.** A batch writes one subfolder per source, so Include
+   subfolders stays on; a single-video run writes its clips directly into one folder and does not
+   need it.
+4. **Clear the handoff when a new cut begins**, so a newer failed or cancelled job can never present
+   the previous run's directory as its own result.
+
+Unchanged, and deliberately so:
+
+- **Scan Folder stays the operator's action.** Nothing expensive starts by itself. Walking a clip
+  library is exactly the cost `_on_cut_open_in_library` already refuses to pay unasked, and this
+  item must not start paying it.
+- **Nothing is moved, deleted, sorted or overwritten.** The handoff fills in a folder box. Keep /
+  discard remains R5's read-only review plus the separately reviewed transfer work, and nothing here
+  grants that any new authority.
+- **A partial or cancelled job may offer the button only if clips actually reached disk**, with
+  wording that says what really happened. On those paths `written` is the truth, not the plan.
+
+Reuse the existing handler, the existing button and the existing Video Review widgets. The change is
+*which* directory arrives and *when* it is offered — not a new review surface.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -1163,7 +1234,8 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R7.3** — "When voice clips do not fit" modes | **MERGED AND DEPLOYED** (PR #79, main `eb3839cb`) — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) is still **not offered**: R10 now exists as a local candidate, so what it waits on is the Auto-Repeat-to-Fit resolver rather than the repeat mechanism. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **The owner has personally tested Strict / Skip / Trim and accepted them**, and it is now merged and deployed. **Not independently reviewed** |
 | **Stage-5 Cancel** — Cancel actually interrupts video analysis | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not independently reviewed** |
 | **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. It is **operational**: the configured folder on this machine holds 4,580 records. **Not independently reviewed** |
-| **R10** — **Repeat Music 1×–30×** | **IMPLEMENTED LOCALLY, IN A DRAFT PR, PENDING OWNER TEST** — branch `feat/fun-repeat-music-r10` off `b90c265f`. 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. **Not merged, not deployed, not owner-tested, not independently reviewed** |
+| **R10** — **Repeat Music 1×–30×** | **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED** — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Not merged, not deployed, not independently reviewed** |
+| **R11** — Raw Cutter → **"Review these clips"** output handoff | **PLANNED — small UX improvement**, after the R10 release work. The navigation half already ships: `cut_open_library_btn` → `_on_cut_open_in_library` selects Media Library → Video Review, prefills the folder, enables Include subfolders and scans nothing. Planned is handing over the finished job's **exact** output directory instead of the parent folder, offering it when Single Video or Folder Batch completes with clips on disk, and clearing the handoff when a new cut begins. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement** |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
@@ -1197,16 +1269,21 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    (measured 0.016–0.45 s, against an incident where it took about an hour), and one shared cache
    folder now serves every BeatSync version under the same Windows user — it is operational, with
    4,580 records in the configured folder on this machine.
-7. **R10 — Repeat Music 1×–30×** — **IMPLEMENTED LOCALLY, PENDING THE OWNER TEST**, on
-   `feat/fun-repeat-music-r10` off `b90c265f`, in a draft PR. 1× is verified content-identical to
+7. **R10 — Repeat Music 1×–30×** — **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**, on
+   `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. 1× is verified content-identical to
    pristine `main`; 2×–30× are FFprobe-verified to the frame; later cycles get newly planned shots;
    voice, SFX, profiles, Cancel and the Variant Lab batch all exercised at repeat counts above one.
-   What remains is the owner test, an independent review, merge and deploy — four separate things,
-   none of them done.
+   **The owner has rendered 2× and 3× on a real 2,476-video library and accepted the result.** What
+   remains is an independent review, merge and deploy — three separate things, none of them done —
+   plus one owner decision on the 720p30 `-shortest` gap recorded in the section above.
 7a. **Auto Repeat to Fit Voice Layers — the next small integration.** Pick the smallest repeat count
    up to 30 that makes the voice selection placeable, decided by **actual placement feasibility**
    rather than by summing durations. This, not the repeat mechanism, is what R7.3's fourth mode is
    now waiting on. Deliberately **not** part of R10.
+7b. **R11 — Raw Cutter → "Review these clips".** A small UX improvement, after the R10 release
+   work: hand the finished job's exact output directory to the review surface that already exists,
+   and offer it at the moment a job completes. Explicitly **not** a new feature — no extra tab, no
+   second review engine, no automatic scanning and no file movement.
 8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
