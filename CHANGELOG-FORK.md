@@ -20,6 +20,85 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-31 (FUN R10 A/V End Alignment: the timeline no longer plans past the audio)
+
+**The published video could end up to two frames before its own music.** Found in the owner's real
+3x render: the frame-locked timeline planned **20852** frames and the file carried **20850**, ending
+at 834.000000s under an audio master of 834.063688s — a 63.7 ms gap, more than one frame interval at
+25 fps.
+
+**Not a Repeat Music defect, and no frames were lost in extraction.** `build_frame_aligned_cut_timeline`
+derives its end from `seconds_to_frame_count`, which **rounds**, so music whose length is not a whole
+number of output frames yields a timeline ending up to half a frame *past* the audio. Final assembly
+muxes with `-shortest`, which then discards the overhang. Measured on the real render body, at both
+1x and 3x:
+
+| encoder | planned | published | discarded |
+|---|---|---|---|
+| `cpu` (libx264 `ultrafast`, no B-frames) | 501 / 1502 | 500 / 1501 | **1 frame** |
+| `h264_nvenc` (B-frames, `has_b_frames=2`) | 501 / 1502 | 499 / 1500 | **2 frames** |
+
+The owner's render was NVENC — the UI default — which is why it lost two. Extraction was exact
+throughout: the same NVENC render on music that *is* a whole number of frames published 500 of 500,
+so the FUN R10 Final Frame Fix's per-segment guarantee held and nothing under-delivered.
+
+**Why no existing test or acceptance render caught it.** Every R10 fixture (`music_20s.wav`,
+`music_4s.wav`, the 60 s control) is an exact multiple of the output frame interval at every profile
+rate, so `round` landed exactly on the audio end and `-shortest` had nothing to discard; and every
+profile render used the `cpu` path, which loses one frame rather than two. The condition needs music
+that does not divide into frames **and** the default encoder. `media/music_overshoot.wav` —
+the owner's own music trimmed to 961 019 samples (20.021229 s) — reproduces it at 20 s.
+
+**The correction has two parts, because the clamp alone only moved the problem.** Stepping the
+timeline's end back fixed the frame count but flipped the sign of the gap: `-shortest` then
+undercut the *audio* instead, by an inconsistent 0, 1 or 2 PCM packets — 50.7 ms on a 60 s render and
+**77.3 ms** on a 14-minute one. So the frame-locked plan is also passed to final assembly and becomes
+an explicit output-side `-t`, which cuts both streams at exactly the planned position.
+
+| | frames | video | audio | V−A |
+|---|---|---|---|---|
+| before, nvenc 3x | 1500 | 60.000000 | 60.063688 | −63.7 ms |
+| clamp only, nvenc 3x | 1501 | 60.040000 | 59.989333 | +50.7 ms |
+| clamp + `-t`, nvenc 3x | **1501** | **60.040000** | **60.040000** | **0.0 ms** |
+
+Properties:
+
+- **The published frames do not change on the path that was already correct.** The frame the clamp
+  gives up is precisely the one `-shortest` was discarding, so a `cpu` render publishes the same
+  count from the same segments; an NVENC render regains the extra frame it was losing.
+- **`plan == published` at every rate and repeat count measured**, and at 25 fps — the owner's
+  profile and the reported defect — video and audio durations are **equal**, across
+  {cpu, nvenc} × {1x, 2x, 3x} and for both frame-aligned and non-aligned music.
+- **Bounded to a single frame, and the clamp is inert when the audio is frame-aligned** — so every
+  existing fixture, and the accepted 1x baseline, are untouched. Verified with the whole correction
+  in place: the 1x control's **600** coded frame checksums are identical to the accepted R10 baseline
+  and its audio PCM SHA-256 still matches `efec99d1…6465143` to the byte.
+- **`-shortest` is kept**, no frame is padded or duplicated, no audio is resampled, re-timed or
+  pitch-shifted, and the beat grid, Stage-5 analysis and cache identity are untouched.
+- **`timeline_seconds` is a defaulted parameter placed before `lifecycle`**, which C3-R1A's seam
+  contract pins last. `None` is the previous behaviour exactly.
+
+**One residual, measured and deliberately not closed: ~36 ms at 720p30.** At 30 fps the assembled
+segments' mp4 `stts` deltas are not uniformly 512 ticks, so the concatenated video's container
+duration lands ~125 ticks (8 ms) *below* `frames / fps`. `-t` therefore sits above the real video end
+and stops governing, `-shortest` governs instead, and its audio undercut reappears: 1801 of 1801
+frames, but V−A = +35.7 ms (1.07 frames at 30 fps). 25 fps does not show it — the concat lands exactly
+on the plan there. Dropping `-shortest` when a plan is supplied was measured and gives **−8.3 ms**,
+but it removes the protection against a container that over-reports its audio duration (a CBR MP3
+with no Xing header can be off by seconds, and the timeline is built from that same figure, so
+truncating the video is the safer failure). That trade is an owner decision, not one to take inside
+this fix.
+- **No module-level name was added to the builder.** `tests/test_music_repeat.py` AST-extracts that
+  function and executes it against a namespace holding only `np` and `seconds_to_frame_count`, so the
+  tolerance is a literal and the clamp calls nothing — a test now pins that dependency set directly
+  instead of an allowlist of unparsed call text.
+
+Two test claims were **amended because measurement falsified them**, not because they were
+inconvenient: `test_the_extended_timeline_quantises_without_accumulating_drift` asserted the timeline
+ends exactly at `round(total * fps)` (its `cycle = 7.3` fixture is deliberately not frame-aligned, so
+many of its thirty cases rounded past the audio), and `test_the_frame_locked_timeline_builder_is_untouched`
+asserted the builder "gained nothing; it was already correct".
+
 ### Fixed — 2026-10-31 (FUN R10 Final Frame Fix: a segment asking for N frames gets N)
 
 **A clip positioned flush against the end of its source lost its last frame.** Pre-existing, and

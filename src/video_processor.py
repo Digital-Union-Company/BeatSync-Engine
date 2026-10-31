@@ -407,7 +407,24 @@ def build_frame_aligned_cut_timeline(beat_times: BeatTimes, audio_duration: floa
 
     # Quantize ABSOLUTE cut positions, not per-segment durations. This removes
     # cumulative drift caused by round((beat[i+1] - beat[i]) * fps) on each clip.
+    #
+    # [FORK] Digital-Union (FUN R10 A/V End Alignment): the timeline may not end PAST the audio.
+    # `seconds_to_frame_count` ROUNDS, so music whose length is not a whole number of output frames
+    # yields an end up to half a frame beyond the audio -- and final assembly's `-shortest` then
+    # discards the overhang. Measured: ONE frame on a stream without B-frames, TWO on an NVENC
+    # stream carrying them, which is how a 3x/720p25 render of 834.063688s music planned 20852
+    # frames and published 20850. Planning that frame buys nothing (its extraction is thrown away)
+    # and leaves the published video up to 80ms short of its own music. Stepping the end back to the
+    # last frame that still ENDS within the audio makes the plan achievable while leaving the
+    # published frames identical. Arithmetic only, bounded to a single frame, and inert whenever the
+    # audio already is a whole number of frames -- which is every synthetic fixture, so this is not
+    # reachable from the existing acceptance renders. The epsilon absorbs float error at rates like
+    # 23.976 rather than knocking an exact multiple down a frame; it is a literal because this
+    # function is AST-extracted and executed against a two-name namespace by
+    # `tests/test_music_repeat.py`, where a module-level constant would be a `NameError`.
     end_frame = max(1, seconds_to_frame_count(audio_duration, fps))
+    if end_frame > 1 and end_frame / fps > audio_duration + 1e-9:
+        end_frame -= 1
     cut_frames = np.rint(raw_cut_times * fps).astype(int)
     cut_frames = np.clip(cut_frames, 0, end_frame)
     cut_frames[0] = 0
@@ -978,6 +995,10 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 end_time=end_time,
                 use_nvenc=False,  # ProRes uses stream copy
                 temp_dir=session_temp_dir,
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): the frame-locked plan is the
+                # authority on the output's length, so the mux cuts both streams there instead of
+                # leaving it to `-shortest`, which is imprecise by an inconsistent 0-2 units.
+                timeline_seconds=float(sum(segment_frames)) / float(fps),
                 lifecycle=lifecycle
             )
         except RenderCancelled:
@@ -1264,6 +1285,8 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
                 gpu_encoder=gpu_encoder,
                 fps=fps,
                 temp_dir=session_temp_dir,
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): see the ProRes assembly above.
+                timeline_seconds=float(sum(segment_frames)) / float(fps),
                 lifecycle=lifecycle
             )
         except RenderCancelled:

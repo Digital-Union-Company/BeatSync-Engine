@@ -60,6 +60,26 @@ def processor_tree() -> ast.Module:
     return _tree(_PROCESSOR_SRC)
 
 
+@pytest.fixture(scope="module")
+def timeline():
+    """The REAL `build_frame_aligned_cut_timeline`, AST-extracted and executed.
+
+    [FORK] Digital-Union (FUN R10 A/V End Alignment): the end-boundary clamp is asserted against the
+    production function rather than a paraphrase, by the same technique
+    `tests/test_music_repeat.py` uses -- and against the same deliberately minimal namespace, which
+    is itself one of the constraints the clamp had to satisfy.
+    """
+    pytest.importorskip("numpy", reason="the frame-locked timeline is numpy-based")
+    import numpy
+
+    namespace = {"np": numpy}
+    bodies = [_func(_tree(_FFMPEG_SRC), "seconds_to_frame_count"),
+              _func(_tree(_PROCESSOR_SRC), "build_frame_aligned_cut_timeline")]
+    module = ast.Module(body=bodies, type_ignores=[])
+    exec(compile(module, _PROCESSOR_SRC, "exec"), namespace)  # noqa: S102
+    return namespace["build_frame_aligned_cut_timeline"]
+
+
 # ===========================================================================
 # 1. The pure contract
 # ===========================================================================
@@ -398,13 +418,99 @@ def test_the_truncated_plan_sentence_has_exactly_two_consumers():
     assert "too short for its planned segment" in processor_source
 
 
-def test_the_frame_locked_timeline_builder_is_untouched(processor_tree):
-    """The correction is confined to extraction. The timeline arithmetic is not part of it."""
+def test_the_frame_locked_timeline_quantisation_is_untouched(processor_tree):
+    """The quantisation is untouched. Only the END BOUNDARY moved.
+
+    [FORK] Digital-Union (FUN R10 A/V End Alignment): this test was
+    `test_the_frame_locked_timeline_builder_is_untouched` and asserted the builder "gained nothing;
+    it was already correct". That claim was falsified by measurement -- the builder planned an end
+    up to half a frame past the audio, and `-shortest` discarded the overhang -- so the claim is
+    amended rather than kept. What the correction may NOT touch is the absolute quantisation, and
+    that is what is pinned here.
+    """
     source = ast.unparse(_func(processor_tree, "build_frame_aligned_cut_timeline"))
     assert "np.rint(raw_cut_times * fps)" in source
     assert "segment_frames = np.diff(cut_frames).astype(int)" in source
     assert "segment_durations = segment_frames / fps" in source
-    assert "frame_lock" not in source, "the builder gained nothing; it was already correct"
+
+
+def test_the_timeline_builder_stays_executable_against_a_two_name_namespace(processor_tree):
+    """The end-boundary clamp may not import anything, including this milestone's own fork module.
+
+    `tests/test_music_repeat.py` AST-extracts this function and executes it against a namespace
+    holding only `np` and `seconds_to_frame_count`, so ANY module-level name the body gains is a
+    `NameError` over thirty parametrised cases. That is why the tolerance is a literal and why the
+    clamp is arithmetic rather than a call into `beatsync_fork.frame_lock`.
+    """
+    fn = _func(processor_tree, "build_frame_aligned_cut_timeline")
+    source = ast.unparse(fn)
+    for forbidden in ("fork_frame_lock", "frame_lock.", "import "):
+        assert forbidden not in source, forbidden
+
+    # Every name the body READS that it does not itself bind has to come from the harness namespace
+    # or from builtins. That is the executability property stated directly, rather than an
+    # allowlist of unparsed call text -- which a chained call like
+    # `np.asarray(...).reshape(-1)` defeats without saying anything about the dependency.
+    import builtins
+
+    # Annotations are excluded: they are not evaluated when the body runs, which is exactly why
+    # the existing `BeatTimes` annotation has never broken the music-repeat harness.
+    annotations = [argument.annotation for argument in fn.args.args if argument.annotation]
+    if fn.returns is not None:
+        annotations.append(fn.returns)
+    annotated = {node.id for tree in annotations for node in ast.walk(tree)
+                 if isinstance(node, ast.Name)}
+
+    bound = {argument.arg for argument in fn.args.args}
+    bound |= {node.id for node in ast.walk(fn)
+              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    read = {node.id for node in ast.walk(fn)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    free = read - bound - annotated - set(dir(builtins))
+    assert free <= {"np", "seconds_to_frame_count"}, sorted(free)
+
+
+def test_the_timeline_never_ends_past_the_audio(timeline):
+    """The defect, stated as the property it violated.
+
+    Measured on the owner's own music (278.021229s, 25fps): the plan was 20852 frames = 834.080000s
+    against an audio master of 834.063688s, and the published file carried 20850 -- `-shortest`
+    discarding two frames on an NVENC stream with B-frames. Every one of these cases rounds UP
+    without the clamp.
+    """
+    for audio_duration, fps in [
+        (278.021229, 25.0),         # the owner's music, 1x
+        (834.063688, 25.0),         # the owner's music, 3x -- the reported render
+        (20.021229, 25.0),          # the fixture that reproduces it at 20s
+        (60.063688, 25.0),          # the same fixture, 3x
+        (10.019, 30.0),
+        (7.3, 23.976),
+    ]:
+        _cuts, frames, _durations, _dropped = timeline([1.0, 2.0, 3.0], audio_duration, fps)
+        planned = int(sum(frames))
+        assert planned / fps <= audio_duration + 1e-9, (audio_duration, fps, planned)
+        # and it gives up at most ONE frame: the next frame up WOULD have overrun
+        assert (planned + 1) / fps > audio_duration
+
+
+def test_an_exactly_frame_aligned_audio_length_is_not_clamped(timeline):
+    """The clamp is inert on every existing acceptance fixture, which is why none of them caught it."""
+    for audio_duration, fps, expected in [
+        (20.0, 25.0, 500),          # media/music_20s.wav
+        (60.0, 25.0, 1500),         # the same at 3x
+        (60.0, 30.0, 1800),
+        (4.0, 25.0, 100),           # media/music_4s.wav
+    ]:
+        _cuts, frames, _durations, _dropped = timeline([1.0, 2.0, 3.0], audio_duration, fps)
+        assert int(sum(frames)) == expected, (audio_duration, fps)
+        assert int(sum(frames)) / fps == pytest.approx(audio_duration)
+
+
+def test_the_clamp_cannot_empty_a_timeline(timeline):
+    """A one-frame timeline stays one frame: `end_frame > 1` guards the floor."""
+    for audio_duration, fps in [(0.001, 25.0), (0.02, 25.0), (0.039, 25.0)]:
+        _cuts, frames, _durations, _dropped = timeline([0.5], audio_duration, fps)
+        assert int(sum(frames)) >= 1, (audio_duration, fps)
 
 
 def test_the_worker_guard_adds_no_probe_subprocess_or_loop(processor_tree):
@@ -1077,3 +1183,107 @@ def test_the_source_file_is_never_modified(real_extractor, source_30fps, tmp_pat
         use_nvenc=False, gpu_encoder="none", geometry="", lifecycle=None)
     assert ok, reason
     assert (os.path.getsize(source_30fps), os.stat(source_30fps).st_mtime_ns) == before
+
+
+# ===========================================================================
+# 4. The final-assembly cut (FUN R10 A/V End Alignment)
+#
+# `-shortest` alone is imprecise with stream copy: measured 0, 1 and 2 PCM packets off the audio of
+# otherwise identical renders, and 77.3 ms off a 14-minute one. The frame-locked plan is therefore
+# passed to the mux and becomes an explicit `-t`, WITHOUT removing `-shortest`.
+# ===========================================================================
+
+
+def test_the_mux_takes_the_plan_length_before_lifecycle(ffmpeg_tree):
+    """A new seam parameter may not displace `lifecycle`, which C3-R1A pins LAST."""
+    fn = _func(ffmpeg_tree, "concatenate_videos_ffmpeg")
+    names = [argument.arg for argument in fn.args.args]
+    assert names[-1] == "lifecycle", names
+    assert names[-2] == "timeline_seconds", names
+    # ...and it is defaulted, so every pre-existing caller is still valid and unchanged in behaviour
+    defaults = dict(zip(names[len(names) - len(fn.args.defaults):], fn.args.defaults))
+    assert isinstance(defaults["timeline_seconds"], ast.Constant)
+    assert defaults["timeline_seconds"].value is None
+
+
+def test_every_audio_mux_branch_cuts_at_the_plan_and_keeps_shortest(ffmpeg_tree):
+    """All three assembly branches, not just the fast one the owner's render happened to take."""
+    source = ast.unparse(_func(ffmpeg_tree, "concatenate_videos_ffmpeg"))
+    # three audio-muxing branches: ProRes combine, fast concat-copy, re-encode fallback
+    assert source.count("'-shortest'") == 3, "`-shortest` must be KEPT on every branch"
+    assert source.count("if timeline_seconds:") == 3
+    assert source.count("'-t', str(timeline_seconds)") == 3
+    # the cut is bounded to the audio branches; a no-audio assembly is already exact
+    assert "'-t', str(timeline_seconds)" not in source.split("if audio_file")[0]
+
+
+def test_both_assembly_call_sites_pass_the_frame_locked_plan(processor_tree):
+    """The plan, never a re-derived duration: `sum(segment_frames) / fps` is the only authority."""
+    fn = _func(processor_tree, "create_music_video")
+    calls = [node for node in ast.walk(fn) if isinstance(node, ast.Call)
+             and ast.unparse(node.func) == "concatenate_videos_ffmpeg"]
+    assert len(calls) == 2, "the ProRes and H.264/NVENC assemblies"
+    for call in calls:
+        passed = {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+        assert passed["timeline_seconds"] == "float(sum(segment_frames)) / float(fps)", passed
+        # and audio_duration is NOT what the mux is cut at -- the plan is at or below it
+        assert "audio_duration" not in passed.get("timeline_seconds", "")
+
+
+@needs_ffmpeg
+def test_the_plan_cut_makes_video_and_audio_end_together(tmp_path):
+    """The property the milestone exists for, measured on real FFmpeg.
+
+    Audio deliberately NOT a whole number of frames: 20.021229s at 25fps rounds to 501 frames
+    (20.040000s), so without the timeline clamp the plan overruns the audio and `-shortest` eats
+    into one of the two streams.
+    """
+    import math
+
+    audio = tmp_path / "odd.wav"
+    subprocess.run([FFMPEG_BIN, "-v", "error", "-nostdin", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=440:sample_rate=48000",
+                    "-af", "atrim=end_sample=961019", "-c:a", "pcm_s24le", "-ac", "2",
+                    str(audio)], check=True, timeout=120)
+    fps = 25.0
+    duration = 961019 / 48000
+    planned = int(round(duration * fps))
+    if planned / fps > duration:
+        planned -= 1                                   # the same clamp the timeline applies
+    assert planned == 500, planned
+
+    video = tmp_path / "v.mp4"
+    subprocess.run([FFMPEG_BIN, "-v", "error", "-nostdin", "-y", "-f", "lavfi",
+                    "-i", f"testsrc=size=128x72:rate={fps:g}", "-vframes", str(planned),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-an", "-fps_mode", "cfr", "-r", f"{fps:g}",
+                    "-fflags", "+genpts", "-movflags", "+faststart", str(video)],
+                   check=True, timeout=180)
+    listing = tmp_path / "l.txt"
+    listing.write_text(f"file '{str(video).replace(chr(92), '/')}'\n", encoding="utf-8")
+
+    def mux(target, with_plan):
+        cmd = [FFMPEG_BIN, "-v", "error", "-nostdin", "-f", "concat", "-safe", "0",
+               "-i", str(listing), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "pcm_s24le", "-ar", "48000", "-shortest"]
+        if with_plan:
+            cmd.extend(["-t", str(planned / fps)])
+        cmd.extend(["-fflags", "+genpts", "-movflags", "+faststart", "-y", str(target)])
+        subprocess.run(cmd, check=True, timeout=300)
+        return target
+
+    def ends(path):
+        def one(stream, entry):
+            out = subprocess.run([FFPROBE_BIN, "-v", "error", "-select_streams", stream,
+                                  "-show_entries", f"stream={entry}", "-of", "csv=p=0",
+                                  str(path)], capture_output=True, text=True, timeout=60)
+            return float(out.stdout.strip())
+        return one("v:0", "duration"), one("a:0", "duration")
+
+    without = ends(mux(tmp_path / "no_t.mp4", False))
+    with_plan = ends(mux(tmp_path / "with_t.mp4", True))
+
+    # `-shortest` on its own leaves them apart; the explicit plan cut lands them together
+    assert math.isclose(with_plan[0], with_plan[1], abs_tol=1e-6), with_plan
+    assert math.isclose(with_plan[0], planned / fps, abs_tol=1e-6), with_plan
+    assert abs(without[0] - without[1]) > abs(with_plan[0] - with_plan[1]), (without, with_plan)

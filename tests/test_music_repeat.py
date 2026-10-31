@@ -642,7 +642,16 @@ def test_the_extended_timeline_quantises_without_accumulating_drift(frame_lock, 
     cut_times, segment_frames, segment_durations, _dropped = frame_lock(
         numpy.asarray(extended, dtype=float), total, fps)
 
+    # [FORK] Digital-Union (FUN R10 A/V End Alignment): AMENDED. This read `int(round(total * fps))`
+    # and asserted the timeline ends exactly there -- which is the behaviour the milestone corrected,
+    # not a property to preserve. `cycle = 7.3` is deliberately not frame-aligned at any of the three
+    # rates, so `round` lands PAST the audio on many of these combinations, and final assembly's
+    # `-shortest` then discarded the overhang. The timeline now stops at the last frame that still
+    # ends within the audio, so the expectation is the clamped end rather than the rounded one.
     end_frame = int(round(total * fps))
+    if end_frame > 1 and end_frame / fps > total + 1e-9:
+        end_frame -= 1
+    assert end_frame / fps <= total + 1e-9, "the timeline must never end past the audio"
     # every segment length is a FRAME DIFFERENCE, so the sum is the end frame exactly
     assert int(sum(segment_frames)) == end_frame
     assert len(segment_durations) == len(segment_frames) == len(cut_times) - 1

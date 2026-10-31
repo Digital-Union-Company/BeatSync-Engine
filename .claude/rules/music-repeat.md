@@ -198,7 +198,23 @@ so the variety is demonstrably a property of the library rather than of randomne
   `create_music_video` would re-apply the same window to the repeated master and clamp it back to
   one excerpt). The GUI has no trim controls, so the feature is unrestricted there.
 
-## A pre-existing defect this feature surfaced, and did not fix
+## Two pre-existing defects this feature surfaced, and did not itself fix
+
+> **Both have since been corrected, in the extractor / frame-lock contract rather than here.** The
+> flush-at-EOF frame loss below was fixed by the FUN R10 Final Frame Fix, and the owner's real 3×
+> render then exposed a second, unrelated one: the timeline's end is `round(audio_duration × fps)`,
+> which for music that is not a whole number of frames plans up to half a frame past the audio, and
+> `-shortest` discards the overhang — one frame on a stream without B-frames, **two** on an NVENC
+> stream. Neither is caused by Repeat Music and neither was fixed inside it: both live in
+> `.claude/rules/pipeline-core.md`. The repeat count is still not a parameter of either correction,
+> and `video_processor.py`'s only change is the end-boundary clamp in
+> `build_frame_aligned_cut_timeline`, which a 1× render takes identically.
+>
+> One consequence for this rule's own measurements: `cycle_seconds` is a *measured* duration and is
+> almost never a whole number of output frames, so a repeated master's total is almost always in the
+> clamped case. A repeated render's published frame count is therefore
+> `floor(repeat × cycle_seconds × fps)` rather than `round(...)` whenever the two differ — at most one
+> frame, and the same rule a 1× render of the same music follows.
 
 A clip positioned **flush against the end of a source** loses its last frame:
 `start=28.84s, dur=1.16s` on a 30.00 s source yields 28 frames instead of 29 at 25 fps, and 34

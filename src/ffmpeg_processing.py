@@ -1051,7 +1051,8 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                               audio_file: str = None, start_time: float = 0.0,
                               end_time: float = None, use_nvenc: bool = False,
                               gpu_encoder: str = 'h264_nvenc', fps: float = 30.0,
-                              temp_dir: str = None, lifecycle=None) -> str:
+                              temp_dir: str = None, timeline_seconds: float = None,
+                              lifecycle=None) -> str:
     """
     Concatenate video files using FFmpeg concat demuxer.
 
@@ -1061,6 +1062,23 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
     threaded to every ``_run_media_command`` call below. This function's own ``finally`` only
     cleans up temp files -- it has no ``except Exception``, so a ``RenderCancelled`` raised from any
     branch already propagates unchanged; nothing here may add a catch that would swallow it.
+
+    [FORK] Digital-Union (FUN R10 A/V End Alignment): ``timeline_seconds`` is the frame-locked
+    plan's own length, ``sum(segment_frames) / fps``, and it becomes an output-side ``-t`` on each
+    of the three audio-muxing branches. ``None`` is the previous behaviour exactly, so every other
+    caller is unchanged; it is placed before ``lifecycle`` because the C3-R1A seam contract requires
+    ``lifecycle`` to stay the LAST parameter.
+
+    **Why ``-shortest`` alone is not enough, measured rather than assumed.** ``-shortest`` ends the
+    output when the first stream ends, but with stream copy it is imprecise by a small and
+    inconsistent amount -- it cut 0, 1 and 2 PCM packets off the audio of three otherwise identical
+    renders, and 77.3 ms off a 14-minute one. So the published video and its music did not end
+    together even once the timeline stopped planning past the audio. An explicit ``-t`` at the plan
+    cuts both streams at exactly the planned position: measured 20851 frames / 834.040000 s video
+    against 834.040000 s audio, a 0.0 ms difference, where ``-shortest`` alone gave 833.962667 s.
+
+    ``-shortest`` is **kept** rather than replaced. It still protects the case ``-t`` cannot: an
+    audio file shorter than the plan. The two are belt and braces, and whichever is shorter wins.
     """
     if temp_dir is None:
         temp_dir = os.path.dirname(output_file)
@@ -1135,9 +1153,14 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     '-c:a', 'pcm_s24le',
                     '-ar', '48000',
                     '-shortest',  # Use shortest stream (audio)
+                ]
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                if timeline_seconds:
+                    cmd.extend(['-t', str(timeline_seconds)])
+                cmd.extend([
                     '-y',
                     output_file
-                ]
+                ])
                 
                 result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
                 
@@ -1185,6 +1208,9 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 cmd.extend(['-c:v', 'copy'])
                 if audio_file:
                     cmd.extend(['-c:a', 'pcm_s24le', '-ar', '48000', '-shortest'])
+                    # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                    if timeline_seconds:
+                        cmd.extend(['-t', str(timeline_seconds)])
                 cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
 
                 result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
@@ -1227,7 +1253,10 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     '-ar', '48000',
                     '-shortest',
                 ])
-            
+                # [FORK] Digital-Union (FUN R10 A/V End Alignment): cut both streams at the plan.
+                if timeline_seconds:
+                    cmd.extend(['-t', str(timeline_seconds)])
+
             cmd.extend([
                 '-fps_mode', 'cfr',
                 '-r', str(fps),

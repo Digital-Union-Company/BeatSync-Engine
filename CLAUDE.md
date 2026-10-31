@@ -138,6 +138,23 @@ These apply in almost every session. Each has a scoped rule with the full contra
   never a refusal. The first attempt's argv is unchanged apart from `-progress`, and 1× is verified
   identical to the accepted baseline frame-checksum for frame-checksum. →
   `.claude/rules/pipeline-core.md`
+- **And the timeline may not end PAST the audio (FUN R10 A/V End Alignment).** `end_frame` is
+  `seconds_to_frame_count(audio_duration, fps)`, which **rounds**, so music that is not a whole
+  number of output frames planned up to half a frame beyond the audio — and final assembly's
+  `-shortest` discarded the overhang: **one** frame without B-frames, **two** on an NVENC stream,
+  which is the UI default. Hence the owner's real 3× render planning 20852 frames and publishing
+  20850, ending 63.7 ms before its own music. **Extraction was never at fault** — the same NVENC
+  render on frame-aligned music published 500 of 500 — so measure the plan against the audio before
+  suspecting the extractor. The builder now steps the end back one frame only when it would overrun —
+  exactly the frame `-shortest` was throwing away, so previously-correct output is unchanged and
+  `plan == published`. **The clamp alone only flipped the sign**, because `-shortest` then undercut
+  the *audio* by an inconsistent 0–2 PCM packets (77.3 ms on a 14-minute render), so the plan's own
+  length is also passed to `concatenate_videos_ffmpeg` as `timeline_seconds` and becomes an
+  output-side `-t` on all three audio-muxing branches. `-shortest` is **kept** — it still covers an
+  audio file shorter than the plan. The clamp is **arithmetic only and calls nothing** (the builder is
+  AST-exec'd against a two-name namespace), bounded to one frame, and inert for every frame-aligned
+  fixture in the repo — which is why no existing test saw it. A ~36 ms residual at 720p30 is measured
+  and deliberately left open. → `.claude/rules/pipeline-core.md`
 - **Stage 5 runs out-of-process** and never loads a model in-process; the response JSON is the only
   semantic authority. The retained request/response JSON files are **intentionally** left behind for
   debugging. → `.claude/rules/stage5-worker.md`
