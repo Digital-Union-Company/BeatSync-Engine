@@ -20,6 +20,89 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-10-31 (FUN R10 Final Frame Fix: a segment asking for N frames gets N)
+
+**A clip positioned flush against the end of its source lost its last frame.** Pre-existing, and
+reproduced identically on pristine `main` (`b90c265f`) with its own extractor, so Repeat Music
+neither caused it nor was required to expose it — a longer timeline simply draws more clips from the
+same sources and so meets the flush-at-EOF case more often. The visible symptom was a 3x / 720p25
+render measuring **1499 frames instead of 1500**.
+
+**Cause, measured rather than inferred.** `src_b_1080p.mp4` is 30.000000 s at 30 fps (900 frames,
+last PTS 29.966667). The plan asked for 29 output frames from `start=28.840000` for `1.160000` —
+exactly the source's remaining content:
+
+```
+-ss 28.84 -t 1.16 -i src                      ->  34 source frames   (not 35)
+  ... -vf trim,setpts                         ->  34
+  ... -vf trim,setpts,fps=25                  ->  28   SHORT
+-ss 27.84 -t 1.16 -i src   (1.0 s earlier)    ->  35 source frames
+  ... -vf trim,setpts,fps=25                  ->  29   OK
+```
+
+So the `fps` filter is **innocent**: given 35 input frames it yields 29 every time. Accurate `-ss`
+snaps the window start *forward* to the first frame at or after the seek point (28.840000 →
+28.866667, frame 866), costing up to one source frame. Anywhere else in the file that is invisible,
+because the window reaches 1/30 s further in and the 35th frame is there; at the end of the source
+there is nothing past EOF to make it up with. A second, smaller contributor rides along: the start
+is clamped with the *unquantised* duration while the extractor extends the window to
+`frame_count / fps`, which at 30 fps is 1.166667 s — already 0.006667 s past the source end.
+
+- `src/beatsync_fork/frame_lock.py` — **new, stdlib-only**: the whole contract as pure decisions.
+  What the progress stream said (`frames_from_progress`, delegating the parse to `media_sample`'s
+  hardened block-terminator semantics, so evidence comes from the last *completed* block alone),
+  where to seek instead (`recovery_seek`), and how a shortfall is worded. `MAX_EXTRACTION_ATTEMPTS`
+  is 2 — one planned window, at most one corrected one.
+- `src/ffmpeg_processing.py` — `extract_clip_segment_ffmpeg_detailed` appends `-progress pipe:1`
+  (free: both runner paths already captured stdout, the output goes to a file, and stderr — the
+  failure summariser's input — is untouched), verifies the written count, and on a measured
+  shortfall takes **one** corrected re-seek anchored on the end of the source with one *source*
+  frame of lead-in. `-vframes` still bounds the output, so a corrected window can never come back
+  long. A shortfall that survives returns `(False, reason)`, becoming an ordinary clip failure that
+  `create_music_video` already refuses the render on. `_probe_output_frame_count` is the
+  independent second reading — `stream=nb_frames`, header only, **no decode** — consulted only when
+  a clip is already suspect, so the happy path costs nothing. `extract_prores_segment_random`
+  carried the identical defect and the identical insufficient acceptance test (`returncode == 0`
+  plus a non-empty file); it now verifies each attempt and gets the same single re-seek.
+- `src/video_processor.py` — `create_clip_parallel` refuses a source too short for its planned
+  segment instead of quietly shortening it. Both branches clamp the read to the source's real
+  duration, which also shrank the *segment*, since the extractor derives its frame count from the
+  duration handed to it. Arithmetic only — no probe, no subprocess, no loop, because that body is
+  executed against a hand-built namespace by three suites.
+- `tests/test_frame_lock.py` — **new**: the pure contract; the real extractor and worker bodies
+  AST-extracted and executed over a recording runner (exact/short/long/unmeasured, the single
+  confirmation probe, the attempt bound, cancellation from *both* attempts, the lifecycle reaching
+  the retry); and an opt-in real-FFmpeg tier that re-measures the reported case, mid-file controls,
+  flush-at-EOF, a too-short source, four source/output rate pairs, 29.97 fps, both fixed output
+  profiles, consecutive segments and source immutability.
+
+**The repeated-frame answer was rejected.** A real frame *can* be decoded here, so holding or
+duplicating the last one would make a frame-exact timeline out of content the source never
+contained. The correction moves the window; every frame in the result is a decoded source frame.
+
+**Deliberately NOT refused: an unmeasured count.** If neither the progress stream nor the container
+header yields a number, the segment keeps its historical behaviour. Refusing on absent evidence
+would fail renders that are fine, which is worse than the defect.
+
+**1x compatibility is exact, not approximate.** The 1x ordinary render's 600 coded frame checksums
+are identical to both the accepted R10 baseline and pristine `main`, and its audio PCM SHA-256
+matches to the byte — no clip in it sits flush against EOF, so no re-seek fires. **Measured after
+the fix:** 3x / 720p25 = **1500** frames / 60.000000 s (was 1499 / 59.960000), 3x / 720p30 = 1800,
+2x / 720p25 = 1000, 1x / 720p25 = 500 — every one exact, with audio and video durations equal.
+Per-clip accounting over 1x / 3x / 5x timelines reports *every* clip producing exactly the frames
+the timeline asked for.
+
+**No cache change.** `CACHE_CONTRACT_VERSION` stays `stage5_cache_v3`, `ANALYSIS_VERSION` stays
+`auto_av_analysis_v8_llama_vulkan_batched`, and the correction reaches no musical timeline, no
+creative planner and no Stage-5 identity.
+
+**Still open, measured and deliberately not changed here.** `stage6_av_planner` floors
+`final_duration` at 0.05 s, so a 1-frame slot (0.033 s at 30 fps) is handed to the extractor as
+0.05 s and extracted as **2** frames. The extractor is exact for what it was asked, the surplus is
+absorbed by final assembly's `-shortest` (all four renders above are exact), and correcting the
+floor would change content in renders that are currently correct — so it is recorded as a separate
+item rather than folded into this fix.
+
 ### Added — 2026-10-31 (FUN R10: Repeat Music 1x-30x)
 
 Play the selected song up to thirty times and render a full-length music video whose later

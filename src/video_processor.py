@@ -583,8 +583,36 @@ def create_clip_parallel(args):
             else:
                 clip_start = 0
                 source_duration = video_duration
-            
-        
+
+
+        # [FORK] Digital-Union (FUN R10 Final Frame Fix): the planned segment is never silently
+        # shortened.
+        #
+        # Both branches above clamp the read to the source's REAL probed duration, which is
+        # correct as far as it goes -- you cannot read content a file does not contain. What was
+        # missing is that the clamp also quietly shrinks the SEGMENT: the extractor derives its
+        # frame count from the duration handed to it, so a source shorter than its slot produced a
+        # clip that was frame-exact for the window it was given and short for the timeline it was
+        # planned into. `build_frame_aligned_cut_timeline` has already allocated that slot, so the
+        # shortfall shifts every later cut -- the exact failure the frame-lock invariant exists to
+        # prevent, arriving by the one route that reported success.
+        #
+        # So it is refused here, where both numbers are in scope, rather than absorbed. The
+        # extractor cannot make this call: it is handed the clamped duration and has no way to
+        # know what the plan wanted. Arithmetic only -- no probe, no subprocess, no retry and no
+        # loop, because `tests/test_extraction_failure_context.py` executes this body against a
+        # namespace holding only the names it uses and pins all four of those absences.
+        planned_frames = int(round(float(final_duration) * float(fps)))
+        available_frames = int(round(float(source_duration) * float(fps)))
+        if available_frames < planned_frames:
+            elapsed = time.perf_counter() - clip_started
+            detail = describe_failure(
+                f"Source is too short for its planned segment: it can supply {available_frames} "
+                f"of the {planned_frames} output frames the frame-locked timeline allocated "
+                f"(source duration {video_duration:.3f}s). Extracting the shorter clip would "
+                f"desynchronise every later cut, so it is refused rather than truncated.")
+            return (i, None, target_size, None, detail, elapsed)
+
         # Output file
         temp_clip_path = os.path.join(temp_dir, f"temp_clip_{i}_{uuid.uuid4().hex}.mp4")
         

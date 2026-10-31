@@ -124,6 +124,20 @@ These apply in almost every session. Each has a scoped rule with the full contra
   positions to output frames once; segment lengths are frame *differences*. Never reintroduce
   per-segment `round(duration * fps)`. If a clip fails to extract, `create_music_video` **raises**
   rather than concatenating a short timeline. → `.claude/rules/pipeline-core.md`
+- **And the invariant is now enforced on the RESULT, not just the plan (FUN R10 Final Frame Fix).**
+  **A segment requesting N output frames produces N, or fails clearly** — `rc=0` plus a non-empty
+  MP4 is explicitly *not* proof of a correct segment, which is how a clip flush against the end of
+  its source silently lost its last frame (3× / 720p25 measured 1499 frames instead of 1500;
+  pre-existing, reproduced on pristine `main`). The cause is accurate `-ss` snapping the window
+  start **forward** by up to one source frame, invisible mid-file and unrecoverable at EOF — *not*
+  the `fps` filter, which produced 29 output frames from 35 input frames every time. The extractor
+  captures FFmpeg's own written-frame count via `-progress pipe:1` (free; stderr untouched),
+  confirms a suspect count against a **header-only** `nb_frames` read, and takes at most **one**
+  corrected re-seek anchored on the source's end with one *source* frame of lead-in. A repeated or
+  padded frame is never substituted where a real frame can be decoded; an **unmeasured** count is
+  never a refusal. The first attempt's argv is unchanged apart from `-progress`, and 1× is verified
+  identical to the accepted baseline frame-checksum for frame-checksum. →
+  `.claude/rules/pipeline-core.md`
 - **Stage 5 runs out-of-process** and never loads a model in-process; the response JSON is the only
   semantic authority. The retained request/response JSON files are **intentionally** left behind for
   debugging. → `.claude/rules/stage5-worker.md`
