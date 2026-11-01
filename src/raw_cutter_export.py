@@ -651,6 +651,34 @@ def _discard_staging(path: str) -> None:
 # source, by the loop in `gui.py`.
 # ---------------------------------------------------------------------------------------------
 
+def _normalize_folder_text(value: object) -> str:
+    """The operator's typed folder text, or ``""`` when they did not actually name a folder.
+
+    [FORK] Digital-Union (Raw Cutter batch empty-input hotfix). Both batch entry points funnel a
+    typed path through the same two steps -- trim it, then make it absolute -- and
+    ``os.path.abspath("")`` returns the **current working directory**, which for this app is its own
+    install folder. An unnamed input folder therefore quietly meant "cut everything under the
+    application directory": a Start Batch with a blank field discovered the bundled demo media and a
+    finished render and began cutting them. So the emptiness test has to happen *here*, before
+    `abspath` can invent a path out of nothing.
+
+    Returns ``""`` for anything that does not name a folder -- not a string at all, blank,
+    whitespace-only, or nothing but quotation marks -- and ``""`` is each caller's signal to refuse
+    rather than resolve. The trailing `strip()` is deliberate: a quoted run of spaces is still
+    nothing, and it only looks non-empty until the quotes come off.
+
+    `str()` is deliberately **not** applied to a non-string. ``str(None)`` is ``"None"``, which
+    abspath turns into a real child of the working directory, and the operator is then told that a
+    folder named `None` could not be found -- a confusing refusal in place of an accurate one.
+    """
+    if not isinstance(value, str):
+        return ""
+    trimmed = value.strip().strip('"').strip()
+    if not trimmed:
+        return ""
+    return os.path.expandvars(os.path.expanduser(trimmed))
+
+
 @dataclass(frozen=True)
 class DiscoveryResult:
     """The frozen input list for one batch. Order is deterministic and fixed before any work."""
@@ -687,9 +715,10 @@ def discover_batch_sources(folder: str, recursive: bool) -> DiscoveryResult:
     """
     from beatsync_fork import input_manager
 
-    if not isinstance(folder, str) or not folder.strip():
+    folder_text = _normalize_folder_text(folder)
+    if not folder_text:
         return DiscoveryResult(error="Enter the folder that holds your source videos.")
-    root = os.path.abspath(os.path.expandvars(os.path.expanduser(folder.strip().strip('"'))))
+    root = os.path.abspath(folder_text)
     if not os.path.exists(root):
         return DiscoveryResult(root=root, error=f"Folder not found:\n{root}")
     if not os.path.isdir(root):
@@ -726,13 +755,22 @@ def resolve_batch_roots(input_folder: str, output_folder: str) -> tuple[str, str
     The output folder does not have to exist yet; its nearest existing ancestor is resolved instead,
     so a brand-new destination is judged on where it will really be.
     """
-    if not isinstance(output_folder, str) or not output_folder.strip():
+    # [FORK] Digital-Union (Raw Cutter batch empty-input hotfix): the INPUT is validated here too,
+    # and before `abspath`, which is the whole fix. This function runs ahead of
+    # `discover_batch_sources` on the Start Batch path, so an unvalidated blank field reached
+    # `abspath("")`, became the working directory, and arrived at discovery as a perfectly ordinary
+    # non-empty path that its own emptiness check could no longer recognise. Refusing here is what
+    # makes Start Batch agree with Count Videos, which passes the operator's raw text straight to
+    # discovery and has always refused.
+    source_text = _normalize_folder_text(input_folder)
+    if not source_text:
+        return "", "", "Enter the folder that holds your source videos."
+    target_text = _normalize_folder_text(output_folder)
+    if not target_text:
         return "", "", "Choose an output folder for the finished clips."
 
-    source = os.path.abspath(os.path.expandvars(os.path.expanduser(str(input_folder).strip()
-                                                                   .strip('"'))))
-    target = os.path.abspath(os.path.expandvars(os.path.expanduser(output_folder.strip()
-                                                                   .strip('"'))))
+    source = os.path.abspath(source_text)
+    target = os.path.abspath(target_text)
     if os.path.exists(target) and not os.path.isdir(target):
         return "", "", f"The output path is not a folder:\n{target}"
 
