@@ -298,6 +298,80 @@ def test_discovery_excludes_a_manifest_and_a_video_for_free(tmp_path):
     assert [os.path.basename(m.path) for m in found.files] == ["real.wav"]
 
 
+@pytest.fixture()
+def app_directory(tmp_path, monkeypatch):
+    """A stand-in for the install folder, holding the kind of audio this defect would have served:
+    an exported voice clip and a bundled sample. The process runs *inside* it, as the app does."""
+    app = tmp_path / "application_directory"
+    (app / "input" / "audio").mkdir(parents=True)
+    (app / "output").mkdir()
+    for rel in ("output/exported_voice.wav", "input/audio/bundled_sample.mp3"):
+        (app / rel).write_bytes(b"\x00" * 4096)
+    monkeypatch.chdir(app)
+    return app
+
+
+@pytest.mark.parametrize("folder", ("", "   ", "\t", "\n", '"', '""', '""""', '"   "',
+                                    '  "  "  ', '" "', None, 7, 7.5, True, b"C:\\clips",
+                                    (), [], {}))
+def test_an_unnamed_folder_is_refused_and_never_scans_the_application_directory(
+        folder, app_directory):
+    """`os.path.abspath("")` is the working directory, which for this app is its install folder --
+    so text that normalises to nothing used to mean "review every render in `output/`". The quoted
+    shapes are the ones that got through: the pre-fix guard tested `folder.strip()` and only
+    *then* stripped the quotation marks."""
+    found = review.discover_audio(folder, True)
+    assert found.error == "Enter the folder that holds the audio clips."
+    assert found.root == "", "a refusal must not report a resolved root"
+    assert found.files == () and found.discovered_count == 0
+
+
+def test_an_environment_variable_that_expands_to_nothing_is_an_unnamed_folder(
+        app_directory, monkeypatch):
+    monkeypatch.setenv("BEATSYNC_TEST_EMPTY_FOLDER", "")
+    for text in ("%BEATSYNC_TEST_EMPTY_FOLDER%", '"%BEATSYNC_TEST_EMPTY_FOLDER%"'):
+        found = review.discover_audio(text, True)
+        assert found.error == "Enter the folder that holds the audio clips."
+        assert found.root == "" and found.files == ()
+
+
+def test_the_pre_fix_normalization_really_did_resolve_to_the_application_directory(app_directory):
+    """Liveness control: without it the rows above would pass against code that never had the
+    defect. This is the exact expression `discover_audio` used to run."""
+    for text in ('""', '"   "'):
+        pre_fix = os.path.abspath(os.path.expandvars(os.path.expanduser(text.strip().strip('"'))))
+        assert os.path.realpath(pre_fix) == os.path.realpath(str(app_directory))
+        assert core.normalize_folder_text(text) == ""
+
+
+def test_a_folder_that_was_named_still_resolves_however_it_was_typed(app_directory, monkeypatch):
+    real = app_directory.parent / "real review folder"
+    real.mkdir()
+    (real / "clip.wav").write_bytes(b"\x00" * 4096)
+    monkeypatch.setenv("BEATSYNC_TEST_REAL_FOLDER", str(real))
+    for text in (str(real), f'"{real}"', f"  {real}  ", f'  "{real}"  ',
+                 os.path.relpath(str(real), str(app_directory)),
+                 "%BEATSYNC_TEST_REAL_FOLDER%", '"%BEATSYNC_TEST_REAL_FOLDER%"'):
+        found = review.discover_audio(text, True)
+        assert not found.error, f"{text!r} was refused: {found.error}"
+        assert [os.path.basename(media.path) for media in found.files] == ["clip.wav"]
+
+
+def test_both_review_tabs_decide_this_the_same_way_from_one_implementation(app_directory):
+    """Two tabs, one answer. `audio_review` does not define its own normaliser: it calls the core's,
+    the same way it already shares the registry, the authorization gates and `Discovery` -- so a
+    refusal cannot be right on one tab and wrong on the other."""
+    source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "src", "beatsync_fork", "audio_review.py"),
+                  encoding="utf-8").read()
+    assert "core.normalize_folder_text(folder)" in source
+    assert "def normalize_folder_text" not in source, "must not be a second implementation"
+    for text in ('""', '"   "', "   ", None):
+        assert bool(review.discover_audio(text, True).error) \
+            == bool(core.discover_clips(text, True).error)
+        assert review.discover_audio(text, True).root == core.discover_clips(text, True).root == ""
+
+
 def test_discovery_can_be_told_not_to_descend(tmp_path):
     (tmp_path / "top.wav").write_bytes(b"x" * 16)
     nested = tmp_path / "deeper"

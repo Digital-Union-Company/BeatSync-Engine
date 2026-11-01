@@ -154,6 +154,146 @@ def test_a_file_path_instead_of_a_folder_is_refused(clips_tree):
     assert cr.discover_clips(os.path.join(clips_tree, "clip0001.mp4"), True).error
 
 
+# ---------------------------------------------------------------------------------------------
+# 1b. An unnamed review folder is refused BEFORE it can become the application directory
+# ---------------------------------------------------------------------------------------------
+# `os.path.abspath("")` is the current working directory, which for this app is its own install
+# folder -- so any normalisation that can turn the operator's text into `""` turns an unnamed
+# folder into "review everything we shipped, plus every render in `output/`". The quoted shapes
+# are what a Windows "Copy as path" paste leaves behind once the path between the quotes has been
+# deleted, and they are the ones that got through: the pre-fix guard tested `folder.strip()` and
+# only *then* stripped the quotation marks.
+
+#: Text an operator can leave in the folder field that names no folder at all.
+UNNAMED_FOLDER_TEXT = ("", "   ", "\t", "\n", '"', '""', '""""', '"   "', '  "  "  ', '" "')
+
+#: Values a widget can hand over that are not folder text in the first place. `str()` must not be
+#: applied to these: `str(None)` is `"None"`, a real child of the working directory.
+NOT_FOLDER_TEXT = (None, 7, 7.5, True, b"C:\\clips", [], {}, ())
+
+
+@pytest.fixture()
+def app_directory(tmp_path, monkeypatch):
+    """A stand-in for the install folder, holding exactly what makes this defect expensive: the
+    bundled demo media and a finished render. The process runs *inside* it, as the app does."""
+    app = tmp_path / "application_directory"
+    (app / "input" / "video").mkdir(parents=True)
+    (app / "output").mkdir()
+    for rel in ("output/finished_render.mp4", "input/video/demo_source.mp4"):
+        (app / rel).write_bytes(b"\x00" * 4096)
+    monkeypatch.chdir(app)
+    return app
+
+
+@pytest.mark.parametrize("folder", UNNAMED_FOLDER_TEXT + NOT_FOLDER_TEXT)
+def test_an_unnamed_folder_is_refused_and_never_scans_the_application_directory(
+        folder, app_directory):
+    found = cr.discover_clips(folder, True)
+    assert found.error == "Enter the folder that holds the clips."
+    assert found.root == "", "a refusal must not report a resolved root"
+    assert found.files == () and found.discovered_count == 0
+
+
+def test_an_environment_variable_that_expands_to_nothing_is_an_unnamed_folder(
+        app_directory, monkeypatch):
+    """The emptiness test has to happen *after* expansion, which is why the expansion lives inside
+    the normaliser rather than beside the `abspath` call."""
+    for value in ("", "   ", '""'):
+        monkeypatch.setenv("BEATSYNC_TEST_EMPTY_FOLDER", value)
+        for text in ("%BEATSYNC_TEST_EMPTY_FOLDER%", '"%BEATSYNC_TEST_EMPTY_FOLDER%"'):
+            found = cr.discover_clips(text, True)
+            if value == '""':
+                # Quotes that arrive *from* a variable are a value, not the operator's quoting, so
+                # they are not stripped a second time. It must still not be the app directory.
+                assert found.root and os.path.realpath(found.root) != os.path.realpath(os.getcwd())
+                continue
+            assert found.error == "Enter the folder that holds the clips."
+            assert found.root == "" and found.files == ()
+
+
+def test_the_pre_fix_normalization_really_did_resolve_to_the_application_directory(app_directory):
+    """Liveness control for the parametrized test above: without it, those rows would pass against
+    code that never had the defect. This is the exact expression `discover_clips` used to run, and
+    it is asserted to produce the application directory -- which is what the fix refuses."""
+    for text in ('""', '"   "'):
+        pre_fix = os.path.abspath(os.path.expandvars(os.path.expanduser(text.strip().strip('"'))))
+        assert os.path.realpath(pre_fix) == os.path.realpath(str(app_directory))
+        assert cr.normalize_folder_text(text) == "", "the corrected normaliser refuses it"
+
+
+def test_a_folder_that_was_named_still_resolves_however_it_was_typed(app_directory, monkeypatch):
+    """The refusal must not cost any spelling that already worked: quoted, padded, relative, and
+    expanded from an environment variable or a home reference."""
+    real = app_directory.parent / "real review folder"
+    real.mkdir()
+    (real / "clip.mp4").write_bytes(b"\x00" * 4096)
+    monkeypatch.setenv("BEATSYNC_TEST_REAL_FOLDER", str(real))
+    spellings = (str(real), f'"{real}"', f"  {real}  ", f'  "{real}"  ',
+                 os.path.relpath(str(real), str(app_directory)),
+                 "%BEATSYNC_TEST_REAL_FOLDER%", '"%BEATSYNC_TEST_REAL_FOLDER%"')
+    for text in spellings:
+        found = cr.discover_clips(text, True)
+        assert not found.error, f"{text!r} was refused: {found.error}"
+        assert [os.path.basename(media.path) for media in found.files] == ["clip.mp4"]
+
+
+def test_normalize_folder_text_is_total_and_answers_only_about_the_text(tmp_path):
+    """It is a string function: it decides whether the operator named something, never whether that
+    something exists. A folder that does not exist still has a name, and the caller's own
+    `exists`/`isdir` checks are what refuse it -- with their own, different wording."""
+    for value in UNNAMED_FOLDER_TEXT + NOT_FOLDER_TEXT:
+        assert cr.normalize_folder_text(value) == ""
+    missing = tmp_path / "not_created"
+    assert cr.normalize_folder_text(str(missing)) == str(missing)
+    assert "not found" in cr.discover_clips(str(missing), True).error.lower()
+
+
+def test_the_normalizer_touches_no_filesystem_and_launches_nothing():
+    """Structural, over the syntax tree. The fix had to sit in front of `abspath`, which is one
+    step away from the discovery call -- so it is worth pinning that it stayed a text function and
+    did not grow a probe, a listing, a move or a process."""
+    tree = ast.parse(open(os.path.join(_SRC, "beatsync_fork", "clips_review.py"),
+                          encoding="utf-8").read())
+    body = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "normalize_folder_text")
+    # The DOCSTRING is dropped before any of this runs. It explains the `abspath` hazard in
+    # words, and a substring ban that reads the prose documenting it fails on the very sentence
+    # that makes the rule understandable -- a trap this repository has walked into repeatedly.
+    statements = [node for node in body.body
+                  if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                          and isinstance(node.value.value, str))]
+    assert statements and len(statements) < len(body.body), "expected a documented function"
+    code = "\n".join(ast.unparse(node) for node in statements)
+    calls = sorted({ast.unparse(node.func) for node in ast.walk(body)
+                    if isinstance(node, ast.Call)})
+    #: The two expansions are the only `os` calls it is allowed to make. `abspath` is deliberately
+    #: NOT among them: resolving is the caller's job, and doing it here would put the defect back.
+    permitted_os = {"os.path.expandvars", "os.path.expanduser"}
+    offenders = [call for call in calls
+                 if call.split("(")[0].startswith(("os.", "shutil.", "subprocess.", "open"))
+                 and call.split("(")[0] not in permitted_os]
+    assert not offenders, f"the normaliser reaches the filesystem or a process: {offenders}"
+    for banned in ("abspath", "realpath", "exists", "isdir", "stat", "listdir", "scandir",
+                   "walk", "rename", "remove", "unlink", "Popen"):
+        assert banned not in code, f"normalize_folder_text reaches {banned}"
+
+
+def test_the_fix_is_confined_to_discovery_and_names_nothing_in_the_serving_path():
+    """The authorization and transfer surfaces are untouched by construction, not by review: the
+    normaliser is reached only by the two discovery functions, and neither media server nor the
+    audio filing module mentions it."""
+    for module in ("clips_media_server.py", "audio_media_server.py"):
+        text = open(os.path.join(_SRC, module), encoding="utf-8").read()
+        assert "normalize_folder_text" not in text
+    for module in ("audio_library.py", "collision.py"):
+        text = open(os.path.join(_SRC, "beatsync_fork", module), encoding="utf-8").read()
+        assert "normalize_folder_text" not in text
+    core_source = open(os.path.join(_SRC, "beatsync_fork", "clips_review.py"),
+                       encoding="utf-8").read()
+    assert core_source.count("normalize_folder_text(") == 2, \
+        "defined once, called once -- from discovery and nowhere else"
+
+
 # =============================================================================================
 # 2. Opaque identity
 # =============================================================================================
