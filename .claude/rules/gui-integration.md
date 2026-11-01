@@ -438,6 +438,40 @@ automatically.
   and the success line reads the resolved declaration back off `beat_info` **duck-typed** for the
   same reason. A C3 batch builds its tuple **once before the candidate loop**, so every selected
   candidate provably gets an equal declaration. See `.claude/rules/freestyle.md`.
+- **The Raw Cutter's Activity & Performance read-out is a FRAGMENT of the existing progress panel,
+  not a component (R12).** `_cut_progress_html` gained one keyword-only `activity: str = ''` which
+  it appends as the last child of its own container; omitting it leaves the output byte-identical
+  to the pre-R12 panel. That shape is load-bearing twice over: the three Raw Cutter handlers'
+  emitted arities are pinned against their `outputs` lists by `tests/test_raw_cutter_seam.py`, so a
+  second component would have widened `_on_cut_analyze`, `_on_cut_run` and `_on_cut_batch_run_ui`
+  together; and `_cut_progress_html` is AST-extracted and executed against a **two-name** namespace
+  (`html_lib` + `_CUT_TONES`), so it must stay dependency-free — which is why what crosses into it
+  is a pre-rendered string rather than a record.
+
+  All policy lives in the pure, **clock-injected** `beatsync_fork/raw_cutter_activity.py`; `gui.py`
+  supplies `time.perf_counter()` readings and the facts, through `_cut_activity` (a running frame:
+  declares the phase, then renders — one reading for both) and `_cut_activity_final` (a terminal
+  frame: freezes both timers and does **not** restart the phase timer on the terminal label).
+
+  Four rules that are easy to break by accident:
+
+  * **A refusal carries no activity panel.** `refuse(...)` in `_on_cut_run` performed no work —
+    no mutex, no directory, no clip — so a timer there would be counting a job that never began.
+  * **The batch's terminal phase comes from `_CUT_BATCH_ACTIVITY`**, keyed by
+    `fork_cutter_batch`'s own `TERMINAL_*` vocabulary, so the panel, the headline and the manifest
+    are three renderings of one classification. Never derive it from the status text. The missing
+    key is a run that never started and renders `PHASE_NOT_RUN`, which is deliberately not spelled
+    as a cancellation.
+  * **The browser tick is anchored, not incremented.** `CUT_ACTIVITY_JS` is a **third** authorised
+    `app.load(js=…)` installer (`tests/test_open_output_folder.py` holds the identity allowlist),
+    registers no server call, selects by **class** because both modes render the same markup into
+    two components, and makes no network request of any kind. A Gradio update replaces the element
+    and loses per-element state, so the anchor is keyed by the panel's `data-job-token` /
+    `data-phase-token` and survives the re-render.
+  * **Nothing new may probe the GPU.** `gui.py` has exactly two audited `subprocess.run` call
+    sites; the panel reports `GPU usage: Unavailable` and names the encoder instead, and Qwen is
+    reported as *not used* rather than as offline. Adding a sampler to fill in a percentage would
+    break the pinned site count and buy a cosmetic number.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -446,6 +480,7 @@ automatically.
 | Seam you are editing | Open |
 |---|---|
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
+| the Raw Cutter's **Activity & Performance** panel, `_cut_activity` / `_cut_activity_final`, `CUT_ACTIVITY_JS` or `raw_cutter_activity.py` (R12) | the R12 bullet above **+** `ROADMAP.md` R12 for the product contract — and `tests/test_raw_cutter_activity.py`, which executes the pure timer rules rather than asserting about them |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |

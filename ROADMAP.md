@@ -854,13 +854,15 @@ A configured-but-unreachable folder (an offline drive) falls back to the local c
 so**, loudly, rather than starting a silent cold re-analysis. Clearing a shared cache costs every
 installation on the machine, and the Cache Management panel now says that before it is done.
 
-### R10 — Repeat Music 1×–30× · **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**
+### R10 — Repeat Music 1×–30× · **MERGED AND DEPLOYED (PR #81, main `5cdbd8cc`)**
 
-Branch `feat/fun-repeat-music-r10`, cut from `main` at `b90c265f`, head `005951c8` in **draft
-PR #81**. Every bullet this section planned is implemented, and **the owner has personally rendered
-2× and 3× against a real 2,476-video library, watched the results and accepted the visual and
-musical outcome.** Merge, deploy and independent review are three separate things and none of them
-is done.
+Branch `feat/fun-repeat-music-r10`, cut from `main` at `b90c265f`, head `4fe07315`, merged as
+**PR #81** into `main` at **`5cdbd8ccd7c385ad8bafbaf657f048779a574df7`** (tree `a62a0aaf…`) and
+deployed to the production checkout on the same revision. Every bullet this section planned is
+implemented, and **the owner personally rendered 2× and 3× against a real 2,476-video library,
+watched the results and accepted the visual and musical outcome.** The go-live smoke test passed
+on the served Gradio config plus a short 2× NVENC render that planned 200 frames and published
+200. **Still not independently reviewed.**
 
 **🔁 Repeat Music** is a `gr.Slider` (1–30, step 1, default 1) directly below the Audio File
 control, with a live read-out beneath it — `00:20 × 5 = 01:40 of finished video.` — that warns
@@ -994,6 +996,147 @@ Unchanged, and deliberately so:
 
 Reuse the existing handler, the existing button and the existing Video Review widgets. The change is
 *which* directory arrives and *when* it is offered — not a new review surface.
+
+### R12 — Raw Cutter Live Activity & Performance Panel · **IMPLEMENTATION IN PROGRESS**
+
+The complaint this answers is one sentence: when BeatSync spends several minutes analyzing or
+cutting a video, the operator could see *that* something was happening, but not **how long** it had
+been happening. R4-B already gave the Raw Cutter a truthful progress bar, named phases and per-clip
+and per-source counts; what was missing was a continuously visible timing read-out, and it was
+missing worst exactly where it mattered — inside one long blocking FFmpeg call that reports nothing
+and therefore produces no new progress event for minutes at a time.
+
+**A compact secondary panel sits directly below the existing progress bar, in both modes.** It is
+rendered *inside* the same panel container, which is why it needed no new component, no new
+`outputs` entry and no change to any handler's emitted arity — the three Raw Cutter handlers'
+widths are pinned by `tests/test_raw_cutter_seam.py`, and a second component would have widened all
+of them.
+
+```
+ACTIVITY & PERFORMANCE
+Current phase   Detecting scenes
+Status          ● Working
+Elapsed         02:34
+Phase elapsed   01:48
+File            recording_001.mp4
+Clip            8 / 24          (only when the handler knows it)
+FFmpeg          ● Active
+Encoder         NVENC H.264 (GPU)
+Qwen            Not used in Raw Cutter
+GPU usage       Unavailable
+```
+
+- **Both modes.** Single Video renders it from `_on_cut_analyze` and `_on_cut_run`; Folder Batch
+  renders it from `_on_cut_batch_run_ui`, driven entirely by the sink `_on_cut_batch_run` already
+  publishes. `_on_cut_batch_run` keeps its name, signature, body and every reviewed terminal path;
+  the only line added inside it publishes the phase name for the record write, at the one point
+  that already knows it is writing one.
+- **Real phases, no invented ones.** Single Video: *Preparing / probing · Detecting scenes ·
+  Planning clips · Cutting / encoding*, then *Completed · Partially completed · Cancelled ·
+  Failed*. There is deliberately **no single-video Finalizing phase**: it was built, measured in
+  the browser at **1 ms** — `eof` is queued from the export worker's own `finally`, so the thread
+  is already leaving by then — and removed, because announcing it displaced the terminal panel's
+  only useful phase figure (a finished job reported `Phase elapsed 00:00` for that millisecond
+  instead of how long the cutting had taken). A phase label that replaces a measured figure with
+  an unmeasurable one is the same defect as a percentage for an opaque phase. The batch's
+  equivalent step **is** published, because the batch already emits a frame while it runs. Folder
+  Batch: *Discovering files · Analyzing current source · Cutting
+  current source · Writing manifest*, with *Source N / Total* as its own line, then the same
+  terminal set plus *Did not run* — which is deliberately **not** spelled as a cancellation,
+  because a refused batch stopped nothing. Each phase is announced *before* its blocking call, so
+  the label on screen is the step actually running.
+- **No percentage was added.** The bar above still owns the only honest fraction the cutter can
+  produce (published clips over planned clips), and the panel adds no number that was not measured:
+  no rate, no percentage for an opaque phase, and no prediction of when anything will finish.
+- **Two timers, and the browser ticks them.** Total job elapsed and current-phase elapsed, updated
+  about once a second by **one `setInterval` per page** (`CUT_ACTIVITY_JS`, installed with
+  `fn=None`, so it registers no server call). It is **anchored, not incremented**: on the first
+  panel carrying a token it records `Date.now() - elapsed` and then renders the difference, which
+  is what stops a Gradio re-render restarting the count — a Gradio update replaces the element and
+  loses any per-element state, so the anchor is keyed by token rather than by element. Both figures
+  are also written as text server-side, so a panel is correct as of the moment it was emitted even
+  with the script blocked. There is **no backend poll, no new endpoint and no background service**:
+  `tests/test_raw_cutter_activity.py` pins that the script contains no `fetch`, `XMLHttpRequest`,
+  `WebSocket`, `EventSource` or beacon of any kind.
+- **The phase timer resets only on a real phase change**, and in the batch only when the *source*
+  or the phase changes — probe, detection and planning collapse into one *Analyzing current source*
+  phase, because they are one operation from the operator's side and three resets per file would
+  make the figure useless on exactly the slow ones.
+- **Terminal panels are frozen by the server**, not left to the browser to decide:
+  `data-running="0"`, and the figures are written verbatim and never advanced. The phase timer is
+  deliberately not restarted on the terminal label — what an operator wants from a finished job is
+  how long its last real phase took.
+- **An idle job shows no timer at all.** The idle panel is still empty, and a refusal — stale plan,
+  no plan, nothing to export, a busy mutex — carries no activity panel: it performed no work, so
+  there is nothing to time.
+- **FFmpeg status is stated, never guessed.** It is reported from what each step really runs:
+  FFprobe during the probe, FFmpeg during detection and export, idle during planning and the record
+  write, and *unknown* before anything has started. A naive "a job is running" reading would have
+  claimed Active for work that is entirely in Python.
+- **Qwen is reported as `Not used in Raw Cutter`.** It is genuinely not part of this workflow, and a
+  red *Offline* indicator would report a component the tool never asks for as a fault.
+- **GPU utilisation and VRAM are reported as `Unavailable`, and the encoder is reported
+  separately.** Nothing lightweight and already supported in this process can read them, and
+  `gui.py` holds exactly **two** audited `subprocess.run` call sites, pinned by test — a repeated
+  `nvidia-smi` poll would be a third, plus sampling cost, for a cosmetic percentage. So the panel
+  says what is true. The encoder *is* known and is named (`NVENC H.264 (GPU)` / `libx264 (CPU)`,
+  with any other FFmpeg encoder passed through under its own name).
+- **Observational only.** Scene-detection thresholds, cut planning, FFmpeg encoding arguments,
+  output filenames and directories, batch manifests, both cancellation behaviours, job admission
+  and the render mutex are all untouched. **Analyze still never arms Cancel** — it installs no
+  `CutterJob` and holds no mutex, so presenting Cancel as able to stop it would be a lie, and that
+  asymmetry with Cut Video is preserved exactly.
+
+The policy lives in `src/beatsync_fork/raw_cutter_activity.py`, which is pure and **clock-injected**
+— it reads no clock, starts no child and touches no disk, so every timer rule is executed directly
+on a bare interpreter rather than asserted about structurally. `gui.py` supplies the readings
+(`time.perf_counter()`, monotonic, so a system clock change cannot make an elapsed figure jump) and
+the facts.
+
+**Measured in a real Chrome session** against the candidate on port 7895, driving the shipped UI:
+
+| What | Measurement |
+|---|---|
+| **Scene detection, 24 min / 1080p / 4.47 GB source** | The server emitted **one** frame and then went silent for the whole 9.95 s pass: `data-job-ms` stayed at **28** throughout, while the displayed `Elapsed` advanced **00:00 → 00:08**. That gap is the entire reason the browser tick exists |
+| Bar during that phase | `data-determinate="0"`, `data-pct="-1"` — indeterminate, no number invented |
+| Cutting, 19 clips at 720p | timers **00:00 → 00:10**, `Clip 1 / 19 → 19 / 19`, FFmpeg `Active`, `Encoder NVENC H.264 (GPU)`, Cancel armed throughout and disarmed at the end |
+| Terminal freeze | `data-running="0"` and the figure **unchanged across 11 further seconds** of sampling |
+| Cancel during cutting (150-clip plan) | amber `stopping`, phase `Cancelled`, frozen at **00:06**, 4 of 150 clips kept, Cancel disarmed, FFmpeg `Idle` |
+| Terminal failure (a file that is not a video) | phase `Failed`, `data-status="failed"`, frozen at 00:00, **Cut Video stays unavailable** |
+| Folder Batch, 3 sources | `Source 1 / 3 → 2 / 3 → 3 / 3`, bar 0 → 33 → 67 → 100 %, phase timer reset per source (`data-phase-ms` back to 0 at each), terminal `Completed` frozen at **00:07** |
+| Folder Batch, 2 slower sources | both `Analyzing current source` and `Cutting current source` observed per source, phase sequence incrementing 3 → 5 → 7 → 9; 29 of 29 clips exported, terminal frozen at **00:37** |
+| Consecutive jobs | the second Analyze minted a new job identity and restarted from zero while the first stayed frozen at its own 00:09 |
+| Refusals / idle | the "plan needs refreshing" panel carried **0** activity panels |
+
+Two readings that look odd and are correct: a terminal panel can show `Phase elapsed 00:00`, because
+the last real phase genuinely was instantaneous — *Planning clips* measured 6 ms after a 10 s
+detection — and the total elapsed beside it is the number that matters. And the detection phase
+shows `FFmpeg Active` while planning shows `Idle`, because planning is pure arithmetic.
+
+### R13 — Video Review Transfer Working Overlay · **PLANNED — next UX improvement**
+
+Today, pressing **Confirm** in Video Review starts moving and sorting the selected clips with no
+immediate visible acknowledgement, which has two bad consequences: a long transfer looks like a
+dead button, and an impatient second click is a second submission. Planned:
+
+1. **Show a Working overlay immediately**, before the first file moves.
+2. **Disable Confirm, Proceed and the relevant classification controls** while it runs.
+3. **Prevent accidental duplicate submissions** — the overlay is the operator-visible half; the
+   server-side single-flight protection is the authority and stays so.
+4. **Report progress concretely** — *Moving 12 / 84 clips* — from clips actually moved, never from a
+   timer.
+5. **Restore the controls when the operation finishes *or* fails**, including on an exceptional
+   path, so a failure can never leave the surface permanently disabled.
+6. **Preserve the existing two-step confirmation for unmarked clips** exactly as it is.
+7. **Maintain safe retry behaviour**: a repeated click must never overwrite, delete or move
+   additional clips.
+
+Consider the same pattern for Audio Review afterwards; the two surfaces already share the collision
+policy, so the overlay is the natural next thing to share.
+
+**Not implemented in the R12 pull request**, deliberately. It is a different surface with a
+different risk profile — R12 only observes, while R13 touches the control states of a workflow that
+moves files.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -1234,8 +1377,10 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R7.3** — "When voice clips do not fit" modes | **MERGED AND DEPLOYED** (PR #79, main `eb3839cb`) — branch `feat/fun-audio-overflow-r7-3` off `d98fb55a`. Modes 1–3 shipped: Strict (default, the historical refusal, byte-identical filtergraph) / Skip (cursor deliberately not advanced, so a later shorter clip still lands) / Trim-then-skip (a real `atrim` on the voice input, not only a shortened plan). Mode 4 (Repeat-music) is still **not offered**: R10 now exists as a local candidate, so what it waits on is the Auto-Repeat-to-Fit resolver rather than the repeat mechanism. Decided by the real planner, never by summing durations; zero placed clips stays fatal. **The owner has personally tested Strict / Skip / Trim and accepted them**, and it is now merged and deployed. **Not independently reviewed** |
 | **Stage-5 Cancel** — Cancel actually interrupts video analysis | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not independently reviewed** |
 | **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. It is **operational**: the configured folder on this machine holds 4,580 records. **Not independently reviewed** |
-| **R10** — **Repeat Music 1×–30×** | **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED** — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Not merged, not deployed, not independently reviewed** |
+| **R10** — **Repeat Music 1×–30×** | **MERGED AND DEPLOYED** (PR #81, main `5cdbd8cc`) — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `4fe07315`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Merged and deployed; not independently reviewed** |
 | **R11** — Raw Cutter → **"Review these clips"** output handoff | **PLANNED — small UX improvement**, after the R10 release work. The navigation half already ships: `cut_open_library_btn` → `_on_cut_open_in_library` selects Media Library → Video Review, prefills the folder, enables Include subfolders and scans nothing. Planned is handing over the finished job's **exact** output directory instead of the parent folder, offering it when Single Video or Folder Batch completes with clips on disk, and clearing the handoff when a new cut begins. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement** |
+| **R12** — Raw Cutter **Live Activity & Performance panel** | **IMPLEMENTATION IN PROGRESS** — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`, draft PR. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. **Not merged, not deployed, not independently reviewed** |
+| **R13** — Video Review **transfer Working overlay** | **PLANNED — next UX improvement.** Show a Working overlay the moment Confirm starts moving clips, disable Confirm / Proceed / classification while it runs, report `Moving 12 / 84 clips` from clips actually moved, restore the controls on success *and* on failure, keep the existing two-step confirmation for unmarked clips, and keep server-side single-flight as the authority so a repeated click can never move, overwrite or delete extra clips. Deliberately **not** implemented in the R12 pull request |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
@@ -1269,13 +1414,12 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    (measured 0.016–0.45 s, against an incident where it took about an hour), and one shared cache
    folder now serves every BeatSync version under the same Windows user — it is operational, with
    4,580 records in the configured folder on this machine.
-7. **R10 — Repeat Music 1×–30×** — **OWNER-ACCEPTED, PR #81 OPEN DRAFT, NOT YET DEPLOYED**, on
-   `feat/fun-repeat-music-r10` off `b90c265f`, head `005951c8`. 1× is verified content-identical to
-   pristine `main`; 2×–30× are FFprobe-verified to the frame; later cycles get newly planned shots;
-   voice, SFX, profiles, Cancel and the Variant Lab batch all exercised at repeat counts above one.
-   **The owner has rendered 2× and 3× on a real 2,476-video library and accepted the result.** What
-   remains is an independent review, merge and deploy — three separate things, none of them done —
-   plus one owner decision on the 720p30 `-shortest` gap recorded in the section above.
+7. ~~**R10 — Repeat Music 1×–30×**.~~ **Done** — merged as PR #81 and deployed at main
+   `5cdbd8cc`, which is the current production head. 1× is verified content-identical to pristine
+   `b90c265f`; 2×–30× are FFprobe-verified to the frame; later cycles get newly planned shots.
+   **The owner rendered 2× and 3× on a real 2,476-video library and accepted the result.** Still
+   **not independently reviewed**, and one owner decision remains open on the 720p30 `-shortest`
+   gap recorded in the section above.
 7a. **Auto Repeat to Fit Voice Layers — the next small integration.** Pick the smallest repeat count
    up to 30 that makes the voice selection placeable, decided by **actual placement feasibility**
    rather than by summing durations. This, not the repeat mechanism, is what R7.3's fourth mode is
@@ -1284,6 +1428,13 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    work: hand the finished job's exact output directory to the review surface that already exists,
    and offer it at the moment a job completes. Explicitly **not** a new feature — no extra tab, no
    second review engine, no automatic scanning and no file movement.
+7c. **R12 — Raw Cutter live Activity & Performance panel.** **In progress** on
+   `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`, in a draft PR awaiting the owner's own test.
+   The smallest possible answer to "I cannot tell whether it is working": a compact timing
+   read-out under the existing bar, in both cutter modes, with no new progress system and no
+   backend poll.
+7d. **R13 — Video Review transfer Working overlay.** The next UX improvement after R12: make a
+   long Confirm visibly busy and make a second click structurally harmless. Not started.
 8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing

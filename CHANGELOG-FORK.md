@@ -20,6 +20,44 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-01 (FUN R12: Raw Cutter live Activity & Performance panel)
+
+**When the Raw Cutter spends minutes on one file, the screen now says how long it has been
+working.** R4-B already gave it a truthful progress bar, named phases and per-clip counts; what was
+missing was a timing read-out, and it was missing worst exactly where it mattered. Measured in a
+real browser against a 24-minute 1080p source: the server emitted **one** frame and then went
+silent for the whole **9.95 s** scene-detection pass (`data-job-ms` stayed at 28 throughout), which
+is precisely the window an operator reads as "hung".
+
+A compact panel now sits directly below the existing bar, in **both** Single Video and Folder
+Batch, reporting the current phase, a status indicator, total elapsed, current-phase elapsed, the
+file, `Source N / Total` and `Clip X / Y` where they are known, FFmpeg activity, and the encoder.
+During that same 9.95 s pass the displayed elapsed advanced **00:00 → 00:08** while the bar stayed
+indeterminate (`data-pct="-1"`) — no number was invented, and no percentage, rate or completion
+prediction was added anywhere.
+
+- **No new component and no new progress system.** The panel is an HTML fragment appended inside
+  the existing progress panel, so no handler's emitted arity and no `outputs` list changed, and
+  omitting it leaves the pre-R12 panel byte-identical. `_on_cut_batch_run` keeps its name,
+  signature, body and every reviewed terminal path.
+- **No backend polling, no new endpoint, no background service.** One `setInterval` per page
+  (`CUT_ACTIVITY_JS`, registered with `fn=None`) reads the panel's own `data-*` figures. It is
+  anchored rather than incremented, so a Gradio re-render cannot restart the count, and a terminal
+  panel is frozen by the server (`data-running="0"`) rather than by the browser's judgement.
+- **Nothing is claimed that was not measured.** `Qwen: Not used in Raw Cutter` rather than a red
+  *Offline* for a component this workflow never asks for; `GPU usage: Unavailable` rather than a
+  sampled percentage, with the encoder named separately — `gui.py` keeps exactly two audited
+  `subprocess.run` call sites. FFmpeg activity is stated per phase from what each step really runs.
+- **A `Finalizing` phase was built, measured at 1 ms and removed**, because announcing it displaced
+  the terminal panel's only useful phase figure.
+- **Observational only.** Scene-detection thresholds, cut planning, FFmpeg arguments, output names
+  and directories, batch manifests, both cancellation behaviours, job admission and the render
+  mutex are untouched, and Analyze still never arms Cancel.
+
+New: `src/beatsync_fork/raw_cutter_activity.py` (pure, clock-injected, stdlib-only) and
+`tests/test_raw_cutter_activity.py`. Roadmap: R12 (this) and R13 (Video Review transfer overlay,
+planned, deliberately not implemented here).
+
 ### Fixed — 2026-10-31 (FUN R10 A/V End Alignment: the timeline no longer plans past the audio)
 
 **The published video could end up to two frames before its own music.** Found in the owner's real

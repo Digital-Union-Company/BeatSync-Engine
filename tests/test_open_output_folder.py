@@ -781,6 +781,13 @@ AUTHORIZED_JAVASCRIPT_REGISTRATIONS = (
     # the allowlist is still asserted by identity, so any other JavaScript registration -- or
     # either of these two growing a server call -- still fails.
     ("app.load", "AUDIO_GALLERY_JS"),
+    # [FORK] Raw Cutter R12: the Activity & Performance panel's one-second tick. A THIRD authorised
+    # entry on the same terms -- `fn=None`, so it registers no server call, and it reads nothing
+    # but the `data-*` figures the panel it ticks already published. Authorised deliberately, with
+    # the identity claim unchanged: a fourth registration, or a different script in any slot,
+    # still fails. `tests/test_raw_cutter_activity.py` pins what this one is allowed to contain --
+    # notably that it performs no network call of any kind.
+    ("app.load", "CUT_ACTIVITY_JS"),
 )
 
 
@@ -849,7 +856,8 @@ def test_only_the_authorized_registration_carries_client_side_javascript():
 #: carries. Amended by R7.1, which added the Audio Cutter gallery's listeners; the claim is
 #: unchanged and is still identity-based, so a third registration, or a different script in either
 #: slot, still fails.
-_AUTHORIZED_JS_SCRIPTS = ("CLIPS_GALLERY_JS", "AUDIO_GALLERY_JS")
+#: amended again by Raw Cutter R12, which added the Activity & Performance tick.
+_AUTHORIZED_JS_SCRIPTS = ("CLIPS_GALLERY_JS", "AUDIO_GALLERY_JS", "CUT_ACTIVITY_JS")
 
 
 def test_the_authorized_registration_is_the_gallery_installer_and_nothing_else():

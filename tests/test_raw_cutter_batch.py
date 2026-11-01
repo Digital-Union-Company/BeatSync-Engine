@@ -22,6 +22,8 @@ from beatsync_fork import raw_cutter_batch as batch
 # [FORK] R6: the handlers reference `fork_profiles` for the output-profile default, so the
 # AST-executed namespace must carry it just as it carries the other two fork aliases.
 from beatsync_fork import raw_cutter_profiles as profiles
+# [FORK] R12: and `fork_activity` for the Activity & Performance read-out, for the same reason.
+from beatsync_fork import raw_cutter_activity as activity
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
@@ -1140,16 +1142,25 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
     gui = _tree(_GUI)
     wanted = ["_on_cut_batch_run"]
     if ui:
-        # Three exec'd pieces plus the module-level tone table must land in ONE namespace, or the
+        # Every exec'd piece plus the two module-level tables must land in ONE namespace, or the
         # wrapper cannot resolve the renderer it calls.
-        wanted += ["_cut_progress_html", "_cut_batch_buttons", "_on_cut_batch_run_ui"]
+        #
+        # [FORK] Raw Cutter R12: `_cut_activity` / `_cut_activity_final` and the
+        # `_CUT_BATCH_ACTIVITY` terminal table join it, so the Activity & Performance panel that
+        # these cases assert about is the shipped renderer rather than a stand-in.
+        wanted += ["_cut_progress_html", "_cut_activity", "_cut_activity_final",
+                   "_cut_batch_buttons", "_on_cut_batch_run_ui"]
     body = [_strip_docstrings(_func(gui, name)) for name in wanted]
+    namespace: dict = {}
     if ui:
         body = [node for node in gui.body
                 if isinstance(node, ast.Assign)
-                and getattr(node.targets[0], "id", "") == "_CUT_TONES"] + body
+                and getattr(node.targets[0], "id", "") in ("_CUT_TONES",
+                                                           "_CUT_BATCH_ACTIVITY")] + body
+        # `_CUT_BATCH_ACTIVITY` is built at module scope from the two real fork vocabularies, so
+        # they have to be resolvable BEFORE the body is executed rather than only afterwards.
+        namespace.update(fork_cutter_batch=batch, fork_activity=activity)
     module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
-    namespace: dict = {}
     exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
 
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -1652,6 +1663,13 @@ def test_a_pre_admission_refusal_is_also_never_shown_as_success(tmp_path, monkey
     assert not panel["determinate"]
     assert run.released == 0, "a refused batch released a lock it never acquired"
     assert run.batch_dir == ""
+    # [FORK] R12: and the activity read-out agrees with the headline rather than inventing a
+    # verdict of its own. A refused batch stopped nothing, so it must not read as a cancellation,
+    # and its timers must be frozen rather than ticking against a job that never began.
+    final = run.yields[-1][2]
+    assert 'data-phase="%s"' % activity.PHASE_NOT_RUN in final, final[-400:]
+    assert 'data-running="0"' in final
+    assert activity.PHASE_CANCELLED not in final
 
 
 # --- adjacent terminal classes: none of them may read as an unqualified success ---------------
