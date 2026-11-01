@@ -236,6 +236,11 @@ from beatsync_fork import raw_cutter_activity as fork_activity
 # terminal path has to remember.
 from beatsync_fork import cut_handoff as fork_handoff
 from beatsync_fork import clips_review as fork_clips
+# [FORK] Digital-Union (R13): server-side single-flight for the Video Review transfer. A pure
+# policy object -- one lock, a bounded map of plain records, no filesystem and no thread -- so the
+# admission rule is executed directly in tests rather than asserted about. It is the AUTHORITY for
+# "one sort at a time", which a disabled browser button can never be.
+from beatsync_fork import transfer_guard as fork_transfer
 # [FORK] Digital-Union (UX V4): the native folder dialog and the remembered folder choices. Both
 # are stdlib-only fork modules; the dialog's subprocess lives there rather than here because two
 # suites pin this module's `subprocess.run` site count at exactly two.
@@ -7711,6 +7716,40 @@ _AUDIO_PREVIEW_REGISTRY = fork_clips.ClipRegistry()
 CLIPS_MAX_TRACKED_SESSIONS = 32
 _CLIPS_SCANS = fork_clips.ScanCoordinator(max_owners=CLIPS_MAX_TRACKED_SESSIONS)
 
+#: [R13] The authority for "one Video Review transfer at a time". Deliberately a **separate**
+#: object from `_CLIPS_SCANS` rather than another flag on it: the coordinator owns *pages*, and a
+#: transfer outlives the page lifecycle question it is asked about -- the sort is still running
+#: when a handoff retires the page under it, and both facts have to be readable at once. It is also
+#: why no coordinator lock is held across a file operation: these are two locks taken for two
+#: different spans, never nested.
+_CLIPS_TRANSFERS = fork_transfer.TransferGuard()
+
+
+def _clips_transfer_key(root: str) -> str:
+    """The exclusion key for one review folder.
+
+    Normalised **here**, in the layer that has `os`, because `transfer_guard` performs no path
+    operations at all -- a policy object that silently treated two spellings of one directory as
+    different would be worse than one that never looks. `realpath` resolves junctions and `..`;
+    `normcase` folds the case and separators Windows treats as equal. A root that cannot be
+    resolved answers `''`, which `TransferGuard` reads as "no folder claim" rather than as a claim
+    on every unknown folder -- the owner rule still applies, so this fails safe rather than open.
+
+    **An unnamed root answers `''` before any resolution is attempted**, and that ordering is the
+    same one PR #83 exists for: resolving nothing yields the *current working directory*, which for
+    this app is its own install folder, so it would mint a key naming the installation and let one
+    unnamed root collide with another. A published view always carries a real root, so this is
+    defence in depth -- but it is the exact shape of a defect this repository has already shipped
+    once.
+    """
+    text = str(root or '').strip()
+    if not text:
+        return ''
+    try:
+        return os.path.normcase(os.path.realpath(text))
+    except (OSError, ValueError):
+        return ''
+
 
 def _clips_store():
     """The decision store, created on first use so importing `gui` writes nothing.
@@ -9703,6 +9742,20 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
         return {'ok': False, 'code': code, 'clip': entry.clip_id, 'decision': current,
                 'rev': revision, 'counts': store.counts(identities)}
 
+    # [R13] CLASSIFICATION PROTECTION. A transfer captured its decision snapshot before it started
+    # moving anything, so a decision accepted mid-transfer would be honoured by the screen and
+    # ignored by the batch -- the operator would see a clip marked Keep land in Discarded, with the
+    # server's own record agreeing with neither. So the window is closed on the SERVER, which is
+    # what makes it cover a second browser tab, a replayed POST and any caller that never saw a
+    # greyed-out tile.
+    #
+    # Both reasons are checked, because either one means this clip may be moving right now: this
+    # owner's own transfer, and another session's transfer on the same folder. Nothing is appended
+    # and no revision moves -- `refuse` returns before `store.decide` is reached, and hands the
+    # page the server's current record so the tile resyncs instead of guessing.
+    if _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', ''))) is not None:
+        return refuse('transfer_in_progress')
+
     # [R5-P3 / F2] The expected revision is MANDATORY and strictly typed. The previous code did
     # `int(payload.get('rev'))` inside a try/except that assigned `None`, so a missing, null,
     # string, bool, float, list or dict revision all became "no concurrency check requested" --
@@ -9758,13 +9811,23 @@ def _on_clips_refresh(request: gr.Request = None):
     [R5-P3 / F8] This is also the only thing that moves the Confirm button, and it derives that
     state solely from `store.counts()` -- the durable record. So a clip put back to PENDING
     disables Confirm again on the next Refresh, and no amount of DOM editing can enable it.
+
+    [R13] One further case in which it **disables**, never enables: while a transfer is running on
+    this page. Without it, Refresh mid-sort would light Confirm back up from counts that are still
+    true of a page whose files are being moved -- the screen would contradict the Working state and
+    invite a press the server is going to refuse. This adds no enabling path and derives nothing
+    new; the authority for the refusal itself is `_CLIPS_TRANSFERS`, not this button state.
     """
     try:
         owner = _clips_owner(request)
     except fork_clips.Refusal:
         return (CLIPS_GALLERY_INITIAL_HTML, CLIPS_COUNTS_INITIAL_TEXT,
                 gr.update(interactive=False))
-    return _clips_render_current(owner, '')[1:]
+    grid, counts_text, confirm = _clips_render_current(owner, '')[1:]
+    view = _clips_view(owner)
+    if _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', ''))) is not None:
+        confirm = gr.update(interactive=False)
+    return (grid, counts_text, confirm)
 
 
 def _clips_confirm_only(message: str, gate=False, signature=''):
@@ -9779,8 +9842,60 @@ def _clips_confirm_only(message: str, gate=False, signature=''):
             gr.update(visible=gate), gr.update(visible=gate), signature)
 
 
+def _clips_working_frame(message: str):
+    """A frame that says a transfer is running and takes the controls away while it does.
+
+    [R13] Written at exactly two points -- the moment before the first file moves, and once per
+    progress step. It can only ever **disable** the button: no enabling update appears here and
+    none may ever be added, because Confirm's enabled state is derived from the durable record by
+    `_clips_render_current` and `_on_clips_scan` and from nowhere else (R5-P3 / F8). Stated without
+    naming the forbidden keyword on purpose -- a seam guard in this repository enforces that
+    absence by substring, and prose quoting it has tripped such a guard five times already.
+
+    The report, the grid and the counts are left alone (`gr.update()`): the operator is watching
+    the clips that are being sorted, and blanking the page they pressed Confirm on would hide the
+    batch mid-flight. The grid stays clickable, and that is safe because the *server* refuses a
+    classification while a transfer is active -- a disabled tile would be presentation, and
+    presentation is never the boundary here.
+
+    The sweep gate closes and its arming clears, because the batch it described is now spent. A
+    signature is single-use by design, so a crash mid-transfer cannot leave a live one behind.
+    """
+    return (gr.update(), gr.update(), gr.update(), gr.update(interactive=False), message,
+            gr.update(visible=False), gr.update(visible=False), '')
+
+
 def _on_clips_confirm(armed='', request: gr.Request = None):
+    """The **final** frame of one Confirm or Proceed press, as a plain 8-tuple.
+
+    [R13] `_clips_confirm_frames` is what the buttons are wired to. This is the collected form,
+    kept because the answer a press settles on is a useful thing to ask for directly and because
+    several suites drive the handler as an ordinary function. Draining to the last frame is
+    exactly equivalent to the pre-R13 return value: a refusal and the gate emit one frame, and a
+    completed sort's last frame is the same terminal report the function used to return.
+    """
+    frame = None
+    for frame in _clips_confirm_frames(armed, request):
+        pass
+    return frame
+
+
+def _clips_confirm_frames(armed='', request: gr.Request = None):
     """Sort this page: SELECTED to the Media Library, REJECTED to the Discarded folder.
+
+    [R13] **A generator**, and what the Confirm and Proceed buttons are wired to, so the Working
+    state reaches the browser *before* the first file moves rather than after the last one. The
+    frame shape is part of the contract:
+
+    * **Every refusal and the sweep gate yield exactly one frame**, byte-for-byte the frame the
+      pre-R13 function returned. A Working overlay for a press that moves nothing would be a lie,
+      and the gate moves nothing -- so the single yield is the requirement, not a convenience.
+    * **A press that really sorts yields `1 + N + 1`**: the Working frame, a bounded number of
+      progress frames, and the terminal report. Every progress numerator is counted from recorded
+      `MoveOutcome`s, so it can never run ahead of the disk.
+    * **Nothing is yielded from the `finally`.** Releasing the slot there is what makes an
+      abandoned generator safe -- Gradio closing a dropped event raises `GeneratorExit` at the
+      yield -- and yielding during a close would raise `RuntimeError` instead.
 
     [UX V3] Confirm now does the thing its label promises. What it moves comes entirely from the
     server: the entries are the registry's frozen page and each decision is read from the durable
@@ -9807,25 +9922,43 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
     page with no clip kept, or destinations that no longer validate.
 
-    Every move is a single same-volume ``os.rename`` (see `sort_decided_clips`): no overwrite, no
-    collision renaming, no deletion, and a cross-volume request is refused in words rather than
-    turned into a copy. One clip failing leaves the rest moved and is reported as a partial
-    result. The page only advances to the next batch when every clip on this one actually moved.
+    Every move is a single same-volume ``os.rename`` (see `iter_sorted_clips`): no overwrite, no
+    collision renaming beyond the operator's own saved policy, no deletion, and a cross-volume
+    request is refused in words rather than turned into a copy. One clip failing leaves the rest
+    moved and is reported as a partial result. The page only advances to the next batch when every
+    clip on this one actually moved.
     """
     try:
         owner = _clips_owner(request)
     except fork_clips.Refusal:
-        return _clips_confirm_only("Reload the page: this browser session has no identity.")
+        yield _clips_confirm_only("Reload the page: this browser session has no identity.")
+        return
     view = _clips_view(owner)
     if not view.get('entries'):
-        return _clips_confirm_only("Nothing has been scanned on this page.")
+        yield _clips_confirm_only("Nothing has been scanned on this page.")
+        return
+
+    # [R13] ADVISORY, and labelled as such because getting this wrong is the classic shape of the
+    # bug this feature exists to prevent. Reading "busy" and then starting would be a
+    # check-then-act race; this read decides a MESSAGE and nothing else. Admission is the
+    # test-and-set in `_CLIPS_TRANSFERS.begin` below, after every refusal that changes nothing,
+    # and that call is the only authority. Without this early read a duplicate press during a
+    # sweep would re-open the gate instead of saying what is actually happening -- harmless, since
+    # the gate moves nothing, but it would describe the wrong situation.
+    running = _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', '')))
+    if running is not None:
+        template = (CLIPS_TRANSFER_BUSY_TEXT if running.owner == owner
+                    else CLIPS_TRANSFER_FOLDER_BUSY_TEXT)
+        yield _clips_confirm_only(template.format(done=running.done, total=running.total))
+        return
     # [R5-P11 / N7] A readiness report derived from a record that could not be read would be a
     # false negative with the authority of a positive statement -- "0 kept, 0 discarded" reads as
     # a reviewed page rather than an unreadable one. Refuse to report instead.
     try:
         store = _clips_store()
     except (fork_clips.PersistenceError, OSError) as failure:
-        return _clips_confirm_only(_clips_state_unavailable_text(failure))
+        yield _clips_confirm_only(_clips_state_unavailable_text(failure))
+        return
     identities = _clips_identities(view)
     snapshot = store.snapshot_of(identities)
 
@@ -9842,16 +9975,18 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
         view.get('library', ''), view.get('rejected', ''))
 
     if not plan.can_sort:
-        return _clips_confirm_only(
+        yield _clips_confirm_only(
             f"❌ {CLIPS_CONFIRM_DISABLED_TEXT}\n\n"
             f"{len(plan.unmarked)} of {plan.total} clip(s) are still undecided.")
+        return
 
     verdict, roots = fork_clips.validate_roots(
         view['root'], view.get('library', ''), view.get('rejected', ''), app_root=ROOT_DIR)
     if not verdict.ok:
-        return _clips_confirm_only(
+        yield _clips_confirm_only(
             f"❌ Nothing was moved: the destination folders no longer validate.\n"
             f"{verdict.code}\n{verdict.detail}")
+        return
 
     # Unmarked clips need an explicit, batch-specific confirmation. Without a signature that
     # still matches, NOTHING MOVES: the counts and the consequence are shown and Proceed/Cancel
@@ -9862,7 +9997,12 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
             plan, roots[fork_clips.ROLE_LIBRARY].real, roots[fork_clips.ROLE_REJECTED].real)
         message = "\n".join([CLIPS_SWEEP_GATE_HEADING, ''] + preview
                             + ['', CLIPS_SWEEP_GATE_PROMPT])
-        return _clips_confirm_only(message, gate=True, signature=plan.signature)
+        # [R13] One frame, and deliberately NOT a Working frame: the gate moves nothing, so
+        # announcing work here would be the "dead button" complaint inverted -- a spinner for an
+        # operation that has not been authorised yet. The slot is not claimed either, for the same
+        # reason: a gate the operator never answers must not leave the page marked busy.
+        yield _clips_confirm_only(message, gate=True, signature=plan.signature)
+        return
 
     def decision_of(entry):
         """What this clip is filed as **for this batch only**.
@@ -9878,32 +10018,108 @@ def _on_clips_confirm(armed='', request: gr.Request = None):
             return fork_clips.REJECTED
         return decision
 
-    outcomes = fork_clips.sort_decided_clips(
-        view['entries'], decision_of,
-        {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
-         fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real},
-        # [FORK] R8: the operator's saved collision policy, read from the preference store rather
-        # than threaded in as a widget. Deliberate: everything that decides WHERE a file goes
-        # comes from the server, and the one widget value this handler does take (`armed`) is a
-        # change detector that cannot name a folder.
-        _collision_policy())
-    message = _clips_sorted_text(outcomes, roots)
-    if plan.has_unmarked:
+    # [R13] THE ADMISSION GATE, and the only one. Everything above refuses without changing
+    # anything, which is why the slot is claimed here and not earlier -- the same discipline
+    # `ScanCoordinator` follows, where a scan rejected for a bad folder never takes a generation.
+    # `begin` is one locked test-and-set, so two presses that both got this far cannot both win,
+    # however they interleave.
+    #
+    # The generation is recorded, NOT required: re-scanning does not entitle a second concurrent
+    # transfer. It is read again at the end, to decide whether this transfer may still repaint
+    # the page it acted on.
+    generation = view.get('generation')
+    try:
+        reservation = _CLIPS_TRANSFERS.begin(
+            owner, generation, plan.signature, _clips_transfer_key(view.get('root', '')))
+    except fork_transfer.TransferBusy as busy:
+        template = (CLIPS_TRANSFER_BUSY_TEXT if busy.code == 'transfer_in_progress'
+                    else CLIPS_TRANSFER_FOLDER_BUSY_TEXT)
+        yield _clips_confirm_only(template.format(done=busy.active.done,
+                                                  total=busy.active.total))
+        return
+
+    destinations = {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
+                    fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real}
+    tally = fork_clips.TransferTally(total=plan.total)
+    outcomes = []
+    failure = None
+    try:
+        # The Working state, BEFORE the first file moves. This yield is the feature.
+        _CLIPS_TRANSFERS.note_progress(reservation, 0, tally.total)
+        yield _clips_working_frame(CLIPS_WORKING_STARTING_TEXT.format(total=tally.total))
+
+        # [R13] `iter_sorted_clips` is `sort_decided_clips`' own body, yielding each outcome as it
+        # completes -- one transfer engine, not two. Everything about the move is unchanged: the
+        # same single same-volume `os.rename`, the same no-overwrite guarantee enforced by the
+        # call itself, and the same `collision.py` policy.
+        for outcome in fork_clips.iter_sorted_clips(
+                view['entries'], decision_of, destinations,
+                # [FORK] R8: the operator's saved collision policy, read from the preference store
+                # rather than threaded in as a widget. Deliberate: everything that decides WHERE a
+                # file goes comes from the server, and the one widget value this handler does take
+                # (`armed`) is a change detector that cannot name a folder.
+                _collision_policy()):
+            outcomes.append(outcome)
+            tally.record(outcome)
+            _CLIPS_TRANSFERS.note_progress(reservation, tally.done, tally.total)
+            if not fork_transfer.should_emit(tally.done, tally.total):
+                continue
+            template = (CLIPS_WORKING_PROGRESS_WITH_STAYED_TEXT if tally.stayed
+                        else CLIPS_WORKING_PROGRESS_TEXT)
+            yield _clips_working_frame(template.format(
+                done=tally.done, total=tally.total, moved=tally.moved, stayed=tally.stayed))
+    except Exception as crash:            # noqa: BLE001 - see below; re-raising would strand the UI
+        # [R13] The backstop, and it is narrow in effect even though it is broad in type. Every
+        # expected failure is already a `MoveOutcome`: `iter_sorted_clips` converts each clip's
+        # `OSError` into one, and the durability refusals were handled before the slot was
+        # claimed. So reaching here means a genuine defect -- and the one thing that must not
+        # happen then is a surface left permanently disabled with files already moved and nothing
+        # on screen saying so. The outcomes collected so far are reported truthfully and the
+        # controls come back; `RenderCancelled` cannot arrive here because this path holds no
+        # render lifecycle and starts no render.
+        failure = crash
+    finally:
+        # Released on EVERY terminal path -- success, partial, defect, and an abandoned generator,
+        # where Gradio's close raises `GeneratorExit` at the yield above. Token-matched, so a late
+        # release cannot clear a newer transfer's slot. Nothing is yielded from here.
+        _CLIPS_TRANSFERS.end(reservation)
+
+    message = _clips_sorted_text(outcomes, roots, tally)
+    if plan.has_unmarked and failure is None:
         message = (f"{message}\n\n{len(plan.unmarked)} unmarked clip(s) were moved to the "
                    f"Discarded folder as agreed. Nothing was deleted.")
+    if failure is not None:
+        message = f"{message}\n\n{CLIPS_TRANSFER_CRASHED_TEXT.format(error=failure)}"
 
-    # Re-enumerate whichever way it went. On a clean batch that publishes the next one; on a
-    # partial batch it republishes what is genuinely still on disk, which is the only honest
-    # page to show -- repainting the old one would leave already-moved clips on screen, and
-    # pressing Confirm again would then report them as missing. Clips that stayed keep their
-    # decisions, because a decision is keyed on the file's identity and that has not changed.
-    report, grid, counts_text, confirm = _on_clips_scan(
-        view['root'], view.get('recursive', True), view.get('library', ''),
-        view.get('rejected', ''), view.get('page_size', 100), request)
+    # [R13 / R11 interaction] Whether this transfer may still publish a page.
+    #
+    # The moves themselves are never abandoned half way: the operator pressed Confirm on this
+    # page, and stopping mid-batch for an unrelated navigation would leave a partial sort for no
+    # reason. What the transfer must NOT do is hand the browser a page the server no longer holds
+    # -- which is exactly what re-scanning the old root would do after the Raw Cutter's "Review
+    # these clips" retired it (R11 / F-1), or after the operator started a newer scan.
+    #
+    # So the generation decides, and the two branches are the same two `_on_clips_scan` already
+    # has: still newest, publish the next batch; superseded, repaint the AUTHORITATIVE page
+    # instead of the one this transfer built. That is the R5-P3 / F1 rule applied to a transfer,
+    # and it is why no second notion of "the current page" is introduced here.
+    if _CLIPS_SCANS.is_current(owner, generation):
+        # Re-enumerate whichever way it went. On a clean batch that publishes the next one; on a
+        # partial batch it republishes what is genuinely still on disk, which is the only honest
+        # page to show -- repainting the old one would leave already-moved clips on screen, and
+        # pressing Confirm again would then report them as missing. Clips that stayed keep their
+        # decisions, because a decision is keyed on the file's identity and that has not changed.
+        report, grid, counts_text, confirm = _on_clips_scan(
+            view['root'], view.get('recursive', True), view.get('library', ''),
+            view.get('rejected', ''), view.get('page_size', 100), request)
+    else:
+        report, grid, counts_text, confirm = _clips_render_current(
+            owner, CLIPS_TRANSFER_PAGE_MOVED_ON_TEXT)
+        message = f"{message}{CLIPS_TRANSFER_STALE_NOTE_TEXT}"
     # The gate closes and the arming is cleared: this batch is spent, and a signature that
     # outlived its batch is exactly what the signature exists to prevent.
-    return (report, grid, counts_text, confirm, message,
-            gr.update(visible=False), gr.update(visible=False), '')
+    yield (report, grid, counts_text, confirm, message,
+           gr.update(visible=False), gr.update(visible=False), '')
 
 
 def _on_clips_sweep_cancel(request: gr.Request = None):
@@ -9917,12 +10133,21 @@ def _on_clips_sweep_cancel(request: gr.Request = None):
     return _clips_confirm_only(CLIPS_SWEEP_CANCELLED_TEXT)
 
 
-def _clips_sorted_text(outcomes, roots) -> str:
-    """What actually happened, per clip, in the operator's words rather than status codes."""
+def _clips_sorted_text(outcomes, roots, tally=None) -> str:
+    """What actually happened, per clip, in the operator's words rather than status codes.
+
+    [R13] `tally` adds the explicit **moved / skipped / failed / of total** line. It is optional
+    and defaults to counting `outcomes`, which keeps this callable for a completed batch with
+    nothing extra to say -- but a transfer that stopped early must pass its own tally, because
+    counting the outcomes it managed to collect would silently rebase the denominator and report
+    "9 of 9" for a batch of 84.
+    """
     moved = [o for o in outcomes if o.ok]
     kept = [o for o in moved if o.decision == fork_clips.SELECTED]
     binned = [o for o in moved if o.decision == fork_clips.REJECTED]
     stayed = [o for o in outcomes if not o.ok]
+    if tally is None:
+        tally = fork_clips.tally_outcomes(outcomes)
 
     lines = []
     if moved and not stayed:
@@ -9932,6 +10157,8 @@ def _clips_sorted_text(outcomes, roots) -> str:
                      f"{len(stayed)} stayed where they were.")
     else:
         lines.append("❌ Nothing was moved.")
+    lines.append(CLIPS_TRANSFER_TALLY_TEXT.format(
+        moved=tally.moved, skipped=tally.skipped, failed=tally.failed, total=tally.total))
     lines.append("")
     lines.append(f"Media Library ({roots[fork_clips.ROLE_LIBRARY].real}): {len(kept)} kept")
     lines.append(f"Discarded ({roots[fork_clips.ROLE_REJECTED].real}): {len(binned)} discarded")
@@ -13337,8 +13564,15 @@ def create_ui() -> gr.Blocks:
         _clips_confirm_outputs = [clips_report, clips_gallery, clips_counts, clips_confirm_btn,
                                   clips_confirm_out, clips_proceed_btn, clips_sweep_cancel_btn,
                                   clips_armed_state]
+        #
+        # [R13] Both are wired to the GENERATOR, `_clips_confirm_frames`, so the Working frame
+        # reaches the browser before the first file moves. `concurrency_limit=None` is unchanged
+        # and load-bearing: a lane of 1 would leave the second press QUEUED rather than letting
+        # the server refuse it, which is the measured S2-A R3 trap, and a queued duplicate that
+        # ran later against a spent batch is strictly worse than one refused now. Single-flight is
+        # `_CLIPS_TRANSFERS`, which is provable without Gradio.
         clips_confirm_btn.click(
-            fn=_on_clips_confirm,
+            fn=_clips_confirm_frames,
             inputs=[clips_armed_state],
             outputs=_clips_confirm_outputs,
             concurrency_limit=None,
@@ -13349,7 +13583,7 @@ def create_ui() -> gr.Blocks:
         # the gate falls through instead of being shown. A second entry point that skipped any of
         # those checks would be a way around them.
         clips_proceed_btn.click(
-            fn=_on_clips_confirm,
+            fn=_clips_confirm_frames,
             inputs=[clips_armed_state],
             outputs=_clips_confirm_outputs,
             concurrency_limit=None,

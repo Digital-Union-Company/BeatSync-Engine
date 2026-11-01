@@ -1141,6 +1141,54 @@ CLIPS_MOVE_REASONS = {
     "in_use": "something still has the file open — close it and press Confirm again",
     "failed": "the move failed",
 }
+# [R13] The Working overlay. The first of these is shown BEFORE the first file moves, which is the
+# whole point of the feature: a long transfer used to look like a dead button.
+CLIPS_WORKING_STARTING_TEXT = (
+    "⏳ Working — sorting {total} clip(s).\n"
+    "Nothing has moved yet. Leave this tab open; Confirm is unavailable until it finishes."
+)
+# `{done}` is RECORDED outcomes, never a prediction and never a timer. `{moved}` is how many of
+# them actually moved, which is why both numbers are shown rather than one standing in for the
+# other -- a skipped clip is counted as done and was not moved.
+CLIPS_WORKING_PROGRESS_TEXT = "⏳ Moving {done} / {total} clips — {moved} moved so far."
+CLIPS_WORKING_PROGRESS_WITH_STAYED_TEXT = (
+    "⏳ Moving {done} / {total} clips — {moved} moved, {stayed} left in place so far."
+)
+# The honest closing tally, appended to the existing per-clip report. `skipped` and `failed` are
+# deliberately separate: a taken filename or a file somebody still has open is a refusal this code
+# made on purpose, while a failure is an error it could not classify.
+CLIPS_TRANSFER_TALLY_TEXT = "Moved {moved} · skipped {skipped} · failed {failed} · of {total}."
+CLIPS_TRANSFER_BUSY_TEXT = (
+    "⏳ Nothing was started: this page is already being sorted ({done} of {total} clip(s) done).\n"
+    "Wait for it to finish — pressing Confirm again cannot make it go faster, and the server "
+    "refuses a second run so that no clip is moved twice."
+)
+CLIPS_TRANSFER_FOLDER_BUSY_TEXT = (
+    "⏳ Nothing was started: another review session is already sorting this folder "
+    "({done} of {total} clip(s) done).\n"
+    "Wait for it to finish. Two sessions sorting one folder is refused by the server, not just "
+    "discouraged in the browser."
+)
+CLIPS_TRANSFER_BLOCKED_DECISION_TEXT = (
+    "This page is being sorted right now, so its clips cannot be re-classified until it finishes."
+)
+# The transfer finished, but the page it was sorting is no longer the current one -- an operator
+# re-scanned, or the Raw Cutter's "Review these clips" retired it (R11 / F-1). The counts below are
+# still exactly what happened; what is NOT shown is a repaint of a page the server no longer holds.
+CLIPS_TRANSFER_PAGE_MOVED_ON_TEXT = (
+    "Video Review has moved on to a different page since this sort started, so the gallery below "
+    "shows what the server holds now rather than the folder that was just sorted."
+)
+CLIPS_TRANSFER_STALE_NOTE_TEXT = (
+    "\n\nThis page was replaced while the sort was running, so the grid above is not a repaint of "
+    "it. Everything reported here really happened; press Scan Folder on a folder to review it "
+    "again."
+)
+CLIPS_TRANSFER_CRASHED_TEXT = (
+    "❌ The sort stopped early: {error}\n\n"
+    "Everything reported above already happened and nothing was overwritten or deleted. The "
+    "clips that did not move are still where they were, so pressing Confirm again is safe."
+)
 # [R5-P3 / F1] A scan that was overtaken by a newer scan of the same browser session. It changed
 # nothing, and the gallery it is replacing shows the newest page rather than its own, whose
 # session the newer scan already revoked.

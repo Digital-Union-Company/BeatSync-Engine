@@ -1760,6 +1760,43 @@ def move_decided_clip(entry: ClipEntry, destination_dir: str,
     return result
 
 
+def iter_sorted_clips(entries: Iterable[ClipEntry], decision_of, destinations: dict[str, str],
+                      policy: str = collision.DEFAULT_POLICY):
+    """:func:`sort_decided_clips`, yielding each outcome the instant it is complete.
+
+    [FORK] R13. This is the **one** transfer engine; :func:`sort_decided_clips` is now a list of
+    what this yields, so there is no second ordering, no second collision path and no second set
+    of refusals to keep in step. Extracting a generator rather than adding a progress callback is
+    deliberate: a callback would have to be invoked from inside the loop, and the GUI rule that
+    nothing may touch a Gradio component from anywhere but the generator frame makes a callback
+    the wrong shape. Yielding lets the caller's own generator do every widget update.
+
+    An outcome is yielded **after** its move has already happened or been refused, so a consumer
+    counting them is counting recorded facts and never a prediction. Abandoning this generator
+    stops the batch where it is; nothing is undone, because each rename was independently complete
+    the moment it returned.
+    """
+    made: set[str] = set()
+    for entry in entries:
+        decision = decision_of(entry)
+        destination_dir = destinations.get(decision)
+        if destination_dir is None:
+            yield MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
+                              detail="undecided clips are never sorted")
+            continue
+        if destination_dir not in made:
+            try:
+                os.makedirs(destination_dir, exist_ok=True)
+            except OSError as exc:
+                yield MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
+                                  detail=io_detail(exc))
+                continue
+            made.add(destination_dir)
+        outcome = move_decided_clip(entry, destination_dir, policy)
+        outcome.decision = decision
+        yield outcome
+
+
 def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: dict[str, str],
                        policy: str = collision.DEFAULT_POLICY) -> list[MoveOutcome]:
     """Move each decided clip to the folder its decision names. Returns one outcome per clip.
@@ -1772,28 +1809,71 @@ def sort_decided_clips(entries: Iterable[ClipEntry], decision_of, destinations: 
     rename is independently complete the moment it returns, so a partial batch is a real partial
     result and is reported as one. A :data:`PENDING` clip is never touched -- Confirm is not
     offered until the page has none, and this refuses to act on one even if it were.
+
+    [FORK] R13: now the collected form of :func:`iter_sorted_clips`. Same entries, same order,
+    same outcomes -- this signature and return type are unchanged on purpose, because several
+    suites drive it directly and a caller that does not need progress should not have to care
+    that progress exists.
     """
-    outcomes: list[MoveOutcome] = []
-    made: set[str] = set()
-    for entry in entries:
-        decision = decision_of(entry)
-        destination_dir = destinations.get(decision)
-        if destination_dir is None:
-            outcomes.append(MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
-                                        detail="undecided clips are never sorted"))
-            continue
-        if destination_dir not in made:
-            try:
-                os.makedirs(destination_dir, exist_ok=True)
-            except OSError as exc:
-                outcomes.append(MoveOutcome(entry.clip_id, entry.label, decision, FAILED,
-                                            detail=io_detail(exc)))
-                continue
-            made.add(destination_dir)
-        outcome = move_decided_clip(entry, destination_dir, policy)
-        outcome.decision = decision
-        outcomes.append(outcome)
-    return outcomes
+    return list(iter_sorted_clips(entries, decision_of, destinations, policy))
+
+
+#: Statuses that mean "left where it was, for a reason the operator can act on".
+#:
+#: Kept separate from :data:`FAILED` because the distinction is the whole point of reporting
+#: skipped and failed apart: a taken filename, a file somebody still has open and a clip that
+#: changed under review are all *refusals this code made deliberately*, while :data:`FAILED` is
+#: an error it could not classify. Collapsing them would make a healthy no-overwrite refusal read
+#: as a malfunction.
+SKIPPED_STATUSES = (MISSING, CHANGED, OCCUPIED, CROSS_VOLUME, IN_USE)
+
+
+@dataclass
+class TransferTally:
+    """Moved / skipped / failed, counted from recorded outcomes only.
+
+    [FORK] R13. ``total`` is the size of the batch that was admitted; ``done`` is how much of it
+    has actually been attempted. Nothing here is derived from elapsed time, a rate or an estimate,
+    which is why :meth:`record` is the only thing that can move any of these numbers.
+    """
+
+    total: int = 0
+    moved: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+    @property
+    def done(self) -> int:
+        return self.moved + self.skipped + self.failed
+
+    @property
+    def stayed(self) -> int:
+        """Clips that did not move, for whichever reason. ``skipped + failed``."""
+        return self.skipped + self.failed
+
+    def record(self, outcome: MoveOutcome) -> "TransferTally":
+        if outcome.status == MOVED:
+            self.moved += 1
+        elif outcome.status in SKIPPED_STATUSES:
+            self.skipped += 1
+        else:
+            self.failed += 1
+        return self
+
+
+def tally_outcomes(outcomes: Iterable[MoveOutcome], total: int | None = None) -> TransferTally:
+    """Collect ``outcomes`` into a :class:`TransferTally`.
+
+    ``total`` defaults to the number of outcomes given. Passing it explicitly is how a *partial*
+    batch stays honest: an abandoned or crashed transfer has fewer outcomes than clips, and
+    reporting ``done`` against the real batch size is the difference between "9 of 84" and a
+    silently rebased "9 of 9".
+    """
+    tally = TransferTally()
+    for outcome in outcomes:
+        tally.record(outcome)
+    tally.total = tally.done if total is None else int(total)
+    return tally
 
 
 def tile_html(entry: ClipEntry, decision: str, revision: int, session_id: str,

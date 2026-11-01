@@ -1,0 +1,907 @@
+"""R13 Video Review Transfer Working Overlay: the real handler, driven frame by frame.
+
+[FORK] Digital-Union. The pure admission rule is ``test_transfer_guard.py``; this file is about
+``gui.py``'s use of it, and it reaches the handler the same way ``test_clips_gui_integration.py``
+does -- ``ast``-extracted from the shipped source and executed against a synthesised parent
+namespace, because ``gui.py`` cannot be imported on a bare interpreter. The harness is *imported*
+from that suite rather than copied, which is what keeps the two files testing one namespace: a
+stub that drifted would let this file pass against handlers the app does not ship.
+
+What is asserted here, in the brief's own terms:
+
+* a visible Working state **before** the first file moves, and none at all for a press that moves
+  nothing;
+* progress counted from recorded ``MoveOutcome``s;
+* server-side single-flight against repeated clicks, two browser sessions and a replayed event;
+* classification refused while a batch is being sorted;
+* the two-step confirmation preserved;
+* ``collision.py``'s policies reused, with nothing overwritten;
+* a safe terminal state on success, partial failure and an exception;
+* and the R11 interaction -- what a transfer may publish when the page moved on under it.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import threading
+
+import pytest
+
+from beatsync_fork import clips_review as cr
+from beatsync_fork import collision
+from beatsync_fork import transfer_guard as tg
+from test_clips_gui_integration import (_GUI, _Gr, _build, _no_poster, _tree_of_clips, ui)  # noqa: F401
+
+_SELECTED, _REJECTED, _PENDING = cr.SELECTED, cr.REJECTED, cr.PENDING
+
+
+@pytest.fixture
+def world(tmp_path, ui):                                    # noqa: F811 - the imported fixture
+    media = _tree_of_clips(tmp_path, count=3)
+    namespace = _build(str(tmp_path / "state"), ui, poster_runner=_no_poster)
+    return {
+        "ns": namespace, "media": media, "tmp": tmp_path, "ui": ui,
+        "library": str(tmp_path / "library"), "rejected": str(tmp_path / "rejected"),
+        "request": _Gr.Request,
+    }
+
+
+def _scan(world, owner, folder=None, page_size=100):
+    return world["ns"]["_on_clips_scan"](
+        folder or world["media"], True, world["library"], world["rejected"], page_size,
+        world["request"](session_hash=owner))
+
+
+def _keep_all(world, owner):
+    """Mark every clip on the owner's page KEPT, through the real decision endpoint.
+
+    The expected revision is read from the store rather than assumed to be 0, because decisions
+    are keyed on the *file's* identity: a second browser session scanning the same folder meets
+    the revisions the first one already moved, and the optimistic-concurrency check is strict by
+    design (a coerced or skipped revision is the R5-P3 / F2 fail-open).
+    """
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    store = namespace["_clips_store"]()
+    for entry in view["entries"]:
+        identity = view["identity"][entry.clip_id]
+        current, revision = store.get(identity)
+        if current == _SELECTED:
+            continue
+        answer = namespace["_clips_decide"](owner, view["session"], view["page"], entry,
+                                            {"to": _SELECTED, "rev": revision})
+        assert answer["ok"] is True, answer
+    return view
+
+
+def _entries_in(folder):
+    """Real `ClipEntry` records for every file in `folder`, in name order.
+
+    Deterministic ids rather than the registry's opaque ones, so the two forms below can be
+    compared position for position -- the point of that test is the *order and the outcomes*, and
+    randomly minted ids would make it compare nothing.
+    """
+    entries = []
+    for index, name in enumerate(sorted(os.listdir(folder)), start=1):
+        path = os.path.join(folder, name)
+        stat = os.stat(path)
+        entries.append(cr.ClipEntry(
+            clip_id=f"c{index:04d}", index=index, path=path, size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns, dev=getattr(stat, "st_dev", -1),
+            ino=getattr(stat, "st_ino", -1), suffix=os.path.splitext(path)[1]))
+    return entries
+
+
+def _frames(world, owner, armed=""):
+    return list(world["ns"]["_clips_confirm_frames"](armed, world["request"](session_hash=owner)))
+
+
+# Frame positions, named once so no assertion below counts on its fingers.
+_REPORT, _GRID, _COUNTS, _CONFIRM, _MESSAGE, _PROCEED, _CANCEL, _ARMED = range(8)
+
+
+# =============================================================================================
+# 1 — the Working state, and where it may NOT appear
+# =============================================================================================
+
+def test_a_real_sort_shows_working_before_the_first_file_moves(world):
+    """The complaint R13 answers: a long Confirm looked like a dead button. The first frame has
+    to arrive before anything has moved, which is why the handler is a generator -- a function
+    cannot say "working" and then work."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    sources = [entry.path for entry in view["entries"]]
+
+    stream = world["ns"]["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    first = next(stream)
+
+    assert world["ui"]["CLIPS_WORKING_STARTING_TEXT"].splitlines()[0].format(total=3) \
+        in first[_MESSAGE] or "Working" in first[_MESSAGE], first[_MESSAGE]
+    assert first[_CONFIRM] == {"interactive": False}, "Confirm must go away while it works"
+    assert first[_PROCEED] == {"visible": False} and first[_CANCEL] == {"visible": False}
+    assert first[_ARMED] == "", "a spent batch must not leave a live signature"
+    for source in sources:
+        assert os.path.isfile(source), "a file moved BEFORE the Working frame was emitted"
+    assert not os.path.exists(world["library"]), "the destination was created too early"
+
+    remaining = list(stream)
+    assert remaining, "the sort never ran"
+    for source in sources:
+        assert not os.path.exists(source), "the sort did not actually move the clips"
+
+
+def test_the_working_frame_leaves_the_grid_and_counts_alone(world):
+    """The operator is watching the batch being sorted. Blanking the page they pressed Confirm on
+    would hide it mid-flight -- and the grid staying clickable is safe because the SERVER refuses
+    a classification while a transfer is active, which a disabled tile could never promise."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    working = _frames(world, owner)[0]
+    for position in (_REPORT, _GRID, _COUNTS):
+        assert working[position] == {}, f"frame position {position} was repainted mid-sort"
+
+
+def test_the_sweep_gate_emits_exactly_one_frame_and_no_working_state(world):
+    """Requirement: do not show Working when Confirm merely presents the confirmation gate and
+    moves nothing. A spinner for an operation that has not been authorised yet is the dead-button
+    complaint inverted."""
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    first = view["entries"][0]
+    assert namespace["_clips_decide"](owner, view["session"], view["page"], first,
+                                       {"to": _SELECTED, "rev": 0})["ok"] is True
+
+    frames = _frames(world, owner)
+
+    assert len(frames) == 1, "the gate must not stream"
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in frames[0][_MESSAGE]
+    assert frames[0][_PROCEED] == {"visible": True}
+    assert frames[0][_ARMED], "the gate must arm the batch it showed"
+    for entry in view["entries"]:
+        assert os.path.isfile(entry.path), "the gate moved a file"
+
+
+@pytest.mark.parametrize("prepare", ["nothing_scanned", "no_identity", "nothing_kept"])
+def test_every_refusal_emits_exactly_one_frame_and_claims_no_slot(world, prepare):
+    """A refusal changes nothing, so it must not announce work and must not leave the page
+    marked busy -- the same discipline `ScanCoordinator` follows, where a scan rejected for a bad
+    folder never takes a generation."""
+    owner = "tab-a"
+    if prepare == "nothing_kept":
+        _scan(world, owner)
+    elif prepare == "nothing_scanned":
+        pass
+    if prepare == "no_identity":
+        frames = list(world["ns"]["_clips_confirm_frames"]("", world["request"](None)))
+    else:
+        frames = _frames(world, owner)
+
+    assert len(frames) == 1, frames
+    assert frames[0][_PROCEED] == {"visible": False}, "a refusal must not open the gate"
+    assert world["ns"]["_CLIPS_TRANSFERS"].active_for(owner) is None, \
+        "a refusal claimed the single-flight slot"
+
+
+def test_the_collected_accessor_returns_the_last_frame(world):
+    """`_on_clips_confirm` is the pre-R13 shape, kept because the answer a press settles on is a
+    useful thing to ask for. It must be the TERMINAL frame, never the Working one."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    final = world["ns"]["_on_clips_confirm"]("", world["request"](session_hash=owner))
+    assert "Sorted all 3" in final[_MESSAGE], final[_MESSAGE]
+    assert final[_ARMED] == ""
+
+
+# =============================================================================================
+# 2 — truthful progress
+# =============================================================================================
+
+def test_progress_is_counted_from_recorded_outcomes(world):
+    """`Moving 2 / 3` must mean two clips have actually been attempted. Every intermediate frame
+    is checked against the disk, so a number that ran ahead of the renames would fail here."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    total = len(view["entries"])
+
+    seen = []
+    for frame in world["ns"]["_clips_confirm_frames"]("", world["request"](session_hash=owner)):
+        gone = sum(1 for entry in view["entries"] if not os.path.exists(entry.path))
+        seen.append((frame[_MESSAGE], gone))
+
+    numbers = [int(message.split("Moving ")[1].split(" /")[0])
+               for message, _ in seen if "Moving " in message]
+    assert numbers == list(range(1, total + 1)), numbers
+    for message, gone in seen:
+        if "Moving " not in message:
+            continue
+        done = int(message.split("Moving ")[1].split(" /")[0])
+        assert done == gone, f"{message!r} claimed {done} with {gone} actually moved"
+
+
+def test_the_closing_report_states_moved_skipped_and_failed(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    message = _frames(world, owner)[-1][_MESSAGE]
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=3, skipped=0, failed=0, total=3) in message, message
+
+
+def test_a_skipped_clip_is_reported_as_skipped_and_not_as_a_failure(world):
+    """A taken filename is a refusal this code made on purpose -- `collision.SKIP` reports it and
+    moves nothing. Counting it as a failure would make the no-overwrite guarantee read as a
+    malfunction."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    os.makedirs(world["library"], exist_ok=True)
+    blocked = view["entries"][1]
+    occupant = os.path.join(world["library"], os.path.basename(blocked.path))
+    with open(occupant, "wb") as handle:
+        handle.write(b"i was here first")
+
+    message = _frames(world, owner)[-1][_MESSAGE]
+
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=2, skipped=1, failed=0, total=3) in message, message
+    assert open(occupant, "rb").read() == b"i was here first", "the occupant was overwritten"
+    assert os.path.isfile(blocked.path), "the blocked clip must stay where it is"
+
+
+def test_a_partial_batch_keeps_the_real_denominator(world):
+    """An abandoned or crashed transfer has fewer outcomes than clips, and reporting against the
+    outcomes it collected would silently rebase the denominator -- "2 of 2" for a batch of 3."""
+    tally = cr.TransferTally(total=3)
+    tally.record(cr.MoveOutcome("a", "Clip 0001", _SELECTED, cr.MOVED))
+    tally.record(cr.MoveOutcome("b", "Clip 0002", _SELECTED, cr.MOVED))
+    assert (tally.done, tally.total) == (2, 3)
+    assert cr.tally_outcomes([], total=3).total == 3
+    assert cr.tally_outcomes([]).total == 0, "no outcomes and no stated total is an empty batch"
+
+
+def test_no_frame_ever_predicts_anything(world):
+    """No rate, no percentage, no estimate, no time remaining. The panel says what happened."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    for frame in _frames(world, owner):
+        lowered = frame[_MESSAGE].lower()
+        for forbidden in ("remaining", "eta", "estimat", "about a minute", "/s", "per second",
+                          "%"):
+            assert forbidden not in lowered, f"{forbidden!r} in {frame[_MESSAGE]!r}"
+
+
+def test_the_progress_frame_count_is_bounded_for_a_large_batch(world, tmp_path):
+    """One Gradio round trip per clip is right for three and wasteful for a thousand. The budget
+    bounds the frames without ever bounding the truth -- the last outcome always emits."""
+    big = _tree_of_clips(tmp_path / "big", count=120)
+    owner = "tab-a"
+    _scan(world, owner, folder=big, page_size=200)
+    _keep_all(world, owner)
+
+    frames = _frames(world, owner)
+    progress = [f for f in frames if "Moving " in f[_MESSAGE]]
+
+    assert len(progress) <= tg.PROGRESS_FRAME_BUDGET + 1, len(progress)
+    assert "Moving 120 / 120" in progress[-1][_MESSAGE], progress[-1][_MESSAGE]
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=120, skipped=0, failed=0, total=120) in frames[-1][_MESSAGE]
+
+
+# =============================================================================================
+# 3 — server-side single-flight
+# =============================================================================================
+
+def test_a_second_press_during_a_sort_is_refused_by_the_server(world):
+    """The authority is the guard, not a disabled button. Driven by starting the second press
+    from inside the first's progress loop, which is exactly the double-click the operator makes."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    duplicate = []
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)                                            # the Working frame: the slot is held
+    duplicate = list(namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner)))
+    rest = list(stream)
+
+    assert len(duplicate) == 1, "a refused duplicate must not stream"
+    assert world["ui"]["CLIPS_TRANSFER_BUSY_TEXT"].splitlines()[0].split("(")[0] \
+        in duplicate[0][_MESSAGE], duplicate[0][_MESSAGE]
+    assert "Sorted all 3" in rest[-1][_MESSAGE], "the first press must still finish"
+    # Exactly one copy of each clip reached the library, under its own name.
+    names = sorted(os.listdir(world["library"]))
+    assert names == sorted(os.path.basename(e.path) for e in view["entries"]), names
+    assert not os.path.exists(world["rejected"]) or os.listdir(world["rejected"]) == []
+
+
+def test_a_duplicate_press_produces_no_extra_collision_suffix(world):
+    """The named hazard: under SUFFIX a second concurrent run of the same batch could take the
+    next free name and leave `clip0000_01.mp4` beside `clip0000.mp4`. Single-flight is what
+    makes that unreachable, so the assertion is on the destination listing."""
+    owner = "tab-a"
+    namespace = _build(str(world["tmp"] / "state2"), world["ui"], poster_runner=_no_poster)
+    namespace["_collision_policy"] = lambda: collision.SUFFIX
+    world["ns"] = namespace
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    list(namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner)))
+    list(stream)
+
+    names = sorted(os.listdir(world["library"]))
+    assert names == sorted(os.path.basename(e.path) for e in view["entries"]), names
+    assert not any("_01" in name for name in names), f"a duplicate minted a suffix: {names}"
+
+
+def test_a_replayed_event_is_refused_exactly_like_a_second_click(world):
+    """A replayed submission is indistinguishable from a second click at this layer, which is the
+    point: the server does not need to tell them apart, because admission is a test-and-set and
+    not a judgement about where a request came from."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    replay = list(namespace["_clips_confirm_frames"]("captured-signature-from-an-old-body",
+                                                      world["request"](session_hash=owner)))
+    list(stream)
+
+    assert len(replay) == 1
+    assert "already being sorted" in replay[0][_MESSAGE], replay[0][_MESSAGE]
+
+
+def test_two_browser_sessions_cannot_sort_one_folder_at_once(world):
+    """Two tabs are two owner keys, so the per-owner rule alone would admit both. The refusal
+    names the real case rather than reporting somebody else's press as this page's own."""
+    namespace = world["ns"]
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    _scan(world, "tab-b")
+    _keep_all(world, "tab-b")
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    other = list(namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-b")))
+    list(stream)
+
+    assert len(other) == 1
+    assert "another review session" in other[0][_MESSAGE], other[0][_MESSAGE]
+
+
+def test_many_concurrent_presses_admit_exactly_one_sort(world):
+    """Real threads against the real handler. `concurrency_limit=None` means Gradio delivers all
+    of them, so this is the shape the shipped app actually sees."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    results, start = [], threading.Barrier(8)
+
+    def press():
+        start.wait()
+        results.append(list(namespace["_clips_confirm_frames"](
+            "", world["request"](session_hash=owner))))
+
+    threads = [threading.Thread(target=press) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    sorted_runs = [r for r in results if any("Moving " in f[_MESSAGE] for f in r)]
+    assert len(sorted_runs) == 1, f"{len(sorted_runs)} presses sorted at once"
+    names = sorted(os.listdir(world["library"]))
+    assert names == sorted(os.path.basename(e.path) for e in view["entries"]), names
+
+
+def test_the_slot_is_released_so_a_retry_is_possible(world):
+    """A leaked slot would mean the page could never be sorted again, which is why the release
+    sits in a `finally`. The retry is genuinely *admitted* here, not refused as busy.
+
+    What the retry finds is pre-R13 behaviour and is left exactly as it was: emptying the folder
+    makes the post-sort re-enumeration refuse before it takes a generation, which deliberately
+    does **not** blank the current page (`.claude/rules/clips-preview.md` -- an empty enumeration
+    may not destroy an otherwise valid view). So the second press re-attempts the same entries and
+    reports every one of them as no longer where the scan found it. Nothing moves, nothing is
+    overwritten, and that is the safe retry the requirement asks for."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    _frames(world, owner)
+
+    assert world["ns"]["_CLIPS_TRANSFERS"].active_for(owner) is None, \
+        "the slot leaked, so the page can never be sorted again"
+
+    library_before = sorted(os.listdir(world["library"]))
+    again = _frames(world, owner)
+
+    assert any("Moving " in f[_MESSAGE] for f in again), \
+        "the retry was refused as busy rather than admitted"
+    final = again[-1][_MESSAGE]
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=0, skipped=3, failed=0, total=3) in final, final
+    assert world["ui"]["CLIPS_MOVE_REASONS"]["missing"] in final, final
+    assert sorted(os.listdir(world["library"])) == library_before, \
+        "the retry moved something a second time"
+    assert len(library_before) == len(view["entries"])
+
+
+# =============================================================================================
+# 4 — classification protection
+# =============================================================================================
+
+def test_a_classification_is_refused_while_the_batch_is_being_sorted(world):
+    """A transfer captured its snapshot before it started moving. A decision accepted now would
+    be honoured by the screen and ignored by the batch -- the operator would watch a clip they
+    just marked Keep land in Discarded."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    answer = namespace["_clips_decide"](owner, view["session"], view["page"],
+                                         view["entries"][2], {"to": _REJECTED, "rev": 1})
+    list(stream)
+
+    assert answer["ok"] is False
+    assert answer["code"] == "transfer_in_progress", answer
+    assert answer["decision"] == _SELECTED, "the refusal must disclose the server's own record"
+    assert answer["rev"] == 1, "a refusal must not move the revision"
+
+
+def test_a_refused_classification_writes_nothing_durable(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    identity = view["identity"][view["entries"][0].clip_id]
+    before = namespace["_clips_store"]().get(identity)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": _REJECTED, "rev": before[1]})
+    assert namespace["_clips_store"]().get(identity) == before, \
+        "a refusal reached the durable store"
+    list(stream)
+
+
+def test_another_sessions_classification_on_the_same_folder_is_refused_too(world):
+    """The second tab never saw a greyed-out tile, which is exactly why the check cannot live in
+    the browser. Its clips are the ones being moved, so its decisions are refused as well."""
+    namespace = world["ns"]
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    _scan(world, "tab-b")
+    other = namespace["_clips_view"]("tab-b")
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    answer = namespace["_clips_decide"]("tab-b", other["session"], other["page"],
+                                         other["entries"][0], {"to": _SELECTED, "rev": 0})
+    list(stream)
+
+    assert answer["ok"] is False and answer["code"] == "transfer_in_progress", answer
+
+
+def test_classification_works_again_the_moment_the_sort_finishes(world):
+    """The protection is a window, not a latch. A latch that outlived the batch would be a new
+    way to strand the page."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    _frames(world, owner)
+    namespace = world["ns"]
+
+    # The post-sort re-scan published the next page: here, the now-empty folder.
+    assert namespace["_CLIPS_TRANSFERS"].busy(owner) is None
+    _scan(world, owner, folder=_tree_of_clips(world["tmp"] / "more", count=1))
+    fresh = namespace["_clips_view"](owner)
+    answer = namespace["_clips_decide"](owner, fresh["session"], fresh["page"],
+                                         fresh["entries"][0], {"to": _SELECTED, "rev": 0})
+    assert answer["ok"] is True, answer
+
+
+def test_refresh_does_not_light_confirm_back_up_mid_sort(world):
+    """Presentation, not authority -- but a screen that contradicts the Working state invites a
+    press the server is going to refuse. It can only ever disable."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    _grid, _counts, confirm = namespace["_on_clips_refresh"](
+        world["request"](session_hash=owner))
+    list(stream)
+
+    assert confirm == {"interactive": False}, confirm
+
+
+# =============================================================================================
+# 5 — the two-step confirmation is preserved
+# =============================================================================================
+
+def test_unmarked_clips_still_need_an_explicit_proceed(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": _SELECTED, "rev": 0})
+
+    gated = _frames(world, owner)
+    assert len(gated) == 1 and gated[0][_PROCEED] == {"visible": True}
+    signature = gated[0][_ARMED]
+    for entry in view["entries"]:
+        assert os.path.isfile(entry.path), "the gate moved a file"
+
+    swept = _frames(world, owner, armed=signature)
+    assert any("Moving " in f[_MESSAGE] for f in swept), "Proceed did not sort"
+    assert len(os.listdir(world["library"])) == 1
+    assert len(os.listdir(world["rejected"])) == 2, "the unmarked clips went to Discarded"
+
+
+def test_a_signature_that_does_not_match_re_opens_the_gate_and_claims_no_slot(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": _SELECTED, "rev": 0})
+
+    frames = _frames(world, owner, armed="not-the-signature-for-this-batch")
+
+    assert len(frames) == 1
+    assert world["ui"]["CLIPS_SWEEP_GATE_HEADING"] in frames[0][_MESSAGE]
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None, \
+        "an unanswered gate left the page marked busy"
+    for entry in view["entries"]:
+        assert os.path.isfile(entry.path)
+
+
+def test_the_sweep_still_writes_no_durable_decision(world):
+    """R8's rule, re-asserted through the streaming handler: an unmarked clip swept to Discarded
+    stays PENDING in the store, so re-scanning shows it undecided rather than attributing a
+    decision to the operator."""
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": _SELECTED, "rev": 0})
+    unmarked = view["identity"][view["entries"][1].clip_id]
+
+    signature = _frames(world, owner)[0][_ARMED]
+    _frames(world, owner, armed=signature)
+
+    assert namespace["_clips_store"]().get(unmarked)[0] == _PENDING, \
+        "the sweep wrote a decision the operator never made"
+
+
+# =============================================================================================
+# 6 — collision behaviour is reused, never reimplemented
+# =============================================================================================
+
+def test_the_suffix_policy_still_takes_the_next_free_name(world):
+    owner = "tab-a"
+    namespace = _build(str(world["tmp"] / "state3"), world["ui"], poster_runner=_no_poster)
+    namespace["_collision_policy"] = lambda: collision.SUFFIX
+    world["ns"] = namespace
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    os.makedirs(world["library"], exist_ok=True)
+    taken = os.path.basename(view["entries"][0].path)
+    with open(os.path.join(world["library"], taken), "wb") as handle:
+        handle.write(b"first")
+
+    message = _frames(world, owner)[-1][_MESSAGE]
+
+    stem, suffix = os.path.splitext(taken)
+    assert os.path.isfile(os.path.join(world["library"], f"{stem}_01{suffix}")), \
+        os.listdir(world["library"])
+    assert open(os.path.join(world["library"], taken), "rb").read() == b"first", \
+        "the occupant was overwritten"
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=3, skipped=0, failed=0, total=3) in message, message
+
+
+def test_the_handler_names_no_second_naming_engine(world):
+    """One collision implementation. A date stamp, a hash or a hand-rolled counter here would be
+    a second policy for the operator to discover."""
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    node = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "_clips_confirm_frames")
+    body = ast.unparse(node)
+    assert "_collision_policy()" in body, "the operator's saved policy must still be the input"
+    for forbidden in ("strftime", "uuid", "sha256", "md5", "_01", "copy2", "copyfile",
+                      "os.replace", "shutil"):
+        assert forbidden not in body, f"the handler reaches {forbidden}"
+
+
+def test_the_transfer_engine_is_one_implementation():
+    """`sort_decided_clips` is now a list of what `iter_sorted_clips` yields. Two loops would be
+    two orderings, two sets of refusals and two collision paths to keep in step."""
+    source = ast.parse(open(os.path.join(os.path.dirname(_GUI), "beatsync_fork",
+                                         "clips_review.py"), encoding="utf-8").read())
+    collected = next(n for n in source.body
+                     if isinstance(n, ast.FunctionDef) and n.name == "sort_decided_clips")
+    body = [s for s in collected.body if not (isinstance(s, ast.Expr)
+                                              and isinstance(s.value, ast.Constant))]
+    assert len(body) == 1 and isinstance(body[0], ast.Return)
+    assert "iter_sorted_clips" in ast.unparse(body[0])
+    assert [a.arg for a in collected.args.args] == \
+           [a.arg for a in next(n for n in source.body if isinstance(n, ast.FunctionDef)
+                                and n.name == "iter_sorted_clips").args.args], \
+        "the two must take the same arguments, or one of them is a second engine"
+
+
+def test_the_collected_and_streaming_forms_agree(tmp_path):
+    """Same entries, same order, same outcomes -- asserted against a real filesystem rather than
+    argued from the refactor."""
+    entries = _entries_in(_tree_of_clips(tmp_path, count=6))
+    streamed = list(cr.iter_sorted_clips(entries, lambda e: _SELECTED,
+                                         {_SELECTED: str(tmp_path / "out")}))
+    assert [o.status for o in streamed] == [cr.MOVED] * 6
+    assert [o.clip_id for o in streamed] == [e.clip_id for e in entries]
+
+    entries2 = _entries_in(_tree_of_clips(tmp_path / "two", count=6))
+    collected = cr.sort_decided_clips(entries2, lambda e: _SELECTED,
+                                      {_SELECTED: str(tmp_path / "out2")})
+    assert [o.status for o in collected] == [o.status for o in streamed]
+    assert [o.clip_id for o in collected] == [o.clip_id for o in streamed]
+    assert [o.decision for o in collected] == [o.decision for o in streamed]
+
+
+# =============================================================================================
+# 7 — safe terminal behaviour
+# =============================================================================================
+
+def test_an_exception_releases_the_slot_and_restores_the_controls(world, monkeypatch):
+    """The one thing that must not happen on a defect: a surface left permanently disabled with
+    files already moved and nothing on screen saying so."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    real = cr.move_decided_clip
+    calls = []
+
+    def exploding(entry, destination_dir, policy=collision.DEFAULT_POLICY):
+        calls.append(entry)
+        if len(calls) == 2:
+            raise RuntimeError("a defect inside the transfer")
+        return real(entry, destination_dir, policy)
+
+    monkeypatch.setattr(cr, "move_decided_clip", exploding)
+    frames = _frames(world, owner)
+    monkeypatch.undo()
+
+    final = frames[-1]
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None, "the slot leaked on a defect"
+    assert final[_CONFIRM] != {"interactive": False} or final[_CONFIRM] == {}, final[_CONFIRM]
+    assert "a defect inside the transfer" in final[_MESSAGE], final[_MESSAGE]
+    assert world["ui"]["CLIPS_TRANSFER_TALLY_TEXT"].format(
+        moved=1, skipped=0, failed=0, total=3) in final[_MESSAGE], final[_MESSAGE]
+    assert final[_ARMED] == "" and final[_PROCEED] == {"visible": False}
+    # The clip that did move really moved; the other two are untouched, so a retry is safe.
+    assert os.path.isfile(view["entries"][1].path) and os.path.isfile(view["entries"][2].path)
+    assert _frames(world, owner), "a retry after a defect was refused"
+
+
+def test_abandoning_the_stream_releases_the_slot(world):
+    """Gradio closes a dropped event, which raises `GeneratorExit` at the yield. Nothing is
+    undone -- each rename was independently complete -- but the page must not stay busy forever."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is not None
+    stream.close()
+
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None, \
+        "an abandoned stream left the page marked busy"
+
+
+def test_a_partial_batch_republishes_what_is_really_on_disk(world):
+    """The pre-R13 rule, unchanged: repainting the old page would leave already-moved clips on
+    screen, and pressing Confirm again would then report them as missing."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    os.makedirs(world["library"], exist_ok=True)
+    blocked = view["entries"][0]
+    with open(os.path.join(world["library"], os.path.basename(blocked.path)), "wb") as handle:
+        handle.write(b"taken")
+
+    final = _frames(world, owner)[-1]
+
+    assert os.path.basename(blocked.path) not in final[_GRID], \
+        "the grid must be re-enumerated, not repainted"
+    assert "Enumerated 1 clip" in final[_REPORT], final[_REPORT]
+    # Still kept, because a decision is keyed on identity and that has not changed.
+    assert "Kept 1" in final[_COUNTS] or "1" in final[_COUNTS], final[_COUNTS]
+
+
+def test_the_report_says_nothing_was_overwritten_or_deleted(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    os.makedirs(world["library"], exist_ok=True)
+    with open(os.path.join(world["library"],
+                           os.path.basename(view["entries"][0].path)), "wb") as handle:
+        handle.write(b"taken")
+    message = _frames(world, owner)[-1][_MESSAGE]
+    assert "Nothing was overwritten, renamed or deleted" in message, message
+
+
+def test_no_frame_leaks_a_filesystem_path_the_operator_did_not_type(world):
+    """The boundary this whole surface is built on. The destinations the operator typed may of
+    course appear; nothing else may."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    for frame in _frames(world, owner):
+        message = frame[_MESSAGE]
+        assert "state" + os.sep + "clips-review" not in message, message
+        assert "posters" not in message, message
+
+
+# =============================================================================================
+# 8 — the R11 interaction: what a transfer may publish when the page moved on under it
+# =============================================================================================
+
+def test_a_transfer_whose_page_was_retired_mid_sort_publishes_no_page(world):
+    """[R11 / F-1 interaction] The moves are not abandoned -- the operator pressed Confirm on
+    that page. What the transfer must NOT do is re-scan the old root and hand the browser a page
+    the server no longer holds, which is precisely the defect R11 closed."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    namespace["_CLIPS_SCANS"].invalidate(owner)             # the "Review these clips" handoff
+    rest = list(stream)
+    final = rest[-1]
+
+    # The sort finished and really moved the clips.
+    assert "Sorted all 3" in final[_MESSAGE], final[_MESSAGE]
+    for entry in view["entries"]:
+        assert not os.path.exists(entry.path)
+    # But no page was published, and the screen says so rather than showing a stale grid.
+    assert namespace["_clips_view"](owner) == {}, "the retired page was resurrected"
+    assert world["ui"]["CLIPS_TRANSFER_PAGE_MOVED_ON_TEXT"] in final[_REPORT], final[_REPORT]
+    assert world["ui"]["CLIPS_TRANSFER_STALE_NOTE_TEXT"].strip() in final[_MESSAGE]
+    assert final[_CONFIRM] == {"interactive": False}
+    assert "r5-tile" not in final[_GRID], "a retired page was repainted as current"
+
+
+def test_a_transfer_superseded_by_a_newer_scan_does_not_republish_the_old_root(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    elsewhere = _tree_of_clips(world["tmp"] / "elsewhere", count=2)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    _scan(world, owner, folder=elsewhere)                   # the operator scans another folder
+    final = list(stream)[-1]
+
+    current = namespace["_clips_view"](owner)
+    assert current["root"] == os.path.realpath(elsewhere), \
+        "the finished transfer overwrote the newer page"
+    assert len(current["entries"]) == 2
+    assert world["ui"]["CLIPS_TRANSFER_STALE_NOTE_TEXT"].strip() in final[_MESSAGE]
+    # And it still reports what it really did.
+    assert "Sorted all 3" in final[_MESSAGE]
+    for entry in view["entries"]:
+        assert not os.path.exists(entry.path)
+
+
+def test_a_handoff_during_a_sort_does_not_stop_the_sort(world):
+    """Stated as an assertion because the alternative is a defensible design that was NOT
+    chosen: aborting mid-batch would leave a partial sort for an unrelated navigation action."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    namespace["_CLIPS_SCANS"].invalidate(owner)
+    list(stream)
+
+    assert sorted(os.listdir(world["library"])) == \
+        sorted(os.path.basename(e.path) for e in view["entries"])
+
+
+def test_a_retirement_mid_sort_leaves_the_durable_decisions_intact(world):
+    """The coordinator holds pages, not decisions -- R11's rule, re-asserted across a transfer."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    identities = [view["identity"][e.clip_id] for e in view["entries"]]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    namespace["_CLIPS_SCANS"].invalidate(owner)
+    list(stream)
+
+    store = namespace["_clips_store"]()
+    for identity in identities:
+        assert store.get(identity)[0] == _SELECTED, "a retirement destroyed a decision"
+
+
+def test_no_coordinator_lock_is_held_across_the_moves(world):
+    """Two locks, two spans, never nested. A coordinator lock held across a batch of renames
+    would block the very `_clips_view` read the decision endpoint performs on every
+    classification -- so a tile click would hang instead of being refused."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    # Both of these take the coordinator's own locks. If one were held for the batch, these
+    # would block and the test would time out rather than fail.
+    assert namespace["_clips_view"](owner) != {}
+    assert namespace["_CLIPS_SCANS"].newest(owner) > 0
+    assert namespace["_CLIPS_SCANS"].invalidate(owner) > 0
+    list(stream)
+
+
+def test_the_handler_introduces_no_second_notion_of_the_current_page(world):
+    """Reuse, not a parallel lifecycle. The page question is answered by the coordinator's
+    generation and the transfer question by the guard; neither is reimplemented here."""
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    body = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                            and n.name == "_clips_confirm_frames"))
+    assert "_CLIPS_SCANS.is_current(owner, generation)" in body
+    for forbidden in ("_CLIPS_SCANS.begin", "_CLIPS_SCANS.publish", "_CLIPS_SCANS.discard",
+                      "_CLIPS_SCANS.invalidate", "_CLIPS_SCANS.forget", "global ",
+                      "new_session", "revoke"):
+        assert forbidden not in body, f"the transfer reaches {forbidden}"
+
+
+def test_the_guard_is_claimed_once_and_released_in_a_finally(world):
+    """Structural, because the ordering is what makes every terminal path safe and no single
+    behavioural test can schedule all of them."""
+    tree = ast.parse(open(_GUI, encoding="utf-8").read())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_clips_confirm_frames")
+    calls = [ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)]
+    assert calls.count("_CLIPS_TRANSFERS.begin") == 1, "one admission gate, not two"
+    assert calls.count("_CLIPS_TRANSFERS.end") == 1, "one release, not two"
+
+    tries = [n for n in ast.walk(node) if isinstance(n, ast.Try) and n.finalbody]
+    assert any("_CLIPS_TRANSFERS.end" in ast.unparse(t.finalbody) for t in tries), \
+        "the release must be in a finally, or an abandoned generator leaks the slot"
+    for attempt in tries:
+        assert not any(isinstance(n, ast.Yield) for n in ast.walk(ast.Module(
+            body=list(attempt.finalbody), type_ignores=[]))), \
+            "yielding from a finally raises RuntimeError when the generator is closed"

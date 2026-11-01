@@ -36,6 +36,7 @@ import pytest
 
 from beatsync_fork import clips_review as cr
 from beatsync_fork import collision
+from beatsync_fork import transfer_guard as tg
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -48,8 +49,12 @@ _HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailabl
              "_clips_failure_text", "_clips_poster_exists", "_clips_poster_resolver",
              "_clips_identities", "_clips_durations",
              "_on_clips_check", "_clips_render_current", "_on_clips_scan",
+             # [R13] The transfer's exclusion key, then the single-flight generator and the
+             # collected form every pre-R13 assertion in this file drives.
+             "_clips_transfer_key",
              "_clips_decide", "_clips_state", "_on_clips_refresh",
-             "_clips_confirm_only", "_clips_sorted_text", "_on_clips_confirm",
+             "_clips_confirm_only", "_clips_working_frame", "_clips_sorted_text",
+             "_clips_confirm_frames", "_on_clips_confirm",
              # [FORK] R8 Final Polish: the sweep gate's Cancel half.
              "_on_clips_sweep_cancel")
 
@@ -121,6 +126,12 @@ def _build(state_dir, ui_constants, poster_runner=None, poster_hook=None):
         "_CLIPS_STORE": None,
         "CLIPS_MAX_TRACKED_SESSIONS": 32,
         "_CLIPS_SCANS": cr.ScanCoordinator(max_owners=32),
+        # [R13] The real single-flight authority, a fresh one per built namespace so two tests
+        # never inherit each other's active transfers. Not a stub: the admission rule is the
+        # thing under test in `test_clips_transfer_overlay.py`, and every assertion here about a
+        # press being refused or allowed has to meet the shipped object.
+        "fork_transfer": tg,
+        "_CLIPS_TRANSFERS": tg.TransferGuard(),
         # [FORK] R8 UX Refresh: Confirm reads the operator's saved filename-collision policy, so
         # the handler names `gui._collision_policy`. It is stubbed to the DEFAULT here on purpose:
         # every assertion in this suite is about the pre-R8 behaviour -- one clip per name, an
@@ -597,16 +608,21 @@ def test_only_the_record_can_ever_ENABLE_the_confirm_button():
             movers.append(node.name)
         if "interactive=True" in body or "interactive=counts" in body:
             enablers.append(node.name)
+    # [R13] `_clips_working_frame` is the fifth mover, and it is exactly the safe addition this
+    # test's docstring describes: it takes Confirm away while a transfer is running and has no
+    # route to giving it back. The enablers list is unchanged, which is the assertion that
+    # matters -- R13 added a transfer, not a second authority over the button.
     assert sorted(movers) == ["_clips_render_current", "_clips_unavailable_outputs",
+                              "_clips_working_frame",
                               "_on_clips_refresh", "_on_clips_scan"], movers
     assert sorted(enablers) == ["_clips_render_current", "_on_clips_scan"], (
         f"only these may enable Confirm, and both from the record: {enablers}")
-    unavailable = next(n for n in tree.body
-                       if isinstance(n, ast.FunctionDef)
-                       and n.name == "_clips_unavailable_outputs")
-    body = ast.unparse(unavailable)
-    assert "interactive=False" in body and "interactive=True" not in body, (
-        "the persistence-unavailable path may only ever DISABLE Confirm")
+    for disable_only in ("_clips_unavailable_outputs", "_clips_working_frame"):
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == disable_only)
+        body = ast.unparse(node)
+        assert "interactive=False" in body and "interactive=True" not in body, (
+            f"{disable_only} may only ever DISABLE Confirm")
     for name in enablers:
         node = next(n for n in tree.body
                     if isinstance(n, ast.FunctionDef) and n.name == name)
