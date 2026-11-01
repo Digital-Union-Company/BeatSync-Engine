@@ -20,6 +20,28 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-01 (Raw Cutter: an unnamed Folder Batch folder is refused, not guessed)
+
+**Start Batch with a blank folder field no longer cuts the application's own install directory.**
+Found during R12 production acceptance: pressing Start Batch with nothing in the folder box did not
+refuse. `resolve_batch_roots` validated only the *output* folder, so the input went straight to
+`os.path.abspath("")`, which returns the current working directory — the app's own folder. It
+recursed from there, discovered 25 videos (Gradio's bundled demo media plus a finished render) and
+started cutting them; the operator cancelled after 11. Nothing was overwritten — output goes to the
+chosen output folder — but the work was never asked for.
+
+The fix is one shared normalizer applied **before** either path is made absolute, so the emptiness
+test happens while there is still an empty value to see. It refuses a missing, blank,
+whitespace-only or quote-only folder, and `str()` is no longer applied to a non-string — `str(None)`
+became the literal path component `None`, and the operator was told a folder called `None` was not
+found. Count Videos never had the bug, because it hands the typed text straight to discovery, whose
+own check has always fired; the two entry points now agree. A refusal returns before the filesystem
+scan, before the render mutex and before any batch directory or manifest exists.
+
+Valid input is untouched and measured as such: absolute paths, legitimate relative paths, quoted
+paths, `~` and `%VAR%` expansion, junction resolution and the output-inside-source nesting refusal
+all behave identically before and after.
+
 ### Added — 2026-11-01 (FUN R12: Raw Cutter live Activity & Performance panel)
 
 **When the Raw Cutter spends minutes on one file, the screen now says how long it has been

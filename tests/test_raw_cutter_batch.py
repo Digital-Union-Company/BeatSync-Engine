@@ -247,6 +247,133 @@ def test_the_adapter_resolves_both_roots_before_judging_them(export_tree):
     assert resolve_at < judge_at, "resolution must precede the containment decision"
 
 
+# ---------------------------------------------------------------------------------------------
+# 2b. An unnamed batch folder is refused, never silently turned into the application directory
+#
+# [FORK] Digital-Union (Raw Cutter batch empty-input hotfix). The defect these cases pin was
+# observed in production: Start Batch with a BLANK folder field did not refuse. `resolve_batch_roots`
+# validated only the output, so the input reached `os.path.abspath("")`, which returns the current
+# working directory -- the app's own install folder. Discovery then received a perfectly ordinary
+# non-empty path, so its own emptiness check could not fire, and the batch began cutting the bundled
+# demo media and a finished render. Count Videos never had the bug because it passes the operator's
+# raw text straight to discovery; the two entry points simply disagreed.
+# ---------------------------------------------------------------------------------------------
+
+_UNNAMED_FOLDER_VALUES = ("", "   ", '""', '"   "', None, 0)
+
+
+def _load_export_boundary():
+    """Exec the REAL adapter validation boundary against a minimal namespace.
+
+    `raw_cutter_export` pulls in `ffmpeg_processing` and `gpu_cpu_utils` at module scope, so it
+    cannot be imported here; these three functions plus `DiscoveryResult` are extracted and run as
+    themselves. `ast.unparse` on the `ClassDef` is deliberate -- `ast.get_source_segment` would drop
+    `@dataclass(frozen=True)` and `DiscoveryResult` would come back fieldless.
+    """
+    import dataclasses
+
+    tree = _tree(_EXPORT)
+    wanted = ("_normalize_folder_text", "discover_batch_sources", "resolve_batch_roots")
+    pieces = [node for node in tree.body
+              if (isinstance(node, ast.ClassDef) and node.name == "DiscoveryResult")
+              or (isinstance(node, ast.Assign)
+                  and getattr(node.targets[0], "id", "") == "SUPPORTED_SOURCE_SUFFIXES")
+              or (isinstance(node, ast.FunctionDef) and node.name in wanted)]
+    namespace: dict = {"os": os, "dataclass": dataclasses.dataclass}
+    module = ast.fix_missing_locations(ast.Module(body=pieces, type_ignores=[]))
+    exec(compile(module, _EXPORT, "exec"), namespace)      # noqa: S102 - the body under test
+    return namespace
+
+
+@pytest.mark.parametrize("value", _UNNAMED_FOLDER_VALUES)
+def test_an_unnamed_batch_source_folder_is_refused_not_resolved(value, tmp_path, monkeypatch):
+    """The incident, as a test. The working directory is stocked with videos exactly as the real
+    install is, so a regression would be caught by the discovery that follows rather than only by
+    the message."""
+    namespace = _load_export_boundary()
+    install = tmp_path / "FakeInstall"
+    (install / "bin" / "demo_media").mkdir(parents=True)
+    for rel in ("output/a_render.mp4", "bin/demo_media/a.mp4"):
+        target = install.joinpath(*rel.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\0" * 512)
+    monkeypatch.chdir(install)
+
+    source, target, error = namespace["resolve_batch_roots"](value, str(tmp_path / "clips"))
+    assert error, f"{value!r} must be refused"
+    assert source == "" and target == "", "a refusal resolves nothing"
+    assert str(install) not in source, "the application directory must never be substituted"
+    # And nothing downstream could scan it even if a caller ignored the error.
+    assert not namespace["discover_batch_sources"](source, True).ok
+
+
+@pytest.mark.parametrize("value", _UNNAMED_FOLDER_VALUES)
+def test_count_videos_refuses_exactly_what_start_batch_refuses(value):
+    """Requirement: both actions handle invalid input consistently. Count Videos calls discovery
+    with the operator's raw text; Start Batch goes through `resolve_batch_roots` first."""
+    namespace = _load_export_boundary()
+    assert not namespace["discover_batch_sources"](value, True).ok, f"Count Videos: {value!r}"
+    assert namespace["resolve_batch_roots"](value, "C:\\out")[2], f"Start Batch: {value!r}"
+
+
+def test_a_real_batch_folder_is_still_accepted(tmp_path):
+    """The guard must not be so broad that it refuses legitimate input -- including a quoted path
+    and one that needs expansion, both of which the operator can genuinely type."""
+    namespace = _load_export_boundary()
+    footage = tmp_path / "footage"
+    footage.mkdir()
+    (footage / "one.mp4").write_bytes(b"\0" * 512)
+    out = str(tmp_path / "clips")
+
+    source, target, error = namespace["resolve_batch_roots"](str(footage), out)
+    assert not error and source and target
+    assert source == os.path.realpath(str(footage))
+    quoted_source, _t, quoted_error = namespace["resolve_batch_roots"](f'"{footage}"', f'"{out}"')
+    assert not quoted_error and quoted_source == source, "a quoted path is still a path"
+    found = namespace["discover_batch_sources"](str(footage), True)
+    assert found.ok and len(found.paths) == 1
+
+
+def test_the_batch_input_folder_is_validated_before_it_is_made_absolute(export_tree):
+    """The ordering IS the fix. `os.path.abspath("")` is the current working directory, so a check
+    that runs after it can only ever see a plausible path and has nothing left to refuse."""
+    node = _func(export_tree, "resolve_batch_roots")
+    normalized = [inner for inner in ast.walk(node)
+                  if isinstance(inner, ast.Call)
+                  and getattr(inner.func, "id", "") == "_normalize_folder_text"
+                  and any(getattr(arg, "id", "") == "input_folder" for arg in inner.args)]
+    assert normalized, "the input folder must go through the shared normalizer"
+    absolutes = [inner for inner in ast.walk(node)
+                 if isinstance(inner, ast.Call) and "abspath" in ast.unparse(inner.func)]
+    assert absolutes, "the function still resolves paths"
+    assert min(c.lineno for c in normalized) < min(c.lineno for c in absolutes), \
+        "the input must be validated BEFORE it is made absolute"
+    # The old shape -- abspath straight onto the raw argument -- must not come back.
+    for call in absolutes:
+        rendered = ast.unparse(call)
+        assert "input_folder" not in rendered, rendered
+        assert "str(input_folder)" not in rendered, rendered
+
+
+def test_a_refused_batch_scans_nothing_admits_nothing_and_creates_nothing(gui_tree):
+    """A refusal must land before the filesystem scan, before the render mutex and before any
+    output directory or manifest exists -- so the handler's own ordering is pinned, not just the
+    adapter's return value."""
+    body = _code_only(_func(gui_tree, "_on_cut_batch_run"))
+    resolve_at = body.index("resolve_batch_roots")
+    for later in ("discover_batch_sources", "_RENDER_LOCK", "prepare_batch_directory",
+                  "write_batch_manifest"):
+        assert later in body, later
+        assert resolve_at < body.index(later), f"{later} must not precede the roots refusal"
+    # The refusal is a return, not a fall-through into the work below.
+    node = _func(gui_tree, "_on_cut_batch_run")
+    guards = [inner for inner in ast.walk(node)
+              if isinstance(inner, ast.If) and getattr(inner.test, "id", "") == "error"]
+    assert guards, "the resolve error must be guarded"
+    assert any(isinstance(stmt, ast.Return) for guard in guards for stmt in guard.body), \
+        "the guard must return rather than continue"
+
+
 # =============================================================================================
 # 3. Outcome classification and honest totals
 # =============================================================================================
