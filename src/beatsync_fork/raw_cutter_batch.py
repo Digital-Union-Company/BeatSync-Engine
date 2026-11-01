@@ -134,6 +134,11 @@ PHASE_PROBE = "probing"
 PHASE_DETECT = "detecting scenes"
 PHASE_PLAN = "planning"
 PHASE_EXPORT = "exporting"
+#: [FORK] Digital-Union (Raw Cutter R12): the authoritative record being written, at the one moment
+#: the batch already knows it is doing that. It is normally sub-second and so is normally not
+#: observable in the UI -- it is published because it is a real operation with a real name, not to
+#: make the panel look busier than the work is.
+PHASE_MANIFEST = "writing the batch record"
 
 MANIFEST_SCHEMA = "beatsync-raw-cutter-batch-1"
 MANIFEST_FILENAME = "batch_manifest.json"

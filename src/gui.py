@@ -226,6 +226,10 @@ from beatsync_fork import raw_cutter as fork_cutter
 # parsing, path-relationship refusal, the decision journal and the gallery markup.
 # [FORK] Digital-Union (R6): Raw Cutter output video profiles.
 from beatsync_fork import raw_cutter_profiles as fork_profiles
+# [FORK] Digital-Union (Raw Cutter R12): the Activity & Performance read-out. Pure and
+# clock-injected -- it owns the phase vocabulary, the two timers and the panel markup; this module
+# supplies the readings and the facts.
+from beatsync_fork import raw_cutter_activity as fork_activity
 from beatsync_fork import clips_review as fork_clips
 # [FORK] Digital-Union (UX V4): the native folder dialog and the remembered folder choices. Both
 # are stdlib-only fork modules; the dialog's subprocess lives there rather than here because two
@@ -932,6 +936,68 @@ AUDIO_GALLERY_JS = r"""
     const button = event.target.closest ? event.target.closest('.r7-release-audio') : null;
     if (button) { stop(); }
   }, true);
+}
+"""
+
+# [FORK] Digital-Union (Raw Cutter R12): the Activity & Performance panel's one-second tick.
+#
+# Why this exists at all: `Analyze` spends minutes inside a single blocking FFmpeg scene-detection
+# pass, and a generator cannot yield from inside it. The server therefore emits one panel and goes
+# quiet, which is exactly the situation an operator reads as "hung". So the browser keeps the two
+# elapsed figures moving from the panel's own data, which costs no backend poll, no new endpoint
+# and no background service.
+#
+# Three properties worth stating, because each one was a way to get this wrong:
+#
+#   * It is anchored, not incremented. On the first panel carrying a token it records
+#     `Date.now() - elapsed`, then renders `Date.now() - anchor`. A Gradio re-render replaces the
+#     element and loses any per-element state, so an incrementing counter would restart on every
+#     server frame -- the anchor survives because it is keyed by TOKEN, not by element.
+#   * It is frozen by the server, not guessed. `data-running="0"` means a terminal panel, and a
+#     terminal panel's figures are written verbatim and never advanced again.
+#   * It is selected by CLASS. Single Video and Folder Batch render the same markup into two
+#     components, so an id would be ambiguous by construction.
+#
+# Session isolation is inherent: the panel is a component value, so each browser session ticks its
+# own job and sees no other.
+CUT_ACTIVITY_JS = r"""
+() => {
+  if (window.__bsCutActivity) { return; }
+  const anchors = {};
+  const pad = (n) => (n < 10 ? "0" + n : "" + n);
+  const show = (ms) => {
+    let total = Math.floor(ms / 1000);
+    if (total < 0) { total = 0; }
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return (h > 0 ? h + ":" + pad(m) : pad(m)) + ":" + pad(s);
+  };
+  const FIELDS = [
+    ["data-job-token", "data-job-ms", ".bs-cut-job-elapsed"],
+    ["data-phase-token", "data-phase-ms", ".bs-cut-phase-elapsed"]
+  ];
+  const tick = () => {
+    const live = {};
+    document.querySelectorAll(".bs-cut-activity").forEach((panel) => {
+      const running = panel.getAttribute("data-running") === "1";
+      FIELDS.forEach((field) => {
+        const token = panel.getAttribute(field[0]) || "";
+        const base = parseInt(panel.getAttribute(field[1]) || "0", 10) || 0;
+        const out = panel.querySelector(field[2]);
+        if (!out || !token) { return; }
+        if (!running) { out.textContent = show(base); return; }
+        live[token] = true;
+        if (anchors[token] === undefined) { anchors[token] = Date.now() - base; }
+        out.textContent = show(Date.now() - anchors[token]);
+      });
+    });
+    Object.keys(anchors).forEach((token) => {
+      if (!live[token]) { delete anchors[token]; }
+    });
+  };
+  window.__bsCutActivity = setInterval(tick, 1000);
+  tick();
 }
 """
 
@@ -6117,7 +6183,7 @@ _CUT_TONES = {
 
 
 def _cut_progress_html(title: str, detail: str = '', *, done=None, total=None,
-                       note: str = '', tone: str = 'active') -> str:
+                       note: str = '', tone: str = 'active', activity: str = '') -> str:
     """One progress panel for the Raw Cutter. Returns HTML; never invents a number.
 
     Passing `done` and `total` produces a DETERMINATE bar whose percentage is exactly
@@ -6131,6 +6197,13 @@ def _cut_progress_html(title: str, detail: str = '', *, done=None, total=None,
 
     `data-*` attributes are deliberate: they are the stable contract the browser tests read, so a
     test never has to parse presentation.
+
+    [FORK] Digital-Union (Raw Cutter R12): `activity` is an already-rendered HTML fragment --
+    `fork_activity.activity_html`, normally reached through `_cut_activity` below -- appended
+    INSIDE this panel, directly beneath the bar. A pre-rendered string rather than a record on
+    purpose: this renderer stays dependency-free and stdlib-only, which is what lets it be
+    AST-extracted and executed against a two-name namespace. Omitting it leaves the output
+    byte-identical to the pre-R12 panel, so every idle, refused and stale path is untouched.
     """
     bar, fill = _CUT_TONES.get(tone, _CUT_TONES['active'])
     determinate = isinstance(done, int) and isinstance(total, int) and total > 0
@@ -6171,6 +6244,8 @@ def _cut_progress_html(title: str, detail: str = '', *, done=None, total=None,
     if note:
         rows.append(f'<div id="cut-progress-note" style="opacity:.65;font-size:.85em;'
                     f'margin-top:4px;">{html_lib.escape(note)}</div>')
+    if activity:
+        rows.append(activity)
     rows.append('</div>')
     return ''.join(rows)
 
@@ -6178,6 +6253,34 @@ def _cut_progress_html(title: str, detail: str = '', *, done=None, total=None,
 def _cut_progress_clear() -> str:
     """The idle panel: empty, so nothing claims work is happening when none is."""
     return ''
+
+
+def _cut_activity(clock, phase, *, key=None, **facts) -> str:
+    """A RUNNING frame: declare the phase that is about to execute, then render it.
+
+    [FORK] Digital-Union (Raw Cutter R12). The reading is `time.perf_counter()` -- monotonic, so a
+    system clock adjustment mid-job cannot make an elapsed figure jump or go backwards, and the
+    browser needs no wall-clock agreement with the server because what crosses the wire is an
+    elapsed duration, never an instant. One reading serves both the phase change and the render,
+    so the two cannot disagree by a scheduling hiccup.
+
+    Called immediately BEFORE each blocking step, which is what makes the phase on screen the
+    phase actually running rather than the one that just finished.
+    """
+    now = time.perf_counter()
+    clock.enter(phase, now, key)
+    return clock.render(now, **facts)
+
+
+def _cut_activity_final(clock, phase, status, **facts) -> str:
+    """A TERMINAL frame: both timers freeze where the work actually left them.
+
+    `data-running="0"`, so the browser writes these figures verbatim and stops advancing them.
+    The phase timer is deliberately NOT restarted on the terminal label: what an operator wants
+    from a finished job is how long its last real phase took, and a `Completed` phase that has
+    been running for zero seconds says nothing at all.
+    """
+    return clock.render(time.perf_counter(), status=status, running=False, phase=phase, **facts)
 
 
 def _cut_buttons(*, analyze: bool, run: bool, cancel: bool):
@@ -6244,14 +6347,26 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
     busy = _cut_buttons(analyze=False, run=False, cancel=False)
     idle_no_plan = _cut_buttons(analyze=True, run=False, cancel=False)
 
+    # [FORK] R12: the job clock starts here, before the first probe, so the total elapsed covers
+    # the whole operator-visible wait rather than only the part after the first panel.
+    clock = fork_activity.ActivityClock(time.perf_counter())
+    name = os.path.basename(str(source_path or ''))
+
     def fail(summary, details_text):
         return (summary, [], None, details_text,
                 _cut_progress_html(CUT_ANALYZE_FAILED_TITLE, summary.lstrip('❌ ').split('\n')[0],
-                                   tone='failed')) + idle_no_plan
+                                   tone='failed',
+                                   activity=_cut_activity_final(
+                                       clock, fork_activity.PHASE_FAILED,
+                                       fork_activity.STATUS_FAILED,
+                                       source=name, ffmpeg=False))) + idle_no_plan
 
     yield ('', [], gr.update(), gr.update(),
            _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_PROBE_TEXT,
-                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE,
+                              activity=_cut_activity(
+                                  clock, fork_activity.PHASE_PREPARING,
+                                  source=name, ffmpeg=True))) + busy
 
     probe = cutter_export.probe_source(source_path)
     if not probe.ok:
@@ -6271,8 +6386,13 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
 
     yield ('', [], gr.update(), details,
            _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_DETECT_TEXT,
-                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE,
+                              activity=_cut_activity(
+                                  clock, fork_activity.PHASE_DETECTING,
+                                  source=name, ffmpeg=True))) + busy
 
+    # The long one. This single call can run for minutes with nothing to report, and the browser
+    # timer announced in `CUT_ACTIVITY_JS` is what keeps the panel above visibly alive through it.
     scenes = cutter_export.detect_scenes(source.path, threshold)
     if not scenes.succeeded:
         yield fail((f"❌ Scene detection failed, so no plan was made.\n{scenes.error}\n\n"
@@ -6281,7 +6401,10 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
 
     yield ('', [], gr.update(), details,
            _cut_progress_html(CUT_PHASE_ANALYZING_TITLE, CUT_PHASE_PLAN_TEXT,
-                              note=CUT_PROGRESS_INDETERMINATE_NOTE)) + busy
+                              note=CUT_PROGRESS_INDETERMINATE_NOTE,
+                              activity=_cut_activity(
+                                  clock, fork_activity.PHASE_PLANNING,
+                                  source=name, ffmpeg=False))) + busy
 
     try:
         plan = fork_cutter.plan_segments(source.duration, scenes.times, low, high, level)
@@ -6312,11 +6435,23 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
         panel = _cut_progress_html(
             CUT_PHASE_ANALYZING_TITLE + ' — done',
             f'{plan.count} clip(s) planned. Press Cut Video to export them.',
-            done=plan.count, total=plan.count, tone='done')
+            done=plan.count, total=plan.count, tone='done',
+            activity=_cut_activity_final(clock, fork_activity.PHASE_COMPLETED,
+                                         fork_activity.STATUS_DONE,
+                                         source=name, ffmpeg=False))
         buttons = _cut_buttons(analyze=True, run=True, cancel=False)
     else:
+        # [FORK] R12: the ANALYSIS completed -- it simply found nothing long enough to export, and
+        # nothing was stopped or failed, so the activity status says `Completed`. The amber bar
+        # and `CUT_ANALYZE_DONE_NO_WORK_TEXT` beside it carry the "but there is nothing to cut"
+        # half. Reporting the run itself as stopped here would describe an event that never
+        # happened.
         panel = _cut_progress_html(CUT_PLAN_STALE_TITLE, CUT_ANALYZE_DONE_NO_WORK_TEXT,
-                                   tone='stopping')
+                                   tone='stopping',
+                                   activity=_cut_activity_final(
+                                       clock, fork_activity.PHASE_COMPLETED,
+                                       fork_activity.STATUS_DONE,
+                                       source=name, ffmpeg=False))
         buttons = _cut_buttons(analyze=True, run=False, cancel=False)
     yield (summary, fork_cutter.plan_table_rows(plan), state, details, panel) + buttons
 
@@ -6371,6 +6506,13 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     busy = _cut_buttons(analyze=False, run=False, cancel=True)
     idle_plan = _cut_buttons(analyze=True, run=True, cancel=False)
     idle_no_plan = _cut_buttons(analyze=True, run=False, cancel=False)
+
+    # [FORK] R12: started before the staleness gate and the probe, so the elapsed figure is the
+    # operator's own wait. A refusal below carries NO activity panel on purpose: it performed no
+    # work, and a timer running against a job that never started would be the one thing this
+    # read-out exists to prevent.
+    clock = fork_activity.ActivityClock(time.perf_counter())
+    name = os.path.basename(str(source_path or ''))
 
     def refuse(text, *, keep_plan=True):
         """A refusal performs no work, so the controls go straight back to idle."""
@@ -6448,7 +6590,10 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                   f"{'removed' if remove_audio else 'kept'}.")
         yield (header, _cut_progress_html(
             CUT_PHASE_CUTTING_TITLE, 'Starting…', done=0, total=plan.count,
-            note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+            note=CUT_PROGRESS_ENCODING_NOTE,
+            activity=_cut_activity(clock, fork_activity.PHASE_PREPARING, source=name,
+                                   clip_done=0, clip_total=plan.count, ffmpeg=False,
+                                   encoder=fork_activity.encoder_label(encoder)))) + busy
 
         # [FORK] P1: `export_segments` is a BLOCKING call, so running it in this frame is exactly
         # why the screen used to freeze from the first clip to the last. It now runs on a worker
@@ -6494,7 +6639,11 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 yield (header, _cut_progress_html(
                     CUT_PHASE_CUTTING_TITLE, current or 'Encoding…',
                     done=published, total=plan.count,
-                    note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+                    note=CUT_PROGRESS_ENCODING_NOTE,
+                    activity=_cut_activity(
+                        clock, fork_activity.PHASE_CUTTING, source=name,
+                        clip_done=published, clip_total=plan.count, ffmpeg=True,
+                        encoder=fork_activity.encoder_label(encoder)))) + busy
                 continue
             kind = event[0]
             if kind == 'eof':
@@ -6507,8 +6656,20 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                           else f'Clip failed: {event[1].error}'
             yield (header, _cut_progress_html(
                 CUT_PHASE_CUTTING_TITLE, current, done=published, total=plan.count,
-                note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+                note=CUT_PROGRESS_ENCODING_NOTE,
+                activity=_cut_activity(
+                    clock, fork_activity.PHASE_CUTTING, source=name,
+                    clip_done=published, clip_total=plan.count, ffmpeg=True,
+                    encoder=fork_activity.encoder_label(encoder)))) + busy
 
+        # [FORK] R12: there is deliberately NO `Finalizing` frame here, and that is a measured
+        # decision rather than an omission. Reaping the worker and composing the report is real
+        # work with a real name, but `eof` is queued from the worker's own `finally`, so by this
+        # point the thread is already on its way out: an announced Finalizing phase measured
+        # **1 ms** in the browser. Announcing it cost the terminal panel its only useful phase
+        # figure -- the finished job then reported `Phase elapsed 00:00` for a one-millisecond
+        # phase instead of how long the cutting had actually taken. The same rule that forbids a
+        # percentage for an unmeasurable phase forbids a phase label that displaces a measured one.
         worker.join()
         if 'error' in outcome:
             # Re-raised here so the existing, reviewed handlers below keep owning every terminal
@@ -6541,7 +6702,13 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             f'{len(done)} of {plan.count} clip(s) written'
             + (f'; {len(failed)} failed' if failed else '.'),
             done=len(done), total=plan.count,
-            tone='failed' if failed else 'done')) + idle_plan
+            tone='failed' if failed else 'done',
+            activity=_cut_activity_final(
+                clock,
+                fork_activity.PHASE_PARTIAL if failed else fork_activity.PHASE_COMPLETED,
+                fork_activity.STATUS_FAILED if failed else fork_activity.STATUS_DONE,
+                source=name, clip_done=len(done), clip_total=plan.count, ffmpeg=False,
+                encoder=fork_activity.encoder_label(encoder)))) + idle_plan
 
     except cutter_export.CutterCancelled:
         # `completed` is the truth here, never `results`: the exception propagated out of
@@ -6563,15 +6730,26 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         lines.append("Your source file was not modified.")
         yield ("\n".join(lines), _cut_progress_html(
             CUT_CANCELLED_TEXT.split('.')[0], f'{len(written)} of {plan.count} clip(s) kept.',
-            done=len(written), total=plan.count, tone='stopping')) + idle_plan
+            done=len(written), total=plan.count, tone='stopping',
+            activity=_cut_activity_final(
+                clock, fork_activity.PHASE_CANCELLED, fork_activity.STATUS_STOPPING,
+                source=name, clip_done=len(written), clip_total=plan.count,
+                ffmpeg=False))) + idle_plan
     except Exception as exc:
         # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
         import traceback
         traceback.print_exc()
         text = (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
                 f"Your source file was not modified.")
+        # [FORK] R12: deliberately no clip counts and no encoder here. Both names are bound inside
+        # the `try` and a fault can land before either exists, so naming them on this path would
+        # turn a reported failure into a NameError on the generator's own thread.
         yield (text, _cut_progress_html(CUT_CUT_FAILED_TITLE,
-                                        f'{type(exc).__name__}: {exc}', tone='failed')) + idle_plan
+                                        f'{type(exc).__name__}: {exc}', tone='failed',
+                                        activity=_cut_activity_final(
+                                            clock, fork_activity.PHASE_FAILED,
+                                            fork_activity.STATUS_FAILED,
+                                            source=name, ffmpeg=False))) + idle_plan
     finally:
         # [FORK] P1: the export now lives on a worker, so admission must not be handed back while
         # that worker is still writing. If this frame unwinds early -- an abandoned Gradio stream
@@ -6827,7 +7005,11 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         if started:
             sink['terminal'] = fork_cutter_batch.terminal_status(
                 items, total, is_cancelled, fatal_error=fatal)
-            publish(total=total)
+            # [FORK] Digital-Union (Raw Cutter R12): the phase is published at the one point that
+            # already knows the authoritative record is being written. It is a real operation
+            # with a real name; it is also normally sub-second, so what the operator usually sees
+            # is the terminal panel immediately after it.
+            publish(total=total, phase=fork_cutter_batch.PHASE_MANIFEST)
         else:
             sink.pop('terminal', None)
             publish()
@@ -7093,6 +7275,23 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         _RENDER_LOCK.release()
 
 
+#: [FORK] Digital-Union (Raw Cutter R12): the batch's terminal class, as the activity panel's own
+#: (phase, status) pair. Keyed by `fork_cutter_batch`'s `TERMINAL_*` vocabulary -- the same pure
+#: classifier the headline and the manifest use -- so the panel, the headline and the record are
+#: three renderings of one fact rather than three opinions. A missing key is a run that never
+#: started and is handled at the call site, not defaulted to here.
+_CUT_BATCH_ACTIVITY = {
+    fork_cutter_batch.TERMINAL_FAILED:
+        (fork_activity.PHASE_FAILED, fork_activity.STATUS_FAILED),
+    fork_cutter_batch.TERMINAL_CANCELLED:
+        (fork_activity.PHASE_CANCELLED, fork_activity.STATUS_STOPPING),
+    fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES:
+        (fork_activity.PHASE_PARTIAL, fork_activity.STATUS_FAILED),
+    fork_cutter_batch.TERMINAL_COMPLETED:
+        (fork_activity.PHASE_COMPLETED, fork_activity.STATUS_DONE),
+}
+
+
 def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
                          max_seconds, remove_audio, rename_output, output_profile):
     """[FORK] Digital-Union (Raw Cutter progress P1): the batch, with a visible bar and controls.
@@ -7110,6 +7309,18 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     busy = _cut_batch_buttons(count=False, start=False, cancel=True)
     idle = _cut_batch_buttons(count=True, start=True, cancel=False)
 
+    # [FORK] Digital-Union (Raw Cutter R12): the Activity & Performance read-out, driven entirely
+    # from the sink the batch already publishes. The wrapper stays the only thing that changed:
+    # `_on_cut_batch_run` keeps its name, signature, body and every reviewed terminal path.
+    #
+    # The phase KEY carries the source position as well as the phase, so the phase timer answers
+    # "how long has this source been encoding" rather than running across the whole batch. The
+    # phase LABEL collapses probe/detect/plan into one analysis phase -- the detail line beneath
+    # still names which of the three, and resetting the timer three times per source would make it
+    # useless on exactly the files that are slow.
+    clock = fork_activity.ActivityClock(time.perf_counter())
+    encoder = fork_activity.encoder_label('h264_nvenc' if NVENC_AVAILABLE else 'libx264')
+
     status, summary = '', ''
     for status, summary in _on_cut_batch_run(
             input_folder, recursive, output_folder, sensitivity, min_seconds,
@@ -7117,10 +7328,20 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
         total = sink.get('total')
         detail = (f"Source {sink.get('position')} of {total}: "
                   f"{sink.get('name', '')} — {sink.get('phase', '')}") if total else ''
+        raw_phase = sink.get('phase', '')
+        position = sink.get('position')
         yield (status, summary,
                _cut_progress_html(CUT_BATCH_RUNNING_TITLE, detail,
                                   done=sink.get('finished'), total=total,
-                                  note=CUT_PROGRESS_ENCODING_NOTE)) + busy
+                                  note=CUT_PROGRESS_ENCODING_NOTE,
+                                  activity=_cut_activity(
+                                      clock,
+                                      fork_activity.batch_phase_label(raw_phase),
+                                      key=f'{position}:{raw_phase}',
+                                      source=sink.get('name', ''),
+                                      position=position, position_total=total,
+                                      ffmpeg=fork_activity.batch_ffmpeg_active(raw_phase),
+                                      encoder=encoder))) + busy
 
     # One final frame: the controls come back and the panel states the terminal outcome.
     #
@@ -7145,11 +7366,24 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     }.get(sink.get('terminal'), ('stopping', CUT_BATCH_NOT_RUN_TITLE))
     # A run whose every source succeeded but whose authoritative record never reached disk is not
     # a clean success. The summary has always said so; the panel now agrees with it.
+    # [FORK] R12: the activity panel's terminal phase comes from the SAME structural class the
+    # headline does -- `_CUT_BATCH_ACTIVITY` is keyed by the batch module's own `TERMINAL_*`
+    # vocabulary, so the two cannot drift, and neither is read off the status text. The neutral
+    # default is a run that never started, which is not a cancellation and must not read as one.
+    act_phase, act_status = _CUT_BATCH_ACTIVITY.get(
+        sink.get('terminal'), (fork_activity.PHASE_NOT_RUN, fork_activity.STATUS_STOPPING))
     if sink.get('manifest_error') and tone == 'done':
         tone, title = 'failed', CUT_BATCH_RECORD_LOST_TITLE
+        act_phase, act_status = fork_activity.PHASE_PARTIAL, fork_activity.STATUS_FAILED
+    # Both timers freeze here: the panel is emitted with `data-running="0"`, which is what stops
+    # the browser interval advancing a job that is over.
     yield (status, summary,
            _cut_progress_html(title, '', done=sink.get('finished'),
-                              total=sink.get('total'), tone=tone)) + idle
+                              total=sink.get('total'), tone=tone,
+                              activity=_cut_activity_final(
+                                  clock, act_phase, act_status,
+                                  position_total=sink.get('total'), ffmpeg=False,
+                                  encoder=encoder))) + idle
 
 
 def _on_cut_batch_cancel() -> Tuple[str, str]:
@@ -12898,6 +13132,11 @@ def create_ui() -> gr.Blocks:
         # merged script: the two galleries share no behaviour beyond being grids of tiles, and one
         # combined blob would make either harder to change safely.
         app.load(fn=None, inputs=None, outputs=None, js=AUDIO_GALLERY_JS)
+        # [FORK] Digital-Union (Raw Cutter R12): the Activity & Performance panel's one-second
+        # tick. `fn=None`, so it registers no server call and adds no backend poll -- it installs
+        # one interval per page that reads the panel's own `data-*` figures. A third separate
+        # registration for the same reason the two above are separate: nothing is shared.
+        app.load(fn=None, inputs=None, outputs=None, js=CUT_ACTIVITY_JS)
 
     return app
 
