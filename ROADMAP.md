@@ -1335,6 +1335,27 @@ event, a classification refused mid-sort with the durable record proven untouche
 injected into the second of three moves, an abandoned generator, and the R11 retirement and
 newer-scan cases. Full suite **9349 passed, 9 skipped**.
 
+**Measured in a real Chrome session** against the candidate on port 7899, driving the shipped UI
+with a `MutationObserver` recording every frame as it arrived. The console error monitor was proven
+with an injected canary *before* any zero-error claim:
+
+| What | Measurement |
+|---|---|
+| 8 clips, all kept | **11 frames**: the Working frame first (`Nothing has moved yet`, Confirm disabled) then `Moving 1/8 … 8/8`, then `✅ Sorted all 8 clip(s).` / `Moved 8 · skipped 0 · failed 0 · of 8.` Whole sort **111 ms** |
+| Working before the first move | asserted *in the browser*, from the frame text, and on disk — nothing had left the source folder when it arrived |
+| **Three Confirm presses in one tick**, the `disabled` attribute stripped between each | **four** server refusals — *"Nothing was started: this page is already being sorted (0 of 300 clip(s) done)"* — and **one** sort. Gradio delivered every press; `concurrency_limit=None` is why they reached the handler instead of queueing |
+| What reached the disk from those three presses | exactly **300** of 300, **0** in Discarded, **0** suffixed duplicates, 2,700 still in the source |
+| Progress budget, 300 clips | **49** progress frames at a stride of **6** — `ceil(300/50)` — ending on `Moving 300 / 300`, i.e. the last outcome, not a rounded stride |
+| JS errors | **zero**, against a canary-proven monitor |
+| Server exceptions | **none** across the whole session, apart from Gradio correctly refusing an out-of-range page size the test itself typed |
+
+One honest limitation of that session: a same-volume `os.rename` of small files is **fast** — 300
+clips in **956 ms**, and the page maximum is 500 — so a browser cannot hold a sort open for long on
+an SSD, and the duplicate presses had to be fired in the same tick rather than mid-sort. The
+mid-sort cases (a classification refused while a batch runs, the R11 retirement, an injected
+exception, an abandoned generator) are therefore measured in the suite, which drives the generator
+frame by frame and schedules them deterministically rather than racing a 3 ms-per-clip loop.
+
 **Two things recorded as open rather than claimed closed.** There is **no Cancel for a transfer**:
 abandoning the Gradio event does stop the loop and release the slot, but that is a dropped frame and
 not a cancel anybody pressed, and it must not be described as one. And the progress figure is
