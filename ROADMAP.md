@@ -1117,19 +1117,37 @@ shows `FFmpeg Active` while planning shows `Idle`, because planning is pure arit
 
 Today, pressing **Confirm** in Video Review starts moving and sorting the selected clips with no
 immediate visible acknowledgement, which has two bad consequences: a long transfer looks like a
-dead button, and an impatient second click is a second submission. Planned:
+dead button, and an impatient second click is a second submission.
 
-1. **Show a Working overlay immediately**, before the first file moves.
-2. **Disable Confirm, Proceed and the relevant classification controls** while it runs.
-3. **Prevent accidental duplicate submissions** — the overlay is the operator-visible half; the
-   server-side single-flight protection is the authority and stays so.
-4. **Report progress concretely** — *Moving 12 / 84 clips* — from clips actually moved, never from a
-   timer.
-5. **Restore the controls when the operation finishes *or* fails**, including on an exceptional
-   path, so a failure can never leave the surface permanently disabled.
-6. **Preserve the existing two-step confirmation for unmarked clips** exactly as it is.
-7. **Maintain safe retry behaviour**: a repeated click must never overwrite, delete or move
-   additional clips.
+**Collision handling is NOT part of this work, because it already ships.** `beatsync_fork/collision.py`
+carries two policies — `SKIP` (`DEFAULT_POLICY`, the historical behaviour: report the collision and
+move nothing) and `SUFFIX` (`clip.wav` → `clip_01.wav` → `clip_02.wav` …) — exposed at **Settings →
+📄 When a destination filename already exists → *Rename automatically (clip_01, clip_02, …)***, and
+**both Video Review and Audio Review already use it**. The owner does not care about exact
+filenames, so automatically taking the next free suffix is an accepted answer. **Do not add a second
+naming engine, a date-stamp scheme, or whole-file hashing to solve a filename collision.**
+
+Acceptance criteria:
+
+1. **Confirm and Proceed enter a visible Working state the moment a real sorting operation
+   begins** — before the first file moves, not after the first response returns.
+2. **While working, duplicate sort submissions and classification changes are blocked for the
+   active batch.**
+3. **The server enforces single-flight, and it is the authority.** Disabling HTML buttons is a
+   courtesy that does not survive a second browser tab, a replayed event, or any caller that never
+   saw the UI — exactly the reasoning `_RENDER_LOCK` already embodies for renders.
+4. **Progress is shown, and the final counts are truthful** — *Moving 12 / 84 clips* derived from
+   clips actually moved, never from a timer, then explicit **moved / skipped / failed** totals.
+5. **The existing keep-only confirmation is preserved**, including the separate explicit approval
+   before unmarked clips are moved to Discarded.
+6. **The existing collision policy is retained and reused.** Under `SUFFIX`, a collision in either
+   Kept or Discarded takes the next free filename. **Nothing is ever overwritten, deleted or
+   silently lost** — `collision.py` already treats the no-replace rename itself as the authority
+   rather than an `exists()` pre-check, and that property must not be weakened for convenience.
+7. **Failure or partial success releases the UI and shows the clips that actually remain.** A
+   failure must never leave the surface permanently disabled, and a retry must be safe.
+
+**No new review engine and no new tab.** Reuse the Video Review surface that exists.
 
 Consider the same pattern for Audio Review afterwards; the two surfaces already share the collision
 policy, so the overlay is the natural next thing to share.
@@ -1137,6 +1155,95 @@ policy, so the overlay is the natural next thing to share.
 **Not implemented in the R12 pull request**, deliberately. It is a different surface with a
 different risk profile — R12 only observes, while R13 touches the control states of a workflow that
 moves files.
+
+### R14 — Media Library Refresh & Maintenance · **PLANNED**
+
+The goal is that the owner can maintain large collections of reviewed clips without repeatedly
+repairing names and cache problems by hand.
+
+**As with R13's collisions, the mechanism largely exists and must be extended rather than
+duplicated.** `beatsync_fork/cache_admin.py` already inspects and clears this application's caches,
+and it already has the hard-won safety properties this item needs: it **discovers nothing** (every
+root is handed in by `gui._cache_categories()`), it proves every path inside its root with
+`realpath` + `commonpath` rather than a string prefix, it prunes reparse points from `os.walk`
+(which otherwise descends an NTFS junction), it **reports and keeps** a file an active job holds
+open, it prunes only *empty* directories with `os.rmdir` and contains no `shutil.rmtree`, and its
+`expensive` flag already separates the Stage-5 analysis cache from a poster that costs one frame
+grab.
+
+#### R14-A — Refresh & Inspect · **READ-ONLY**
+
+A maintenance action under Media Library that inspects the configured library folder, and
+optionally the Discarded folder, and reports: total media files; duplicate filenames and likely
+destination collisions; cache records whose source is present; records referencing missing paths;
+records on inaccessible or disconnected drives; the current Stage-5 cache location and its reusable
+record count; and the estimated reclaimable space.
+
+Three constraints decide whether that report is honest:
+
+- **`os.path.exists() == False` is not proof that a file was deleted.** A disconnected network or
+  removable drive answers identically. *Missing file* and *unreachable root* must be **separate
+  verdicts**, decided by testing the root's reachability first, with an explicit **unknown** when
+  neither can be established. An unresolved verdict is a reason to keep, never to clean.
+- **The cheap direction is the record's own payload.** A record stores
+  `"video_file": os.path.abspath(video_file)` and the reader already validates it against the
+  expected path, so classifying records by source state needs no re-derivation. Record *filenames*
+  are hashes (`{8 hex}_{24 hex}.json`) and carry no path at all.
+- **Scope to verified library roots.** Never sweep the whole shared Stage-5 cache or unrelated
+  source libraries: that folder is read by several installations, so a judgement formed from one
+  library's point of view is wrong for every other — including the production install nobody is
+  currently looking at.
+
+#### R14-B — Optional Cleanup · **only after an explicit confirmation**
+
+- **Dry-run preview first**, stating the exact file count and the bytes that would be reclaimed.
+- **Preserve unrelated Qwen model and cache variants.** A record keyed by a different backend or
+  config token is not obsolete; it belongs to another configuration.
+- **Never delete cache for a temporarily offline drive**, and never delete original media.
+- **Prefer reversible quarantine for the first implementation** — which is also what this
+  repository's housekeeping policy already requires wherever deletion safety is not established.
+- **Respect active analysis and render jobs**: `cache_admin` already reports and keeps a file that
+  is held open, and the render mutex already exists to be asked.
+
+#### R14-C — Optional Rename / Canonicalize · **only if the owner asks for it**
+
+Prefer a lightweight unique naming convention; the existing `clip_01` / `clip_02` suffix is
+sufficient for ordinary collisions. **Do not rename thousands of valid files to make their names
+prettier.**
+
+**The cache cost of a rename is real, and it is measured against the code rather than assumed:**
+
+```
+_video_signature  = CACHE_CONTRACT_VERSION + ANALYSIS_VERSION + ABSOLUTE PATH
+                    + st_size + st_mtime_ns + bounded fingerprint
+                    + backend token + Qwen config token
+candidate id      = f"{_hash_text(os.path.abspath(video_file), 10)}_{index:05d}_{start_ms:08d}"
+record payload    = {"video_file": os.path.abspath(video_file), ...}   # validated by the reader
+```
+
+So a filesystem rename invalidates the lookup **three times over**: the signature, every candidate
+id inside the payload, and the payload's own stored `video_file`. The absolute path is in identity
+**on purpose** — identity is *location + content*, so a moved file re-keys — and that contract must
+not be changed for cosmetic naming.
+
+A safe re-key is nevertheless conceivable, and cheaply, because the content evidence already
+exists: `_bounded_fingerprint` is BLAKE2b-128 over the size plus at most **3 MiB** (head, middle and
+tail windows), **not** a whole-file hash. An exact, verified old-path → new-path move could be
+proven by requiring `st_size`, `st_mtime_ns` and that fingerprint to match, then rewriting the
+payload's `video_file` and **every** candidate id and each reference that points at one.
+
+If that migration is ever built: **only migrate when content identity and every required piece of
+metadata can be proven correct — never fabricate a cache entry**; **if safe migration cannot be
+demonstrated, preserve the old entry** and report plainly that the renamed file needs re-analysis,
+because a stale hit is far worse than a cache miss; and **do not change the global Stage-5 identity
+contract** — `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` stay untouched, since this is a record
+migration and not a contract change.
+
+**Known limitation, stated rather than designed around:** that payload rewrite is the real cost of
+R14-C and it has not been prototyped. Until it is, the honest shape of R14-C is *rename the files
+and report that their cached analysis no longer applies* — correct, but expensive on a large
+library, and a reason to keep using `SUFFIX` on new collisions rather than normalising names that
+already work.
 
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
@@ -1380,7 +1487,8 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R10** — **Repeat Music 1×–30×** | **MERGED AND DEPLOYED** (PR #81, main `5cdbd8cc`) — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `4fe07315`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Merged and deployed; not independently reviewed** |
 | **R11** — Raw Cutter → **"Review these clips"** output handoff | **PLANNED — small UX improvement**, after the R10 release work. The navigation half already ships: `cut_open_library_btn` → `_on_cut_open_in_library` selects Media Library → Video Review, prefills the folder, enables Include subfolders and scans nothing. Planned is handing over the finished job's **exact** output directory instead of the parent folder, offering it when Single Video or Folder Batch completes with clips on disk, and clearing the handoff when a new cut begins. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement** |
 | **R12** — Raw Cutter **Live Activity & Performance panel** | **IMPLEMENTATION IN PROGRESS** — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`, draft PR. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. **Not merged, not deployed, not independently reviewed** |
-| **R13** — Video Review **transfer Working overlay** | **PLANNED — next UX improvement.** Show a Working overlay the moment Confirm starts moving clips, disable Confirm / Proceed / classification while it runs, report `Moving 12 / 84 clips` from clips actually moved, restore the controls on success *and* on failure, keep the existing two-step confirmation for unmarked clips, and keep server-side single-flight as the authority so a repeated click can never move, overwrite or delete extra clips. Deliberately **not** implemented in the R12 pull request |
+| **R13** — Video Review **transfer Working overlay** | **PLANNED — next UX improvement.** Show a Working overlay the moment Confirm starts moving clips, disable Confirm / Proceed / classification while it runs, report `Moving 12 / 84 clips` from clips actually moved, restore the controls on success *and* on failure, keep the existing two-step confirmation for unmarked clips, and keep server-side single-flight as the authority so a repeated click can never move, overwrite or delete extra clips. **Collision handling is out of scope because it already ships** — `collision.py`'s `SUFFIX` policy, at Settings → *When a destination filename already exists*, is reused as-is; no second naming engine. Deliberately **not** implemented in the R12 pull request |
+| **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
@@ -1434,7 +1542,12 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    read-out under the existing bar, in both cutter modes, with no new progress system and no
    backend poll.
 7d. **R13 — Video Review transfer Working overlay.** The next UX improvement after R12: make a
-   long Confirm visibly busy and make a second click structurally harmless. Not started.
+   long Confirm visibly busy and make a second click structurally harmless. Not started. The
+   collision half is already solved by `collision.py`'s `SUFFIX` policy and is reused, not rebuilt.
+7e. **R14 — Media Library Refresh & Maintenance.** After R13: a read-only library and cache
+   inventory first, optional reversible cleanup second, optional renaming last and only on request.
+   Not started, and deliberately gated on proving that every path-derived cache identity can be
+   updated safely before any mass rename is attempted.
 8. **R9 — Audio Layers explanation**, which costs no engine work and unblocks the existing feature.
 9. **R3 / Smart Passages** and **R8 / Smart Audio Cut** stay behind all of the above. Both are
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
