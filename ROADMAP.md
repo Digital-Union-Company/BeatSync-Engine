@@ -953,7 +953,7 @@ voice selection placeable, decided by **actual placement feasibility** rather th
 durations, which is the correction R7.3 records above. R7.3's mode 4 is no longer blocked on R10
 existing; it is blocked on that resolver being written, and is still deliberately not offered.
 
-### R11 — Raw Cutter → "Review these clips" · **PLANNED — small UX improvement**
+### R11 — Raw Cutter → "Review these clips" · **IMPLEMENTED — reviewed, F-1 fixed, awaiting merge**
 
 The workflow the owner wants is one line: **cut video → finish → review the exported clips → keep or
 discard.** Today the last arrow is the operator's own navigation.
@@ -997,7 +997,88 @@ Unchanged, and deliberately so:
 Reuse the existing handler, the existing button and the existing Video Review widgets. The change is
 *which* directory arrives and *when* it is offered — not a new review surface.
 
-### R12 — Raw Cutter Live Activity & Performance Panel · **IMPLEMENTATION IN PROGRESS**
+#### What shipped, and the three things implementation changed about the plan above
+
+All four items are implemented, on the existing button and the existing handler. The record is a
+pure fork module, `beatsync_fork/cut_handoff.py`, holding a plain dict of primitives in a new
+session-scoped `cut_handoff_state`:
+
+```
+{'directory': str, 'recursive': bool, 'clips': int, 'mode': 'single'|'batch', 'outcome': str}
+```
+
+**1. The published-clip gate is a property of the record, not a check each terminal path makes.**
+`cut_handoff.build()` answers `None` unless the job both named a directory *and* published at
+least one clip, so "never offer an empty folder" cannot be forgotten by one of the eight emitting
+paths — and `read()` re-applies the same gate to a record coming back out of session state, which
+is untrusted input on the way in. Measured on the real handler: a run whose every clip failed
+creates its run directory and still offers nothing.
+
+**2. The clip count had to come from two different places, and neither is the plan.** A single run
+counts its own validated `on_complete` results (`done`, or `written` on a cancellation, where the
+exception discards `export_segments`' return value). A batch could not count anything locally —
+the wrapper never sees per-source results — so `publish()` now carries `clips` from the fold it
+already computes, `summarise(items, total).clips_written`. Both are published clips by
+construction; `plan.count` is reachable from neither, and a test asserts it stays that way.
+
+**3. The button also had to become *unavailable*, which the plan did not say.** Item 1 asks for the
+action to be "clearly offered"; a button that is equally clickable before the first cut cannot do
+that, so `cut_open_library_btn` ships `interactive=False` and is written by both handlers together
+with the state. That is why each handler gained **two** outputs rather than one, inserted between
+the payload and the three button states — the button set is the tail of every emitted expression,
+so anything appended after it would misalign all three updates on every frame. `_on_cut_run` went
+5 → 7 outputs and `_on_cut_batch_run_ui` 6 → 8; `_on_cut_batch_run`, the reviewed batch core,
+keeps its signature, its body and its 2-tuple arity.
+
+Two smaller decisions worth recording because they are trades rather than details:
+
+- **A crash does not discard clips already on disk.** `completed` and `run_directory` are bound
+  *before* `_on_cut_run`'s `try`, so the failure path can honestly offer what was written — which
+  is also why the R12 note there names `done`/`failed`/`encoder` as the unsafe names and not these
+  two.
+- **A lost manifest does not withhold review.** The clips exist either way, and refusing to show
+  an operator their own footage because a record write failed is the wrong direction. The panel
+  and the summary still report the lost record.
+
+The handoff is **frozen when the job ends**: `cut_output` is no longer an input to the button at
+all, so editing the output-folder box afterwards cannot redirect a finished job's review. Pressing
+it performs exactly one filesystem call — `os.path.isdir`, a single `stat` — and a folder that has
+since been moved or deleted is **reported**, never repaired and never silently replaced by its
+parent.
+
+#### F-1, found by independent review and fixed: handing over a new folder retires the old page
+
+The plan above is about *which folder arrives*. It was silent about what happens to the review the
+operator already had open, and the first implementation wrote only the folder box, the recursion
+flag, the two tab selections and the report. Everything that makes a review page **actionable** is
+derived from the server's per-owner page rather than from those widgets, so the grid, the counters,
+Confirm and a sweep the operator had already armed all went on describing folder A after the button
+had navigated to folder B. Measured on the candidate with real media: pressing Confirm sorted **A**
+into the Media Library while every visible label said B, and pressing Proceed on a sweep armed on A
+sent two of A's clips to Discarded.
+
+**Clearing the gallery would not have been enough**, which is the part worth remembering.
+`_on_clips_confirm` takes no folder and no page from the browser — it refuses only when
+`_clips_view(owner)` is empty — so a greyed-out button is presentation, not a boundary; Refresh
+repaints from that same view and would have republished A and re-enabled Confirm one click later;
+and a scan of A still in flight could have published A as current *after* the handoff.
+
+So the page itself is retired, through a new `ScanCoordinator.invalidate(owner)` — `begin()` plus
+`discard()` collapsed into one locked step, so there is no interval in which a stale page is still
+the newest. Confirm, Proceed and the decision endpoint then refuse because the page is gone, and
+the seven appended outputs (5 → 12 on this one handler, all five original positions unchanged)
+exist so the screen stops asserting something the server no longer holds. The empty state they
+carry is the one Refresh already renders, so there is one notion of "no current page" rather than
+two kept in step by hand.
+
+Durable decisions are untouched — the coordinator holds pages, not decisions, so A's kept marks are
+still there when A is scanned again — retirement is per-owner, so a second browser session keeps
+its own page, and a **refused** handoff retires nothing: both refusal paths leave every review
+output exactly as it was, because a mis-press must not cost an operator the page they were working
+on. Scan Folder is still the operator's own deliberate action, and the handoff still performs
+exactly one `os.path.isdir`.
+
+### R12 — Raw Cutter Live Activity & Performance Panel · **MERGED AND DEPLOYED**
 
 The complaint this answers is one sentence: when BeatSync spends several minutes analyzing or
 cutting a video, the operator could see *that* something was happening, but not **how long** it had
@@ -1485,8 +1566,8 @@ merged nor shipped), and **planned** (agreed, not written).
 | **Stage-5 Cancel** — Cancel actually interrupts video analysis | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — branch `feat/fun-stage5-cancel-shared-cache` stacked on `feat/fun-audio-overflow-r7-3`. Retires C3-R1A's `BOUNDARY_ONLY_CANCEL` for Stage 5 after a real owner incident (a whole library selected against a cold cache; Cancel pressed; Stage 5 ran on for about an hour). Cancellable during the cache-identity phase, the record scan, between sources, inside the FFmpeg scene pass, every 32 decoded frames, every 16 scored windows, and during the Qwen worker wait — which also terminates the worker's own `llama-server` grandchild. Measured latencies on real media: **0.016–0.45 s** deterministic, **0.20 s** Qwen. Completed records survive and are reused; nothing incomplete is written; Stage 6 never starts. The Qwen worker **process** is still cancellation-free by contract. **Not independently reviewed** |
 | **Shared Analysis Cache** — one Stage-5 cache across BeatSync versions | **MERGED AND DEPLOYED** (PR #80, main `b90c265f`) — same branch. A per-user setting at `%LOCALAPPDATA%\BeatSync\shared-config.json`, deliberately **outside every checkout**, so a new playtest tree finds the same cache with no setup. A location change, never a migration: the directory was never part of Stage-5 identity, so `CACHE_CONTRACT_VERSION` and `ANALYSIS_VERSION` are untouched and **no record was invalidated**. Measured across two app roots: 8 sources analysed cold in 3.24 s by the first, **8/8 cache hits in 0.053 s** by the second. Includes an additive, never-overwriting **Import existing cache** (2,086 current-generation records copied out of the real production cache, which came out byte-identical) and a shared-folder warning on the Cache Management panel. It is **operational**: the configured folder on this machine holds 4,580 records. **Not independently reviewed** |
 | **R10** — **Repeat Music 1×–30×** | **MERGED AND DEPLOYED** (PR #81, main `5cdbd8cc`) — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `4fe07315`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Merged and deployed; not independently reviewed** |
-| **R11** — Raw Cutter → **"Review these clips"** output handoff | **PLANNED — small UX improvement**, after the R10 release work. The navigation half already ships: `cut_open_library_btn` → `_on_cut_open_in_library` selects Media Library → Video Review, prefills the folder, enables Include subfolders and scans nothing. Planned is handing over the finished job's **exact** output directory instead of the parent folder, offering it when Single Video or Folder Batch completes with clips on disk, and clearing the handoff when a new cut begins. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement** |
-| **R12** — Raw Cutter **Live Activity & Performance panel** | **IMPLEMENTATION IN PROGRESS** — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`, draft PR. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. **Not merged, not deployed, not independently reviewed** |
+| **R11** — Raw Cutter → **"Review these clips"** output handoff | **IMPLEMENTED — independently reviewed QUALIFIED, its one finding (F-1) fixed, awaiting merge.** Branch `feat/fun-raw-cutter-review-these-clips-r11` off `d5bc160f`. The existing button and the existing handler now hand over the finished job's **own** directory — `run_directory` for a single video, `batch_directory` for a batch — read from a new session-scoped `cut_handoff_state` instead of the `cut_output` parent widget, which is no longer an input to the button at all. Recursion follows the job's shape (off for single, on for batch) rather than being hardcoded on, and the button ships `interactive=False` until a job has published clips. The gate is a property of the pure record, not of each terminal path: `cut_handoff.build()` answers `None` unless a directory was named *and* at least one clip reached disk, and `read()` re-applies it to anything coming back out of session state. Counts are **published** clips on both sides — validated `on_complete` results for a single run, `summarise(...).clips_written` for a batch — so `plan.count` is reachable from neither. Every non-terminal and every refused frame clears the record, so a new, failed or refused cut cannot present the previous job's folder as its own result; a partial, cancelled or crashed job offers review only if clips exist, with wording that says which. Pressing it performs exactly one `os.path.isdir` and a vanished folder is reported, never replaced by its parent. `_on_cut_run` 5 → 7 outputs and `_on_cut_batch_run_ui` 6 → 8; `_on_cut_batch_run` keeps its signature, body and 2-tuple arity. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement.** 49 new tests, including the first executable harness for `_on_cut_run`. **Independent review returned QUALIFIED with one finding, F-1: the handoff navigated to the new folder while the gallery, the counters, Confirm and an armed sweep still described the previous one, so Confirm sorted the PREVIOUS folder's clips.** Fixed by retiring the server's per-owner review page through a new `ScanCoordinator.invalidate(owner)` — one locked step — before repainting, so Confirm, Proceed, Refresh and the decision endpoint all refuse because the page is gone rather than because a button went grey; this handler went 5 → 12 outputs with all five original positions unchanged, a refused handoff retires nothing, durable decisions and other browser sessions are untouched, and 17 further tests were added. **Not merged, not deployed** |
+| **R12** — Raw Cutter **Live Activity & Performance panel** | **MERGED AND DEPLOYED** (PR #82, main `e0bc9393`) — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. Deployed and GUI-smoke-verified; two follow-up hotfixes shipped on top of it for a defect family it exposed rather than caused (PR #83 `ffb828a1`, PR #84 `d5bc160f`: an unnamed Folder Batch / review folder became the application's own install directory via `os.path.abspath('')`). **Not independently reviewed** |
 | **R13** — Video Review **transfer Working overlay** | **PLANNED — next UX improvement.** Show a Working overlay the moment Confirm starts moving clips, disable Confirm / Proceed / classification while it runs, report `Moving 12 / 84 clips` from clips actually moved, restore the controls on success *and* on failure, keep the existing two-step confirmation for unmarked clips, and keep server-side single-flight as the authority so a repeated click can never move, overwrite or delete extra clips. **Collision handling is out of scope because it already ships** — `collision.py`'s `SUFFIX` policy, at Settings → *When a destination filename already exists*, is reused as-is; no second naming engine. Deliberately **not** implemented in the R12 pull request |
 | **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
@@ -1532,15 +1613,18 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    up to 30 that makes the voice selection placeable, decided by **actual placement feasibility**
    rather than by summing durations. This, not the repeat mechanism, is what R7.3's fourth mode is
    now waiting on. Deliberately **not** part of R10.
-7b. **R11 — Raw Cutter → "Review these clips".** A small UX improvement, after the R10 release
-   work: hand the finished job's exact output directory to the review surface that already exists,
-   and offer it at the moment a job completes. Explicitly **not** a new feature — no extra tab, no
-   second review engine, no automatic scanning and no file movement.
-7c. **R12 — Raw Cutter live Activity & Performance panel.** **In progress** on
-   `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`, in a draft PR awaiting the owner's own test.
-   The smallest possible answer to "I cannot tell whether it is working": a compact timing
-   read-out under the existing bar, in both cutter modes, with no new progress system and no
-   backend poll.
+7b. **R11 — Raw Cutter → "Review these clips".** **Implemented** on
+   `feat/fun-raw-cutter-review-these-clips-r11` off `d5bc160f`, awaiting review: the finished job's
+   exact output directory now reaches the review surface that already exists, offered at the moment
+   a job completes and cleared the moment a new one starts. Still **not** a new feature — no extra
+   tab, no second review engine, no automatic scanning and no file movement. Independently
+   reviewed **QUALIFIED**; its one finding (F-1 — navigating to the new folder left the previous
+   folder's page actionable, so Confirm sorted the wrong one) is **fixed**, by retiring the
+   server's per-owner review page rather than by greying out a button.
+7c. **R12 — Raw Cutter live Activity & Performance panel.** **Merged and deployed** (PR #82, main
+   `e0bc9393`), owner-tested. The smallest possible answer to "I cannot tell whether it is
+   working": a compact timing read-out under the existing bar, in both cutter modes, with no new
+   progress system and no backend poll.
 7d. **R13 — Video Review transfer Working overlay.** The next UX improvement after R12: make a
    long Confirm visibly busy and make a second click structurally harmless. Not started. The
    collision half is already solved by `collision.py`'s `SUFFIX` policy and is reused, not rebuilt.

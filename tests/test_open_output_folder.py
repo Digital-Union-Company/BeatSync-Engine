@@ -625,7 +625,23 @@ def test_no_existing_output_tuple_or_writer_matrix_changed():
 #: same reason every state above is. Separate from `audio_armed_state` because the two tabs review
 #: different clips, and a signature minted for one batch must not authorise a sweep of another --
 #: `test_a_signature_from_a_different_batch_cannot_authorise_a_sweep` pins that directly.
-_EXPECTED_STATE_COUNT = 13
+#:
+#: 14 since Raw Cutter R11, for `cut_handoff_state` -- the finished job's "Review these clips"
+#: record. The fourteenth is the reviewed decision this pin exists to force, and it is the exact
+#: sibling of the Audio Cutter's `audio_run_dir_state`: the Raw Cutter kept no run-directory state,
+#: which is precisely why its Review button had to hand over the PARENT output folder and show an
+#: operator three jobs when they asked about one. It carries a plain dict of primitives -- a folder
+#: name, a bool, an int and two short strings -- round-trippable through JSON, which is what
+#: `test_cut_handoff.py::test_the_record_holds_only_plain_serializable_values` proves. Nothing
+#: live enters it: no handle, no job, no lock, and no path object.
+#:
+#: Per-session for the same reason every state above is, and here that is load-bearing rather than
+#: conventional: a process-global handoff path would let one operator's cut redirect another
+#: operator's review. It is deliberately NOT merged into `cut_plan_state` -- a plan describes work
+#: that has not happened yet and is consumed by Cut Video, while a handoff describes work that is
+#: over and is consumed by the Review button; sharing one slot would let a new analysis clear a
+#: finished job's record, or a finished job invalidate a plan.
+_EXPECTED_STATE_COUNT = 14
 
 
 def test_the_expected_state_count_matches_the_named_states():

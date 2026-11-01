@@ -164,6 +164,23 @@ during a transition, and every reader — the handler, Refresh and the `/r5state
 same honest "no current page" rather than a grid whose every tile answers `403 unknown_session`.
 An empty gallery is a state the operator can act on; a page of dead credentials is not.
 
+**And `invalidate(owner)` retires a page from outside the scan path [R11 / F-1].** Something other
+than a scan can make the page an operator is looking at no longer the page they are about to act
+on: the Raw Cutter's "Review these clips" fills Video Review's folder box with a *different*
+folder, and before this existed the grid, the counters, Confirm and an armed sweep all went on
+describing the previous one — so Confirm sorted the **previous** folder while every visible label
+named the new one. It is deliberately `begin()` + `discard()` collapsed into **one locked step**, so
+there is no interval in which a stale view is still newest, and the three properties above carry
+over unchanged: a scan already in flight can no longer `publish` (it cannot restore the retired
+page), a scan started afterwards is entirely normal, and `view()` answers `{}` so every reader —
+Confirm, Proceed, Refresh, `/r5decide` and `/r5state` — refuses rather than acting on it.
+
+It is **per-owner** and it is **not a decision**: this class holds pages, not decisions, so an
+operator's kept and discarded marks survive untouched and another browser session keeps its own
+page and session id. Anything that needs to retire a page must call this rather than add a second
+notion of "the current page" beside it; and whatever calls it must leave the durable store alone.
+The caller's own contract is in `.claude/rules/gui-integration.md` (R11 / F-1).
+
 **What this does *not* promise.** A server-side generation check cannot order HTTP responses. If a
 superseded scan's response is assembled before the newer scan publishes, it paints the empty state
 and can still arrive *after* the newer scan's grid, leaving the browser momentarily empty while a

@@ -20,6 +20,119 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-01 (Raw Cutter R11: "Review these clips" hands over the finished job's own folder)
+
+**The button that takes you from a finished cut to Video Review now hands over the directory that
+job actually wrote, instead of the parent folder it sits in.** The navigation half shipped in R8 and
+is unchanged — one button selects Media Library → Video Review, fills in the folder box, and
+deliberately scans nothing. What was wrong was *which* folder arrived: the button read the
+`cut_output` widget, because the Raw Cutter kept no run-directory state the way the Audio Cutter's
+`audio_run_dir_state` does. An operator who had cut three times was handed all three, with
+subfolders forced on. R8 recorded that as an accepted accuracy trade whose price was the Cut
+handlers' positionally pinned return signatures; R11 pays that price.
+
+A new session-scoped `cut_handoff_state` carries a plain dict of primitives:
+
+```
+{'directory': str, 'recursive': bool, 'clips': int, 'mode': 'single'|'batch', 'outcome': str}
+```
+
+`run_directory` for a single video, `batch_directory` for a batch — in both cases the directory the
+job's own `prepare_*_directory` created, published by the handler that created it. It is never
+inferred from a timestamp, reconstructed from the output-root text or parsed out of a status
+message, and there is deliberately **no fallback** to the parent folder, the output root or the
+working directory.
+
+Four properties are structural rather than things a terminal path has to remember:
+
+- **A job that published no clips offers nothing.** `cut_handoff.build()` answers `None` unless a
+  directory was named *and* at least one clip reached disk, so a run that created its folder and
+  then failed every clip cannot invite the operator to review an empty folder. `read()` re-applies
+  the same gate to a record coming back out of session state, which is untrusted input on the way
+  in — and rebuilds it, so a tampered `recursive` flag is corrected to the value its mode implies
+  rather than honoured.
+- **Counts are published clips, never planned ones.** A single run counts its own validated
+  `on_complete` results; on a cancellation that is the callback's list, because the exception
+  discards `export_segments`' return value. A batch carries `summarise(...).clips_written` out
+  through the sink it already writes. `plan.count` and `clips_planned` are reachable from neither.
+- **Starting a cut clears the previous job's record** — including a refused or crashed attempt, and
+  including every running frame — so no job can be presented as the result of a different one.
+- **The outcome is the same classification everything else uses.** For a batch it comes from
+  `fork_cutter_batch`'s `TERMINAL_*` vocabulary, so the review prompt is a fourth rendering of the
+  one classifier the headline, the manifest and the activity panel already share, never read off a
+  status string.
+
+Recursion follows the job's shape — off for a single video, on for a batch — rather than being
+hardcoded on. A partial, cancelled or crashed job offers review only if clips exist, with wording
+that says which happened: a stopped job is never described as finished, and a job with failures is
+never described as clean. A crash does **not** discard clips already on disk, and a lost manifest
+does not withhold review of clips that exist.
+
+The button ships `interactive=False` and becomes available when a job has published clips. Pressing
+it performs exactly one filesystem call, `os.path.isdir` — a single `stat`, not a walk — so a folder
+moved or deleted since the cut is **reported** rather than repaired or silently replaced. Scan
+Folder remains the operator's own action: nothing is scanned, probed, moved, renamed, deleted or
+re-decided by the handoff.
+
+| | Before | After |
+|---|---|---|
+| Folder handed over | `cut_output`, the parent | the job's own `run_directory` / `batch_directory` |
+| Include subfolders | always on | off for single, on for batch |
+| Available | always | once a job has published clips |
+| After a failed or refused cut | still offers the previous job | cleared |
+| Zero clips written | offers the folder | offers nothing |
+| Editing the output box afterwards | redirects the finished job's review | cannot: the record is frozen at job end |
+
+Implementation: a new stdlib-only `src/beatsync_fork/cut_handoff.py` owning the record and every
+rule above; `_cut_handoff()` in `gui.py` returning the state and the button's availability as one
+set, for the same reason `_cut_buttons` does; `_on_cut_run` widened 5 → 7 outputs and
+`_on_cut_batch_run_ui` 6 → 8, both with the new pair inserted between the payload and the three
+button states, because the button set is the tail of every emitted expression. `_on_cut_batch_run`
+— the reviewed batch core — keeps its name, signature, body and 2-tuple arity; it gained two sink
+writes at the one place that already knew the facts. No new tab, no second review engine, no
+duplicate folder selector, no transfer mechanism and no new endpoint.
+
+49 new tests across `tests/test_cut_handoff.py` and `tests/test_raw_cutter_batch.py`, including the
+repository's **first executable harness for `_on_cut_run`**: the shipped handler run against a
+synthesised exporter and a real temporary filesystem, so the handoff's behaviour on every terminal
+path — success, partial, cancelled before and after the first clip, crashed before and after, and
+three refusals — is measured rather than inferred from the syntax tree.
+
+### Fixed — 2026-11-01 (Raw Cutter R11 / F-1: handing over a new folder retires the old review page)
+
+**Pressing "Review these clips" no longer leaves the previous folder's clips one click from being
+sorted.** The first R11 implementation wrote the folder box, the recursion flag, the two tab
+selections and the report — and nothing else. Everything that makes a review page *actionable* is
+derived from the server's per-owner page rather than from those widgets, so the grid, the counters,
+Confirm and a sweep the operator had already armed all went on describing the folder they had just
+navigated away from.
+
+Measured on the candidate with real media, folder A scanned and kept, a finished job in folder B:
+
+| After the handoff to B | Before | After |
+|---|---|---|
+| Pressing Confirm | sorted **A** — "✅ Sorted all 2 clip(s)" — into the Media Library | refused: "Nothing has been scanned on this page." |
+| Pressing Proceed on a sweep armed on A | moved 1 of **A**'s clips to the Library and its 2 unmarked clips to Discarded | refused; all three of A's clips stayed put |
+| Pressing Refresh | repainted **A**'s gallery, counts "Kept 2", Confirm available | the empty state, Confirm unavailable |
+| A scan of A still in flight | republished A as the current page | cannot publish; A stays retired |
+| The server's current page | still A, while every visible label said B | none, until the operator scans |
+
+The correction is a new `ScanCoordinator.invalidate(owner)` — `begin()` + `discard()` collapsed into
+**one locked step**, so there is no interval in which a stale page is still the newest — called by
+the handoff before it repaints. The view is the authority, so Confirm, Proceed and the decision
+endpoint refuse because the page is gone, **not** because a button went grey; the seven appended
+outputs (grid, counters, Confirm, both halves of the sweep gate, its signature, its prompt) are
+consequences of the retirement, and the empty state they carry is the one Refresh already renders,
+so Refresh cannot resurrect the page either. `_on_cut_open_in_library` widened 5 → 12 outputs, with
+all five original positions unchanged.
+
+Nothing else changed. Durable decisions are untouched — the coordinator holds pages, not decisions,
+so A's kept marks are still there when A is scanned again — retirement is per-owner, so a second
+browser session keeps its own page, and a **refused** handoff retires nothing at all: both refusal
+paths leave every review output exactly as it was, because a mis-press must not cost an operator
+the page they were working on. The handoff still performs exactly one `os.path.isdir` and still
+scans, probes, moves, renames and deletes nothing. 14 further tests in `tests/test_cut_handoff.py`.
+
 ### Fixed — 2026-11-01 (Clips Review and Audio Review: an unnamed review folder is refused, not guessed)
 
 **Scan with nothing but quotation marks in the folder box no longer reviews the application's own
