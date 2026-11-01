@@ -275,10 +275,15 @@ def test_the_batch_terminal_class_is_structural_not_parsed_from_prose(gui_tree):
 def test_the_progress_panel_never_writes_outside_the_raw_cutter(gui_tree):
     """Every P1 output must be a Raw Cutter widget. One stray render-state write here would make
     a progress update capable of disturbing a render."""
+    # [FORK] Raw Cutter R11: `cut_handoff_state` and `cut_open_library_btn` join the allowed set.
+    # Both are Raw Cutter widgets, which is the property this test is about -- the handoff state
+    # is declared beside `cut_plan_state` in the cutter's own tab, and the Review button is the
+    # cutter's own control. Nothing outside the cutter became writable.
     allowed = {"cut_summary", "cut_table", "cut_plan_state", "cut_source_info", "cut_progress",
                "cut_report", "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn",
                "cut_batch_status", "cut_batch_summary", "cut_batch_progress",
-               "cut_batch_count_btn", "cut_batch_start_btn", "cut_batch_cancel_btn"}
+               "cut_batch_count_btn", "cut_batch_start_btn", "cut_batch_cancel_btn",
+               "cut_handoff_state", "cut_open_library_btn"}
     for widget in ("cut_analyze_btn", "cut_run_btn", "cut_cancel_btn",
                    "cut_batch_start_btn", "cut_batch_cancel_btn"):
         written = set(_names(_kwargs(_click(gui_tree, widget))["outputs"]))

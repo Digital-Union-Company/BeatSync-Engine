@@ -24,6 +24,10 @@ from beatsync_fork import raw_cutter_batch as batch
 from beatsync_fork import raw_cutter_profiles as profiles
 # [FORK] R12: and `fork_activity` for the Activity & Performance read-out, for the same reason.
 from beatsync_fork import raw_cutter_activity as activity
+# [FORK] R11: and `fork_handoff`, which the wrapper's terminal frame calls to build the "Review
+# these clips" record. The REAL module, so what these cases assert about the offer is the shipped
+# gate -- including its refusal to produce a record for a job that published no clips.
+from beatsync_fork import cut_handoff as handoff
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GUI = os.path.join(_REPO_ROOT, "src", "gui.py")
@@ -100,6 +104,28 @@ def _kwargs(call: ast.Call) -> dict:
 
 def _names(node) -> list[str]:
     return [n.id for n in ast.walk(node) if isinstance(n, ast.Name)]
+
+
+#: [FORK] Raw Cutter R11: how many Gradio outputs one emitted expression supplies.
+#:
+#: The wrapper emits `(payload tuple) + _cut_handoff(record) + _cut_batch_buttons(...)`, so a bare
+#: `len(node.value.left.elts)` can only see one segment of that spine and raises `AttributeError`
+#: on the rest. The two helper widths are declared here by name, exactly as the sibling table in
+#: `test_raw_cutter_seam.py` does: a helper whose width is unknown returns 0, which fails the
+#: comparison loudly rather than quietly agreeing.
+_HELPER_WIDTH = {"_cut_batch_buttons": 3, "_cut_buttons": 3, "_cut_handoff": 2}
+
+
+def _emitted_width(node) -> int:
+    if isinstance(node, ast.Tuple):
+        return len(node.elts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _emitted_width(node.left) + _emitted_width(node.right)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return _HELPER_WIDTH.get(node.func.id, 0)
+    if isinstance(node, ast.Name):
+        return 3                        # `busy` / `idle`, each bound to a button-set call
+    return 0
 
 
 def _item(index: int, outcome: str, **extra) -> batch.BatchItem:
@@ -761,8 +787,13 @@ def test_the_single_video_workflow_is_unchanged(gui_tree, gui_source):
                                           "cut_source_info",
                                           "cut_progress", "cut_analyze_btn", "cut_run_btn",
                                           "cut_cancel_btn"]
-    assert _names(run["outputs"]) == ["cut_report",
-                                      "cut_progress", "cut_analyze_btn", "cut_run_btn",
+    # [FORK] Raw Cutter R11: the handoff pair is the deliberate addition, and it is INSERTED
+    # before the button states rather than appended after them -- the button set is the tail of
+    # every emitted expression, so appending after it would misalign all three. Listed explicitly
+    # for the same reason the P1 additions are.
+    assert _names(run["outputs"]) == ["cut_report", "cut_progress",
+                                      "cut_handoff_state", "cut_open_library_btn",
+                                      "cut_analyze_btn", "cut_run_btn",
                                       "cut_cancel_btn"]
     # And neither handler may reach outside the Raw Cutter: no render, source-confirmation,
     # Media Preparation or Qwen widget may appear in either list.
@@ -882,8 +913,18 @@ def test_the_batch_generator_always_yields_both_of_its_two_outputs(gui_tree):
 
     [FORK] Raw Cutter progress P1: there are now TWO arities to pin, and both still matter.
     `_on_cut_batch_run` -- the reviewed batch -- keeps yielding exactly 2-tuples, which is what
-    makes it safe to delegate to. The wrapper that Gradio actually calls writes 6 widgets, and
-    every one of its yields must be 6 wide.
+    makes it safe to delegate to. The wrapper that Gradio actually calls writes every widget.
+
+    [FORK] Raw Cutter R11: the wrapper widened from 6 to 8 -- the handoff record and the Review
+    button joined it. The CORE's 2-tuple is deliberately unchanged, which is the point of putting
+    the handoff in the wrapper: the reviewed batch body keeps its signature, its terminal paths
+    and its arity, and publishes the two new facts through the sink it already writes.
+
+    The emitted shape is now `(3-tuple) + _cut_handoff(record) + <3 button updates>`, so the
+    payload tuple is no longer the immediate `.left` of the yield -- it is at the bottom of a
+    left-leaning `BinOp` spine. Walking that spine is what makes this assertion survive the next
+    appended pair instead of silently reading `.elts` off a `BinOp` and raising `AttributeError`
+    where a failed assertion was meant.
     """
     core = _func(gui_tree, "_on_cut_batch_run")
     core_yields = [n for n in ast.walk(core) if isinstance(n, ast.Yield)]
@@ -894,16 +935,23 @@ def test_the_batch_generator_always_yields_both_of_its_two_outputs(gui_tree):
 
     outputs = _kwargs(_click(gui_tree, "cut_batch_start_btn"))["outputs"]
     assert _names(outputs) == ["cut_batch_status", "cut_batch_summary", "cut_batch_progress",
+                               "cut_handoff_state", "cut_open_library_btn",
                                "cut_batch_count_btn", "cut_batch_start_btn",
                                "cut_batch_cancel_btn"]
+    assert len(outputs.elts) == 8
     wrapper = _func(gui_tree, "_on_cut_batch_run_ui")
     wrapper_yields = [n for n in ast.walk(wrapper) if isinstance(n, ast.Yield)]
     assert wrapper_yields, "the wrapper must stream progress"
     for node in wrapper_yields:
-        # `(status, summary, panel) + <three button updates>` == 6.
         assert isinstance(node.value, ast.BinOp), ast.unparse(node)
-        assert len(node.value.left.elts) == 3, ast.unparse(node)
-        assert len(outputs.elts) == 6
+        payload = node.value
+        while isinstance(payload, ast.BinOp):
+            payload = payload.left
+        assert isinstance(payload, ast.Tuple), ast.unparse(node)
+        assert len(payload.elts) == 3, ast.unparse(node)
+        # And the whole emitted expression is as wide as the declared outputs: 3 payload values,
+        # the handoff pair, and the three button updates.
+        assert _emitted_width(node.value) == len(outputs.elts), ast.unparse(node)
 
 
 def test_the_count_button_is_read_only_and_takes_no_mutex(gui_tree):
@@ -1240,6 +1288,31 @@ class _BatchRun:
     def headline(self):
         return self.summary.splitlines()[0] if self.summary else ""
 
+    # --- [FORK] R11: the "Review these clips" handoff, for a run driven through the wrapper ---
+    #
+    # Indices 3 and 4 by construction: the wrapper emits
+    # `(status, summary, panel) + _cut_handoff(record) + <three button updates>`, and the two
+    # appended values sit between the payload and the buttons. `handoffs` exists because the
+    # interesting property is not only what the final frame says but that **every** running frame
+    # cleared it.
+
+    @property
+    def handoff(self):
+        """The final frame's handoff record. `None` means nothing is offered."""
+        return self.yields[-1][3] if self.yields and len(self.yields[-1]) >= 5 else None
+
+    @property
+    def handoffs(self):
+        """Every handoff value the wrapper emitted, in order."""
+        return [y[3] for y in self.yields if len(y) >= 5]
+
+    @property
+    def review_enabled(self):
+        """Whether the final frame left the Review button clickable."""
+        if not self.yields or len(self.yields[-1]) < 5:
+            return None
+        return self.yields[-1][4].get("interactive")
+
     @property
     def outcomes(self):
         return [s["outcome"] for s in self.manifest["sources"]] if self.manifest else []
@@ -1275,18 +1348,27 @@ def _run_batch(tmp_path, monkeypatch, *, sources=("a.mp4", "b.mp4", "c.mp4"),
         # [FORK] Raw Cutter R12: `_cut_activity` / `_cut_activity_final` and the
         # `_CUT_BATCH_ACTIVITY` terminal table join it, so the Activity & Performance panel that
         # these cases assert about is the shipped renderer rather than a stand-in.
+        #
+        # [FORK] Raw Cutter R11: `_cut_handoff` joins it, so the handoff record and the Review
+        # button's availability come out of the shipped helper rather than a stand-in -- which is
+        # what makes the "cleared while running, offered only when clips exist" cases below
+        # assertions about the real seam.
         wanted += ["_cut_progress_html", "_cut_activity", "_cut_activity_final",
-                   "_cut_batch_buttons", "_on_cut_batch_run_ui"]
+                   "_cut_batch_buttons", "_cut_handoff", "_on_cut_batch_run_ui"]
     body = [_strip_docstrings(_func(gui, name)) for name in wanted]
     namespace: dict = {}
     if ui:
         body = [node for node in gui.body
                 if isinstance(node, ast.Assign)
                 and getattr(node.targets[0], "id", "") in ("_CUT_TONES",
-                                                           "_CUT_BATCH_ACTIVITY")] + body
+                                                           "_CUT_BATCH_ACTIVITY",
+                                                           "_CUT_BATCH_HANDOFF")] + body
         # `_CUT_BATCH_ACTIVITY` is built at module scope from the two real fork vocabularies, so
         # they have to be resolvable BEFORE the body is executed rather than only afterwards.
-        namespace.update(fork_cutter_batch=batch, fork_activity=activity)
+        # [FORK] R11: `_CUT_BATCH_HANDOFF` is built the same way, from `fork_cutter_batch`'s
+        # `TERMINAL_*` names and `fork_handoff`'s outcome names, so it needs the same treatment.
+        namespace.update(fork_cutter_batch=batch, fork_activity=activity,
+                         fork_handoff=handoff)
     module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
     exec(compile(module, _GUI, "exec"), namespace)          # noqa: S102 - the body under test
 
@@ -1879,6 +1961,171 @@ def test_a_clean_batch_is_still_shown_as_a_clean_success(tmp_path, monkeypatch):
     assert panel["state"] == "done", panel
     assert panel["title"] == _UI["CUT_BATCH_DONE_TITLE"], panel
     assert panel["pct"] == 100
+
+
+# =============================================================================================
+# 11b. [FORK] Digital-Union (Raw Cutter R11): the batch's "Review these clips" handoff
+#
+# Driven through the same `ui=True` harness, so these are assertions about the shipped wrapper
+# and the shipped `fork_handoff` gate together -- which is the seam the feature lives in. The
+# pure record's own rules, and the single-video handler's terminal paths, are in
+# `tests/test_cut_handoff.py`.
+# =============================================================================================
+
+def test_a_finished_batch_hands_over_the_batch_directory_with_subfolders_included(tmp_path,
+                                                                                  monkeypatch):
+    """The exact directory, from the batch itself -- never the output ROOT it was created in,
+    and never reconstructed from a timestamp. Subfolders are included because a batch writes one
+    folder per source, which is a fact about the job rather than an operator preference."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    assert run.handoff is not None
+    assert run.handoff["directory"] == run.batch_dir
+    assert run.handoff["directory"] != str(tmp_path / "out"), "the output ROOT must not be used"
+    assert run.handoff["recursive"] is True
+    assert run.handoff["mode"] == handoff.MODE_BATCH
+    assert run.handoff["outcome"] == handoff.OUTCOME_COMPLETED
+    assert run.review_enabled is True
+    # The count is published clips, and it matches what is really on disk.
+    assert run.handoff["clips"] == len(run.clips)
+    assert run.handoff["clips"] == run.manifest["totals"]["clips_written"]
+    assert _UI["LABEL_CUT_OPEN_LIBRARY"] in run.summary
+
+
+def test_every_running_batch_frame_clears_the_handoff(tmp_path, monkeypatch):
+    """A batch in flight must not leave the previous job's folder on offer."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    assert len(run.handoffs) > 1
+    assert all(value is None for value in run.handoffs[:-1]), run.handoffs
+    assert run.handoffs[-1] is not None
+
+
+def test_a_batch_cancelled_part_way_offers_only_the_clips_that_reached_disk(tmp_path,
+                                                                           monkeypatch):
+    """Cancelled after one source: offered, with cancelled wording, counting published clips."""
+    def stop_after_first(source, plan, run_directory, job, on_complete, naming):
+        if "b.mp4" in source.path:
+            raise _FakeCancelled("stopped")
+        for segment in plan.segments:
+            target = os.path.join(run_directory, cutter.segment_filename(
+                source.path, segment.index, plan.count, naming=naming))
+            with open(target, "wb") as hand:
+                hand.write(b"\0" * 1024)
+            on_complete(_Res(index=segment.index, ok=True, size_bytes=1024, error=""))
+        return None
+
+    run = _run_batch(tmp_path, monkeypatch, ui=True, export_hook=stop_after_first)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_CANCELLED
+    assert run.clips, "the first source really did write clips"
+    assert run.handoff is not None
+    assert run.handoff["outcome"] == handoff.OUTCOME_CANCELLED
+    assert run.handoff["clips"] == len(run.clips)
+    assert run.handoff["directory"] == run.batch_dir
+    assert run.review_enabled is True
+
+
+def test_a_batch_that_published_no_clips_offers_nothing(tmp_path, monkeypatch):
+    """A batch can obtain a directory and still write nothing -- every source unreadable. The
+    folder exists; review must not be offered for it."""
+    def every_probe_fails(path):
+        raise RuntimeError("unreadable source")
+
+    run = _run_batch(tmp_path, monkeypatch, ui=True, probe_fault=every_probe_fails)
+    assert run.batch_dir, "the batch directory was created"
+    assert run.clips == [], "but no clip was written"
+    assert run.handoff is None
+    assert run.review_enabled is False
+    assert _UI["LABEL_CUT_OPEN_LIBRARY"] not in run.summary
+
+
+def test_a_batch_refused_before_it_got_a_directory_offers_nothing(tmp_path, monkeypatch):
+    """No directory, no terminal class, no handoff -- and deliberately no fallback to the output
+    root, which is exactly what R11 removed from the button."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True,
+                     batch_dir_error="the output folder is read-only")
+    assert run.handoff is None
+    assert run.review_enabled is False
+    assert all(value is None for value in run.handoffs), run.handoffs
+
+
+def test_a_batch_refused_before_admission_offers_nothing(tmp_path, monkeypatch):
+    """The pre-mutex refusal: it never reaches finalisation, so the sink carries no directory."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True, prelock=True)
+    assert run.handoff is None
+    assert run.review_enabled is False
+
+
+def test_a_lost_manifest_does_not_withhold_review_of_clips_that_exist(tmp_path, monkeypatch):
+    """A deliberate trade, stated so it is not mistaken for an oversight: the clips are on disk
+    either way, and refusing to show the operator their own footage because a record write failed
+    would be the wrong direction. The panel and the summary still say the record was lost."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True, manifest_error="disk full")
+    assert run.clips, "clips were written"
+    assert run.handoff is not None
+    assert run.handoff["clips"] == len(run.clips)
+    assert run.review_enabled is True
+    assert run.panel["title"] == _UI["CUT_BATCH_RECORD_LOST_TITLE"], run.panel
+
+
+def test_a_batch_with_a_failed_source_offers_review_with_qualified_wording(tmp_path,
+                                                                          monkeypatch):
+    """`completed_with_failures` must not read as a clean finish in the review prompt either."""
+    def fail_the_second(source, plan, run_directory, job, on_complete, naming):
+        ok = "b.mp4" not in source.path
+        for segment in plan.segments:
+            if ok:
+                target = os.path.join(run_directory, cutter.segment_filename(
+                    source.path, segment.index, plan.count, naming=naming))
+                with open(target, "wb") as hand:
+                    hand.write(b"\0" * 1024)
+            on_complete(_Res(index=segment.index, ok=ok, size_bytes=1024 if ok else 0,
+                             error="" if ok else "injected"))
+        return None
+
+    run = _run_batch(tmp_path, monkeypatch, ui=True, export_hook=fail_the_second)
+    assert run.manifest["terminal_status"] == batch.TERMINAL_COMPLETED_WITH_FAILURES
+    assert run.handoff is not None
+    assert run.handoff["outcome"] == handoff.OUTCOME_PARTIAL
+    assert "did not finish" in run.summary
+    assert run.review_enabled is True
+
+
+def test_the_batch_handoff_count_is_published_clips_not_planned_ones(tmp_path, monkeypatch):
+    """The requirement in its exact form. Every source plans clips; only one writes any."""
+    def only_the_first_writes(source, plan, run_directory, job, on_complete, naming):
+        ok = "a.mp4" in source.path
+        for segment in plan.segments:
+            if ok:
+                target = os.path.join(run_directory, cutter.segment_filename(
+                    source.path, segment.index, plan.count, naming=naming))
+                with open(target, "wb") as hand:
+                    hand.write(b"\0" * 1024)
+            on_complete(_Res(index=segment.index, ok=ok, size_bytes=1024 if ok else 0,
+                             error="" if ok else "injected"))
+        return None
+
+    run = _run_batch(tmp_path, monkeypatch, ui=True, export_hook=only_the_first_writes)
+    planned = run.manifest["totals"]["clips_planned"]
+    written = run.manifest["totals"]["clips_written"]
+    assert 0 < written < planned, (written, planned)
+    assert run.handoff["clips"] == written == len(run.clips)
+
+
+def test_every_batch_frame_is_as_wide_as_the_declared_outputs(tmp_path, monkeypatch):
+    """Measured on real emitted frames, because Gradio writes the wrong widget rather than
+    failing on a width mismatch."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    assert {len(y) for y in run.yields} == {8}, {len(y) for y in run.yields}
+
+
+def test_the_batch_handoff_changes_nothing_on_disk(tmp_path, monkeypatch):
+    """The handoff records a folder name. It must not move, rename or delete anything, and the
+    clips must be exactly where the batch wrote them."""
+    run = _run_batch(tmp_path, monkeypatch, ui=True)
+    before = sorted(os.path.relpath(p, run.batch_dir) for p in run.clips)
+    present = sorted(os.path.relpath(os.path.join(b, f), run.batch_dir)
+                     for b, _d, fs in os.walk(run.batch_dir) for f in fs if f.endswith(".mp4"))
+    assert before == present
+    assert os.path.isdir(run.handoff["directory"])
 
 
 # =============================================================================================

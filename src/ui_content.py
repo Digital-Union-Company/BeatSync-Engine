@@ -2239,11 +2239,30 @@ INFO_AUDIO_OPEN_IN_PREVIEW = (
     "later. It fills the folder in for you; you still press Scan Folder there."
 )
 
-LABEL_CUT_OPEN_LIBRARY = "\U0001f4da Open results in Media Library"
+# [FORK] Digital-Union (Raw Cutter R11): the button now hands over the FINISHED JOB's own output
+# folder rather than the parent output widget, so it is named after what it does. It is available
+# once a cut has written clips and unavailable before that -- which is the honest state, because
+# there is no particular job to review yet. Video Review's own folder box stays editable, so
+# reviewing never requires having run the cutter.
+LABEL_CUT_OPEN_LIBRARY = "\U0001f3ac Review these clips"
 INFO_CUT_OPEN_LIBRARY = (
-    "Loads your Raw Cutter output folder into **Media Library → Video Review**, with subfolders "
-    "included — each cut writes its own timestamped subfolder. It fills the folder in for you; "
-    "you still press Scan Folder there."
+    "Available once a cut has written clips. It loads **that job's own output folder** into "
+    "**Media Library → Video Review** and sets subfolders to match the job — included for a "
+    "folder batch, excluded for a single video. It only fills the folder in; you still press "
+    "Scan Folder there, and nothing is read, moved or renamed until you do."
+)
+#: Pressed with no finished job behind it. It names the reason rather than the folder, because
+#: there is no folder: falling back to the parent output widget is exactly what R11 removed.
+CUT_HANDOFF_NONE_TEXT = (
+    "Cut some clips first — there is no finished job to review yet.\n"
+    "You can also type or browse to any folder in Video Review and press Scan Folder."
+)
+#: The job finished and wrote clips, but its folder is no longer there. Reported, never repaired,
+#: and never silently replaced by its parent: a moved or deleted output folder is something the
+#: operator needs to know about, not something to paper over with a folder that still exists.
+CUT_HANDOFF_MISSING_TEXT = (
+    "That job's output folder is no longer there:\n{folder}\n"
+    "It may have been moved, renamed or deleted since the cut finished. Nothing was changed."
 )
 
 # [R7.2] Every selector here is a CLASS, and that is a requirement rather than a tidy-up. R7.1 had

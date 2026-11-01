@@ -157,6 +157,10 @@ _CUTTER_WIDGETS = (
     "cut_mode", "cut_batch_folder", "cut_batch_recursive", "cut_batch_count_btn",
     "cut_batch_discovery", "cut_batch_start_btn", "cut_batch_cancel_btn", "cut_batch_status",
     "cut_batch_summary",
+    # [FORK] R11. Same contract once more: the finished job's handoff record and the button that
+    # reads it are footage curation. Wired into a render handler, the folder a cut happened to
+    # write would become part of the render request.
+    "cut_handoff_state", "cut_open_library_btn",
 )
 
 
@@ -993,7 +997,13 @@ def test_the_cut_inputs_match_the_handler_signature(gui_tree):
 
 
 #: The three button updates `_cut_buttons` / `_cut_batch_buttons` return as one set.
-_BUTTON_SET_WIDTH = {"_cut_buttons": 3, "_cut_batch_buttons": 3}
+#:
+#: [FORK] Raw Cutter R11: `_cut_handoff` joins them at width 2 -- the handoff record plus the
+#: Review button's availability, returned together for the same reason the button sets are, so
+#: that a record can never outlive the control that offers it. Declared by name here, which is
+#: what lets `_emitted_arity` resolve it; an unlisted helper resolves to 0 and fails the arity
+#: comparison loudly rather than being skipped.
+_BUTTON_SET_WIDTH = {"_cut_buttons": 3, "_cut_batch_buttons": 3, "_cut_handoff": 2}
 
 
 def _emitted_arity(node, locals_=None):
@@ -1067,9 +1077,15 @@ def test_the_cut_outputs_match_what_the_handler_yields(gui_tree):
     Cut Video gained the progress panel and the three button states, and it emits from several
     terminal paths (success, cancellation, failure, and four separate refusals). Every one of
     them must be exactly as wide as the declared outputs.
+
+    [FORK] Raw Cutter R11: the handoff record and the Review button are APPENDED between the
+    payload and the button states, so the declared width is 7. The position is not cosmetic --
+    the button set is emitted as the tail of the expression, so anything appended after it would
+    misalign all three button updates on every single frame.
     """
     outputs = _kwargs(_click(gui_tree, "cut_run_btn"))["outputs"]
     assert _names(outputs) == ["cut_report", "cut_progress",
+                               "cut_handoff_state", "cut_open_library_btn",
                                "cut_analyze_btn", "cut_run_btn", "cut_cancel_btn"]
     declared = len(outputs.elts)
     handler = _func(gui_tree, "_on_cut_run")

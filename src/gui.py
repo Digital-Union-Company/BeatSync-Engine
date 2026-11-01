@@ -230,6 +230,11 @@ from beatsync_fork import raw_cutter_profiles as fork_profiles
 # clock-injected -- it owns the phase vocabulary, the two timers and the panel markup; this module
 # supplies the readings and the facts.
 from beatsync_fork import raw_cutter_activity as fork_activity
+# [FORK] Digital-Union (Raw Cutter R11): the finished job's handoff record. Pure, and the gate on
+# whether review is offered at all lives in it -- a record exists only when clips really reached
+# disk, so "do not offer an empty folder" is a property of the record rather than a check a
+# terminal path has to remember.
+from beatsync_fork import cut_handoff as fork_handoff
 from beatsync_fork import clips_review as fork_clips
 # [FORK] Digital-Union (UX V4): the native folder dialog and the remembered folder choices. Both
 # are stdlib-only fork modules; the dialog's subprocess lives there rather than here because two
@@ -6304,6 +6309,23 @@ def _cut_batch_buttons(*, count: bool, start: bool, cancel: bool):
             gr.update(interactive=cancel, variant='stop'))
 
 
+def _cut_handoff(record):
+    """[FORK] Digital-Union (Raw Cutter R11): the handoff state and the Review button, as one set.
+
+    Returned together for exactly the reason `_cut_buttons` is: the state and the control that
+    reads it must never be written separately, or a job's record can outlive the button that
+    offers it -- or worse, a button can stay lit over a record that has just been cleared, which
+    is the "an old job presented as the result of a new operation" failure this feature has to
+    avoid by construction.
+
+    `None` is the cleared form and it is what every non-terminal and every refused path emits, so
+    starting a cut invalidates the previous job's handoff before any new work begins. Availability
+    is not decided here: `fork_handoff.is_offer` is the one gate, and it answers yes only for a
+    record that names a directory AND counts at least one clip that really reached disk.
+    """
+    return (record, gr.update(interactive=fork_handoff.is_offer(record)))
+
+
 def _on_cut_planning_input_change():
     """A planning setting moved, so the plan on screen no longer describes this source.
 
@@ -6515,9 +6537,15 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
     name = os.path.basename(str(source_path or ''))
 
     def refuse(text, *, keep_plan=True):
-        """A refusal performs no work, so the controls go straight back to idle."""
+        """A refusal performs no work, so the controls go straight back to idle.
+
+        [FORK] R11: it also CLEARS the handoff. A refused attempt is still a new operation, and
+        leaving the previous job's record in place would let the Review button present an older
+        cut as the result of this one.
+        """
         return (text, _cut_progress_html(CUT_CUT_REFUSED_TITLE, text.split('\n')[0],
-                                         tone='failed')) + (idle_plan if keep_plan else idle_no_plan)
+                                         tone='failed')) + _cut_handoff(None) \
+            + (idle_plan if keep_plan else idle_no_plan)
 
     source, plan = _restore_plan(plan_state)
     if source is None:
@@ -6588,12 +6616,15 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
         header = (f"✂️ Cutting {plan.count} clip(s) into:\n{run_directory}\n\n"
                   f"Encoder: {encoder}. Audio: "
                   f"{'removed' if remove_audio else 'kept'}.")
+        # [FORK] R11: the handoff is cleared the moment real work starts, so the Review button
+        # cannot keep offering the previous run's directory while this one is cutting.
         yield (header, _cut_progress_html(
             CUT_PHASE_CUTTING_TITLE, 'Starting…', done=0, total=plan.count,
             note=CUT_PROGRESS_ENCODING_NOTE,
             activity=_cut_activity(clock, fork_activity.PHASE_PREPARING, source=name,
                                    clip_done=0, clip_total=plan.count, ffmpeg=False,
-                                   encoder=fork_activity.encoder_label(encoder)))) + busy
+                                   encoder=fork_activity.encoder_label(encoder)))) \
+            + _cut_handoff(None) + busy
 
         # [FORK] P1: `export_segments` is a BLOCKING call, so running it in this frame is exactly
         # why the screen used to freeze from the first clip to the last. It now runs on a worker
@@ -6643,7 +6674,8 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                     activity=_cut_activity(
                         clock, fork_activity.PHASE_CUTTING, source=name,
                         clip_done=published, clip_total=plan.count, ffmpeg=True,
-                        encoder=fork_activity.encoder_label(encoder)))) + busy
+                        encoder=fork_activity.encoder_label(encoder)))) \
+                    + _cut_handoff(None) + busy
                 continue
             kind = event[0]
             if kind == 'eof':
@@ -6660,7 +6692,8 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 activity=_cut_activity(
                     clock, fork_activity.PHASE_CUTTING, source=name,
                     clip_done=published, clip_total=plan.count, ffmpeg=True,
-                    encoder=fork_activity.encoder_label(encoder)))) + busy
+                    encoder=fork_activity.encoder_label(encoder)))) \
+                + _cut_handoff(None) + busy
 
         # [FORK] R12: there is deliberately NO `Finalizing` frame here, and that is a measured
         # decision rather than an omission. Reaping the worker and composing the report is real
@@ -6695,6 +6728,18 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             lines.extend(f"  #{r.index}: {r.error}" for r in failed[:20])
             if len(failed) > 20:
                 lines.append(f"  ... and {len(failed) - 20} more")
+        # [FORK] R11: the handoff is built from `done` -- clips that fired `on_complete` validated
+        # and are on disk -- never from `plan.count`. A job whose every clip failed therefore
+        # offers nothing, because `fork_handoff.build` answers None for a zero count, and the
+        # offer line below is empty for the same reason rather than by a second rule.
+        handoff = fork_handoff.build(
+            run_directory, mode=fork_handoff.MODE_SINGLE, clips=len(done),
+            outcome=(fork_handoff.OUTCOME_PARTIAL if failed
+                     else fork_handoff.OUTCOME_COMPLETED))
+        offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
+        if offer:
+            lines.append("")
+            lines.append(offer)
         lines.append("")
         lines.append("Your source file was not modified.")
         yield ("\n".join(lines), _cut_progress_html(
@@ -6708,7 +6753,8 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 fork_activity.PHASE_PARTIAL if failed else fork_activity.PHASE_COMPLETED,
                 fork_activity.STATUS_FAILED if failed else fork_activity.STATUS_DONE,
                 source=name, clip_done=len(done), clip_total=plan.count, ffmpeg=False,
-                encoder=fork_activity.encoder_label(encoder)))) + idle_plan
+                encoder=fork_activity.encoder_label(encoder)))) \
+            + _cut_handoff(handoff) + idle_plan
 
     except cutter_export.CutterCancelled:
         # `completed` is the truth here, never `results`: the exception propagated out of
@@ -6726,6 +6772,17 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                 lines.append(f"  ... and {len(written) - 20} more")
         if failed_before_stop:
             lines.append(f"{len(failed_before_stop)} clip(s) had already failed before the stop.")
+        # [FORK] R11: a stopped job offers review only if clips genuinely reached disk, and the
+        # record says *cancelled* so the wording cannot read as a finished cut. `written` is the
+        # truth here for the same reason the count above is -- the exception discarded
+        # `export_segments`' return value, so the callback's list is the only evidence.
+        handoff = fork_handoff.build(
+            run_directory, mode=fork_handoff.MODE_SINGLE, clips=len(written),
+            outcome=fork_handoff.OUTCOME_CANCELLED)
+        offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
+        if offer:
+            lines.append("")
+            lines.append(offer)
         lines.append("")
         lines.append("Your source file was not modified.")
         yield ("\n".join(lines), _cut_progress_html(
@@ -6734,13 +6791,24 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
             activity=_cut_activity_final(
                 clock, fork_activity.PHASE_CANCELLED, fork_activity.STATUS_STOPPING,
                 source=name, clip_done=len(written), clip_total=plan.count,
-                ffmpeg=False))) + idle_plan
+                ffmpeg=False))) + _cut_handoff(handoff) + idle_plan
     except Exception as exc:
         # Total: a cut that raised must report rather than vanish behind Gradio's generic error.
         import traceback
         traceback.print_exc()
+        # [FORK] R11: a crash does NOT discard clips that already reached disk. `completed` and
+        # `run_directory` are both bound BEFORE the `try`, so reading them here is safe on every
+        # fault -- which is exactly why the R12 note below names `done`/`failed`/`encoder` and
+        # not these two. The record is `partial`: the job did not finish, and saying so is the
+        # whole point of carrying an outcome rather than a boolean.
+        handoff = fork_handoff.build(
+            run_directory, mode=fork_handoff.MODE_SINGLE,
+            clips=sum(1 for r in completed if r.ok),
+            outcome=fork_handoff.OUTCOME_PARTIAL)
+        offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
         text = (f"❌ Cutting failed.\n  {type(exc).__name__}: {exc}\n\n"
-                f"Your source file was not modified.")
+                + (f"{offer}\n\n" if offer else "")
+                + f"Your source file was not modified.")
         # [FORK] R12: deliberately no clip counts and no encoder here. Both names are bound inside
         # the `try` and a fault can land before either exists, so naming them on this path would
         # turn a reported failure into a NameError on the generator's own thread.
@@ -6749,7 +6817,8 @@ def _on_cut_run(plan_state, source_path, output_folder, sensitivity, min_seconds
                                         activity=_cut_activity_final(
                                             clock, fork_activity.PHASE_FAILED,
                                             fork_activity.STATUS_FAILED,
-                                            source=name, ffmpeg=False))) + idle_plan
+                                            source=name, ffmpeg=False))) \
+            + _cut_handoff(handoff) + idle_plan
     finally:
         # [FORK] P1: the export now lives on a worker, so admission must not be handed back while
         # that worker is still writing. If this frame unwinds early -- an abandoned Gradio stream
@@ -6953,9 +7022,15 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         only from `progress(phase)`, which runs BEFORE each source's `record(...)`, so the final
         source was missing from every terminal panel and a fully successful batch reported
         `n - 1` of `n` -- measured at 50 %, 67 % and 80 % for two, three and five sources.
+
+        [FORK] Digital-Union (Raw Cutter R11): `clips` rides along from the SAME fold, so the
+        handoff's clip count is the sum of per-source `clips_written` -- clips the exporter's own
+        `on_complete` validated -- and can never be a planned count. One more value from a fold
+        this function already computes; nothing new is measured and nothing is read back.
         """
         totals = fork_cutter_batch.summarise(items, total)
-        sink.update(finished=totals.attempted, completed=totals.completed, **extra)
+        sink.update(finished=totals.attempted, completed=totals.completed,
+                    clips=totals.clips_written, **extra)
 
     def finalise(is_cancelled, fatal=''):
         """[FORK] R2: the ONE terminal finalisation. Backfill, then write the manifest.
@@ -7005,6 +7080,13 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
         if started:
             sink['terminal'] = fork_cutter_batch.terminal_status(
                 items, total, is_cancelled, fatal_error=fatal)
+            # [FORK] Digital-Union (Raw Cutter R11): the batch's OWN output directory, published
+            # at the one point that already knows whether the run obtained one. The wrapper needs
+            # the exact directory and must never reconstruct it from the output-root widget or
+            # from a timestamp -- that reconstruction is precisely what R11 removes. A run that
+            # never got a directory publishes none, so no terminal class and no directory appear
+            # together and there is nothing for the handoff to be built from.
+            sink['directory'] = batch_directory
             # [FORK] Digital-Union (Raw Cutter R12): the phase is published at the one point that
             # already knows the authoritative record is being written. It is a real operation
             # with a real name; it is also normally sub-second, so what the operator usually sees
@@ -7012,6 +7094,10 @@ def _on_cut_batch_run(input_folder, recursive, output_folder, sensitivity, min_s
             publish(total=total, phase=fork_cutter_batch.PHASE_MANIFEST)
         else:
             sink.pop('terminal', None)
+            # [FORK] R11: and no directory either. A batch refused before it obtained one has
+            # nothing to review, and leaving a stale key here is how the previous batch's folder
+            # would be offered as this one's result.
+            sink.pop('directory', None)
             publish()
         try:
             # Only sources never opened at all become `not_attempted`; anything the loop touched
@@ -7291,6 +7377,22 @@ _CUT_BATCH_ACTIVITY = {
         (fork_activity.PHASE_COMPLETED, fork_activity.STATUS_DONE),
 }
 
+#: [FORK] Digital-Union (Raw Cutter R11): the batch's terminal class as the handoff's own outcome
+#: vocabulary. Keyed by the SAME pure `TERMINAL_*` classifier the headline, the manifest and the
+#: activity panel are keyed by, so the review prompt is a fourth rendering of one classification
+#: rather than a fifth opinion -- and never read off the status text.
+#:
+#: `TERMINAL_FAILED` maps to `partial`, which is the honest word: the batch did not finish, and
+#: whatever clips reached disk before it stopped are still worth reviewing. A missing key is a run
+#: that never started; it is handled at the call site, where it resolves to no outcome at all and
+#: therefore to no handoff, rather than being defaulted to something printable here.
+_CUT_BATCH_HANDOFF = {
+    fork_cutter_batch.TERMINAL_FAILED: fork_handoff.OUTCOME_PARTIAL,
+    fork_cutter_batch.TERMINAL_CANCELLED: fork_handoff.OUTCOME_CANCELLED,
+    fork_cutter_batch.TERMINAL_COMPLETED_WITH_FAILURES: fork_handoff.OUTCOME_PARTIAL,
+    fork_cutter_batch.TERMINAL_COMPLETED: fork_handoff.OUTCOME_COMPLETED,
+}
+
 
 def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, min_seconds,
                          max_seconds, remove_audio, rename_output, output_profile):
@@ -7330,6 +7432,8 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
                   f"{sink.get('name', '')} — {sink.get('phase', '')}") if total else ''
         raw_phase = sink.get('phase', '')
         position = sink.get('position')
+        # [FORK] R11: cleared on every running frame, so a batch that is still working cannot
+        # leave the Review button offering the previous job's folder.
         yield (status, summary,
                _cut_progress_html(CUT_BATCH_RUNNING_TITLE, detail,
                                   done=sink.get('finished'), total=total,
@@ -7341,7 +7445,7 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
                                       source=sink.get('name', ''),
                                       position=position, position_total=total,
                                       ffmpeg=fork_activity.batch_ffmpeg_active(raw_phase),
-                                      encoder=encoder))) + busy
+                                      encoder=encoder))) + _cut_handoff(None) + busy
 
     # One final frame: the controls come back and the panel states the terminal outcome.
     #
@@ -7375,15 +7479,33 @@ def _on_cut_batch_run_ui(input_folder, recursive, output_folder, sensitivity, mi
     if sink.get('manifest_error') and tone == 'done':
         tone, title = 'failed', CUT_BATCH_RECORD_LOST_TITLE
         act_phase, act_status = fork_activity.PHASE_PARTIAL, fork_activity.STATUS_FAILED
+    # [FORK] Digital-Union (Raw Cutter R11): the handoff for a finished batch. Three facts, all of
+    # them published structurally by the batch itself and none of them reconstructed here:
+    #
+    #   * the directory is `sink['directory']` -- the batch's OWN output folder. Absent for a run
+    #     that never obtained one, and there is deliberately no fallback to the output-root widget.
+    #   * the count is `sink['clips']`, the sum of per-source `clips_written`, so a batch whose
+    #     every source failed offers nothing even though it has a directory.
+    #   * the outcome comes from the same `TERMINAL_*` class the headline uses. A run with no
+    #     terminal class resolves to no outcome, which `fork_handoff.build` refuses -- so "never
+    #     offer a job that did not run" holds without a second check.
+    #
+    # A lost manifest does NOT withhold review: the clips are on disk either way, and refusing to
+    # show the operator their own footage because a record write failed would be the wrong trade.
+    handoff = fork_handoff.build(
+        sink.get('directory', ''), mode=fork_handoff.MODE_BATCH,
+        clips=sink.get('clips', 0),
+        outcome=_CUT_BATCH_HANDOFF.get(sink.get('terminal'), ''))
+    offer = fork_handoff.offer_text(handoff, LABEL_CUT_OPEN_LIBRARY)
     # Both timers freeze here: the panel is emitted with `data-running="0"`, which is what stops
     # the browser interval advancing a job that is over.
-    yield (status, summary,
+    yield (status, summary + (f"\n\n{offer}" if offer else ''),
            _cut_progress_html(title, '', done=sink.get('finished'),
                               total=sink.get('total'), tone=tone,
                               activity=_cut_activity_final(
                                   clock, act_phase, act_status,
                                   position_total=sink.get('total'), ffmpeg=False,
-                                  encoder=encoder))) + idle
+                                  encoder=encoder))) + _cut_handoff(handoff) + idle
 
 
 def _on_cut_batch_cancel() -> Tuple[str, str]:
@@ -9189,33 +9311,49 @@ def _on_audio_open_in_library(run_directory):
             f"Press Scan Folder there when you are ready to review it.")
 
 
-def _on_cut_open_in_library(output_folder):
-    """"Open results in Media Library": hand the Raw Cutter's output folder to Video Review.
+def _on_cut_open_in_library(handoff):
+    """"Review these clips": hand the FINISHED JOB's own output directory to Video Review.
 
     The symmetric partner of :func:`_on_audio_open_in_library`, and it shares that function's two
     properties: it selects both the outer tab and the inner section, and **it scans nothing**. The
     operator presses Scan when they are ready; until then no disk is walked.
 
-    What it hands over is the *parent* output folder with subfolders included, because every run
-    writes its own fresh timestamped subfolder and the Raw Cutter keeps no run-directory state. So
-    the message says exactly that rather than implying this is the one run's directory -- an
-    operator who has cut three times will see all three, which is honest and usually what they
-    want.
+    [FORK] Digital-Union (Raw Cutter R11): what arrives is `cut_handoff_state` -- the record the
+    completed job published -- not the `cut_output` widget it used to read. That is the whole
+    feature. Three consequences worth stating, because each replaces something this function used
+    to do wrong:
 
-    Total by construction: a missing or blank folder is reported and changes nothing, and every
-    return path yields one update per output so Gradio's positional alignment cannot drift.
+    * **The directory is the job's own.** A single run hands over its `run_directory`, a batch its
+      `batch_directory`. Neither is inferred from a timestamp, reconstructed from the output-root
+      text or parsed out of a status message, and there is **no fallback to the parent folder** --
+      the parent is what used to be handed over, and showing an operator three jobs when they
+      asked about one is exactly the inaccuracy R11 removes.
+    * **Recursion follows the job's shape**, from the record, rather than being hardcoded on.
+    * **Editing the output-folder widget afterwards cannot redirect the handoff**, because that
+      widget is no longer an input to this handler at all.
+
+    The record is re-validated through `fork_handoff.read` rather than trusted: it has been round
+    -tripped through session state, so on the way back in it is untrusted input. One `isdir` check
+    then asks whether the folder is still there -- a single `stat`, not a walk, and deliberately
+    asked now rather than cached, because a record describes a job that finished and not a disk
+    that has stayed still since. A folder that has gone is **reported**, never repaired and never
+    silently replaced by one that still exists.
+
+    Total by construction: every return path yields one update per output, so Gradio's positional
+    alignment cannot drift, and the two refusal paths change no widget but the report.
     """
-    folder = str(output_folder or '').strip()
-    if not folder:
+    record = fork_handoff.read(handoff)
+    if record is None:
+        return (gr.update(), gr.update(), gr.update(), gr.update(), CUT_HANDOFF_NONE_TEXT)
+    folder = record['directory']
+    if not os.path.isdir(folder):
         return (gr.update(), gr.update(), gr.update(), gr.update(),
-                "Set an output folder first — there is nothing to open yet.")
+                CUT_HANDOFF_MISSING_TEXT.format(folder=folder))
     return (gr.update(value=folder),
-            gr.update(value=True),
+            gr.update(value=record['recursive']),
             gr.Tabs(selected='tab-media-library'),
             gr.Tabs(selected='tab-video-review'),
-            f"Loaded the Raw Cutter output folder into Media Library → Video Review:\n{folder}\n"
-            f"Subfolders are included, because each cut writes its own timestamped subfolder.\n"
-            f"Press Scan Folder there when you are ready to review.")
+            fork_handoff.loaded_text(record))
 
 
 def _browse_audio_source(current):
@@ -10830,17 +10968,22 @@ def create_ui() -> gr.Blocks:
                 # so it is available in Single and Folder Batch alike -- those two columns are
                 # mutually exclusive and a button inside either would vanish in the other mode.
                 #
-                # It hands over `cut_output` (the parent output folder) with subfolders INCLUDED,
-                # rather than the exact run directory. That is a deliberate accuracy trade and not
-                # laziness: every run writes its own fresh timestamped subfolder, and the Raw
-                # Cutter keeps no run-directory state the way the Audio Cutter's
-                # `audio_run_dir_state` does. Adding one would mean changing the Cut handler's
-                # return signature, which several suites pin positionally -- so the button reads a
-                # widget that already exists and tells the operator exactly what it did. Reviewing
-                # still never requires having run a cutter: Video Review's folder box is editable
-                # and this only ever fills it in.
+                # [FORK] Digital-Union (Raw Cutter R11): it now hands over the FINISHED JOB's own
+                # directory, read from `cut_handoff_state` below, and no longer reads `cut_output`
+                # at all. The R8 version handed over the parent output folder with subfolders
+                # forced on, because the Raw Cutter kept no run-directory state the way the Audio
+                # Cutter's `audio_run_dir_state` does; that was an accepted accuracy trade, and
+                # its cost was that an operator who had cut three times was shown all three. R11
+                # pays the price that trade was avoiding -- the Cut handlers' return signatures,
+                # which several suites pin positionally, are widened here and in those suites
+                # together.
+                #
+                # It starts UNAVAILABLE, for the same reason Cut Video does: before a job has
+                # written clips there is no particular job to review, and an enabled button could
+                # only earn a refusal. Reviewing still never requires having run a cutter --
+                # Video Review's own folder box is editable and this only ever fills it in.
                 cut_open_library_btn = gr.Button(
-                    LABEL_CUT_OPEN_LIBRARY, variant='secondary', size='sm',
+                    LABEL_CUT_OPEN_LIBRARY, variant='secondary', size='sm', interactive=False,
                     elem_id='cut-open-library-button')
                 gr.Markdown(INFO_CUT_OPEN_LIBRARY)
 
@@ -10848,6 +10991,14 @@ def create_ui() -> gr.Blocks:
                 # handle or lifecycle -- may enter `gr.State`, and a dict is also what lets the
                 # Cut handler recompute the staleness signature and compare it.
                 cut_plan_state = gr.State(None)
+                # [FORK] Digital-Union (Raw Cutter R11): the finished job's handoff record, under
+                # exactly the same discipline -- a plain dict of primitives, or `None` for "no
+                # job". It is SESSION state, which is the point: two browser sessions each review
+                # their own last job, and a process-global path would let one operator's cut
+                # redirect another's review. Nothing live may enter it, no filesystem handle, no
+                # job and no lock -- what it holds is a folder NAME and three numbers about a job
+                # that is already over.
+                cut_handoff_state = gr.State(None)
 
             # [FORK] Digital-Union (R7 Raw Audio Cutter V1): the SIXTH top-level tab, placed
             # between Advanced Tools and Clips Preview.
@@ -12265,12 +12416,17 @@ def create_ui() -> gr.Blocks:
                      cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
         )
+        # [FORK] Digital-Union (Raw Cutter R11): two outputs are APPENDED after the payload and
+        # BEFORE the three button states, which is the one position that works. The button set is
+        # emitted as the tail of `(payload…) + _cut_handoff(…) + buttons`, so the handoff pair has
+        # to sit between them; putting it last would misalign every button update on every frame.
+        # `inputs` is untouched -- a handoff is something a job produces, never something it reads.
         cut_run_btn.click(
             fn=_on_cut_run,
             inputs=[cut_plan_state, cut_source, cut_output, cut_sensitivity,
                     cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output,
                     cut_output_profile],
-            outputs=[cut_report, cut_progress,
+            outputs=[cut_report, cut_progress, cut_handoff_state, cut_open_library_btn,
                      cut_analyze_btn, cut_run_btn, cut_cancel_btn],
             concurrency_limit=None,
         )
@@ -12296,9 +12452,14 @@ def create_ui() -> gr.Blocks:
         # It is not a render and not a cut: no `_RENDER_LOCK`, no cutter lane, and its own
         # unlimited concurrency lane for the measured R3 reason -- a lane of 1 would queue a
         # second click instead of letting it run.
+        #
+        # [FORK] Digital-Union (Raw Cutter R11): `inputs` is the handoff record, NOT `cut_output`.
+        # That substitution is the feature, and it also closes a hazard the old wiring had: with
+        # the output-folder widget as the input, editing that box after a job finished silently
+        # redirected the finished job's review. The record is frozen at the moment the job ended.
         cut_open_library_btn.click(
             fn=_on_cut_open_in_library,
-            inputs=[cut_output],
+            inputs=[cut_handoff_state],
             outputs=[clips_input, clips_recursive, main_tabs, library_tabs, clips_report],
             concurrency_limit=None,
         )
@@ -12352,7 +12513,10 @@ def create_ui() -> gr.Blocks:
             inputs=[cut_batch_folder, cut_batch_recursive, cut_output, cut_sensitivity,
                     cut_min_seconds, cut_max_seconds, cut_remove_audio, cut_rename_output,
                     cut_output_profile],
+            # [FORK] R11: the same two appended outputs, in the same position and for the same
+            # reason -- after the payload, before the button states.
             outputs=[cut_batch_status, cut_batch_summary, cut_batch_progress,
+                     cut_handoff_state, cut_open_library_btn,
                      cut_batch_count_btn, cut_batch_start_btn, cut_batch_cancel_btn],
             concurrency_limit=None,
         )

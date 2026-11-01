@@ -6,6 +6,7 @@ paths:
   - "tests/test_gui_progress_seam.py"
   - "tests/test_creative_controls_seam.py"
   - "tests/test_audio_layers_seam.py"
+  - "tests/test_cut_handoff.py"
 ---
 > Scoped rule. The always-loaded constitution is the root `CLAUDE.md`; operating policies are in
 > `.claude/rules/operating-policies.md`.
@@ -472,6 +473,47 @@ automatically.
     sites; the panel reports `GPU usage: Unavailable` and names the encoder instead, and Qwen is
     reported as *not used* rather than as offline. Adding a sampler to fill in a percentage would
     break the pinned site count and buy a cosmetic number.
+- **The Raw Cutter's "Review these clips" handoff is a RECORD, and the gate lives in the record
+  (R11).** `cut_handoff_state` is session state holding a plain dict of primitives —
+  `{directory, recursive, clips, mode, outcome}` — or `None`. All the policy is in the pure
+  `beatsync_fork/cut_handoff.py`; `gui.py` supplies the facts.
+
+  ```
+  _cut_handoff(record)  ->  (record, gr.update(interactive=fork_handoff.is_offer(record)))
+  ```
+
+  Returned as one pair for exactly the reason `_cut_buttons` is: writing the state and the control
+  that reads it separately is how a record outlives the button that offers it, or a button stays
+  lit over a record that was just cleared. Six rules, each of which something used to get wrong:
+
+  * **`build()` answers `None` unless a directory was named AND at least one clip reached disk.**
+    That is the "never offer an empty folder" gate, and it is a property of the record rather than a
+    check each of the eight emitting paths has to remember. `read()` re-applies it to a record
+    coming back out of session state — untrusted input on the way in — by *rebuilding* through
+    `build`, so a tampered `recursive` is corrected to what its mode implies rather than honoured.
+  * **The count is PUBLISHED clips.** `done` / `written` / `completed` for a single run (the
+    callback's list, because a cancellation discards `export_segments`' return value);
+    `summarise(...).clips_written` for a batch, carried out through `publish()`. `plan.count` and
+    `clips_planned` must stay unreachable from every `fork_handoff.build` call site.
+  * **The exact directory is published by the handler that created it.** `sink['directory']` is
+    written where `started = bool(batch_directory)` is already known, and popped when the run never
+    obtained one. A wrapper that rebuilt it from the output-root text plus a timestamp would be
+    guessing. There is **no fallback** — not the parent, not the output root, not `abspath('')`.
+  * **Every non-terminal and every refused frame emits `_cut_handoff(None)`**, which is what makes
+    "a new, failed or refused cut cannot present the previous job's folder" structural.
+  * **The batch's outcome comes from `_CUT_BATCH_HANDOFF`**, keyed by `fork_cutter_batch`'s own
+    `TERMINAL_*` vocabulary — a fourth rendering of the one classifier the headline, the manifest
+    and the activity panel share. A missing key resolves to no outcome, which `build` refuses.
+  * **Pressing it does exactly one `os.path.isdir`.** A single `stat`, asked *then* rather than
+    cached, because a record describes a finished job and not a disk that stayed still. No walk, no
+    probe, no FFmpeg, no move, no rename, no decision write. `inputs=[cut_handoff_state]` and
+    **not** `cut_output`: with the widget as input, editing it after a job finished silently
+    redirected that job's review.
+
+  The two appended outputs sit **between the payload and the three button states** on both handlers
+  (`_on_cut_run` 7, `_on_cut_batch_run_ui` 8) because the button set is the tail of every emitted
+  expression — appending after it misaligns all three updates on every frame. `_on_cut_batch_run`
+  keeps its name, signature, body and 2-tuple arity; it gained only sink writes.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -481,6 +523,7 @@ automatically.
 |---|---|
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | the Raw Cutter's **Activity & Performance** panel, `_cut_activity` / `_cut_activity_final`, `CUT_ACTIVITY_JS` or `raw_cutter_activity.py` (R12) | the R12 bullet above **+** `ROADMAP.md` R12 for the product contract — and `tests/test_raw_cutter_activity.py`, which executes the pure timer rules rather than asserting about them |
+| the **"Review these clips"** button, `cut_handoff_state`, `_cut_handoff`, `_on_cut_open_in_library`, `_CUT_BATCH_HANDOFF` or `cut_handoff.py` (R11) | the R11 bullet above **+** `ROADMAP.md` R11 for the product contract — and `tests/test_cut_handoff.py`, which executes the real `_on_cut_run` on every terminal path rather than asserting about it. `.claude/rules/clips-preview.md` too if you touch what Video Review does with the folder it receives |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |
