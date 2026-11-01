@@ -791,6 +791,47 @@ class Discovery:
     error: str = ""
 
 
+def normalize_folder_text(value: Any) -> str:
+    """The operator's typed folder text, or ``""`` when they did not actually name a folder.
+
+    Both review surfaces funnel a typed path through the same two steps -- normalise it, then make
+    it absolute -- and ``os.path.abspath("")`` returns the **current working directory**, which for
+    this app is its own install folder. So the emptiness test has to happen *here*, before
+    ``abspath`` can invent a path out of nothing: an unnamed review folder otherwise quietly meant
+    "review everything under the application directory", and a Scan with a field holding nothing
+    but quotation marks enumerated the bundled demo media and the operator's finished renders.
+
+    Returns ``""`` for anything that does not name a folder -- not a string at all, blank,
+    whitespace-only, nothing but quotation marks, a quoted run of spaces, or an environment-variable
+    reference that expands to nothing or to nothing but whitespace -- and ``""`` is each caller's
+    signal to refuse rather than resolve.
+
+    Two orderings in here are the whole correction, and both were measured:
+
+    * **Strip, then re-test.** The pre-fix guard tested ``folder.strip()`` and only then removed the
+      quotation marks, so ``'""'`` passed a test it would have failed one step later. The trailing
+      ``strip()`` is deliberate for the same reason: a quoted run of spaces is still nothing, and it
+      only looks non-empty until the quotes come off.
+    * **Expand, then re-test.** The expansion happens *inside* this function and the caller tests
+      what comes back, so ``%VAR%`` for a variable set to the empty string is refused too. Testing
+      before expanding would let it through to ``abspath("")``.
+
+    ``str()`` is deliberately **not** applied to a non-string. ``str(None)`` is ``"None"``, which
+    abspath turns into a real child of the working directory, and the operator is then told that a
+    folder named `None` could not be found -- a confusing refusal in place of an accurate one.
+
+    This is the video/audio review sibling of ``raw_cutter_export._normalize_folder_text``, kept
+    here rather than imported because ``raw_cutter_export`` is upstream-adjacent and reaches the
+    runtime this package may not import.
+    """
+    if not isinstance(value, str):
+        return ""
+    trimmed = value.strip().strip('"').strip()
+    if not trimmed:
+        return ""
+    return os.path.expandvars(os.path.expanduser(trimmed)).strip()
+
+
 def discover_clips(folder: Any, recursive: Any) -> Discovery:
     """Enumerate reviewable clips in the Raw Cutter's own deterministic order.
 
@@ -802,9 +843,10 @@ def discover_clips(folder: Any, recursive: Any) -> Discovery:
     """
     from beatsync_fork import input_manager
 
-    if not isinstance(folder, str) or not folder.strip():
+    folder_text = normalize_folder_text(folder)
+    if not folder_text:
         return Discovery(recursive=bool(recursive), error="Enter the folder that holds the clips.")
-    root = os.path.abspath(os.path.expandvars(os.path.expanduser(folder.strip().strip('"'))))
+    root = os.path.abspath(folder_text)
     if not os.path.exists(root):
         return Discovery(root=root, recursive=bool(recursive), error=f"Folder not found:\n{root}")
     if not os.path.isdir(root):

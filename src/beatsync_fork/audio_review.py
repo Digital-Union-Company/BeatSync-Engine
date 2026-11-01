@@ -105,13 +105,19 @@ def discover_audio(folder: Any, recursive: Any) -> core.Discovery:
 
     Every failure is a :class:`~beatsync_fork.clips_review.Discovery` carrying ``error`` prose --
     never an exception -- because every caller is a Gradio event handler.
+
+    "Did the operator actually name a folder?" is :func:`core.normalize_folder_text`, for the same
+    reason the order is that module's: this one already shares the registry, the authorization
+    gates and the ``Discovery`` record with it, so sharing the one answer adds no dependency and
+    keeps a refusal from being right on one tab and wrong on the other.
     """
     from beatsync_fork import input_manager
 
-    if not isinstance(folder, str) or not folder.strip():
+    folder_text = core.normalize_folder_text(folder)
+    if not folder_text:
         return core.Discovery(recursive=bool(recursive),
                               error="Enter the folder that holds the audio clips.")
-    root = os.path.abspath(os.path.expandvars(os.path.expanduser(folder.strip().strip('"'))))
+    root = os.path.abspath(folder_text)
     if not os.path.exists(root):
         return core.Discovery(root=root, recursive=bool(recursive),
                               error=f"Folder not found:\n{root}")

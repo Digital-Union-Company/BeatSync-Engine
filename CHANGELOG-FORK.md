@@ -20,6 +20,54 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-01 (Clips Review and Audio Review: an unnamed review folder is refused, not guessed)
+
+**Scan with nothing but quotation marks in the folder box no longer reviews the application's own
+install directory.** The same defect PR #83 fixed in the Raw Cutter was still present in both review
+surfaces, reached by a different shape of input. `discover_clips` and `discover_audio` tested
+`folder.strip()` for emptiness and only *then* stripped the surrounding quotation marks, so text
+that was nothing but quotes passed a test it would have failed one step later, arrived at
+`os.path.abspath("")` — which returns the current working directory, the app's own folder — and was
+enumerated as a perfectly ordinary review folder. That is what a Windows "Copy as path" paste leaves
+behind once the path between the quotes has been deleted.
+
+Measured on `ffb828a1`, with the process running in a stand-in install directory holding bundled demo
+media and a finished render. Seven input shapes enumerated that directory in **both** functions:
+
+| Folder text | Before | After |
+|---|---|---|
+| `""`, `"`, `""""` | 2 files, root = the application directory | refused, no root reported |
+| `"   "`, `  "  "  `, `" "` | 2 files, root = the application directory | refused, no root reported |
+| `%VAR%` for a variable set to `""` (quoted or not) | 2 files, root = the application directory | refused, no root reported |
+| `""`, `"   "` (already-blank text, `None`, `7`) | already refused | refused, unchanged |
+| absolute, quoted, padded, relative, `%VAR%`, `~` | resolved | resolved, unchanged |
+
+The fix is `clips_review.normalize_folder_text`, applied **before** either function makes a path
+absolute, so the emptiness test happens while there is still an empty value to see. Two orderings in
+it are the whole correction and both are pinned by test: strip the quotation marks and *re-test*, and
+expand environment variables and `~` inside the normalizer so the caller tests the **post-expansion**
+value — which is why `%VAR%` for an empty variable is now refused too, a case the quote-only report
+did not name. `str()` is deliberately not applied to a non-string, because `str(None)` becomes the
+literal path component `None` and the operator is then told that a folder called `None` was not found.
+
+`audio_review` calls the core's normalizer rather than defining a second one, the same way it already
+shares the registry, the six authorization gates and the `Discovery` record with it — so a refusal
+cannot be right on one tab and wrong on the other. Each function keeps its own existing refusal
+wording ("Enter the folder that holds the clips." / "…the audio clips."), its deterministic
+`input_manager.scan_folder` ordering and its media allowlist.
+
+**Separately verified, and not defective:** the post-PR #83 Raw Cutter was re-measured against the
+same `%VAR%`-expands-to-empty concern, through its real `discover_batch_sources` and
+`resolve_batch_roots` rather than through its helper alone. All four quote-only and empty-variable
+shapes refuse at both entry points, because PR #83's normalizer already expands before it returns and
+both callers test the returned value. No Raw Cutter change was needed or made.
+
+Nothing about media serving, authorization, file transfer, `ReviewStore`, the durable journal or the
+sort/filing path is touched: the refusal happens before the scan, and a test asserts the normalizer
+is reached only from discovery and is named nowhere in either media server, in `audio_library` or in
+`collision`. A further structural test pins it as a text function — no `abspath`, no probe, no
+listing, no move, no process.
+
 ### Fixed — 2026-11-01 (Raw Cutter: an unnamed Folder Batch folder is refused, not guessed)
 
 **Start Batch with a blank folder field no longer cuts the application's own install directory.**

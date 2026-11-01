@@ -840,6 +840,44 @@ extension — which matters, because it is the file that holds the real source p
 file is rejected; and a file with real bytes that Chromium cannot decode **is** enumerated,
 because an unplayable clip must still be classifiable.
 
+### An unnamed folder is refused BEFORE it is made absolute
+
+`os.path.abspath("")` returns the **current working directory**, which for this app is its own
+install folder — so any normalisation that can produce `""` turns an unnamed review folder into
+"review everything we shipped, plus every render in `output/`". `discover_clips` used to test
+`folder.strip()` for emptiness and only *then* strip the surrounding quotation marks, so text that
+was nothing but quotes passed a test it would have failed one step later. Measured on `ffb828a1`
+from inside a stand-in install directory: `""`, `"`, `""""`, `"   "`, `  "  "  ` and `%VAR%` for a
+variable set to the empty string each enumerated that directory, in **both** review surfaces.
+
+`normalize_folder_text` is the one answer, and **two orderings in it are the whole correction**:
+
+* **strip the quotes, then re-test** — including a trailing `strip()`, because a quoted run of
+  spaces is still nothing and only looks non-empty until the quotes come off;
+* **expand, then re-test** — `expandvars`/`expanduser` run *inside* the normaliser and the caller
+  tests what comes back, which is what refuses `%VAR%` for an empty variable. Testing before
+  expanding lets it through to `abspath("")`.
+
+`str()` is deliberately **not** applied to a non-string: `str(None)` is `"None"`, a real child of
+the working directory, and the operator is then told a folder called `None` was not found. The
+normaliser is a **text** function — no `abspath`, no probe, no listing, no move, no process — and
+resolving stays the caller's job; a structural test pins that, with the docstring excluded from the
+substring check, because prose explaining the `abspath` hazard trips a ban on the word.
+
+`audio_review.discover_audio` **calls this one** rather than defining a second — see
+`.claude/rules/audio-review.md`. It is the sibling of `raw_cutter_export._normalize_folder_text`
+(PR #83) and is kept here rather than imported, because `raw_cutter_export` reaches the runtime this
+package may not import.
+
+**`identify_root` still has the old ordering, and that is recorded rather than fixed.** It accepts
+`'""'` and resolves it to the application directory at the unit level. In the shipped GUI the
+destination path is **not** reachable: `gui.py` always passes `app_root=ROOT_DIR`, and
+`protected_runtime_destination` refuses it because `output/`, `bin/` and `state/` lie inside that
+root — so the refusal is safe but names the wrong reason. `audio_review.validate_destinations`
+already strips before testing and answers `empty_path`, and `compare_destinations` answers
+`destinations_identical`. Changing `identify_root` moves stable refusal codes on the transfer-gating
+path and was deliberately left out of the discovery hotfix; do not "tidy" it without its own review.
+
 ## Path relationships are refused before anything is read
 
 `validate_roots` compares **resolved real paths** with `commonpath` (never a string prefix, so

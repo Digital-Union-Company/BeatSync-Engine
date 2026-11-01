@@ -197,6 +197,27 @@ on a mono voice clip would double the bitrate it needs for the same quality.
 `.mp3` is already in `audio_mix.SUPPORTED_VOICE_EXTENSIONS`, so the clips work in Audio Layers; a
 test asserts **every** format the cutter can write is accepted there, so the two cannot drift.
 
+## An unnamed folder is refused before it is made absolute, by the CORE's normaliser
+
+`os.path.abspath("")` is the working directory, which for this app is its own install folder, so
+folder text that normalises to nothing used to mean "review every render in `output/`".
+`discover_audio` had the same ordering defect its video sibling had — emptiness tested on
+`folder.strip()`, quotation marks removed only afterwards — and the same seven input shapes
+(`""`, `"`, `""""`, `"   "`, `  "  "  `, `" "`, and `%VAR%` for an empty variable) enumerated the
+install directory. Measured on `ffb828a1`.
+
+It now calls **`core.normalize_folder_text`** and defines nothing of its own, the same way it
+already shares the registry, the six authorization gates and `Discovery` — so a refusal cannot be
+right on one tab and wrong on the other. The full contract, and the two orderings that are the
+whole correction, are in `.claude/rules/clips-preview.md`; a test asserts this module contains no
+`def normalize_folder_text` and that both tabs answer identically. Each surface keeps its **own**
+refusal wording ("…the clips." / "…the audio clips."), its `input_manager.scan_folder` ordering and
+its media allowlist.
+
+`validate_destinations` was already correct here — it strips before it tests, and answers
+`empty_path` — and is untouched. Nothing about serving, authorization, the sort plan or filing
+changes: the refusal happens before the scan.
+
 ## Nothing scans as a side effect
 
 An explicit requirement, and the easy thing to get wrong once a folder box has a remembered value.
