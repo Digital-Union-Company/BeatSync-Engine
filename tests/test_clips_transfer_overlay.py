@@ -517,6 +517,470 @@ def test_classification_works_again_the_moment_the_sort_finishes(world):
     assert answer["ok"] is True, answer
 
 
+# =============================================================================================
+# 4b — F-1: a decision accepted by the server can never be silently ignored by a transfer
+# =============================================================================================
+#
+# Section 4 above tests the easy half: a classification arriving *while* a batch is being sorted.
+# The defect was in the window before that -- between the transfer reading its decision snapshot
+# and claiming its slot -- where `busy()` legitimately reported nothing and a decision was
+# accepted, made durable, and then ignored by the batch, both halves reporting success.
+#
+# Every test here places an interleaving by construction rather than by racing the clock: the
+# admission hook fires in the instant between the snapshot and the claim, and `_SuspendedCommit`
+# suspends the one place a decision becomes durable. Real store, real handler, real files.
+
+def _hook_admission(world, before):
+    """Run ``before()`` ONCE, in the instant between the transfer's snapshot and its admission.
+
+    Wrapping the guard instance is what makes this a *scheduler* rather than a race: the handler
+    looks `begin` up on the object when it calls it, so this is the shipped code path with one
+    extra statement at an exactly known point.
+
+    One-shot deliberately. It models one operator click landing in one window, and a hook that
+    fired on every admission would also fire on the *retry* -- re-classifying each time, so the
+    retry would be refused for the same reason, for ever. That is an artefact of the hook, not of
+    the handler: a refusal says "press Confirm again", and the second press only meets a changed
+    snapshot if somebody really did classify again inside it.
+    """
+    guard = world["ns"]["_CLIPS_TRANSFERS"]
+    real = guard.begin
+    fired = []
+
+    def hooked(*args, **kwargs):
+        if not fired:
+            fired.append(True)
+            before()
+        return real(*args, **kwargs)
+
+    guard.begin = hooked
+    return guard
+
+
+class _SuspendedCommit:
+    """Hold a classification open *inside* its durable commit.
+
+    `ReviewStore.decide` is the only place a decision becomes durable, so suspending it is how a
+    commit is placed after an instant the transfer has already passed -- which is the one thing a
+    post-admission snapshot re-read cannot defend against on its own.
+    """
+
+    def __init__(self, world):
+        self.store = world["ns"]["_clips_store"]()
+        self._real = self.store.decide
+        self.entered = threading.Event()
+        self.may_commit = threading.Event()
+        self.committed = threading.Event()
+        self.store.decide = self._wrapped
+
+    def _wrapped(self, *args, **kwargs):
+        self.entered.set()
+        assert self.may_commit.wait(10), "the test never released the suspended commit"
+        try:
+            return self._real(*args, **kwargs)
+        finally:
+            self.committed.set()
+
+    def classify_in_background(self, world, owner, view, entry, to, rev):
+        answer = {}
+
+        def run():
+            answer["reply"] = world["ns"]["_clips_decide"](
+                owner, view["session"], view["page"], entry, {"to": to, "rev": rev})
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        assert self.entered.wait(10), "the classification never reached its durable commit"
+        return thread, answer
+
+
+def _where(world, name):
+    if os.path.exists(os.path.join(world["library"], name)):
+        return "library"
+    if os.path.exists(os.path.join(world["rejected"], name)):
+        return "rejected"
+    return "unmoved"
+
+
+def _landed(world, role="library"):
+    """What is in a destination, treating "never created" as "nothing arrived".
+
+    A press refused before its first move never reaches `iter_sorted_clips`, so the destination
+    may legitimately not exist yet -- which is itself the strongest form of "nothing moved", and
+    must not read as a test error.
+    """
+    try:
+        return sorted(os.listdir(world[role]))
+    except FileNotFoundError:
+        return []
+
+
+def test_case_a_a_decision_committed_before_the_snapshot_is_in_the_plan(world):
+    """The ordinary case, stated as a control: a classification that finished before Confirm was
+    pressed is simply part of the batch. The correction must not turn this into a refusal."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    target = view["entries"][1]
+    identity = view["identity"][target.clip_id]
+    _, revision = namespace["_clips_store"]().get(identity)
+
+    answer = namespace["_clips_decide"](owner, view["session"], view["page"], target,
+                                        {"to": _REJECTED, "rev": revision})
+    assert answer["ok"] is True
+    frames = _frames(world, owner)
+
+    assert _where(world, os.path.basename(target.path)) == "rejected", \
+        "the accepted decision was not the one the transfer acted on"
+    assert world["ui"]["CLIPS_DECISIONS_CHANGED_TEXT"] not in frames[-1][_MESSAGE], \
+        "a decision that predates the snapshot must not be reported as a late change"
+    assert len(frames) > 1, "a real sort must still show the Working state"
+
+
+def test_case_b_a_delayed_durable_write_cannot_be_overtaken_by_the_transfer(world):
+    """The straddle, and the heart of F-1.
+
+    The classification is past every check and inside its journal append; the transfer then tries
+    to start. Admitting it would move files by a snapshot that is about to be contradicted, while
+    the classification reports success. So the transfer is refused instead -- explicitly, in one
+    frame, having moved nothing.
+    """
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    target = view["entries"][1]
+    identity = view["identity"][target.clip_id]
+    _, revision = namespace["_clips_store"]().get(identity)
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    def during_the_window():
+        held["thread"], held["answer"] = suspended.classify_in_background(
+            world, owner, view, target, _REJECTED, revision)
+
+    _hook_admission(world, during_the_window)
+    frames = _frames(world, owner)
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    assert len(frames) == 1, f"a refused press must move nothing and show one frame: {len(frames)}"
+    assert world["ui"]["CLIPS_DECISION_IN_FLIGHT_TEXT"] == frames[0][_MESSAGE], frames[0][_MESSAGE]
+    assert _landed(world) == [], "a refused transfer moved a file"
+    assert held["answer"]["reply"]["ok"] is True, \
+        "the classification was the one holding the floor; it must still succeed"
+    assert namespace["_clips_store"]().get(identity) == (_REJECTED, revision + 1)
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0, "a decision slot leaked"
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None, "a reservation leaked"
+
+
+def test_case_c_a_classification_after_admission_does_not_advance_the_revision(world):
+    """Section 4 asserts the refusal; this asserts the two things that make it safe -- no durable
+    revision moved, and no decision slot was taken by a request that was refused."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    target = view["entries"][2]
+    identity = view["identity"][target.clip_id]
+    before = namespace["_clips_store"]().get(identity)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    answer = namespace["_clips_decide"](owner, view["session"], view["page"], target,
+                                        {"to": _REJECTED, "rev": before[1]})
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0, \
+        "a refused classification registered a decision slot"
+    list(stream)
+
+    assert answer["ok"] is False and answer["code"] == "transfer_in_progress"
+    assert namespace["_clips_store"]().get(identity) == before, \
+        "a refusal reached the durable record"
+
+
+def test_case_d_no_decision_is_ever_accepted_and_then_ignored(world):
+    """The invariant itself, asserted as the conjunction that must never hold: accepted, durable,
+    and contradicted by where the file actually went.
+
+    This is the case that proves a post-admission snapshot re-read is not sufficient on its own.
+    Measured against a probe carrying only that re-read, the commit landed immediately after the
+    comparison, the re-read saw nothing, and the file moved by the stale snapshot. The claim in
+    `TransferGuard.begin_decision` is what closes it.
+    """
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    target = view["entries"][1]
+    identity = view["identity"][target.clip_id]
+    name = os.path.basename(target.path)
+    _, revision = namespace["_clips_store"]().get(identity)
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    _hook_admission(world, lambda: held.update(zip(
+        ("thread", "answer"),
+        suspended.classify_in_background(world, owner, view, target, _REJECTED, revision))))
+    frames = _frames(world, owner)
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    accepted = held["answer"]["reply"]["ok"] is True
+    durable = namespace["_clips_store"]().get(identity)[0]
+    landed = _where(world, name)
+    assert not (accepted and landed == "library" and durable == _REJECTED), (
+        f"accepted={accepted} durable={durable} landed={landed}: a decision the server accepted "
+        f"was silently ignored by the transfer, and both reported success")
+    assert landed == "unmoved", f"the refused transfer moved the clip to {landed}"
+    assert len(frames) == 1
+
+
+def test_case_e_an_acknowledged_keep_never_lands_in_discarded(world):
+    """The operator's own account of the bug: they marked a clip Keep, were told Keep, and watched
+    it go to Discarded -- because the sweep had already planned it as unmarked.
+
+    The classification runs to completion inside the admission window, so it holds no slot by the
+    time `begin` runs and admission is right to succeed. The post-admission re-read is what
+    catches it, which is why both halves of the correction are needed.
+    """
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    store = namespace["_clips_store"]()
+
+    kept, late = view["entries"][0], view["entries"][1]
+    _, revision = store.get(view["identity"][kept.clip_id])
+    namespace["_clips_decide"](owner, view["session"], view["page"], kept,
+                               {"to": _SELECTED, "rev": revision})
+
+    gate = _frames(world, owner)
+    assert len(gate) == 1 and gate[0][_ARMED], "the sweep gate did not arm"
+    armed = gate[0][_ARMED]
+
+    answer = {}
+
+    def during_the_window():
+        _, current = store.get(view["identity"][late.clip_id])
+        answer["reply"] = namespace["_clips_decide"](
+            owner, view["session"], view["page"], late, {"to": _SELECTED, "rev": current})
+
+    _hook_admission(world, during_the_window)
+    frames = _frames(world, owner, armed=armed)
+
+    assert answer["reply"]["ok"] is True, "the Keep was not acknowledged at all"
+    assert _where(world, os.path.basename(late.path)) != "rejected", \
+        "a clip the server accepted as KEEP was swept into Discarded"
+    assert _where(world, os.path.basename(late.path)) == "unmoved"
+    assert len(frames) == 1 and frames[0][_MESSAGE] == world["ui"]["CLIPS_DECISIONS_CHANGED_TEXT"]
+    assert _landed(world) == [], "the refused sweep moved something"
+
+
+def test_case_f_an_acknowledged_reject_never_lands_in_the_library(world):
+    """The same defect in the other direction, which matters because it has no sweep in it: a
+    plain Confirm, and a clip re-classified from Keep to Discard inside the window."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    store = namespace["_clips_store"]()
+    late = view["entries"][1]
+    answer = {}
+
+    def during_the_window():
+        _, current = store.get(view["identity"][late.clip_id])
+        answer["reply"] = namespace["_clips_decide"](
+            owner, view["session"], view["page"], late, {"to": _REJECTED, "rev": current})
+
+    _hook_admission(world, during_the_window)
+    frames = _frames(world, owner)
+
+    assert answer["reply"]["ok"] is True
+    assert _where(world, os.path.basename(late.path)) != "library", \
+        "a clip the server accepted as REJECTED was moved into the Media Library"
+    assert len(frames) == 1 and frames[0][_MESSAGE] == world["ui"]["CLIPS_DECISIONS_CHANGED_TEXT"]
+    assert _landed(world) == [], \
+        "nothing may move on a press that refused before the Working frame"
+
+    # And the retry sorts the page as it now stands, which is what makes the refusal honest
+    # rather than a dead end.
+    again = _frames(world, owner)
+    assert len(again) > 1, "the retry was refused too"
+    assert _where(world, os.path.basename(late.path)) == "rejected"
+
+
+def test_case_g_two_sessions_on_one_folder_exclude_each_others_decisions_and_sorts(world):
+    """Neither tab ever saw the other's greyed-out button, which is the whole reason this lives on
+    the server. The second tab's in-flight decision refuses the first tab's transfer."""
+    namespace = world["ns"]
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    _scan(world, "tab-b")
+    other = namespace["_clips_view"]("tab-b")
+    target = other["entries"][0]
+    _, revision = namespace["_clips_store"]().get(other["identity"][target.clip_id])
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    _hook_admission(world, lambda: held.update(zip(
+        ("thread", "answer"),
+        suspended.classify_in_background(world, "tab-b", other, target, _REJECTED, revision))))
+    frames = _frames(world, "tab-a")
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    assert len(frames) == 1
+    assert frames[0][_MESSAGE] == world["ui"]["CLIPS_DECISION_IN_FLIGHT_TEXT"]
+    assert _landed(world) == []
+    assert held["answer"]["reply"]["ok"] is True
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0
+
+
+def test_case_h_a_decision_on_a_different_folder_never_delays_a_sort(world):
+    """Exclusion is the two rules admission already used, not a global stop-the-world. Two
+    operators on two folders must not be able to refuse each other."""
+    namespace = world["ns"]
+    elsewhere = _tree_of_clips(world["tmp"] / "elsewhere", count=2)
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    namespace["_on_clips_scan"](elsewhere, True, str(world["tmp"] / "lib2"),
+                               str(world["tmp"] / "rej2"), 100,
+                               world["request"](session_hash="tab-b"))
+    other = namespace["_clips_view"]("tab-b")
+    target = other["entries"][0]
+    _, revision = namespace["_clips_store"]().get(other["identity"][target.clip_id])
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    _hook_admission(world, lambda: held.update(zip(
+        ("thread", "answer"),
+        suspended.classify_in_background(world, "tab-b", other, target, _SELECTED, revision))))
+    frames = _frames(world, "tab-a")
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    assert len(frames) > 1, "an unrelated folder's classification refused this sort"
+    assert len(_landed(world)) == 3, "the sort did not complete"
+
+
+def test_case_h_alias_spellings_of_one_folder_are_one_key(world):
+    """Two spellings of one directory must not look like two folders, or the cross-session rule
+    could be walked around by typing the path differently."""
+    key = world["ns"]["_clips_transfer_key"]
+    canonical = key(world["media"])
+    assert canonical
+    for spelling in (os.path.join(world["media"], ""),
+                     os.path.join(world["media"], "."),
+                     os.path.join(world["media"], "..", os.path.basename(world["media"])),
+                     world["media"] + os.sep):
+        assert key(spelling) == canonical, spelling
+
+
+def test_case_i_a_failing_durable_write_leaks_no_decision_slot(world):
+    """The slot is released in a `finally`, and this is why that matters: a slot that outlived a
+    failed commit would refuse this owner's transfers until the app restarted -- a worse failure
+    than the one being corrected."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    store = namespace["_clips_store"]()
+    target = view["entries"][0]
+    real = store.decide
+
+    def exploding(*args, **kwargs):
+        raise OSError("the journal could not be appended")
+
+    store.decide = exploding
+    try:
+        with pytest.raises(OSError):
+            namespace["_clips_decide"](owner, view["session"], view["page"], target,
+                                       {"to": _REJECTED, "rev": 1})
+    finally:
+        store.decide = real
+
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0, \
+        "a decision slot survived a failed durable write"
+    assert len(_frames(world, owner)) > 1, "the owner's transfers are now permanently refused"
+
+
+def test_case_i_a_stale_write_refusal_leaks_no_decision_slot(world):
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+
+    answer = namespace["_clips_decide"](owner, view["session"], view["page"],
+                                        view["entries"][0], {"to": _REJECTED, "rev": 99})
+    assert answer["ok"] is False and answer["code"] == cr.REVISION_CONFLICT
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0
+
+
+def test_case_i_an_abandoned_generator_releases_the_reservation(world):
+    """Gradio closing a dropped event raises `GeneratorExit` at the yield. The refusal added for
+    F-1 sits inside the same `try`, so neither path can strand the slot."""
+    owner = "tab-a"
+    _scan(world, owner)
+    _keep_all(world, owner)
+    namespace = world["ns"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash=owner))
+    next(stream)
+    stream.close()
+
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0
+
+
+def test_case_i_a_refused_late_change_releases_the_reservation(world):
+    """The new refusal returns from inside the `try` whose `finally` releases the slot, rather
+    than releasing by hand -- so a later edit cannot reintroduce a leak by adding a path."""
+    owner = "tab-a"
+    _scan(world, owner)
+    view = _keep_all(world, owner)
+    namespace = world["ns"]
+    store = namespace["_clips_store"]()
+    late = view["entries"][1]
+
+    def during_the_window():
+        _, current = store.get(view["identity"][late.clip_id])
+        namespace["_clips_decide"](owner, view["session"], view["page"], late,
+                                   {"to": _REJECTED, "rev": current})
+
+    _hook_admission(world, during_the_window)
+    frames = _frames(world, owner)
+
+    assert len(frames) == 1 and frames[0][_MESSAGE] == world["ui"]["CLIPS_DECISIONS_CHANGED_TEXT"]
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None, \
+        "the late-change refusal leaked a reservation"
+
+
+def test_case_j_the_sweep_gate_claims_neither_a_slot_nor_a_decision(world):
+    """The gate moves nothing, so it must leave the page unmarked in both registers -- otherwise a
+    gate the operator never answers would refuse their next classification."""
+    owner = "tab-a"
+    _scan(world, owner)
+    namespace = world["ns"]
+    view = namespace["_clips_view"](owner)
+    _, revision = namespace["_clips_store"]().get(view["identity"][view["entries"][0].clip_id])
+    namespace["_clips_decide"](owner, view["session"], view["page"], view["entries"][0],
+                               {"to": _SELECTED, "rev": revision})
+
+    gate = _frames(world, owner)
+
+    assert len(gate) == 1 and gate[0][_ARMED]
+    assert namespace["_CLIPS_TRANSFERS"].active_for(owner) is None
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0
+    answer = namespace["_clips_decide"](owner, view["session"], view["page"],
+                                        view["entries"][1], {"to": _SELECTED, "rev": 0})
+    assert answer["ok"] is True, "the unanswered gate refused a later classification"
+
+
 def test_refresh_does_not_light_confirm_back_up_mid_sort(world):
     """Presentation, not authority -- but a screen that contradicts the Working state invites a
     press the server is going to refuse. It can only ever disable."""

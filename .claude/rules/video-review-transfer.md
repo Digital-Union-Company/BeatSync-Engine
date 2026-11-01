@@ -21,9 +21,14 @@ transfer engine, not a new tab, not a second review surface and not a second col
 
 ```
 beatsync_fork/transfer_guard.py     NEW   the single-flight authority, pure policy
+                                    +     [F-1] begin_decision / end_decision / deciding,
+                                          DecisionSlot, DecisionInFlight, _conflicting_transfer
 beatsync_fork/clips_review.py       +     iter_sorted_clips, TransferTally, tally_outcomes
 gui.py  _clips_confirm_frames       ->    the handler is now a GENERATOR
-gui.py  _clips_decide               +     one refusal while a transfer is active
+                                    +     [F-1] a DecisionInFlight refusal, and the decision
+                                          snapshot RE-DERIVED under the reservation
+gui.py  _clips_decide               ->    [F-1] CLAIMS a decision slot instead of reading the
+                                          advisory busy(), and releases it in a finally
 ```
 
 `sort_decided_clips` keeps its exact signature and return type, `move_decided_clip` is **untouched**,
@@ -64,8 +69,24 @@ else's session, they would go looking for a press they never made.
   batch, on an exception and on an **abandoned generator**, where Gradio closing a dropped event
   raises `GeneratorExit` at the yield.
 * **`busy()` is ADVISORY and is labelled so in the source.** Reading it and then starting would be
-  the very race `begin` removes. Its callers use it to choose a *message*, and to refuse a
-  classification. Admission is `begin` and nothing else.
+  the very race `begin` removes. Its callers use it to choose a *message* **and nothing else**.
+  Admission is `begin`; a durable decision is `begin_decision`; those two are the only authorities.
+  It used to be documented as *also* refusing a classification, and that was the F-1 defect — a
+  read cannot refuse anything, because what it reports may change before the caller acts on it.
+* **A durable decision is CLAIMED, not permitted by a check (F-1).** `begin_decision` /
+  `end_decision` take a short-lived slot covering one `store.decide`, deciding under the **same**
+  lock as `begin` and by the **same** two rules. `begin` refuses `DecisionInFlight` while a
+  conflicting decision is still being written. The pair is mutually exclusive, which buys the
+  invariant the whole feature needs:
+
+  > Once `begin` has returned a reservation, no conflicting durable decision can be in flight and
+  > none can start until it is released — so a snapshot taken **after** admission is the batch's
+  > final truth, and a decision the server accepted can never be silently ignored by a transfer
+  > already running.
+
+  Neither call ever waits; both raise, and the caller turns that into an explicit retry. A
+  conflict is a sub-10-millisecond coincidence between two human-paced actions, so a queue would
+  add a blocking path to save nobody any time and a busy-wait would add an unbounded stall.
 
 `transfer_guard.py` performs **no path operations at all** — the caller normalises the folder key
 (`gui._clips_transfer_key`, `realpath` + `normcase`). A policy object that silently treated two
@@ -84,6 +105,8 @@ wired to:
 | Press | Frames |
 |---|---|
 | Any refusal (no identity, nothing scanned, unreadable record, nothing kept, destinations stopped validating, **busy**) | **exactly 1**, byte-for-byte the frame the pre-R13 function returned |
+| **A decision still being written** (`DecisionInFlight`, F-1) | **exactly 1**, before the slot is claimed |
+| **A decision that landed while this press derived its plan** (F-1) | **exactly 1**, *after* the slot is claimed and before the Working frame — so the slot is released by the same `finally` |
 | The sweep gate | **exactly 1**, and it claims **no slot** |
 | A real sort | **1 + N + 1** — Working, bounded progress, terminal |
 
@@ -134,22 +157,52 @@ has already happened or been refused, so a consumer counting them is counting fa
   because the prose explaining each ban naturally contains the banned token and this repository
   has tripped its own substring bans that way five times.
 
-## Classification is refused on the server while a batch is being sorted
+## A classification and a sort are mutually exclusive (F-1)
 
-A transfer captures its decision snapshot before it starts moving. A decision accepted afterwards
-would be honoured by the screen and ignored by the batch: the operator would watch a clip they just
-marked Keep land in Discarded, with the durable record agreeing with neither.
+A transfer captures its decision snapshot before it starts moving. A decision that lands outside
+that snapshot would be honoured by the screen and ignored by the batch: the operator would watch a
+clip they just marked Keep land in Discarded, with the durable record agreeing with neither.
 
-`_clips_decide` therefore refuses `transfer_in_progress`, and **both** reasons are checked — this
-owner's own transfer, and another session's transfer on the same folder. The second tab never saw a
-greyed-out tile, which is exactly why the check cannot live in the browser.
+**The original R13 code got this wrong, and it is worth stating plainly because the shape recurs.**
+`_clips_decide` read `_CLIPS_TRANSFERS.busy(...)` and then committed. That refused the obvious case
+— a classification arriving *during* a sort — and missed the one that mattered: a classification
+that passed the read *before* a transfer was admitted still committed *after* it, was answered
+`ok: True`, was durable, and was invisible to the batch, with **both halves reporting success**.
+Reproduced in both directions on the shipped handler: `PENDING→SELECTED` swept into Discarded, and
+`SELECTED→REJECTED` moved into the Media Library, each with a terminal frame saying
+`✅ Sorted all 3 clip(s).`
 
-The refusal goes through the existing `refuse(...)` helper, so: nothing is appended, no revision
-moves, validation happens before `store.decide` is reached, and the already-authorized page is
-handed the server's current decision, revision and counts so a tile resyncs instead of guessing.
+**A post-admission snapshot re-read does not close it on its own, and that was measured rather than
+argued.** Against a probe carrying only that re-read, a classification suspended inside its own
+commit re-read as *unchanged*, became durable immediately afterwards, and the transfer moved the
+file by the stale snapshot anyway. The re-read closes the case where the decision *completed*
+before admission; it cannot see one that is mid-commit.
 
-It is a **window, not a latch** — it ends with the transfer. A latch that outlived the batch would
-be a new way to strand the page.
+So both halves are in place, and neither is sufficient alone:
+
+| half | closes | mechanism |
+|---|---|---|
+| `begin_decision` / `DecisionInFlight` | a decision **straddling** admission | one locked test-and-set shared with `begin` |
+| the snapshot re-read under the reservation | a decision that **completed** between the snapshot and admission | `store.snapshot_of(identities) != snapshot` → refuse |
+
+`_clips_decide` still answers `transfer_in_progress` for **both** reasons — this owner's own
+transfer and another session's transfer on the same folder — so the page resyncs exactly as before.
+The second tab never saw a greyed-out tile, which is why this cannot live in the browser.
+
+The refusal still goes through the existing `refuse(...)` helper, so: nothing is appended, no
+revision moves, validation happens before `store.decide` is reached, and the already-authorized
+page is handed the server's current decision, revision and counts so a tile resyncs instead of
+guessing. The slot is released in a `finally` covering every path — refusal, `StaleWrite`, a
+durability failure and a defect — because a slot that outlived its decision would refuse this
+owner's transfers until the app restarted, a worse failure than the one being corrected.
+
+It is a **window, not a latch** — both claims end with the operation that took them. A latch that
+outlived the batch would be a new way to strand the page.
+
+**The re-read refuses rather than re-plans, deliberately.** Re-planning would have to re-derive
+`plan.signature`, and a sweep the operator armed against the old signature must not be silently
+re-aimed at a batch they never agreed to. A retry costs one press, re-derives everything and goes
+through the gate again — which is what the signature is for.
 
 `_on_clips_refresh` also stops *enabling* Confirm while a transfer is active. That is presentation
 only and can never enable: Confirm's enabled state is still derived from `store.counts()` by
@@ -223,5 +276,27 @@ Consequences, each covered by a test:
 * **`root_key` exclusion rests on `realpath`.** Two genuinely different paths that resolve to one
   directory are caught; a path that `realpath` cannot resolve is not claimed at all. A hard link to
   the same bytes under two directory names is **not** detected, and is not attempted.
+* **The decision slot is held across one `live_identity_ok` open and one journal append (F-1).** A
+  Confirm pressed inside that window is refused with "press Confirm again" rather than admitted —
+  the right trade, since the alternative is admitting it onto a snapshot about to be contradicted.
+  Measured at roughly 5–6 ms for one `_clips_decide`, so it is not observable at human pace; on a
+  contended disk the open can take longer, and the refusal then lasts as long as the open does.
+* **Two refusals in a row are possible in principle.** If a classification really did land inside
+  the retry's window too, the retry is refused for the same reason. Each refusal is honest and
+  moves nothing, and the window requires a decision to land in a sub-millisecond gap, so there is
+  no livelock at operator pace — but nothing *bounds* the retries, and this is a property rather
+  than a guarantee.
+* **`TransferGuard.refused` still undercounts** (review MINOR M-2). The advisory short-circuit in
+  `_clips_confirm_frames` returns before `begin`, so the ordinary duplicate press never reaches the
+  counter. Diagnostic only, and deliberately not "fixed" by moving the authority.
+* **`_clips_decide` answers `transfer_in_progress` even when the cause is another session's folder
+  transfer** (review MINOR M-3). `begin_decision` now raises the distinct `folder_in_progress`, and
+  the call site deliberately maps both to one code: the page resyncs from the attached record
+  either way, and changing the wire code would churn an existing assertion for a cosmetic gain.
+* **The slot is released before the terminal repaint** (review MINOR M-1). A duplicate press in
+  that window is admitted and runs a second read-only attempt: measured at 0 files moved, 0
+  suffixes, `❌ Nothing was moved`, with the two concurrent scans resolved by the existing
+  generation discipline. Holding the slot across a read-only re-enumeration would lengthen the
+  classification-refusal window for no integrity gain, so it is documented rather than changed.
 * **Audio Review has no overlay.** The two surfaces already share `collision.py`, so this is the
   natural next thing to share — but it is not implemented here and R13 claims nothing about it.

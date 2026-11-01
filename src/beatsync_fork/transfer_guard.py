@@ -44,6 +44,37 @@ installs the record and returns; the record in ``_active`` is what marks the own
 files happens with no lock held, and :meth:`TransferGuard.note_progress` re-takes it only for the
 duration of two integer assignments. A lock held across a batch of renames would block the very
 inspection the decision endpoint performs on every classification.
+
+**Decisions are claimed too, and that is the F-1 correction.** Excluding a second *transfer* was
+never sufficient, because the other operation that must not overlap a transfer is a
+**classification** -- a durable decision written while a batch is already being sorted from an
+earlier snapshot. The original R13 code refused such a classification by reading :meth:`busy` and
+then committing, which is the very check-then-act shape :meth:`begin` exists to remove: a decision
+that passed the read *before* admission still committed *after* it, was answered ``ok: True``, was
+durable, and was ignored by the batch -- both halves reporting success while a clip the operator
+marked Keep landed in Discarded.
+
+A post-admission re-read of the decision snapshot does **not** close that on its own, and this was
+measured rather than assumed: a classification suspended inside its own commit re-read as
+*unchanged*, then became durable immediately afterwards, and the transfer moved the file by the
+stale snapshot anyway. So the two operations are made mutually exclusive instead:
+
+* :meth:`begin_decision` claims a short-lived slot that covers one durable ``decide``, and refuses
+  while a conflicting transfer holds the floor;
+* :meth:`begin` refuses while a conflicting decision is still in flight;
+* both decide under the **same** lock, so neither can slip past the other however they interleave.
+
+What that buys the caller is the property the whole feature needs, and it is worth stating as an
+invariant because every test below is really a test of it:
+
+    once :meth:`begin` has returned a reservation, no conflicting durable decision can be in
+    flight and none can start until it is released -- so a snapshot taken *after* admission is
+    the batch's final truth, and a decision accepted by the server can never be silently ignored
+    by a transfer already running.
+
+Neither call ever waits: both raise, and the caller turns that into an explicit retry. A conflict
+is a sub-10-millisecond coincidence between two human-paced actions, so queueing it would add a
+blocking path to save nobody any time, and a busy-wait would add a stall with no bound at all.
 """
 
 from __future__ import annotations
@@ -73,6 +104,23 @@ class TransferBusy(Exception):
         self.active = active
 
 
+class DecisionInFlight(Exception):
+    """A durable decision is still being written, so a transfer may not be admitted yet.
+
+    Deliberately **not** a :class:`TransferBusy`: that one always carries the active transfer it
+    refused against, and here there is no transfer at all -- the refusal is the opposite case, a
+    classification the caller must let finish. Giving it its own type is what stops a caller
+    reaching for ``.active`` and finding nothing, and lets the UI say the one thing that is
+    actually true and actionable: press Confirm again.
+
+    ``code`` is stable and is what a test should assert on.
+    """
+
+    def __init__(self, code: str = "decision_in_flight"):
+        super().__init__(code)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class Reservation:
     """Proof that this caller won the slot. Opaque, and the only thing that can release it."""
@@ -80,6 +128,21 @@ class Reservation:
     owner: str
     generation: Any
     signature: str
+    root_key: str
+    token: int
+
+
+@dataclass(frozen=True)
+class DecisionSlot:
+    """Proof that this caller may commit one durable decision. Opaque, like :class:`Reservation`.
+
+    It is held for the duration of ONE ``decide`` -- a journal append and an in-memory update --
+    and is not a lock, a permission or a transaction. It confers no authority: the decision
+    endpoint still revalidates the page, the transition, the live identity and the expected
+    revision exactly as before, and a slot-holder whose checks fail writes nothing.
+    """
+
+    owner: str
     root_key: str
     token: int
 
@@ -146,12 +209,36 @@ class TransferGuard:
     def __init__(self):
         self._lock = threading.Lock()
         self._active: dict[str, ActiveTransfer] = {}
+        #: Durable decisions currently being written, keyed by token. Keyed by token rather than
+        #: by owner because several owners may legitimately be classifying at once -- only a
+        #: *conflicting* pair is excluded, and the conflict rule is the same pair of rules
+        #: admission uses.
+        self._deciding: dict[int, DecisionSlot] = {}
+        #: One counter for both kinds of claim, so a transfer token and a decision token can
+        #: never collide and a stale release of either cannot match the other.
         self._token = 0
         #: Refusals, for diagnosis. A duplicate submission that was correctly refused is the
         #: feature working, so this is a counter rather than a warning.
         self.refused = 0
 
     # ---- admission -------------------------------------------------------------------
+
+    def _conflicting_transfer(self, owner: str, root_key: str) -> tuple[str, ActiveTransfer] | None:
+        """The transfer that excludes ``(owner, root_key)``, with its code. **Call under the lock.**
+
+        Factored out because admission and decision claims must apply *exactly* the same two
+        rules -- one transfer per owner, one per folder across owners -- and two copies of that
+        pair would eventually disagree. The order is load-bearing: a self-collision is reported as
+        one rather than as somebody else's folder.
+        """
+        mine = self._active.get(owner)
+        if mine is not None:
+            return "transfer_in_progress", mine
+        if root_key:
+            for other in self._active.values():
+                if other.root_key == root_key:
+                    return "folder_in_progress", other
+        return None
 
     def begin(self, owner: str, generation: Any, signature: str,
               root_key: str) -> Reservation:
@@ -163,18 +250,25 @@ class TransferGuard:
           double-click or a replayed event.
         * ``folder_in_progress`` -- somebody else's review session is sorting this same folder.
           Rarer, and worth saying plainly rather than reporting as a self-collision.
+
+        [F-1] It also raises :class:`DecisionInFlight` while a conflicting durable decision is
+        still being written. That is the half of the correction that cannot be done on the caller's
+        side at all: the caller cannot know whether a classification has *passed its own checks*
+        and is about to commit, and a snapshot re-read after admission provably does not find out
+        (a decision suspended inside its commit re-reads as unchanged). Refusing admission for the
+        few milliseconds a journal append takes is what makes the post-admission snapshot final.
         """
         key = str(owner)
+        root = str(root_key or '')
         with self._lock:
-            mine = self._active.get(key)
-            if mine is not None:
+            conflict = self._conflicting_transfer(key, root)
+            if conflict is not None:
                 self.refused += 1
-                raise TransferBusy("transfer_in_progress", mine)
-            if root_key:
-                for other in self._active.values():
-                    if other.root_key == root_key:
-                        self.refused += 1
-                        raise TransferBusy("folder_in_progress", other)
+                raise TransferBusy(*conflict)
+            for pending in self._deciding.values():
+                if pending.owner == key or (root and pending.root_key == root):
+                    self.refused += 1
+                    raise DecisionInFlight()
             self._token += 1
             record = ActiveTransfer(owner=key, generation=generation,
                                     signature=str(signature or ''), root_key=str(root_key or ''),
@@ -183,6 +277,58 @@ class TransferGuard:
             return Reservation(owner=key, generation=generation,
                                signature=record.signature, root_key=record.root_key,
                                token=record.token)
+
+    # ---- decision claims (F-1) -------------------------------------------------------
+
+    def begin_decision(self, owner: str, root_key: str = '') -> DecisionSlot:
+        """Claim the right to commit ONE durable decision, or raise :class:`TransferBusy`.
+
+        The mirror of :meth:`begin`, deciding under the same lock and by the same two rules, which
+        is what makes the pair mutually exclusive rather than merely both careful. The refusal
+        codes are :meth:`begin`'s, because the reason really is a transfer: this page is being
+        sorted, or somebody else is sorting this folder.
+
+        This **replaces** a :meth:`busy` read followed by a commit. That shape refused the common
+        case and missed the one that mattered -- a classification that passed the read before
+        admission and committed after it. Here the claim *is* the check, so there is no instant
+        between them for a transfer to be admitted in.
+
+        Release it in a ``finally``: see :meth:`end_decision`.
+        """
+        key = str(owner)
+        root = str(root_key or '')
+        with self._lock:
+            conflict = self._conflicting_transfer(key, root)
+            if conflict is not None:
+                self.refused += 1
+                raise TransferBusy(*conflict)
+            self._token += 1
+            slot = DecisionSlot(owner=key, root_key=root, token=self._token)
+            self._deciding[slot.token] = slot
+            return slot
+
+    def end_decision(self, slot: DecisionSlot) -> bool:
+        """Release ``slot``. Idempotent, token-matched, and never raises.
+
+        Called from a ``finally`` for the same reason :meth:`end` is: the commit it covers can
+        refuse, raise :class:`~beatsync_fork.clips_review.StaleWrite`, or fail durably, and a slot
+        that outlived its decision would refuse every subsequent transfer for this owner with no
+        way back short of a restart. Keyed by token, so releasing twice is harmless and releasing
+        somebody else's is impossible.
+        """
+        with self._lock:
+            return self._deciding.pop(slot.token, None) is not None
+
+    def deciding(self) -> int:
+        """How many durable decisions are in flight. For diagnosis and for one specific test.
+
+        The map is bounded by the number of decision requests actually executing -- each one is
+        claimed and released inside a single call -- so this is the figure that shows the
+        correction cannot accumulate state. It is deliberately a count, not the slots: a caller
+        has no business inspecting somebody else's claim.
+        """
+        with self._lock:
+            return len(self._deciding)
 
     # ---- the record ------------------------------------------------------------------
 
@@ -225,9 +371,14 @@ class TransferGuard:
         """Either reason this owner cannot classify or sort right now. Advisory only.
 
         **This is not an admission gate.** Reading it and then acting would be the check-then-act
-        race :meth:`begin` exists to remove; its callers use it to choose a *message*, and to
-        refuse a classification that would otherwise change a snapshot already in flight. Admission
-        is :meth:`begin` and nothing else.
+        race :meth:`begin` exists to remove; its callers use it to choose a *message* and nothing
+        else. Admission is :meth:`begin`, a decision claim is :meth:`begin_decision`, and those two
+        are the only authorities.
+
+        [F-1] It used to be documented as also refusing a classification. It was, and that was the
+        defect: a read cannot refuse anything, because the state it reports may change before the
+        caller acts on it. Every mutation is now gated by a claim, and this is left as presentation
+        only -- which is all a greyed-out button or a "already being sorted" line ever needed.
         """
         return self.active_for(owner) or self.active_on_root(root_key)
 

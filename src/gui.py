@@ -9742,43 +9742,66 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
         return {'ok': False, 'code': code, 'clip': entry.clip_id, 'decision': current,
                 'rev': revision, 'counts': store.counts(identities)}
 
-    # [R13] CLASSIFICATION PROTECTION. A transfer captured its decision snapshot before it started
-    # moving anything, so a decision accepted mid-transfer would be honoured by the screen and
-    # ignored by the batch -- the operator would see a clip marked Keep land in Discarded, with the
-    # server's own record agreeing with neither. So the window is closed on the SERVER, which is
-    # what makes it cover a second browser tab, a replayed POST and any caller that never saw a
-    # greyed-out tile.
+    # [R13 / F-1] CLASSIFICATION PROTECTION, and it is a CLAIM rather than a check.
     #
-    # Both reasons are checked, because either one means this clip may be moving right now: this
-    # owner's own transfer, and another session's transfer on the same folder. Nothing is appended
-    # and no revision moves -- `refuse` returns before `store.decide` is reached, and hands the
-    # page the server's current record so the tile resyncs instead of guessing.
-    if _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', ''))) is not None:
+    # A transfer captures its decision snapshot before it starts moving anything, so a decision
+    # that lands outside that snapshot would be honoured by the screen and ignored by the batch --
+    # the operator would see a clip marked Keep land in Discarded, with the server's own record
+    # agreeing with neither. This is closed on the SERVER, which is what makes it cover a second
+    # browser tab, a replayed POST and any caller that never saw a greyed-out tile.
+    #
+    # The original R13 code read `_CLIPS_TRANSFERS.busy(...)` here and then committed below. That
+    # refused the obvious case and missed the one that mattered: a classification that passed the
+    # read *before* a transfer was admitted still committed *after* it, was answered `ok: True`,
+    # was durable, and was invisible to the batch -- both halves reporting success. Re-reading the
+    # snapshot after admission does not find it either; a decision suspended inside its own commit
+    # re-reads as unchanged and becomes durable a moment later. Measured, not reasoned about.
+    #
+    # So the claim is the check. `begin_decision` decides under the same lock as `begin`, which
+    # makes the two mutually exclusive: while this slot is held the owner's transfer cannot be
+    # admitted, and once a transfer is admitted this call refuses. Both reasons are still checked,
+    # because either means this clip may be moving right now -- this owner's own transfer, and
+    # another session's transfer on the same folder -- and both still answer with the same code,
+    # so the page resyncs from the attached record exactly as it did before.
+    try:
+        slot = _CLIPS_TRANSFERS.begin_decision(
+            owner, _clips_transfer_key(view.get('root', '')))
+    except fork_transfer.TransferBusy:
         return refuse('transfer_in_progress')
 
-    # [R5-P3 / F2] The expected revision is MANDATORY and strictly typed. The previous code did
-    # `int(payload.get('rev'))` inside a try/except that assigned `None`, so a missing, null,
-    # string, bool, float, list or dict revision all became "no concurrency check requested" --
-    # a fail-open, and one reachable from the shipped client, because `parseInt` of a tampered
-    # non-numeric `data-rev` is `NaN` and `JSON.stringify(NaN)` is `null`. Validation now happens
-    # before anything is written, and a bad revision is refused with its own stable code.
+    # Everything that can write is inside the slot, and the slot is released on EVERY path --
+    # refusal, `StaleWrite`, a durability failure, or a defect. A slot that outlived its decision
+    # would refuse this owner's transfers until the app restarted, which is a worse failure than
+    # the one being fixed. It is held across one `live_identity_ok` open and one journal append,
+    # so a transfer pressed inside that window is told to press Confirm again rather than being
+    # admitted onto a snapshot that is about to be contradicted.
     try:
-        expected = fork_clips.parse_expected_revision(payload)
-    except fork_clips.RevisionError as bad:
-        return refuse(bad.code)
+        # [R5-P3 / F2] The expected revision is MANDATORY and strictly typed. The previous code
+        # did `int(payload.get('rev'))` inside a try/except that assigned `None`, so a missing,
+        # null, string, bool, float, list or dict revision all became "no concurrency check
+        # requested" -- a fail-open, and one reachable from the shipped client, because `parseInt`
+        # of a tampered non-numeric `data-rev` is `NaN` and `JSON.stringify(NaN)` is `null`.
+        # Validation happens before anything is written, and a bad revision is refused with its
+        # own stable code.
+        try:
+            expected = fork_clips.parse_expected_revision(payload)
+        except fork_clips.RevisionError as bad:
+            return refuse(bad.code)
 
-    # Identity is revalidated on the OPENED DESCRIPTOR, so a path repointed between enumeration
-    # and now is caught rather than inherited.
-    if not _CLIPS_REGISTRY.live_identity_ok(entry):
-        return refuse('identity_changed')
-    try:
-        decision, revision = store.decide(owner, identity, target, view['scan_id'], expected)
-    except fork_clips.StaleWrite as stale:
-        return {'ok': False, 'code': stale.code, 'clip': entry.clip_id,
-                'decision': stale.current, 'rev': stale.revision,
+        # Identity is revalidated on the OPENED DESCRIPTOR, so a path repointed between
+        # enumeration and now is caught rather than inherited.
+        if not _CLIPS_REGISTRY.live_identity_ok(entry):
+            return refuse('identity_changed')
+        try:
+            decision, revision = store.decide(owner, identity, target, view['scan_id'], expected)
+        except fork_clips.StaleWrite as stale:
+            return {'ok': False, 'code': stale.code, 'clip': entry.clip_id,
+                    'decision': stale.current, 'rev': stale.revision,
+                    'counts': store.counts(identities)}
+        return {'ok': True, 'clip': entry.clip_id, 'decision': decision, 'rev': revision,
                 'counts': store.counts(identities)}
-    return {'ok': True, 'clip': entry.clip_id, 'decision': decision, 'rev': revision,
-            'counts': store.counts(identities)}
+    finally:
+        _CLIPS_TRANSFERS.end_decision(slot)
 
 
 def _clips_state(owner, session_id, page_token):
@@ -9920,7 +9943,11 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     The durable record is never written by the sweep: see `decision_of` below.
 
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
-    page with no clip kept, or destinations that no longer validate.
+    page with no clip kept, destinations that no longer validate, a transfer already running, and
+    -- [F-1] -- a durable decision still being written, or one that landed while this press was
+    deriving its plan. The last two are what make the "accepted but ignored" classification
+    impossible rather than merely unlikely; see `transfer_guard`'s module docstring for the
+    invariant and why a snapshot re-read alone does not establish it.
 
     Every move is a single same-volume ``os.rename`` (see `iter_sorted_clips`): no overwrite, no
     collision renaming beyond the operator's own saved policy, no deletion, and a cross-volume
@@ -10037,6 +10064,14 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
         yield _clips_confirm_only(template.format(done=busy.active.done,
                                                   total=busy.active.total))
         return
+    except fork_transfer.DecisionInFlight:
+        # [F-1] A classification is between its checks and its journal append. Admitting here is
+        # exactly the defect: the decision would become durable a moment later and this batch
+        # would move by the snapshot taken before it. The window is one journal append long, so
+        # the honest answer is to say so and let the operator press again -- a retry re-derives
+        # the whole plan and picks the new decision up.
+        yield _clips_confirm_only(CLIPS_DECISION_IN_FLIGHT_TEXT)
+        return
 
     destinations = {fork_clips.SELECTED: roots[fork_clips.ROLE_LIBRARY].real,
                     fork_clips.REJECTED: roots[fork_clips.ROLE_REJECTED].real}
@@ -10044,6 +10079,28 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     outcomes = []
     failure = None
     try:
+        # [F-1] THE SNAPSHOT IS RE-DERIVED UNDER THE RESERVATION, and this is the second half of
+        # the correction -- neither half is sufficient alone.
+        #
+        # `begin` excludes a decision that straddles admission. It cannot exclude one that
+        # *completed* between `snapshot_of` above and `begin` just now: that decision held no slot
+        # by the time admission ran, so admission was right to succeed, and the plan is simply out
+        # of date. The snapshot is therefore read again here -- and because the reservation is now
+        # held, no conflicting decision can be in flight or start, so this read is the batch's
+        # final truth for its whole lifetime. That is the invariant `transfer_guard` states.
+        #
+        # It sits INSIDE the try whose `finally` releases the slot, so the refusal cannot leak a
+        # reservation: a `return` here runs that `finally` on the way out. Nothing has moved yet
+        # and no Working frame has been shown, so this is still a press that changed nothing.
+        #
+        # Refusing rather than re-planning is deliberate. Re-planning would have to re-derive
+        # `plan.signature`, and a sweep the operator armed against the old signature must not be
+        # silently re-aimed at a batch they never agreed to. A retry costs one press, re-derives
+        # everything and goes through the gate again -- which is what the signature is for.
+        if store.snapshot_of(identities) != snapshot:
+            yield _clips_confirm_only(CLIPS_DECISIONS_CHANGED_TEXT)
+            return
+
         # The Working state, BEFORE the first file moves. This yield is the feature.
         _CLIPS_TRANSFERS.note_progress(reservation, 0, tally.total)
         yield _clips_working_frame(CLIPS_WORKING_STARTING_TEXT.format(total=tally.total))

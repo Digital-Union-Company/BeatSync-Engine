@@ -83,14 +83,46 @@ which is exactly the unverifiable progress this change replaces. `PROGRESS_FRAME
 the frames and the **last outcome always emits**, so the closing figure is a measurement rather
 than a rounded stride.
 
-**Classification is refused on the server while a batch is being sorted.** A transfer captures its
-decision snapshot before it moves anything, so a decision accepted afterwards would be honoured by
-the screen and ignored by the batch — the operator would watch a clip they just marked Keep land in
-Discarded, with the durable record agreeing with neither. `_clips_decide` answers
-`transfer_in_progress` through the existing `refuse(...)` helper, so nothing is appended, no
-revision moves, and the already-authorized page is handed the server's own record to resync from.
-Both reasons are checked, because the second tab never saw a greyed-out tile. It is a window, not a
-latch: it ends with the transfer.
+**A classification and a sort are mutually exclusive, and the first attempt at this was wrong.** A
+transfer captures its decision snapshot before it moves anything, so a decision that lands outside
+that snapshot would be honoured by the screen and ignored by the batch — the operator would watch a
+clip they just marked Keep land in Discarded, with the durable record agreeing with neither.
+
+The first version of this change read `_CLIPS_TRANSFERS.busy(...)` in `_clips_decide` and then
+committed — the very check-then-act shape the admission rule above exists to remove. Independent
+review (**F-1**) reproduced the consequence deterministically on the shipped handler, in both
+directions: a classification that passed the read *before* a transfer was admitted still committed
+*after* it, was answered `ok: True`, was durable, and was invisible to the batch, with **both halves
+reporting success** — `PENDING→SELECTED` swept into Discarded and `SELECTED→REJECTED` moved into the
+Media Library, each under a terminal frame reading `✅ Sorted all 3 clip(s).` Measured windows: a
+confirm side of about 0.7 ms against a `_clips_decide` of about 5.6 ms, so the commit side dominates
+and widens under journal contention. The exposure is a **misfiled, not a lost** clip: nothing is
+deleted, nothing overwritten, and it is recoverable by moving it back.
+
+**A post-admission snapshot re-read does not close it, which was measured rather than assumed.**
+Against a probe carrying only that re-read, a classification suspended inside its own commit
+re-read as *unchanged* and became durable immediately afterwards; the transfer moved the file by
+the stale snapshot anyway. So the correction is two halves, and neither is sufficient alone:
+
+| half | closes | mechanism |
+|---|---|---|
+| `TransferGuard.begin_decision` / `DecisionInFlight` | a decision **straddling** admission | one locked test-and-set, sharing `begin`'s lock and its two rules |
+| the snapshot re-read under the reservation | a decision that **completed** between the snapshot and admission | `snapshot_of(identities) != snapshot` → refuse, moving nothing |
+
+What that buys is a statable invariant rather than a narrower window: **once `begin` has returned a
+reservation, no conflicting durable decision can be in flight and none can start until it is
+released**, so a snapshot taken after admission is the batch's final truth. Neither call ever waits
+— both raise, and the caller turns that into an explicit retry, because a conflict is a
+sub-10-millisecond coincidence between two human-paced actions and a queue would add a blocking
+path to save nobody any time.
+
+`_clips_decide` still answers `transfer_in_progress` through the existing `refuse(...)` helper, so
+nothing is appended, no revision moves, and the already-authorized page is handed the server's own
+record to resync from. Both reasons are still checked, because the second tab never saw a
+greyed-out tile. The decision slot is released in a `finally` covering refusal, `StaleWrite`, a
+durability failure and a defect — a slot that outlived its decision would refuse this owner's
+transfers until the app restarted. Both claims are a window, not a latch: each ends with the
+operation that took it.
 
 **The R11 interaction is decided, not left to chance.** A page can stop being current *while the
 sort runs* — a newer scan, or the Raw Cutter's "Review these clips" retiring it through

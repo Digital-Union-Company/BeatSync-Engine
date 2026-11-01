@@ -1172,6 +1172,21 @@ CLIPS_TRANSFER_FOLDER_BUSY_TEXT = (
 CLIPS_TRANSFER_BLOCKED_DECISION_TEXT = (
     "This page is being sorted right now, so its clips cannot be re-classified until it finishes."
 )
+# [F-1] The two refusals that close the admission window. Both are the same situation seen from
+# the two sides -- a classification and a sort arriving within a few milliseconds of each other --
+# and both say the same true thing: nothing happened, press again. Neither mentions a race, a lock
+# or a snapshot, because the operator's model is "I clicked two things at once" and the only
+# instruction that matters is the second sentence.
+CLIPS_DECISION_IN_FLIGHT_TEXT = (
+    "⏳ Nothing was started: a clip you just marked is still being saved.\n"
+    "Press Confirm again — this takes a few milliseconds, and starting now would sort the page "
+    "as it was a moment ago instead of as you just left it."
+)
+CLIPS_DECISIONS_CHANGED_TEXT = (
+    "⏳ Nothing was moved: a clip was marked while this sort was starting.\n"
+    "Press Confirm again to sort the page as it stands now. No file was touched, and the "
+    "decision you just made has been saved."
+)
 # The transfer finished, but the page it was sorting is no longer the current one -- an operator
 # re-scanned, or the Raw Cutter's "Review these clips" retired it (R11 / F-1). The counts below are
 # still exactly what happened; what is NOT shown is a repaint of a page the server no longer holds.
