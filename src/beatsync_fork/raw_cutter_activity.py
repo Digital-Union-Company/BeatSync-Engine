@@ -50,7 +50,11 @@ _STATUS_COLOURS: Dict[str, str] = {
 _STATUS_LABELS: Dict[str, str] = {
     STATUS_WORKING: "Working",
     STATUS_DONE: "Completed",
-    STATUS_STOPPING: "Stopping",
+    # Past tense, deliberately. This value is only ever rendered on a TERMINAL frame -- every
+    # running frame uses `STATUS_WORKING`, and a structural test pins that `STATUS_STOPPING`
+    # reaches `_cut_activity_final` and nothing else. "Stopping" would therefore describe an
+    # in-progress wind-down on a panel that is, by construction, already finished.
+    STATUS_STOPPING: "Stopped",
     STATUS_FAILED: "Failed",
 }
 _NEUTRAL = "#8b949e"               # grey -- known to be not applicable, which is not a fault

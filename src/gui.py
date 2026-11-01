@@ -6441,11 +6441,16 @@ def _on_cut_analyze(source_path, sensitivity, min_seconds, max_seconds):
                                          source=name, ffmpeg=False))
         buttons = _cut_buttons(analyze=True, run=True, cancel=False)
     else:
+        # [FORK] R12: the ANALYSIS completed -- it simply found nothing long enough to export, and
+        # nothing was stopped or failed, so the activity status says `Completed`. The amber bar
+        # and `CUT_ANALYZE_DONE_NO_WORK_TEXT` beside it carry the "but there is nothing to cut"
+        # half. Reporting the run itself as stopped here would describe an event that never
+        # happened.
         panel = _cut_progress_html(CUT_PLAN_STALE_TITLE, CUT_ANALYZE_DONE_NO_WORK_TEXT,
                                    tone='stopping',
                                    activity=_cut_activity_final(
                                        clock, fork_activity.PHASE_COMPLETED,
-                                       fork_activity.STATUS_STOPPING,
+                                       fork_activity.STATUS_DONE,
                                        source=name, ffmpeg=False))
         buttons = _cut_buttons(analyze=True, run=False, cancel=False)
     yield (summary, fork_cutter.plan_table_rows(plan), state, details, panel) + buttons

@@ -288,6 +288,46 @@ def test_ffmpeg_activity_is_stated_from_what_each_batch_phase_really_runs():
     assert activity.batch_ffmpeg_active(batch.PHASE_MANIFEST) is False
 
 
+def test_no_status_label_describes_an_action_still_in_progress_on_a_finished_job():
+    """Found in review: `STATUS_STOPPING` rendered as "Stopping", but it reaches the screen ONLY
+    on terminal frames -- so it described a wind-down that had already finished. The label is past
+    tense, and the structural half of the guarantee is the next test."""
+    assert activity._STATUS_LABELS[activity.STATUS_STOPPING] == "Stopped"
+    for status, label in activity._STATUS_LABELS.items():
+        if status == activity.STATUS_WORKING:
+            continue
+        assert not label.endswith("ing"), (status, label)
+
+
+def test_the_stopping_status_can_only_reach_a_terminal_frame(gui_tree):
+    """The other half: every `STATUS_STOPPING` in `gui.py` is an argument to
+    `_cut_activity_final` or to the batch's terminal table. A running frame that used it would
+    reintroduce the defect above, with a past-tense label on a job that is still working."""
+    running_frames = []
+    for node in ast.walk(gui_tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_cut_activity"):
+            if "STATUS_STOPPING" in ast.unparse(node):
+                running_frames.append(ast.unparse(node))
+    assert running_frames == [], running_frames
+    # And it is genuinely still in use terminally, so this test cannot pass vacuously.
+    terminal = [ast.unparse(n) for n in ast.walk(gui_tree)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "_cut_activity_final" and "STATUS_STOPPING" in ast.unparse(n)]
+    assert terminal, "STATUS_STOPPING is no longer used; delete it or this guard"
+
+
+def test_an_analysis_that_found_nothing_to_export_is_not_reported_as_stopped(gui_tree):
+    """Also from review. A plan with no exportable shot is a COMPLETED analysis with an honest
+    answer, not a stopped or failed run -- the amber bar and the no-work text carry that half."""
+    body = _code_only(_func(gui_tree, "_on_cut_analyze"))
+    marker = body.index("CUT_ANALYZE_DONE_NO_WORK_TEXT")
+    window = body[marker:marker + 320]
+    assert "fork_activity.STATUS_DONE" in window, window
+    assert "STATUS_STOPPING" not in window, window
+    assert "STATUS_FAILED" not in window, window
+
+
 def test_a_did_not_run_panel_is_not_spelled_as_a_cancellation():
     """A refused batch stopped nothing, so it must not report that the operator did."""
     assert activity.PHASE_NOT_RUN != activity.PHASE_CANCELLED
