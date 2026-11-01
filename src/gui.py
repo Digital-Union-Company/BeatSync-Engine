@@ -9311,7 +9311,51 @@ def _on_audio_open_in_library(run_directory):
             f"Press Scan Folder there when you are ready to review it.")
 
 
-def _on_cut_open_in_library(handoff):
+def _cut_handoff_review_unchanged():
+    """The seven Video Review outputs of a handoff that was REFUSED: leave every one alone.
+
+    [FORK] Digital-Union (Raw Cutter R11, F-1). A fresh tuple per call rather than a module-level
+    constant, because a `gr.update()` payload is a mutable mapping and one shared instance would
+    be handed to every session's response.
+    """
+    return tuple(gr.update() for _ in range(7))
+
+
+def _cut_handoff_retire_review(request):
+    """Retire whatever Video Review currently holds for this browser session, and repaint it.
+
+    [FORK] Digital-Union (Raw Cutter R11, F-1). The handoff changes which folder Video Review is
+    *about*. Everything that makes the previous folder actionable -- the grid, the counters, the
+    Confirm button, a sweep the operator had already armed -- is derived from the server's
+    per-owner page, so that page is retired through the review coordinator and the surfaces are
+    then repainted from the coordinator exactly as Refresh would paint them.
+
+    Doing it in that order is the whole point. The widget updates returned here are *consequences*
+    of the retirement, never the mechanism: a disabled button is not an authorization boundary,
+    and Confirm, Proceed and the decision endpoint all refuse because `_clips_view` is now empty,
+    not because something in the browser went grey.
+
+    `_on_clips_refresh` is reused rather than reassembled from the initial constants so that there
+    is exactly one notion of "no current page". It reaches no disk here: with the page retired,
+    `_clips_render_current` returns on its `not view.get('entries')` branch before the durable
+    store is opened.
+
+    A session with no identity has no page to retire; it still gets the repainted empty state,
+    which is what its Refresh would show anyway.
+    """
+    try:
+        _CLIPS_SCANS.invalidate(_clips_owner(request))
+    except fork_clips.Refusal:
+        pass
+    grid, counts, confirm = _on_clips_refresh(request)
+    return (grid, counts, confirm,
+            gr.update(visible=False),      # the sweep gate closes ...
+            gr.update(visible=False),      # ... both halves of it ...
+            '',                            # ... and the batch signature it was armed with
+            CLIPS_CONFIRM_DISABLED_TEXT)   # the gate's prompt went with the page it described
+
+
+def _on_cut_open_in_library(handoff, request: gr.Request = None):
     """"Review these clips": hand the FINISHED JOB's own output directory to Video Review.
 
     The symmetric partner of :func:`_on_audio_open_in_library`, and it shares that function's two
@@ -9339,21 +9383,35 @@ def _on_cut_open_in_library(handoff):
     that has stayed still since. A folder that has gone is **reported**, never repaired and never
     silently replaced by one that still exists.
 
+    [FORK] Digital-Union (Raw Cutter R11, F-1): a handoff that succeeds also **retires whatever
+    Video Review was holding**, through `_cut_handoff_retire_review`. Filling the folder box with
+    a different folder while the gallery, the counts, Confirm and an armed sweep all still
+    described the previous one was a real hazard, not a cosmetic one: pressing Confirm then sorted
+    the *previous* folder -- and an armed sweep moved its unmarked clips to Discarded -- while
+    every visible label named the new one.
+
+    The two refusal paths deliberately do **not** retire anything. They change nothing but the
+    report, so a mis-press cannot cost an operator the page they were working on; a handoff that
+    was refused has not moved Video Review anywhere.
+
     Total by construction: every return path yields one update per output, so Gradio's positional
-    alignment cannot drift, and the two refusal paths change no widget but the report.
+    alignment cannot drift.
     """
     record = fork_handoff.read(handoff)
     if record is None:
-        return (gr.update(), gr.update(), gr.update(), gr.update(), CUT_HANDOFF_NONE_TEXT)
+        return (gr.update(), gr.update(), gr.update(), gr.update(), CUT_HANDOFF_NONE_TEXT) \
+            + _cut_handoff_review_unchanged()
     folder = record['directory']
     if not os.path.isdir(folder):
         return (gr.update(), gr.update(), gr.update(), gr.update(),
-                CUT_HANDOFF_MISSING_TEXT.format(folder=folder))
+                CUT_HANDOFF_MISSING_TEXT.format(folder=folder)) \
+            + _cut_handoff_review_unchanged()
     return (gr.update(value=folder),
             gr.update(value=record['recursive']),
             gr.Tabs(selected='tab-media-library'),
             gr.Tabs(selected='tab-video-review'),
-            fork_handoff.loaded_text(record))
+            fork_handoff.loaded_text(record)) \
+        + _cut_handoff_retire_review(request)
 
 
 def _browse_audio_source(current):
@@ -12457,10 +12515,24 @@ def create_ui() -> gr.Blocks:
         # That substitution is the feature, and it also closes a hazard the old wiring had: with
         # the output-folder widget as the input, editing that box after a job finished silently
         # redirected the finished job's review. The record is frozen at the moment the job ended.
+        #
+        # [FORK] Digital-Union (Raw Cutter R11, F-1): seven more outputs, APPENDED after the five
+        # above. They are the review surfaces the retirement repaints -- the grid, the counters,
+        # Confirm, both halves of the sweep gate, the batch signature it was armed with, and the
+        # gate's own prompt. Appending keeps the five original positions exactly where they were.
+        #
+        # None of them is the safety mechanism. `_cut_handoff_retire_review` retires the server's
+        # per-owner page first, and Confirm, Proceed and the decision endpoint then refuse because
+        # that page is gone; these updates exist so the screen stops asserting something the
+        # server no longer holds. A refused handoff writes `gr.update()` to all seven, so it
+        # leaves the operator's page exactly as it was.
         cut_open_library_btn.click(
             fn=_on_cut_open_in_library,
             inputs=[cut_handoff_state],
-            outputs=[clips_input, clips_recursive, main_tabs, library_tabs, clips_report],
+            outputs=[clips_input, clips_recursive, main_tabs, library_tabs, clips_report,
+                     clips_gallery, clips_counts, clips_confirm_btn,
+                     clips_proceed_btn, clips_sweep_cancel_btn, clips_armed_state,
+                     clips_confirm_out],
             concurrency_limit=None,
         )
 

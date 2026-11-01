@@ -27,6 +27,7 @@ import types as _types
 
 import pytest
 
+from beatsync_fork import clips_review as fork_clips
 from beatsync_fork import cut_handoff as handoff
 from beatsync_fork import raw_cutter as cutter
 from beatsync_fork import raw_cutter_activity as activity
@@ -762,3 +763,274 @@ def test_nothing_in_the_source_tree_was_moved_or_renamed(tmp_path, monkeypatch):
     assert (tmp_path / "recording.mp4").exists(), "the source must be untouched"
     assert run.clips == sorted(os.listdir(run.run_dir))
     assert all(name.endswith(".mp4") for name in run.clips)
+
+
+# =============================================================================================
+# 4. F-1: a handoff retires the review page it is navigating away from
+#
+# The independent R11 review measured this, on the candidate and with real media: scan folder A,
+# keep its clips, finish a job into B, press "Review these clips", press Confirm -- and **A** was
+# sorted into the Media Library while every visible label named B. Pressing Proceed on a sweep
+# that had been armed on A was worse: one of A's clips went to the Library and its two unmarked
+# clips went to Discarded.
+#
+# The cause is not the gallery. Everything actionable about a review page -- the grid, the
+# counters, Confirm's admission, an armed sweep's signature, and the decision endpoint -- is
+# derived from the coordinator's per-owner view, and the handoff changed the folder box without
+# touching it. So the correction retires that view, and the widget updates are consequences.
+#
+# Two tiers, matching the rest of this file: the coordinator primitive is imported and tested as
+# ordinary code, and the seam is pinned by `ast` over the real `src/gui.py`.
+# =============================================================================================
+
+_CLIPS_REVIEW_PY = os.path.join(_REPO_ROOT, "src", "beatsync_fork", "clips_review.py")
+
+
+def test_invalidate_retires_the_owners_page_without_scanning_anything():
+    """The primitive F-1's correction is built on. It is a pure state transition: one locked step
+    that leaves the owner with no current page at all."""
+    coordinator = fork_clips.ScanCoordinator()
+    generation = coordinator.begin("owner-one")
+    assert coordinator.publish("owner-one", generation, {"entries": ["a"], "root": "A"}) is True
+    assert coordinator.view("owner-one").get("entries") == ["a"]
+
+    retired = coordinator.invalidate("owner-one")
+
+    assert coordinator.view("owner-one") == {}, "the page must be gone, not merely stale"
+    assert isinstance(retired, int) and not isinstance(retired, bool)
+    assert retired > generation, "retiring must take a NEWER generation, not reuse one"
+    assert coordinator.newest("owner-one") == retired
+
+
+def test_an_older_scan_still_in_flight_cannot_restore_the_retired_page():
+    """The ordering that makes this safe rather than cosmetic. A scan's poster pass takes seconds,
+    so a scan of A can still be running when the handoff lands -- and before the fix its
+    `publish` succeeded and put A back as the current page."""
+    coordinator = fork_clips.ScanCoordinator()
+    inflight = coordinator.begin("owner-one")
+    coordinator.invalidate("owner-one")
+
+    assert coordinator.publish("owner-one", inflight, {"entries": ["a"]}) is False
+    assert coordinator.view("owner-one") == {}
+    # ... and its own failure path cannot blank a page it no longer owns either.
+    assert coordinator.discard("owner-one", inflight) is False
+
+
+def test_a_scan_started_after_the_handoff_behaves_entirely_normally():
+    """Retiring a page must not wedge the surface: pressing Scan Folder is still the one
+    deliberate way to get a review session, and it must work the first time."""
+    coordinator = fork_clips.ScanCoordinator()
+    coordinator.publish("owner-one", coordinator.begin("owner-one"), {"entries": ["a"]})
+    coordinator.invalidate("owner-one")
+
+    generation = coordinator.begin("owner-one")
+    assert coordinator.publish("owner-one", generation, {"entries": ["b"], "root": "B"}) is True
+    assert coordinator.view("owner-one")["root"] == "B"
+
+
+def test_invalidate_touches_exactly_one_owner():
+    """Two browser sessions. One operator pressing Review must not blank the other's gallery."""
+    coordinator = fork_clips.ScanCoordinator()
+    for owner in ("one", "two"):
+        coordinator.publish(owner, coordinator.begin(owner), {"entries": [owner]})
+    coordinator.invalidate("one")
+
+    assert coordinator.view("one") == {}
+    assert coordinator.view("two").get("entries") == ["two"]
+
+
+def test_retiring_a_session_that_never_scanned_registers_nothing():
+    """Found by the focused review of this correction, not by the original finding.
+
+    Unlike `begin`, this is reached by a UI action an operator can take in a browser session that
+    has never opened Video Review -- and both of the coordinator's maps are capped, evicting the
+    least recently used. Registering a brand-new key would therefore let pressing Review in a
+    fresh session drop a *different* session's live page.
+    """
+    coordinator = fork_clips.ScanCoordinator(max_owners=2)
+    for owner in ("one", "two"):
+        coordinator.publish(owner, coordinator.begin(owner), {"entries": [owner]})
+
+    assert coordinator.invalidate("a-session-that-never-scanned") == 0
+
+    assert coordinator.view("one").get("entries") == ["one"], "evicted a live page"
+    assert coordinator.view("two").get("entries") == ["two"], "evicted a live page"
+    assert coordinator.newest("a-session-that-never-scanned") == 0
+
+
+def test_retiring_still_blocks_a_scan_that_has_begun_but_not_published():
+    """The complement of the test above, and the reason the shortcut is keyed on the generation
+    map rather than on the stored view: `begin` records the generation *before* a scan changes
+    anything, so an owner with a scan in flight has a key even though it has no page yet. That
+    owner must still be retired, or the in-flight scan would publish A after the handoff."""
+    coordinator = fork_clips.ScanCoordinator()
+    inflight = coordinator.begin("owner-one")
+    assert coordinator.view("owner-one") == {}, "no page published yet"
+
+    assert coordinator.invalidate("owner-one") > inflight
+    assert coordinator.publish("owner-one", inflight, {"entries": ["a"]}) is False
+
+
+def test_invalidate_refuses_an_unusable_owner_rather_than_inventing_one():
+    """Fails closed, like every other owner-keyed call here: there is deliberately no shared
+    anonymous slot for one session's retirement to reach into."""
+    coordinator = fork_clips.ScanCoordinator()
+    for bad in (None, "", 0):
+        with pytest.raises(fork_clips.Refusal):
+            coordinator.invalidate(bad)
+
+
+def test_invalidate_is_not_a_decision_and_writes_no_record():
+    """It holds pages, not decisions. The durable record lives in the store and must be
+    unreachable from here -- an operator's kept/discarded marks survive a handoff."""
+    body = _code_only(_func(_tree(_CLIPS_REVIEW_PY), "invalidate"))
+    for forbidden in ("store", "journal", "snapshot", "DECISIONS", "SELECTED", "REJECTED",
+                      "open(", "os.", "commit", "write"):
+        assert forbidden not in body, forbidden
+
+
+# ---- the seam -------------------------------------------------------------------------------
+
+#: The Review button's declared outputs, in order. The five original positions are unchanged and
+#: the seven review surfaces are appended, so a frame cannot silently reorder into them.
+_REVIEW_OUTPUTS = ["clips_input", "clips_recursive", "main_tabs", "library_tabs", "clips_report",
+                   "clips_gallery", "clips_counts", "clips_confirm_btn",
+                   "clips_proceed_btn", "clips_sweep_cancel_btn", "clips_armed_state",
+                   "clips_confirm_out"]
+
+#: What each review-surface helper must return. Both are seven wide, because both answer the same
+#: seven appended outputs -- one by retiring the page, the other by changing nothing.
+_HANDOFF_HELPER_WIDTHS = {"_cut_handoff_retire_review": 7,
+                          "_cut_handoff_review_unchanged": 7}
+
+
+def test_the_review_button_writes_the_surfaces_it_invalidates(gui_tree):
+    """Exact equality, not a subset: this is the positional contract the handler's three return
+    paths are measured against, and an output appended in the wrong place would misalign it."""
+    outputs = _kwargs(_click(gui_tree, "cut_open_library_btn"))["outputs"]
+    assert _names(outputs) == _REVIEW_OUTPUTS
+
+
+def test_each_review_surface_helper_is_seven_wide(gui_tree):
+    for name, expected in _HANDOFF_HELPER_WIDTHS.items():
+        returns = [n for n in ast.walk(_func(gui_tree, name))
+                   if isinstance(n, ast.Return) and n.value is not None]
+        assert returns, name
+        for node in returns:
+            if isinstance(node.value, ast.Tuple):
+                assert len(node.value.elts) == expected, ast.unparse(node)
+            else:                                  # the generated `tuple(... range(N))` form
+                assert str(expected) in ast.unparse(node.value), ast.unparse(node)
+
+
+def test_the_retirement_writes_the_right_value_into_each_surface(gui_tree):
+    """Width is not enough, and a mutation run proved it: swapping the armed-sweep clear for a
+    bare `gr.update()` left every other assertion in this file passing. The seven returned
+    elements are therefore matched to the seven appended outputs **by position**, and each one's
+    shape is pinned.
+
+    Note this reads the raw tree rather than `_code_only`, which blanks string constants -- under
+    that transform an empty string and a sentence are the same node.
+    """
+    appended = _REVIEW_OUTPUTS[5:]
+    returns = [n for n in ast.walk(_func(gui_tree, "_cut_handoff_retire_review"))
+               if isinstance(n, ast.Return) and n.value is not None]
+    assert len(returns) == 1
+    elements = returns[0].value.elts
+    assert len(elements) == len(appended) == 7
+    rendered = dict(zip(appended, (ast.unparse(e) for e in elements)))
+
+    # The grid, the counters and Confirm come straight from the repaint, by name.
+    assert rendered["clips_gallery"] == "grid"
+    assert rendered["clips_counts"] == "counts"
+    assert rendered["clips_confirm_btn"] == "confirm"
+    # Both halves of the sweep gate close.
+    assert rendered["clips_proceed_btn"] == "gr.update(visible=False)"
+    assert rendered["clips_sweep_cancel_btn"] == "gr.update(visible=False)"
+    # The arming is VOIDED, not merely left alone. A surviving signature authorises nothing today
+    # -- a freshly computed one for another folder could not match it -- but "it would not happen
+    # to collide" is not the property the operator was promised.
+    assert rendered["clips_armed_state"] == "''"
+    # And the gate's prompt goes with the page it was describing.
+    assert rendered["clips_confirm_out"] == "CLIPS_CONFIRM_DISABLED_TEXT"
+
+
+def test_every_handoff_path_is_exactly_as_wide_as_the_declared_outputs(gui_tree):
+    """Gradio aligns positionally, so a path returning eleven values where twelve are declared
+    writes the wrong widget. Each `return` is flattened with the helper widths resolved."""
+    declared = len(_kwargs(_click(gui_tree, "cut_open_library_btn"))["outputs"].elts)
+    assert declared == len(_REVIEW_OUTPUTS)
+    returns = [n for n in ast.walk(_func(gui_tree, "_on_cut_open_in_library"))
+               if isinstance(n, ast.Return) and n.value is not None]
+    assert len(returns) == 3, "a record refusal, a vanished folder, and the handoff itself"
+    for node in returns:
+        width = 0
+        stack = [node.value]
+        while stack:                               # flatten the `(...) + helper()` spine
+            item = stack.pop()
+            if isinstance(item, ast.BinOp) and isinstance(item.op, ast.Add):
+                stack.extend((item.left, item.right))
+            elif isinstance(item, ast.Tuple):
+                width += len(item.elts)
+            elif isinstance(item, ast.Call):
+                width += _HANDOFF_HELPER_WIDTHS[ast.unparse(item.func)]
+            else:                                  # pragma: no cover - a shape nobody declared
+                raise AssertionError(ast.unparse(item))
+        assert width == declared, ast.unparse(node)
+
+
+def test_a_refused_handoff_leaves_the_review_page_exactly_as_it_was(gui_tree):
+    """A mis-press must not cost the operator the page they were working on. Both refusals use
+    the no-change helper, and that helper writes nothing but a bare update."""
+    handler = _code_only(_func(gui_tree, "_on_cut_open_in_library"))
+    assert handler.count("_cut_handoff_review_unchanged()") == 2
+    assert handler.count("_cut_handoff_retire_review(request)") == 1
+    helper = _code_only(_func(gui_tree, "_cut_handoff_review_unchanged"))
+    assert "gr.update()" in helper
+    for forbidden in ("invalidate", "_on_clips_refresh", "value=", "interactive=", "visible="):
+        assert forbidden not in helper, forbidden
+
+
+def test_the_retirement_goes_through_the_review_coordinator(gui_tree):
+    """Reuse, not a second state machine. The authority for what is actionable is the
+    coordinator's per-owner view, so that is what is retired -- a flag beside it would leave two
+    notions of "the current page" to be kept in step by hand."""
+    body = _code_only(_func(gui_tree, "_cut_handoff_retire_review"))
+    assert "_CLIPS_SCANS.invalidate(_clips_owner(request))" in body
+    assert "_on_clips_refresh(request)" in body, \
+        "the empty state must be the one Refresh renders, not a second set of constants"
+    for forbidden in ("_CLIPS_SCANS.begin", "_CLIPS_SCANS.discard", "_CLIPS_SCANS.publish",
+                      "new_session", "revoke", "_CLIPS_REGISTRY", "global "):
+        assert forbidden not in body, forbidden
+
+
+def test_the_retirement_scans_nothing_moves_nothing_and_decides_nothing(gui_tree):
+    """The same ban list the handler itself carries, applied to the helper -- otherwise the
+    cheapest route to a side effect would be the function the handler delegates to."""
+    body = _code_only(_func(gui_tree, "_cut_handoff_retire_review"))
+    for forbidden in ("listdir", "os.walk", "scandir", "glob", "discover_clips", "subprocess",
+                      "Popen", "FFPROBE_PATH", "FFMPEG_PATH", "os.rename", "os.replace",
+                      "shutil", "os.remove", "makedirs", "open(", "sort_decided_clips",
+                      "plan_sort", "_clips_store", "getcwd", "abspath", "ROOT_DIR"):
+        assert forbidden not in body, f"the retirement reaches {forbidden}"
+
+
+def test_a_session_without_identity_does_not_break_the_handoff(gui_tree):
+    """`_clips_owner` fails closed, and that refusal must not take the handoff down with it: a
+    session with no identity has no page to retire, and filling a folder box never needed one."""
+    handlers = [n for n in ast.walk(_func(gui_tree, "_cut_handoff_retire_review"))
+                if isinstance(n, ast.ExceptHandler)]
+    assert len(handlers) == 1
+    assert ast.unparse(handlers[0].type) == "fork_clips.Refusal", \
+        "contain the identity refusal specifically, never a bare except"
+    assert all(isinstance(stmt, ast.Pass) for stmt in handlers[0].body)
+
+
+def test_the_handoff_takes_the_injected_request_and_no_new_widget(gui_tree):
+    """The request is INJECTED, never listed in `inputs` -- so the browser gains no new way to
+    name an owner, and the button still reads exactly one widget."""
+    handler = _func(gui_tree, "_on_cut_open_in_library")
+    assert [a.arg for a in handler.args.args] == ["handoff", "request"]
+    assert ast.unparse(handler.args.args[1].annotation) == "gr.Request"
+    assert _names(_kwargs(_click(gui_tree, "cut_open_library_btn"))["inputs"]) \
+        == ["cut_handoff_state"]

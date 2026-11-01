@@ -682,6 +682,58 @@ class ScanCoordinator:
             self._views.move_to_end(key)
             return view
 
+    def invalidate(self, owner: Any) -> int:
+        """Retire the owner's current page **without scanning anything**, and answer the
+        generation that now holds the owner's slot.
+
+        [R11 / F-1] Why a coordinator method rather than a flag somewhere else. Something outside
+        the scan path can make the page an operator is looking at no longer the page they are
+        about to act on -- the Raw Cutter's "Review these clips" fills Video Review's folder box
+        with a *different* folder, and the gallery, the counts, the Confirm button and an armed
+        sweep all went on describing the previous one. The server-side view is the authority for
+        every one of those, so the honest state is reached by retiring the view, not by disabling
+        a button in the browser.
+
+        This is deliberately the same shape as a newest scan that took a generation and then
+        failed -- :meth:`begin` followed by :meth:`discard` -- except that it is **one locked
+        step**, so there is no interval in which a stale view is still the newest. Three
+        properties follow from doing it here:
+
+        * :meth:`view` reads empty for this owner from now on, so every caller that derives from
+          it (Refresh, Confirm, Proceed, the decision endpoint and the state read) refuses rather
+          than acting on the retired page;
+        * a scan **already in flight** under an older generation can no longer publish, because
+          :meth:`publish` requires the newest generation -- it cannot restore the retired page;
+        * a scan the operator starts **afterwards** takes a newer generation and behaves entirely
+          normally, so pressing Scan Folder is still the one deliberate way to get a page.
+
+        What it does not touch, because none of it lives here: durable decisions (this class holds
+        no decisions -- it holds pages), any other owner's generation or view, and any other
+        review surface. Invalidating is **not** a decision, a move or a write of any kind.
+
+        **An owner that has never scanned registers nothing, and answers 0.** This is not a
+        micro-optimisation: unlike :meth:`begin`, which is reached only by a scan that is really
+        going to run, this is reached by a UI action that an operator can take in a session that
+        has never opened Video Review at all. Both maps here are capped at ``max_owners`` and
+        :meth:`_prune` evicts the least recently used, so registering a brand-new key would let
+        pressing a button in a fresh browser session drop a *different* session's live page.
+        There is nothing to retire for an owner with no generation, and -- because :meth:`begin`
+        records the generation before a scan changes anything -- an absent key also means no scan
+        of theirs can be in flight. Answering 0 matches :meth:`newest`, which is 0 for an owner
+        nobody has scanned for.
+        """
+        key = _require_owner(owner)
+        with self._lock:
+            if key not in self._newest:
+                return 0
+            self._counter += 1
+            generation = self._counter
+            self._newest[key] = generation
+            self._newest.move_to_end(key)
+            self._views.pop(key, None)
+            self._prune()
+            return generation
+
     def discard(self, owner: Any, generation: Any) -> bool:
         """Clear the owner's view if ``generation`` is still the newest.
 

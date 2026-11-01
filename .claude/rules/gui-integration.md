@@ -514,6 +514,44 @@ automatically.
   (`_on_cut_run` 7, `_on_cut_batch_run_ui` 8) because the button set is the tail of every emitted
   expression — appending after it misaligns all three updates on every frame. `_on_cut_batch_run`
   keeps its name, signature, body and 2-tuple arity; it gained only sink writes.
+
+  **And a successful handoff RETIRES the review page it is navigating away from (R11 / F-1).** The
+  first implementation wrote only the folder box, the recursion flag, the two tab selections and the
+  report — so the grid, the counters, Confirm, and a sweep the operator had already armed all went
+  on describing the *previous* folder. Measured on the candidate with real media: scan A, keep its
+  clips, finish a job into B, press Review, press Confirm → **A** was sorted into the Media Library
+  while every visible label named B; with a sweep armed on A it was worse, one clip to the Library
+  and two unmarked clips to Discarded. The gallery was never the problem:
+
+  ```
+  ScanCoordinator.invalidate(owner)   # one locked step: newest generation, no view stored
+  _on_cut_open_in_library -> (5 original) + _cut_handoff_retire_review(request)   # 12 outputs
+                          -> (5 original) + _cut_handoff_review_unchanged()       # on a refusal
+  ```
+
+  * **The server-side view is the authority, so that is what is retired.** Confirm, Proceed and the
+    `/r5decide` endpoint all refuse because `_clips_view` is empty afterwards — **not** because a
+    button went grey. A disabled widget is never the authorization boundary here, and the seven
+    appended outputs are consequences of the retirement, not the mechanism.
+  * **Reuse the coordinator; do not add a second notion of "the current page."** `invalidate` is
+    deliberately the shape of a newest scan that failed (`begin` then `discard`) collapsed into one
+    locked step, so there is no interval in which a stale view is still newest. A scan **already in
+    flight** then cannot `publish` (it is no longer newest, so it cannot restore the retired page),
+    and a scan started **afterwards** behaves entirely normally — pressing Scan Folder is still the
+    one deliberate way to get a page.
+  * **The empty state is the one `_on_clips_refresh` renders**, not a second set of constants — which
+    is also why Refresh cannot resurrect the retired page. It reaches no disk: with the page retired,
+    `_clips_render_current` returns before the durable store is opened.
+  * **Durable decisions are never touched.** The coordinator holds pages, not decisions; A's kept and
+    discarded marks survive the handoff and are still there when A is scanned again. Retiring a page
+    is not a decision, a move or a write of any kind, and it is **per-owner**: another browser
+    session keeps its own page and session id.
+  * **A REFUSED handoff retires nothing.** Both refusal paths write `gr.update()` to all seven
+    review outputs, so a mis-press cannot cost an operator the page they were working on — a handoff
+    that was refused has not moved Video Review anywhere.
+  * **`gr.Request` is injected, never an input.** The button still reads exactly one widget
+    (`cut_handoff_state`), so the browser gains no new way to name an owner, and an unusable
+    identity fails closed into "nothing to retire" rather than taking the handoff down.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 

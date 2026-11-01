@@ -98,6 +98,41 @@ synthesised exporter and a real temporary filesystem, so the handoff's behaviour
 path — success, partial, cancelled before and after the first clip, crashed before and after, and
 three refusals — is measured rather than inferred from the syntax tree.
 
+### Fixed — 2026-11-01 (Raw Cutter R11 / F-1: handing over a new folder retires the old review page)
+
+**Pressing "Review these clips" no longer leaves the previous folder's clips one click from being
+sorted.** The first R11 implementation wrote the folder box, the recursion flag, the two tab
+selections and the report — and nothing else. Everything that makes a review page *actionable* is
+derived from the server's per-owner page rather than from those widgets, so the grid, the counters,
+Confirm and a sweep the operator had already armed all went on describing the folder they had just
+navigated away from.
+
+Measured on the candidate with real media, folder A scanned and kept, a finished job in folder B:
+
+| After the handoff to B | Before | After |
+|---|---|---|
+| Pressing Confirm | sorted **A** — "✅ Sorted all 2 clip(s)" — into the Media Library | refused: "Nothing has been scanned on this page." |
+| Pressing Proceed on a sweep armed on A | moved 1 of **A**'s clips to the Library and its 2 unmarked clips to Discarded | refused; all three of A's clips stayed put |
+| Pressing Refresh | repainted **A**'s gallery, counts "Kept 2", Confirm available | the empty state, Confirm unavailable |
+| A scan of A still in flight | republished A as the current page | cannot publish; A stays retired |
+| The server's current page | still A, while every visible label said B | none, until the operator scans |
+
+The correction is a new `ScanCoordinator.invalidate(owner)` — `begin()` + `discard()` collapsed into
+**one locked step**, so there is no interval in which a stale page is still the newest — called by
+the handoff before it repaints. The view is the authority, so Confirm, Proceed and the decision
+endpoint refuse because the page is gone, **not** because a button went grey; the seven appended
+outputs (grid, counters, Confirm, both halves of the sweep gate, its signature, its prompt) are
+consequences of the retirement, and the empty state they carry is the one Refresh already renders,
+so Refresh cannot resurrect the page either. `_on_cut_open_in_library` widened 5 → 12 outputs, with
+all five original positions unchanged.
+
+Nothing else changed. Durable decisions are untouched — the coordinator holds pages, not decisions,
+so A's kept marks are still there when A is scanned again — retirement is per-owner, so a second
+browser session keeps its own page, and a **refused** handoff retires nothing at all: both refusal
+paths leave every review output exactly as it was, because a mis-press must not cost an operator
+the page they were working on. The handoff still performs exactly one `os.path.isdir` and still
+scans, probes, moves, renames and deletes nothing. 14 further tests in `tests/test_cut_handoff.py`.
+
 ### Fixed — 2026-11-01 (Clips Review and Audio Review: an unnamed review folder is refused, not guessed)
 
 **Scan with nothing but quotation marks in the folder box no longer reviews the application's own
