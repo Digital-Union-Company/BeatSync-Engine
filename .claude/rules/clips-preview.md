@@ -1007,9 +1007,28 @@ exists.
 
 ## Confirm
 
-Disabled while anything is undecided, and when enabled it **reports**. It reads the durable record
-and says what a later authorized phase would do. It moves nothing, and there is no code behind it
-that could.
+**This section described R5-P1 and was left behind by two later phases. Corrected under R13,
+because a reader would have taken it as current:** Confirm has *sorted* since R5-UX V3 — "it moves
+nothing, and there is no code behind it that could" was true of P1 and is **false of the shipped
+app**. The admission rule became "at least one clip is KEPT" under R8 Final Polish, not "nothing is
+undecided". The P1 statement is preserved as history in *What is implemented, and what deliberately
+is not* above, which is scoped to P1 and says so.
+
+What is true now: Confirm is enabled when the durable record holds at least one KEPT clip, and
+pressing it moves this page's clips — SELECTED to the Media Library, REJECTED to the Discarded
+folder — through `sort_decided_clips` / `iter_sorted_clips` and `collision.py`. Unmarked clips need
+an explicit, batch-specific Proceed first. Every move is one same-volume no-overwrite `os.rename`;
+nothing is deleted, nothing is overwritten and a cross-volume request is refused in words.
+
+**The transfer is single-flight, observable and server-authoritative (R13).** `iter_sorted_clips`
+is the generator form of `sort_decided_clips` — one engine, yielding each `MoveOutcome` after its
+move has already happened — and `TransferTally` / `tally_outcomes` count moved, skipped and failed
+from those recorded outcomes rather than from a timer. `SKIPPED_STATUSES` keeps a deliberate
+refusal (`occupied`, `in_use`, `missing`, `changed`, `cross_volume`) apart from an unclassified
+`failed`; collapsing them would make a healthy no-overwrite refusal read as a malfunction. The
+admission authority is `beatsync_fork/transfer_guard.py`, and a classification is refused while a
+batch is being sorted. **Full contract: `.claude/rules/video-review-transfer.md`** — read it before
+touching `iter_sorted_clips`, the tally, or anything in `gui.py`'s Confirm path.
 
 [R5-P3 / F8] Its enabled state comes **only** from `_on_clips_scan` / `_on_clips_refresh`, both of
 which derive it from `store.counts()` — the durable record. That is deliberate and must stay:

@@ -279,7 +279,13 @@ def test_the_clips_handlers_take_an_injected_request_not_a_widget(tree: ast.Modu
     Asserted against the parsed signature rather than a formatted string: the earlier version of
     this test matched source text and broke on a line wrap, which proved nothing about the code.
     """
-    for name in ("_on_clips_scan", "_on_clips_refresh", "_on_clips_confirm"):
+    # [R13] `_clips_confirm_frames` is added because it is what the Confirm and Proceed buttons are
+    # actually wired to. `_on_clips_confirm` is kept in the list rather than replaced: it is the
+    # collected form several suites drive, and it must keep the same injected-request shape -- but
+    # guarding only it would leave the wired handler uncovered, which is the coverage the rename
+    # would silently have cost.
+    for name in ("_on_clips_scan", "_on_clips_refresh", "_on_clips_confirm",
+                 "_clips_confirm_frames"):
         func = next((n for n in ast.walk(tree)
                      if isinstance(n, ast.FunctionDef) and n.name == name), None)
         assert func is not None, f"{name} is missing"

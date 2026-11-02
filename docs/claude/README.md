@@ -42,6 +42,7 @@ first (or its rule Read explicitly), so the contract is in context before the mu
 | `scale-diagnostics.md` | `src/beatsync_fork/input_report.py`, `src/video_processor.py`, `src/video_analysis.py`, `tests/test_scale_diagnostics.py` |
 | `fork-package.md` | `src/beatsync_fork/**/*.py`, `tests/test_no_runtime_dependency.py`, `tests/test_fork_identity.py` |
 | `clips-preview.md` | `src/beatsync_fork/clips_review.py`, `src/clips_media_server.py`, `tests/test_clips_{review,media_server}.py`, `docs/claude/clips-preview-selector-v1.md` |
+| `video-review-transfer.md` | `src/beatsync_fork/transfer_guard.py`, `tests/test_transfer_guard.py`, `tests/test_clips_transfer_overlay.py` |
 | `audio-review.md` | `src/beatsync_fork/{audio_review,audio_cutter,audio_library}.py`, `src/audio_media_server.py`, `tests/test_audio_{review,media_server,cutter,preview_tab}.py` |
 | `gui-integration.md` | `src/gui.py`, `src/ui_content.py` |
 | `test-harness.md` | `tests/**/*.py`, `pytest.ini`, `requirements-dev.txt` |
