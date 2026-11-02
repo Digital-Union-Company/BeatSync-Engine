@@ -9,12 +9,20 @@ a pure module instead of inside the Gradio handler. The handler's use of it is
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import threading
+import time
 
 import pytest
 
 from beatsync_fork import transfer_guard as tg
+
+# `time` and `contextlib` are used by the interval-property harness below, and only there. The
+# "no clock" and "no filesystem" guards at the end of this file read `inspect.getsource(tg)` --
+# the GUARD module -- not this file, so a test-side clock cannot weaken them: the ban is on
+# `transfer_guard` reading a clock to decide a *frame*, not on a test holding a claim open for a
+# measurable interval.
 
 
 def test_the_first_caller_wins_the_slot_and_the_second_is_refused():
@@ -530,82 +538,593 @@ def test_the_race_is_not_vacuous_when_the_exclusion_is_removed():
         "an unguarded implementation never overlapped -- the race cannot detect one"
 
 
-def test_no_conflicting_claims_ever_overlap_in_time():
-    """The INTERVAL property, which is a different statement from "never both won".
+# =============================================================================================
+# The INTERVAL property -- rebuilt after review finding F-6
+# =============================================================================================
+#
+# [F-6] The first version of this section was VACUOUS, and it was shipped and documented as the
+# proof of the invariant's second half. Independent review measured its catch rate against four
+# defective guards and got **0/40 on every one of them**, including a guard with no exclusion
+# whatsoever and the pre-F-1 guard whose twelve classifying workers all died on an uncaught
+# `AttributeError` while the test still passed.
+#
+# The cause was one line too few. It did this:
+#
+#     opened = tick()
+#     closed = tick()          # <- nothing in between
+#
+# with both ticks serialised by the same lock, so every recorded span was a pair of **adjacent
+# integers** and the overlap predicate `a.opened < b.closed and b.opened < a.closed` could
+# essentially never be true. Measured by replaying that span algebra with no guard involved at
+# all: 300 of 300 spans zero-width, **0 overlaps observable**. The `len(spans) > 50` floor did
+# not catch the dead-worker case either, because the transfer half alone clears 50.
+#
+# So there was no interval. What follows measures one, and the correctness argument is
+# **coordination, not sleeping**: an Event handshake puts the conflicting admission attempt
+# strictly inside a held claim, so on a defective guard the second span is *structurally* nested
+# in the first and the overlap is not a matter of scheduling luck. A short bounded sleep is added
+# on top, and is deliberately never the only thing making the window real.
+#
+# Four standing not-vacuous proofs follow the test, one per defect direction, and two of them
+# (M3, M4) use **different owners and different root keys** on purpose: a probe that relied on a
+# same-owner or same-root collision would be refused by rules 1 and 2 and would mask exactly the
+# rules it is meant to be testing.
 
-    The invariant says *none can start until it is released*, and a race whose claims are never
-    released cannot test that half: once the first winner takes the floor every later caller is
-    refused for the rest of the round. So here each claim is held for a real interval, released,
-    and the round repeats -- and every pair of spans that conflict by the guard's own rules is
-    checked for temporal overlap. A lock-protected counter supplies the total order, because wall
-    clock readings from several threads cannot be compared safely.
+
+class _IntervalLog:
+    """Logical spans with a lock-protected total order, plus full worker bookkeeping.
+
+    The clock is logical rather than wall-clock because readings taken on several threads cannot
+    be ordered safely against one another. Every mutation goes through the one lock, so `spans`
+    and the four outcome lists are consistent without depending on `list.append` being atomic.
     """
-    guard = tg.TransferGuard()
-    tick_lock = threading.Lock()
-    clock = [0]
-    spans = []
-    roots = {"tab-a": "k:/clips", "tab-b": "k:/clips"}
-    page = ("id-1", "id-2")
 
-    def tick():
-        with tick_lock:
-            clock[0] += 1
-            return clock[0]
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clock = 0
+        self.spans = []
+        self.admitted = []
+        self.refused = []
+        self.failed = []
+        self.finished = []
 
-    def record(kind, owner, root, opened, closed):
-        with tick_lock:
-            spans.append((kind, owner, root, opened, closed))
+    def tick(self) -> int:
+        with self._lock:
+            self._clock += 1
+            return self._clock
 
-    def transfer(owner):
-        for _ in range(25):
-            try:
-                claim = guard.begin(owner, 1, "sig", roots[owner], page)
-            except (tg.TransferBusy, tg.DecisionInFlight):
-                continue
-            opened = tick()
-            closed = tick()
+    def record_span(self, kind, owner, root_key, identities, opened, closed):
+        with self._lock:
+            self.spans.append({"kind": kind, "owner": owner, "root_key": root_key,
+                               "identities": frozenset(identities),
+                               "opened": opened, "closed": closed})
+
+    def note(self, bucket, value):
+        with self._lock:
+            getattr(self, bucket).append(value)
+
+    def note_refusal(self, label, who, code):
+        """A refusal is an EVENT IN THE TOTAL ORDER, and stamping it is what makes this harness
+        falsifiable.
+
+        [F-6] The logical clock only advances when something happens to a claim. A refusal that
+        did not tick left the holder's span spanning no events at all -- width 1 -- so there was
+        nothing for an overlap or an enclosure check to see even though a real conflict had just
+        been met inside a real interval. Stamping the refusal means the holder's span provably
+        *contains* the moment its conflict was refused.
+        """
+        with self._lock:
+            self._clock += 1
+            self.refused.append({"label": label, "who": who, "code": code, "at": self._clock})
+
+    def refusals_inside(self, span) -> list:
+        """The refusals stamped strictly between this span's open and close ticks.
+
+        Takes the lock like every other accessor here. In practice it is only ever called after
+        the workers have been joined, but the class's whole claim is that one lock covers its
+        state, and a reader that quietly opted out would be the next person's trap.
+        """
+        with self._lock:
+            return [r for r in self.refused if span["opened"] < r["at"] < span["closed"]]
+
+
+class _Latch:
+    """A countdown every worker arrives at, so a holder can wait for *everybody's outcome*.
+
+    This is what makes the contended phase deterministic: the winner does not hold its claim for
+    an arbitrary time, it holds it until all the other presses have actually been through
+    admission and reported. Their refusals are therefore known to have happened while the
+    winner's span was open.
+    """
+
+    def __init__(self, count: int):
+        self._remaining = count
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+
+    def arrive(self):
+        with self._lock:
+            self._remaining -= 1
+            if self._remaining <= 0:
+                self._done.set()
+
+    def wait(self, timeout):
+        return self._done.wait(timeout)
+
+
+def _spans_conflict(first: dict, second: dict) -> bool:
+    """Whether two recorded spans are a pair the guard's own rules forbid holding at once.
+
+    This is deliberately the guard's rule set restated over spans -- owner, then folder, then
+    identity overlap -- rather than a looser "any two claims". Two things follow, and both matter:
+
+    * **decision vs decision is never a violation.** Concurrent classifications of one clip are
+      permitted by design and are serialised by `ReviewStore.decide`'s own lock with an
+      optimistic revision check, so flagging them would make this test assert something false.
+    * **a bare identity overlap across two owners and two roots IS a violation**, which is the
+      F-2 rule and the reason M3 below can be detected at all.
+    """
+    if first["kind"] == second["kind"] == "decision":
+        return False
+    if first["owner"] == second["owner"]:
+        return True
+    if first["root_key"] and first["root_key"] == second["root_key"]:
+        return True
+    return not first["identities"].isdisjoint(second["identities"])
+
+
+def _overlapping(first: dict, second: dict) -> bool:
+    """Strictly overlapping logical intervals.
+
+    Strict on both sides, so two *sequential* claims -- the second opening at or after the first
+    closed -- are never mistaken for a violation. That is the normal, correct outcome and the
+    whole file would be noise if it counted.
+    """
+    return first["opened"] < second["closed"] and second["opened"] < first["closed"]
+
+
+@contextlib.contextmanager
+def _hold_transfer(guard, log, owner, root_key, identities):
+    """Admit a transfer, hold it for a measurable logical interval, release it in `finally`.
+
+    If `begin` raises there is nothing to release and nothing to record: the exception propagates
+    to the caller, which records a refusal. The span is recorded *after* the close tick and the
+    release, so a span exists only for a claim that was genuinely held.
+    """
+    claim = guard.begin(owner, 1, "sig", root_key, identities)
+    opened = log.tick()
+    try:
+        yield claim
+    finally:
+        closed = log.tick()
+        try:
             guard.end(claim)
-            record("transfer", owner, roots[owner], opened, closed)
+        finally:
+            log.record_span("transfer", owner, root_key, identities, opened, closed)
 
-    def decision(owner):
-        for _ in range(25):
-            try:
-                claim = guard.begin_decision(owner, roots[owner], "id-1")
-            except (tg.TransferBusy, tg.DecisionInFlight):
-                continue
-            opened = tick()
-            closed = tick()
+
+@contextlib.contextmanager
+def _hold_decision(guard, log, owner, root_key, identity):
+    """The same, for one durable decision slot."""
+    claim = guard.begin_decision(owner, root_key, identity)
+    opened = log.tick()
+    try:
+        yield claim
+    finally:
+        closed = log.tick()
+        try:
             guard.end_decision(claim)
-            record("decision", owner, roots[owner], opened, closed)
+        finally:
+            log.record_span("decision", owner, root_key, (identity,), opened, closed)
 
-    gate = threading.Barrier(24)
 
-    def worker(target, owner):
-        gate.wait(30)
-        target(owner)
+#: One tree, scanned by two sessions as an ancestor and a descendant. Two owners, two root keys,
+#: one shared durable identity -- the configuration that rules 1 and 2 are both blind to.
+_OWNER_PARENT, _OWNER_CHILD = "tab-parent", "tab-child"
+_ROOT_PARENT, _ROOT_CHILD = "k:/clips", "k:/clips/sub"
+_SHARED = "id-shared"
+_PARENT_PAGE = (_SHARED, "id-parent-only")
 
-    owners = ("tab-a", "tab-b")
-    threads = [threading.Thread(
-        target=worker,
-        args=(transfer if index % 4 < 2 else decision, owners[index % 2]), daemon=True)
-        for index in range(24)]
+
+def _probe_attack_inside_a_held_claim(guard, log, hold, attack, label):
+    """Run `attack` strictly INSIDE the interval `hold` is holding, by Event handshake.
+
+    Two Events and no sleeping: the holder publishes `holding` once its claim is open, the
+    attacker waits for that before trying, and the holder does not close until the attacker has
+    published `attacked`. So on a guard that wrongly admits the attacker, the attacker's span is
+    nested inside the holder's and the overlap is structural.
+
+    Every worker's exception is captured, and both Events are set on every path -- including the
+    failure paths -- so a defective guard produces a recorded failure rather than a hung test.
+    """
+    holding, attacked = threading.Event(), threading.Event()
+
+    def _holder():
+        try:
+            with hold(guard, log):
+                log.note("admitted", (label, "holder"))
+                holding.set()
+                # A real interval, held open until the attacker has finished trying. The sleep is
+                # supplementary: the handshake is what makes the window certain.
+                time.sleep(0.001)
+                if not attacked.wait(30):
+                    log.note("failed", (label, "holder", "the attacker never reported"))
+        except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+            log.note_refusal(label, "holder", declined.code)
+        except BaseException as crash:               # noqa: BLE001 - a dead worker is a failure
+            log.note("failed", (label, "holder", repr(crash)))
+        finally:
+            holding.set()                            # never leave the attacker waiting
+            log.note("finished", (label, "holder"))
+
+    def _attacker():
+        try:
+            if not holding.wait(30):
+                log.note("failed", (label, "attacker", "the holder never reported"))
+                return
+            attack(guard, log)
+        except BaseException as crash:               # noqa: BLE001 - a dead worker is a failure
+            log.note("failed", (label, "attacker", repr(crash)))
+        finally:
+            attacked.set()                           # never leave the holder waiting
+            log.note("finished", (label, "attacker"))
+
+    threads = [threading.Thread(target=_holder, daemon=True),
+               threading.Thread(target=_attacker, daemon=True)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(60)
-    assert not [t for t in threads if t.is_alive()], "a worker hung"
+    return [t for t in threads if t.is_alive()]
 
-    assert len(spans) > 50, f"too little contention to mean anything: {len(spans)}"
-    overlaps = []
-    for index, first in enumerate(spans):
-        for second in spans[index + 1:]:
-            if first[0] == second[0] == "decision":
-                continue                    # decisions deliberately do not exclude each other
-            if first[3] < second[4] and second[3] < first[4]:
-                overlaps.append((first, second))
-    assert not overlaps, f"conflicting claims overlapped: {overlaps[:3]}"
-    assert guard.deciding() == 0
-    assert all(guard.active_for(owner) is None for owner in owners)
+
+def _attack_with_a_cross_root_transfer(guard, log):
+    """A second SORT of the shared clip, arriving under another owner and another folder."""
+    try:
+        with _hold_transfer(guard, log, _OWNER_CHILD, _ROOT_CHILD, (_SHARED,)):
+            log.note("admitted", ("cross-root transfer", "attacker"))
+            time.sleep(0.001)
+    except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+        log.note_refusal("cross-root transfer", "attacker", declined.code)
+
+
+def _attack_with_a_cross_root_decision(guard, log):
+    """A CLASSIFICATION of the shared clip, arriving under another owner and another folder."""
+    try:
+        with _hold_decision(guard, log, _OWNER_CHILD, _ROOT_CHILD, _SHARED):
+            log.note("admitted", ("cross-root decision", "attacker"))
+            time.sleep(0.001)
+    except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+        log.note_refusal("cross-root decision", "attacker", declined.code)
+
+
+def _attack_with_a_transfer_over_a_pending_decision(guard, log):
+    """The reverse direction: admission attempted while a cross-root decision is in flight.
+
+    This is the only probe that can see `begin` skipping the pending-decision map, because a
+    decision in flight holds no `ActiveTransfer` for the identity rule to find.
+    """
+    try:
+        with _hold_transfer(guard, log, _OWNER_PARENT, _ROOT_PARENT, _PARENT_PAGE):
+            log.note("admitted", ("transfer over a pending decision", "attacker"))
+            time.sleep(0.001)
+    except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+        log.note_refusal("transfer over a pending decision", "attacker", declined.code)
+
+
+def _attack_with_a_second_classification(guard, log):
+    """A control, not an attack: a second classification of the shared clip under a third owner.
+
+    It MUST be admitted and MAY overlap, because concurrent classifications are permitted. It is
+    here so the test is known to distinguish a real violation from legitimate concurrency rather
+    than merely never meeting any.
+    """
+    try:
+        with _hold_decision(guard, log, "tab-third", "k:/elsewhere", _SHARED):
+            log.note("admitted", ("concurrent classification", "attacker"))
+            time.sleep(0.001)
+    except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+        log.note_refusal("concurrent classification", "attacker", declined.code)
+
+
+def _contended_phase(guard, log, presses=24, rounds=3):
+    """Many sessions, each its OWN owner and OWN root key, all over one shared page.
+
+    Deterministic by construction rather than by timing: a barrier makes every press attempt
+    admission together, and the winner then holds its claim until a latch confirms **every** press
+    has been through admission and recorded an outcome. The refusals are therefore known to have
+    occurred inside the winner's open span.
+    """
+    for _ in range(rounds):
+        gate = threading.Barrier(presses)
+        latch = _Latch(presses)
+
+        def _press(index):
+            owner, root = f"tab-{index:02d}", f"k:/root-{index:02d}"
+            try:
+                gate.wait(30)
+                try:
+                    with _hold_transfer(guard, log, owner, root, _PARENT_PAGE):
+                        log.note("admitted", ("contended", owner))
+                        latch.arrive()               # report BEFORE waiting, or this deadlocks
+                        latch.wait(30)
+                        time.sleep(0.001)
+                except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+                    log.note_refusal("contended", owner, declined.code)
+                    latch.arrive()
+            except BaseException as crash:           # noqa: BLE001 - a dead worker is a failure
+                log.note("failed", ("contended", owner, repr(crash)))
+                latch.arrive()
+            finally:
+                log.note("finished", ("contended", owner))
+
+        threads = [threading.Thread(target=_press, args=(index,), daemon=True)
+                   for index in range(presses)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        alive = [t for t in threads if t.is_alive()]
+        assert not alive, f"{len(alive)} contended presses hung"
+
+
+def _hold_parent_transfer(guard, log):
+    """The PARENT session sorting its page, which contains the shared clip."""
+    return _hold_transfer(guard, log, _OWNER_PARENT, _ROOT_PARENT, _PARENT_PAGE)
+
+
+def _hold_child_decision(guard, log):
+    """The CHILD session classifying the shared clip, under its own folder."""
+    return _hold_decision(guard, log, _OWNER_CHILD, _ROOT_CHILD, _SHARED)
+
+
+def _measure_interval_property(guard):
+    """Measure the interval half of the invariant, and raise `AssertionError` on any violation.
+
+    Factored out so the test below and the four standing not-vacuous proofs after it run **the
+    same** measurement -- a control that exercised a different code path would prove nothing about
+    the test it is supposed to be validating. Returns the log so a caller can inspect it.
+
+    Assertion order is load-bearing, and was chosen by running it against all four mutants:
+
+    1. **a dead worker first**, so a missing-API guard fails on its captured exception rather than
+       slipping through to an overlap check with nothing to compare;
+    2. then the worker census;
+    3. then **the property itself**, so a guard that refuses nothing at all fails on the real
+       overlap rather than on "nothing was refused" -- the latter is true of it, but it is the
+       weaker statement and names the wrong defect;
+    4. and only then the positive evidence that the harness actually met a conflict, which is
+       what stops THIS function from ever becoming vacuous again.
+    """
+    log = _IntervalLog()
+    probes = [
+        (_hold_parent_transfer, _attack_with_a_cross_root_transfer, "cross-root transfer"),
+        (_hold_parent_transfer, _attack_with_a_cross_root_decision, "cross-root decision"),
+        (_hold_child_decision, _attack_with_a_transfer_over_a_pending_decision,
+         "transfer over a pending decision"),
+        # A CONTROL, not an attack, and deliberately decision-against-decision: a classification
+        # arriving while that clip is being SORTED is correctly refused, so pairing this with a
+        # transfer holder would assert the opposite of the contract. Two classifications of one
+        # clip are permitted, must both be admitted, and their spans MUST overlap without being
+        # flagged -- which is what proves `_spans_conflict` tells the two cases apart.
+        (_hold_child_decision, _attack_with_a_second_classification,
+         "concurrent classification (control)"),
+    ]
+    for hold, attack, label in probes:
+        hung = _probe_attack_inside_a_held_claim(guard, log, hold, attack, label)
+        assert not hung, f"{label}: a worker hung"
+    _contended_phase(guard, log)
+
+    # 1 -- no worker may die. [F-6] The old version had no such list at all, which is how it
+    # passed against a guard whose decision API did not exist.
+    assert not log.failed, f"a worker raised unexpectedly: {log.failed[:3]}"
+
+    # 2 -- every worker reached the end of its body. 4 probes x 2 workers + 3 rounds x 24 presses.
+    expected_workers = len(probes) * 2 + 3 * 24
+    assert len(log.finished) == expected_workers, \
+        f"only {len(log.finished)} of {expected_workers} workers finished"
+
+    # 3 -- THE PROPERTY. Every pair the guard's own rules forbid holding at once, checked for
+    # strict temporal overlap. Strict on both sides, so sequential claims are never miscounted.
+    assert log.spans, "no claim was ever held, so there was nothing to measure"
+    overlaps = [(first, second)
+                for index, first in enumerate(log.spans)
+                for second in log.spans[index + 1:]
+                if _spans_conflict(first, second) and _overlapping(first, second)]
+    assert not overlaps, f"conflicting claims overlapped in time: {overlaps[:3]}"
+
+    # 4 -- the harness actually met a conflict, INSIDE a held interval. [F-6] This is the part
+    # the old version had no way of knowing: it is not enough that no overlap was found, the
+    # window has to have been open while a conflicting claim was attempted. A refusal stamps the
+    # logical clock, so a holder's span strictly ENCLOSING a refusal is direct evidence that the
+    # attempt happened during the hold rather than before or after it.
+    assert log.admitted, "nothing was ever admitted, so no claim was ever held"
+    assert log.refused, "nothing was ever refused, so no conflict was ever met"
+    enclosing = [span for span in log.spans if log.refusals_inside(span)]
+    assert enclosing, (
+        "no held claim enclosed a single refusal -- every conflicting attempt happened outside "
+        "the window, so this measurement would pass against an unguarded guard. That is F-6.")
+    assert max(len(log.refusals_inside(span)) for span in enclosing) >= 20, (
+        "the contended round's refusals did not land inside the winner's span: "
+        f"{[len(log.refusals_inside(s)) for s in enclosing]}")
+
+    # 5 -- nothing outstanding, so no span was left open and no claim leaked.
+    assert guard.deciding() == 0, "a decision slot leaked"
+    leaked = [s["owner"] for s in log.spans if guard.active_for(s["owner"]) is not None]
+    assert not leaked, f"a reservation leaked: {leaked}"
+    return log
+
+
+def test_no_conflicting_claims_ever_overlap_in_time():
+    """The INTERVAL property, which is a different statement from "never both won".
+
+    The invariant says *none can start until it is released*. A race whose claims are never
+    released cannot test that half -- once the first winner takes the floor every later caller is
+    refused for the rest of the round -- so this holds each claim open for a measurable logical
+    interval and checks every conflicting pair of spans for temporal overlap.
+
+    [F-6] Rewritten after review. The previous version ticked its two boundaries back to back, so
+    every span was zero width and the overlap check could not fire: measured at **0/40 against
+    four defective guards**, one of which had no exclusion at all. The four proofs below are the
+    standing evidence that this version discriminates, and the enclosure assertion inside
+    `_measure_interval_property` is what stops the defect returning silently -- a window that was
+    never open while a conflict was attempted now fails loudly instead of reporting success.
+    """
+    log = _measure_interval_property(tg.TransferGuard())
+
+    # Positive evidence, so a future regression cannot make this pass by measuring nothing.
+    assert len(log.spans) >= 5, f"too few held claims to mean anything: {len(log.spans)}"
+    assert len(log.refused) >= 24, f"too little contention: {len(log.refused)} refusals"
+    kinds = {span["kind"] for span in log.spans}
+    assert kinds == {"transfer", "decision"}, f"one kind of claim was never held: {kinds}"
+    # The permitted-concurrency control really was permitted, so the identity rule is not a
+    # blanket freeze on classification: two sessions may classify one clip at the same time, and
+    # `ReviewStore.decide`'s own lock and revision check are what order them.
+    assert any(label == "concurrent classification" for label, *_ in log.admitted), \
+        "a second classification of one clip was refused -- that is not the contract"
+    # And the two overlapping decision spans were NOT reported as a violation, which is the
+    # discrimination this harness would be worthless without.
+    decisions = [span for span in log.spans if span["kind"] == "decision"]
+    assert any(_overlapping(first, second)
+               for index, first in enumerate(decisions)
+               for second in decisions[index + 1:]), \
+        "no two classifications ever overlapped, so the permitted case was never exercised"
+
+
+# ---- [F-6] the four standing proofs that the interval test is not vacuous --------------------
+#
+# Each mutant is a subclass, so no production source is modified. Each proof asserts the interval
+# test FAILS **and** that it failed for the intended reason, because a control that only checks
+# "it failed" would be satisfied by a typo.
+
+
+class _M1NoExclusionAtAll(tg.TransferGuard):
+    """Both claims granted without consulting anything. Raises nothing, so only the overlap check
+    can catch it."""
+
+    def begin(self, owner, generation, signature, root_key, identities=()):
+        with self._lock:
+            self._token += 1
+            record = tg.ActiveTransfer(owner=str(owner), generation=generation,
+                                       signature=str(signature), root_key=str(root_key),
+                                       token=self._token, identities=frozenset(identities))
+            self._active[str(owner)] = record
+            return tg.Reservation(owner=record.owner, generation=generation,
+                                  signature=record.signature, root_key=record.root_key,
+                                  token=record.token, identities=record.identities)
+
+    def begin_decision(self, owner, root_key='', identity=''):
+        with self._lock:
+            self._token += 1
+            slot = tg.DecisionSlot(owner=str(owner), root_key=str(root_key),
+                                   token=self._token, identity=str(identity))
+            self._deciding[slot.token] = slot
+            return slot
+
+
+class _M2MissingBeginDecision(tg.TransferGuard):
+    """The pre-F-1 shape: the decision API does not exist."""
+
+    def begin_decision(self, *args, **kwargs):
+        raise AttributeError("'TransferGuard' object has no attribute 'begin_decision'")
+
+
+class _M3NoIdentityOverlapRule(tg.TransferGuard):
+    """F-2 undone. The owner and folder rules only, with the API shape kept so nothing raises."""
+
+    def _conflicting_transfer(self, owner, root_key, identities=frozenset()):
+        mine = self._active.get(owner)
+        if mine is not None:
+            return "transfer_in_progress", mine
+        if root_key:
+            for other in self._active.values():
+                if other.root_key == root_key:
+                    return "folder_in_progress", other
+        return None
+
+
+class _M4AdmissionIgnoresPendingDecisions(tg.TransferGuard):
+    """F-1's other half undone: `begin` consults `_active` but never `_deciding`."""
+
+    def begin(self, owner, generation, signature, root_key, identities=()):
+        key = str(owner)
+        root = str(root_key or '')
+        claimed = frozenset(identities)
+        with self._lock:
+            conflict = self._conflicting_transfer(key, root, claimed)
+            if conflict is not None:
+                self.refused += 1
+                raise tg.TransferBusy(*conflict)
+            self._token += 1
+            record = tg.ActiveTransfer(owner=key, generation=generation,
+                                       signature=str(signature or ''),
+                                       root_key=str(root_key or ''), token=self._token,
+                                       identities=claimed)
+            self._active[key] = record
+            return tg.Reservation(owner=key, generation=generation, signature=record.signature,
+                                  root_key=record.root_key, token=record.token,
+                                  identities=claimed)
+
+
+def _interval_failure_for(mutant):
+    """Run the interval measurement against `mutant` and return the assertion it raised."""
+    with pytest.raises(AssertionError) as failure:
+        _measure_interval_property(mutant())
+    return str(failure.value)
+
+
+def test_the_interval_test_is_not_vacuous_when_there_is_no_exclusion_at_all():
+    """M1. The mutant raises nothing, so the exception bookkeeping cannot catch it -- only a real
+    overlap of two real intervals can, which is precisely what F-6 was unable to observe."""
+    reason = _interval_failure_for(_M1NoExclusionAtAll)
+    assert "conflicting claims overlapped in time" in reason, reason
+
+
+def test_the_interval_test_is_not_vacuous_when_the_decision_claim_is_missing():
+    """M2. It must fail on a CAPTURED worker exception, not pass quietly because the classifying
+    workers never acquired anything -- that silent abstention was the whole of F-3 and F-6."""
+    reason = _interval_failure_for(_M2MissingBeginDecision)
+    assert "a worker raised unexpectedly" in reason, reason
+    assert "AttributeError" in reason, reason
+
+
+def test_the_interval_test_is_not_vacuous_when_the_identity_rule_is_removed():
+    """M3, and the probe is deliberately cross-owner AND cross-root.
+
+    Had it leaned on a same-owner or same-folder collision, rules 1 and 2 would have refused the
+    attacker and the missing identity rule would have been invisible -- the mask that let F-2 ship
+    in the first place.
+    """
+    reason = _interval_failure_for(_M3NoIdentityOverlapRule)
+    assert "conflicting claims overlapped in time" in reason, reason
+
+
+def test_the_interval_test_is_not_vacuous_when_admission_ignores_pending_decisions():
+    """M4. A decision claim is held under the CHILD owner and the CHILD root while the PARENT
+    owner attempts a transfer on the parent root over the same identity. Nothing is in `_active`,
+    so only the pending-decision map can refuse it -- and this mutant does not look."""
+    reason = _interval_failure_for(_M4AdmissionIgnoresPendingDecisions)
+    assert "conflicting claims overlapped in time" in reason, reason
+
+
+def test_the_interval_probe_really_does_place_the_attack_inside_the_hold():
+    """The handshake, asserted directly rather than trusted.
+
+    If the attacker ever ran before or after the hold, the probes above would be measuring
+    sequential claims and M1 would escape. On the unguarded mutant the attacker IS admitted, so
+    its span must be strictly nested inside the holder's.
+    """
+    log = _IntervalLog()
+    guard = _M1NoExclusionAtAll()
+    hung = _probe_attack_inside_a_held_claim(
+        guard, log, _hold_parent_transfer, _attack_with_a_cross_root_transfer, "nesting")
+    assert not hung and not log.failed, log.failed
+    assert len(log.spans) == 2, log.spans
+    attacker = next(s for s in log.spans if s["owner"] == _OWNER_CHILD)
+    holder = next(s for s in log.spans if s["owner"] == _OWNER_PARENT)
+    assert holder["opened"] < attacker["opened"] < attacker["closed"] < holder["closed"], \
+        f"the attack was not inside the hold: holder={holder} attacker={attacker}"
+    assert _spans_conflict(holder, attacker) and _overlapping(holder, attacker)
 
 
 def test_many_owners_may_classify_at_once():
