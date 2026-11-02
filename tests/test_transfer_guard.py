@@ -342,45 +342,270 @@ def test_a_decision_slot_survives_an_exception_in_the_work_it_covers():
     assert guard.begin("tab-a", 1, "sig", "k:/clips").owner == "tab-a"
 
 
+class _Race:
+    """One barrier, half the workers pressing Confirm and half classifying, for one owner.
+
+    **Every worker outcome is recorded, and that is the whole point rather than a nicety:**
+
+    * ``won`` -- the claims that succeeded, by kind, each with the claim object so the caller can
+      release it *after* joining;
+    * ``refused`` -- the claims the guard declined, which is a *correct* outcome and has to be
+      seen to have happened, or the assertions are being made over a race that never collided;
+    * ``failed`` -- **any other exception**. Review finding F-3 was that this list did not exist.
+      A worker whose body raised something its ``except`` clause did not name simply died, the
+      thread turned it into a ``PytestUnhandledThreadExceptionWarning``, and the parent's "they
+      never both won" assertion was satisfied because one side had never run at all -- so the
+      test passed against an implementation with **no decision claim whatsoever**;
+    * ``finished`` -- proof that every worker reached the end of its body, so a hang or an early
+      return cannot pass for a clean race either.
+
+    **Nothing is released inside the round.** That is load-bearing for the mutual-exclusion
+    assertion: the claims have to be held concurrently for "both kinds won" to mean "both kinds
+    were held at once". Releasing inside a worker would make a sequential pass of sixteen
+    successful decisions after one finished transfer look like a violation, and would make the
+    test assert nothing about overlap. The *interval* property -- that nothing can start while a
+    conflicting claim is held -- is a different statement and is asserted separately by
+    :func:`test_no_conflicting_claims_ever_overlap_in_time`.
+    """
+
+    def __init__(self, guard, threads=32):
+        self.guard = guard
+        self.threads = threads
+        self.won = []
+        self.refused = []
+        self.failed = []
+        self.finished = []
+
+    def run(self):
+        start = threading.Barrier(self.threads)
+
+        def press():
+            try:
+                start.wait(30)
+                try:
+                    claim = self.guard.begin("tab-a", 1, "sig", "k:/clips", ("id-1", "id-2"))
+                except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+                    self.refused.append(("transfer", declined.code))
+                else:
+                    self.won.append(("transfer", claim))
+            except BaseException as unexpected:          # noqa: BLE001 - recorded, see docstring
+                self.failed.append(("transfer", repr(unexpected)))
+            finally:
+                self.finished.append("transfer")
+
+        def classify():
+            try:
+                start.wait(30)
+                try:
+                    claim = self.guard.begin_decision("tab-a", "k:/clips", "id-1")
+                except (tg.TransferBusy, tg.DecisionInFlight) as declined:
+                    self.refused.append(("decision", declined.code))
+                else:
+                    self.won.append(("decision", claim))
+            except BaseException as unexpected:          # noqa: BLE001 - recorded, see docstring
+                self.failed.append(("decision", repr(unexpected)))
+            finally:
+                self.finished.append("decision")
+
+        workers = [threading.Thread(target=press if index % 2 else classify, daemon=True)
+                   for index in range(self.threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+        assert not [w for w in workers if w.is_alive()], "a worker hung"
+        return self
+
+    @property
+    def kinds(self):
+        return [kind for kind, _ in self.won]
+
+    def release(self):
+        """Give every successful claim back, so one guard can run many rounds."""
+        for kind, claim in self.won:
+            if kind == "transfer":
+                self.guard.end(claim)
+            else:
+                self.guard.end_decision(claim)
+        self.won = []
+
+
 def test_a_transfer_and_a_decision_racing_one_owner_never_both_win():
     """The whole correction in one assertion. Both operations test-and-set under the same lock, so
     however 32 threads interleave the pair is mutually exclusive -- which is exactly what the
-    original `if not busy: commit()` could not promise."""
+    original `if not busy: commit()` could not promise.
+
+    [F-3] Rewritten after review. Every worker's outcome is now captured and an unexpected
+    exception is a FAILURE rather than a silent abstention: the previous shape passed against a
+    guard with no `begin_decision` at all, because the sixteen classifying threads died on
+    `AttributeError` and left the winners list holding only transfers. The two tests below are the
+    standing proof that this one now discriminates, in both defect directions.
+    """
+    guard = tg.TransferGuard()
     for attempt in range(40):
-        guard = tg.TransferGuard()
-        won = []
-        start = threading.Barrier(32)
+        race = _Race(guard).run()
 
-        def press():
-            start.wait()
+        assert not race.failed, \
+            f"attempt {attempt}: a worker raised unexpectedly: {race.failed[:3]}"
+        assert len(race.finished) == 32, \
+            f"attempt {attempt}: only {len(race.finished)} of 32 workers ran"
+        # Decisions do not exclude each other -- only a transfer excludes them -- so a round may
+        # legally end with one transfer and no decision, or no transfer and several decisions.
+        # What must never happen is the two being held at the same time.
+        assert not ("transfer" in race.kinds and "decision" in race.kinds), \
+            f"attempt {attempt}: a transfer and a decision both won: {race.kinds}"
+        assert race.won, f"attempt {attempt}: nobody won at all"
+        # Contention actually happened. With 32 threads at one barrier the losers are what prove
+        # the exclusion did something, rather than that it was never exercised.
+        assert race.refused, f"attempt {attempt}: no claim was refused, so nothing raced"
+        assert all(code in ("transfer_in_progress", "folder_in_progress", "clip_in_progress",
+                            "decision_in_flight") for _, code in race.refused), race.refused
+        race.release()
+
+    assert guard.deciding() == 0
+    assert guard.active_for("tab-a") is None
+    assert guard.refused > 0, "the refusal counter never moved, so the race never collided"
+
+
+def test_the_race_is_not_vacuous_when_the_decision_claim_is_missing():
+    """[F-3] Standing proof #1 that the race discriminates: the pre-F-1 shape.
+
+    A guard with no decision claim must make the race FAIL, and fail *for the intended reason* --
+    the classifying workers could not claim anything. Before the rewrite this exact configuration
+    produced a green test and 1240 unhandled-thread warnings.
+    """
+    class _NoDecisionClaim(tg.TransferGuard):
+        def begin_decision(self, *args, **kwargs):
+            raise AttributeError("'TransferGuard' object has no attribute 'begin_decision'")
+
+    race = _Race(_NoDecisionClaim()).run()
+
+    assert len(race.finished) == 32, "a worker was lost instead of having its failure recorded"
+    assert race.failed, "a defective guard produced no recorded failure -- still vacuous"
+    assert all(kind == "decision" for kind, _ in race.failed), race.failed
+    assert "AttributeError" in race.failed[0][1], race.failed[0]
+    assert "decision" not in race.kinds, "a claim succeeded against a guard that has none"
+
+
+def test_the_race_is_not_vacuous_when_the_exclusion_is_removed():
+    """[F-3] Standing proof #2, and the one that matters more: a guard that hands out both claims.
+
+    It raises nothing, so the exception bookkeeping cannot catch it -- only the mutual-exclusion
+    assertion can. If this mutant never produced an overlap, the race test would be measuring
+    thread scheduling rather than the guard.
+    """
+    class _NoExclusion(tg.TransferGuard):
+        """Admission and decision claims that register without consulting anything."""
+
+        def begin(self, owner, generation, signature, root_key, identities=()):
+            with self._lock:
+                self._token += 1
+                record = tg.ActiveTransfer(owner=str(owner), generation=generation,
+                                           signature=str(signature), root_key=str(root_key),
+                                           token=self._token,
+                                           identities=frozenset(identities))
+                self._active[str(owner)] = record
+                return tg.Reservation(owner=record.owner, generation=generation,
+                                      signature=record.signature, root_key=record.root_key,
+                                      token=record.token, identities=record.identities)
+
+        def begin_decision(self, owner, root_key='', identity=''):
+            with self._lock:
+                self._token += 1
+                slot = tg.DecisionSlot(owner=str(owner), root_key=str(root_key),
+                                       token=self._token, identity=str(identity))
+                self._deciding[slot.token] = slot
+                return slot
+
+    guard = _NoExclusion()
+    overlapped = False
+    for _ in range(40):
+        race = _Race(guard).run()
+        assert not race.failed and len(race.finished) == 32, "the mutant failed for the wrong reason"
+        if "transfer" in race.kinds and "decision" in race.kinds:
+            overlapped = True
+            break
+        race.release()
+    assert overlapped, \
+        "an unguarded implementation never overlapped -- the race cannot detect one"
+
+
+def test_no_conflicting_claims_ever_overlap_in_time():
+    """The INTERVAL property, which is a different statement from "never both won".
+
+    The invariant says *none can start until it is released*, and a race whose claims are never
+    released cannot test that half: once the first winner takes the floor every later caller is
+    refused for the rest of the round. So here each claim is held for a real interval, released,
+    and the round repeats -- and every pair of spans that conflict by the guard's own rules is
+    checked for temporal overlap. A lock-protected counter supplies the total order, because wall
+    clock readings from several threads cannot be compared safely.
+    """
+    guard = tg.TransferGuard()
+    tick_lock = threading.Lock()
+    clock = [0]
+    spans = []
+    roots = {"tab-a": "k:/clips", "tab-b": "k:/clips"}
+    page = ("id-1", "id-2")
+
+    def tick():
+        with tick_lock:
+            clock[0] += 1
+            return clock[0]
+
+    def record(kind, owner, root, opened, closed):
+        with tick_lock:
+            spans.append((kind, owner, root, opened, closed))
+
+    def transfer(owner):
+        for _ in range(25):
             try:
-                guard.begin("tab-a", 1, "sig", "k:/clips")
-                won.append("transfer")
+                claim = guard.begin(owner, 1, "sig", roots[owner], page)
             except (tg.TransferBusy, tg.DecisionInFlight):
-                pass
+                continue
+            opened = tick()
+            closed = tick()
+            guard.end(claim)
+            record("transfer", owner, roots[owner], opened, closed)
 
-        def classify():
-            start.wait()
+    def decision(owner):
+        for _ in range(25):
             try:
-                guard.begin_decision("tab-a", "k:/clips")
-                won.append("decision")
-            except tg.TransferBusy:
-                pass
+                claim = guard.begin_decision(owner, roots[owner], "id-1")
+            except (tg.TransferBusy, tg.DecisionInFlight):
+                continue
+            opened = tick()
+            closed = tick()
+            guard.end_decision(claim)
+            record("decision", owner, roots[owner], opened, closed)
 
-        threads = [threading.Thread(target=press if index % 2 else classify)
-                   for index in range(32)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+    gate = threading.Barrier(24)
 
-        # Decisions do not exclude each other -- only a transfer excludes them -- so the legal
-        # outcomes are "one transfer and no decision" or "no transfer and any number of
-        # decisions". What must never happen is a transfer alongside a decision.
-        assert not ("transfer" in won and "decision" in won), \
-            f"attempt {attempt}: a transfer and a decision both won: {won}"
-        assert won.count("transfer") <= 1, f"attempt {attempt}: {won}"
-        assert won, f"attempt {attempt}: nobody won at all"
+    def worker(target, owner):
+        gate.wait(30)
+        target(owner)
+
+    owners = ("tab-a", "tab-b")
+    threads = [threading.Thread(
+        target=worker,
+        args=(transfer if index % 4 < 2 else decision, owners[index % 2]), daemon=True)
+        for index in range(24)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert not [t for t in threads if t.is_alive()], "a worker hung"
+
+    assert len(spans) > 50, f"too little contention to mean anything: {len(spans)}"
+    overlaps = []
+    for index, first in enumerate(spans):
+        for second in spans[index + 1:]:
+            if first[0] == second[0] == "decision":
+                continue                    # decisions deliberately do not exclude each other
+            if first[3] < second[4] and second[3] < first[4]:
+                overlaps.append((first, second))
+    assert not overlaps, f"conflicting claims overlapped: {overlaps[:3]}"
+    assert guard.deciding() == 0
+    assert all(guard.active_for(owner) is None for owner in owners)
 
 
 def test_many_owners_may_classify_at_once():
@@ -392,6 +617,197 @@ def test_many_owners_may_classify_at_once():
     for slot in slots:
         guard.end_decision(slot)
     assert guard.deciding() == 0
+
+
+# ---- identity-based cross-root exclusion (F-2) ----------------------------------------------
+#
+# The owner rule asks "whose press is this" and the folder rule asks "which directory". Neither
+# asks the only question that decides whether two operations collide: **which clips**. Two review
+# sessions that scanned an ancestor and a descendant of one tree have two owners and two resolved
+# roots, and the same clip in both batches under the same durable identity -- so a classification
+# from the child page was accepted, made durable, and ignored by a sort already running on the
+# parent page. The identity set is the exact conflict unit, and these tests are about that.
+
+def test_a_decision_is_refused_when_its_clip_is_in_another_sessions_batch():
+    """The F-2 defect, at the authority. Different owner, different root, same clip."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x", "id-y"))
+    with pytest.raises(tg.TransferBusy) as refused:
+        guard.begin_decision("tab-b", "k:/parent/child", "id-x")
+    assert refused.value.code == "clip_in_progress"
+    assert refused.value.active.owner == "tab-a", "the refusal must name the transfer that caused it"
+    assert guard.deciding() == 0, "a refused claim must register nothing"
+
+
+def test_a_decision_on_a_clip_outside_that_batch_is_still_admitted():
+    """Exclusion is per clip, not per tree. A child folder's OTHER clips stay classifiable."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+    assert guard.begin_decision("tab-b", "k:/parent/child", "id-z").identity == "id-z"
+
+
+def test_admission_is_refused_while_a_cross_root_decision_on_one_of_its_clips_is_in_flight():
+    """The straddle, in the direction a decision-in-flight holds no `ActiveTransfer` to scan.
+
+    `_conflicting_transfer` cannot see it -- there is no transfer -- so `begin` has to compare the
+    pending slot's identity against the page it is about to claim. Without that half, the decision
+    becomes durable a moment after admission and the batch moves by the snapshot it took before.
+    """
+    guard = tg.TransferGuard()
+    guard.begin_decision("tab-b", "k:/parent/child", "id-x")
+    with pytest.raises(tg.DecisionInFlight):
+        guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x", "id-y"))
+    assert guard.active_for("tab-a") is None
+
+
+def test_an_in_flight_decision_on_an_unrelated_clip_does_not_delay_admission():
+    guard = tg.TransferGuard()
+    guard.begin_decision("tab-b", "k:/elsewhere", "id-q")
+    assert guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",)).owner == "tab-a"
+
+
+def test_two_transfers_over_an_overlapping_batch_cannot_run_at_once():
+    """The hazard the owner/folder pair never excluded either: two sessions moving one file.
+
+    Strictly worse than the classification case, because both would call `os.rename` on the same
+    path -- one of them finding it already gone.
+    """
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig-a", "k:/parent", ("id-x", "id-y"))
+    with pytest.raises(tg.TransferBusy) as refused:
+        guard.begin("tab-b", 1, "sig-b", "k:/parent/child", ("id-y",))
+    assert refused.value.code == "clip_in_progress"
+
+
+def test_two_transfers_over_disjoint_batches_remain_independent():
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig-a", "k:/one", ("id-x",))
+    assert guard.begin("tab-b", 1, "sig-b", "k:/two", ("id-z",)).owner == "tab-b"
+
+
+def test_the_identity_rule_still_applies_when_neither_root_resolved():
+    """`_clips_transfer_key` answers `''` for a path it cannot resolve, which switches the folder
+    rule off. The identity is still known, so the clip is still protected -- this is the case the
+    folder rule was never able to cover at all."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "", ("id-x",))
+    with pytest.raises(tg.TransferBusy) as refused:
+        guard.begin_decision("tab-b", "", "id-x")
+    assert refused.value.code == "clip_in_progress"
+    assert guard.begin_decision("tab-b", "", "id-z").owner == "tab-b", \
+        "an unresolved root must not make every clip busy"
+
+
+def test_an_empty_identity_set_disables_only_the_identity_rule():
+    """The same fail-safe shape `root_key` has: an unknown page is not evidence about any clip,
+    and every pre-F-2 four-argument caller keeps its exact behaviour."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent")              # no identities supplied
+    assert guard.active_for("tab-a").identities == frozenset()
+    # the owner rule is untouched
+    with pytest.raises(tg.TransferBusy) as refused:
+        guard.begin_decision("tab-a", "k:/parent", "id-x")
+    assert refused.value.code == "transfer_in_progress"
+    # the folder rule is untouched
+    with pytest.raises(tg.TransferBusy) as folder:
+        guard.begin_decision("tab-b", "k:/parent", "id-x")
+    assert folder.value.code == "folder_in_progress"
+    # and with nothing recorded, a cross-root clip claim is admitted exactly as it was pre-F-2
+    assert guard.begin_decision("tab-b", "k:/parent/child", "id-x").identity == "id-x"
+
+
+def test_the_refusal_order_is_most_specific_first():
+    """Each code must be the most specific true statement: an operator told "another session is
+    sorting this folder" about their own press goes looking for a click they never made."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+    # self-collision, even though the folder and the clip also match
+    with pytest.raises(tg.TransferBusy) as mine:
+        guard.begin_decision("tab-a", "k:/parent", "id-x")
+    assert mine.value.code == "transfer_in_progress"
+    # folder collision, even though the clip also matches
+    with pytest.raises(tg.TransferBusy) as folder:
+        guard.begin_decision("tab-b", "k:/parent", "id-x")
+    assert folder.value.code == "folder_in_progress"
+    # only when neither of those applies is it reported as a clip overlap
+    with pytest.raises(tg.TransferBusy) as clip:
+        guard.begin_decision("tab-b", "k:/parent/child", "id-x")
+    assert clip.value.code == "clip_in_progress"
+
+
+def test_the_claimed_identity_set_is_frozen_against_the_callers_list():
+    """The conflict decision was made against this set, so the record must not be able to change
+    under it. A list the caller keeps appending to would let a transfer silently widen its own
+    exclusion after admission -- or narrow it."""
+    guard = tg.TransferGuard()
+    page = ["id-x"]
+    reservation = guard.begin("tab-a", 1, "sig", "k:/parent", page)
+    page.append("id-z")
+
+    assert isinstance(reservation.identities, frozenset)
+    assert reservation.identities == frozenset({"id-x"})
+    assert guard.active_for("tab-a").identities == frozenset({"id-x"})
+    assert guard.begin_decision("tab-b", "k:/other", "id-z").identity == "id-z", \
+        "the record grew after admission"
+
+
+def test_progress_updates_do_not_disturb_the_claimed_identities():
+    guard = tg.TransferGuard()
+    reservation = guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+    assert guard.note_progress(reservation, 3, 9) is True
+    record = guard.active_for("tab-a")
+    assert record.identities == frozenset({"id-x"}) and (record.done, record.total) == (3, 9)
+
+
+def test_releasing_a_transfer_frees_its_clips_immediately():
+    """A window, not a latch -- in the identity register as well."""
+    guard = tg.TransferGuard()
+    reservation = guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+    with pytest.raises(tg.TransferBusy):
+        guard.begin_decision("tab-b", "k:/parent/child", "id-x")
+    assert guard.end(reservation) is True
+    assert guard.begin_decision("tab-b", "k:/parent/child", "id-x").identity == "id-x"
+
+
+def test_the_advisory_conflict_read_reports_the_guards_own_reason():
+    """`conflict()` exists so the screen cannot keep its own copy of the rules. It must answer
+    with the same code the claim would raise, and must not claim anything itself."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+
+    assert guard.conflict("tab-a", "k:/parent", ("id-x",))[0] == "transfer_in_progress"
+    assert guard.conflict("tab-b", "k:/parent", ("id-x",))[0] == "folder_in_progress"
+    assert guard.conflict("tab-b", "k:/parent/child", ("id-x",))[0] == "clip_in_progress"
+    assert guard.conflict("tab-b", "k:/elsewhere", ("id-z",)) is None
+    assert guard.conflict("tab-b", "k:/parent/child") is None, \
+        "without a page the identity rule must stay off"
+    assert guard.deciding() == 0 and guard.refused == 0, "an advisory read claimed or counted"
+
+
+def test_busy_without_a_page_answers_exactly_as_it_did_before_f2():
+    """`busy()` gained an optional third argument. Every existing caller passes two, and must get
+    the pre-F-2 answer: this owner's transfer, or one on this exact folder."""
+    guard = tg.TransferGuard()
+    guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x",))
+    assert guard.busy("tab-a") is not None
+    assert guard.busy("tab-b", "k:/parent") is not None
+    assert guard.busy("tab-b", "k:/parent/child") is None
+    assert guard.busy("tab-b") is None
+    # and with a page it also answers for the clip
+    assert guard.busy("tab-b", "k:/parent/child", ("id-x",)) is not None
+
+
+def test_many_overlapping_claims_leak_nothing():
+    guard = tg.TransferGuard()
+    for _ in range(300):
+        reservation = guard.begin("tab-a", 1, "sig", "k:/parent", ("id-x", "id-y"))
+        with pytest.raises(tg.TransferBusy):
+            guard.begin_decision("tab-b", "k:/child", "id-y")
+        slot = guard.begin_decision("tab-b", "k:/child", "id-q")
+        assert guard.end_decision(slot) is True
+        assert guard.end(reservation) is True
+    assert guard.deciding() == 0
+    assert guard.active_for("tab-a") is None and guard.active_for("tab-b") is None
 
 
 # ---- the progress-frame budget -------------------------------------------------------------

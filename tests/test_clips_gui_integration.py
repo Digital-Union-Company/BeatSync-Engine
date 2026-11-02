@@ -52,6 +52,9 @@ _HANDLERS = ("_clips_store", "_clips_state_unavailable_text", "_clips_unavailabl
              # [R13] The transfer's exclusion key, then the single-flight generator and the
              # collected form every pre-R13 assertion in this file drives.
              "_clips_transfer_key",
+             # [F-2] The refusal-code -> sentence mapping. Extracted rather than stubbed, so the
+             # suite asserts against the text the app actually ships.
+             "_clips_transfer_busy_text",
              "_clips_decide", "_clips_state", "_on_clips_refresh",
              "_clips_confirm_only", "_clips_working_frame", "_clips_sorted_text",
              "_clips_confirm_frames", "_on_clips_confirm",

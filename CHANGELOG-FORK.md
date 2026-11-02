@@ -110,19 +110,52 @@ the stale snapshot anyway. So the correction is two halves, and neither is suffi
 | the snapshot re-read under the reservation | a decision that **completed** between the snapshot and admission | `snapshot_of(identities) != snapshot` → refuse, moving nothing |
 
 What that buys is a statable invariant rather than a narrower window: **once `begin` has returned a
-reservation, no conflicting durable decision can be in flight and none can start until it is
-released**, so a snapshot taken after admission is the batch's final truth. Neither call ever waits
-— both raise, and the caller turns that into an explicit retry, because a conflict is a
-sub-10-millisecond coincidence between two human-paced actions and a queue would add a blocking
-path to save nobody any time.
+reservation, no durable decision touching any identity on its page can be in flight and none can
+start until it is released — whatever owner or root it arrives under**, so a snapshot taken after
+admission is the batch's final truth. Neither call ever waits — both raise, and the caller turns
+that into an explicit retry, because a conflict is a sub-10-millisecond coincidence between two
+human-paced actions and a queue would add a blocking path to save nobody any time.
+
+**The conflict unit is the clip, not the folder, and the first version of that was wrong too
+(F-2).** The owner rule asks whose press it is and the folder rule asks which directory; neither
+asks which *clips*. Two review sessions that scanned an **ancestor and a descendant** of one tree
+have two owner keys and two different `root_key`s — and the same clip in both batches under the
+same durable decision identity, because a decision is keyed on the file and not on the path it was
+reached through. Independent review reproduced the consequence on the corrected F-1 tree: a
+classification accepted from the child page was answered `ok: True`, was durable, and was ignored
+by a sort already running on the parent page, which filed the clip by its older snapshot —
+`accepted=True durable=REJECTED landed=library`, under a terminal frame reading
+`✅ Sorted all 4 clip(s).` The exposure is again a **misfiled, not a lost** clip.
+
+The correction is **one more rule inside the same atomic decision**, not a second mechanism: a
+transfer reservation carries the bounded, frozen set of decision identities on its page, a decision
+claim carries the one identity it may change, and `_conflicting_transfer` applies owner, then
+folder, then **identity overlap** — all under the one existing lock, with `isdisjoint` so nothing is
+allocated inside it. `begin` additionally compares the pending-decision map against its own page,
+because a decision in flight holds no active record to be scanned. Three consequences beyond the
+reported defect: two *transfers* over an overlapping batch are now excluded as well (both would
+`os.rename` the same path); a root `realpath` cannot resolve still protects its clips, which the
+folder rule could never do; and the refusal is its own code and sentence (`clip_in_progress`,
+`CLIPS_TRANSFER_CLIP_BUSY_TEXT`) because the folders really are different and saying "this folder"
+would send the operator to the wrong one. `gui._clips_transfer_busy_text` is now the only place a
+code becomes a sentence, and `TransferGuard.conflict` is the advisory read both the screen and
+`busy()` go through, so presentation cannot drift from the authority.
+
+**Stated exactly, because the point of F-2 was an over-broad claim.** The protection is over
+durable decision *identities*. A clip reachable under two **different** identities is not
+detected — two hard links to one set of bytes are two identities, and that is not attempted. Path
+aliases are a different thing and are covered: junctions, `..`, case and trailing separators
+collapse to one `root_key` and one identity, measured against a real NTFS junction. And the rule is
+identity overlap rather than a path-prefix test, so two nested folders whose pages share no clip
+stay completely independent.
 
 `_clips_decide` still answers `transfer_in_progress` through the existing `refuse(...)` helper, so
 nothing is appended, no revision moves, and the already-authorized page is handed the server's own
-record to resync from. Both reasons are still checked, because the second tab never saw a
-greyed-out tile. The decision slot is released in a `finally` covering refusal, `StaleWrite`, a
-durability failure and a defect — a slot that outlived its decision would refuse this owner's
-transfers until the app restarted. Both claims are a window, not a latch: each ends with the
-operation that took it.
+record to resync from. Every reason is checked, because the second tab never saw a greyed-out tile.
+The decision slot is released in a `finally` covering refusal, `StaleWrite`, a durability failure
+and a defect — a slot that outlived its decision would refuse this owner's transfers until the app
+restarted. Both claims are a window, not a latch: each ends with the operation that took it, and a
+released transfer frees its clips in the same instant.
 
 **The R11 interaction is decided, not left to chance.** A page can stop being current *while the
 sort runs* — a newer scan, or the Raw Cutter's "Review these clips" retiring it through

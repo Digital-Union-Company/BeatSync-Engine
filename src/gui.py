@@ -7751,6 +7751,34 @@ def _clips_transfer_key(root: str) -> str:
         return ''
 
 
+def _clips_transfer_busy_text(code: str) -> str:
+    """[F-2] One `TransferGuard` refusal code -> one sentence. The ONE place that mapping lives.
+
+    Both the advisory message and the admission refusal read it, which is what stops a screen
+    naming a reason the guard did not give. Before F-2 the two call sites each re-derived the
+    reason -- one from `running.owner == owner`, the other from `busy.code` -- and with a third
+    code to tell apart, each would have had to become a copy of all three rules.
+
+    `clip_in_progress` is the new one and it earns its own sentence: the folders really are
+    different, so reusing "this same folder" would send the operator to the wrong folder.
+
+    A function rather than a module-level dict **on purpose**: the GUI handlers are reached in
+    tests by `ast`-extracting named `FunctionDef`s into a synthesised namespace, so a module-level
+    constant would simply not exist there and the harness would have to carry a copy of it --
+    exactly the kind of stub that drifts from the shipped text and lets a suite pass against a
+    handler the app does not ship.
+
+    An unrecognised code falls back to the commonest true statement rather than raising: a refusal
+    that cannot name its reason must still refuse, because the alternative is a traceback on the
+    one path whose whole job is to move nothing.
+    """
+    return {
+        'transfer_in_progress': CLIPS_TRANSFER_BUSY_TEXT,
+        'folder_in_progress': CLIPS_TRANSFER_FOLDER_BUSY_TEXT,
+        'clip_in_progress': CLIPS_TRANSFER_CLIP_BUSY_TEXT,
+    }.get(str(code), CLIPS_TRANSFER_BUSY_TEXT)
+
+
 def _clips_store():
     """The decision store, created on first use so importing `gui` writes nothing.
 
@@ -9763,9 +9791,18 @@ def _clips_decide(owner, session_id, page_token, entry, payload):
     # because either means this clip may be moving right now -- this owner's own transfer, and
     # another session's transfer on the same folder -- and both still answer with the same code,
     # so the page resyncs from the attached record exactly as it did before.
+    # [F-2] The identity is part of the claim. Without it the guard can only ask "is this owner or
+    # this folder busy", and a clip reached through a child folder by a second session is neither
+    # -- which is how a classification was still being accepted and then ignored by a sort running
+    # on the parent page. `identity` is the durable record's own key, resolved above from the
+    # already-validated page, so this adds no new notion of what a clip is.
+    #
+    # The wire code stays `transfer_in_progress` for every reason, deliberately (review MINOR
+    # M-3): the page resyncs from the attached record either way, and `clip_in_progress` would
+    # churn existing assertions for a cosmetic gain on a route the operator never reads.
     try:
         slot = _CLIPS_TRANSFERS.begin_decision(
-            owner, _clips_transfer_key(view.get('root', '')))
+            owner, _clips_transfer_key(view.get('root', '')), identity)
     except fork_transfer.TransferBusy:
         return refuse('transfer_in_progress')
 
@@ -9848,7 +9885,11 @@ def _on_clips_refresh(request: gr.Request = None):
                 gr.update(interactive=False))
     grid, counts_text, confirm = _clips_render_current(owner, '')[1:]
     view = _clips_view(owner)
-    if _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', ''))) is not None:
+    # [F-2] The page's identities are supplied too, so Refresh also greys Confirm when the clips
+    # on this page are being sorted by another session under a DIFFERENT root. Still presentation,
+    # still only ever disabling: the authority is `begin`, and no enabling update appears here.
+    if _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', '')),
+                             _clips_identities(view)) is not None:
         confirm = gr.update(interactive=False)
     return (grid, counts_text, confirm)
 
@@ -9943,11 +9984,18 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     The durable record is never written by the sweep: see `decision_of` below.
 
     Refusals, each of which moves nothing: no identity, nothing scanned, an unreadable record, a
-    page with no clip kept, destinations that no longer validate, a transfer already running, and
-    -- [F-1] -- a durable decision still being written, or one that landed while this press was
-    deriving its plan. The last two are what make the "accepted but ignored" classification
-    impossible rather than merely unlikely; see `transfer_guard`'s module docstring for the
-    invariant and why a snapshot re-read alone does not establish it.
+    page with no clip kept, destinations that no longer validate, a transfer already running --
+    this page, this folder, or [F-2] a different folder holding some of these very clips -- and
+    [F-1] a durable decision still being written, or one that landed while this press was deriving
+    its plan.
+
+    Those last refusals are what close the "accepted but ignored" classification, and the scope of
+    that is stated exactly rather than as a flourish: **no durable decision touching any identity
+    on this page can be committed between the snapshot below and the release of the reservation**,
+    whatever owner or root it arrives under. What is NOT claimed is a clip reachable under two
+    *different* durable identities -- two hard links to one set of bytes are two identities and are
+    not detected. See `transfer_guard`'s module docstring for the invariant, why a snapshot re-read
+    alone does not establish it, and why the conflict unit is the clip rather than the folder.
 
     Every move is a single same-volume ``os.rename`` (see `iter_sorted_clips`): no overwrite, no
     collision renaming beyond the operator's own saved policy, no deletion, and a cross-volume
@@ -9965,6 +10013,14 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
         yield _clips_confirm_only("Nothing has been scanned on this page.")
         return
 
+    # [F-2] The page's durable decision identities, derived here because BOTH the advisory read
+    # below and the admission claim further down now need them, and because the transfer will act
+    # on exactly this set -- `decision_of` reaches every clip through `view['identity']`. It is a
+    # pure list comprehension over the view, so it raises nothing and changes no refusal ordering:
+    # the four refusals around it are emitted in the same order, with the same frames, as before.
+    identities = _clips_identities(view)
+    transfer_key = _clips_transfer_key(view.get('root', ''))
+
     # [R13] ADVISORY, and labelled as such because getting this wrong is the classic shape of the
     # bug this feature exists to prevent. Reading "busy" and then starting would be a
     # check-then-act race; this read decides a MESSAGE and nothing else. Admission is the
@@ -9972,11 +10028,17 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     # and that call is the only authority. Without this early read a duplicate press during a
     # sweep would re-open the gate instead of saying what is actually happening -- harmless, since
     # the gate moves nothing, but it would describe the wrong situation.
-    running = _CLIPS_TRANSFERS.busy(owner, _clips_transfer_key(view.get('root', '')))
+    #
+    # [F-2] It asks `conflict(...)` rather than `busy(...)` so the *reason* comes from the guard's
+    # own rule instead of being re-derived here from the record. The previous
+    # `running.owner == owner` test was a second copy of rule 1, and with a third rule to
+    # distinguish it would have had to become a second copy of all three -- which is exactly how
+    # a screen starts disagreeing with the authority that refuses the press.
+    running = _CLIPS_TRANSFERS.conflict(owner, transfer_key, identities)
     if running is not None:
-        template = (CLIPS_TRANSFER_BUSY_TEXT if running.owner == owner
-                    else CLIPS_TRANSFER_FOLDER_BUSY_TEXT)
-        yield _clips_confirm_only(template.format(done=running.done, total=running.total))
+        code, record = running
+        yield _clips_confirm_only(
+            _clips_transfer_busy_text(code).format(done=record.done, total=record.total))
         return
     # [R5-P11 / N7] A readiness report derived from a record that could not be read would be a
     # false negative with the authority of a positive statement -- "0 kept, 0 discarded" reads as
@@ -9986,7 +10048,6 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     except (fork_clips.PersistenceError, OSError) as failure:
         yield _clips_confirm_only(_clips_state_unavailable_text(failure))
         return
-    identities = _clips_identities(view)
     snapshot = store.snapshot_of(identities)
 
     # [FORK] R8 Final Polish: keep-only classification, the same two-step gate Audio Review uses.
@@ -10054,15 +10115,18 @@ def _clips_confirm_frames(armed='', request: gr.Request = None):
     # The generation is recorded, NOT required: re-scanning does not entitle a second concurrent
     # transfer. It is read again at the end, to decide whether this transfer may still repaint
     # the page it acted on.
+    # [F-2] The page's identities are part of the claim, and that is what closes the cross-root
+    # case: `root_key` says which FOLDER is being sorted, and the folder is the wrong proxy for
+    # "which files" whenever two sessions scanned an ancestor and a descendant of one tree. The
+    # set is bounded by the page (`MAX_CLIPS_PER_PAGE`), is frozen by `begin` into a `frozenset`,
+    # and is exactly what `decision_of` will act on -- so the thing excluded is the thing done.
     generation = view.get('generation')
     try:
         reservation = _CLIPS_TRANSFERS.begin(
-            owner, generation, plan.signature, _clips_transfer_key(view.get('root', '')))
+            owner, generation, plan.signature, transfer_key, identities)
     except fork_transfer.TransferBusy as busy:
-        template = (CLIPS_TRANSFER_BUSY_TEXT if busy.code == 'transfer_in_progress'
-                    else CLIPS_TRANSFER_FOLDER_BUSY_TEXT)
-        yield _clips_confirm_only(template.format(done=busy.active.done,
-                                                  total=busy.active.total))
+        yield _clips_confirm_only(_clips_transfer_busy_text(busy.code).format(
+            done=busy.active.done, total=busy.active.total))
         return
     except fork_transfer.DecisionInFlight:
         # [F-1] A classification is between its checks and its journal append. Admitting here is

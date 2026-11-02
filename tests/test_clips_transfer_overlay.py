@@ -383,24 +383,61 @@ def test_two_browser_sessions_cannot_sort_one_folder_at_once(world):
 
 def test_many_concurrent_presses_admit_exactly_one_sort(world):
     """Real threads against the real handler. `concurrency_limit=None` means Gradio delivers all
-    of them, so this is the shape the shipped app actually sees."""
+    of them, so this is the shape the shipped app actually sees.
+
+    **The overlap is now enforced rather than hoped for.** A barrier only guarantees that the
+    presses *start* together, and a three-clip sort finishes in microseconds -- so the winner could
+    release before a straggler reached `begin`, the straggler was then legitimately admitted, and
+    the assertion below saw "2 presses sorted at once". Measured at **4 failures in 30 runs** on
+    the pristine R13 candidate: a pre-existing race in this test, not in the guard, and the one
+    thing a single-flight test must not be is occasionally right.
+
+    So the winner is held at its first `note_progress` -- the call immediately before the Working
+    frame, with the reservation already taken -- until every one of the eight presses has been
+    through admission. Then the presses genuinely overlap, "exactly one sorted" is a statement
+    about concurrency rather than about scheduling luck, and the test is deterministic.
+    """
     owner = "tab-a"
     _scan(world, owner)
     view = _keep_all(world, owner)
     namespace = world["ns"]
-    results, start = [], threading.Barrier(8)
+    presses = 8
+    guard = namespace["_CLIPS_TRANSFERS"]
+    real_begin, real_progress = guard.begin, guard.note_progress
+    attempted, everyone_tried = [], threading.Event()
+
+    def counting_begin(*args, **kwargs):
+        try:
+            return real_begin(*args, **kwargs)
+        finally:
+            attempted.append(1)
+            if len(attempted) >= presses:
+                everyone_tried.set()
+
+    def holding_progress(reservation, done, total):
+        # `done == 0` is the frame before the first file moves, so holding here keeps the
+        # reservation taken for the whole admission window without delaying any move afterwards.
+        if done == 0:
+            assert everyone_tried.wait(30), "not every press reached admission"
+        return real_progress(reservation, done, total)
+
+    guard.begin = counting_begin
+    guard.note_progress = holding_progress
+    results, start = [], threading.Barrier(presses)
 
     def press():
-        start.wait()
+        start.wait(30)
         results.append(list(namespace["_clips_confirm_frames"](
             "", world["request"](session_hash=owner))))
 
-    threads = [threading.Thread(target=press) for _ in range(8)]
+    threads = [threading.Thread(target=press, daemon=True) for _ in range(presses)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(30)
+        thread.join(60)
+    assert not [t for t in threads if t.is_alive()], "a press hung"
 
+    assert len(attempted) == presses, f"only {len(attempted)} of {presses} reached admission"
     sorted_runs = [r for r in results if any("Moving " in f[_MESSAGE] for f in r)]
     assert len(sorted_runs) == 1, f"{len(sorted_runs)} presses sorted at once"
     names = sorted(os.listdir(world["library"]))
@@ -979,6 +1016,496 @@ def test_case_j_the_sweep_gate_claims_neither_a_slot_nor_a_decision(world):
     answer = namespace["_clips_decide"](owner, view["session"], view["page"],
                                         view["entries"][1], {"to": _SELECTED, "rev": 0})
     assert answer["ok"] is True, "the unanswered gate refused a later classification"
+
+
+# =============================================================================================
+# 4c — F-2: the conflict unit is the CLIP, not the folder
+# =============================================================================================
+#
+# Section 4b closes the window between a snapshot and an admission. It closes it for operations
+# the guard can *see* collide -- same owner, or same resolved folder. Neither question is the one
+# that decides whether two operations touch the same file.
+#
+# Two review sessions that scanned an ancestor and a descendant of one tree have two owner keys
+# and two different `root_key`s, and the same clip in both batches under the SAME durable decision
+# identity. So a classification accepted from the child page was answered `ok: True`, was durable,
+# and was ignored by a sort already running on the parent page, which filed the clip by its older
+# snapshot -- the same "accepted but ignored" conjunction as F-1, reached by a route neither of the
+# first two rules could see. Independent review reproduced it on the F-1 tree.
+#
+# These tests use the real store, real files and two real scans. Several of them deliberately use
+# **no synchronisation hook at all**: starting the generator and stopping at its first yield is
+# enough to hold a reservation, so the overlap is placed by ordinary control flow.
+
+def _nested_world(world, child_clips=1):
+    """A parent tree with a subfolder, and a second destination pair for the other session.
+
+    Returns ``(parent, child)``. The parent already holds three clips from the fixture, so after
+    this a recursive scan of the parent sees four and a scan of the child sees one -- and that one
+    clip is in both batches.
+    """
+    parent = world["media"]
+    child = os.path.join(parent, "sub")
+    os.makedirs(child, exist_ok=True)
+    for index in range(child_clips):
+        with open(os.path.join(child, f"nested{index:04d}.mp4"), "wb") as handle:
+            handle.write(b"n" * (777 + index))
+    world["library2"] = str(world["tmp"] / "library2")
+    world["rejected2"] = str(world["tmp"] / "rejected2")
+    return parent, child
+
+
+def _scan_child(world, owner, child, recursive=True):
+    """Scan ``child`` as ``owner``, into that session's OWN destinations.
+
+    Separate destinations on purpose: it is what makes a misfiling visible as "the clip went to
+    the other session's Media Library" rather than being hidden by a shared folder.
+    """
+    return world["ns"]["_on_clips_scan"](
+        child, recursive, world["library2"], world["rejected2"], 100,
+        world["request"](session_hash=owner))
+
+
+def _shared_clip(world, parent_view, child_view):
+    """The one clip present in both pages, with its single durable identity."""
+    name = "nested0000.mp4"
+    in_parent = [e for e in parent_view["entries"] if os.path.basename(e.path) == name]
+    in_child = [e for e in child_view["entries"] if os.path.basename(e.path) == name]
+    assert in_parent, "the nested clip is not in the parent's recursive batch"
+    assert in_child, "the nested clip is not in the child's batch"
+    identity = child_view["identity"][in_child[0].clip_id]
+    assert identity == parent_view["identity"][in_parent[0].clip_id], \
+        "the two pages disagree on the clip's identity -- this suite would prove nothing"
+    return in_child[0], identity, name
+
+
+def _two_sessions_on_nested_roots(world, recursive=True):
+    """Owner A on the parent (recursively), owner B on the child. Everything A sees is KEPT."""
+    parent, child = _nested_world(world)
+    _scan(world, "tab-a", folder=parent)
+    parent_view = _keep_all(world, "tab-a")
+    _scan_child(world, "tab-b", child, recursive=recursive)
+    child_view = world["ns"]["_clips_view"]("tab-b")
+    assert world["ns"]["_clips_transfer_key"](parent) \
+        != world["ns"]["_clips_transfer_key"](child), "this suite needs two distinct root keys"
+    return parent_view, child_view
+
+
+def test_f2_case_1_a_cross_root_classification_in_flight_refuses_the_sort(world):
+    """Scenario 1 -- classification first. Owner B's decision is suspended inside its journal
+    append; owner A then presses Confirm on the parent page.
+
+    Admitting would be the defect: B's decision becomes durable a moment later and A's batch moves
+    by the snapshot it took before. `_conflicting_transfer` cannot see it -- a decision in flight
+    holds no active transfer -- so `begin` compares the pending slot's identity against the page
+    it is about to claim.
+    """
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    target, identity, name = _shared_clip(world, parent_view, child_view)
+    _, revision = namespace["_clips_store"]().get(identity)
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    _hook_admission(world, lambda: held.update(zip(
+        ("thread", "answer"),
+        suspended.classify_in_background(world, "tab-b", child_view, target, _REJECTED,
+                                         revision))))
+    frames = _frames(world, "tab-a")
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    assert len(frames) == 1, f"a refused press must emit one frame, got {len(frames)}"
+    assert frames[0][_MESSAGE] == world["ui"]["CLIPS_DECISION_IN_FLIGHT_TEXT"], frames[0][_MESSAGE]
+    assert _landed(world) == [], "a refused transfer moved a file"
+    assert held["answer"]["reply"]["ok"] is True, \
+        "the classification held the floor; it must still succeed"
+    assert namespace["_clips_store"]().get(identity) == (_REJECTED, revision + 1)
+    assert _where(world, name) == "unmoved"
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0, "a decision slot leaked"
+    assert namespace["_CLIPS_TRANSFERS"].active_for("tab-a") is None, "a reservation leaked"
+
+
+def test_f2_case_2_a_cross_root_classification_is_refused_once_the_sort_holds_the_floor(world):
+    """Scenario 2 -- transfer first. **No synchronisation hook**: the generator's first yield IS
+    the reservation being held, so the overlap is placed by ordinary control flow.
+
+    This is the direction that was reproduced as accepted-but-ignored: B's classification used to
+    be admitted, committed and reported `ok: True` while A's batch filed the clip by its older
+    snapshot.
+    """
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    target, identity, name = _shared_clip(world, parent_view, child_view)
+    before = namespace["_clips_store"]().get(identity)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)                                  # the Working frame: the reservation is held
+    answer = namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                        target, {"to": _REJECTED, "rev": before[1]})
+    assert namespace["_CLIPS_TRANSFERS"].deciding() == 0, \
+        "a refused classification registered a decision slot"
+    list(stream)
+
+    assert answer["ok"] is False and answer["code"] == "transfer_in_progress", answer
+    assert namespace["_clips_store"]().get(identity) == before, \
+        "a REFUSED classification advanced the durable revision"
+    # and the sort did what the record says, which is the property that actually matters
+    assert _where(world, name) == "library", \
+        "the clip A sorted as KEPT did not land in the library"
+    assert namespace["_clips_store"]().get(identity)[0] == _SELECTED
+
+
+def test_f2_case_3_two_cross_root_transfers_cannot_run_at_once(world):
+    """Scenario 3 -- two concurrent transfer submissions over an overlapping batch.
+
+    Strictly worse than the classification case: both sorts would `os.rename` the same path, and
+    the loser would find the file already gone. The owner and folder rules never excluded this
+    either, so it is part of the same correction.
+    """
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    _shared_clip(world, parent_view, child_view)
+    # B keeps its single clip so its own press would otherwise be admissible
+    for entry in child_view["entries"]:
+        identity = child_view["identity"][entry.clip_id]
+        current, revision = namespace["_clips_store"]().get(identity)
+        if current != _SELECTED:
+            namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                       entry, {"to": _SELECTED, "rev": revision})
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    other = _frames(world, "tab-b")
+    list(stream)
+
+    assert len(other) == 1, f"the overlapping sort was admitted: {len(other)} frames"
+    # A's figures are deterministic here: the Working frame `next(stream)` consumed is
+    # emitted immediately after `note_progress(reservation, 0, tally.total)`, and A's
+    # recursive page holds four clips -- so the refusal must quote 0 of 4, not a parsed guess.
+    assert other[0][_MESSAGE] == world["ui"]["CLIPS_TRANSFER_CLIP_BUSY_TEXT"].format(
+        done=0, total=4), other[0][_MESSAGE]
+    assert "different folder" in other[0][_MESSAGE], \
+        "the refusal must not claim the folders are the same"
+    assert not os.path.exists(world["library2"]) or os.listdir(world["library2"]) == [], \
+        "the refused session moved a file"
+
+
+def test_f2_case_4_the_same_identity_through_two_owner_sessions_is_one_clip(world):
+    """Scenario 4. The protection is keyed on the durable identity, so it cannot be walked around
+    by arriving through a different session -- which is the whole reason it is not in the browser.
+    """
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    target, identity, _ = _shared_clip(world, parent_view, child_view)
+    guard = namespace["_CLIPS_TRANSFERS"]
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    assert identity in guard.active_for("tab-a").identities, \
+        "the reservation does not cover the clip it is about to move"
+    assert guard.conflict("tab-b", namespace["_clips_transfer_key"](
+        os.path.dirname(target.path)), [identity])[0] == "clip_in_progress"
+    list(stream)
+    assert guard.conflict("tab-b", "", [identity]) is None, "the exclusion outlived the transfer"
+
+
+def test_f2_case_5_unrelated_folders_remain_fully_independent(world):
+    """Scenario 5. Exclusion is per clip, not a global stop-the-world: two operators reviewing two
+    trees must not be able to refuse each other."""
+    namespace = world["ns"]
+    elsewhere = _tree_of_clips(world["tmp"] / "elsewhere", count=2)
+    world["library2"] = str(world["tmp"] / "library2")
+    world["rejected2"] = str(world["tmp"] / "rejected2")
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    _scan_child(world, "tab-b", elsewhere)
+    other = namespace["_clips_view"]("tab-b")
+    for entry in other["entries"]:
+        identity = other["identity"][entry.clip_id]
+        _, revision = namespace["_clips_store"]().get(identity)
+        namespace["_clips_decide"]("tab-b", other["session"], other["page"], entry,
+                                   {"to": _SELECTED, "rev": revision})
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    unrelated = _frames(world, "tab-b")
+    list(stream)
+
+    assert len(unrelated) > 1, "an unrelated folder's sort was refused"
+    assert len(_landed(world)) == 3 and len(os.listdir(world["library2"])) == 2
+
+
+def test_f2_case_6_nested_folders_with_no_shared_clip_stay_independent(world):
+    """Scenario 6. The rule is identity overlap, NOT an ancestor test on the paths.
+
+    Owner A scans the parent **non-recursively**, so the nested clip is not on its page at all.
+    The folders are still nested; the batches are disjoint; both sorts must proceed. A path-prefix
+    rule would have refused this, which is why the conflict unit is the clip.
+    """
+    namespace = world["ns"]
+    parent, child = _nested_world(world)
+    namespace["_on_clips_scan"](parent, False, world["library"], world["rejected"], 100,
+                                world["request"](session_hash="tab-a"))
+    parent_view = _keep_all(world, "tab-a")
+    assert all(os.path.basename(e.path) != "nested0000.mp4" for e in parent_view["entries"]), \
+        "the non-recursive scan picked up the nested clip"
+    _scan_child(world, "tab-b", child)
+    child_view = namespace["_clips_view"]("tab-b")
+    for entry in child_view["entries"]:
+        identity = child_view["identity"][entry.clip_id]
+        _, revision = namespace["_clips_store"]().get(identity)
+        namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"], entry,
+                                   {"to": _SELECTED, "rev": revision})
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    nested = _frames(world, "tab-b")
+    list(stream)
+
+    assert len(nested) > 1, "a nested folder with no shared clip was refused"
+    assert len(_landed(world)) == 3
+    assert os.listdir(world["library2"]) == ["nested0000.mp4"]
+
+
+def test_f2_case_7_identical_roots_and_alias_spellings_are_still_excluded_first(world):
+    """Scenario 7. The folder rule is not weakened and still answers FIRST, with its own code:
+    told "another session is sorting a different folder that contains them" about the very same
+    folder, an operator would go looking for a folder that does not exist."""
+    namespace = world["ns"]
+    _scan(world, "tab-a")
+    _keep_all(world, "tab-a")
+    aliased = os.path.join(world["media"], "..", os.path.basename(world["media"]))
+    assert namespace["_clips_transfer_key"](aliased) \
+        == namespace["_clips_transfer_key"](world["media"])
+    namespace["_on_clips_scan"](aliased, True, str(world["tmp"] / "library2"),
+                                str(world["tmp"] / "rejected2"), 100,
+                                world["request"](session_hash="tab-b"))
+    other = namespace["_clips_view"]("tab-b")
+    for entry in other["entries"]:
+        identity = other["identity"][entry.clip_id]
+        _, revision = namespace["_clips_store"]().get(identity)
+        if namespace["_clips_store"]().get(identity)[0] != _SELECTED:
+            namespace["_clips_decide"]("tab-b", other["session"], other["page"], entry,
+                                       {"to": _SELECTED, "rev": revision})
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    alias = _frames(world, "tab-b")
+    list(stream)
+
+    assert len(alias) == 1
+    assert "this folder" in alias[0][_MESSAGE], alias[0][_MESSAGE]
+    assert alias[0][_MESSAGE] != world["ui"]["CLIPS_TRANSFER_CLIP_BUSY_TEXT"], \
+        "an alias of one folder was reported as a different folder"
+
+
+def test_f2_case_8_an_unresolvable_root_still_protects_the_clip(world):
+    """Scenario 8 -- unknown `root_key`, matching identity.
+
+    `_clips_transfer_key` answers `''` for a path it cannot resolve, which switches the folder rule
+    off entirely. Before F-2 that left the clip unprotected across owners; the identity is still
+    known, so it is protected now. Asserted at the authority, because a view cannot be published
+    with an unresolvable root.
+    """
+    namespace = world["ns"]
+    guard = namespace["_CLIPS_TRANSFERS"]
+    _scan(world, "tab-a")
+    view = _keep_all(world, "tab-a")
+    identities = namespace["_clips_identities"](view)
+    assert namespace["_clips_transfer_key"]("") == ''
+
+    reservation = guard.begin("tab-a", view.get("generation"), "sig", '', identities)
+    try:
+        with pytest.raises(tg.TransferBusy) as refused:
+            guard.begin_decision("tab-b", '', identities[0])
+        assert refused.value.code == "clip_in_progress"
+        assert guard.begin_decision("tab-b", '', "an-identity-nobody-is-sorting").owner == "tab-b"
+    finally:
+        guard.end(reservation)
+
+
+def test_f2_case_9_a_suspended_cross_root_commit_is_never_overtaken(world):
+    """Scenario 9, stated as the invariant's own conjunction: accepted, durable, and contradicted
+    by where the file actually went. This is the exact shape independent review measured on the
+    F-1 tree as `accepted=True durable=REJECTED landed=library`."""
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    target, identity, name = _shared_clip(world, parent_view, child_view)
+    _, revision = namespace["_clips_store"]().get(identity)
+    suspended = _SuspendedCommit(world)
+    held = {}
+
+    _hook_admission(world, lambda: held.update(zip(
+        ("thread", "answer"),
+        suspended.classify_in_background(world, "tab-b", child_view, target, _REJECTED,
+                                         revision))))
+    frames = _frames(world, "tab-a")
+    suspended.may_commit.set()
+    assert suspended.committed.wait(10)
+    held["thread"].join(10)
+
+    accepted = held["answer"]["reply"]["ok"] is True
+    durable = namespace["_clips_store"]().get(identity)[0]
+    landed = _where(world, name)
+    assert not (accepted and durable == _REJECTED and landed == "library"), (
+        f"accepted={accepted} durable={durable} landed={landed}: a decision the server accepted "
+        f"was silently ignored by a transfer under a different root, and both reported success")
+    assert landed == "unmoved" and len(frames) == 1
+
+
+def test_f2_case_10_admission_then_a_direct_classification_request(world):
+    """Scenario 10, and deliberately **hook-free**: the reservation is held by stopping the
+    generator at its first yield, and the classification is an ordinary call -- the same thing a
+    second browser tab's POST is at this layer. No `_hook_admission`, no `_SuspendedCommit`.
+    """
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    target, identity, name = _shared_clip(world, parent_view, child_view)
+    before = namespace["_clips_store"]().get(identity)
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    replies = [namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                          target, {"to": _REJECTED, "rev": before[1]})
+               for _ in range(5)]
+    list(stream)
+
+    assert all(r["ok"] is False and r["code"] == "transfer_in_progress" for r in replies), replies
+    assert namespace["_clips_store"]().get(identity) == before, \
+        "five refused classifications advanced the durable revision"
+    assert _where(world, name) == "library"
+    # the refusal discloses the server's own record so the tile resyncs rather than guessing
+    assert replies[0]["decision"] == before[0] and replies[0]["rev"] == before[1]
+    # And the exclusion is a window, not a latch: once the sort finishes the guard refuses
+    # nothing. B's page is now genuinely stale -- A moved the file -- so the SAME request is
+    # refused for a different and truthful reason, on the opened descriptor rather than by a
+    # claim. That distinction is the point: `identity_changed` means the clip really moved;
+    # `transfer_in_progress` meant somebody was moving it.
+    guard = namespace["_CLIPS_TRANSFERS"]
+    assert guard.active_for("tab-a") is None and guard.deciding() == 0
+    assert guard.conflict("tab-b", "k:/child", [identity]) is None, \
+        "the clip-level exclusion outlived the transfer that took it"
+    again = namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                       target, {"to": _REJECTED, "rev": before[1]})
+    assert again["ok"] is False and again["code"] == "identity_changed", again
+
+
+@pytest.mark.parametrize("policy", [collision.SKIP, collision.SUFFIX])
+def test_f2_case_11_collision_handling_is_untouched_by_the_identity_rule(world, policy):
+    """Scenario 11. The no-overwrite guarantee is enforced by the `os.rename` call itself, and
+    nothing about the conflict model touches it. Both policies are exercised against an occupied
+    destination, after a cross-root refusal, so the refusal path cannot have perturbed them."""
+    namespace = _build(str(world["tmp"] / "state-collide"), world["ui"],
+                       poster_runner=_no_poster)
+    namespace["_collision_policy"] = lambda: policy
+    world["ns"] = namespace
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    target, identity, name = _shared_clip(world, parent_view, child_view)
+
+    # occupy the destination with a DIFFERENT file of the same name
+    os.makedirs(world["library"], exist_ok=True)
+    with open(os.path.join(world["library"], name), "wb") as handle:
+        handle.write(b"squatter")
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    refused = namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                         target, {"to": _REJECTED, "rev": 0})
+    frames = list(stream)
+
+    assert refused["ok"] is False, "the cross-root classification was admitted"
+    with open(os.path.join(world["library"], name), "rb") as handle:
+        assert handle.read() == b"squatter", "the occupying file was overwritten"
+    names = sorted(os.listdir(world["library"]))
+    if policy == collision.SKIP:
+        assert not any("_01" in n for n in names), names
+        assert "skipped 1" in frames[-1][_MESSAGE], frames[-1][_MESSAGE]
+    else:
+        assert "nested0000_01.mp4" in names, names
+    assert frames, "the sort produced no terminal frame"
+
+
+def test_f2_case_12_cross_root_refusals_leak_no_claim(world):
+    """Scenario 12, all three terminal shapes, each measured on the guard afterwards."""
+    parent_view, child_view = _two_sessions_on_nested_roots(world)
+    namespace = world["ns"]
+    guard = namespace["_CLIPS_TRANSFERS"]
+    target, identity, _ = _shared_clip(world, parent_view, child_view)
+    store = namespace["_clips_store"]()
+
+    # (a) an abandoned generator releases the reservation, so the clip frees up
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    assert guard.conflict("tab-b", "k:/child", [identity])[0] == "clip_in_progress"
+    stream.close()
+    assert guard.active_for("tab-a") is None and guard.deciding() == 0
+    assert guard.conflict("tab-b", "k:/child", [identity]) is None
+
+    # (b) a durable write failure inside a cross-root claim releases the slot
+    real = store.decide
+    store.decide = lambda *a, **k: (_ for _ in ()).throw(OSError("journal append failed"))
+    try:
+        with pytest.raises(OSError):
+            namespace["_clips_decide"]("tab-b", child_view["session"], child_view["page"],
+                                       target, {"to": _REJECTED, "rev": 0})
+    finally:
+        store.decide = real
+    assert guard.deciding() == 0, "a failed cross-root commit kept its slot"
+
+    # (c) a stale reservation cannot clear a newer one, and cannot free the clip early
+    first = guard.begin("tab-a", 1, "sig", "k:/parent", [identity])
+    guard.end(first)
+    second = guard.begin("tab-a", 2, "sig", "k:/parent", [identity])
+    assert guard.end(first) is False, "a stale release cleared a newer reservation"
+    assert guard.conflict("tab-b", "k:/child", [identity])[0] == "clip_in_progress"
+    assert guard.end(second) is True
+    assert guard.conflict("tab-b", "k:/child", [identity]) is None
+
+
+def test_f2_the_handler_claims_exactly_the_identities_it_will_act_on(world):
+    """The thing excluded must be the thing done. If the claim covered a different set from the
+    one `decision_of` reaches, the protection would be aimed at the wrong clips -- so the
+    reservation's identities are compared against the page's own identity map."""
+    namespace = world["ns"]
+    parent, _ = _nested_world(world)
+    _scan(world, "tab-a", folder=parent)
+    view = _keep_all(world, "tab-a")
+
+    stream = namespace["_clips_confirm_frames"]("", world["request"](session_hash="tab-a"))
+    next(stream)
+    record = namespace["_CLIPS_TRANSFERS"].active_for("tab-a")
+    assert record.identities == frozenset(
+        view["identity"][entry.clip_id] for entry in view["entries"])
+    assert len(record.identities) == 4, "the recursive page should carry four clips"
+    assert isinstance(record.identities, frozenset), "the claimed set must be immutable"
+    list(stream)
+
+
+def test_f2_one_refusal_code_maps_to_one_sentence(world):
+    """`_clips_transfer_busy_text` is the ONE place a code becomes a sentence, so a screen cannot
+    name a reason the guard did not give. An unknown code still refuses rather than raising."""
+    text = world["ns"]["_clips_transfer_busy_text"]
+    assert text("transfer_in_progress") == world["ui"]["CLIPS_TRANSFER_BUSY_TEXT"]
+    assert text("folder_in_progress") == world["ui"]["CLIPS_TRANSFER_FOLDER_BUSY_TEXT"]
+    assert text("clip_in_progress") == world["ui"]["CLIPS_TRANSFER_CLIP_BUSY_TEXT"]
+    assert text("something_invented_later") == world["ui"]["CLIPS_TRANSFER_BUSY_TEXT"]
+    for code in ("transfer_in_progress", "folder_in_progress", "clip_in_progress"):
+        formatted = text(code).format(done=2, total=7)
+        assert "{" not in formatted, f"{code} left an unfilled field"
+        assert "2 of 7" in formatted
+
+
+def test_f2_the_clip_refusal_names_a_different_folder_and_discloses_no_path(world):
+    """Operator-visible wording. It must not say "this folder" -- the folders really differ -- and
+    it must not print the other session's root, which may not even be readable by this operator."""
+    message = world["ui"]["CLIPS_TRANSFER_CLIP_BUSY_TEXT"].format(done=1, total=4)
+    assert "different folder" in message
+    assert "this folder" not in message
+    for leak in (":\\", ":/", "C:", "/home/"):
+        assert leak not in message, f"the refusal discloses a path fragment: {leak}"
+    assert message.count("\n") == 1, "the refusal should stay two lines like its siblings"
 
 
 def test_refresh_does_not_light_confirm_back_up_mid_sort(world):

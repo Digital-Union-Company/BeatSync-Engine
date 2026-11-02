@@ -1169,6 +1169,19 @@ CLIPS_TRANSFER_FOLDER_BUSY_TEXT = (
     "Wait for it to finish. Two sessions sorting one folder is refused by the server, not just "
     "discouraged in the browser."
 )
+# [F-2] The third reason a sort is refused, and the only one an operator could not guess: another
+# review session is sorting a DIFFERENT folder that happens to contain some of these clips --
+# because it scanned a parent or a child of this one. Saying "this folder" there would send them
+# looking at the wrong folder, which is exactly why this is its own sentence rather than a reuse of
+# the one above. It names the overlap and nothing else: no path is disclosed, because the other
+# session's root is not this operator's business and may not even be readable by them.
+CLIPS_TRANSFER_CLIP_BUSY_TEXT = (
+    "⏳ Nothing was started: some of these clips are already being sorted by another review "
+    "session ({done} of {total} clip(s) done).\n"
+    "That session is working on a different folder that contains them — a parent or a subfolder "
+    "of this one. Wait for it to finish; the server refuses both runs so that no clip is moved "
+    "twice."
+)
 CLIPS_TRANSFER_BLOCKED_DECISION_TEXT = (
     "This page is being sorted right now, so its clips cannot be re-classified until it finishes."
 )
