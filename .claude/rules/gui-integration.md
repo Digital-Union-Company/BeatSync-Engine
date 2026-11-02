@@ -552,6 +552,40 @@ automatically.
   * **`gr.Request` is injected, never an input.** The button still reads exactly one widget
     (`cut_handoff_state`), so the browser gains no new way to name an owner, and an unusable
     identity fails closed into "nothing to retire" rather than taking the handoff down.
+- **Video Review's Confirm is a GENERATOR, and single-flight is a server lock (R13).**
+  `_clips_confirm_frames` is what `clips_confirm_btn` and `clips_proceed_btn` are wired to;
+  `_on_clips_confirm` is kept as the collected form that drains to the last frame, which is exactly
+  the pre-R13 return value.
+
+  ```
+  any refusal, and the sweep gate   ->  exactly ONE frame, and NO slot claimed
+  a real sort                       ->  Working, bounded progress, terminal
+  _CLIPS_TRANSFERS.begin / .end     ->  one locked test-and-set; released in a finally
+  ```
+
+  * **No Working frame for a press that moves nothing.** The gate moves nothing, so announcing work
+    there is the dead-button complaint inverted. The slot is claimed **after** every refusal that
+    changes nothing — the discipline `ScanCoordinator` already follows.
+  * **`concurrency_limit=None` is unchanged on both registrations and is load-bearing.** A lane of
+    1 would leave the duplicate press **queued** rather than letting the server refuse it (the
+    measured S2-A R3 trap), and a queued duplicate that ran later against a spent batch is worse
+    than one refused now. The authority is the guard, which is provable without Gradio.
+  * **`_clips_working_frame` is a disable-only mover.** It is the fifth entry in the mover identity
+    set in `tests/test_clips_gui_integration.py` and the **enabler set is unchanged** — Confirm's
+    enabled state still comes from `store.counts()` through `_clips_render_current` and
+    `_on_clips_scan` and nowhere else (R5-P3 / F8). `_on_clips_refresh` gained one further
+    *disabling* case for the same reason.
+  * **`_clips_decide` refuses `transfer_in_progress`** while this owner — or another session on the
+    same folder — is sorting, through the existing `refuse(...)` helper, so nothing is appended and
+    no revision moves.
+  * **Nothing is yielded from the `finally`**, which is what makes an abandoned Gradio event safe,
+    and **no coordinator lock is held across the moves**: two locks, two spans, never nested.
+  * **The generation decides what a finished transfer may publish.** Still newest, re-enumerate;
+    superseded — by a newer scan or by R11's `invalidate` — repaint the *authoritative* page
+    instead. No second notion of "the current page" is introduced, and a test pins that the handler
+    names only `_CLIPS_SCANS.is_current`.
+
+  Full contract: `.claude/rules/video-review-transfer.md`.
 - **The asyncio Proactor patch that swallows benign `WinError 10054` pipe resets is intentional**, not
   dead code.
 
@@ -562,6 +596,7 @@ automatically.
 | progress panel, `ProgressView`, event plumbing, Qwen live progress | `.claude/rules/progress-events.md` |
 | the Raw Cutter's **Activity & Performance** panel, `_cut_activity` / `_cut_activity_final`, `CUT_ACTIVITY_JS` or `raw_cutter_activity.py` (R12) | the R12 bullet above **+** `ROADMAP.md` R12 for the product contract — and `tests/test_raw_cutter_activity.py`, which executes the pure timer rules rather than asserting about them |
 | the **"Review these clips"** button, `cut_handoff_state`, `_cut_handoff`, `_on_cut_open_in_library`, `_CUT_BATCH_HANDOFF` or `cut_handoff.py` (R11) | the R11 bullet above **+** `ROADMAP.md` R11 for the product contract — and `tests/test_cut_handoff.py`, which executes the real `_on_cut_run` on every terminal path rather than asserting about it. `.claude/rules/clips-preview.md` too if you touch what Video Review does with the folder it receives |
+| Video Review's **Confirm / Proceed** path, `_clips_confirm_frames`, `_clips_working_frame`, `_CLIPS_TRANSFERS`, `iter_sorted_clips`, `TransferTally` or `transfer_guard.py` (R13) | `.claude/rules/video-review-transfer.md` **+** `.claude/rules/clips-preview.md` — the page lifecycle it decides against is the coordinator's, and `ROADMAP.md` R13 for the product contract |
 | Video Source block, scan/confirm/gate, the shared gate core | `.claude/rules/input-gate.md` |
 | the C3 2–4-candidate render seam, render mutex, continuation policy, batch summary | `.claude/rules/variant-lab.md` **+** `.claude/rules/input-gate.md` **+** `.claude/rules/pipeline-core.md` |
 | the **Cancel Active Render** button, `render_invocation_state`, the active-render slot, `RenderLifecycle`, or any `lifecycle=` parameter on a pipeline function (C3-R1A) | `.claude/rules/render-worker.md` **+** `.claude/rules/variant-lab.md` (C3-R1A section) **+** `.claude/rules/pipeline-core.md` **+** `.claude/rules/progress-events.md` |

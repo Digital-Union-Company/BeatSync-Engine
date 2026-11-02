@@ -20,6 +20,185 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
+
+**Pressing Confirm in Video Review used to start moving files with no acknowledgement at all.** Two
+consequences the owner named in one sentence: a long transfer looked like a dead button, and an
+impatient second click was a second submission. R13 makes the *existing* transfer observable and
+single-flight. It adds no tab, no button, no second review surface, no second transfer engine, no
+second naming policy, no subprocess and no background service.
+
+**The handler is now a generator, because a function cannot say "working" and then work.**
+`_clips_confirm_frames` is what `clips_confirm_btn` and `clips_proceed_btn` are wired to, and the
+frame shape is the contract rather than a detail:
+
+```
+any refusal, and the sweep gate   ->  exactly ONE frame, and NO slot claimed
+a real sort                       ->  Working, bounded progress, terminal
+```
+
+A spinner for an operation that moves nothing is the dead-button complaint inverted, so the gate
+gets no Working frame and claims no slot — a gate the operator never answers must not leave the
+page marked busy. `_on_clips_confirm` is kept as the collected form that drains to the last frame,
+which is exactly the pre-R13 return value; seventeen existing assertions hold unchanged.
+
+**Single-flight is a server-side test-and-set, in a new pure module.**
+`src/beatsync_fork/transfer_guard.py` is stdlib-only — one `threading.Lock`, a bounded map of plain
+records, no filesystem, no thread — so the admission rule is *executed* in tests rather than
+asserted about. A disabled HTML button is a courtesy that does not survive a second browser tab, a
+replayed event or any caller that never saw the UI, which is the same reasoning `_RENDER_LOCK`
+already embodies for renders; and `if not busy: start()` is a check-then-act race that passes a
+single-threaded test and fails a concurrent one.
+
+The operation identity is written out rather than left implicit:
+
+| Component | Exclusive? | Why |
+|---|---|---|
+| `owner` | **yes** | a duplicate submission is always a duplicate from the same owner |
+| `root_key` | **yes, across owners** | two tabs have two owner keys and could otherwise sort one folder at once |
+| `generation` | no | re-scanning must not entitle a second *concurrent* transfer |
+| `signature` | no | diagnosis only |
+
+`transfer_in_progress` and `folder_in_progress` are separate codes because they mean different
+things to an operator: told "this page is already being sorted" about somebody else's session, they
+would go looking for a press they never made. The lock is **never held across a file operation** —
+one held across a batch of renames would block the `_clips_view` read the decision endpoint
+performs on every classification, so a tile click would hang instead of being refused. Release and
+progress are both **token-matched**, so a transfer finishing late cannot un-busy the page a newer
+one is sorting. `concurrency_limit=None` is unchanged on both registrations and is load-bearing: a
+lane of 1 would leave the duplicate press **queued** rather than refused, which is the measured
+S2-A R3 trap and strictly worse than a refusal now.
+
+**Progress is counted, never predicted.** `iter_sorted_clips` is `sort_decided_clips`' own body
+yielding each `MoveOutcome` *after* its move has happened or been refused, so the numerator is
+recorded fact — and `sort_decided_clips` is now a list of what it yields, with its signature and
+return type untouched, so there is one engine and not two orderings. `moved` and `done` are both
+shown rather than one standing in for the other, because a skipped clip is done and was not moved.
+The report closes on **moved / skipped / failed / of total**, with a deliberate refusal
+(`occupied`, `in_use`, `missing`, `changed`, `cross_volume`) kept apart from an unclassified
+failure — collapsing them would make a healthy no-overwrite refusal read as a malfunction. There is
+no rate, no percentage, no estimate and no time remaining, and `should_emit` reads **no clock**: a
+throttle driven by elapsed seconds would make the frame sequence depend on how fast the disk is,
+which is exactly the unverifiable progress this change replaces. `PROGRESS_FRAME_BUDGET = 50` caps
+the frames and the **last outcome always emits**, so the closing figure is a measurement rather
+than a rounded stride.
+
+**A classification and a sort are mutually exclusive, and the first attempt at this was wrong.** A
+transfer captures its decision snapshot before it moves anything, so a decision that lands outside
+that snapshot would be honoured by the screen and ignored by the batch — the operator would watch a
+clip they just marked Keep land in Discarded, with the durable record agreeing with neither.
+
+The first version of this change read `_CLIPS_TRANSFERS.busy(...)` in `_clips_decide` and then
+committed — the very check-then-act shape the admission rule above exists to remove. Independent
+review (**F-1**) reproduced the consequence deterministically on the shipped handler, in both
+directions: a classification that passed the read *before* a transfer was admitted still committed
+*after* it, was answered `ok: True`, was durable, and was invisible to the batch, with **both halves
+reporting success** — `PENDING→SELECTED` swept into Discarded and `SELECTED→REJECTED` moved into the
+Media Library, each under a terminal frame reading `✅ Sorted all 3 clip(s).` Measured windows: a
+confirm side of about 0.7 ms against a `_clips_decide` of about 5.6 ms, so the commit side dominates
+and widens under journal contention. The exposure is a **misfiled, not a lost** clip: nothing is
+deleted, nothing overwritten, and it is recoverable by moving it back.
+
+**A post-admission snapshot re-read does not close it, which was measured rather than assumed.**
+Against a probe carrying only that re-read, a classification suspended inside its own commit
+re-read as *unchanged* and became durable immediately afterwards; the transfer moved the file by
+the stale snapshot anyway. So the correction is two halves, and neither is sufficient alone:
+
+| half | closes | mechanism |
+|---|---|---|
+| `TransferGuard.begin_decision` / `DecisionInFlight` | a decision **straddling** admission | one locked test-and-set, sharing `begin`'s lock and its two rules |
+| the snapshot re-read under the reservation | a decision that **completed** between the snapshot and admission | `snapshot_of(identities) != snapshot` → refuse, moving nothing |
+
+What that buys is a statable invariant rather than a narrower window: **once `begin` has returned a
+reservation, no durable decision touching any identity on its page can be in flight and none can
+start until it is released — whatever owner or root it arrives under**, so a snapshot taken after
+admission is the batch's final truth. Neither call ever waits — both raise, and the caller turns
+that into an explicit retry, because a conflict is a sub-10-millisecond coincidence between two
+human-paced actions and a queue would add a blocking path to save nobody any time.
+
+**The conflict unit is the clip, not the folder, and the first version of that was wrong too
+(F-2).** The owner rule asks whose press it is and the folder rule asks which directory; neither
+asks which *clips*. Two review sessions that scanned an **ancestor and a descendant** of one tree
+have two owner keys and two different `root_key`s — and the same clip in both batches under the
+same durable decision identity, because a decision is keyed on the file and not on the path it was
+reached through. Independent review reproduced the consequence on the corrected F-1 tree: a
+classification accepted from the child page was answered `ok: True`, was durable, and was ignored
+by a sort already running on the parent page, which filed the clip by its older snapshot —
+`accepted=True durable=REJECTED landed=library`, under a terminal frame reading
+`✅ Sorted all 4 clip(s).` The exposure is again a **misfiled, not a lost** clip.
+
+The correction is **one more rule inside the same atomic decision**, not a second mechanism: a
+transfer reservation carries the bounded, frozen set of decision identities on its page, a decision
+claim carries the one identity it may change, and `_conflicting_transfer` applies owner, then
+folder, then **identity overlap** — all under the one existing lock, with `isdisjoint` so nothing is
+allocated inside it. `begin` additionally compares the pending-decision map against its own page,
+because a decision in flight holds no active record to be scanned. Three consequences beyond the
+reported defect: two *transfers* over an overlapping batch are now excluded as well (both would
+`os.rename` the same path); a root `realpath` cannot resolve still protects its clips, which the
+folder rule could never do; and the refusal is its own code and sentence (`clip_in_progress`,
+`CLIPS_TRANSFER_CLIP_BUSY_TEXT`) because the folders really are different and saying "this folder"
+would send the operator to the wrong one. `gui._clips_transfer_busy_text` is now the only place a
+code becomes a sentence, and `TransferGuard.conflict` is the advisory read both the screen and
+`busy()` go through, so presentation cannot drift from the authority.
+
+**Stated exactly, because the point of F-2 was an over-broad claim.** The protection is over
+durable decision *identities*. A clip reachable under two **different** identities is not
+detected — two hard links to one set of bytes are two identities, and that is not attempted. Path
+aliases are a different thing and are covered: junctions, `..`, case and trailing separators
+collapse to one `root_key` and one identity, measured against a real NTFS junction. And the rule is
+identity overlap rather than a path-prefix test, so two nested folders whose pages share no clip
+stay completely independent.
+
+`_clips_decide` still answers `transfer_in_progress` through the existing `refuse(...)` helper, so
+nothing is appended, no revision moves, and the already-authorized page is handed the server's own
+record to resync from. Every reason is checked, because the second tab never saw a greyed-out tile.
+The decision slot is released in a `finally` covering refusal, `StaleWrite`, a durability failure
+and a defect — a slot that outlived its decision would refuse this owner's transfers until the app
+restarted. Both claims are a window, not a latch: each ends with the operation that took it, and a
+released transfer frees its clips in the same instant.
+
+**The R11 interaction is decided, not left to chance.** A page can stop being current *while the
+sort runs* — a newer scan, or the Raw Cutter's "Review these clips" retiring it through
+`ScanCoordinator.invalidate`. The moves are **not** abandoned: the operator pressed Confirm on that
+page, and aborting mid-batch for an unrelated navigation action would leave a partial sort for no
+reason. But re-enumerating the retired root would hand the browser a page the server no longer
+holds, reinstating the exact defect R11 closed. So the generation recorded at admission is read
+again at the end, and the two branches are the two `_on_clips_scan` already has: still newest,
+publish the next batch; superseded, repaint the **authoritative** page. That is the R5-P3 / F1 rule
+applied to a transfer, which is why no second notion of "the current page" was introduced — a test
+pins that the handler names `_CLIPS_SCANS.is_current` and reaches no other coordinator method.
+
+**Unchanged, and deliberately so:** the two-step sweep confirmation and its single-use signature;
+the sweep writing **no** durable decision; one same-volume no-overwrite `os.rename` with the refusal
+enforced by the call itself; `os.replace` still never used; nothing deleted; a cross-volume request
+still refused in words rather than degraded into a copy; `validate_roots` on every press against
+the destinations carried on the view; `move_decided_clip` and `collision.py` not modified at all.
+Single-flight is also what makes the named collision hazard unreachable — a second concurrent run
+of one batch could otherwise take the next free suffix and leave `clip0000_01.mp4` beside
+`clip0000.mp4`.
+
+**64 new tests.** 21 execute the admission rule on a bare interpreter, including 24 real threads at
+a barrier proving exactly one press is admitted, and the no-clock and no-filesystem guards are AST
+checks rather than substring scans — the prose explaining each ban contains the banned token, and
+this repository has tripped its own substring bans that way five times. 43 drive the real,
+`ast`-extracted handler frame by frame against a real filesystem: Working-before-the-first-move
+checked against the disk, every intermediate numerator checked against how many files had actually
+gone, a duplicate press started from inside the first press's progress loop, two browser sessions on
+one folder, a replayed event, a classification refused mid-sort with the durable record proven
+untouched, an exception injected into the second of three moves, an abandoned generator, and both
+R11 cases. Full suite **9349 passed, 9 skipped**.
+
+**Two things recorded as open rather than claimed closed.** There is **no Cancel for a transfer**:
+abandoning the Gradio event does stop the loop and release the slot, but that is a dropped frame and
+not a cancel anybody pressed, and it must not be described as one. And the progress figure is
+server-side text with no browser tick, so between two emitted frames the number on screen is stale
+by up to one stride — never wrong, but not advancing either.
+
+A documentation correction came with it: `.claude/rules/clips-preview.md`'s Confirm section still
+said Confirm "moves nothing, and there is no code behind it that could". That was true of R5-P1 and
+has been false since R5-UX V3 shipped sorting. It is corrected, with the P1 statement preserved as
+history in the section that is actually scoped to P1.
+
 ### Added — 2026-11-01 (Raw Cutter R11: "Review these clips" hands over the finished job's own folder)
 
 **The button that takes you from a finished cut to Video Review now hands over the directory that

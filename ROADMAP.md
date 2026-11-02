@@ -1214,11 +1214,41 @@ the last real phase genuinely was instantaneous — *Planning clips* measured 6 
 detection — and the total elapsed beside it is the number that matters. And the detection phase
 shows `FFmpeg Active` while planning shows `Idle`, because planning is pure arithmetic.
 
-### R13 — Video Review Transfer Working Overlay · **PLANNED — next UX improvement**
+### R13 — Video Review Transfer Working Overlay · **REVIEWED TWICE, F-1 AND F-2 REMEDIATED — awaiting re-review**
 
-Today, pressing **Confirm** in Video Review starts moving and sorting the selected clips with no
-immediate visible acknowledgement, which has two bad consequences: a long transfer looks like a
-dead button, and an impatient second click is a second submission.
+Branch `feat/fun-video-review-working-overlay-r13` off `8a1c2ec4`. **Not merged, not deployed.**
+
+**Independent review found one blocking MAJOR, F-1, and it has been corrected.** Criterion 2 —
+"while working, duplicate sort submissions and classification changes are blocked for the active
+batch" — was implemented by reading the guard's own *advisory* `busy()` and then committing, which
+is check-then-act. A classification that passed the read before a transfer was admitted still
+committed after it, was answered `ok: True`, was durable, and was ignored by the batch, with both
+halves reporting success. The review's suggested fix — re-reading the decision snapshot after
+admission — was tested against a probe carrying only that re-read and **did not close it**: a
+commit suspended inside itself re-reads as unchanged. The correction is therefore two halves, a
+decision claim (`TransferGuard.begin_decision`, sharing `begin`'s lock) *and* the post-admission
+re-read, which together make the pair mutually exclusive rather than merely narrower.
+
+**A second independent review of that correction confirmed the F-1 mechanism and found a further
+MAJOR, F-2, now also corrected.** The mutual exclusion was decided on `(owner, root_key)`, and
+neither asks which *clips*: two sessions that scanned an **ancestor and a descendant** of one tree
+have two owner keys and two different root keys, and the same clip in both batches under the same
+durable identity. Reproduced on the F-1 tree as `accepted=True durable=REJECTED landed=library`
+under `✅ Sorted all 4 clip(s).` — a classification accepted and then ignored, by a route neither
+rule could see. The fix adds **one more rule inside the same atomic decision**: the reservation
+carries the page's bounded, frozen identity set, the decision claim carries the one identity it may
+change, and `_conflicting_transfer` applies owner, then folder, then **identity overlap** — one
+lock, one critical section, no second mutex and no second engine. It also closes two things the
+owner/folder pair never excluded: two *transfers* over an overlapping batch, and a root `realpath`
+cannot resolve. The same review found the 32-thread race test **vacuous** (its classifying workers
+died on an uncaught `AttributeError`, so it passed against an implementation with no decision claim
+at all) and two inaccurate test-evidence claims; all four findings are fixed. Details in
+`CHANGELOG-FORK.md` and `.claude/rules/video-review-transfer.md`; three review MINORs (M-1, M-2,
+M-3) remain accepted, documented and deliberately unchanged.
+
+Pressing **Confirm** in Video Review started moving and sorting the selected clips with no
+immediate visible acknowledgement, which had two bad consequences: a long transfer looked like a
+dead button, and an impatient second click was a second submission.
 
 **Collision handling is NOT part of this work, because it already ships.** `beatsync_fork/collision.py`
 carries two policies — `SKIP` (`DEFAULT_POLICY`, the historical behaviour: report the collision and
@@ -1256,6 +1286,109 @@ policy, so the overlay is the natural next thing to share.
 **Not implemented in the R12 pull request**, deliberately. It is a different surface with a
 different risk profile — R12 only observes, while R13 touches the control states of a workflow that
 moves files.
+
+#### What shipped, and the three things implementation decided that the plan left open
+
+All seven criteria are implemented, on the existing Confirm and Proceed buttons, the existing
+review surface and the existing transfer. The operative contract is
+`.claude/rules/video-review-transfer.md`.
+
+**1. The handler had to become a generator, because a function cannot say "working" and then
+work.** `_clips_confirm_frames` is what both buttons are wired to, and the frame shape is the
+contract rather than an implementation choice: **every refusal and the sweep gate emit exactly
+one frame**, byte-for-byte what the pre-R13 function returned, and a press that really sorts emits
+`1 + N + 1`. Criterion 1 says the Working state must appear "before the first file moves, not after
+the first response returns" — a single-return function can only do the second. `_on_clips_confirm`
+is kept as the collected form that drains to the last frame, so a caller that does not need
+progress is unaffected and seventeen existing assertions hold unchanged.
+
+**2. The lock scope is a design decision, and the plan did not name one.** The authority is
+`beatsync_fork/transfer_guard.py` — pure policy, one `threading.Lock`, no filesystem, no thread —
+and the operation identity is written out: `(owner, generation, signature, root_key)`, of which
+**`owner` and `root_key` are exclusive** and the other two are recorded. The owner rule is the
+duplicate-press rule; the folder rule exists because two browser tabs have two owner keys and would
+otherwise sort one folder at once, and it answers a separate code (`folder_in_progress`) because an
+operator told "this page is already being sorted" about somebody else's session would go looking for
+a press they never made. Admission is one locked **test-and-set**: `if not busy: start()` passes a
+single-threaded test and fails the 24-thread one. `concurrency_limit=None` is unchanged and
+load-bearing — a lane of 1 would leave the duplicate **queued** rather than refused, which is the
+measured S2-A R3 trap and strictly worse.
+
+**3. R13 had to decide what a finished transfer may publish, which the plan did not anticipate at
+all.** A page can stop being current *while the sort runs* — a newer scan, or R11's
+`ScanCoordinator.invalidate` from the Raw Cutter's "Review these clips". The moves are **not**
+abandoned (the operator pressed Confirm on that page, and aborting mid-batch for an unrelated
+navigation action would leave a partial sort for no reason), but re-enumerating the retired root
+would hand the browser a page the server no longer holds — reinstating the exact defect R11 closed.
+So the generation recorded at admission is read again at the end, and the two branches are the two
+`_on_clips_scan` already has: still newest, publish the next batch; superseded, repaint the
+**authoritative** page instead. That is the R5-P3 / F1 rule applied to a transfer, and it is why no
+second notion of "the current page" was introduced.
+
+Four smaller decisions worth recording because they are trades:
+
+- **Progress is counted, never predicted.** `iter_sorted_clips` yields each `MoveOutcome` *after*
+  its move has happened or been refused, so the numerator is recorded fact. `moved` and `done` are
+  both shown rather than one standing in for the other — a skipped clip is done and was not moved —
+  and the report closes on **moved / skipped / failed / of total**, with a deliberate refusal
+  (`occupied`, `in_use`, `missing`, `changed`, `cross_volume`) kept apart from an unclassified
+  failure. No rate, no percentage, no estimate, no time remaining, and `should_emit` **reads no
+  clock**: a throttle driven by elapsed seconds would make the frame sequence depend on how fast
+  the disk is, which is the unverifiable progress this feature replaces. `PROGRESS_FRAME_BUDGET`
+  caps the frames at 50 and always emits the last outcome, so the closing figure is a measurement
+  rather than a rounded stride.
+- **Classification is refused on the server, not in the browser.** A transfer captures its snapshot
+  before it moves anything, so a decision accepted afterwards would be honoured by the screen and
+  ignored by the batch — the operator would watch a clip they just marked Keep land in Discarded.
+  `_clips_decide` refuses `transfer_in_progress` through the existing `refuse(...)` helper, so
+  nothing is appended and no revision moves, and it checks **both** reasons because the second tab
+  never saw a greyed-out tile. It is a window, not a latch.
+- **The Working frame leaves the grid and the counts alone.** The operator is watching the batch
+  being sorted; blanking the page they pressed Confirm on would hide it mid-flight. The grid stays
+  clickable, and that is safe precisely *because* the server refuses the classification — a disabled
+  tile is presentation, and presentation is never the boundary here. `_clips_working_frame` is the
+  fifth **disable-only** mover of the Confirm button and the enabler set is unchanged.
+- **One transfer engine.** `sort_decided_clips` is now `list(iter_sorted_clips(...))` with its
+  signature and return type untouched; `move_decided_clip` and `collision.py` are not modified at
+  all. Single-flight is also what makes the named collision hazard unreachable — a second
+  concurrent run of one batch could otherwise take the next free suffix and leave `clip0000_01.mp4`
+  beside `clip0000.mp4`.
+
+**64 new tests** — 21 executing the admission rule on a bare interpreter (including 24 real threads
+at a barrier, proving exactly one press is admitted) and 43 driving the real `ast`-extracted handler
+frame by frame against a real filesystem: Working-before-the-first-move checked against the disk,
+every intermediate numerator checked against how many files had actually gone, a duplicate press
+started from inside the first press's progress loop, two browser sessions on one folder, a replayed
+event, a classification refused mid-sort with the durable record proven untouched, an exception
+injected into the second of three moves, an abandoned generator, and the R11 retirement and
+newer-scan cases. Full suite **9349 passed, 9 skipped**.
+
+**Measured in a real Chrome session** against the candidate on port 7899, driving the shipped UI
+with a `MutationObserver` recording every frame as it arrived. The console error monitor was proven
+with an injected canary *before* any zero-error claim:
+
+| What | Measurement |
+|---|---|
+| 8 clips, all kept | **11 frames**: the Working frame first (`Nothing has moved yet`, Confirm disabled) then `Moving 1/8 … 8/8`, then `✅ Sorted all 8 clip(s).` / `Moved 8 · skipped 0 · failed 0 · of 8.` Whole sort **111 ms** |
+| Working before the first move | asserted *in the browser*, from the frame text, and on disk — nothing had left the source folder when it arrived |
+| **Three Confirm presses in one tick**, the `disabled` attribute stripped between each | **four** server refusals — *"Nothing was started: this page is already being sorted (0 of 300 clip(s) done)"* — and **one** sort. Gradio delivered every press; `concurrency_limit=None` is why they reached the handler instead of queueing |
+| What reached the disk from those three presses | exactly **300** of 300, **0** in Discarded, **0** suffixed duplicates, 2,700 still in the source |
+| Progress budget, 300 clips | **49** progress frames at a stride of **6** — `ceil(300/50)` — ending on `Moving 300 / 300`, i.e. the last outcome, not a rounded stride |
+| JS errors | **zero**, against a canary-proven monitor |
+| Server exceptions | **none** across the whole session, apart from Gradio correctly refusing an out-of-range page size the test itself typed |
+
+One honest limitation of that session: a same-volume `os.rename` of small files is **fast** — 300
+clips in **956 ms**, and the page maximum is 500 — so a browser cannot hold a sort open for long on
+an SSD, and the duplicate presses had to be fired in the same tick rather than mid-sort. The
+mid-sort cases (a classification refused while a batch runs, the R11 retirement, an injected
+exception, an abandoned generator) are therefore measured in the suite, which drives the generator
+frame by frame and schedules them deterministically rather than racing a 3 ms-per-clip loop.
+
+**Two things recorded as open rather than claimed closed.** There is **no Cancel for a transfer**:
+abandoning the Gradio event does stop the loop and release the slot, but that is a dropped frame and
+not a cancel anybody pressed, and it must not be described as one. And the progress figure is
+server-side text with no browser tick, so between two emitted frames the number on screen is stale
+by up to one stride — never wrong, but not advancing either.
 
 ### R14 — Media Library Refresh & Maintenance · **PLANNED**
 
@@ -1588,7 +1721,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R10** — **Repeat Music 1×–30×** | **MERGED AND DEPLOYED** (PR #81, main `5cdbd8cc`) — branch `feat/fun-repeat-music-r10` off `b90c265f`, head `4fe07315`. **The owner rendered 2× and 3× against a real 2,476-video library and accepted the visual and musical result.** 1× is the legacy path *structurally* (every added statement sits behind a repeat guard) and is verified content-identical to a pristine `b90c265f` clone: one `framemd5` digest, one audio PCM hash, an empty diff over 83 pipeline-fact lines. 2×/3×/5× measured at exactly 1200/1800/3000 frames and 40/60/100 s; 30× of a 4 s fixture at 3600 frames / 120.000000 s with peak memory **482 MB against 475 MB at 1×**. The three cycles of a 3× master are byte-identical PCM, so each repetition is the whole song with no boundary gap. Later cycles are newly planned: 10/11 and 11/11 cuts differ from cycle 0, deterministically. Voice and SFX place across the full timeline (three of five clips past the first repetition at 5×); Cancel works during the audio preparation and during extraction; the Variant Lab batch freezes one repeat for every candidate; `--repeat-music` gives CLI parity. Two **pre-existing** defects surfaced by the longer timeline are fixed on the same branch: the EOF last-frame loss (`c0d64cbe`) and a timeline that rounded one frame past the audio, whose overhang `-shortest` then discarded — 1 frame without B-frames, **2** on NVENC, which is why the accepted 3× render planned 20,852 and published 20,850 (`005951c8`). A ~36 ms end gap at **720p30** remains as a known observation, frame count still exact, pending an owner decision on `-shortest`. **Merged and deployed; not independently reviewed** |
 | **R11** — Raw Cutter → **"Review these clips"** output handoff | **MERGED AND DEPLOYED** (PR #85, main `5e8a6013`) — branch `feat/fun-raw-cutter-review-these-clips-r11` off `d5bc160f`, head `198e6e9e`; the merge tree equals the approved candidate tree `2cd2d1a0`. Independently reviewed **QUALIFIED**, its one finding (F-1) fixed, and **accepted in a production GUI smoke test** (7 normal-workflow + 10 F-1 properties, zero JS errors against a canary-proven oracle). The existing button and the existing handler now hand over the finished job's **own** directory — `run_directory` for a single video, `batch_directory` for a batch — read from a new session-scoped `cut_handoff_state` instead of the `cut_output` parent widget, which is no longer an input to the button at all. Recursion follows the job's shape (off for single, on for batch) rather than being hardcoded on, and the button ships `interactive=False` until a job has published clips. The gate is a property of the pure record, not of each terminal path: `cut_handoff.build()` answers `None` unless a directory was named *and* at least one clip reached disk, and `read()` re-applies it to anything coming back out of session state. Counts are **published** clips on both sides — validated `on_complete` results for a single run, `summarise(...).clips_written` for a batch — so `plan.count` is reachable from neither. Every non-terminal and every refused frame clears the record, so a new, failed or refused cut cannot present the previous job's folder as its own result; a partial, cancelled or crashed job offers review only if clips exist, with wording that says which. Pressing it performs exactly one `os.path.isdir` and a vanished folder is reported, never replaced by its parent. `_on_cut_run` 5 → 7 outputs and `_on_cut_batch_run_ui` 6 → 8; `_on_cut_batch_run` keeps its signature, body and 2-tuple arity. **No new tab, no second review engine, no duplicate folder selector, no automatic scan, and no file movement.** 49 new tests, including the first executable harness for `_on_cut_run`. **Independent review returned QUALIFIED with one finding, F-1: the handoff navigated to the new folder while the gallery, the counters, Confirm and an armed sweep still described the previous one, so Confirm sorted the PREVIOUS folder's clips.** Fixed by retiring the server's per-owner review page through a new `ScanCoordinator.invalidate(owner)` — one locked step — before repainting, so Confirm, Proceed, Refresh and the decision endpoint all refuse because the page is gone rather than because a button went grey; this handler went 5 → 12 outputs with all five original positions unchanged, a refused handoff retires nothing, durable decisions and other browser sessions are untouched, and 17 further tests were added. The F-1 fix was then **proven on the deployed production build** by stripping `disabled` off Confirm and firing it anyway: the server refused with *"Nothing has been scanned on this page."*, the retired folder stayed byte-identical and both destinations stayed empty, while re-scanning it returned its kept mark intact |
 | **R12** — Raw Cutter **Live Activity & Performance panel** | **MERGED AND DEPLOYED** (PR #82, main `e0bc9393`) — branch `feat/fun-raw-cutter-activity-r12` off `5cdbd8cc`. A compact read-out below the existing bar in both modes: real phase, status indicator, total and per-phase elapsed, file, `Source N / Total`, `Clip X / Y`, FFmpeg activity and encoder. Measured in Chrome: during a **9.95 s** blocking scene-detection pass the server emitted one frame and went silent (`data-job-ms` fixed at 28) while the display advanced **00:00 → 00:08**; cutting 19 clips ran 00:00 → 00:10 with `Clip 1/19 → 19/19`; Cancel froze at 00:06 with 4 of 150 clips kept; a batch showed per-source phase resets and 29 of 29 clips. **No new component, no new progress system, no backend poll, no new endpoint, no percentage invented.** GPU usage reports *Unavailable* and Qwen *Not used in Raw Cutter* rather than guessing. Observational only — no cutter algorithm, output path, manifest or cancellation behaviour changed. Deployed and GUI-smoke-verified; two follow-up hotfixes shipped on top of it for a defect family it exposed rather than caused (PR #83 `ffb828a1`, PR #84 `d5bc160f`: an unnamed Folder Batch / review folder became the application's own install directory via `os.path.abspath('')`). **Not independently reviewed** |
-| **R13** — Video Review **transfer Working overlay** | **PLANNED — next UX improvement.** Show a Working overlay the moment Confirm starts moving clips, disable Confirm / Proceed / classification while it runs, report `Moving 12 / 84 clips` from clips actually moved, restore the controls on success *and* on failure, keep the existing two-step confirmation for unmarked clips, and keep server-side single-flight as the authority so a repeated click can never move, overwrite or delete extra clips. **Collision handling is out of scope because it already ships** — `collision.py`'s `SUFFIX` policy, at Settings → *When a destination filename already exists*, is reused as-is; no second naming engine. Deliberately **not** implemented in the R12 pull request |
+| **R13** — Video Review **transfer Working overlay** | **REVIEWED TWICE, F-1 AND F-2 REMEDIATED — awaiting re-review.** Branch `feat/fun-video-review-working-overlay-r13` off `8a1c2ec4`. The Confirm/Proceed handler is now a **generator**, `_clips_confirm_frames`, so the Working state reaches the browser *before* the first file moves; `_on_clips_confirm` is kept as the collected form and is byte-equivalent to the pre-R13 return value. Every refusal and the sweep gate emit **exactly one frame and claim no slot** — a spinner for an operation that moves nothing is the dead-button complaint inverted. Single-flight is a server-side **test-and-set** in the new pure `beatsync_fork/transfer_guard.py`, with the operation identity written out as `(owner, generation, signature, root_key)`: `owner` and `root_key` are exclusive (two browser tabs have two owner keys and would otherwise sort one folder at once, answered by its own `folder_in_progress` code), while `generation` is recorded rather than required because re-scanning must not entitle a second concurrent transfer. `concurrency_limit=None` is unchanged and load-bearing — a lane of 1 would leave the duplicate **queued** rather than refused (the measured S2-A R3 trap). Progress is counted from recorded `MoveOutcome`s, never a timer: `iter_sorted_clips` yields each one after its move happened or was refused, `moved` and `done` are both shown because a skipped clip is done and was not moved, the report closes on **moved / skipped / failed / of total** with a deliberate refusal kept apart from an unclassified failure, and `should_emit` reads **no clock** while capping the frames at 50 and always emitting the last outcome. **A classification and a sort are mutually exclusive, after independent review found the first attempt was not (F-1).** That attempt read the guard's *advisory* `busy()` in `_clips_decide` and then committed — check-then-act — so a classification that passed the read before admission still committed after it, was answered `ok: True`, was durable, and was ignored by the batch with both halves reporting success; reproduced in both directions on the shipped handler. The review's suggested post-admission snapshot re-read was measured against a probe carrying only that re-read and **did not close it**, because a commit suspended inside itself re-reads as unchanged. The correction is two halves: a **decision claim** (`begin_decision` / `end_decision`, deciding under `begin`'s own lock and by its own two rules, with `begin` raising the new `DecisionInFlight` while a conflicting decision is still being written) **and** the post-admission re-read, which together yield the invariant that once `begin` returns a reservation no conflicting durable decision can be in flight or start until it is released. Neither call waits; both raise, and the caller turns that into an explicit retry. `_clips_decide` still answers `transfer_in_progress` for this owner *and* for another session on the same folder, because the second tab never saw a greyed-out tile, still through the existing `refuse(...)` helper, so nothing is appended and no revision moves; the slot is released in a `finally` covering refusal, `StaleWrite`, a durability failure and a defect, and the transfer's reservation likewise on success, a partial batch, an injected exception and an **abandoned generator**; nothing is yielded from the `finally`, and no coordinator lock is held across the moves. **The R11 interaction is decided and tested**: a transfer whose page was retired or superseded mid-sort still completes its moves and reports them truthfully, but repaints the **authoritative** page rather than re-enumerating the root it was sorting — the R5-P3 / F1 rule applied to a transfer, so no second notion of "the current page" exists. **The two-step sweep confirmation, the no-overwrite `os.rename`, path containment, destination re-validation and `collision.py`'s two policies are all untouched**; `sort_decided_clips` keeps its signature and is now a list of what `iter_sorted_clips` yields, so there is one engine. **No new tab, no new button, no second review surface, no second naming engine, no new subprocess and no background service.** 64 new tests for the overlay plus **28 more for F-1** (15 bare-interpreter, including 32 threads at a barrier racing a transfer against a decision; 13 driving the real `ast`-extracted handler, with the interleaving placed by hooking admission and suspending the one durable commit rather than by racing a clock). Measured against the pristine candidate rather than asserted: **25 of the 28 F-1 tests fail there**; the other three legitimately pass, because two are scope tests with nothing to break pre-F-1 (a decision on a different folder, and alias spellings collapsing to one key) and one is the race test that review finding F-3 showed to be vacuous. The two that isolate the straddle fail against the recheck-only probe as well. **A second independent review confirmed the F-1 mechanism and found a further MAJOR, F-2, now corrected.** Exclusion was decided on `(owner, root_key)`, and neither component asks which *clips*: two sessions that scanned an ancestor and a descendant of one tree have two owner keys and two different root keys, and the same clip in both batches under the same durable identity -- reproduced on the F-1 tree as `accepted=True durable=REJECTED landed=library` under a terminal frame reading `✅ Sorted all 4 clip(s).` The correction is **one more rule in the same atomic decision**: the reservation carries the page's bounded, frozen identity set, the decision claim carries the one identity it may change, and `_conflicting_transfer` applies owner, then folder, then **identity overlap**, all under the one existing lock with `isdisjoint` so nothing is allocated inside it -- no second mutex, no second engine, and `begin` additionally compares the pending-decision map against its own page because a decision in flight holds no active record to scan. It closes two further things the owner/folder pair never excluded: two *transfers* over an overlapping batch (both would `os.rename` one path), and a root `realpath` cannot resolve. The rule is identity overlap and **not** a path-prefix test, so two nested folders whose pages share no clip stay independent; what is deliberately **not** claimed is a clip reachable under two *different* identities -- two hard links are two identities and are not detected, while path aliases (junctions, `..`, case, trailing separators) do collapse to one key and one identity, measured against a real NTFS junction. The same review found the 32-thread race test **vacuous** -- its classifying workers died on an uncaught `AttributeError`, so it passed against an implementation with no decision claim at all -- and it now records every worker outcome, treats an unexpected exception as a failure, and is backed by two standing not-vacuous proofs plus a separate interval test for the "none can start until it is released" half. A pre-existing flake was also found and fixed while re-running it: `test_many_concurrent_presses_admit_exactly_one_sort` only hoped the eight presses would overlap, and failed 4 times in 30 on the pristine candidate; the winner is now held at its first `note_progress` until every press has been through admission, measured 0 in 40 after. Open and recorded: **no Cancel for a transfer** (abandoning the event is a dropped frame, not a cancel anybody pressed), and the progress figure is server-side text with no browser tick, so it is stale by up to one stride between frames. **Not merged, not deployed** |
 | **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
@@ -1647,9 +1780,14 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    `e0bc9393`), owner-tested. The smallest possible answer to "I cannot tell whether it is
    working": a compact timing read-out under the existing bar, in both cutter modes, with no new
    progress system and no backend poll.
-7d. **R13 — Video Review transfer Working overlay.** The next UX improvement after R12: make a
-   long Confirm visibly busy and make a second click structurally harmless. Not started. The
-   collision half is already solved by `collision.py`'s `SUFFIX` policy and is reused, not rebuilt.
+7d. **R13 — Video Review transfer Working overlay.** **Implemented** on
+   `feat/fun-video-review-working-overlay-r13` off `8a1c2ec4`, awaiting review: a long Confirm is
+   now visibly busy before the first file moves, and a second click is structurally harmless
+   because single-flight is a server-side test-and-set rather than a disabled button. Progress is
+   counted from recorded move outcomes and the report closes on moved / skipped / failed. The
+   collision half was already solved by `collision.py`'s `SUFFIX` policy and is reused, not
+   rebuilt; the two-step sweep confirmation and the no-overwrite rename are untouched. No Cancel
+   for a transfer, recorded as open rather than claimed closed.
 7e. **R14 — Media Library Refresh & Maintenance.** After R13: a read-only library and cache
    inventory first, optional reversible cleanup second, optional renaming last and only on request.
    Not started, and deliberately gated on proving that every path-derived cache identity can be
