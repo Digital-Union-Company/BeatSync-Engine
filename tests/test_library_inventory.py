@@ -1242,3 +1242,429 @@ def test_l_legacy_callers_without_an_explicit_root_still_work_by_containment(tmp
     sibling.mkdir()
     assert lib.retract_subtree([inside], lib.probe_root(str(sibling)))[0].published != \
         lib.MISSING_CONFIRMED
+
+
+# =============================================================================================
+# M. F-6: the evidence's own RESOLVED directory must belong to the root being inspected
+#
+# F-1 fixed the root's anchor and F-2 fixed the root's identity. Neither asked where the
+# *evidence* came from, so one level of nesting reinstated the original defect: a junction
+# `<root>\Link` resolving onto another volume is lexically a child of the root's typed text, so
+# `list_directory` accepted it on the typed-containment disjunct, stamped it with the root's
+# `root_key`, and finalisation then settled a leaf beneath it against the root's storage -- which
+# was reachable -- while saying nothing at all about the storage that actually held the file.
+#
+# Two properties are pinned here, and neither is a drive-letter comparison:
+#
+#   * containment is measured on the RESOLVED directory, in `list_directory` and again at
+#     finalisation through `LeafVerdict.listing_real`;
+#   * a same-volume junction escaping to a sibling is refused identically -- its anchor is
+#     *equal* to the root's, which is asserted below so these tests cannot pass on an
+#     anchor comparison alone.
+#
+# Every test asserts the physical provenance (`Listing.real`, `LeafVerdict.listing_real`) as well
+# as the published verdict, because the pre-fix code recorded the correct resolved location and
+# then discarded it -- a suite that only reads the verdict cannot tell the two apart.
+# =============================================================================================
+
+def nested_junction_case(tmp_path, *, target, root_name="Library"):
+    """A root with a real nested junction in it, pointing at ``target``.
+
+    Returns ``(root_path, root_state, junction_path)`` or ``None`` when a junction cannot be made.
+    """
+    root = tmp_path / root_name
+    root.mkdir()
+    (root / "present.mp4").write_bytes(b"x")
+    link = make_junction(root / "Link", target)
+    if link is None:
+        return None
+    return str(root), lib.probe_root(str(root)), link
+
+
+def escape_outcome(root, root_state, directory, *, explicit_root):
+    """One full pass over ``directory`` offered as ``root_state``'s evidence."""
+    listing = lib.list_directory(directory, **({"root": root_state} if explicit_root else {}))
+    leaf = lib.classify_leaf(os.path.join(str(directory), "gone.mp4"), listing,
+                             lstat=raiser(oserror(winerror=2)))
+    settled = lib.retract_subtree([leaf], lib.probe_root(root))[0]
+    return listing, leaf, settled
+
+
+# --- 1 & 2: cross-volume nested junction, with and without an explicit root ------------------
+
+@pytest.mark.parametrize("explicit_root", [True, False])
+def test_m_a_nested_cross_volume_junction_cannot_confirm_a_deletion(tmp_path, explicit_root):
+    """**The F-6 control.** Injected so the far volume is deterministic on any machine.
+
+    Pre-fix this published MISSING_CONFIRMED with the detail "the storage holding it was still
+    there", for both call shapes. The explicit-root shape is refused at `list_directory`; the
+    no-root shape has no containment guard there at all and is refused at finalisation.
+    """
+    root = tmp_path / "Library"
+    root.mkdir()
+    (root / "present.mp4").write_bytes(b"x")
+    link, far = str(root / "Link"), r"D:\OtherMedia"
+    resolve = xvol_realpath(link, far)
+
+    state = lib.probe_root(str(root))
+    assert state.positively_observed, "the root itself is perfectly healthy"
+    listing = lib.list_directory(link, realpath=resolve, isdir=lambda _p: True,
+                                 listdir=lambda _p: ["present.mp4"],
+                                 **({"root": state} if explicit_root else {}))
+    # The resolved location really is on the other volume -- the F-1 fix gets this right, and
+    # discarding it was F-6.
+    assert listing.real == far
+    assert listing.anchor == "D:" + os.sep
+    assert listing.anchor != lib.anchor_of(state.real), "the volumes really do differ"
+
+    if explicit_root:
+        assert not listing.ok, "a folder resolving outside the root is not that root's evidence"
+        assert listing.verdict == lib.NOT_INSPECTED
+        assert "does not lie under" in listing.detail
+
+    leaf = lib.classify_leaf(os.path.join(link, "gone.mp4"), listing,
+                             lstat=raiser(oserror(winerror=2)))
+    settled = lib.retract_subtree([leaf], lib.probe_root(str(root)))[0]
+    assert settled.published == lib.UNKNOWN
+    assert settled.published != lib.MISSING_CONFIRMED
+    assert lib.confirmed_missing([settled]) == ()
+    assert "storage holding it was still there" not in settled.detail
+
+
+def test_m_the_no_root_shape_is_refused_by_the_recorded_listing_provenance(tmp_path):
+    """Why `listing_real` has to exist: without an explicit root there is nothing else to check.
+
+    The leaf's typed path IS under the root, the root IS positively observed, and `root_key` is
+    empty on both sides -- so every other signal available at finalisation says yes.
+    """
+    root = tmp_path / "Library"
+    root.mkdir()
+    (root / "present.mp4").write_bytes(b"x")
+    link, far = str(root / "Link"), r"D:\OtherMedia"
+    listing = lib.list_directory(link, realpath=xvol_realpath(link, far),
+                                 isdir=lambda _p: True, listdir=lambda _p: ["present.mp4"])
+    assert listing.ok and listing.root_key == "", "no root was named, so there is no identity"
+    leaf = lib.classify_leaf(os.path.join(link, "gone.mp4"), listing,
+                             lstat=raiser(oserror(winerror=2)))
+    assert leaf.verdict == lib.MISSING_PROVISIONAL, "the first three clauses do hold"
+    assert leaf.listing_real == far, "the physical origin travelled with the verdict"
+
+    state = lib.probe_root(str(root))
+    assert lib.is_within(leaf.path, state.real), "the leaf's TYPED path is under the root"
+    assert state.positively_observed
+    assert lib._same_inspection_root(state, leaf), "jurisdiction alone says yes"
+    assert not lib._listing_belongs_to_root(state, leaf), "and containment says no"
+    settled = lib.retract_subtree([leaf], state)[0]
+    assert settled.published == lib.UNKNOWN
+    assert settled.is_final and "does not lie under" in settled.detail
+    assert "anchor_reachable_at_end" in settled.clauses.unmet()
+
+
+# --- 3: same-volume escape, where no anchor comparison could help ----------------------------
+
+@pytest.mark.parametrize("explicit_root", [True, False])
+def test_m_a_same_volume_junction_escaping_to_a_sibling_is_refused(tmp_path, explicit_root):
+    """A REAL junction, and the case that proves the guard is not a drive-letter test.
+
+    The escape target is on the same volume as the root, so the anchors are *equal*; only the
+    resolved location distinguishes them.
+    """
+    outside = tmp_path / "SiblingOutside"
+    outside.mkdir()
+    (outside / "present.mp4").write_bytes(b"x")
+    case = nested_junction_case(tmp_path, target=outside)
+    if case is None:
+        pytest.skip("this platform or privilege level cannot create a junction")
+    root, state, link = case
+    assert lib.anchor_of(str(outside)) == lib.anchor_of(state.real), \
+        "same volume by construction: an anchor comparison cannot separate these"
+
+    listing, leaf, settled = escape_outcome(root, state, link, explicit_root=explicit_root)
+    assert lib.is_within(os.path.abspath(link), root), "the junction IS a typed child of the root"
+    assert not lib.is_within(listing.real or str(outside), root), \
+        "but its resolved location is not"
+    if explicit_root:
+        assert not listing.ok and listing.verdict == lib.NOT_INSPECTED
+    else:
+        assert listing.ok and leaf.listing_real
+        assert not lib.is_within(leaf.listing_real, root)
+    assert settled.published == lib.UNKNOWN
+    assert settled.published != lib.MISSING_CONFIRMED
+
+
+# --- 4: the target volume is gone while the link's own volume answers ------------------------
+
+def test_m_the_target_volume_may_be_gone_while_the_link_volume_answers(tmp_path):
+    """The whole point of clause (d), at one level of nesting.
+
+    The root is on a live volume and is positively observed at the end of the pass. The storage
+    that actually held the file is gone -- and is corroborated as gone by probing it directly.
+    """
+    root = tmp_path / "Library"
+    root.mkdir()
+    (root / "present.mp4").write_bytes(b"x")
+    link, far = str(root / "Link"), r"D:\OtherMedia"
+    resolve = xvol_realpath(link, far)
+    listing = lib.list_directory(link, realpath=resolve, isdir=lambda _p: True,
+                                 listdir=lambda _p: ["present.mp4"])
+    leaf = lib.classify_leaf(os.path.join(link, "gone.mp4"), listing,
+                             lstat=raiser(oserror(winerror=2)))
+    assert leaf.verdict == lib.MISSING_PROVISIONAL
+
+    # D: has gone away. The root -- and the volume the LINK sits on -- have not.
+    end_root = lib.probe_root(str(root), isdir=volume_gone("D:"))
+    end_target = lib.probe_root(far, realpath=resolve, isdir=volume_gone("D:"),
+                                listdir=raiser(oserror(winerror=21)),
+                                lstat=raiser(OSError(errno.EINVAL, "x")))
+    assert end_root.verdict == lib.PRESENT and end_root.positively_observed, \
+        "the approved root is genuinely, truthfully fine"
+    assert end_target.verdict == lib.ROOT_UNREACHABLE and not end_target.positively_observed, \
+        "and the storage that held the file is genuinely gone"
+    settled = lib.retract_subtree([leaf], end_root)[0]
+    assert settled.published == lib.UNKNOWN
+    assert lib.confirmed_missing([settled]) == ()
+
+
+# --- 5 & 6: the legitimate cases, which must be entirely unaffected --------------------------
+
+@pytest.mark.parametrize("explicit_root", [True, False])
+def test_m_a_selected_junction_root_and_its_children_still_confirm(tmp_path, explicit_root):
+    """The correction must not reject junction-backed roots.
+
+    `probe_root` resolves the root first, so a child reached through the selected link resolves
+    *inside* `state.real` and resolved containment already admits it. This is why the typed
+    disjunct was never needed.
+    """
+    real = tmp_path / "real_library"
+    child = real / "set_01"
+    child.mkdir(parents=True)
+    (child / "other.mp4").write_bytes(b"x")
+    (real / "other.mp4").write_bytes(b"x")
+    link = make_junction(tmp_path / "link_to_library", real)
+    if link is None:
+        pytest.skip("this platform or privilege level cannot create a junction")
+    state = lib.probe_root(link)
+    assert state.verdict == lib.PRESENT and state.is_reparse and state.positively_observed
+
+    for directory in (link, os.path.join(link, "set_01")):
+        listing = lib.list_directory(directory, **({"root": state} if explicit_root else {}))
+        assert listing.ok, f"{directory} is legitimate evidence for its own junction root"
+        assert lib.is_within(listing.real, state.real), "it resolves INSIDE the resolved root"
+        leaf = lib.classify_leaf(os.path.join(directory, "gone.mp4"), listing)
+        assert leaf.listing_real and lib.is_within(leaf.listing_real, state.real)
+        settled = lib.retract_subtree([leaf], lib.probe_root(link))[0]
+        assert settled.published == lib.MISSING_CONFIRMED, \
+            f"a real deletion under {directory} must still be reportable"
+        assert settled.clauses.all_four
+
+
+@pytest.mark.parametrize("explicit_root", [True, False])
+def test_m_an_ordinary_subdirectory_is_still_valid_evidence(tmp_path, explicit_root):
+    root = tmp_path / "library"
+    child = root / "set_02"
+    child.mkdir(parents=True)
+    (child / "other.mp4").write_bytes(b"x")
+    state = lib.probe_root(str(root))
+    listing = lib.list_directory(str(child), **({"root": state} if explicit_root else {}))
+    assert listing.ok
+    leaf = lib.classify_leaf(str(child / "gone.mp4"), listing)
+    assert leaf.listing_real == listing.real
+    settled = lib.retract_subtree([leaf], lib.probe_root(str(root)))[0]
+    assert settled.published == lib.MISSING_CONFIRMED
+
+
+# --- 7..10: the F-2 properties, re-pinned through the new guard ------------------------------
+
+def test_m_nested_roots_still_keep_distinct_provenance(tmp_path):
+    """Both guards now apply, and they answer differently -- which is the design."""
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    (inner / "other.mp4").write_bytes(b"x")
+    st_outer, st_inner = lib.probe_root(str(outer)), lib.probe_root(str(inner))
+    assert st_outer.root_key != st_inner.root_key
+    leaf = lib.classify_leaf(str(inner / "gone.mp4"),
+                             lib.list_directory(str(inner), root=st_inner))
+    # The inner listing IS physically under the outer root, so containment alone would admit it.
+    assert lib._listing_belongs_to_root(st_outer, leaf), "containment cannot separate them"
+    assert not lib._same_inspection_root(st_outer, leaf), "identity can, and does"
+    assert lib.retract_subtree([leaf], st_outer)[0].published != lib.MISSING_CONFIRMED
+    assert lib.retract_subtree([leaf], st_inner)[0].published == lib.MISSING_CONFIRMED
+
+
+def test_m_foreign_root_evidence_is_still_returned_untouched(tmp_path):
+    """A jurisdiction mismatch is still not consumed -- only a *contradiction* is failed closed."""
+    _rootA, _stA, _lst, provisional = provenance_chain(tmp_path, "rootA")
+    rootB = tmp_path / "rootB"
+    rootB.mkdir()
+    passed_over = lib.retract_subtree([provisional], lib.probe_root(str(rootB)))[0]
+    assert passed_over.verdict == lib.MISSING_PROVISIONAL, "untouched, not retracted"
+    assert not passed_over.is_final
+    settled = lib.retract_subtree([passed_over], lib.probe_root(str(tmp_path / "rootA")))
+    assert settled[0].published == lib.MISSING_CONFIRMED, "its own root can still settle it"
+
+
+def test_m_a_same_root_access_denied_still_confirms(tmp_path):
+    root, _state, _lst, provisional = provenance_chain(tmp_path)
+    denied = lib.probe_root(str(root), listdir=raiser(PermissionError(errno.EACCES, "denied")))
+    assert denied.verdict == lib.ACCESS_DENIED and denied.positively_observed
+    assert lib._listing_belongs_to_root(denied, provisional), \
+        "the listing was taken under this very root"
+    assert lib.retract_subtree([provisional], denied)[0].published == lib.MISSING_CONFIRMED
+
+
+def test_m_mid_pass_root_loss_still_retracts(tmp_path):
+    root, _state, _lst, provisional = provenance_chain(tmp_path)
+    lost = lib.probe_root(str(root), isdir=lambda _p: False)
+    assert lost.verdict == lib.ROOT_UNREACHABLE and not lost.positively_observed
+    settled = lib.retract_subtree([provisional], lost)[0]
+    assert settled.published == lib.UNKNOWN
+    assert "retracted" in settled.detail, "the disconnect wording, not the containment wording"
+    assert "anchor_reachable_at_end" in settled.clauses.unmet()
+
+
+# --- 11: may_descend refuses it, and so does the direct call --------------------------------
+
+def test_m_may_descend_refuses_the_escape_and_so_does_list_directory(tmp_path):
+    """`may_descend` is a real guard, but it is not the enforced sequence.
+
+    Nothing couples the two functions, so `list_directory` must refuse the same directory on its
+    own -- including when `lstat` cannot decide whether the child is a reparse point at all.
+    """
+    outside = tmp_path / "SiblingOutside"
+    outside.mkdir()
+    (outside / "present.mp4").write_bytes(b"x")
+    case = nested_junction_case(tmp_path, target=outside)
+    if case is None:
+        pytest.skip("this platform or privilege level cannot create a junction")
+    root, state, link = case
+
+    assert lib.may_descend(state, link).action == lib.SKIP_REPARSE_ESCAPES
+    undecidable = lib.may_descend(state, link, lstat=raiser(OSError(errno.EIO, "undecidable")))
+    assert not undecidable.is_reparse, "the reparse status could not be established"
+    assert undecidable.action == lib.SKIP_OUTSIDE_ROOT, \
+        "and it is still refused, because containment is measured on the resolved location"
+    assert not undecidable.allowed
+
+    # Now bypass may_descend entirely, which is what a path-verifying caller would do.
+    listing = lib.list_directory(link, root=state)
+    assert not listing.ok and listing.verdict == lib.NOT_INSPECTED
+
+
+# --- 12: absent or contradictory provenance fails closed ------------------------------------
+
+def test_m_a_missing_claim_with_no_recorded_listing_provenance_fails_closed(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    state = lib.probe_root(str(root))
+    hand_built = lib.LeafVerdict(
+        path=str(root / "gone.mp4"), verdict=lib.MISSING_PROVISIONAL,
+        clauses=lib.Clauses(parent_listed=True, name_absent=True, leaf_absent_error=True,
+                            anchor_reachable_at_listing=True))
+    assert hand_built.listing_real == "", "no origin was recorded"
+    assert lib._same_inspection_root(state, hand_built), "jurisdiction says yes"
+    assert not lib._listing_belongs_to_root(state, hand_built), "provenance cannot be checked"
+    settled = lib.retract_subtree([hand_built], state)[0]
+    assert settled.published == lib.UNKNOWN
+    assert lib.confirmed_missing([settled]) == ()
+
+
+def test_m_a_contradictory_listing_provenance_fails_closed(tmp_path):
+    """`root_key` matches this root exactly, and the recorded origin is somewhere else entirely."""
+    root = tmp_path / "library"
+    root.mkdir()
+    state = lib.probe_root(str(root))
+    contradictory = lib.LeafVerdict(
+        path=str(root / "gone.mp4"), verdict=lib.MISSING_PROVISIONAL, root_key=state.root_key,
+        listing_real=r"D:\SomewhereElse",
+        clauses=lib.Clauses(parent_listed=True, name_absent=True, leaf_absent_error=True,
+                            anchor_reachable_at_listing=True))
+    assert lib._same_inspection_root(state, contradictory), "the identity matches exactly"
+    settled = lib.retract_subtree([contradictory], state)[0]
+    assert settled.published == lib.UNKNOWN
+    assert settled.is_final, "a contradiction is settled, not left hanging as another root's"
+
+
+@pytest.mark.parametrize("verdict", [lib.PRESENT, lib.ACCESS_DENIED, lib.ROOT_UNREACHABLE,
+                                     lib.UNKNOWN, lib.NOT_INSPECTED])
+def test_m_verdicts_that_assert_nothing_are_not_held_hostage_to_provenance(tmp_path, verdict):
+    """Failing closed applies to a missing CLAIM. Everything else still passes through."""
+    root = tmp_path / "library"
+    root.mkdir()
+    item = lib.LeafVerdict(path=str(root / "x.mp4"), verdict=verdict, is_final=True)
+    assert item.listing_real == ""
+    assert lib._listing_belongs_to_root(lib.probe_root(str(root)), item)
+    settled = lib.retract_subtree([item], lib.probe_root(str(root)))[0]
+    assert settled.published == verdict
+
+
+# --- the review's surviving M5a gap: no second pass may promote a retracted verdict ----------
+
+def test_m_a_retracted_verdict_is_never_promoted_by_a_second_pass(tmp_path):
+    """Closes the test gap the independent review found by mutation.
+
+    Deleting ``(MISSING_PROVISIONAL, False)`` from the transition table survived the whole suite,
+    because the verdict then stayed MISSING_PROVISIONAL and ``published`` already launders that to
+    UNKNOWN -- but a *second* finalisation against a healthy root would then promote it to
+    MISSING_CONFIRMED, which the module says is impossible. So the internal verdict is asserted,
+    not only the published one, and the second pass is actually performed.
+    """
+    path, listing = satisfying_case(tmp_path)
+    provisional = lib.classify_leaf(path, listing)
+    assert provisional.verdict == lib.MISSING_PROVISIONAL
+
+    retracted = lib.retract_subtree([provisional], lost_root(tmp_path))[0]
+    assert retracted.verdict == lib.UNKNOWN, \
+        "the retraction must REPLACE the provisional verdict, not merely hide it"
+    assert retracted.published == lib.UNKNOWN and retracted.is_final
+
+    for _ in range(3):
+        retracted = lib.retract_subtree([retracted], reachable_root(tmp_path))[0]
+        assert retracted.verdict == lib.UNKNOWN
+        assert retracted.published != lib.MISSING_CONFIRMED
+    assert lib.confirmed_missing([retracted]) == ()
+
+
+# --- opt-in: the same nested escape on real cross-volume hardware ---------------------------
+
+@pytest.mark.skipif(not os.environ.get("BEATSYNC_TEST_XVOL_DIR"),
+                    reason="set BEATSYNC_TEST_XVOL_DIR to a writable directory on a DIFFERENT "
+                           "volume to exercise a real cross-volume nested junction")
+def test_m_a_real_nested_cross_volume_junction_cannot_confirm_a_deletion(tmp_path):
+    """The opt-in real-hardware form of the injected F-6 control above.
+
+    Opt-in because a second volume is not a property of every machine, and a test must not invent
+    one. The storage loss is still an injected `isdir`: nothing is unplugged or unmounted.
+    """
+    base = os.environ["BEATSYNC_TEST_XVOL_DIR"]
+    if os.path.splitdrive(os.path.abspath(base))[0].upper() == \
+            os.path.splitdrive(os.path.abspath(str(tmp_path)))[0].upper():
+        pytest.skip("BEATSYNC_TEST_XVOL_DIR is on the same volume as tmp_path")
+    target = os.path.join(base, "r14a_f6_fixture")
+    os.makedirs(target, exist_ok=True)
+    try:
+        with open(os.path.join(target, "present.mp4"), "wb") as handle:
+            handle.write(b"x")
+        case = nested_junction_case(tmp_path, target=target)
+        if case is None:
+            pytest.skip("this platform or privilege level cannot create a junction")
+        root, state, link = case
+        far_drive = os.path.splitdrive(os.path.abspath(target))[0]
+        assert os.path.splitdrive(os.path.realpath(link))[0].upper() == far_drive.upper(), \
+            "the junction really does resolve across the volume boundary"
+
+        for explicit_root in (True, False):
+            listing, leaf, _ = escape_outcome(root, state, link, explicit_root=explicit_root)
+            end_root = lib.probe_root(root, isdir=volume_gone(far_drive))
+            assert end_root.positively_observed, "the root's own volume still answers"
+            settled = lib.retract_subtree([leaf], end_root)[0]
+            assert settled.published == lib.UNKNOWN, \
+                f"explicit_root={explicit_root} must not confirm a deletion on lost storage"
+            if explicit_root:
+                assert not listing.ok
+    finally:
+        stray = os.path.join(target, "present.mp4")
+        if os.path.isfile(stray):
+            os.remove(stray)
+        if os.path.isdir(target) and not os.listdir(target):
+            os.rmdir(target)
