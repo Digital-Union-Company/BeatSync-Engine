@@ -1608,6 +1608,71 @@ product work, not an excuse to change the current single-song render default.
 
 ---
 
+### R17 — Chrome / Windows Desktop Notifications for Long Jobs · **PROPOSED, NOT STARTED**
+
+Owner-requested UX improvement (2026-11-04): after a lengthy operation finishes, **Google Chrome
+should offer an optional Windows desktop notification**, so the operator can work elsewhere rather
+than continuously watch BeatSync's tab. This is independent of the scanner safety hotfix, R14-A
+inventory, R15 Audio Cutter V2 and R16 Music Playlist Mode. **No implementation is authorised by
+this roadmap entry.**
+
+**First release (R17-A) — open-page notifications.** With BeatSync open in Chrome (the tab may be
+in the background), display one notification when an authoritative long-running job reaches its
+terminal state. Candidate event sources include Raw Cutter single / Folder Batch, full video render
+and Variant Lab batch, Stage-5 analysis/preparation, Audio Cutter single / eventual Folder Batch,
+and other genuinely long operations where the server already has a reliable terminal result.
+Scope by real job lifecycle, not a timer, guessed duration or "FFmpeg process disappeared". Distinguish
+**success**, **partial success (completed / skipped / failed)**, **failed**, and **cancelled**. Do
+not announce success while a final file is still being written or while the result is unknown.
+A brief example: `BeatSync — Raw Cutter batch finished · 27 completed, 1 failed`; clicking a
+notification should focus the corresponding open BeatSync tab and relevant result if safe. No
+automatic click, move, render, cleanup, restart or retry.
+
+**Settings → Notifications (R17-A).** Include a saved **Enable desktop notifications** toggle
+(**OFF by default**), an explicit **Allow notifications in Chrome** action and **Send test
+notification**. Show distinct app-setting and browser-permission states:
+`not requested` / `granted` / `denied` / `unsupported` and a plain explanation for each.
+A user gesture must initiate `Notification.requestPermission()`; never ask on page load, during
+a render, or because the saved toggle changed indirectly. The BeatSync toggle disables delivery
+even if Chrome permission remains granted; changing Chrome's per-origin permission belongs to
+Chrome Site Settings and is never falsely claimed to be revoked by BeatSync. A denied or
+unsupported browser capability must not block the job or affect its terminal report. Optional
+later refinements: per-job-type switches and quiet notifications, only if the simplest UX proves
+insufficient.
+
+**Security and reliability contract.** Desktop notification support requires a secure browsing
+context and permission. The local production origin `http://127.0.0.1:7860` is generally a
+potentially trustworthy loopback origin, unlike an ordinary insecure remote HTTP origin; verify
+actual `isSecureContext`, API presence and `Notification.permission` in the target Chrome
+version. Browser/Windows notification settings, Focus Assist / Do Not Disturb and OS policy can
+suppress display, so do not promise a guaranteed alert or replace in-app completion reporting.
+A notification must be associated with the **correct owner/session, job id and terminal event**;
+do not broadcast one operator's jobs to all tabs or issue duplicates from multiple Gradio updates,
+reconnections or tabs. Default notification content is minimal, with job type, terminal outcome
+and safe counts, **not full local file paths, media names or sensitive logs** on the Windows
+lock screen. Retain no new media metadata; do not duplicate progress engines or add a timer,
+daemon, background poller, new external cloud service or browser extension.
+
+**Browser lifecycle boundary — explicit.** V1 works while an authorised BeatSync page is actually
+open and receives the job's terminal result, even if another application is in the foreground.
+A normal page `Notification()` is not a promise that an alert will fire after the page is
+closed, Chrome has shut down or the session has disconnected. **R17-B (optional, separate future
+decision)** can investigate service-worker / Push-based persistent delivery after page closure,
+its security and lifecycle implications, and whether local-only BeatSync architecture can support
+it safely. Do not silently ship a background process or add push infrastructure in R17-A.
+
+**Acceptance to plan before coding:** manual permission granted/denied/reset tests in Chrome;
+toggle OFF/ON persistence; test notification; a real completed and a failed synthetic Raw Cutter
+batch; completed/failed/cancelled render and Stage-5 terminal cases; partial batch counts;
+no duplicate across repeat progress frames and two open browser tabs; no toast on page load;
+no source-path leakage; correct page focus on click; truthful non-delivery when Chrome blocks it;
+no change to existing job result, Cancel or concurrency behavior. Test on Windows with Chrome,
+using synthetic data, and separately document what happens with page open in background,
+page closed, browser closed and OS notifications disabled. Only authorise implementation after
+the scanner deployment and other active work are separately resolved.
+
+---
+
 ### R8 — Smart Audio Cut · **EXPERIMENTAL, NOT PLANNED FOR IMPLEMENTATION**
 
 Only once R7 has proven useful in practice:
@@ -1854,6 +1919,7 @@ merged nor shipped), and **planned** (agreed, not written).
 | **R14** — Media Library **Refresh & Maintenance** | **PLANNED.** A read-only inventory first (media count, duplicate filenames, cache records present / missing / on unreachable drives, cache location and reusable record count, reclaimable space), then optional confirmed cleanup with a dry-run preview and **reversible quarantine** preferred, then optional filename normalisation. Extends the existing `cache_admin.py` rather than adding a second engine. Two hard rules: **a missing file and an unreachable drive are different verdicts**, and the Stage-5 cache is keyed by **absolute path** with **path-derived candidate ids**, so a rename invalidates the signature, every candidate id and the payload's stored `video_file` — mass renaming or cache migration is not to be implemented until every identity reference can be proven safely updatable. Never clear the shared cache because a source is temporarily unavailable |
 | **R15** — Audio Cutter V2: multi-stream video, Folder Batch, one Audio Review | **PROPOSED, NOT STARTED (owner ideas 2026-11-03).** R7.2 already accepts single video files with audio, but chooses only `a:0`; R15-A proposes processing each audio stream, R15-B proposes mixed audio/video Folder Batch, and R15-C proposes removing the duplicate Cutter review surface in favour of the existing Media Library → Audio Review handoff. Recommended bounded sequence C → A → B; batch is gated on the shared-scanner NTFS junction fix. No source work authorised |
 | **R16** — Music Playlist Mode for Video Render | **PROPOSED, NOT STARTED (owner ideas 2026-11-03).** Ordered multiple songs with Move Up/Down, Shuffle and Sort by Name; one continuous soundtrack for beat/shot planning and rendering; visible order is frozen, no silent reshuffle. Existing single-track and R10 Repeat Music remain unchanged by default; playlist-repeat interaction is a future explicit decision |
+| **R17** — Chrome / Windows notifications on long-job completion | **PROPOSED, NOT STARTED (owner idea 2026-11-04).** Opt-in Settings toggle OFF by default plus explicit Chrome permission and a test notification. One truthful success/partial/failure/cancelled desktop alert per terminal Raw Cutter, render, Stage-5 or other long job when an authorised BeatSync page remains open; background tab supported, no duplicate alerts, no paths in notification text. Closed-page delivery is separate optional R17-B research (service worker / Push), NOT promised for V1. No daemon or deploy authorised |
 | **UX Refresh** — seven workflow-named tabs, Media Library, Settings, truthful Creative Profile, Output Video Profiles, soft audio edges | **MERGED AND DEPLOYED** (PR #78, main `d98fb55a`) — branch `feat/fun-ux-refresh-r8`. Whole suite green at every commit; FFprobe-verified across 4 profiles × 5 source shapes; cache clearing, collision suffixing, preference persistence and the Media Library source all exercised in the running GUI. Owner-tested and **accepted**. **Not independently reviewed.** Its `R8-UX-REFRESH` identifier is unrelated to roadmap item R8 below |
 | **R8** — Smart Audio Cut (ASR + classification) | **EXPERIMENTAL, DEFERRED** — still not planned for implementation. R7 adds no transcription and no classifier, so nothing here has started. **Unrelated to the `R8-UX-REFRESH` task identifier** used by the UX Refresh row above; the two collided by accident |
 | **R9** — Audio Layers usability and tutorial | **PARTLY IMPLEMENTED** — R7.1's optional Comfort Mix (Auto Balance + music return) and R7.3's overflow policy are both merged and deployed; the documentation half is unstarted. **Auto Repeat to Fit** is the next Audio Layers-adjacent item |
@@ -1933,11 +1999,12 @@ Re-set by the owner after the V3 playtest: **practical usability first, one feat
    **opt-in by design**, and neither may be mixed with Stage-5 cache identity or the existing
    Qwen worker.
 
-> **New proposed backlog (2026-11-03; not inserted into the numbered owner priority):**
-> **R15** Audio Cutter V2 (review consolidation → all audio tracks → Folder Batch) and **R16**
-> Music Playlist Mode are recorded above as **PROPOSED / NOT STARTED**. They do not displace
-> the shared input-scanner NTFS junction safety hotfix (#88), R14-A work, or the already recorded
-> product-owner priority decisions. Implement them only under separate owner-approved tasks.
+> **New proposed backlog (2026-11-03 to 2026-11-04; not inserted into the numbered owner priority):**
+> **R15** Audio Cutter V2 (review consolidation → all audio tracks → Folder Batch), **R16**
+> Music Playlist Mode, and **R17** opt-in Chrome/Windows notifications for completed long jobs
+> are recorded above as **PROPOSED / NOT STARTED**. They do not displace the shared input-scanner
+> NTFS junction safety hotfix (#88), R14-A work, or the already recorded product-owner priority
+> decisions. Implement them only under separate owner-approved tasks.
 
 > **The security research programme is separate and is not re-prioritised here.** PR #75, the
 > Win32 primitive and the A/B/C/F owner decisions are recorded in their own evidence packages and
