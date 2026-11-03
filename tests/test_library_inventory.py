@@ -73,14 +73,22 @@ def listing_for(path, names, *, ok=True, anchor_reachable=True, verdict=None):
 
 
 def reachable_root(path=None):
-    return lib.RootState(typed=str(path or "C:\\x"), real=str(path or "C:\\x"),
-                         anchor="C:\\", verdict=lib.PRESENT, anchor_reachable=True,
-                         exists=True, listed=True)
+    """A positively-observed root.
+
+    ``anchor`` is derived from the path rather than hardcoded: a literal ``"C:\\"`` happened to
+    agree with ``tmp_path`` on the machine this was written on, but it is not a property of the
+    path handed in, and a suite whose root fixtures disagree with their own leaves on any other
+    machine would be measuring the wrong thing.
+    """
+    where = str(path or "C:\\x")
+    return lib.RootState(typed=where, real=where, anchor=lib.anchor_of(where),
+                         verdict=lib.PRESENT, anchor_reachable=True, exists=True, listed=True)
 
 
 def lost_root(path=None):
-    return lib.RootState(typed=str(path or "C:\\x"), real=str(path or "C:\\x"),
-                         anchor="C:\\", verdict=lib.ROOT_UNREACHABLE, anchor_reachable=False)
+    where = str(path or "C:\\x")
+    return lib.RootState(typed=where, real=where, anchor=lib.anchor_of(where),
+                         verdict=lib.ROOT_UNREACHABLE, anchor_reachable=False)
 
 
 def absent_drive_letter():
@@ -800,7 +808,437 @@ def test_j_a_whole_pass_over_a_fixture_tree_changes_nothing_on_disk(tmp_path):
                 for name in ("clip.mp4", "absent.mp4", "set_01")]
     lib.may_descend(state, str(root / "set_01"))
     lib.retract_subtree(verdicts, lib.probe_root(str(root)))
+    lib.list_directory(str(root), root=state)
+    lib.list_directory(str(tmp_path / "never_created"), root=state)
     # And the folder that does not exist must still not exist.
     lib.probe_root(str(tmp_path / "never_created"))
     assert not os.path.exists(str(tmp_path / "never_created"))
     assert manifest() == before, "the pass changed something on disk"
+
+
+# =============================================================================================
+# K. F-1: the storage anchor is the EFFECTIVE target's, not the typed path's
+#
+# The review that found F-1 measured it on a real cross-volume NTFS junction: a root selected as
+# `E:\...\Link` resolving onto `D:\...` recorded `E:\` as its anchor, so clause (d) watched a
+# volume holding none of the files and `D:` could vanish without retracting anything. None of the
+# 106 tests that existed then could see it, because every fixture was single-volume and the one
+# junction test built its link INSIDE tmp_path. These tests are deliberately injected rather than
+# volume-dependent, so the property is pinned on every machine.
+# =============================================================================================
+
+def xvol_realpath(link, target):
+    """A `realpath` that resolves exactly one path onto another volume."""
+    def _resolve(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(link)):
+            return target
+        return os.path.realpath(path)
+    return _resolve
+
+
+def volume_gone(drive):
+    """An `isdir` for which one whole volume has stopped answering."""
+    def _isdir(path):
+        try:
+            if os.path.splitdrive(os.path.abspath(path))[0].upper() == drive.upper():
+                return False
+        except (OSError, ValueError):
+            pass
+        return os.path.isdir(path)
+    return _isdir
+
+
+def test_k_probe_root_anchors_on_the_resolved_target_not_the_typed_path():
+    """**The assertion whose absence let the corrected-anchor mutant survive.**
+
+    If the anchor is taken before resolution this fails, which is the whole point: the previous
+    suite passed identically with the anchor derived either way.
+    """
+    state = lib.probe_root(r"E:\Lib\Link", realpath=xvol_realpath(r"E:\Lib\Link", r"D:\Real"),
+                           isdir=lambda _p: True, listdir=lambda _p: ["clip.mp4"],
+                           lstat=raiser(OSError(errno.EINVAL, "not a link")))
+    assert state.real == r"D:\Real"
+    assert state.anchor == lib.anchor_of(state.real), "the anchor must name the resolved storage"
+    assert state.anchor == "D:" + os.sep
+    assert state.anchor != lib.anchor_of(r"E:\Lib\Link"), "the typed volume is not the storage"
+
+
+def test_k_list_directory_anchors_on_the_resolved_target_too():
+    """Clause (d1) is recorded by `list_directory`, so it must anchor the same way."""
+    listing = lib.list_directory(r"E:\Lib\Link",
+                                 realpath=xvol_realpath(r"E:\Lib\Link", r"D:\Real"),
+                                 isdir=lambda _p: True, listdir=lambda _p: ["other.mp4"])
+    assert listing.ok
+    assert listing.anchor == "D:" + os.sep
+    assert listing.anchor == lib.anchor_of(listing.real)
+
+
+def test_k_target_volume_lost_while_the_link_volume_stays_reachable_is_never_missing():
+    """The F-1 reproduction, deterministically. `E:` never goes away; `D:` does."""
+    link, target = r"E:\Lib\Link", r"D:\Real"
+    resolve = xvol_realpath(link, target)
+    listing = lib.list_directory(link, realpath=resolve, isdir=lambda _p: True,
+                                 listdir=lambda _p: ["other.mp4"])
+    provisional = lib.classify_leaf(os.path.join(link, "gone.mp4"), listing,
+                                    lstat=raiser(oserror(winerror=2)))
+    assert provisional.verdict == lib.MISSING_PROVISIONAL, "the first three clauses do hold"
+
+    final = lib.probe_root(link, realpath=resolve, isdir=volume_gone("D:"),
+                           listdir=raiser(oserror(winerror=21)),
+                           lstat=raiser(OSError(errno.EINVAL, "x")))
+    assert final.anchor == "D:" + os.sep
+    assert not final.anchor_reachable, "the storage holding the files is gone"
+    assert lib.anchor_of(link) == "E:" + os.sep and os.path.isdir  # the link volume is fine
+
+    settled = lib.retract_subtree([provisional], final)
+    assert settled[0].published == lib.UNKNOWN
+    assert settled[0].published != lib.MISSING_CONFIRMED
+    assert lib.confirmed_missing(settled) == ()
+
+
+def test_k_a_resolved_unc_share_that_goes_away_is_never_missing():
+    """The same defect where the resolved target is a share rather than a drive.
+
+    Entirely injected: no host is contacted.
+    """
+    link, share = r"C:\LibLink", r"\\filer01\media\lib"
+    resolve = xvol_realpath(link, share)
+    listing = lib.list_directory(link, realpath=resolve, isdir=lambda _p: True,
+                                 listdir=lambda _p: ["other.mp4"])
+    assert listing.anchor == r"\\filer01\media" + os.sep, "the share root is the anchor"
+    provisional = lib.classify_leaf(os.path.join(link, "gone.mp4"), listing,
+                                    lstat=raiser(oserror(winerror=2)))
+
+    final = lib.probe_root(link, realpath=resolve,
+                           isdir=lambda p: not str(p).startswith("\\\\"),
+                           listdir=raiser(oserror(winerror=53)),
+                           lstat=raiser(OSError(errno.EINVAL, "x")))
+    assert final.verdict == lib.ROOT_UNREACHABLE
+    assert not final.anchor_reachable
+    assert lib.retract_subtree([provisional], final)[0].published == lib.UNKNOWN
+
+
+def test_k_a_root_whose_path_will_not_resolve_offers_no_anchor_to_trust():
+    """A lexical fallback must never stand in as proof that the real target is reachable."""
+    state = lib.probe_root(r"C:\LibLink", realpath=raiser(OSError(errno.EACCES, "nope")),
+                           isdir=lambda _p: True)
+    assert state.verdict == lib.UNKNOWN
+    assert state.real == ""
+    assert not state.anchor_reachable, "an unresolved target is not a reachable one"
+    assert not state.positively_observed
+
+
+def test_k_an_unresolvable_reparse_target_cannot_settle_a_missing_claim(tmp_path):
+    """The contradictory case: the LINK's volume is live, so `anchor_reachable` is True, while the
+    root's own verdict is a hold. One true boolean is not positive evidence."""
+
+    class _Reparse:
+        st_file_attributes = 0x400
+        st_mode = 0o040000
+        st_dev = 1
+        st_ino = 2
+
+    state = lib.probe_root(r"C:\LibLink", lstat=lambda _p: _Reparse(), realpath=lambda p: p,
+                           isdir=lambda _p: True, listdir=lambda _p: [])
+    assert state.verdict == lib.UNKNOWN and state.is_reparse
+    assert state.anchor_reachable, "the link itself sits on a live volume"
+    assert not state.positively_observed, "a hold is not an observation"
+
+    leaf = r"C:\LibLink\gone.mp4"
+    provisional = lib.classify_leaf(leaf, listing_for(leaf, ["other.mp4"]),
+                                    lstat=raiser(oserror(winerror=2)))
+    assert provisional.verdict == lib.MISSING_PROVISIONAL
+    assert lib.retract_subtree([provisional], state)[0].published == lib.UNKNOWN
+
+
+def test_k_a_selected_junction_root_is_still_followed_and_anchored_on_its_target(tmp_path):
+    """The correction must not break the legitimate case: an explicitly selected junction root is
+    followed, and its anchor is its target's."""
+    real = tmp_path / "real_library"
+    real.mkdir()
+    (real / "clip.mp4").write_bytes(b"x")
+    link = make_junction(tmp_path / "link_to_library", real)
+    if link is None:
+        pytest.skip("this platform or privilege level cannot create a junction")
+    state = lib.probe_root(link)
+    assert state.verdict == lib.PRESENT and state.is_reparse and state.entry_count == 1
+    assert state.anchor == lib.anchor_of(state.real)
+    assert state.positively_observed
+
+
+@pytest.mark.skipif(not os.environ.get("BEATSYNC_TEST_XVOL_DIR"),
+                    reason="set BEATSYNC_TEST_XVOL_DIR to a writable directory on a DIFFERENT "
+                           "volume to exercise a real cross-volume junction")
+def test_k_a_real_cross_volume_junction_records_its_target_volume(tmp_path):
+    """The opt-in real-hardware form of the injected tests above.
+
+    The independent review measured this on real storage (link on `E:`, target on `D:`): the
+    anchor answered `E:\\` before the fix and `D:\\` after. It is opt-in because a second volume
+    is not a property of every machine, and a test must not invent one.
+    """
+    base = os.environ["BEATSYNC_TEST_XVOL_DIR"]
+    if os.path.splitdrive(os.path.abspath(base))[0].upper() == \
+            os.path.splitdrive(os.path.abspath(str(tmp_path)))[0].upper():
+        pytest.skip("BEATSYNC_TEST_XVOL_DIR is on the same volume as tmp_path")
+    target = os.path.join(base, "r14a_xvol_fixture")
+    os.makedirs(target, exist_ok=True)
+    try:
+        link = make_junction(tmp_path / "xvol_link", target)
+        if link is None:
+            pytest.skip("this platform or privilege level cannot create a junction")
+        state = lib.probe_root(link)
+        assert state.verdict == lib.PRESENT and state.is_reparse
+        assert state.anchor == lib.anchor_of(state.real)
+        assert state.anchor != lib.anchor_of(str(tmp_path)), "the volumes really do differ"
+    finally:
+        if os.path.isdir(target) and not os.listdir(target):
+            os.rmdir(target)
+
+
+# =============================================================================================
+# L. F-2: finalisation is bound to the root and storage that produced the evidence
+#
+# `retract_subtree` previously read one boolean - `RootState.anchor_reachable` - and nothing else,
+# so any reachable root could settle any leaf. Jurisdiction and outcome are now separate
+# questions: evidence from another root is returned untouched (neither confirmed nor retracted,
+# so its own root's pass can still settle it), and the outcome is read from the root's whole
+# observation rather than one flag.
+# =============================================================================================
+
+def provenance_chain(tmp_path, name="rootA"):
+    """A root, a listing taken explicitly under it, and a provisional finding from that listing."""
+    root = tmp_path / name
+    root.mkdir()
+    (root / "other.mp4").write_bytes(b"x")
+    state = lib.probe_root(str(root))
+    listing = lib.list_directory(str(root), root=state)
+    leaf = str(root / "gone.mp4")
+    return root, state, listing, lib.classify_leaf(leaf, listing)
+
+
+def test_l_the_root_identity_travels_the_whole_chain(tmp_path):
+    """Listing -> leaf -> finalisation -> published verdict, with provenance intact throughout."""
+    root, state, listing, provisional = provenance_chain(tmp_path)
+    assert state.root_key, "the root has an established identity"
+    assert listing.root_key == state.root_key, "the listing records the root it was taken under"
+    assert provisional.root_key == state.root_key, "and the leaf verdict carries it onward"
+    settled = lib.retract_subtree([provisional], lib.probe_root(str(root)))
+    assert settled[0].root_key == state.root_key, "finalisation preserves it"
+    assert settled[0].published == lib.MISSING_CONFIRMED
+
+
+def test_l_the_correct_reachable_root_does_confirm(tmp_path):
+    root, _state, _listing, provisional = provenance_chain(tmp_path)
+    settled = lib.retract_subtree([provisional], lib.probe_root(str(root)))
+    assert settled[0].published == lib.MISSING_CONFIRMED
+    assert settled[0].clauses.all_four and settled[0].is_final
+    assert lib.confirmed_missing(settled) == (os.path.abspath(str(root / "gone.mp4")),)
+
+
+def test_l_a_root_on_another_drive_cannot_confirm_another_roots_leaf(tmp_path):
+    _root, _state, _listing, provisional = provenance_chain(tmp_path)
+    elsewhere = lib.RootState(typed=r"Q:\other", real=r"Q:\other", anchor="Q:" + os.sep,
+                              verdict=lib.PRESENT, anchor_reachable=True, exists=True,
+                              listed=True)
+    assert elsewhere.positively_observed, "it really is a reachable, observed root"
+    settled = lib.retract_subtree([provisional], elsewhere)
+    assert settled[0].published != lib.MISSING_CONFIRMED
+    assert lib.confirmed_missing(settled) == ()
+
+
+def test_l_an_unrelated_root_on_the_SAME_drive_cannot_confirm_either(tmp_path):
+    """Sharing a drive letter is not sharing an inspection scope. A drive-letter comparison would
+    pass this and must not be what the guard rests on."""
+    _rootA, stateA, _lst, provisional = provenance_chain(tmp_path, "rootA")
+    rootB = tmp_path / "rootB"
+    rootB.mkdir()
+    stateB = lib.probe_root(str(rootB))
+    assert stateB.positively_observed
+    assert lib.anchor_of(stateB.real) == lib.anchor_of(stateA.real), "same volume, by construction"
+    settled = lib.retract_subtree([provisional], stateB)
+    assert settled[0].published != lib.MISSING_CONFIRMED
+    assert lib.confirmed_missing(settled) == ()
+
+
+def test_l_nested_roots_keep_distinct_provenance(tmp_path):
+    """The case containment alone cannot answer: a leaf under the inner root IS under the outer
+    one, so only explicit identity can tell the two inspections apart."""
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    (inner / "other.mp4").write_bytes(b"x")
+    st_outer, st_inner = lib.probe_root(str(outer)), lib.probe_root(str(inner))
+    assert st_outer.root_key != st_inner.root_key
+    assert lib.is_within(str(inner / "gone.mp4"), str(outer)), "containment cannot separate them"
+
+    provisional = lib.classify_leaf(str(inner / "gone.mp4"),
+                                    lib.list_directory(str(inner), root=st_inner))
+    assert lib.retract_subtree([provisional], st_outer)[0].published != lib.MISSING_CONFIRMED
+    assert lib.retract_subtree([provisional], st_inner)[0].published == lib.MISSING_CONFIRMED
+
+
+def test_l_foreign_evidence_is_returned_untouched_not_destroyed(tmp_path):
+    """A wrong-root call must not consume the finding either: the right root's pass still has to
+    be able to settle it. This is what makes a per-root loop over one verdict list safe."""
+    rootA, _stateA, _lst, provisional = provenance_chain(tmp_path, "rootA")
+    rootB = tmp_path / "rootB"
+    rootB.mkdir()
+
+    passed_over = lib.retract_subtree([provisional], lib.probe_root(str(rootB)))[0]
+    assert passed_over.verdict == lib.MISSING_PROVISIONAL, "still provisional, not retracted"
+    assert not passed_over.is_final
+    assert passed_over.published == lib.UNKNOWN
+
+    settled = lib.retract_subtree([passed_over], lib.probe_root(str(rootA)))
+    assert settled[0].published == lib.MISSING_CONFIRMED, "its own root can still settle it"
+
+
+def test_l_an_unknown_root_state_is_not_positive_evidence_even_when_reachable(tmp_path):
+    """Case 10: a contradictory pair - `verdict=UNKNOWN` with `anchor_reachable=True`."""
+    _root, state, _lst, provisional = provenance_chain(tmp_path)
+    contradictory = lib.RootState(typed=state.typed, real=state.real, anchor=state.anchor,
+                                  verdict=lib.UNKNOWN, anchor_reachable=True)
+    assert contradictory.reachable, "the one boolean says yes"
+    assert not contradictory.positively_observed, "the observation as a whole does not"
+    settled = lib.retract_subtree([provisional], contradictory)
+    assert settled[0].published == lib.UNKNOWN
+    assert "anchor_reachable_at_end" in settled[0].clauses.unmet()
+
+
+@pytest.mark.parametrize("verdict", [lib.ROOT_UNREACHABLE, lib.CONFIGURED_NOT_CREATED,
+                                     lib.NOT_INSPECTED, lib.UNKNOWN])
+def test_l_no_non_observed_verdict_can_confirm_however_reachable_it_claims_to_be(verdict,
+                                                                                 tmp_path):
+    _root, state, _lst, provisional = provenance_chain(tmp_path)
+    claimed = lib.RootState(typed=state.typed, real=state.real, anchor=state.anchor,
+                            verdict=verdict, anchor_reachable=True, exists=True, listed=True)
+    assert lib.retract_subtree([provisional], claimed)[0].published != lib.MISSING_CONFIRMED
+
+
+def test_l_a_state_with_no_established_location_cannot_confirm(tmp_path):
+    _root, state, _lst, provisional = provenance_chain(tmp_path)
+    nowhere = lib.RootState(typed=state.typed, real="", anchor=state.anchor,
+                            verdict=lib.PRESENT, anchor_reachable=True, exists=True, listed=True)
+    assert nowhere.root_key == ""
+    assert not nowhere.positively_observed
+    assert lib.retract_subtree([provisional], nowhere)[0].published != lib.MISSING_CONFIRMED
+
+
+def test_l_a_same_root_access_denied_final_state_may_still_confirm(tmp_path):
+    """Case 11, and the design's anchor-versus-directory distinction, preserved deliberately.
+
+    The storage is demonstrably still there and the parent listing already succeeded; an ACL
+    change at the end of a pass does not make a deleted file undeleted. Turning this into a
+    storage-disconnection finding would be the opposite error to F-1.
+    """
+    root, _state, _lst, provisional = provenance_chain(tmp_path)
+    denied = lib.probe_root(str(root), listdir=raiser(PermissionError(errno.EACCES, "denied")))
+    assert denied.verdict == lib.ACCESS_DENIED
+    assert denied.anchor_reachable and denied.exists and not denied.listed
+    assert denied.positively_observed, "present but refused is still an observation"
+    assert lib.retract_subtree([provisional], denied)[0].published == lib.MISSING_CONFIRMED
+
+
+def test_l_a_root_lost_after_its_listing_still_retracts(tmp_path):
+    """Case 12: the mid-pass-disconnect guard, through the provenance-bearing path."""
+    root, _state, _lst, provisional = provenance_chain(tmp_path)
+    lost = lib.probe_root(str(root), isdir=lambda _p: False)
+    assert lost.verdict == lib.ROOT_UNREACHABLE and not lost.positively_observed
+    settled = lib.retract_subtree([provisional], lost)
+    assert settled[0].published == lib.UNKNOWN
+    assert settled[0].is_final
+    assert "retracted" in settled[0].detail
+    assert lib.confirmed_missing(settled) == ()
+
+
+def test_l_a_leaf_that_vanishes_concurrently_stays_unknown(tmp_path):
+    """Case 13, through the provenance-bearing path: the listing showed the name, so its absence
+    now is a race rather than an observation."""
+    root = tmp_path / "rootA"
+    root.mkdir()
+    leaf = root / "racing.mp4"
+    leaf.write_bytes(b"x")
+    state = lib.probe_root(str(root))
+    listing = lib.list_directory(str(root), root=state)
+    verdict = lib.classify_leaf(str(leaf), listing, lstat=raiser(oserror(winerror=2)))
+    assert lib.retract_subtree([verdict], lib.probe_root(str(root)))[0].published == lib.UNKNOWN
+
+
+def test_l_an_empty_reachable_root_stays_distinct_from_an_unreachable_one(tmp_path):
+    """Case 14, restated against the new accessors: the most confusable pair in the model."""
+    root = tmp_path / "empty"
+    root.mkdir()
+    empty = lib.probe_root(str(root))
+    gone = lib.probe_root(str(root), isdir=lambda _p: False)
+    assert empty.verdict == lib.PRESENT and empty.listed and empty.entry_count == 0
+    assert empty.positively_observed
+    assert gone.verdict == lib.ROOT_UNREACHABLE and not gone.positively_observed
+    assert empty.verdict != gone.verdict
+
+
+def test_l_a_normal_same_volume_library_is_unaffected(tmp_path):
+    """Case 1: the ordinary path must be exactly as it was."""
+    root = tmp_path / "library"
+    root.mkdir()
+    for name in ("a.mp4", "b.mkv", "c.mp4"):
+        (root / name).write_bytes(b"x")
+    state = lib.probe_root(str(root))
+    assert state.verdict == lib.PRESENT and state.entry_count == 3
+    assert state.anchor == lib.anchor_of(str(root)) == lib.anchor_of(state.real)
+    listing = lib.list_directory(str(root), root=state)
+    present = lib.classify_leaf(str(root / "a.mp4"), listing)
+    absent = lib.classify_leaf(str(root / "gone.mp4"), listing)
+    settled = lib.retract_subtree([present, absent], lib.probe_root(str(root)))
+    assert [item.published for item in settled] == [lib.PRESENT, lib.MISSING_CONFIRMED]
+
+
+def test_l_a_listing_offered_for_a_root_it_is_not_under_is_refused(tmp_path):
+    """The `root=` keyword must not become a way to label foreign evidence."""
+    rootA = tmp_path / "rootA"
+    rootB = tmp_path / "rootB"
+    rootA.mkdir()
+    rootB.mkdir()
+    (rootB / "other.mp4").write_bytes(b"x")
+    stateA = lib.probe_root(str(rootA))
+    mislabelled = lib.list_directory(str(rootB), root=stateA)
+    assert not mislabelled.ok
+    assert mislabelled.verdict == lib.NOT_INSPECTED
+    assert not mislabelled.covers(str(rootB / "gone.mp4"))
+    verdict = lib.classify_leaf(str(rootB / "gone.mp4"), mislabelled,
+                                lstat=raiser(oserror(winerror=2)))
+    assert verdict.published != lib.MISSING_CONFIRMED
+
+
+def test_l_a_subdirectory_listing_is_valid_evidence_for_its_root(tmp_path):
+    """And the legitimate use of `root=`: a child directory inside the root carries the root's
+    identity, not its own."""
+    root = tmp_path / "library"
+    child = root / "set_01"
+    child.mkdir(parents=True)
+    (child / "other.mp4").write_bytes(b"x")
+    state = lib.probe_root(str(root))
+    listing = lib.list_directory(str(child), root=state)
+    assert listing.ok and listing.root_key == state.root_key
+    provisional = lib.classify_leaf(str(child / "gone.mp4"), listing)
+    assert provisional.root_key == state.root_key
+    settled = lib.retract_subtree([provisional], lib.probe_root(str(root)))
+    assert settled[0].published == lib.MISSING_CONFIRMED
+
+
+def test_l_legacy_callers_without_an_explicit_root_still_work_by_containment(tmp_path):
+    """`root=` is optional, so a caller inspecting one directory keeps working - and a leaf that
+    is not under the root being finalised is still refused."""
+    root = tmp_path / "library"
+    root.mkdir()
+    (root / "other.mp4").write_bytes(b"x")
+    listing = lib.list_directory(str(root))
+    assert listing.root_key == ""
+    inside = lib.classify_leaf(str(root / "gone.mp4"), listing)
+    assert inside.root_key == ""
+    assert lib.retract_subtree([inside], lib.probe_root(str(root)))[0].published == \
+        lib.MISSING_CONFIRMED
+
+    sibling = tmp_path / "library-evil"
+    sibling.mkdir()
+    assert lib.retract_subtree([inside], lib.probe_root(str(sibling)))[0].published != \
+        lib.MISSING_CONFIRMED

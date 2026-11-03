@@ -23,7 +23,7 @@ So the gate is **positive evidence about the container**, and ``winerror`` is on
     A leaf file may be called missing only when its containing directory was listed
     successfully in THIS pass, the name was not in that listing, a direct lstat failed
     in a way consistent with an absent NAME rather than an absent path/device/share, and
-    the root anchor was reachable both when that listing was taken and when the pass ended.
+    the storage anchor was reachable both when that listing was taken and when the pass ended.
 
 All four, or it is not missing. The fourth clause is the mid-pass-disconnect guard: a removable
 disk pulled half way through a long inspection would otherwise convert a whole subtree into
@@ -32,6 +32,28 @@ of a pass, a leaf that has satisfied the first three is held in an internal prov
 :func:`retract_subtree` is what finalises or retracts it. :attr:`LeafVerdict.published` refuses to
 show a provisional claim as a confirmation, so a consumer that reads too early sees a hold rather
 than an assertion.
+
+**Clause (d) is only worth anything if it names the right storage and the right root.** Two
+independent review findings were both failures of identification rather than of the model:
+
+* **F-1** -- the anchor was derived from the operator's typed path *before* resolution, so a root
+  selected as ``E:\\LibraryLink`` that resolves onto ``D:\\ActualLibrary`` watched ``E:``. Measured
+  on a real cross-volume junction: ``E:`` stayed reachable, ``D:`` went away, and a whole subtree
+  was confirmed missing while its disk was unavailable. The anchor is now taken from the
+  **resolved** location, and a root whose target cannot be established yields no trustworthy
+  anchor at all rather than falling back to the typed volume -- a lexical fallback is not proof
+  that anything is reachable.
+* **F-2** -- finalisation read one boolean, ``RootState.anchor_reachable``, and nothing else. Any
+  reachable root could settle any leaf, and a root whose own verdict was a *hold* still counted as
+  "the storage is still there". Evidence now carries the identity of the root it was taken under
+  (:attr:`Listing.root_key` onto :attr:`LeafVerdict.root_key`), jurisdiction is decided before
+  outcome, and the outcome is read from :attr:`RootState.positively_observed` -- an established
+  anchor, reachable, on a root that was actually observed.
+
+What deliberately did **not** change: a root that is itself a junction is still followed; a root
+that is present but merely refused (:data:`ACCESS_DENIED`) can still settle a listing that already
+succeeded, because an ACL change does not make a deleted file undeleted; and
+:data:`ROOT_UNREACHABLE` still retracts.
 
 **Verdicts travel in one direction: they may only ever be weakened.** There is no code path from
 ``UNKNOWN`` to ``MISSING_CONFIRMED``, and retrying an ambiguous error cannot create one. Two
@@ -223,6 +245,13 @@ def anchor_of(path: str) -> str:
     ``os.path.splitdrive`` returns ``"C:"`` for a local path and ``"\\\\host\\share"`` for a UNC
     path, so one call covers both cases this app meets. A relative or anchorless path yields
     ``""``, and an empty anchor is treated as not reachable -- there is nothing to probe.
+
+    **Hand this the RESOLVED path, never the typed one.** A root the operator selected as
+    ``E:\\LibraryLink`` may be a junction onto ``D:\\ActualLibrary``; the storage that holds every
+    file reachable through it is ``D:``, and ``E:`` can stay perfectly reachable while ``D:`` is
+    gone. Deriving the anchor before resolution was finding F-1: clause (d) watched a volume that
+    was never involved in storing anything, so a whole subtree could be confirmed missing while
+    its disk was unavailable. Callers in this module therefore resolve first and pass ``real``.
     """
     drive, _ = os.path.splitdrive(os.path.abspath(path) if path else "")
     if not drive:
@@ -307,8 +336,46 @@ class RootState:
 
         A root that is reachable but refused (:data:`ACCESS_DENIED`) has not gone away, so it must
         not retract a listing that already succeeded. A root whose anchor is gone has.
+
+        This is one boolean about one volume. It is **not** on its own authority to finalise a
+        missing claim -- see :attr:`positively_observed` and :attr:`root_key`.
         """
         return bool(self.anchor_reachable)
+
+    @property
+    def root_key(self) -> str:
+        """This root's identity: its own resolved location, normalised. ``""`` if unestablished.
+
+        Derived rather than stored so that it cannot disagree with :attr:`real`, and so a
+        ``RootState`` built by hand gets it for free. It is the **resolved** location, which is
+        what makes two roots that merely share a drive letter -- or a nested root and its parent --
+        distinguishable from one another.
+        """
+        return _norm(self.real) if self.real else ""
+
+    @property
+    def positively_observed(self) -> bool:
+        """Is this a positive, self-consistent observation of THIS root's own storage?
+
+        Clause (d2) needs evidence, and ``anchor_reachable`` alone is not evidence: finding F-2 was
+        that a root whose own verdict is a hold (:data:`UNKNOWN`) -- the link could not be
+        followed, the path would not resolve -- still carried ``anchor_reachable=True`` and was
+        accepted as "the storage is still there". So all three must agree:
+
+        * the effective storage anchor was established at all, and
+        * it was reachable, and
+        * the root itself was positively observed -- it listed (:data:`PRESENT`), or it is there
+          and merely refused us (:data:`ACCESS_DENIED`).
+
+        :data:`ACCESS_DENIED` is deliberately included. An ACL change at the end of a pass does not
+        make a deleted file undeleted, and the storage is demonstrably still present, so treating
+        it as a disconnection would manufacture a false storage-loss finding out of an ordinary
+        permission change. A hold, a root that no longer exists
+        (:data:`CONFIGURED_NOT_CREATED`), :data:`ROOT_UNREACHABLE` and :data:`NOT_INSPECTED` are
+        all *not* positive observations.
+        """
+        return bool(self.anchor_reachable and self.anchor and self.root_key
+                    and self.verdict in (PRESENT, ACCESS_DENIED))
 
     @property
     def ok(self) -> bool:
@@ -324,11 +391,18 @@ class Listing:
 
     ``names`` holds normalised-case entry names so clause (b) is a case-insensitive membership
     test, which is what a Windows filesystem means by "that name is taken".
+
+    ``root_key`` is the identity of the inspection root this listing was taken **under**, when the
+    caller named one. It is stored rather than derived because a listing of a subdirectory belongs
+    to a root whose path is not the subdirectory's, and it travels onto every leaf verdict this
+    listing produces so that finalisation can tell whose evidence it is holding. ``""`` means the
+    caller named no root, and finalisation then falls back to containment.
     """
 
     directory: str = ""
     real: str = ""
     anchor: str = ""
+    root_key: str = ""
     ok: bool = False
     verdict: str = NOT_INSPECTED
     names: frozenset = field(default_factory=frozenset)
@@ -359,11 +433,16 @@ class LeafVerdict:
     :attr:`published` is the accessor every consumer must read. It exists so that a provisional
     missing finding cannot escape as a confirmation before the end-of-pass anchor check has
     happened -- reading too early yields :data:`UNKNOWN`, which is a hold.
+
+    ``root_key`` carries the identity of the inspection root whose listing produced this verdict,
+    copied from :attr:`Listing.root_key`. It is what lets :func:`retract_subtree` refuse to settle
+    one root's evidence with another root's end-of-pass state.
     """
 
     path: str = ""
     verdict: str = NOT_INSPECTED
     clauses: Clauses = field(default_factory=Clauses)
+    root_key: str = ""
     is_final: bool = False
     is_regular: bool = False
     dev: int = -1
@@ -419,12 +498,25 @@ def probe_root(path, *, listdir=os.listdir, lstat=os.lstat, isdir=os.path.isdir,
     the same ordering ``cache_admin._resolved_root`` uses, and for the same reason. A *nested*
     junction is a different question entirely and is :func:`may_descend`'s.
 
+    **The anchor is taken from the resolved location, not from the typed path** -- the correction
+    for finding F-1. Measured on a real cross-volume junction: a root selected as ``E:\\…\\Link``
+    resolving onto ``D:\\…`` previously recorded ``E:\\`` as its anchor, so clause (d) watched a
+    volume that held none of the files and ``D:`` could vanish without retracting anything. The
+    anchor now answers ``D:\\``, which is the storage whose loss actually matters. A root whose
+    target cannot be established yields no trustworthy anchor at all and is reported unreachable
+    rather than falling back to the typed volume.
+
     The verdicts, and why each is the honest one:
 
     * no folder named                       -> ``NOT_INSPECTED`` (there was never a path)
+    * the path will not resolve              -> ``UNKNOWN`` with the anchor **not** reachable, so
+      no lexical fallback can pose as positive evidence about the real target
     * the anchor cannot be reached           -> ``ROOT_UNREACHABLE`` (and no leaf verdict may form)
     * a reparse point that will not resolve  -> ``UNKNOWN`` (its true location is unknown, so
-      containment would be meaningless -- fail closed rather than guess)
+      containment would be meaningless -- fail closed rather than guess). The anchor bool may well
+      be ``True`` here, because the *link* sits on a live volume; that is exactly why
+      :attr:`RootState.positively_observed`, not :attr:`RootState.reachable`, is what authorises a
+      confirmation
     * the directory exists and lists         -> ``PRESENT``
     * the directory exists and is refused    -> ``ACCESS_DENIED``
     * absent, but its parent is live         -> ``CONFIGURED_NOT_CREATED`` -- the case that must
@@ -438,20 +530,26 @@ def probe_root(path, *, listdir=os.listdir, lstat=os.lstat, isdir=os.path.isdir,
                          detail="no folder was named, so nothing was inspected")
 
     absolute = os.path.abspath(typed)
-    anchor = anchor_of(absolute)
+    reparse = is_reparse_point(absolute, lstat=lstat)
+
+    # Resolution comes FIRST, and the anchor is taken from the result (F-1). The typed path's own
+    # volume is not the storage: a junction root on E: can hold its files on D:.
+    try:
+        real = realpath(absolute)
+    except (OSError, ValueError) as exc:
+        # The effective target was never established. The typed path's volume is a lexical
+        # fallback, and a lexical fallback is not proof that the target is reachable, so this
+        # cannot be positive evidence for anything.
+        return RootState(typed=typed, real="", anchor=anchor_of(absolute), verdict=UNKNOWN,
+                         anchor_reachable=False, is_reparse=reparse,
+                         detail=f"the path could not be resolved: {exc}")
+
+    anchor = anchor_of(real)
     try:
         anchor_reachable = bool(anchor) and bool(isdir(anchor))
     except OSError:
         anchor_reachable = False
 
-    try:
-        real = realpath(absolute)
-    except (OSError, ValueError) as exc:
-        return RootState(typed=typed, real="", anchor=anchor, verdict=UNKNOWN,
-                         anchor_reachable=anchor_reachable,
-                         detail=f"the path could not be resolved: {exc}")
-
-    reparse = is_reparse_point(absolute, lstat=lstat)
     if reparse and _norm(real) == _norm(absolute) and is_reparse_point(real, lstat=lstat):
         # The link did not resolve to a different real location, so its target is unknown and
         # every containment comparison below would be meaningless.
@@ -517,41 +615,70 @@ def probe_root(path, *, listdir=os.listdir, lstat=os.lstat, isdir=os.path.isdir,
                      detail="")
 
 
-def list_directory(directory, *, listdir=os.listdir, isdir=os.path.isdir,
+def list_directory(directory, *, root=None, listdir=os.listdir, isdir=os.path.isdir,
                    realpath=os.path.realpath) -> Listing:
     """List ONE directory and record the result as clause (a) evidence. Not a walker.
 
     An empty but readable directory is ``ok=True`` with an empty ``names`` set, and that is the
     whole point: "there is nothing in it" and "I could not look in it" are different facts, and a
     missing claim may only rest on the first.
+
+    Like :func:`probe_root`, the anchor is taken from the **resolved** directory, so clause (d1)
+    names the storage the entries actually came off rather than the volume the path text sits on.
+
+    ``root`` is the :class:`RootState` this listing is being taken under, and naming it is what
+    gives the resulting leaf verdicts a provenance a later :func:`retract_subtree` can check. It is
+    optional so that a caller inspecting a single directory need not invent a root -- but a pass
+    that walks several roots **should** pass it, because without it finalisation can only fall back
+    to containment, and containment cannot tell a nested root from its parent. A directory that
+    does not lie under the root it is offered for is refused outright rather than silently
+    recorded as that root's evidence.
     """
     typed = normalize_root_text(directory)
     if not typed:
         return Listing(verdict=NOT_INSPECTED, detail="no folder was named")
     absolute = os.path.abspath(typed)
-    anchor = anchor_of(absolute)
+    try:
+        real = realpath(absolute)
+    except (OSError, ValueError) as exc:
+        return Listing(directory=absolute, anchor=anchor_of(absolute), verdict=UNKNOWN,
+                       anchor_reachable=False,
+                       detail=f"the path could not be resolved: {exc}")
+    anchor = anchor_of(real)
     try:
         anchor_reachable = bool(anchor) and bool(isdir(anchor))
     except OSError:
         anchor_reachable = False
-    try:
-        real = realpath(absolute)
-    except (OSError, ValueError) as exc:
-        return Listing(directory=absolute, anchor=anchor, verdict=UNKNOWN,
-                       anchor_reachable=anchor_reachable,
-                       detail=f"the path could not be resolved: {exc}")
+
+    root_key = ""
+    if root is not None:
+        state = root if isinstance(root, RootState) else RootState()
+        root_key = state.root_key
+        if not root_key:
+            return Listing(directory=absolute, real=real, anchor=anchor, verdict=NOT_INSPECTED,
+                           anchor_reachable=anchor_reachable,
+                           detail="the root has no established location, so this folder cannot "
+                                  "be recorded as evidence for it")
+        if not (is_within(real, state.real)
+                or (state.typed and is_within(absolute, state.typed))):
+            return Listing(directory=absolute, real=real, anchor=anchor, root_key=root_key,
+                           verdict=NOT_INSPECTED, anchor_reachable=anchor_reachable,
+                           detail="this folder does not lie under the root it was offered as "
+                                  "evidence for")
+
     try:
         entries = listdir(real)
     except OSError as exc:
         reading = classify_os_error(exc)
         verdict = {_AS_ACCESS_DENIED: ACCESS_DENIED,
                    _AS_UNREACHABLE: ROOT_UNREACHABLE}.get(reading, UNKNOWN)
-        return Listing(directory=absolute, real=real, anchor=anchor, ok=False, verdict=verdict,
+        return Listing(directory=absolute, real=real, anchor=anchor, root_key=root_key,
+                       ok=False, verdict=verdict,
                        anchor_reachable=anchor_reachable and verdict != ROOT_UNREACHABLE,
                        detail=f"the folder could not be listed: {exc}")
     names = frozenset(os.path.normcase(str(name)) for name in entries)
-    return Listing(directory=absolute, real=real, anchor=anchor, ok=True, verdict=PRESENT,
-                   names=names, anchor_reachable=anchor_reachable, detail="")
+    return Listing(directory=absolute, real=real, anchor=anchor, root_key=root_key, ok=True,
+                   verdict=PRESENT, names=names, anchor_reachable=anchor_reachable, detail="")
 
 
 def classify_leaf(path, listing, *, lstat=os.lstat) -> LeafVerdict:
@@ -582,6 +709,10 @@ def classify_leaf(path, listing, *, lstat=os.lstat) -> LeafVerdict:
     absolute = os.path.abspath(text)
     evidence = listing if isinstance(listing, Listing) else Listing()
 
+    # The root this evidence belongs to travels with the verdict, so that the end-of-pass check
+    # can establish it is holding the right root's evidence rather than assuming it.
+    origin = evidence.root_key
+
     try:
         info = lstat(absolute)
     except OSError as exc:
@@ -594,19 +725,21 @@ def classify_leaf(path, listing, *, lstat=os.lstat) -> LeafVerdict:
         )
         if reading == _AS_ACCESS_DENIED:
             return LeafVerdict(path=absolute, verdict=ACCESS_DENIED, clauses=clauses,
-                               is_final=True, detail="the file could not be read")
+                               root_key=origin, is_final=True,
+                               detail="the file could not be read")
         if reading == _AS_UNREACHABLE:
             return LeafVerdict(path=absolute, verdict=ROOT_UNREACHABLE, clauses=clauses,
-                               is_final=True,
+                               root_key=origin, is_final=True,
                                detail="the drive, share or device could not be reached")
         if reading == _AS_LEAF_ABSENT and clauses.first_three and \
                 clauses.anchor_reachable_at_listing:
             return LeafVerdict(
-                path=absolute, verdict=MISSING_PROVISIONAL, clauses=clauses, is_final=False,
+                path=absolute, verdict=MISSING_PROVISIONAL, clauses=clauses, root_key=origin,
+                is_final=False,
                 detail="the parent folder was read and this name was not in it; awaiting the "
                        "end-of-pass check that the drive is still there")
         return LeafVerdict(
-            path=absolute, verdict=UNKNOWN, clauses=clauses, is_final=True,
+            path=absolute, verdict=UNKNOWN, clauses=clauses, root_key=origin, is_final=True,
             detail="not enough evidence to say the file is missing; unmet clause(s): "
                    + (", ".join(clauses.unmet()) or "none"))
 
@@ -616,10 +749,10 @@ def classify_leaf(path, listing, *, lstat=os.lstat) -> LeafVerdict:
     observed = Clauses(parent_listed=evidence.covers(absolute),
                        anchor_reachable_at_listing=bool(evidence.anchor_reachable))
     if regular:
-        return LeafVerdict(path=absolute, verdict=PRESENT, clauses=observed, is_final=True,
-                           is_regular=True, dev=dev, ino=ino, detail="")
-    return LeafVerdict(path=absolute, verdict=UNKNOWN, clauses=observed, is_final=True,
-                       is_regular=False, dev=dev, ino=ino,
+        return LeafVerdict(path=absolute, verdict=PRESENT, clauses=observed, root_key=origin,
+                           is_final=True, is_regular=True, dev=dev, ino=ino, detail="")
+    return LeafVerdict(path=absolute, verdict=UNKNOWN, clauses=observed, root_key=origin,
+                       is_final=True, is_regular=False, dev=dev, ino=ino,
                        detail="it is there, but it is not a regular file")
 
 
@@ -686,6 +819,39 @@ _FINALISATIONS = {
 }
 
 
+def _same_inspection_root(state, item) -> bool:
+    """Is this ``RootState`` about the very root whose listing produced this leaf's evidence?
+
+    This is **jurisdiction**, and it is a separate question from whether the root was reachable.
+    Finding F-2 was that the two were conflated: any reachable root could settle any leaf, so a
+    library on a fixed disk could confirm deletions for a rejected folder on a removable one.
+
+    It is the clause-(d) counterpart of :meth:`Listing.covers`, which already protects clause (a)
+    for exactly the same reason -- evidence about one container must not be borrowed for another.
+
+    Two levels, because A1 is consumed both ways:
+
+    * **Explicit** -- the evidence names the root it was taken under
+      (:attr:`Listing.root_key`, carried onto the verdict). The comparison is then exact, on
+      *resolved* locations, which is what makes a nested root distinguishable from its parent and
+      makes two roots that merely share a drive letter distinguishable from one another. The
+      effective anchors are compared too, so a junction re-pointed onto different storage
+      mid-pass is a mismatch rather than a silent substitution.
+    * **Fallback** -- no root was named, so the strongest honest test is that the leaf lies under
+      the root's own established location. Both the resolved and the typed location are tried,
+      because a junction root legitimately has leaves addressed through the typed path while its
+      resolved location is on another volume.
+    """
+    if item.root_key:
+        if not state.root_key or item.root_key != state.root_key:
+            return False
+        return _norm(anchor_of(item.root_key)) == _norm(anchor_of(state.root_key))
+    if not item.path:
+        return False
+    return bool((state.real and is_within(item.path, state.real))
+                or (state.typed and is_within(item.path, state.typed)))
+
+
 def retract_subtree(verdicts, root_state):
     """Settle clause (d2) for a whole pass. Returns a new tuple; mutates nothing.
 
@@ -697,6 +863,17 @@ def retract_subtree(verdicts, root_state):
       :data:`UNKNOWN`. That is the mid-pass-disconnect guard: a disk pulled during a long
       inspection must not leave behind a subtree of confirmed deletions.
 
+    **Jurisdiction is decided before outcome.** A verdict whose evidence came from a *different*
+    inspection root is not this call's business at all: it is returned untouched, neither confirmed
+    nor retracted, so that the pass over its own root can still settle it correctly. Destroying it
+    here would be as wrong as confirming it. See :func:`_same_inspection_root`.
+
+    **Reachability is read from the root's whole observation, not one boolean.** Clause (d2) is
+    settled from :attr:`RootState.positively_observed`, which requires an established anchor, that
+    anchor reachable, *and* the root positively observed. ``anchor_reachable=True`` on a root whose
+    own verdict is a hold is not evidence that the storage is there -- that was finding F-2's
+    second half.
+
     **Two independent guards keep the direction of travel.** The closed table above is the first.
     The second is the clause re-check below, which refuses to emit a confirmation whose four
     clauses do not all hold -- so even a wrong table cannot manufacture one, and an ``UNKNOWN``
@@ -704,14 +881,18 @@ def retract_subtree(verdicts, root_state):
     are returned untouched rather than guessed at.
     """
     state = root_state if isinstance(root_state, RootState) else RootState()
-    reachable = bool(state.reachable)
+    observed = bool(state.positively_observed)
     settled = []
     for item in verdicts:
         if not isinstance(item, LeafVerdict):
             settled.append(item)
             continue
-        clauses = replace(item.clauses, anchor_reachable_at_end=reachable)
-        outcome = _FINALISATIONS.get((item.verdict, reachable), item.verdict)
+        if not _same_inspection_root(state, item):
+            # Another root's evidence. Not ours to confirm, and not ours to retract either.
+            settled.append(item)
+            continue
+        clauses = replace(item.clauses, anchor_reachable_at_end=observed)
+        outcome = _FINALISATIONS.get((item.verdict, observed), item.verdict)
 
         # The second, independent guard. A confirmation is only ever emitted on the evidence
         # itself, never on the strength of the lookup above.
@@ -722,11 +903,14 @@ def retract_subtree(verdicts, root_state):
             settled.append(replace(item, clauses=clauses, is_final=True))
             continue
         if outcome == MISSING_CONFIRMED:
-            detail = "the parent folder was read, this name was not in it, and the drive was "\
-                     "still there when the inspection finished"
+            detail = "the parent folder was read, this name was not in it, and the storage "\
+                     "holding it was still there when the inspection finished"
         elif item.verdict in (MISSING_PROVISIONAL, MISSING_CONFIRMED):
-            detail = "retracted: the drive or share was not reachable when the inspection "\
-                     "finished, so nothing can be said about this file"
+            detail = ("retracted: the drive or share was not reachable when the inspection "
+                      "finished, so nothing can be said about this file"
+                      if not state.anchor_reachable else
+                      "retracted: the folder's own state could not be positively confirmed when "
+                      "the inspection finished, so nothing can be said about this file")
         else:
             detail = item.detail
         settled.append(replace(item, verdict=outcome, clauses=clauses, is_final=True,
