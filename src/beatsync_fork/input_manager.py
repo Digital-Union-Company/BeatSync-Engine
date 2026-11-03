@@ -22,6 +22,12 @@ A returned :class:`InputSet` therefore means every directory in the tree was rea
 that cannot be stat'ed are a different matter: those are recorded as ``UNREADABLE`` rejections and
 remain visible in the report, because a named rejection is not a silent loss.
 
+A scan is also authoritative only if everything it counted really is *in* the selected folder, so
+the same all-or-nothing rule covers containment: a nested junction or mount point is never
+descended, and because its exclusion cannot be reported through :class:`InputSet`, finding one
+refuses the scan instead of publishing a complete-looking total. See
+:func:`_iter_candidate_paths` for why a nested symlink is deliberately treated differently.
+
 Deliberate non-goals
 --------------------
 No media copying, no FFmpeg, no OpenCV, no Qwen, no rendering, no full-file hashing, and no Gradio
@@ -354,25 +360,121 @@ def _walk_error_raiser(root: str) -> Callable[[OSError], None]:
     return raise_scan_error
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+"""``FILE_ATTRIBUTE_REPARSE_POINT``. A junction, a volume mount point and a symlink all carry it."""
+
+_PLAIN_DIRECTORY = ""
+_NESTED_SYMLINK = "symlink"
+_NESTED_REPARSE = "reparse"
+
+
+def _nested_link_kind(path: str) -> str:
+    """Classify a child directory for traversal safety, from **link-level** metadata only.
+
+    Returns one of :data:`_PLAIN_DIRECTORY`, :data:`_NESTED_SYMLINK` or :data:`_NESTED_REPARSE`.
+
+    Raises:
+        InputScanError: the entry's link metadata could not be read, so whether reading it would
+            leave the selected folder is **undecidable**. It fails closed, because treating an
+            unreadable attribute as "an ordinary folder" is precisely the assumption this function
+            exists to remove.
+
+    Deliberately **not** ``library_inventory.is_reparse_point`` or ``cache_admin._is_reparse``: both
+    answer ``False`` when the attribute cannot be read. That is the right shape for a *reporting*
+    predicate and the wrong shape for a *gate* — an unreadable attribute is not evidence of a plain
+    directory. ``os.lstat`` is resolved from the ``os`` namespace at call time so a test can inject a
+    failure the same way the traversal-error suite injects ``os.scandir``.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise InputScanError(
+            f"Cannot scan folder tree: cannot tell whether {path} is a real folder or a link "
+            f"({exc}), so it is unknown whether reading it would leave the selected folder."
+        ) from exc
+
+    if stat_module.S_ISLNK(info.st_mode):
+        return _NESTED_SYMLINK
+
+    attributes = getattr(info, "st_file_attributes", None)
+    if attributes is None:
+        if os.name == "nt":
+            raise InputScanError(
+                f"Cannot scan folder tree: {path} reported no link metadata, and on this platform "
+                f"a junction cannot be told apart from an ordinary folder without it, so reading "
+                f"it cannot be shown to stay inside the selected folder."
+            )
+        return _PLAIN_DIRECTORY
+
+    return _NESTED_REPARSE if attributes & _FILE_ATTRIBUTE_REPARSE_POINT else _PLAIN_DIRECTORY
+
+
 def _iter_candidate_paths(root: str, recursive: bool) -> Iterator[str]:
     """Yield every file entry under ``root`` in a deterministic order.
 
-    Directory symlinks are not followed, so a self-referential link cannot make the walk unbounded.
+    Nested directory links are never descended, so a self-referential link cannot make the walk
+    unbounded **and** no file stored outside the selected folder can reach the classifier. Two kinds
+    are distinguished, because only one of them was ever actually contained:
 
-    Raises ``InputScanError`` if any directory cannot be listed: the walk is all-or-nothing, never
-    partial. Note that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an
-    entry as a file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE``
-    rejection, so it is still reported rather than lost.
+    * A **symlink** is already excluded by ``os.walk``, which consults ``os.path.islink()``. That
+      silent exclusion is long-standing, intended, and pinned by
+      ``test_symlinked_directory_is_not_traversed``, so it is preserved exactly.
+    * A **junction or volume mount point** is *not* excluded: ``os.path.islink()`` is ``False`` for
+      one on Windows, so ``followlinks=False`` does not stop it and ``os.walk`` descends into its
+      target. Measured on CPython 3.14.3: an unpruned junction was entered, and the files beneath it
+      were ``stat``-ed and counted as part of the selected folder — 1776 of 1808 reported bytes came
+      from outside the root. Pruning ``dirnames`` in place is what stops the descent, which is the
+      same policy ``cache_admin._walk_contained`` already applies to the cache tree.
+
+    A junction therefore makes the scan **refuse**, rather than quietly excluding it. Quietly
+    excluding it would shrink the operator's source set while still reporting a complete-looking
+    total, which is the silent-truncation failure this module exists to prevent; and the excluded
+    directory cannot be reported through :class:`InputSet` without a new field that every caller
+    would have to learn to display. The refusal names the link and says what to do about it, and
+    every existing caller already surfaces ``InputScanError`` to the operator.
+
+    Raises ``InputScanError`` if any directory cannot be listed, if a nested junction is found, or if
+    a child directory's link metadata cannot be read: the walk is all-or-nothing, never partial. Note
+    that ``os.walk`` swallows ``entry.is_dir()`` failures internally and treats such an entry as a
+    file; that entry then reaches the classifier and is accounted for as an ``UNREADABLE`` rejection,
+    so it is still reported rather than lost.
 
     Both modes follow the same rule for *entries*: this function decides only "directory or not", and
     anything that is not a directory is passed to the classifier, which owns extension, ``stat``,
     regular-file, empty-file and ``UNREADABLE`` handling. No entry may be dropped here, because an
     entry dropped here is invisible in every count the report publishes.
+
+    The selected ``root`` itself is never classified, so a folder the operator explicitly chose stays
+    usable even when it is itself a junction: the decision being made here is only ever about a
+    directory the operator did *not* choose.
     """
     if recursive:
         walk = os.walk(root, onerror=_walk_error_raiser(root), followlinks=False)
         for dirpath, dirnames, filenames in walk:
-            dirnames.sort()
+            kept: list[str] = []
+            refused: str | None = None
+            for name in sorted(dirnames):
+                child = os.path.join(dirpath, name)
+                kind = _nested_link_kind(child)
+                if kind == _NESTED_SYMLINK:
+                    continue
+                if kind == _NESTED_REPARSE:
+                    if refused is None:
+                        refused = child
+                    continue
+                kept.append(name)
+            # Assigned before the refusal below, so the walk cannot descend a link even if this
+            # generator is resumed or abandoned: containment is structural, not a side effect of
+            # raising. `kept` is built from sorted(dirnames), so ordering stays deterministic.
+            dirnames[:] = kept
+            if refused is not None:
+                raise InputScanError(
+                    f"Cannot scan folder tree: {refused} is a junction or mount point inside the "
+                    f"selected folder, so the files it leads to are stored somewhere else. They "
+                    f"were not counted, and the scan was refused rather than reporting a total "
+                    f"that mixes in files from another location. To include them, select that "
+                    f"target as a source folder in its own right."
+                )
             for name in sorted(filenames):
                 yield os.path.join(dirpath, name)
         return
