@@ -96,6 +96,15 @@ import os
 import stat as stat_module
 from dataclasses import dataclass, field, replace
 
+# NOTE on why stage A2 imports nothing new (`test_j_the_module_imports_the_standard_library_only`
+# pins this module's imports to exactly `{__future__, os, stat, dataclasses}`):
+#
+# A2 needs the authoritative scanner, the destination-name candidates and a clock. All three are
+# **injected** rather than imported -- `scan`/`scan_error`/`limit_error` are *required* keyword
+# arguments of `inspect_library`, so there is no default for a caller to forget and no silent hole
+# where a refusal could escape unhandled. That keeps A1's own import boundary exactly where its
+# review left it, and it is the same discipline `media_verify` already uses for its FFprobe.
+
 #: POSIX ``ENOENT``. Spelled as a constant rather than imported from ``errno``, deliberately: the
 #: fork package's stdlib allow-list in ``tests/test_no_runtime_dependency.py`` is a curated list
 #: where each entry carries the reason it was added, and widening it is a separate, considered
@@ -1046,6 +1055,709 @@ def summarise(verdicts) -> dict:
     return counts
 
 
+# =============================================================================================
+# stage A2: the bounded, read-only media inventory
+# =============================================================================================
+#
+# A2 adds counting on top of A1's verdicts, and it adds **no second scanner**. Tier A is
+# ``input_manager.scan_folder`` and nothing else; that function owns traversal, containment, the
+# per-entry accounting and the all-or-nothing contract, and it is injected here rather than
+# reimplemented. Tier B is a bounded *diagnostic* walk built out of A1's own ``list_directory`` and
+# ``may_descend``, it runs only after Tier A has already failed, and it produces lower bounds that
+# are never summed into a total.
+#
+# The one rule the whole stage exists to keep: **a figure is either a total or it is labelled as not
+# one.** There is no third state and no way to read a short count as a complete one -- see
+# ``RootInventory.totals``.
+
+#: Entries one root's Tier A scan may classify before it refuses. The owner-approved value.
+#:
+#: This is a **classification-entry ceiling, not a wall-clock or peak-memory limit**, and no report
+#: built on it may say otherwise. ``input_manager.scan_folder`` documents the measured floor the
+#: ceiling cannot reach below (one directory is enumerated whole before its first entry is yielded;
+#: one ``lstat`` runs per child directory before any of that directory's files appear).
+#:
+#: It is sized as a runaway guard rather than a responsiveness budget -- the failure it exists to
+#: catch is a drive root or a system folder being handed in. A ceiling tuned for latency would
+#: refuse a legitimately large library, and a refused root yields **no** total at all, which is the
+#: worse outcome for a panel whose entire purpose is a trustworthy total.
+MAX_INVENTORY_ENTRIES_PER_ROOT = 200_000
+
+#: Tier B's own bounds. Diagnostics must not become the unbounded walk Tier A refused to be.
+MAX_DIAGNOSTIC_DIRECTORIES = 2_000
+MAX_DIAGNOSTIC_ENTRIES = 50_000
+
+#: How many alternative names a destination forecast will offer per conflict. Advisory only.
+MAX_FORECAST_ALTERNATIVES = 3
+
+#: Role names, matching ``user_prefs`` keys. Roles are **handed in**, never discovered: this module
+#: reads no preference file, expands no wildcard and enumerates no drive.
+LIBRARY_ROLE = "clips_library"
+REJECTED_ROLE = "clips_rejected"
+
+#: Inventory completeness. Deliberately a separate axis from A1's root verdicts: a root can be
+#: perfectly :data:`PRESENT` and still yield no total, because the scan of it was refused.
+INVENTORY_COMPLETE = "inventory_complete"
+INVENTORY_INCOMPLETE = "inventory_incomplete"
+
+#: Why an inventory is not complete. Reported, never inferred.
+REASON_NONE = ""
+REASON_ROOT_NOT_USABLE = "root_not_usable"
+REASON_LIMIT_EXCEEDED = "limit_exceeded"
+REASON_SCAN_REFUSED = "scan_refused"
+REASON_ROOT_LOST = "root_lost_during_inspection"
+REASON_STOPPED = "stopped_by_request"
+REASON_NOT_REQUESTED = "not_requested"
+
+INVENTORY_REASONS = (REASON_NONE, REASON_ROOT_NOT_USABLE, REASON_LIMIT_EXCEEDED,
+                     REASON_SCAN_REFUSED, REASON_ROOT_LOST, REASON_STOPPED,
+                     REASON_NOT_REQUESTED)
+
+
+@dataclass(frozen=True)
+class MediaCounts:
+    """One root's media accounting, carried across from :class:`input_manager.InputSet` verbatim.
+
+    Nothing is recomputed here and no figure is derived from a second traversal: every number comes
+    off the one authoritative scan, and :attr:`reconciles` re-asserts that scanner's own counting
+    invariant so a transcription slip in this module cannot pass unnoticed.
+
+    ``ready_bytes`` is the sum of sizes the scanner already ``stat``-ed. **No file was opened** to
+    produce any field here.
+    """
+
+    discovered: int = 0
+    ready: int = 0
+    ready_bytes: int = 0
+    path_collisions: int = 0
+    unsupported: int = 0
+    empty: int = 0
+    unreadable: int = 0
+    not_a_file: int = 0
+
+    @property
+    def rejected(self) -> int:
+        return self.unsupported + self.empty + self.unreadable + self.not_a_file
+
+    @property
+    def reconciles(self) -> bool:
+        """``discovered == ready + rejected + path_collisions`` -- the scanner's own invariant."""
+        return self.discovered == self.ready + self.rejected + self.path_collisions
+
+
+@dataclass(frozen=True)
+class BasenameGroup:
+    """Several files whose **file names** collide, case-insensitively.
+
+    This says nothing whatever about their contents. Two files called ``clip.mp4`` in different
+    folders collide on *destination*, which is the operator's actual problem; whether their bytes
+    match is a different question that would cost a read per file to answer, and the default
+    inventory reads nothing.
+    """
+
+    name: str = ""
+    """The collision key: the basename, normalised case."""
+
+    display: str = ""
+    """The first spelling seen, for a human-readable read-out."""
+
+    paths: tuple = ()
+
+    @property
+    def count(self) -> int:
+        return len(self.paths)
+
+    @property
+    def extra_copies(self) -> int:
+        return max(0, len(self.paths) - 1)
+
+    @property
+    def contents_compared(self) -> bool:
+        """Always ``False``. Present so a consumer must acknowledge it rather than assume."""
+        return False
+
+
+@dataclass(frozen=True)
+class NameConflict:
+    """One basename that a publish into the destination would have to resolve."""
+
+    basename: str = ""
+    occupied: bool = False
+    """The destination already holds this name, as observed in the single listing taken."""
+
+    sources: tuple = ()
+    """Library paths competing for this name."""
+
+    alternatives: tuple = ()
+    """Names :func:`collision.candidate_names` would try next, filtered against that same single
+    listing. Advisory: the destination may change before anything is ever published."""
+
+
+@dataclass(frozen=True)
+class DestinationForecast:
+    """What a publish *would* collide with, as observed once, at one moment.
+
+    A **nonbinding snapshot**. It predicts; it reserves nothing, creates nothing and moves nothing.
+    When the destination could not be observed, :attr:`known` is ``False`` and :attr:`conflicts` is
+    empty *because nothing was looked at* -- which is why a consumer must branch on :attr:`known`
+    rather than reading an empty tuple as "no conflicts".
+    """
+
+    destination: str = ""
+    state: str = NOT_INSPECTED
+    observed: bool = False
+    existing_entries: int = 0
+    conflicts: tuple = ()
+    detail: str = ""
+
+    @property
+    def known(self) -> bool:
+        return bool(self.observed) and self.state == PRESENT
+
+    @property
+    def occupied_names(self) -> tuple:
+        return tuple(item.basename for item in self.conflicts if item.occupied)
+
+    @property
+    def binding(self) -> bool:
+        """Always ``False``. A forecast is never a reservation."""
+        return False
+
+
+@dataclass(frozen=True)
+class Diagnostics:
+    """Tier B. Diagnostics after a Tier A failure, and **never** an inventory.
+
+    Every count here is a **lower bound**: the walk is bounded, it refuses whole subtrees it cannot
+    prove safe, and it stops at its own ceilings. :attr:`complete` says whether it even finished.
+    None of these numbers may be added to, substituted for, or presented as a total.
+    """
+
+    ran: bool = False
+    complete: bool = False
+    directories_listed: int = 0
+    files_seen: int = 0
+    bytes_seen: int = 0
+    unreadable_directories: tuple = ()
+    skipped_links: tuple = ()
+    outside_root: tuple = ()
+    bound_reached: str = ""
+    detail: str = ""
+
+    @property
+    def is_lower_bound(self) -> bool:
+        """Always ``True``. Stated as an attribute so no caller can forget it."""
+        return True
+
+
+@dataclass(frozen=True)
+class RootInventory:
+    """One root's result. Read :attr:`totals`, not :attr:`counts`, unless you mean it."""
+
+    role: str = ""
+    requested: str = ""
+    root: RootState = field(default_factory=RootState)
+    completeness: str = NOT_INSPECTED
+    reason: str = REASON_NOT_REQUESTED
+    counts: MediaCounts | None = None
+    duplicate_basenames: tuple = ()
+    destination: DestinationForecast | None = None
+    diagnostics: Diagnostics | None = None
+    limit: int | None = None
+    counted_at_least: int = 0
+    """A **lower bound** when the scan was refused for a limit. Never a total, and ``0`` otherwise."""
+
+    detail: str = ""
+
+    @property
+    def authoritative(self) -> bool:
+        return self.completeness == INVENTORY_COMPLETE and self.counts is not None
+
+    @property
+    def totals(self) -> MediaCounts | None:
+        """The counts **only** when they are genuinely totals; ``None`` otherwise.
+
+        This accessor is the structural half of "no partial result may be presented as a complete
+        total". :attr:`counts` is kept so a diagnostic read-out can still say what was seen, but a
+        consumer asking for totals cannot be handed a short count by accident.
+        """
+        return self.counts if self.authoritative else None
+
+
+@dataclass(frozen=True)
+class LibraryInventory:
+    """The whole pass. One entry per root offered, in the order they were offered."""
+
+    roots: tuple = ()
+    stopped: bool = False
+
+    observed_at: float = 0.0
+    """When the pass **began**, from the injected clock; ``0.0`` if none was supplied.
+
+    The start, not the end, and deliberately one timestamp for the whole pass rather than one per
+    figure: the filesystem can change under a running inspection, so every finding here describes a
+    window beginning at this instant and nothing is claimed to still be true afterwards."""
+
+    suffixes: tuple = ()
+    limit: int | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Every root inspected produced a total, and the pass was not stopped."""
+        return (not self.stopped) and bool(self.roots) and all(
+            item.authoritative for item in self.roots)
+
+    @property
+    def incomplete_roots(self) -> tuple:
+        return tuple(item for item in self.roots if not item.authoritative)
+
+
+def _basename_key(path: str) -> str:
+    return os.path.normcase(os.path.basename(str(path or "")))
+
+
+def duplicate_basenames(paths) -> tuple:
+    """Group paths whose basenames collide case-insensitively. Reads nothing; opens nothing.
+
+    Only groups of two or more are returned, ordered by key, and each group's paths keep the order
+    they arrived in -- which is the scanner's deterministic ``order_key`` order when the caller
+    passes ``InputSet.paths``.
+    """
+    buckets: dict = {}
+    for path in paths or ():
+        text = str(path or "")
+        if not text:
+            continue
+        key = _basename_key(text)
+        if not key:
+            continue
+        if key not in buckets:
+            buckets[key] = [os.path.basename(text), []]
+        buckets[key][1].append(text)
+    groups = [
+        BasenameGroup(name=key, display=display, paths=tuple(items))
+        for key, (display, items) in buckets.items()
+        if len(items) > 1
+    ]
+    groups.sort(key=lambda group: group.name)
+    return tuple(groups)
+
+
+def forecast_destination(destination, basenames, *, candidate_names=None, probe=None,
+                         listdir=os.listdir, lstat=os.lstat, isdir=os.path.isdir,
+                         realpath=os.path.realpath) -> DestinationForecast:
+    """Predict what publishing ``basenames`` into ``destination`` would collide with.
+
+    **Reads the destination exactly once** and never creates it: :func:`probe_root` establishes its
+    state without ``makedirs``, and one :func:`list_directory` supplies the names. The prediction is
+    then pure set work against that single snapshot.
+
+    An unobservable destination yields ``known=False`` and **no** conflicts, because none were
+    looked for. It is explicitly *not* reported as zero conflicts -- the distinction between
+    "nothing collides" and "I could not tell" is the whole point.
+
+    ``candidate_names`` is injected -- the caller passes ``collision.candidate_names``, so the
+    alternatives offered here are the very names a real publish would try, without this module
+    importing the publishing layer. Omitting it reports the conflicts with no suggestions rather
+    than inventing a naming scheme of its own. ``collision.publish`` is never reached by any path:
+    nothing is moved, renamed, created or overwritten by this function.
+    """
+    probe_fn = probe if probe is not None else probe_root
+    wanted = []
+    seen = set()
+    for name in basenames or ():
+        key = _basename_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        wanted.append(os.path.basename(str(name)))
+
+    text = normalize_root_text(destination)
+    if not text:
+        return DestinationForecast(destination="", state=NOT_INSPECTED, observed=False,
+                                   detail="no destination folder was named, so no prediction was "
+                                          "made and none is implied")
+
+    state = probe_fn(text, listdir=listdir, lstat=lstat, isdir=isdir, realpath=realpath)
+    if state.verdict != PRESENT:
+        return DestinationForecast(
+            destination=state.real or text, state=state.verdict, observed=False,
+            detail=f"the destination could not be read ({state.verdict}), so collisions are "
+                   f"UNKNOWN rather than zero: {state.detail}")
+
+    listing = list_directory(state.real or text, listdir=listdir, isdir=isdir, realpath=realpath)
+    if not listing.ok:
+        return DestinationForecast(
+            destination=state.real or text, state=listing.verdict, observed=False,
+            detail=f"the destination stopped being readable between probe and listing, so "
+                   f"collisions are UNKNOWN rather than zero: {listing.detail}")
+
+    taken = set(listing.names)
+    conflicts = []
+    for name in wanted:
+        key = os.path.normcase(name)
+        if key not in taken:
+            continue
+        alternatives = []
+        if candidate_names is not None:
+            for candidate in candidate_names(name):
+                if os.path.normcase(candidate) in taken:
+                    continue
+                alternatives.append(candidate)
+                if len(alternatives) >= MAX_FORECAST_ALTERNATIVES:
+                    break
+        conflicts.append(NameConflict(basename=name, occupied=True, sources=(),
+                                      alternatives=tuple(alternatives)))
+    conflicts.sort(key=lambda item: os.path.normcase(item.basename))
+    return DestinationForecast(destination=state.real or text, state=PRESENT, observed=True,
+                               existing_entries=len(taken), conflicts=tuple(conflicts),
+                               detail="a snapshot taken once; the destination may change before "
+                                      "anything is published, so this is not binding")
+
+
+def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat,
+                  isdir=os.path.isdir, realpath=os.path.realpath,
+                  max_directories=MAX_DIAGNOSTIC_DIRECTORIES,
+                  max_entries=MAX_DIAGNOSTIC_ENTRIES, should_stop=None) -> Diagnostics:
+    """Tier B: name **every** directory that could not be read, as a bounded lower bound.
+
+    Deliberately **not** ``os.walk``. ``os.walk`` decides whether to descend with
+    ``os.path.islink()``, which is ``False`` for an NTFS junction, so it would follow one straight
+    out of the root -- the defect the shared scanner was hardened against. This walk is built from
+    A1's own :func:`list_directory` and :func:`may_descend` instead, so:
+
+    * a nested reparse point is never entered, whether it escapes or stays inside;
+    * descent requires **resolved-path containment**, not merely "it did not look like a link" --
+      which matters because :func:`is_reparse_point` is a *reporting* predicate and answers
+      ``False`` when link metadata cannot be read, while :func:`may_descend` additionally refuses on
+      containment and so still holds;
+    * a directory whose safety cannot be established is refused rather than guessed at.
+
+    It exists to tell the operator *which* folders to fix, not how many files they have. Every
+    count returned is a lower bound, it stops at its own ceilings, and reaching one is reported
+    through :attr:`Diagnostics.bound_reached` rather than passed off as the end of the tree.
+    """
+    state = root_state if isinstance(root_state, RootState) else RootState()
+    if not state.root_key:
+        return Diagnostics(ran=False, complete=False,
+                           detail="the root has no established location, so nothing could be "
+                                  "diagnosed")
+
+    accepted = frozenset(str(item).casefold() for item in (suffixes or ()) if str(item).strip())
+    unreadable: list = []
+    skipped: list = []
+    outside: list = []
+    directories = 0
+    files = 0
+    total_bytes = 0
+    bound = ""
+    pending = [state.real]
+    stopped = False
+
+    while pending:
+        if should_stop is not None and should_stop():
+            stopped = True
+            break
+        if directories >= int(max_directories):
+            bound = "directories"
+            break
+        current = pending.pop(0)
+        listing = list_directory(current, root=state, listdir=listdir, isdir=isdir,
+                                 realpath=realpath)
+        if not listing.ok:
+            unreadable.append(current)
+            continue
+        directories += 1
+        for name in sorted(listing.names):
+            if files >= int(max_entries):
+                bound = "entries"
+                break
+            child = os.path.join(listing.real or current, name)
+            try:
+                child_is_dir = bool(isdir(child))
+            except OSError:
+                # Undecidable: not counted as a file and not descended. Named, never guessed.
+                unreadable.append(child)
+                continue
+            if child_is_dir:
+                decision = may_descend(state, child, lstat=lstat, realpath=realpath)
+                if decision.allowed:
+                    pending.append(child)
+                elif decision.action in (SKIP_REPARSE_CONTAINED, SKIP_REPARSE_ESCAPES):
+                    skipped.append(child)
+                else:
+                    outside.append(child)
+                continue
+            extension = os.path.splitext(child)[1].casefold()
+            if accepted and extension not in accepted:
+                continue
+            files += 1
+            try:
+                info = lstat(child)
+                total_bytes += int(getattr(info, "st_size", 0) or 0)
+            except OSError:
+                pass
+        if bound:
+            break
+
+    complete = (not pending) and not bound and not unreadable and not stopped
+    if stopped:
+        bound = bound or "stopped"
+    return Diagnostics(
+        ran=True, complete=bool(complete), directories_listed=directories, files_seen=files,
+        bytes_seen=total_bytes, unreadable_directories=tuple(unreadable),
+        skipped_links=tuple(skipped), outside_root=tuple(outside), bound_reached=bound,
+        detail="a bounded diagnostic pass; every figure here is a LOWER BOUND and none of them is "
+               "a total")
+
+
+def _counts_from_input_set(input_set) -> MediaCounts:
+    """Transcribe an ``InputSet`` into :class:`MediaCounts`. No traversal, no recomputation."""
+    by_reason = input_set.rejected_by_reason()
+
+    def _count(name: str) -> int:
+        for reason, value in by_reason.items():
+            if getattr(reason, "name", str(reason)) == name:
+                return int(value)
+        return 0
+
+    return MediaCounts(
+        discovered=int(input_set.discovered_count),
+        ready=int(input_set.ready_count),
+        ready_bytes=int(input_set.total_ready_bytes),
+        path_collisions=int(input_set.path_collisions),
+        unsupported=_count("UNSUPPORTED_EXTENSION"),
+        empty=_count("EMPTY_FILE"),
+        unreadable=_count("UNREADABLE"),
+        not_a_file=_count("NOT_A_FILE"),
+    )
+
+
+def inspect_library(roots, *, suffixes, scan, scan_error, limit_error, destinations=None,
+                    include_rejected=False, max_entries=MAX_INVENTORY_ENTRIES_PER_ROOT,
+                    candidate_names=None, probe=None, should_stop=None, diagnostics=True,
+                    listdir=os.listdir, lstat=os.lstat, isdir=os.path.isdir,
+                    realpath=os.path.realpath, clock=None) -> LibraryInventory:
+    """Inventory the roots handed in. Reads only; creates, moves and deletes nothing.
+
+    Args:
+        roots: ``(role, path)`` pairs. **Explicit and validated, never discovered** -- this
+            function reads no preference file, expands no pattern, probes no drive letter and has
+            no notion of "the other folders". A blank path is refused by
+            :func:`normalize_root_text` before ``os.path.abspath`` could turn it into the
+            application directory.
+        suffixes: the accepted media extensions, **supplied by the caller** (the GUI passes
+            ``clips_review.SERVABLE_SUFFIXES``) rather than imported, so this module stays free of
+            the review layer.
+        scan: **required.** The authoritative scanner -- ``input_manager.scan_folder``. Injected
+            rather than imported, and deliberately given no default: a default would be one more
+            thing a caller could get wrong, and this module would then need the import that A1's
+            own guard pins shut.
+        scan_error: **required.** The exception class (or tuple) a refused scan raises --
+            ``input_manager.InputScanError``.
+        limit_error: **required.** The subclass raised when the ceiling is reached --
+            ``input_manager.InputScanLimitExceeded``. Passed separately because the two refusals
+            read differently to an operator, not because they are handled differently in kind.
+        destinations: optional ``{role: path}`` for collision forecasting. Each is read **once**
+            and never created.
+        include_rejected: a root whose role is :data:`REJECTED_ROLE` is skipped unless this is
+            ``True``. Offering it is not the same as asking for it.
+        max_entries: Tier A's per-root classification ceiling. See
+            :data:`MAX_INVENTORY_ENTRIES_PER_ROOT` for what it is and is not.
+        candidate_names: optional ``collision.candidate_names``-shaped callable for destination
+            alternatives.
+        should_stop: cooperative stop, checked **between roots and between phases only**. One
+            ``scan`` call is atomic and cannot be interrupted; nothing here claims otherwise.
+        diagnostics: run Tier B after a Tier A failure.
+        clock: optional ``time.time``-shaped callable stamping :attr:`LibraryInventory.observed_at`,
+            so every finding carries an "as observed at". ``0.0`` when not supplied.
+
+    Returns:
+        A :class:`LibraryInventory`. Read :attr:`RootInventory.totals` for figures that are totals.
+
+    Tier A is the sole counting authority. A successful ``InputSet`` is
+    :data:`INVENTORY_COMPLETE`; **any** ``InputScanError`` -- including
+    ``InputScanLimitExceeded`` -- is :data:`INVENTORY_INCOMPLETE` with no counts attached, and Tier
+    B then runs for diagnosis only. A Tier A refusal is never converted into a smaller successful
+    inventory: in particular the shared scanner **refuses** a root containing a nested junction, and
+    that refusal is reported as an incomplete inventory plus a named link, never as a total that
+    quietly excluded it.
+
+    Clause (d) is applied to the inventory as well as to leaf verdicts: every root that produced a
+    total is **re-probed at the end of the pass**, and a root that is no longer positively observed
+    is demoted to :data:`INVENTORY_INCOMPLETE`. Demotion only -- nothing is ever promoted.
+    """
+    if scan is None or scan_error is None or limit_error is None:
+        raise ValueError(
+            "scan, scan_error and limit_error are required: pass input_manager.scan_folder, "
+            "input_manager.InputScanError and input_manager.InputScanLimitExceeded")
+    scanner = scan
+    probe_fn = probe if probe is not None else probe_root
+    accepted = tuple(str(item) for item in (suffixes or ()))
+    folders = dict(destinations or {})
+    observed_at = 0.0
+    if clock is not None:
+        try:
+            observed_at = float(clock())
+        except (TypeError, ValueError):
+            observed_at = 0.0
+
+    results: list = []
+    stopped = False
+
+    for role, path in list(roots or ()):
+        role_name = str(role or "")
+        requested = str(path or "")
+
+        if stopped or (should_stop is not None and should_stop()):
+            stopped = True
+            results.append(RootInventory(
+                role=role_name, requested=requested, completeness=NOT_INSPECTED,
+                reason=REASON_STOPPED,
+                detail="the pass was stopped before this folder was inspected"))
+            continue
+
+        if role_name == REJECTED_ROLE and not include_rejected:
+            results.append(RootInventory(
+                role=role_name, requested=requested, completeness=NOT_INSPECTED,
+                reason=REASON_NOT_REQUESTED,
+                detail="the Discarded folder was not included in this inspection"))
+            continue
+
+        state = probe_fn(requested, listdir=listdir, lstat=lstat, isdir=isdir, realpath=realpath)
+        if state.verdict != PRESENT:
+            # A root that is blank, absent, refused, unreachable or unresolvable is not scanned at
+            # all. Tier A never ran, so there is nothing for Tier B to diagnose either: A1's root
+            # verdict already says precisely what was wrong.
+            results.append(RootInventory(
+                role=role_name, requested=requested, root=state,
+                completeness=(NOT_INSPECTED if state.verdict == NOT_INSPECTED
+                              else INVENTORY_INCOMPLETE),
+                reason=(REASON_NOT_REQUESTED if state.verdict == NOT_INSPECTED
+                        else REASON_ROOT_NOT_USABLE),
+                limit=int(max_entries) if max_entries is not None else None,
+                detail=state.detail or f"the folder is {state.verdict}"))
+            continue
+
+        try:
+            input_set = scanner(state.real, recursive=True, extensions=accepted,
+                               detect_duplicates=False, max_entries=max_entries)
+        except limit_error as exc:
+            results.append(RootInventory(
+                role=role_name, requested=requested, root=state,
+                completeness=INVENTORY_INCOMPLETE, reason=REASON_LIMIT_EXCEEDED,
+                diagnostics=(diagnose_root(state, suffixes=accepted, listdir=listdir, lstat=lstat,
+                                           isdir=isdir, realpath=realpath,
+                                           should_stop=should_stop)
+                             if diagnostics else None),
+                limit=int(getattr(exc, "limit", max_entries) or 0),
+                counted_at_least=int(getattr(exc, "counted_at_least", 0) or 0),
+                detail=str(exc)))
+            continue
+        except scan_error as exc:
+            # Covers the nested-junction refusal and every traversal failure. Reported as an
+            # incomplete inventory with a named cause -- never as a smaller complete one.
+            results.append(RootInventory(
+                role=role_name, requested=requested, root=state,
+                completeness=INVENTORY_INCOMPLETE, reason=REASON_SCAN_REFUSED,
+                diagnostics=(diagnose_root(state, suffixes=accepted, listdir=listdir, lstat=lstat,
+                                           isdir=isdir, realpath=realpath,
+                                           should_stop=should_stop)
+                             if diagnostics else None),
+                limit=int(max_entries) if max_entries is not None else None,
+                detail=str(exc)))
+            continue
+
+        counts = _counts_from_input_set(input_set)
+        groups = duplicate_basenames(input_set.paths)
+
+        forecast = None
+        if should_stop is not None and should_stop():
+            stopped = True
+            if role_name in folders:
+                # Tier A finished, so its counts ARE a total and are kept. The forecast is the
+                # phase that was dropped, and it must say so: `None` here would be
+                # indistinguishable from "no destination was configured".
+                forecast = DestinationForecast(
+                    destination="", state=NOT_INSPECTED, observed=False,
+                    detail="the pass was stopped before the destination was read, so collisions "
+                           "are UNKNOWN rather than zero")
+        elif role_name in folders:
+            forecast = forecast_destination(
+                folders[role_name], [os.path.basename(p) for p in input_set.paths],
+                candidate_names=candidate_names, probe=probe_fn, listdir=listdir, lstat=lstat,
+                isdir=isdir, realpath=realpath)
+
+        results.append(RootInventory(
+            role=role_name, requested=requested, root=state, completeness=INVENTORY_COMPLETE,
+            reason=REASON_NONE, counts=counts, duplicate_basenames=groups, destination=forecast,
+            limit=int(max_entries) if max_entries is not None else None, detail=""))
+
+    # Clause (d) for totals: a root that stopped being observable during the pass loses its total.
+    finalised: list = []
+    for item in results:
+        if item.completeness != INVENTORY_COMPLETE:
+            finalised.append(item)
+            continue
+        again = probe_fn(item.root.real or item.requested, listdir=listdir, lstat=lstat,
+                         isdir=isdir, realpath=realpath)
+        if again.positively_observed and again.root_key == item.root.root_key:
+            finalised.append(item)
+            continue
+        finalised.append(replace(
+            item, completeness=INVENTORY_INCOMPLETE, reason=REASON_ROOT_LOST, counts=None,
+            detail="the folder stopped being observable before the pass finished, so its counts "
+                   "are not published as totals"))
+
+    return LibraryInventory(roots=tuple(finalised), stopped=bool(stopped),
+                            observed_at=observed_at, suffixes=accepted,
+                            limit=int(max_entries) if max_entries is not None else None)
+
+
+def inventory_lines(inventory) -> tuple:
+    """A plain read-out. It decides nothing and it never prints a partial figure as a total."""
+    lines: list = []
+    for item in getattr(inventory, "roots", ()) or ():
+        label = item.role or "(folder)"
+        if item.completeness == NOT_INSPECTED:
+            lines.append(f"{label}: NOT INSPECTED - {item.detail or item.reason}")
+            continue
+        if not item.authoritative:
+            lines.append(f"{label}: INVENTORY_INCOMPLETE ({item.reason}) - no count for this "
+                         f"folder is a total")
+            if item.reason == REASON_LIMIT_EXCEEDED:
+                lines.append(f"    the limit of {item.limit} entries was reached; at least "
+                             f"{item.counted_at_least} entries are present")
+            diag = item.diagnostics
+            if diag is not None and diag.ran:
+                lines.append(f"    diagnostics (LOWER BOUND, not a total): {diag.files_seen} "
+                             f"media files in {diag.directories_listed} folders")
+                for path in diag.unreadable_directories:
+                    lines.append(f"    could not read: {path}")
+                for path in diag.skipped_links:
+                    lines.append(f"    link not followed: {path}")
+                if diag.bound_reached:
+                    lines.append(f"    diagnostics stopped at its own bound: {diag.bound_reached}")
+            continue
+        totals = item.totals
+        lines.append(f"{label}: {totals.ready} media files, {totals.ready_bytes} bytes "
+                     f"({totals.discovered} entries seen)")
+        if totals.rejected:
+            lines.append(f"    not media: {totals.unsupported} unsupported, {totals.empty} empty, "
+                         f"{totals.unreadable} unreadable, {totals.not_a_file} not a file")
+        if item.duplicate_basenames:
+            lines.append(f"    {len(item.duplicate_basenames)} duplicate file names - the NAMES "
+                         f"collide; the contents were NOT compared")
+        forecast = item.destination
+        if forecast is not None:
+            if forecast.known:
+                lines.append(f"    destination: {len(forecast.conflicts)} name conflicts "
+                             f"(a snapshot, not binding)")
+            else:
+                lines.append(f"    destination: UNKNOWN - {forecast.detail}")
+    return tuple(lines)
+
+
 __all__ = [
     "ACCESS_DENIED", "CONFIGURED_NOT_CREATED", "ENTER", "LEAF_VERDICTS", "MISSING_CONFIRMED",
     "MISSING_PROVISIONAL", "NOT_INSPECTED", "PRESENT", "ROOT_UNREACHABLE", "ROOT_VERDICTS",
@@ -1054,4 +1766,14 @@ __all__ = [
     "anchor_of", "classify_leaf", "classify_os_error", "confirmed_missing", "is_reparse_point",
     "is_within", "list_directory", "may_descend", "normalize_root_text", "probe_root",
     "retract_subtree", "summarise",
+    # stage A2
+    "INVENTORY_COMPLETE", "INVENTORY_INCOMPLETE", "INVENTORY_REASONS", "LIBRARY_ROLE",
+    "MAX_DIAGNOSTIC_DIRECTORIES", "MAX_DIAGNOSTIC_ENTRIES", "MAX_FORECAST_ALTERNATIVES",
+    "MAX_INVENTORY_ENTRIES_PER_ROOT", "REASON_LIMIT_EXCEEDED", "REASON_NONE",
+    "REASON_NOT_REQUESTED", "REASON_ROOT_LOST", "REASON_ROOT_NOT_USABLE", "REASON_SCAN_REFUSED",
+    "REASON_STOPPED", "REJECTED_ROLE",
+    "BasenameGroup", "DestinationForecast", "Diagnostics", "LibraryInventory", "MediaCounts",
+    "NameConflict", "RootInventory",
+    "diagnose_root", "duplicate_basenames", "forecast_destination", "inspect_library",
+    "inventory_lines",
 ]
