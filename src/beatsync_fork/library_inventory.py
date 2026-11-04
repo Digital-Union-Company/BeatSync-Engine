@@ -1084,8 +1084,30 @@ def summarise(verdicts) -> dict:
 MAX_INVENTORY_ENTRIES_PER_ROOT = 200_000
 
 #: Tier B's own bounds. Diagnostics must not become the unbounded walk Tier A refused to be.
+#:
+#: What each one bounds is load-bearing, and both were corrected after review findings F-1 and F-2
+#: measured them bounding something other than the work:
+#:
+#: * :data:`MAX_DIAGNOSTIC_DIRECTORIES` bounds directories **attempted**. A listing that fails costs
+#:   the same ``listdir`` as one that succeeds, so charging only the successes bounded nothing --
+#:   measured, 2000 unlistable children were every one of them attempted against a ceiling of 3.
+#: * :data:`MAX_DIAGNOSTIC_ENTRIES` bounds directory entries **examined**, before the
+#:   media-extension filter, exactly as Tier A's ceiling does. Charging only supported files left a
+#:   directory of unsupported entries entirely unbounded -- measured, 3000 ``.txt`` files walked
+#:   against a ceiling of 1 that could never fire.
+#:
+#: Neither is a wall-clock or peak-memory limit, and no report built on them may say otherwise:
+#: ``listdir`` still materialises one directory whole before its first entry is examined, so the
+#: irreducible floor is the size of the largest single directory. These bound the *walk*.
 MAX_DIAGNOSTIC_DIRECTORIES = 2_000
 MAX_DIAGNOSTIC_ENTRIES = 50_000
+
+#: How many paths each diagnostic name list collects before it stops collecting. The two ceilings
+#: above bound the walk; this bounds the **record** of it, which is a separate problem: 2000 named
+#: folders is not a read-out an operator can act on, and the names are what Tier B exists to
+#: produce. A list that stopped collecting is never presented as a complete list of folders to fix
+#: -- see :attr:`Diagnostics.names_truncated`.
+MAX_DIAGNOSTIC_NAMES = 200
 
 #: How many alternative names a destination forecast will offer per conflict. Advisory only.
 MAX_FORECAST_ALTERNATIVES = 3
@@ -1244,9 +1266,43 @@ class Diagnostics:
     bound_reached: str = ""
     detail: str = ""
 
+    directories_attempted: int = 0
+    """Directories a ``listdir`` was spent on, successful or not -- what the ceiling charges.
+
+    :attr:`directories_listed` stays the count of *successful* listings, deliberately: one is the
+    cost that had to be bounded, the other is the coverage achieved, and review finding F-1 was
+    exactly the two being conflated."""
+
+    entries_examined: int = 0
+    """Directory entries considered, before any extension filter -- what the entry ceiling charges.
+
+    :attr:`files_seen` and :attr:`bytes_seen` still mean supported media, which is the figure an
+    operator wants; this is the figure a bound needs."""
+
+    undecidable_links: tuple = ()
+    """Child directories whose link status could not be established, and which were therefore not
+    entered.
+
+    A distinct category from :attr:`skipped_links` on purpose: that tuple names entries positively
+    identified as a junction or link, and calling an entry a junction on the strength of a failed
+    metadata read would be inventing evidence. These were refused because nothing was known, which
+    is a different thing to report and a different thing to fix."""
+
+    names_truncated: bool = False
+    """A name list stopped collecting at :data:`MAX_DIAGNOSTIC_NAMES`, so it is not exhaustive."""
+
     @property
     def is_lower_bound(self) -> bool:
-        """Always ``True``. Stated as an attribute so no caller can forget it."""
+        """``True``: no figure here may be read as a total, an exact count or an upper bound.
+
+        It is unconditional, and review finding F-3 is why it is now also *accurate*. Previously a
+        contained junction whose link metadata could not be read was **entered**, so its subtree was
+        walked twice and :attr:`files_seen` reported six files where three existed -- an
+        over-count, which is the one thing a lower bound may not be. Descent now additionally
+        requires link-level evidence that the child is an ordinary folder, so a child that cannot be
+        proven is refused and named in :attr:`undecidable_links`. Refusing can only put these
+        figures further below the truth, never above it, which is what makes the guarantee hold.
+        """
         return True
 
 
@@ -1348,9 +1404,21 @@ def forecast_destination(destination, basenames, *, candidate_names=None, probe=
                          realpath=os.path.realpath) -> DestinationForecast:
     """Predict what publishing ``basenames`` into ``destination`` would collide with.
 
-    **Reads the destination exactly once** and never creates it: :func:`probe_root` establishes its
-    state without ``makedirs``, and one :func:`list_directory` supplies the names. The prediction is
-    then pure set work against that single snapshot.
+    **One authoritative destination-name snapshot for the forecast, preceded by a root-state
+    probe** -- and never once per candidate name, which is the cost this contract exists to rule
+    out. It never creates the destination: :func:`probe_root` establishes its state without
+    ``makedirs`` (that is one ``listdir``), and one :func:`list_directory` then supplies the names
+    (that is the second, and the snapshot).
+
+    The prediction derives **solely from the listing**. The probe's own ``entry_count`` is
+    discarded, no figure here blends the two reads, and a destination that changes between them is
+    reported exactly as the listing found it -- so a name that vanished after the probe is not
+    claimed occupied, and a name that appeared is not missed. The two reads answer two different
+    questions: the probe says whether the folder is observable at all, the listing says what is in
+    it, and collapsing them would lose the "could not tell" branch below.
+
+    The earlier wording here said "reads the destination exactly once" and was corrected after
+    review finding F-4 measured two. The *behaviour* was correct and is unchanged.
 
     An unobservable destination yields ``known=False`` and **no** conflicts, because none were
     looked for. It is explicitly *not* reported as zero conflicts -- the distinction between
@@ -1415,6 +1483,49 @@ def forecast_destination(destination, basenames, *, candidate_names=None, probe=
                                       "anything is published, so this is not binding")
 
 
+#: What link-level metadata actually established about a child directory. Three values, because
+#: "I could not tell" is a real answer and must not be rounded to either of the other two.
+_LINK_PLAIN = "plain"
+_LINK_ALIAS = "alias"
+_LINK_UNDECIDABLE = "undecidable"
+
+
+def _link_evidence(path, *, lstat=os.lstat) -> str:
+    """Is this child an ordinary folder, an alias, or undecidable? Link-level; never followed.
+
+    A **gate**, and therefore deliberately shaped unlike :func:`is_reparse_point`, which is a
+    *reporting* predicate and answers ``False`` when link metadata cannot be read. That is the right
+    shape for a report and the wrong shape for a decision, and it is the same distinction
+    ``input_manager._nested_link_kind`` already draws for Tier A.
+
+    Review finding F-3 is what the missing gate cost: :func:`may_descend` combines that predicate
+    with resolved-path containment, and containment alone cannot tell a *contained* alias from a
+    real folder -- both resolve inside the root. So a contained junction whose ``lstat`` failed was
+    entered, its subtree counted twice, and the result still described itself as a lower bound.
+
+    Returns :data:`_LINK_UNDECIDABLE` rather than guessing. An unreadable attribute is not evidence
+    of a plain directory, and it is not evidence of a junction either -- so this reports neither.
+    """
+    try:
+        info = lstat(path)
+    except OSError:
+        return _LINK_UNDECIDABLE
+
+    mode = getattr(info, "st_mode", None)
+    if mode is not None and stat_module.S_ISLNK(mode):
+        return _LINK_ALIAS
+
+    attributes = getattr(info, "st_file_attributes", None)
+    if attributes is None:
+        # POSIX has no such field and needs none: ``S_ISLNK`` above is the only aliasing primitive
+        # there, so an ordinary directory is still traversed normally. On Windows a junction cannot
+        # be told from a folder without it, so the entry stays undecidable and is refused.
+        return _LINK_UNDECIDABLE if os.name == "nt" else _LINK_PLAIN
+
+    return (_LINK_ALIAS if attributes & stat_module.FILE_ATTRIBUTE_REPARSE_POINT
+            else _LINK_PLAIN)
+
+
 def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat,
                   isdir=os.path.isdir, realpath=os.path.realpath,
                   max_directories=MAX_DIAGNOSTIC_DIRECTORIES,
@@ -1427,15 +1538,33 @@ def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat
     A1's own :func:`list_directory` and :func:`may_descend` instead, so:
 
     * a nested reparse point is never entered, whether it escapes or stays inside;
-    * descent requires **resolved-path containment**, not merely "it did not look like a link" --
-      which matters because :func:`is_reparse_point` is a *reporting* predicate and answers
-      ``False`` when link metadata cannot be read, while :func:`may_descend` additionally refuses on
-      containment and so still holds;
-    * a directory whose safety cannot be established is refused rather than guessed at.
+    * descent requires **resolved-path containment** *and* link-level evidence that the child is an
+      ordinary folder -- not merely "it did not look like a link". Both halves are necessary and
+      review finding F-3 is why: :func:`is_reparse_point` is a *reporting* predicate and answers
+      ``False`` when link metadata cannot be read, and resolved containment cannot tell a
+      **contained** alias from a real folder because both resolve inside the root. So a contained
+      junction with unreadable metadata satisfied :func:`may_descend` and was entered, and its
+      subtree was counted twice. :func:`_link_evidence` is the missing half;
+    * a directory whose safety cannot be established is refused rather than guessed at, and named
+      in :attr:`Diagnostics.undecidable_links` rather than filed under a classification nobody
+      actually observed.
 
     It exists to tell the operator *which* folders to fix, not how many files they have. Every
     count returned is a lower bound, it stops at its own ceilings, and reaching one is reported
     through :attr:`Diagnostics.bound_reached` rather than passed off as the end of the tree.
+
+    What the two ceilings bound -- the correction for review findings F-1 and F-2:
+
+    * ``max_directories`` charges a directory **attempted**, counted before the listing is tried,
+      because a failed listing costs the same ``listdir`` as a successful one.
+      :attr:`Diagnostics.directories_listed` still reports the successes.
+    * ``max_entries`` charges a directory entry **examined**, counted before the extension filter,
+      because an unsupported entry costs the walk an ``isdir`` either way.
+      :attr:`Diagnostics.files_seen` still reports supported media.
+
+    Exactly ``max_entries`` entries may be examined and the pass still finish; the next entry
+    reports the bound. Neither ceiling is a wall-clock or memory bound -- see
+    :data:`MAX_DIAGNOSTIC_ENTRIES`.
     """
     state = root_state if isinstance(root_state, RootState) else RootState()
     if not state.root_key:
@@ -1447,7 +1576,20 @@ def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat
     unreadable: list = []
     skipped: list = []
     outside: list = []
+    undecidable: list = []
+    truncated = False
+
+    def _note(bucket: list, path: str) -> None:
+        """Record a path, or record that the record ran out of room. Never grows without bound."""
+        nonlocal truncated
+        if len(bucket) < MAX_DIAGNOSTIC_NAMES:
+            bucket.append(path)
+        else:
+            truncated = True
+
+    attempted = 0
     directories = 0
+    entries = 0
     files = 0
     total_bytes = 0
     bound = ""
@@ -1458,35 +1600,59 @@ def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat
         if should_stop is not None and should_stop():
             stopped = True
             break
-        if directories >= int(max_directories):
+        if attempted >= int(max_directories):
             bound = "directories"
             break
         current = pending.pop(0)
+        # Charged BEFORE the listing is tried. Charging only successful listings is finding F-1:
+        # a root of unlistable children consumed no budget at all and was walked in full.
+        attempted += 1
         listing = list_directory(current, root=state, listdir=listdir, isdir=isdir,
                                  realpath=realpath)
         if not listing.ok:
-            unreadable.append(current)
+            _note(unreadable, current)
             continue
         directories += 1
         for name in sorted(listing.names):
-            if files >= int(max_entries):
+            if entries >= int(max_entries):
                 bound = "entries"
                 break
+            # Charged BEFORE the extension filter, so an unsupported entry costs the ceiling what
+            # it costs the walk. Charging only supported media is finding F-2, and it is the very
+            # semantics ``scan_folder``'s own docstring rules out for Tier A.
+            entries += 1
             child = os.path.join(listing.real or current, name)
             try:
                 child_is_dir = bool(isdir(child))
             except OSError:
                 # Undecidable: not counted as a file and not descended. Named, never guessed.
-                unreadable.append(child)
+                _note(unreadable, child)
                 continue
             if child_is_dir:
                 decision = may_descend(state, child, lstat=lstat, realpath=realpath)
-                if decision.allowed:
+                if not decision.allowed:
+                    if decision.action in (SKIP_REPARSE_CONTAINED, SKIP_REPARSE_ESCAPES):
+                        _note(skipped, child)
+                    else:
+                        _note(outside, child)
+                    continue
+                # `may_descend` approving is necessary but not sufficient: it rests on resolved
+                # containment plus a reporting predicate that reads False when link metadata is
+                # unreadable, and containment cannot separate a CONTAINED alias from a real folder.
+                # Finding F-3. Descent needs positive link-level evidence as well.
+                #
+                # Cost: one extra `lstat` per child directory `may_descend` approved, because
+                # `DescendDecision.is_reparse` reads False both for "readable, not a link" and for
+                # "could not read", so the approved case cannot be told apart without asking again.
+                # Measured at one per approved child, bounded by both ceilings, on a path that only
+                # runs after Tier A has already failed.
+                evidence = _link_evidence(child, lstat=lstat)
+                if evidence == _LINK_PLAIN:
                     pending.append(child)
-                elif decision.action in (SKIP_REPARSE_CONTAINED, SKIP_REPARSE_ESCAPES):
-                    skipped.append(child)
+                elif evidence == _LINK_ALIAS:
+                    _note(skipped, child)
                 else:
-                    outside.append(child)
+                    _note(undecidable, child)
                 continue
             extension = os.path.splitext(child)[1].casefold()
             if accepted and extension not in accepted:
@@ -1500,13 +1666,17 @@ def diagnose_root(root_state, *, suffixes=(), listdir=os.listdir, lstat=os.lstat
         if bound:
             break
 
-    complete = (not pending) and not bound and not unreadable and not stopped
+    complete = ((not pending) and not bound and not unreadable and not undecidable
+                and not truncated and not stopped)
     if stopped:
         bound = bound or "stopped"
     return Diagnostics(
-        ran=True, complete=bool(complete), directories_listed=directories, files_seen=files,
+        ran=True, complete=bool(complete), directories_attempted=attempted,
+        directories_listed=directories, entries_examined=entries, files_seen=files,
         bytes_seen=total_bytes, unreadable_directories=tuple(unreadable),
-        skipped_links=tuple(skipped), outside_root=tuple(outside), bound_reached=bound,
+        skipped_links=tuple(skipped), outside_root=tuple(outside),
+        undecidable_links=tuple(undecidable), names_truncated=bool(truncated),
+        bound_reached=bound,
         detail="a bounded diagnostic pass; every figure here is a LOWER BOUND and none of them is "
                "a total")
 
@@ -1558,8 +1728,10 @@ def inspect_library(roots, *, suffixes, scan, scan_error, limit_error, destinati
         limit_error: **required.** The subclass raised when the ceiling is reached --
             ``input_manager.InputScanLimitExceeded``. Passed separately because the two refusals
             read differently to an operator, not because they are handled differently in kind.
-        destinations: optional ``{role: path}`` for collision forecasting. Each is read **once**
-            and never created.
+        destinations: optional ``{role: path}`` for collision forecasting. Each is read **once per
+            pass** -- one state probe plus one name snapshot, never once per candidate name -- and
+            never created. See :func:`forecast_destination` for which of the two the prediction
+            comes from.
         include_rejected: a root whose role is :data:`REJECTED_ROLE` is skipped unless this is
             ``True``. Offering it is not the same as asking for it.
         max_entries: Tier A's per-root classification ceiling. See
@@ -1586,6 +1758,22 @@ def inspect_library(roots, *, suffixes, scan, scan_error, limit_error, destinati
     Clause (d) is applied to the inventory as well as to leaf verdicts: every root that produced a
     total is **re-probed at the end of the pass**, and a root that is no longer positively observed
     is demoted to :data:`INVENTORY_INCOMPLETE`. Demotion only -- nothing is ever promoted.
+
+    What that re-probe asks, precisely, and what it therefore does not (review finding F-5): the
+    path re-probed is ``root.real``, the **resolved storage the files were actually counted off**,
+    so the question is *"is the storage I counted still observable?"* and not *"does the selected
+    path still lead here?"*. The two differ for exactly one shape -- a selected root that is itself
+    a junction, repointed to another target mid-pass while the original target stays reachable.
+    There the re-probe passes and the published total remains a truthful, timestamped count of the
+    storage that was counted, while the selected path now leads somewhere else.
+
+    This is deliberate rather than overlooked. A1's findings F-1 and F-6 established the *resolved*
+    location as a root's identity precisely so that figures are attributed to the storage they came
+    off, :attr:`LibraryInventory.observed_at` stamps the window every finding describes, and
+    :class:`RootInventory` retains both :attr:`~RootInventory.requested` and ``root.real`` so the
+    resolution is disclosed rather than hidden -- :func:`inventory_lines` prints both when they
+    differ. Re-probing ``requested`` instead would answer the other question, and would change
+    accepted A1 identity semantics; it is a separate decision, not a defect of this clause.
     """
     if scan is None or scan_error is None or limit_error is None:
         raise ValueError(
@@ -1715,16 +1903,38 @@ def inspect_library(roots, *, suffixes, scan, scan_error, limit_error, destinati
 
 
 def inventory_lines(inventory) -> tuple:
-    """A plain read-out. It decides nothing and it never prints a partial figure as a total."""
+    """A plain read-out. It decides nothing and it never prints a partial figure as a total.
+
+    Every inspected root is named, and when the selected path resolved somewhere else both are
+    printed: the figures belong to the **resolved** storage, so a read-out that showed only the
+    role could not disclose that a selected junction was followed. Review finding F-5.
+
+    The pass's :attr:`LibraryInventory.observed_at` is stated when there is one, because every
+    figure below describes a window beginning at that instant rather than the present moment. It is
+    **omitted entirely** when no clock was injected -- a fabricated timestamp would be worse than
+    none, and this module cannot import ``time`` (its imports are pinned to the stdlib set A1
+    fixed), so the raw value is printed as it was supplied.
+    """
     lines: list = []
+    observed_at = getattr(inventory, "observed_at", 0.0) or 0.0
+    if observed_at:
+        lines.append(f"as observed at {observed_at} - a point in time; the folders below may have "
+                     f"changed since")
     for item in getattr(inventory, "roots", ()) or ():
         label = item.role or "(folder)"
+        requested = item.requested or "(unnamed)"
+        resolved = str(getattr(item.root, "real", "") or "")
+        where = requested
+        if resolved and _norm(resolved) != _norm(requested):
+            where = f"{requested} -> {resolved} (the storage these figures came off)"
         if item.completeness == NOT_INSPECTED:
             lines.append(f"{label}: NOT INSPECTED - {item.detail or item.reason}")
+            lines.append(f"    folder: {where}")
             continue
         if not item.authoritative:
             lines.append(f"{label}: INVENTORY_INCOMPLETE ({item.reason}) - no count for this "
                          f"folder is a total")
+            lines.append(f"    folder: {where}")
             if item.reason == REASON_LIMIT_EXCEEDED:
                 lines.append(f"    the limit of {item.limit} entries was reached; at least "
                              f"{item.counted_at_least} entries are present")
@@ -1736,12 +1946,19 @@ def inventory_lines(inventory) -> tuple:
                     lines.append(f"    could not read: {path}")
                 for path in diag.skipped_links:
                     lines.append(f"    link not followed: {path}")
+                for path in diag.undecidable_links:
+                    lines.append(f"    could not tell whether this is a folder or a link, so it "
+                                 f"was not entered: {path}")
+                if diag.names_truncated:
+                    lines.append(f"    more folders were affected than the {MAX_DIAGNOSTIC_NAMES} "
+                                 f"listed above; this list is TRUNCATED, not complete")
                 if diag.bound_reached:
                     lines.append(f"    diagnostics stopped at its own bound: {diag.bound_reached}")
             continue
         totals = item.totals
         lines.append(f"{label}: {totals.ready} media files, {totals.ready_bytes} bytes "
                      f"({totals.discovered} entries seen)")
+        lines.append(f"    folder: {where}")
         if totals.rejected:
             lines.append(f"    not media: {totals.unsupported} unsupported, {totals.empty} empty, "
                          f"{totals.unreadable} unreadable, {totals.not_a_file} not a file")
@@ -1768,7 +1985,8 @@ __all__ = [
     "retract_subtree", "summarise",
     # stage A2
     "INVENTORY_COMPLETE", "INVENTORY_INCOMPLETE", "INVENTORY_REASONS", "LIBRARY_ROLE",
-    "MAX_DIAGNOSTIC_DIRECTORIES", "MAX_DIAGNOSTIC_ENTRIES", "MAX_FORECAST_ALTERNATIVES",
+    "MAX_DIAGNOSTIC_DIRECTORIES", "MAX_DIAGNOSTIC_ENTRIES", "MAX_DIAGNOSTIC_NAMES",
+    "MAX_FORECAST_ALTERNATIVES",
     "MAX_INVENTORY_ENTRIES_PER_ROOT", "REASON_LIMIT_EXCEEDED", "REASON_NONE",
     "REASON_NOT_REQUESTED", "REASON_ROOT_LOST", "REASON_ROOT_NOT_USABLE", "REASON_SCAN_REFUSED",
     "REASON_STOPPED", "REJECTED_ROLE",

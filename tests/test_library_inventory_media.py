@@ -379,7 +379,22 @@ def test_n_a_blank_destination_is_not_the_working_directory(tmp_path):
     assert forecast.state == li.NOT_INSPECTED
 
 
-def test_n_the_destination_is_listed_exactly_once(tmp_path, monkeypatch):
+def test_n_the_destination_is_listed_once_per_pass_not_per_candidate_name(tmp_path):
+    """One state probe plus one name snapshot -- NOT once per candidate name.
+
+    Renamed from ``..._exactly_once`` after review finding F-4: the old name claimed a single read
+    while the body asserted ``<= 2``, which is the real and intended contract.
+
+    The old body **also could not observe anything**, and that is why the count is now exact. It
+    patched ``os.listdir`` with ``monkeypatch.setattr``, but this module binds
+    ``listdir=os.listdir`` as a **default argument at definition time**, so the spy was never
+    reached and ``len(listings)`` was ``0`` -- which satisfies ``<= 2`` perfectly. The sibling
+    Tier B test already records the rule: ``os.scandir`` is resolved at call time inside
+    ``os.walk`` and so can be patched, while these bound defaults must be *injected*.
+
+    Two reads answer two questions (is it observable; what is in it), and six candidate names must
+    still cost exactly two.
+    """
     root = str(tmp_path / "library")
     for index in range(6):
         write_file(os.path.join(root, f"clip{index}.mp4"), b"C")
@@ -388,21 +403,56 @@ def test_n_the_destination_is_listed_exactly_once(tmp_path, monkeypatch):
         write_file(os.path.join(destination, f"clip{index}.mp4"), b"OLD")
 
     listings = []
-    real_listdir = os.listdir
     target = os.path.normcase(os.path.realpath(destination))
 
     def spy(path):
         if os.path.normcase(os.path.realpath(str(path))) == target:
             listings.append(str(path))
-        return real_listdir(path)
+        return os.listdir(path)
 
-    monkeypatch.setattr(os, "listdir", spy)
-    forecast = one([(li.LIBRARY_ROLE, root)],
-                   destinations={li.LIBRARY_ROLE: destination}).destination
+    forecast = one([(li.LIBRARY_ROLE, root)], destinations={li.LIBRARY_ROLE: destination},
+                   listdir=spy).destination
     assert len(forecast.conflicts) == 6
     # probe_root lists it once to establish PRESENT, list_directory once for the names. Never
-    # once per candidate name, which is what this test exists to prevent.
-    assert len(listings) <= 2, f"the destination was listed {len(listings)} times"
+    # once per candidate name, which is what this test exists to prevent: six names, two reads.
+    assert len(listings) == 2, f"the destination was listed {len(listings)} times, expected 2"
+
+
+def test_n_a_destination_that_changes_between_the_two_reads_reports_the_snapshot(tmp_path):
+    """Which of the two reads the prediction comes from, pinned deterministically.
+
+    Review finding F-4 asked whether two reads could be blended into one incoherent answer. They
+    cannot: the probe establishes observability, the **listing** is the snapshot, and every figure
+    comes from the listing alone. So a name that vanished after the probe is not claimed occupied,
+    and a name that appeared in time for the listing is.
+    """
+    root = str(tmp_path / "library")
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        write_file(os.path.join(root, name), b"C")
+    destination = str(tmp_path / "published")
+    os.makedirs(destination)
+    target = os.path.normcase(os.path.realpath(destination))
+
+    reads = []
+    snapshots = [["a.mp4", "b.mp4"], ["b.mp4", "c.mp4", "d.mp4"]]
+
+    def shifting_listdir(path):
+        if os.path.normcase(os.path.realpath(str(path))) == target:
+            reads.append(str(path))
+            return list(snapshots[min(len(reads) - 1, len(snapshots) - 1)])
+        return os.listdir(path)
+
+    forecast = one([(li.LIBRARY_ROLE, root)], destinations={li.LIBRARY_ROLE: destination},
+                   listdir=shifting_listdir).destination
+
+    assert len(reads) == 2, "the contract is one probe plus one snapshot"
+    assert forecast.known is True
+    # Every figure from the SECOND read, none from the first and none blended.
+    assert forecast.existing_entries == 3
+    assert sorted(forecast.occupied_names) == ["b.mp4", "c.mp4"]
+    assert "a.mp4" not in forecast.occupied_names, (
+        "a name seen only by the probe was reported as occupying the destination")
+    assert forecast.binding is False
 
 
 # =============================================================================================
@@ -936,7 +986,7 @@ _MUTATING_BARE = {"rmtree", "makedirs", "removedirs", "renames", "publish", "sav
 
 _A2_FUNCTIONS = {"inspect_library", "diagnose_root", "forecast_destination",
                  "duplicate_basenames", "inventory_lines", "_counts_from_input_set",
-                 "_basename_key"}
+                 "_basename_key", "_link_evidence"}
 
 
 def _dotted(func):
@@ -1260,3 +1310,746 @@ def test_negative_control_the_counting_invariant_would_catch_a_transcription_sli
     assert bad.reconciles is False
     good = li.MediaCounts(discovered=10, ready=3, unsupported=1, empty=6)
     assert good.reconciles is True
+
+
+# =============================================================================================
+# U - independent-review remediation: F-1, F-2, F-3 (Tier B bounds and containment) and F-5
+#
+# Every test here fails against the reviewed candidate HEAD 10918a54 and passes on the
+# remediation, and each one names the finding it defends. The three BLOCKING findings share one
+# shape: a ceiling or a gate that bounded the figure an operator READS instead of the work the
+# walk DOES. So these tests count calls through the module's own injection seams rather than
+# trusting Diagnostics' own numbers -- which is exactly what looked bounded while the walk was
+# not.
+# =============================================================================================
+
+def entry_classifications(recorded):
+    """The ``isdir`` calls that classified a directory ENTRY.
+
+    ``list_directory`` also ``isdir()``s the storage **anchor** (a drive root) to settle clause
+    (d1). That is fixed per-directory overhead, not entry classification, so it is excluded --
+    otherwise a per-entry ceiling could never be asserted exactly.
+    """
+    out = []
+    for path in recorded:
+        absolute = os.path.abspath(str(path))
+        if os.path.dirname(absolute) != absolute:
+            out.append(absolute)
+    return out
+
+
+def recording_isdir(recorded):
+    def isdir(path):
+        recorded.append(str(path))
+        return os.path.isdir(path)
+    return isdir
+
+
+def denying_listdir(targets, recorded=None):
+    """A ``listdir`` that refuses ``targets``, recording every attempt it was asked to make."""
+    wanted = {os.path.normcase(os.path.abspath(str(p))) for p in targets}
+
+    def listdir(path):
+        if recorded is not None:
+            recorded.append(str(path))
+        if os.path.normcase(os.path.abspath(str(path))) in wanted:
+            raise PermissionError(13, "Access is denied", str(path))
+        return os.listdir(path)
+    return listdir
+
+
+def lstat_without_attributes(targets):
+    """An ``lstat`` answering without ``st_file_attributes`` for ``targets`` only.
+
+    A1's accepted finding F-5, reproduced deterministically: the real failure is a metadata read
+    that fails on a live filesystem, and the consequence under test is that ``is_reparse_point``
+    then answers ``False`` for something that is in fact a junction.
+    """
+    wanted = {os.path.normcase(os.path.abspath(str(p))) for p in targets}
+
+    def lstat(path, *args, **kwargs):
+        info = os.lstat(path, *args, **kwargs)
+        if os.path.normcase(os.path.abspath(str(path))) not in wanted:
+            return info
+
+        class NoAttributes:
+            st_mode = info.st_mode
+            st_size = info.st_size
+        return NoAttributes()
+    return lstat
+
+
+def lstat_raising(targets):
+    wanted = {os.path.normcase(os.path.abspath(str(p))) for p in targets}
+
+    def lstat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(str(path))) in wanted:
+            raise PermissionError(13, "Access is denied", str(path))
+        return os.lstat(path, *args, **kwargs)
+    return lstat
+
+
+# ---------------------------------------------------------------------------------------------
+# F-1: max_directories charges an ATTEMPTED listing
+# ---------------------------------------------------------------------------------------------
+
+def test_u_f1_a_failed_directory_listing_costs_the_directory_ceiling(tmp_path):
+    """Finding F-1. A listing that fails costs the same ``listdir`` as one that succeeds.
+
+    Measured against the reviewed candidate: 2000 unlistable children were every one of them
+    attempted against a ceiling of 3, because the counter was incremented only after a successful
+    listing. The bound never fired and the walk ran to the end of the tree.
+    """
+    root = str(tmp_path / "library")
+    denied = []
+    for index in range(40):
+        child = os.path.join(root, f"d{index:02d}")
+        write_file(os.path.join(child, "clip.mp4"), b"C")
+        denied.append(child)
+    write_file(os.path.join(root, "top.mp4"), b"T")
+
+    attempts = []
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES,
+                            listdir=denying_listdir(denied, attempts), max_directories=3)
+
+    assert diag.bound_reached == "directories"
+    assert diag.complete is False
+    assert diag.directories_attempted == 3
+    assert len(attempts) == 3, (
+        f"{len(attempts)} listings were attempted against a ceiling of 3; the ceiling must be "
+        f"charged for attempts, not for successes")
+    # And the other figure keeps its own meaning: only the root listed successfully.
+    assert diag.directories_listed == 1
+
+
+def test_u_f1_directories_listed_still_counts_successes_only(tmp_path):
+    """The two figures are deliberately not merged: one is cost, the other is coverage."""
+    root = str(tmp_path / "library")
+    for name in ("good_a", "good_b"):
+        write_file(os.path.join(root, name, "clip.mp4"), b"C")
+    bad = os.path.join(root, "bad")
+    write_file(os.path.join(bad, "clip.mp4"), b"C")
+
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, listdir=denying_listdir([bad]))
+
+    assert diag.directories_listed == 3             # bad was never listed
+    assert diag.bound_reached == ""
+    assert diag.complete is False                   # an unreadable folder is incomplete coverage
+    assert len(diag.unreadable_directories) == 1
+    assert diag.directories_attempted == 4          # root + good_a + good_b + bad
+
+
+def test_u_f1_repeated_failures_cannot_grow_the_record_without_bound(tmp_path):
+    """Finding F-1's second half: the ceilings bound the walk, this bounds the RECORD of it."""
+    root = str(tmp_path / "library")
+    count = li.MAX_DIAGNOSTIC_NAMES + 25
+    denied = []
+    for index in range(count):
+        child = os.path.join(root, f"d{index:04d}")
+        os.makedirs(child)
+        denied.append(child)
+
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, listdir=denying_listdir(denied),
+                            max_directories=count + 10)
+
+    assert diag.directories_attempted == count + 1
+    assert len(diag.unreadable_directories) == li.MAX_DIAGNOSTIC_NAMES
+    assert diag.names_truncated is True
+    assert diag.complete is False, "a truncated record is not a complete account"
+
+
+def test_u_f1_a_truncated_record_says_so_in_the_read_out(tmp_path):
+    """A truncated list must never be read as the complete list of folders to fix."""
+    root = str(tmp_path / "library")
+    denied = []
+    for index in range(li.MAX_DIAGNOSTIC_NAMES + 3):
+        child = os.path.join(root, f"d{index:04d}")
+        # A file in each child, so TIER A exceeds its own ceiling and Tier B actually runs. Empty
+        # directories yield no candidate entries at all, so the scan would simply succeed.
+        write_file(os.path.join(child, "clip.mp4"), b"C")
+        denied.append(child)
+
+    item = one([(li.LIBRARY_ROLE, root)], max_entries=2, listdir=denying_listdir(denied))
+    assert item.completeness == li.INVENTORY_INCOMPLETE
+    assert item.diagnostics is not None and item.diagnostics.names_truncated is True
+    text = "\n".join(li.inventory_lines(li.LibraryInventory(roots=(item,))))
+    assert "TRUNCATED" in text
+    assert str(li.MAX_DIAGNOSTIC_NAMES) in text
+
+
+# ---------------------------------------------------------------------------------------------
+# F-2: max_entries charges every entry EXAMINED
+# ---------------------------------------------------------------------------------------------
+
+def test_u_f2_the_entry_ceiling_charges_unsupported_entries_too(tmp_path):
+    """Finding F-2, scenario A: thousands of unsupported entries and ZERO supported media.
+
+    Against the reviewed candidate the ceiling could not fire **at all** here -- 3000 ``.txt``
+    files were classified against a ceiling of 1, and the pass then reported ``complete=True``.
+    This is the exact semantics ``scan_folder``'s own docstring rules out for Tier A, and the
+    author shipped a Tier A negative control to forbid it.
+    """
+    root = str(tmp_path / "library")
+    for index in range(400):
+        write_file(os.path.join(root, f"junk{index:03d}.txt"), b"J")
+
+    recorded = []
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, isdir=recording_isdir(recorded),
+                            max_entries=5)
+
+    assert diag.bound_reached == "entries"
+    assert diag.complete is False
+    assert diag.entries_examined == 5
+    assert diag.files_seen == 0, "no supported media exists, so none may be reported"
+    assert len(entry_classifications(recorded)) == 5, (
+        "the walk classified more entries than the ceiling allowed")
+
+
+def test_u_f2_unsupported_entries_sorting_first_cannot_exhaust_the_walk(tmp_path):
+    """Finding F-2, scenario B -- and the trap that defeated the reviewer's first probe.
+
+    Tier B iterates ``sorted(listing.names)``, so a fixture whose supported files happen to sort
+    FIRST lets a media-only counter reach the ceiling early and an unbounded walk look bounded.
+    Here the unsupported entries deliberately sort ahead of the media.
+    """
+    root = str(tmp_path / "library")
+    for index in range(300):
+        write_file(os.path.join(root, f"aaa{index:03d}.txt"), b"J")
+    for index in range(4):
+        write_file(os.path.join(root, f"zzz{index}.mp4"), b"M")
+
+    recorded = []
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, isdir=recording_isdir(recorded),
+                            max_entries=6)
+
+    assert diag.bound_reached == "entries"
+    assert diag.entries_examined == 6
+    assert diag.files_seen == 0, "the ceiling fires inside the unsupported run, before any media"
+    assert len(entry_classifications(recorded)) == 6
+
+
+def test_u_f2_directories_media_and_junk_all_charge_the_same_ceiling(tmp_path):
+    """Finding F-2, scenario C: the charge is per ENTRY, whatever kind of entry it is."""
+    root = str(tmp_path / "library")
+    os.makedirs(os.path.join(root, "b_dir"))
+    write_file(os.path.join(root, "a_junk.txt"), b"J")
+    write_file(os.path.join(root, "c_clip.mp4"), b"M")
+    write_file(os.path.join(root, "d_junk.txt"), b"J")
+    write_file(os.path.join(root, "e_clip.mp4"), b"M")
+
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, max_entries=3)
+
+    # sorted: a_junk.txt, b_dir, c_clip.mp4 -- an unsupported file, a directory, a media file.
+    # The behavioural assertions come FIRST so that this test discriminates on the defect rather
+    # than on `entries_examined` simply not existing yet.
+    assert diag.bound_reached == "entries"
+    assert diag.files_seen == 1
+    assert diag.complete is False
+    assert diag.entries_examined == 3
+
+
+@pytest.mark.parametrize("ceiling,bound,media", [(6, "", 2), (5, "entries", 1), (7, "", 2)])
+def test_u_f2_exactly_the_ceiling_completes_and_one_fewer_reports_the_bound(
+        tmp_path, ceiling, bound, media):
+    """Finding F-2, scenarios D and E. Exactly N entries may finish; an N+1st reports the bound."""
+    root = str(tmp_path / "library")
+    for index in range(4):
+        write_file(os.path.join(root, f"aaa{index}.txt"), b"J")
+    for index in range(2):
+        write_file(os.path.join(root, f"zzz{index}.mp4"), b"M")
+
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, max_entries=ceiling)
+
+    assert diag.bound_reached == bound
+    assert diag.files_seen == media
+    assert diag.complete is (bound == "")
+    assert diag.entries_examined == min(ceiling, 6)
+
+
+def test_u_f2_files_seen_and_bytes_seen_still_mean_supported_media(tmp_path):
+    """The figure the bound charges and the figure an operator reads stay separate."""
+    root = str(tmp_path / "library")
+    for index in range(10):
+        write_file(os.path.join(root, f"junk{index}.txt"), b"JJJJJJJJ")
+    expected = 0
+    for index in range(3):
+        payload = b"M" * (20 + index)
+        write_file(os.path.join(root, f"clip{index}.mp4"), payload)
+        expected += len(payload)
+
+    state = li.probe_root(root)
+    diag = li.diagnose_root(state, suffixes=SUFFIXES)
+
+    assert diag.entries_examined == 13
+    assert diag.files_seen == 3
+    assert diag.bytes_seen == expected, "bytes must not pick up the unsupported entries"
+    assert diag.complete is True
+
+
+def test_u_f2_the_filtered_and_unfiltered_paths_now_bound_identically(tmp_path):
+    """Finding F-2, scenario F -- the defect's signature, as a control.
+
+    The old behaviour was correct **only** when there was no filter at all, and
+    ``inspect_library`` always passes a non-empty ``suffixes`` (the GUI plan passes
+    ``clips_review.SERVABLE_SUFFIXES``), so the one configuration production never uses was the
+    only correct one. Both must now agree.
+    """
+    root = str(tmp_path / "library")
+    for index in range(200):
+        write_file(os.path.join(root, f"junk{index:03d}.txt"), b"J")
+    state = li.probe_root(root)
+
+    unfiltered = li.diagnose_root(state, suffixes=(), max_entries=4)
+    filtered = li.diagnose_root(state, suffixes=SUFFIXES, max_entries=4)
+
+    assert unfiltered.bound_reached == filtered.bound_reached == "entries"
+    assert unfiltered.entries_examined == filtered.entries_examined == 4
+    assert unfiltered.complete is False and filtered.complete is False
+
+
+# ---------------------------------------------------------------------------------------------
+# F-3: an undecidable child directory is refused, not entered
+# ---------------------------------------------------------------------------------------------
+
+def contained_alias_fixture(tmp_path, files=3):
+    """``root/real`` holding ``files`` media, plus ``root/alias`` as a junction onto it."""
+    root = str(tmp_path / "library")
+    real = os.path.join(root, "real")
+    for index in range(files):
+        write_file(os.path.join(real, f"m{index}.mp4"), b"X" * 10)
+    alias = make_junction(os.path.join(root, "alias"), real)
+    if alias is None:
+        pytest.skip("junctions unavailable on this platform")
+    return root, real, alias
+
+
+def test_u_f3_a_contained_alias_with_readable_metadata_is_named_and_not_entered(tmp_path):
+    """Scenario A: the already-correct baseline, so the scenarios below are a real delta."""
+    root, _real, _alias = contained_alias_fixture(tmp_path)
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES)
+
+    assert diag.files_seen == 3, "three distinct files exist; the alias must not double them"
+    assert [os.path.basename(p) for p in diag.skipped_links] == ["alias"]
+    assert diag.undecidable_links == ()
+    assert diag.complete is True
+
+
+def test_u_f3_a_contained_alias_with_missing_attributes_is_refused_not_entered(tmp_path):
+    """Finding F-3, scenario B. The measured defect, and why containment alone is not enough.
+
+    Against the reviewed candidate this reported **six** files for three, with
+    ``skipped_links=()`` and ``complete=True``: ``is_reparse_point`` degraded to ``False``,
+    ``realpath`` resolved the alias back inside the root, containment held, and ``may_descend``
+    returned ENTER -- so the subtree was walked twice and the result still called itself a lower
+    bound. Resolved containment cannot separate a *contained* alias from a real folder, because
+    both resolve inside the root.
+    """
+    root, _real, alias = contained_alias_fixture(tmp_path)
+    blind = lstat_without_attributes([alias])
+
+    # The predicate genuinely degrades, exactly as A1's accepted finding F-5 says...
+    assert li.is_reparse_point(alias) is True
+    assert li.is_reparse_point(alias, lstat=blind) is False
+
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES, lstat=blind)
+
+    assert diag.files_seen == 3, "the alias subtree was counted twice"
+    assert [os.path.basename(p) for p in diag.undecidable_links] == ["alias"]
+    assert diag.skipped_links == (), (
+        "nothing was positively identified as a link, so nothing may be reported as one")
+    assert diag.complete is False, "a refused subtree is incomplete coverage and must say so"
+    assert diag.is_lower_bound is True
+
+
+def test_u_f3_negative_control_resolved_containment_alone_would_have_entered(tmp_path):
+    """Proof the new gate does the work, rather than the fixture being kind.
+
+    ``may_descend`` -- unchanged, accepted A1 code -- still APPROVES the blinded contained alias.
+    Tier B refuses it anyway. Remove the link-level gate and this fixture goes straight back to
+    double-counting, which is what makes this a discriminating control and not a restatement.
+    """
+    root, _real, alias = contained_alias_fixture(tmp_path)
+    blind = lstat_without_attributes([alias])
+    state = li.probe_root(root)
+
+    decision = li.may_descend(state, alias, lstat=blind)
+    assert decision.allowed is True
+    assert decision.action == li.ENTER
+    assert decision.is_reparse is False
+
+    diag = li.diagnose_root(state, suffixes=SUFFIXES, lstat=blind)
+    assert diag.files_seen == 3
+    assert diag.undecidable_links != ()
+
+
+def test_u_f3_a_contained_alias_whose_lstat_raises_is_refused(tmp_path):
+    """Scenario C: an unreadable attribute and an unreadable entry fail closed the same way."""
+    root, _real, alias = contained_alias_fixture(tmp_path)
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES, lstat=lstat_raising([alias]))
+
+    assert diag.files_seen == 3
+    assert [os.path.basename(p) for p in diag.undecidable_links] == ["alias"]
+    assert diag.complete is False
+
+
+def test_u_f3_an_escaping_alias_is_still_refused_both_ways(tmp_path):
+    """Scenario D, as a no-regression control: the accepted behaviour must not move.
+
+    An escaping alias is refused whether or not its metadata reads, and it keeps landing in the
+    category it always did -- ``skipped_links`` when identified as a link, ``outside_root`` when
+    only containment could settle it.
+    """
+    root = str(tmp_path / "library")
+    write_file(os.path.join(root, "kept.mp4"), b"K")
+    far = str(tmp_path / "outside")
+    write_file(os.path.join(far, "ESCAPED.mp4"), b"X" * 99)
+    link = make_junction(os.path.join(root, "escape"), far)
+    if link is None:
+        pytest.skip("junctions unavailable on this platform")
+    state = li.probe_root(root)
+
+    readable = li.diagnose_root(state, suffixes=SUFFIXES)
+    assert readable.files_seen == 1
+    assert [os.path.basename(p) for p in readable.skipped_links] == ["escape"]
+    assert readable.outside_root == ()
+
+    blind = li.diagnose_root(state, suffixes=SUFFIXES, lstat=lstat_without_attributes([link]))
+    assert blind.files_seen == 1
+    assert [os.path.basename(p) for p in blind.outside_root] == ["escape"]
+    assert blind.skipped_links == ()
+
+    for diag in (readable, blind):
+        named = diag.skipped_links + diag.outside_root + diag.undecidable_links
+        assert all("ESCAPED" not in path for path in named)
+
+
+def test_u_f3_a_self_referential_alias_is_never_entered(tmp_path):
+    """Scenario E. Against the reviewed candidate this reported 50 files for one distinct file.
+
+    The walk terminated only because ``max_directories`` eventually stopped it -- a loop bounded
+    by a ceiling rather than by containment, with every cycle counting the same file again.
+    """
+    root = str(tmp_path / "library")
+    write_file(os.path.join(root, "only.mp4"), b"Y" * 7)
+    loop = make_junction(os.path.join(root, "loop"), root)
+    if loop is None:
+        pytest.skip("junctions unavailable on this platform")
+
+    for lstat_fn in (os.lstat, lstat_without_attributes([loop]), lstat_raising([loop])):
+        diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES, lstat=lstat_fn,
+                                max_directories=50)
+        assert diag.files_seen == 1, "the loop was entered and counted the same file again"
+        assert diag.bound_reached != "directories", (
+            "termination came from the ceiling, not from containment")
+        assert diag.directories_attempted == 1
+
+
+def test_u_f3_an_ordinary_nested_directory_is_still_traversed(tmp_path):
+    """Scenario F. The gate must refuse aliases, not folders."""
+    root = str(tmp_path / "library")
+    write_file(os.path.join(root, "top.mp4"), b"T")
+    write_file(os.path.join(root, "one", "a.mp4"), b"A")
+    write_file(os.path.join(root, "one", "two", "b.mp4"), b"B")
+
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES)
+    assert diag.files_seen == 3
+    assert diag.directories_attempted == 3
+    assert diag.directories_listed == 3
+    assert diag.undecidable_links == () and diag.skipped_links == ()
+    assert diag.complete is True
+
+
+def test_u_f3_a_selected_root_that_is_itself_a_junction_still_works(tmp_path):
+    """Scenario G. A root reached through a junction is legitimate and already resolved by
+    ``probe_root``; the new gate applies to CHILDREN and must not refuse the root itself."""
+    target = str(tmp_path / "storage")
+    for index in range(3):
+        write_file(os.path.join(target, f"c{index}.mp4"), b"C")
+    write_file(os.path.join(target, "deeper", "d.mp4"), b"D")
+    link = make_junction(str(tmp_path / "library"), target)
+    if link is None:
+        pytest.skip("junctions unavailable on this platform")
+
+    diag = li.diagnose_root(li.probe_root(link), suffixes=SUFFIXES)
+    assert diag.files_seen == 4
+    assert diag.complete is True
+    assert diag.undecidable_links == ()
+
+    item = one([(li.LIBRARY_ROLE, link)])
+    assert item.completeness == li.INVENTORY_COMPLETE
+    assert item.totals.ready == 4
+
+
+# ---------------------------------------------------------------------------------------------
+# F-5: what the clause-(d) re-probe asks, and what the read-out therefore owes the operator
+# ---------------------------------------------------------------------------------------------
+
+def test_u_f5_a_root_whose_counted_storage_is_replaced_loses_its_total(tmp_path):
+    """Finding F-5, part 1: the shape where the identity comparison DOES fire.
+
+    Reviewer mutant M9 deleted the ``again.root_key == item.root.root_key`` comparison and
+    survived 231 tests, because the re-probe is handed the already-resolved ``root.real`` and the
+    equality then looks tautological. It is not: when the counted storage is itself replaced by a
+    different folder, ``positively_observed`` is still ``True`` and the key comparison is the
+    **only** thing left to catch it.
+    """
+    root = str(tmp_path / "library")
+    write_file(os.path.join(root, "clip.mp4"), b"C")
+    elsewhere = str(tmp_path / "somewhere_else")
+    write_file(os.path.join(elsewhere, "other.mp4"), b"O")
+
+    calls = []
+    real_probe = li.probe_root
+
+    def probe(path, **kwargs):
+        calls.append(str(path))
+        if len(calls) == 1:
+            return real_probe(path, **kwargs)
+        # A perfectly good, positively observed folder -- just a DIFFERENT one.
+        return real_probe(elsewhere, **kwargs)
+
+    # The discriminator: the re-probe's own state passes every other clause-(d) test.
+    assert real_probe(elsewhere).positively_observed is True
+
+    item = one([(li.LIBRARY_ROLE, root)], probe=probe)
+    assert item.completeness == li.INVENTORY_INCOMPLETE
+    assert item.reason == li.REASON_ROOT_LOST
+    assert item.totals is None
+    assert item.counts is None
+
+
+def test_u_f5_a_selected_junction_repointed_mid_pass_keeps_a_stamped_count_of_what_it_counted(
+        tmp_path):
+    """Finding F-5, part 2: the shape the re-probe deliberately does NOT catch, documented.
+
+    The re-probe asks *"is the storage I counted still observable"*, not *"does the selected path
+    still lead here"*. So a selected junction repointed after Tier A, with its original target
+    left reachable, keeps a total that belongs to the previous target.
+
+    That is an **observation of target A**, not an assertion about the junction's current target,
+    and it is truthful on those terms: ``observed_at`` stamps the window, and ``requested`` and
+    ``root.real`` are both retained and differ. What this test pins is the disclosure -- a figure
+    must be attributable to the storage it came off, or the distinction is academic.
+    """
+    target_a = str(tmp_path / "A")
+    for index in range(3):
+        write_file(os.path.join(target_a, f"a{index}.mp4"), b"A")
+    target_b = str(tmp_path / "B")
+    for index in range(7):
+        write_file(os.path.join(target_b, f"b{index}.mp4"), b"B")
+    link = make_junction(str(tmp_path / "library"), target_a)
+    if link is None:
+        pytest.skip("junctions unavailable on this platform")
+
+    def repointing_scan(*args, **kwargs):
+        result = scan_folder(*args, **kwargs)
+        os.rmdir(link)                                    # removes the junction, not its target
+        assert make_junction(link, target_b) is not None
+        return result
+
+    result = inspect([(li.LIBRARY_ROLE, link)], scan=repointing_scan, clock=lambda: 777.0)
+    item = result.roots[0]
+
+    # The repoint really happened, so the drift under discussion is real.
+    assert os.path.normcase(os.path.realpath(link)) == os.path.normcase(
+        os.path.realpath(target_b))
+
+    assert item.completeness == li.INVENTORY_COMPLETE
+    assert item.totals.ready == 3, "the published total is A's count, which is what was counted"
+    assert item.totals.ready != 7, "and it is NOT a count of whatever the path now leads to"
+    assert result.observed_at == 777.0, "the window the finding describes is stamped"
+
+    # The disclosure: both paths are retained, they differ, and the read-out says so.
+    assert os.path.normcase(item.requested) == os.path.normcase(link)
+    assert os.path.normcase(item.root.real) == os.path.normcase(os.path.realpath(target_a))
+    text = "\n".join(li.inventory_lines(result))
+    assert os.path.basename(target_a) in text
+    assert "->" in text and "the storage these figures came off" in text
+
+
+def test_u_f5_when_the_counted_target_stops_being_observable_the_total_is_retracted(tmp_path):
+    """Finding F-5's companion: the same fixture shape, with target A genuinely gone.
+
+    No injection at all -- the junction is removed and its target renamed away between Tier A and
+    finalisation, and the end-of-pass re-probe of ``root.real`` then finds nothing to confirm.
+    """
+    target_a = str(tmp_path / "A")
+    for index in range(3):
+        write_file(os.path.join(target_a, f"a{index}.mp4"), b"A")
+    link = make_junction(str(tmp_path / "library"), target_a)
+    if link is None:
+        pytest.skip("junctions unavailable on this platform")
+
+    def vanishing_scan(*args, **kwargs):
+        result = scan_folder(*args, **kwargs)
+        os.rmdir(link)
+        os.rename(target_a, str(tmp_path / "A_moved_away"))
+        return result
+
+    item = one([(li.LIBRARY_ROLE, link)], scan=vanishing_scan)
+    assert item.completeness == li.INVENTORY_INCOMPLETE
+    assert item.reason == li.REASON_ROOT_LOST
+    assert item.totals is None
+
+
+def test_u_f5_the_read_out_names_the_folder_the_figures_came_off(tmp_path):
+    """Finding F-5, part 3. The read-out printed only the ROLE, so it could not disclose drift."""
+    plain = str(tmp_path / "plain")
+    write_file(os.path.join(plain, "clip.mp4"), b"C")
+    text = "\n".join(li.inventory_lines(inspect([(li.LIBRARY_ROLE, plain)])))
+    assert f"folder: {plain}" in text
+    assert "->" not in text, "a root that resolved to itself must not claim a resolution"
+
+    target = str(tmp_path / "storage")
+    write_file(os.path.join(target, "clip.mp4"), b"C")
+    link = make_junction(str(tmp_path / "library"), target)
+    if link is None:
+        pytest.skip("junctions unavailable on this platform")
+    text = "\n".join(li.inventory_lines(inspect([(li.LIBRARY_ROLE, link)])))
+    assert link in text and os.path.realpath(target) in text
+    assert "->" in text
+
+
+# ---------------------------------------------------------------------------------------------
+# negative controls for the remediation itself
+# ---------------------------------------------------------------------------------------------
+
+def test_u_negative_control_a_media_only_entry_counter_would_be_caught(tmp_path):
+    """Mirror of Tier A's ``test_f_the_ceiling_counts_discovered_entries_not_supported_files``.
+
+    Had the entry counter stayed behind the suffix filter, ``entries_examined`` would equal
+    ``files_seen`` and this fixture -- which has no media at all -- could never reach a bound.
+    """
+    root = str(tmp_path / "library")
+    for index in range(50):
+        write_file(os.path.join(root, f"junk{index:02d}.txt"), b"J")
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES, max_entries=2)
+    assert diag.entries_examined == 2
+    assert diag.files_seen == 0
+    assert diag.entries_examined != diag.files_seen
+    assert diag.bound_reached == "entries"
+
+
+def test_u_negative_control_a_success_only_directory_counter_would_be_caught(tmp_path):
+    """Had ``max_directories`` stayed on successful listings, ``directories_attempted`` would equal
+    ``directories_listed`` and a tree of unlistable folders would consume no budget at all."""
+    root = str(tmp_path / "library")
+    denied = []
+    for index in range(20):
+        child = os.path.join(root, f"d{index:02d}")
+        os.makedirs(child)
+        denied.append(child)
+    diag = li.diagnose_root(li.probe_root(root), suffixes=SUFFIXES,
+                            listdir=denying_listdir(denied), max_directories=4)
+    assert diag.directories_attempted == 4
+    assert diag.directories_listed == 1
+    assert diag.directories_attempted != diag.directories_listed
+    assert diag.bound_reached == "directories"
+
+
+def test_u_negative_control_the_tier_b_bounds_are_announced_not_silent(tmp_path):
+    """Truncation and refusal are reported, never a quietly shorter answer."""
+    assert li.MAX_DIAGNOSTIC_NAMES > 0
+    assert li.MAX_DIAGNOSTIC_DIRECTORIES > 0 and li.MAX_DIAGNOSTIC_ENTRIES > 0
+    empty = li.Diagnostics()
+    assert empty.names_truncated is False
+    assert empty.undecidable_links == ()
+    assert empty.directories_attempted == 0 and empty.entries_examined == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# F-3, the platform halves of the gate -- both branches, including the one Windows never runs
+# ---------------------------------------------------------------------------------------------
+
+def test_u_f3_the_gate_refuses_a_missing_attribute_on_windows_and_allows_it_on_posix(monkeypatch,
+                                                                                    tmp_path):
+    """``st_file_attributes`` is Windows-only, so the two platforms need different answers.
+
+    On Windows a junction cannot be told from a folder without that field, so a missing field is
+    undecidable and descent is refused. On POSIX the field does not exist at all and ``S_ISLNK``
+    is the only aliasing primitive to detect, so a missing field means an ordinary directory and
+    traversal must still work -- otherwise this gate would refuse every folder on POSIX.
+
+    ``os.name`` is read at call time, which is what makes the branch Windows never executes
+    testable here at all.
+    """
+    folder = str(tmp_path / "plain")
+    os.makedirs(folder)
+    blind = lstat_without_attributes([folder])
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert li._link_evidence(folder, lstat=blind) == li._LINK_UNDECIDABLE
+
+    monkeypatch.setattr(os, "name", "posix")
+    assert li._link_evidence(folder, lstat=blind) == li._LINK_PLAIN
+
+    # And with the field present and the reparse bit clear, both platforms agree it is a folder.
+    monkeypatch.setattr(os, "name", "nt")
+    assert li._link_evidence(folder) == li._LINK_PLAIN
+
+
+def test_u_f3_the_gate_recognises_a_symlink_from_st_mode_alone(tmp_path):
+    """POSIX must be covered without requiring a Windows-only attribute.
+
+    ``S_ISLNK`` is checked **before** ``st_file_attributes`` is consulted, so a symbolic link is an
+    alias on either platform even when no attribute field exists.
+    """
+    import stat as stat_module
+
+    folder = str(tmp_path / "plain")
+    os.makedirs(folder)
+
+    class SymlinkMode:
+        st_mode = stat_module.S_IFLNK | 0o777
+        st_size = 0
+
+    assert li._link_evidence(folder, lstat=lambda *a, **k: SymlinkMode()) == li._LINK_ALIAS
+
+    # A real directory mode, with no attribute field at all, is not an alias.
+    class DirectoryMode:
+        st_mode = stat_module.S_IFDIR | 0o755
+        st_size = 0
+
+    assert li._link_evidence(folder, lstat=lambda *a, **k: DirectoryMode()) in (
+        li._LINK_PLAIN, li._LINK_UNDECIDABLE)
+
+
+def test_u_f3_the_gate_has_exactly_three_answers_and_never_invents_one(tmp_path):
+    """"I could not tell" must stay a distinct answer from both of the others."""
+    assert len({li._LINK_PLAIN, li._LINK_ALIAS, li._LINK_UNDECIDABLE}) == 3
+
+    folder = str(tmp_path / "plain")
+    os.makedirs(folder)
+    answers = {
+        li._link_evidence(folder),
+        li._link_evidence(folder, lstat=lstat_raising([folder])),
+    }
+    assert li._LINK_PLAIN in answers
+    assert li._LINK_UNDECIDABLE in answers, "an unreadable lstat must not read as a plain folder"
+
+
+def test_u_f5_the_read_out_states_the_observation_window_only_when_there_is_one(tmp_path):
+    """Point-in-time, stated when known and never fabricated when it is not.
+
+    Every figure describes a window beginning at ``observed_at``, so a read-out that implies the
+    present moment overstates what was measured. But a timestamp invented because none was
+    supplied would be worse than silence, so the line is omitted entirely without a clock.
+    """
+    root = str(tmp_path / "library")
+    write_file(os.path.join(root, "clip.mp4"), b"C")
+
+    stamped = li.inventory_lines(inspect([(li.LIBRARY_ROLE, root)], clock=lambda: 4242.5))
+    assert stamped[0].startswith("as observed at 4242.5")
+    assert "point in time" in stamped[0]
+
+    unstamped = li.inventory_lines(inspect([(li.LIBRARY_ROLE, root)]))
+    assert not any("as observed at" in line for line in unstamped), (
+        "a timestamp was printed although no clock was injected")
+    assert unstamped[0].startswith(li.LIBRARY_ROLE)

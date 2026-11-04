@@ -238,17 +238,61 @@ def test_d_non_positive_integers_raise_value_error(tmp_path, bad):
 
 @pytest.mark.parametrize("bad", [1.5, "10", [], object(), 2.0])
 def test_d_non_integers_raise_value_error(tmp_path, bad):
+    """`raises(ValueError)` ALONE proves nothing here -- see the bool test below for why."""
     root, _ = mixed_tree(tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as caught:
         scan_folder(root, recursive=True, detect_duplicates=False, max_entries=bad)
+    assert not isinstance(caught.value, InputScanError)
+    assert "max_entries" in str(caught.value)
 
 
 @pytest.mark.parametrize("bad", [True, False])
 def test_d_bool_is_rejected_even_though_it_is_an_int(tmp_path, bad):
-    """`isinstance(True, int)` is True in Python, so `max_entries=True` would silently mean 1."""
+    """`isinstance(True, int)` is True in Python, so `max_entries=True` would silently mean 1.
+
+    The `not isinstance(..., InputScanError)` guard is the whole test, and review finding F-6 is
+    why: `InputScanError` subclasses `ValueError`, so a bare `pytest.raises(ValueError)` ALSO
+    catches `InputScanLimitExceeded`. Restore bool acceptance and `max_entries=True` becomes a
+    ceiling of 1, the fixture tree exceeds it, and the limit refusal satisfies the bare `raises`
+    -- so the test passed while the behaviour it names was gone. The guard distinguishes
+    "rejected as a bad argument" from "accepted, then the scan refused", which is the only
+    difference that matters.
+    """
     root, _ = mixed_tree(tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as caught:
         scan_folder(root, recursive=True, detect_duplicates=False, max_entries=bad)
+    assert not isinstance(caught.value, InputScanError), (
+        "a limit refusal was accepted as proof of argument validation: the ceiling was USED, "
+        "not rejected")
+    assert "max_entries" in str(caught.value)
+    assert "bool" in str(caught.value)
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.5, "10", 0, -1])
+def test_d_every_invalid_ceiling_is_rejected_before_the_filesystem_is_touched(tmp_path,
+                                                                             monkeypatch, bad):
+    """The validation half of F-6, across every rejected shape rather than just `0`.
+
+    A refusal that happened only after a traversal would be the scan talking, not the validator,
+    and the two are told apart here by the filesystem staying untouched.
+    """
+    root, _ = mixed_tree(tmp_path)
+    touched = []
+    for name in ("exists", "isdir"):
+        real = getattr(os.path, name)
+
+        def spy(path, _real=real, _name=name):
+            touched.append(_name)
+            return _real(path)
+
+        monkeypatch.setattr(os.path, name, spy)
+    monkeypatch.setattr(os, "walk", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("the tree was walked despite an invalid ceiling")))
+
+    with pytest.raises(ValueError) as caught:
+        scan_folder(root, recursive=True, detect_duplicates=False, max_entries=bad)
+    assert not isinstance(caught.value, InputScanError)
+    assert touched == []
 
 
 def test_d_validation_happens_before_the_filesystem_is_touched(tmp_path, monkeypatch):
