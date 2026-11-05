@@ -40,15 +40,45 @@ reused forever (the defect `_cache_entry_is_complete` was centralised to fix).
   is never evidence about the record.
 
 **Why a separate module rather than `read_records` inside `library_inventory.py`,** which is where
-the design-of-record placed it: that module's imports are pinned by an existing A1 test to exactly
-``{__future__, os, stat, dataclasses}`` (`test_library_inventory.py`, the "stdlib set a1 pinned"
-guard), and a record reader needs ``json``. Adding it there would mean amending a safety assertion
-that exists to stop exactly that kind of creep. So A3 is its own file and **reuses** A1/A2 through
-ordinary intra-package imports — no second resolver, no second scanner, no second containment rule.
+the design-of-record placed it: an existing A1 test constrains that module's imports to a **subset**
+of ``{__future__, os, stat, dataclasses}`` (`test_library_inventory.py`,
+``test_j_the_module_imports_the_standard_library_only``, whose assertion is ``imported <= {…}``, not
+an exact pin), and a record reader needs ``json`` — which is not in that allowed set. Adding it there
+would mean amending a safety assertion that exists to stop exactly that kind of creep. So A3 is its
+own file and **reuses** A1/A2 through ordinary intra-package imports — no second resolver, no second
+scanner, no second containment rule.
 
 Stdlib only (``json``, ``os``) plus A1/A2, so CLAUDE.md's hard rule holds and every branch is
 testable on a bare interpreter. No clock and no randomness: the observation window comes from an
 injected ``clock`` or is simply absent.
+
+----
+
+**What this module does NOT guarantee.** Stated here because a read-only inventory whose report
+overclaims is worse than one that reports less. Each of these was independently reproduced, and each
+is now bounded and disclosed rather than hidden.
+
+* **Record identity is stat identity, never content equivalence.** Rung 4 detects a file that moved
+  underneath the pass by comparing ``(st_size, st_ino, st_dev)`` captured at the size gate — measured
+  40/40 against the only writer this product has (`video_analysis._save_cache` publishes through a
+  unique temp file and ``os.replace``, so the inode always changes), versus 5/40 for
+  ``st_mtime_ns``, which is why mtime is deliberately not the discriminator. It is **not** proof of
+  content equality: a same-size rewrite performed **in place** — a hand-edit; no writer in this
+  product does that — changes neither size nor inode and is undetectable here. A known residual, not
+  a claim.
+* **The per-record ceiling is enforced on the bytes this pass consumed**, so a record that grows after
+  its size gate is refused rather than parsed, and never parsed as a truncated prefix. The *read* is
+  bounded in **characters** (``max_record_bytes + 1``), because the single ``open`` here is text mode;
+  worst-case I/O is therefore up to four bytes per character under UTF-8. The *verdict* is exact
+  regardless: the ceiling is compared against the consumed text's encoded byte length.
+* **The delegated transport re-read cannot be bounded from here at all.** `analysis_cache.looks_reusable`
+  reopens the path itself, and changing that is outside this module's contract. Its cost is charged as
+  a **stat-time estimate**, a growing file can exceed that estimate during delegation, and the identity
+  re-observation afterwards can only *report* the change — it cannot retract bytes already read.
+* **Rung 6 is lexical containment inside a positively observed root.** It never stats a source, so it
+  says nothing whatsoever about whether that source exists.
+* ``listdir`` materialises one whole directory before any per-entry ceiling can apply, so the floor
+  cost of a pass is the size of that listing. No figure here is a wall-clock or peak-memory bound.
 """
 
 from __future__ import annotations
@@ -59,9 +89,10 @@ import stat as stat_module
 from dataclasses import dataclass, field
 
 from beatsync_fork.library_inventory import (
+    ACCESS_DENIED,
+    PRESENT,
     _LINK_ALIAS,
     _LINK_PLAIN,
-    _LINK_UNDECIDABLE,
     _link_evidence,
     is_within,
 )
@@ -155,7 +186,13 @@ TRANSPORT_UNAVAILABLE = "transport_unavailable"
 # rung 6 -- source scope
 # ---------------------------------------------------------------------------------------------
 
-#: The recorded source resolves inside one of the supplied, verified inspection roots.
+#: The recorded source resolves inside one of the **positively observed** inspection roots — a root
+#: A1 actually saw (:data:`library_inventory.PRESENT`, or :data:`library_inventory.ACCESS_DENIED`:
+#: there and merely refused us). This is a *containment* claim about that root's storage and nothing
+#: more: it does not assert the source exists, and A3 never stats it. A root that A1 could not
+#: positively observe — unreachable, configured-but-never-created, or simply not inspected —
+#: contributes no identity at all, so it can neither manufacture this answer nor
+#: :data:`SCOPE_OUT`; see :func:`_root_is_verified`.
 SCOPE_IN = "scope_in"
 #: It resolves outside every supplied root. A statement about this inspection's **reach**; never
 #: "missing", never "obsolete", never "deletable".
@@ -288,11 +325,37 @@ class RecordInventory:
     complete_counts: dict = field(default_factory=dict)
     completeness_assessed: bool = False
     analysis_mode: str = ""
+    #: Parsed records whose completion authority **refused to answer** (it raised). Counted here
+    #: rather than in :attr:`complete_counts`, which carries only verdicts the authority actually
+    #: gave, so that ``sum(complete_counts.values()) + completion_unavailable`` accounts for every
+    #: parsed record. A raising authority is the absence of a decision, and
+    #: :attr:`complete_records` withholds the folder total while any of these exist.
+    completion_unavailable: int = 0
 
     # rung 6
     scope_counts: dict = field(default_factory=dict)
     scope_assessed: bool = False
+    #: The ``root_key`` of every inspection root A1 **positively observed**. These, and only these,
+    #: are what rung 6 compared against.
     inspection_roots: tuple = ()
+    #: Inputs that were supplied as inspection roots but are **not** verified root identities: a
+    #: bare path string (never probed), or a ``RootState`` whose own verdict is not a positive
+    #: observation of its storage. They are reported so the caller can see they were passed, and
+    #: they deliberately take **no** part in any scope verdict.
+    unverified_roots: tuple = ()
+
+    #: Did the entry loop run to completion? ``False`` means it stopped early — a ceiling, or the
+    #: caller asking it to stop — so the per-entry figures cover only what it reached. This is
+    #: **enumeration**, which is a different question from whether every requested rung answered
+    #: (:attr:`assessments_complete`) and from whether the detail lists are exhaustive
+    #: (:attr:`details_complete`).
+    entries_complete: bool = False
+    #: Did every rung the caller **requested** actually answer, for every record this pass parsed?
+    #: ``False`` when a byte budget prevented a delegated transport check, when a file moved while
+    #: being inspected, or when a completion authority raised. The counts remain honest either way —
+    #: they say ``transport_unavailable`` and :attr:`completion_unavailable` — but a consumer that
+    #: needs every rung answered must read this rather than infer it from the counts.
+    assessments_complete: bool = False
 
     # containment refusals -- never read, by construction
     skipped_aliases: tuple = ()
@@ -321,19 +384,81 @@ class RecordInventory:
         return int(self.parse_counts.get(PARSE_OK, 0))
 
     @property
+    def completion_accounted(self) -> int:
+        """Parsed records whose completion question reached an outcome of **any** kind.
+
+        The invariant worth asserting is ``completion_accounted == records_parsed`` whenever rung 5
+        was requested: every parsed record is either a verdict in :attr:`complete_counts` or an
+        authority that refused to answer in :attr:`completion_unavailable`. Without this term the
+        verdict counter could silently under-total.
+        """
+        return int(sum(self.complete_counts.values())) + int(self.completion_unavailable)
+
+    @property
     def complete_records(self) -> int | None:
-        """How many records are complete, or ``None`` when that was never assessed.
+        """How many records are complete, or ``None`` when that figure was not established.
 
         ``None`` rather than ``0`` is deliberate and is the same discipline A2's ``totals`` uses: a
-        figure that was not established must not be readable as a measurement of zero.
+        figure that was not established must not be readable as a measurement of zero. Two distinct
+        situations withhold it, and neither may be rounded to a number:
+
+        * rung 5 was never assessed at all (no authority, or no mode), and
+        * at least one parsed record's authority **raised**, so the count of complete records is
+          not a count of this folder's complete records. The verdicts that *were* given remain
+          available, explicitly labelled, in :attr:`complete_counts`.
+
+        A partial pass — one a ceiling or a cooperative stop cut short — is different again: every
+        record it reached was genuinely judged, so the figure IS reported, and
+        :attr:`authoritative` is what says it is not a folder total.
         """
         if not self.completeness_assessed:
+            return None
+        if self.completion_unavailable:
             return None
         return int(self.complete_counts.get(COMPLETE_YES, 0))
 
     @property
+    def details_complete(self) -> bool:
+        """Are both detail lists exhaustive — the problem names AND the per-record details?"""
+        return not (self.names_truncated or self.records_truncated)
+
+    @property
+    def counts_exact(self) -> bool:
+        """Do the aggregate counts cover the WHOLE folder, whatever the detail lists show?
+
+        This is the figure a large cache needs. With more records than ``max_reported_names`` the
+        per-record detail list is a shortened *display* — :attr:`records_truncated` says so — while
+        every count (:attr:`entries_listed`, :attr:`records_recognised`, :attr:`parse_counts`,
+        :attr:`contract_counts`, :attr:`transport_counts`, :attr:`complete_counts`,
+        :attr:`scope_counts`) still totals the entire directory. Reading a shortened display as the
+        whole cache, or reading a withheld figure as zero, are the two misreadings this property
+        exists to prevent.
+        """
+        return bool(self.entries_complete and self.state in (CACHE_PRESENT, CACHE_EMPTY))
+
+    @property
     def authoritative(self) -> bool:
-        """May these counts be published as totals for this folder? Only a complete pass may."""
+        """May these counts be published as totals for this folder? Only a complete pass may.
+
+        Deliberately conservative, and deliberately **not** the same question as
+        :attr:`counts_exact`. The two truncation indicators are not symmetric, and the asymmetry is
+        a judgement about evidence rather than an oversight:
+
+        * :attr:`names_truncated` cuts a *problem-name* list. For an alias, an escape, undecidable
+          link metadata, a vanished entry or a changed one, that list is the **only** record that the
+          entry existed at all — those entries never reach :attr:`records`. Truncating it destroys
+          evidence that exists nowhere else, so the pass must not call itself complete. It raises
+          :data:`BOUND_NAMES`, which makes :attr:`complete` — and therefore this — ``False``.
+        * :attr:`records_truncated` shortens the per-record detail *display*, every element of which
+          is already counted in the aggregate counters. It carries no unique evidence, so it does
+          **not** raise a bound and does not clear this flag. :attr:`details_complete` reports it,
+          and a consumer rendering :attr:`records` must consult it before implying the list is the
+          whole cache.
+
+        So: ``authoritative`` answers "may I publish these as folder totals *and* show my full
+        working?"; :attr:`counts_exact` answers "do the numbers cover the whole folder?"; and
+        :attr:`assessments_complete` answers "did every rung I asked for actually answer?".
+        """
         return bool(self.complete and self.state in (CACHE_PRESENT, CACHE_EMPTY))
 
     @property
@@ -390,29 +515,92 @@ def _resolve(path: str, realpath) -> str:
     return resolved if isinstance(resolved, str) else ""
 
 
-def _root_keys(inspection_roots, realpath) -> tuple:
-    """The resolved identity of each supplied root, in A1's ``root_key`` form.
+def _identity(info, size: int) -> tuple:
+    """One file's stat identity: ``(size, inode, device)``, each defaulted rather than assumed.
 
-    Accepts A1 ``RootState`` objects -- the normal caller -- or plain strings, and takes the
-    **resolved** location in both cases. Resolving before deriving identity is A1's F-1 lesson: a
-    root selected as ``E:\\LibraryLink`` may be a junction onto ``D:\\ActualLibrary``, and a scope
-    answer about the typed path would be an answer about the wrong storage.
-
-    A root with no establishable resolved location does not participate: it cannot contain anything
-    we could prove, so folding it in would manufacture a scope verdict out of nothing.
+    Size alone is **not** an identity. A record replaced by a different record of exactly equal
+    byte length is invisible to a size comparison, and `video_analysis._save_cache` publishes every
+    record by ``os.replace`` of a fresh temp file, so the inode is the field that actually moves:
+    measured 40/40 on that writer, against 5/40 for ``st_mtime_ns``, whose resolution on this
+    platform is coarse enough that a fast write can land inside one tick. mtime is therefore
+    deliberately absent from this tuple.
     """
-    keys: list = []
+    return (int(size),
+            int(getattr(info, "st_ino", -1)),
+            int(getattr(info, "st_dev", -1)))
+
+
+def _observe_identity(path, lstat) -> tuple:
+    """Re-observe :func:`_identity` now. A failure answers a tuple that cannot compare equal.
+
+    An identity that cannot be established is not evidence that nothing changed, so it must not be
+    allowed to pass a comparison. ``(-1, -1, -1)`` is unreachable for a real entry, which is what
+    makes "we could not look" fail closed into :data:`TRANSPORT_UNAVAILABLE`.
+    """
+    try:
+        info = lstat(path)
+    except OSError:
+        return (-1, -1, -1)
+    return _identity(info, int(getattr(info, "st_size", -1)))
+
+
+def _root_is_verified(item) -> bool:
+    """Did A1 **positively observe** this root's own storage? Only then may it anchor rung 6.
+
+    `RootState.positively_observed` is A1's own gate -- added by A1's finding F-2, which was exactly
+    this mistake one layer down: a root carrying ``anchor_reachable=True`` while its own verdict was
+    a hold was accepted as "the storage is still there". ``root_key`` cannot stand in for it:
+    ``root_key`` is a *derived* property (``_norm(real)``), and `probe_root` populates ``real`` for
+    :data:`library_inventory.ROOT_UNREACHABLE`, ``CONFIGURED_NOT_CREATED`` and ``UNKNOWN`` verdicts
+    too. A root that was never seen can neither contain a source nor fail to contain one, so letting
+    it answer would manufacture both :data:`SCOPE_IN` and :data:`SCOPE_OUT` out of nothing.
+
+    A ``RootState`` built by hand may legitimately omit the derived ``anchor`` while still recording
+    a positive verdict, so a :data:`library_inventory.PRESENT` or
+    :data:`library_inventory.ACCESS_DENIED` verdict with an established ``root_key`` is accepted as
+    the same claim. For every state `probe_root` actually returns the two tests agree: it sets
+    ``anchor`` from the resolved location on both of its positive paths. ``ACCESS_DENIED`` counts
+    because the folder is demonstrably there and merely refused us -- A1 includes it for the same
+    reason.
+    """
+    if not _clean(getattr(item, "root_key", "")):
+        return False
+    if getattr(item, "positively_observed", False):
+        return True
+    return getattr(item, "verdict", "") in (PRESENT, ACCESS_DENIED)
+
+
+def _root_keys(inspection_roots, realpath) -> tuple:
+    """``(verified_keys, unverified_inputs)`` -- and only the first may answer rung 6.
+
+    Identity is always the **resolved** location, which is A1's F-1 lesson: a root selected as
+    ``E:\\LibraryLink`` may be a junction onto ``D:\\ActualLibrary``, and a scope answer about the
+    typed path would be an answer about the wrong storage. A1 has already resolved its own roots, so
+    a ``RootState`` contributes its ``root_key`` directly.
+
+    A plain string is accepted for compatibility but is **never promoted to a verified root
+    identity**: nobody probed it, so it is resolved for reporting and returned as an unverified
+    input. Callers that want rung 6 answered pass A1 ``RootState`` objects.
+    """
+    verified: list = []
+    unverified: list = []
+
+    def remember(bucket: list, value: str) -> None:
+        if value and value not in bucket:
+            bucket.append(value)
+
     for item in inspection_roots or ():
+        if isinstance(item, str):
+            text = _clean(item)
+            if text:
+                remember(unverified, _resolve(text, realpath) or text)
+            continue
         key = _clean(getattr(item, "root_key", ""))
-        if not key:
-            real = _clean(getattr(item, "real", "")) or (item if isinstance(item, str) else "")
-            real = _clean(real)
-            if real:
-                resolved = _resolve(real, realpath)
-                key = resolved or real
-        if key and key not in keys:
-            keys.append(key)
-    return tuple(keys)
+        if _root_is_verified(item):
+            remember(verified, key)
+        else:
+            remember(unverified, key)
+    return tuple(verified), tuple(unverified)
 
 
 def _classify_scope(payload, root_keys, realpath) -> tuple:
@@ -473,17 +661,33 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         file from the path** -- that second read is charged to the same byte budget, so enabling it
         roughly halves the number of records a given budget covers.
     ``inspection_roots``
-        A1 ``RootState`` objects (or plain paths). Empty leaves rung 6 unassessed: with no root,
-        "outside the library" is not a fact anyone established.
+        A1 ``RootState`` objects. Only a root A1 **positively observed** — it listed
+        (:data:`library_inventory.PRESENT`), or it is there and merely refused us
+        (:data:`library_inventory.ACCESS_DENIED`) — may anchor rung 6; see :func:`_root_is_verified`
+        for why ``root_key`` alone is not enough. Anything else, including a bare path string that
+        nobody probed, is reported in :attr:`RecordInventory.unverified_roots` and takes no part in
+        any verdict. With no verified root, rung 6 is unassessed: "outside the library" is not a
+        fact anyone established.
 
     The bounds charge **work attempted**, not results obtained: a refused, vanished, malformed or
     oversize file costs exactly what a good one costs. They are validated before any filesystem
     call, so a bad ceiling cannot be discovered half way through a folder.
 
-    **What the bounds are not.** ``listdir`` materialises the whole directory before any per-entry
-    ceiling can apply, so the floor cost of a pass is the size of one listing regardless of
-    ``max_entries``. Neither this nor any other ceiling here is a wall-clock or peak-memory bound,
-    and no figure derived from them claims to be.
+    **What the bounds are and are not.** ``max_record_bytes`` governs the bytes this module's own
+    parser consumes — the read is bounded and an over-length result is refused unparsed — but it
+    cannot govern the delegated transport re-read, because `analysis_cache.looks_reusable` reopens
+    the path itself; that cost is charged as a stat-time estimate and a growing file can exceed it.
+    ``listdir`` materialises the whole directory before any per-entry ceiling can apply, so the
+    floor cost of a pass is the size of one listing regardless of ``max_entries``. Neither this nor
+    any other ceiling here is a wall-clock or peak-memory bound, and no figure derived from them
+    claims to be. The module docstring lists every such limit in one place.
+
+    **Reading the result's truthfulness.** Four separate questions, deliberately not collapsed:
+    :attr:`RecordInventory.entries_complete` (was every entry classified?),
+    :attr:`RecordInventory.assessments_complete` (did every requested rung answer?),
+    :attr:`RecordInventory.details_complete` (are the detail lists exhaustive?) and
+    :attr:`RecordInventory.counts_exact` (do the counts cover the whole folder?).
+    :attr:`RecordInventory.authoritative` is the conservative conjunction a publisher should check.
     """
     max_entries = _positive_int(max_entries, "max_entries")
     max_records = _positive_int(max_records, "max_records")
@@ -503,9 +707,17 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
 
     started = _now()
     target = _clean(cache_dir)
-    root_keys = _root_keys(inspection_roots, realpath)
+    root_keys, unverified_roots = _root_keys(inspection_roots, realpath)
     assess_contract = isinstance(contract, str) and bool(contract)
     assess_complete = callable(is_complete) and require_ai is not None
+    # ONE effective mode, shared by the authority call and the label, so the figure and its label
+    # cannot disagree about which mode was judged. Normalised only AFTER the line above has
+    # distinguished `require_ai=None` ("no mode established", rung 5 unassessed) from
+    # `require_ai=False` ("judge the no-AI mode") -- that distinction is load-bearing and survives.
+    # A truthy non-bool therefore selects the require-AI mode in BOTH places rather than relying on
+    # two independent truth tests happening to agree.
+    if assess_complete:
+        require_ai = bool(require_ai)
     # The mode label is part of the completeness figure, not a separate fact: naming a mode while
     # answering nothing for it would report a question as though it had an answer. So it is stated
     # only when rung 5 was actually assessed -- a mode supplied without an authority (or an
@@ -524,6 +736,11 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         kwargs.setdefault("analysis_mode", mode)
         kwargs.setdefault("scope_assessed", assess_scope)
         kwargs.setdefault("inspection_roots", root_keys)
+        kwargs.setdefault("unverified_roots", unverified_roots)
+        # An early return never began enumerating, so neither claim is available to it. A listed
+        # empty folder is the one exception and says so explicitly.
+        kwargs.setdefault("entries_complete", False)
+        kwargs.setdefault("assessments_complete", False)
         return RecordInventory(**kwargs)
 
     if not target:
@@ -550,7 +767,8 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         # Reachable and empty: a complete observation of a folder with nothing in it. This is the
         # one empty answer that IS a total.
         return finish(resolved=resolved, state=CACHE_EMPTY, complete=True, bound=BOUND_NONE,
-                      entries_listed=0, entries_examined=0)
+                      entries_listed=0, entries_examined=0,
+                      entries_complete=True, assessments_complete=True)
 
     parse_counts: dict = {}
     contract_counts: dict = {}
@@ -575,6 +793,9 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
     bytes_charged = 0
     names_truncated = False
     records_truncated = False
+    completion_unavailable = 0
+    assessments_complete = True
+    enumerated_every_entry = True
     bound = BOUND_NONE
 
     def note(bucket: list, value: str) -> None:
@@ -585,17 +806,37 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
             names_truncated = True
 
     def reader(path: str) -> str:
+        """Read ONE record, **bounded**. The byte verdict is the caller's, on what came back.
+
+        The default path reads at most ``max_record_bytes + 1`` characters, so a file that grew
+        after its size gate can no longer be slurped whole: the old unbounded ``handle.read()``
+        turned a stat-time ceiling into no ceiling at all, and was measured consuming 5 000 190
+        bytes under a 1 000-byte limit. The limit is expressed in characters because this is the
+        module's one text-mode ``open``, so the worst case is four bytes per character under UTF-8 --
+        a real bound, and documented as an approximate one in the module docstring. Reading one
+        character *past* the limit is what makes "too large" decidable without a second stat.
+
+        ``newline=""`` disables universal-newline translation so the returned text's encoded length
+        is the file's own byte length rather than a CRLF-shortened one. JSON is newline-insensitive,
+        so nothing downstream changes.
+
+        The injected ``read_text`` seam is a **different trust boundary**: a test supplies the bytes,
+        so the bound above does not apply to it. Its result is byte-checked identically, which is
+        what keeps the verdict consistent across both paths.
+        """
         if read_text is not None:
             return read_text(path)
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return handle.read(max_record_bytes + 1)
 
     for name in names:
         if should_stop is not None and should_stop():
-            bound = BOUND_STOPPED
+            bound = bound or BOUND_STOPPED
+            enumerated_every_entry = False
             break
         if entries_examined >= max_entries:
-            bound = BOUND_ENTRIES
+            bound = bound or BOUND_ENTRIES
+            enumerated_every_entry = False
             break
         entries_examined += 1
 
@@ -630,6 +871,11 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         try:
             info = lstat(full)
             size = int(getattr(info, "st_size", 0))
+            # The identity is captured HERE, from the very observation whose `st_size` becomes
+            # `size` -- i.e. before this pass reads the file. Taking it later instead was measured
+            # to detect nothing: by then a replacement has already happened and every subsequent
+            # stat agrees with itself. This tuple is what rung 4 compares against.
+            gate_identity = _identity(info, size)
             is_file = bool(stat_module.S_ISREG(getattr(info, "st_mode", 0)))
         except FileNotFoundError:
             # Listed and then gone. Instability, reported as such -- never silently dropped, and
@@ -663,7 +909,8 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
             # No PARSE_NOT_READ count is recorded here on purpose: one more unread record would be
             # a figure, and the number actually left unread is unknown because the loop stops
             # classifying at the same moment. `bound` carries that truth instead.
-            bound = BOUND_RECORDS
+            bound = bound or BOUND_RECORDS
+            enumerated_every_entry = False
             break
         if size > max_record_bytes:
             records_attempted += 1
@@ -677,21 +924,42 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
                 records_truncated = True
             continue
         if bytes_charged + size > max_total_bytes:
-            bound = BOUND_TOTAL_BYTES
+            bound = bound or BOUND_TOTAL_BYTES
+            enumerated_every_entry = False
             break
 
         records_attempted += 1
         payload = None
         status = PARSE_OK
         detail = ""
-        # Charged BEFORE the read, so a read that fails part way through is not free. The budget's
-        # safety property is that it is never under-charged; over-charging a file that turned out
-        # to be unreadable is the harmless direction, and :attr:`bytes_charged` is named for what
-        # it actually is rather than implying every charged byte was successfully parsed.
+        # Charged BEFORE the read, so a read that fails part way through is not free; over-charging
+        # a file that turned out to be unreadable is the harmless direction. The *stat* size is only
+        # an estimate of what the read will cost, though, so the charge is reconciled against the
+        # bytes actually consumed immediately below -- which is what makes :attr:`bytes_charged`
+        # truthful for a file that grew. It is named for what it is: bytes charged, not bytes
+        # successfully parsed.
         bytes_charged += size
         try:
             raw = reader(full)
-            payload = json.loads(raw)
+            consumed = len(raw.encode("utf-8"))
+            if consumed > size:
+                # It grew between its size gate and this read. Charge what was really consumed; the
+                # budget cannot un-read bytes, so the honest move is to record them.
+                bytes_charged += consumed - size
+            if consumed > max_record_bytes:
+                # The ceiling applies to the bytes THIS PASS CONSUMED, not only to the earlier stat.
+                # Refused here rather than parsed, and deliberately NOT parsed as a truncated
+                # prefix: a prefix of a JSON object is either invalid or -- worse -- a different,
+                # smaller object. Reported as both an oversize refusal and instability, because the
+                # file demonstrably moved after it was measured.
+                status = PARSE_TOO_LARGE
+                detail = (f"grew past the {max_record_bytes}-byte ceiling after it was measured "
+                          f"at {size} bytes")
+                note(oversize, name)
+                note(changed, name)
+                assessments_complete = False
+            else:
+                payload = json.loads(raw)
         except FileNotFoundError as exc:
             status, detail = PARSE_VANISHED, f"{type(exc).__name__}"
             note(vanished, name)
@@ -703,7 +971,10 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
             status, detail = PARSE_MALFORMED, f"{type(exc).__name__}"
             note(malformed, name)
         else:
-            if not isinstance(payload, dict):
+            # Guarded on PARSE_OK because the oversize refusal above also leaves the try block
+            # without an exception, with `payload` still None -- and `isinstance(None, dict)` would
+            # otherwise relabel a refused-too-large record as "not a JSON object".
+            if status == PARSE_OK and not isinstance(payload, dict):
                 status = PARSE_NOT_OBJECT
                 detail = f"JSON {type(payload).__name__}, not an object"
                 payload = None
@@ -737,17 +1008,22 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
                 # reported as TRANSPORT_UNAVAILABLE: an observation about the folder, not a verdict
                 # about the record.
                 if bytes_charged + size > max_total_bytes:
+                    # A resource ceiling stopped a requested observation, so the pass must say so.
+                    # Recording TRANSPORT_UNAVAILABLE while leaving `bound` empty let the result
+                    # publish itself as a complete, authoritative total with `bound=BOUND_NONE` --
+                    # the one thing a bounded reader must never do. `or` is deliberate: the FIRST
+                    # bound reached is the one that gets reported, never overwritten.
                     record_transport = TRANSPORT_UNAVAILABLE
+                    bound = bound or BOUND_TOTAL_BYTES
+                    assessments_complete = False
                     detail = detail or "transport check skipped: byte budget exhausted"
                 else:
-                    try:
-                        current = int(getattr(lstat(full), "st_size", -1))
-                    except OSError:
-                        current = -1
-                    if current != size:
+                    current = _observe_identity(full, lstat)
+                    if current != gate_identity:
                         record_transport = TRANSPORT_UNAVAILABLE
                         note(changed, name)
-                        detail = detail or "the file changed size during inspection"
+                        assessments_complete = False
+                        detail = detail or "the file changed between being measured and checked"
                     else:
                         bytes_charged += size
                         try:
@@ -755,28 +1031,30 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
                         except Exception as exc:
                             record_transport = TRANSPORT_UNAVAILABLE
                             detail = detail or f"transport check failed: {type(exc).__name__}"
+                            assessments_complete = False
                         else:
-                            if ok:
+                            # Re-observe on BOTH outcomes. The helper opens the path itself, so its
+                            # answer describes whatever bytes were there during ITS read -- and an
+                            # ACCEPTED verdict needs that checked exactly as much as a refused one
+                            # does. Verifying only the refusal branch meant a record replaced by a
+                            # different record of identical length was published as a stable
+                            # TRANSPORT_OK for a payload this pass never parsed.
+                            #
+                            # The discriminator is a fresh observation of the file, never a match on
+                            # the helper's wording: its reason strings are its own to change, and a
+                            # reader that branched on them would break silently when they did.
+                            after = _observe_identity(full, lstat)
+                            if after != gate_identity:
+                                record_transport = TRANSPORT_UNAVAILABLE
+                                note(changed, name)
+                                assessments_complete = False
+                                detail = detail or (
+                                    "the file changed while the transport check read it")
+                            elif ok:
                                 record_transport = TRANSPORT_OK
                             else:
-                                # A refusal is taken at face value UNLESS the file demonstrably
-                                # moved between this pass's parse and the helper's own read. The
-                                # discriminator is a fresh observation of the file, never a match
-                                # on the helper's wording: its reason strings are its own to
-                                # change, and a reader that branched on them would break silently
-                                # when they did.
-                                try:
-                                    after = int(getattr(lstat(full), "st_size", -1))
-                                except OSError:
-                                    after = -1
-                                if after != size:
-                                    record_transport = TRANSPORT_UNAVAILABLE
-                                    note(changed, name)
-                                    detail = detail or (
-                                        "the file changed while the transport check read it")
-                                else:
-                                    record_transport = TRANSPORT_REFUSED
-                                    detail = detail or str(reason)
+                                record_transport = TRANSPORT_REFUSED
+                                detail = detail or str(reason)
                 _bump(transport_counts, record_transport)
 
             if assess_complete:
@@ -788,6 +1066,14 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
                     # one would attribute a decision to an authority that did not make it.
                     record_complete = NOT_ASSESSED
                     detail = detail or f"completion authority raised {type(exc).__name__}"
+                    # Counted, so the verdict counter cannot silently under-total. Previously
+                    # nothing was recorded at all, which made `complete_records` read as a measured
+                    # zero: "no records are complete" rather than "the authority would not answer".
+                    # It is counted HERE rather than as a NOT_ASSESSED key in `complete_counts`
+                    # because that dict carries only verdicts the authority actually gave -- see
+                    # `completion_accounted` for the invariant that ties the two together.
+                    completion_unavailable += 1
+                    assessments_complete = False
                 else:
                     record_complete = COMPLETE_YES if verdict else COMPLETE_NO
                     _bump(complete_counts, record_complete)
@@ -808,6 +1094,15 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
     # Truncating the reported names means the pass can no longer show its work in full, so the
     # result is not a complete observation even if every entry was classified. A2's mutant C6
     # survived precisely because this term was missing there; it is asserted directly below.
+    #
+    # Note which truncation this is, and why `records_truncated` is deliberately NOT folded in
+    # here -- the full reasoning is on `RecordInventory.authoritative`. A problem-name list is the
+    # ONLY place an alias, an escape, undecidable link metadata, a vanished entry or a changed one
+    # is ever named: those entries never reach `records`, so cutting the list destroys evidence held
+    # nowhere else. The per-record detail list carries no such unique evidence -- every element of
+    # it is already in the aggregate counters -- so it is disclosed through `records_truncated` and
+    # `details_complete` instead of silently reclassifying every production-sized cache as an
+    # incomplete observation.
     if bound == BOUND_NONE and names_truncated:
         bound = BOUND_NAMES
 
@@ -821,6 +1116,8 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         parse_counts=parse_counts, bytes_charged=bytes_charged,
         contract_counts=contract_counts, transport_counts=transport_counts,
         complete_counts=complete_counts, scope_counts=scope_counts,
+        completion_unavailable=completion_unavailable,
+        entries_complete=enumerated_every_entry, assessments_complete=assessments_complete,
         skipped_aliases=tuple(aliases), skipped_escapes=tuple(escapes),
         skipped_undecidable=tuple(undecidable), skipped_entries=skipped_entries,
         vanished=tuple(vanished), changed=tuple(changed),

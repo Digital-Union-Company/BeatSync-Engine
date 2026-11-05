@@ -1715,3 +1715,953 @@ def test_m_the_mutant_harness_itself_refuses_a_vacuous_anchor():
         _mutant(("this text is definitely not in the module", "x"))
     with pytest.raises(AssertionError):
         _mutant(("os", "x"))          # matches many times -- also not a usable anchor
+
+
+# =============================================================================================
+# N. the independently reproduced findings F-1 .. F-7
+#
+# Every test in this section was run against the PRE-REMEDIATION module and shown to fail there,
+# except where noted: F-6's behaviour is identical before and after (the fix is additive
+# disclosure), so its evidence is the negative control N-M6 rather than an old/new difference.
+# That distinction is stated per test rather than glossed, because a test that cannot fail is not
+# evidence of an invariant.
+# =============================================================================================
+
+
+def _exact_bytes(directory, name: str, payload, *, pad_to: int) -> str:
+    """Write a record whose encoded length is EXACTLY ``pad_to`` bytes.
+
+    ``newline=""`` matters: without it the platform translates the JSON's own characters on the way
+    out and the byte count stops being the one the test computed.
+    """
+    for pad in range(0, 8192):
+        candidate = dict(payload)
+        candidate["_pad"] = "x" * pad
+        text = json.dumps(candidate)
+        if len(text.encode("utf-8")) == pad_to:
+            path = os.path.join(str(directory), name)
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            return text
+    raise AssertionError(f"no padding reaches exactly {pad_to} bytes")
+
+
+# ---------------------------------------------------------------------------------------------
+# F-1  a resource ceiling that stops a requested observation must be announced
+# ---------------------------------------------------------------------------------------------
+
+def test_n_f1_a_budget_refused_transport_reread_is_announced_as_a_bound(tmp_path):
+    """The pass may not call itself a complete, authoritative total when a ceiling stopped rung 4.
+
+    Pre-remediation this reported ``bound=BOUND_NONE``, ``complete=True`` and
+    ``authoritative=True`` for every budget in ``[S, 2S-1]`` while the delegated re-read had been
+    refused -- the one thing a bounded reader must never do, and the same standard the module
+    already applied to a truncated name list.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    size = os.path.getsize(os.path.join(str(cache), _NAME_A))
+
+    for budget in (size, size + 1, 2 * size - 1):
+        inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable,
+                    max_total_bytes=budget)
+        assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}, budget
+        assert inv.bound == lcr.BOUND_TOTAL_BYTES, budget
+        assert inv.complete is False, budget
+        assert inv.authoritative is False, budget
+        assert inv.assessments_complete is False, budget
+        # The ceiling stopped an ASSESSMENT, not the enumeration: the counts still cover the folder.
+        assert inv.entries_complete is True, budget
+        assert inv.counts_exact is True, budget
+        assert "budget" in inv.records[0].detail
+
+
+def test_n_f1_at_twice_the_record_size_the_reread_happens_and_raises_no_bound(tmp_path):
+    """The exact upper threshold: 2S is enough for the parse AND the delegated re-read."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    size = os.path.getsize(os.path.join(str(cache), _NAME_A))
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable,
+                max_total_bytes=2 * size)
+    assert inv.transport_counts == {lcr.TRANSPORT_OK: 1}
+    assert inv.bound == lcr.BOUND_NONE
+    assert inv.complete is True and inv.authoritative is True
+    assert inv.bytes_charged == 2 * size, "the parse and the delegated re-read are both charged"
+    # Asserted last, deliberately: everything above is unchanged by the remediation, so this test
+    # is a THRESHOLD control that must keep passing, not a discriminator for the fix.
+    assert inv.assessments_complete is True
+
+
+def test_n_f1_a_trailing_non_record_entry_does_not_hide_the_ceiling(tmp_path):
+    """The reachable shape: the budget-exhausted record is the last thing that charges bytes.
+
+    A non-record entry costs no bytes, so the loop runs to the end and nothing else trips the
+    parse-side check -- which is exactly how the omission stayed invisible.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    _write_record(cache, "zz_qwen_batch_request_00001.json", {"retained": "for debugging"})
+    size = os.path.getsize(os.path.join(str(cache), _NAME_A))
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable, max_total_bytes=size)
+    assert inv.other_files == 1, "the loop really did reach the trailing entry"
+    assert inv.bound == lcr.BOUND_TOTAL_BYTES
+    assert inv.complete is False and inv.authoritative is False
+
+
+def test_n_f1_the_first_bound_reached_is_the_one_reported(tmp_path):
+    """A later limit must not overwrite the bound that actually stopped the first observation."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(4):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+    size = os.path.getsize(os.path.join(str(cache), _record_name(0)))
+
+    # Enough budget for the first record's parse but not its delegated re-read, and an entry
+    # ceiling that trips on the very next entry. Pre-remediation the byte ceiling set no bound at
+    # all and the later entry ceiling was reported instead, which named the wrong limit.
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable,
+                max_total_bytes=size, max_entries=1)
+    assert inv.bound == lcr.BOUND_TOTAL_BYTES, "the byte ceiling came first and must survive"
+    assert inv.complete is False
+    assert inv.entries_complete is False, "...and the enumeration is separately reported as partial"
+
+
+# ---------------------------------------------------------------------------------------------
+# F-2  only a root A1 positively observed may anchor rung 6
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("state_factory, label", [
+    (lambda p: lib.probe_root(str(p / "never-created")), "configured_not_created"),
+    (lambda p: lib.probe_root("Z:\\NoSuchVolume\\Library"), "root_unreachable"),
+    (lambda p: lib.RootState(typed="E:\\t", real="D:\\ClaimedNeverProbed",
+                             verdict=lib.NOT_INSPECTED), "not_inspected"),
+    (lambda p: lib.RootState(typed="E:\\u", real="D:\\Unknown", verdict=lib.UNKNOWN,
+                             anchor_reachable=True), "unknown"),
+])
+def test_n_f2_a_root_that_was_not_positively_observed_cannot_answer_scope(tmp_path, state_factory,
+                                                                         label):
+    """``root_key`` is a DERIVED property and is populated for every one of these verdicts.
+
+    Pre-remediation each of them produced a definite ``SCOPE_IN``/``SCOPE_OUT`` -- a claim about a
+    library that was unreachable, never created, or never looked at. A1 publishes
+    `RootState.positively_observed` for precisely this, and it was not consulted.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    state = state_factory(tmp_path)
+    assert state.root_key, f"{label}: the fixture must carry a derived root_key"
+    assert state.positively_observed is False, label
+    _write_record(cache, _NAME_A, _complete_payload(os.path.join(state.real, "clip.mp4")))
+
+    inv = _read_full(cache, roots=[state])
+    assert inv.scope_assessed is False, label
+    assert inv.scope_counts == {}, label
+    assert inv.records[0].scope == lcr.NOT_ASSESSED, label
+    assert inv.inspection_roots == (), label
+    assert inv.unverified_roots == (state.root_key,), label
+
+
+def test_n_f2_a_positively_observed_root_still_answers_scope(tmp_path):
+    """The positive control: the fix must not disarm rung 6 for a root A1 really did see."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    library = tmp_path / "library"
+    library.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload(str(library / "clip.mp4")))
+    _write_record(cache, _NAME_B, _complete_payload("D:\\Elsewhere\\clip.mp4"))
+    state = lib.probe_root(str(library))
+    assert state.verdict == lib.PRESENT and state.positively_observed is True
+
+    inv = _read_full(cache, roots=[state])
+    assert inv.scope_assessed is True
+    assert inv.scope_counts == {lcr.SCOPE_IN: 1, lcr.SCOPE_OUT: 1}
+    assert inv.inspection_roots == (state.root_key,)
+    # Last, because every claim above is unchanged by the remediation: this is the control proving
+    # the fix did not disarm rung 6 for a root A1 really did observe.
+    assert inv.unverified_roots == ()
+
+
+def test_n_f2_a_bare_path_string_is_an_unverified_input_not_a_verified_root(tmp_path):
+    """Nobody probed it, so it may be reported but must never anchor a verdict."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("Q:\\PhantomLibrary\\clip.mp4"))
+
+    inv = _read_full(cache, roots=["Q:\\PhantomLibrary"])
+    assert inv.scope_assessed is False
+    assert inv.scope_counts == {}
+    assert inv.records[0].scope == lcr.NOT_ASSESSED
+    assert inv.inspection_roots == ()
+    assert inv.unverified_roots and "phantomlibrary" in inv.unverified_roots[0].lower()
+
+
+def test_n_f2_scope_still_stats_no_source_video(tmp_path):
+    """Rung 6 resolves a path and compares it. It must not look at the source at all."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    library = tmp_path / "library"
+    library.mkdir()
+    absent = str(library / "never-existed.mp4")
+    _write_record(cache, _NAME_A, _complete_payload(absent))
+    state = lib.probe_root(str(library))
+
+    seen = []
+
+    def spy_lstat(path):
+        seen.append(os.path.normcase(os.path.abspath(path)))
+        return os.lstat(path)
+
+    inv = _read_full(cache, roots=[state], lstat=spy_lstat)
+    assert inv.scope_counts == {lcr.SCOPE_IN: 1}, "a containment claim, on a file that is not there"
+    assert not os.path.exists(absent)
+    assert os.path.normcase(os.path.abspath(absent)) not in seen
+
+
+# ---------------------------------------------------------------------------------------------
+# F-3  the transport change-discriminator, on BOTH branches
+# ---------------------------------------------------------------------------------------------
+
+def _swap_reader(path: str, replacement: str, *, atomic: bool):
+    """Hand back the ORIGINAL bytes, then put ``replacement`` on disk before rung 4 delegates."""
+    def read_text(target):
+        with open(target, "r", encoding="utf-8") as handle:
+            original = handle.read()
+        if atomic:
+            temporary = target + ".newgen"
+            with open(temporary, "w", encoding="utf-8", newline="") as handle:
+                handle.write(replacement)
+            os.replace(temporary, target)
+        else:
+            with open(target, "r+", encoding="utf-8", newline="") as handle:
+                handle.seek(0)
+                handle.write(replacement)
+        return original
+    return read_text
+
+
+def test_n_f3_a_same_size_atomic_replacement_is_not_a_stable_transport_verdict(tmp_path):
+    """The exact concurrency the product can produce, and the reason mtime is not the test.
+
+    `video_analysis._save_cache` publishes every record through a unique temp file and
+    ``os.replace``, so a replacement always changes the inode -- measured 40/40, against 5/40 for
+    ``st_mtime_ns``, whose resolution lets a fast write land inside one tick. Size alone moves on
+    neither. Pre-remediation this record was published as ``TRANSPORT_OK`` with ``unstable=False``:
+    a verdict about bytes the pass never parsed, presented as a stable observation.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    deferred = dict(_complete_payload("C:/x/a.mp4", candidates=[_candidate(0, tagged=False)]))
+    deferred["ai_deferred"] = True
+    usable = _complete_payload("C:/x/a.mp4", candidates=[_candidate(0, tagged=False)])
+    width = max(len(json.dumps(deferred).encode("utf-8")),
+                len(json.dumps(usable).encode("utf-8"))) + 32
+    original = _exact_bytes(cache, _NAME_A, deferred, pad_to=width)
+    replacement = _exact_bytes(tmp_path, "staged.json", usable, pad_to=width)
+    assert len(original.encode("utf-8")) == len(replacement.encode("utf-8"))
+    assert original != replacement, "the two payloads must actually differ"
+    _exact_bytes(cache, _NAME_A, deferred, pad_to=width)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable,
+                read_text=_swap_reader(os.path.join(str(cache), _NAME_A), replacement,
+                                       atomic=True))
+    assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+    assert inv.changed == (_NAME_A,)
+    assert inv.unstable is True
+    assert inv.assessments_complete is False
+
+
+def test_n_f3_a_replacement_of_a_different_size_is_detected_too(tmp_path):
+    """The easy case, kept as a control so the identity widening cannot regress it."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    bigger = json.dumps(_complete_payload("C:/x/a.mp4")) + (" " * 512)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable,
+                read_text=_swap_reader(os.path.join(str(cache), _NAME_A), bigger, atomic=True))
+    assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+    assert inv.changed == (_NAME_A,)
+
+
+def test_n_f3_growth_during_an_ACCEPTED_transport_read_is_detected(tmp_path):
+    """The general gap the same-size case is a special case of.
+
+    The post-read re-observation used to sit inside the refusal branch only, so an ACCEPTED verdict
+    was never checked at all -- a plain size change during the helper's own read was published as a
+    stable ``TRANSPORT_OK``.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+
+    def growing(path, contract):
+        with open(path, "a", encoding="utf-8", newline="") as handle:
+            handle.write(" " * 2048)
+        return ac.looks_reusable(path, contract)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=growing)
+    assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+    assert inv.changed == (_NAME_A,)
+    assert inv.unstable is True
+
+
+def test_n_f3_growth_during_a_REFUSED_transport_read_is_still_detected(tmp_path):
+    """The branch that already verified must keep verifying."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    deferred = dict(_complete_payload("C:/x/a.mp4"))
+    deferred["ai_deferred"] = True
+    _write_record(cache, _NAME_A, deferred)
+
+    def growing(path, contract):
+        with open(path, "a", encoding="utf-8", newline="") as handle:
+            handle.write(" " * 2048)
+        return ac.looks_reusable(path, contract)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=growing)
+    assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+    assert inv.changed == (_NAME_A,)
+
+
+def test_n_f3_a_stable_record_still_reaches_a_transport_verdict(tmp_path):
+    """The positive control. An identity check that refused everything would be useless."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    deferred = dict(_complete_payload("C:/x/b.mp4"))
+    deferred["ai_deferred"] = True
+    _write_record(cache, _NAME_B, deferred)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable)
+    assert inv.transport_counts == {lcr.TRANSPORT_OK: 1, lcr.TRANSPORT_REFUSED: 1}
+    assert inv.changed == () and inv.unstable is False
+    assert inv.complete is True
+    assert inv.assessments_complete is True
+
+
+def test_n_f3_an_unobservable_identity_refuses_a_stable_verdict(tmp_path):
+    """"We could not look" is not evidence that nothing moved, so it must fail closed."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    calls = {"n": 0}
+
+    def flaky_lstat(path):
+        calls["n"] += 1
+        if calls["n"] > 2 and os.path.basename(path) == _NAME_A:
+            raise OSError(5, "device error")
+        return os.lstat(path)
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable, lstat=flaky_lstat)
+    assert inv.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+
+
+# ---------------------------------------------------------------------------------------------
+# F-4  the per-record ceiling governs the bytes this pass consumed
+# ---------------------------------------------------------------------------------------------
+
+def _grow_after_the_size_gate(target: str, text: str):
+    """Grow ``target`` after its SECOND lstat -- the size gate -- and before the read.
+
+    The reader legitimately stats each entry twice (link evidence, then size), so a hook keyed on
+    the first call never opens the stat-then-read window at all: the size gate then simply observes
+    the grown file and refuses it, which looks like the ceiling working.
+    """
+    seen = {"n": 0}
+
+    def wrapped(path):
+        info = os.lstat(path)
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(target)):
+            seen["n"] += 1
+            if seen["n"] == 2:
+                with open(target, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(text)
+        return info
+
+    return wrapped
+
+
+def test_n_f4_a_record_that_grows_after_its_size_gate_is_refused_not_parsed(tmp_path):
+    """Pre-remediation the read was unbounded: measured parsing 5 000 190 bytes under a 1 000-byte
+    ceiling, charging 177, naming nothing in ``oversize`` and reporting no instability.
+
+    The ceiling now applies to the bytes consumed, the refusal is ``PARSE_TOO_LARGE`` rather than a
+    malformed prefix, and the growth is reported.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    path = _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    small = os.path.getsize(path)
+    grown = json.dumps({**_complete_payload("C:/x/a.mp4"), "_bulk": "y" * 200_000})
+    assert small < 1_000 < len(grown.encode("utf-8"))
+
+    inv = _read(cache, contract=CONTRACT, max_record_bytes=1_000,
+                lstat=_grow_after_the_size_gate(path, grown))
+    assert inv.parse_counts == {lcr.PARSE_TOO_LARGE: 1}
+    assert lcr.PARSE_OK not in inv.parse_counts, "the oversized payload must NOT have been parsed"
+    assert inv.oversize == (_NAME_A,)
+    assert inv.changed == (_NAME_A,), "it demonstrably moved after it was measured"
+    assert inv.bytes_charged > small, "the charge must reflect what was really consumed"
+    assert inv.records[0].parse == lcr.PARSE_TOO_LARGE
+    assert inv.assessments_complete is False
+
+
+def test_n_f4_an_oversized_read_is_never_reported_as_malformed(tmp_path):
+    """A truncated prefix of a JSON object is either invalid or a DIFFERENT, smaller object.
+
+    Either way it must not be parsed, and the verdict must say "too large" rather than "malformed":
+    they are different facts about the record and the operator acts on them differently.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    path = _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    grown = json.dumps({**_complete_payload("C:/x/a.mp4"), "_bulk": "y" * 50_000})
+
+    inv = _read(cache, contract=CONTRACT, max_record_bytes=2_000,
+                lstat=_grow_after_the_size_gate(path, grown))
+    assert lcr.PARSE_MALFORMED not in inv.parse_counts
+    assert inv.parse_counts == {lcr.PARSE_TOO_LARGE: 1}
+    assert inv.malformed == ()
+
+
+def test_n_f4_a_multibyte_record_is_judged_on_bytes_and_not_characters(tmp_path):
+    """The read is bounded in CHARACTERS; the ceiling is a BYTE ceiling. Both must hold.
+
+    ``json.dumps`` escapes non-ASCII by default, which would quietly make this fixture
+    single-byte and the assertion vacuous -- hence ``ensure_ascii=False``.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    text = json.dumps({**_complete_payload("C:/x/a.mp4"), "_bulk": "é" * 800},
+                      ensure_ascii=False)
+    path = os.path.join(str(cache), _NAME_A)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    characters = len(text)
+    octets = len(text.encode("utf-8"))
+    assert octets > characters, "the fixture must really be multi-byte"
+
+    ceiling = (characters + octets) // 2            # above the char count, below the byte count
+    inv = _read(cache, contract=CONTRACT, max_record_bytes=ceiling)
+    assert inv.parse_counts == {lcr.PARSE_TOO_LARGE: 1}, \
+        "a character-count ceiling would have accepted this"
+
+
+def test_n_f4_the_record_byte_ceiling_is_exact_at_n_and_n_plus_one(tmp_path):
+    """A stable file at exactly the ceiling is accepted; one byte over is refused unread."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    path = _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    size = os.path.getsize(path)
+
+    reads = []
+
+    def counting(target):
+        reads.append(target)
+        with open(target, "r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    at_cap = _read(cache, contract=CONTRACT, max_record_bytes=size, read_text=counting)
+    assert at_cap.parse_counts == {lcr.PARSE_OK: 1}
+    assert at_cap.bytes_charged == size
+
+    reads.clear()
+    over = _read(cache, contract=CONTRACT, max_record_bytes=size - 1, read_text=counting)
+    assert over.parse_counts == {lcr.PARSE_TOO_LARGE: 1}
+    assert reads == [], "an already-oversize record is refused by the size gate, still unread"
+    assert over.bytes_charged == 0
+
+
+def test_n_f4_ordinary_malformed_json_is_still_malformed(tmp_path):
+    """The bounded reader must not reclassify the ordinary cases it already got right."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, "{broken")
+    _write_record(cache, _NAME_B, "[1, 2, 3]")
+    _write_record(cache, _NAME_C, _complete_payload("C:/x/c.mp4"))
+
+    inv = _read(cache, contract=CONTRACT)
+    assert inv.parse_counts == {lcr.PARSE_MALFORMED: 1, lcr.PARSE_NOT_OBJECT: 1, lcr.PARSE_OK: 1}
+    assert inv.oversize == ()
+
+
+def test_n_f4_the_delegated_reread_is_charged_as_an_estimate_and_says_so(tmp_path):
+    """A3 cannot bound `looks_reusable`'s own read, and the module must not pretend otherwise."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    size = os.path.getsize(os.path.join(str(cache), _NAME_A))
+
+    inv = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable)
+    assert inv.bytes_charged == 2 * size, "the estimate is the stat size, charged twice"
+
+    with open(_A3, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert "stat-time estimate" in source, \
+        "the limitation must be stated where a reader of the contract will find it"
+
+
+# ---------------------------------------------------------------------------------------------
+# F-5  completion accounting
+# ---------------------------------------------------------------------------------------------
+
+def test_n_f5_a_raising_authority_withholds_the_total_instead_of_reading_as_zero(tmp_path):
+    """Pre-remediation this answered ``complete_records == 0``: "no records are complete", which is
+    a measurement, rather than "the authority would not answer", which is the truth."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(5):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    def explode(data, require_ai):
+        raise RuntimeError("authority unavailable")
+
+    inv = _read(cache, contract=CONTRACT, is_complete=explode, require_ai=False)
+    assert inv.complete_records is None, "withheld, never a measured zero"
+    assert inv.completion_unavailable == 5
+    assert inv.completion_accounted == inv.records_parsed == 5
+    assert inv.assessments_complete is False
+    assert all(record.complete == lcr.NOT_ASSESSED for record in inv.records)
+
+
+@pytest.mark.parametrize("builder, expect_yes, expect_no", [
+    (lambda index: _complete_payload(f"C:/x/{index}.mp4"), 4, 0),
+    (lambda index: {"cache_contract": CONTRACT, "analysis_version": VERSION,
+                    "video_file": f"C:/x/{index}.mp4", "candidates": [], "timings": {}}, 0, 4),
+])
+def test_n_f5_every_parsed_record_is_accounted_for(tmp_path, builder, expect_yes, expect_no):
+    """``sum(complete_counts) + completion_unavailable == records_parsed``, both ways round."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(4):
+        _write_record(cache, _record_name(index), builder(index))
+
+    inv = _read(cache, contract=CONTRACT, is_complete=IS_COMPLETE, require_ai=False)
+    assert inv.records_parsed == 4
+    assert inv.completion_accounted == 4
+    assert inv.complete_counts.get(lcr.COMPLETE_YES, 0) == expect_yes
+    assert inv.complete_counts.get(lcr.COMPLETE_NO, 0) == expect_no
+    assert inv.complete_records == expect_yes
+    assert inv.completion_unavailable == 0
+    assert inv.assessments_complete is True
+
+
+def test_n_f5_one_refusal_past_the_detail_cap_still_accounts_and_withholds(tmp_path):
+    """The worst shape: the refusal is beyond ``max_reported_names``, so no per-record detail
+    carries it and the aggregate is the only place it can show up."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(6):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    def mixed(data, require_ai):
+        if data.get("video_file", "").endswith("5.mp4"):
+            raise RuntimeError("declines")
+        return IS_COMPLETE(data, require_ai)
+
+    inv = _read(cache, contract=CONTRACT, is_complete=mixed, require_ai=False,
+                max_reported_names=2)
+    assert inv.records_truncated is True and len(inv.records) == 2
+    assert inv.complete_records is None, "one unanswered record makes the total not a total"
+    assert inv.complete_counts.get(lcr.COMPLETE_YES) == 5, "the verdicts given remain available"
+    assert inv.completion_unavailable == 1
+    assert inv.completion_accounted == inv.records_parsed == 6
+
+
+def test_n_f5_a_partial_pass_still_reports_the_records_it_did_judge(tmp_path):
+    """A ceiling is NOT an unanswered authority: every record reached was genuinely judged, so the
+    figure is reported and `authoritative` is what says it is not a folder total."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(6):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    inv = _read(cache, contract=CONTRACT, is_complete=IS_COMPLETE, require_ai=False,
+                max_records=3)
+    assert inv.bound == lcr.BOUND_RECORDS and inv.authoritative is False
+    assert inv.complete_records == 3, "a partial figure, explicitly not a total"
+    assert inv.records_parsed == 3
+    assert inv.completion_accounted == 3
+
+
+# ---------------------------------------------------------------------------------------------
+# F-6  aggregate completeness is a different question from detail completeness
+#
+# NOTE ON EVIDENCE: the pre-remediation module behaves IDENTICALLY here -- it already kept the
+# counts exact and already set `records_truncated`. The fix is the explicit, separately testable
+# contract (`counts_exact`, `details_complete`, `entries_complete`, `assessments_complete`) plus
+# the documented reason the two truncation indicators differ. The behavioural evidence that
+# `records_truncated` cannot silently disappear is therefore the negative control
+# `test_n_mf6_...` below, which the pre-remediation suite did NOT kill.
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("count", [199, 200, 201])
+def test_n_f6_a_large_cache_keeps_exact_counts_with_a_shortened_detail_list(tmp_path, count):
+    """A production cache holds thousands of records against a 200-entry detail cap.
+
+    Two misreadings must both be impossible: that the displayed records are the whole cache, and
+    that a withheld or shortened figure means zero.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(count):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    inv = _read(cache, contract=CONTRACT, is_complete=IS_COMPLETE, require_ai=False)
+
+    # the counts are exact totals, whatever the detail list shows
+    assert inv.entries_listed == count
+    assert inv.records_recognised == inv.records_attempted == count
+    assert inv.parse_counts.get(lcr.PARSE_OK) == count
+    assert inv.complete_records == count
+    assert sum(inv.parse_counts.values()) == count
+    assert inv.entries_complete is True
+    assert inv.counts_exact is True
+    assert inv.assessments_complete is True
+
+    truncated = count > lcr.MAX_REPORTED_RECORD_NAMES
+    assert inv.records_truncated is truncated
+    assert inv.details_complete is not truncated
+    assert len(inv.records) == min(count, lcr.MAX_REPORTED_RECORD_NAMES)
+    if truncated:
+        assert len(inv.records) < inv.records_attempted, \
+            "the display is shorter than the cache, and says so"
+
+
+def test_n_f6_problem_name_truncation_still_makes_the_pass_incomplete(tmp_path):
+    """The asymmetry, asserted rather than left implicit.
+
+    A problem-name list is the ONLY place an alias, an escape, undecidable link metadata, a vanished
+    entry or a changed one is ever named -- those entries never reach ``records`` at all -- so
+    truncating it destroys evidence held nowhere else and the pass must not call itself complete.
+    A shortened per-record display loses nothing the counters do not still hold.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(5):
+        _write_record(cache, _record_name(index), "{broken")
+    for index in range(5, 10):
+        _write_record(cache, _record_name(index), "[1, 2]")
+
+    inv = _read(cache, contract=CONTRACT, max_reported_names=3)
+    assert inv.names_truncated is True
+    assert inv.bound == lcr.BOUND_NAMES
+    assert inv.complete is False and inv.authoritative is False
+    assert inv.details_complete is False
+    # ...and even then the counts remain exact totals for the folder
+    assert inv.counts_exact is True and inv.entries_complete is True
+    assert sum(inv.parse_counts.values()) == 10
+
+
+def test_n_f6_the_four_truthfulness_questions_are_separately_answerable(tmp_path):
+    """Enumeration, assessment, detail and count-exactness are four facts, not one."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(4):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    clean = _read_full(cache)
+    assert (clean.entries_complete, clean.assessments_complete,
+            clean.details_complete, clean.counts_exact) == (True, True, True, True)
+
+    stopped = _read_full(cache, max_records=2)
+    assert stopped.entries_complete is False and stopped.counts_exact is False
+    assert stopped.assessments_complete is True, "what it did assess, it assessed fully"
+
+    shortened = _read_full(cache, max_reported_names=1)
+    assert shortened.details_complete is False
+    assert shortened.entries_complete is True
+
+
+# ---------------------------------------------------------------------------------------------
+# F-7  one effective require_ai mode, and no dead weight
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("supplied", [True, False, 0, 1, "", "no", [], {}, 0.0, 2.5, [1]])
+def test_n_f7_the_authority_and_the_label_always_answer_the_same_mode(tmp_path, supplied):
+    """Pre-remediation the raw value reached the authority while the label ran its own truth test.
+
+    They agreed only by coincidence; the two could disagree for any authority that compared
+    identity rather than truthiness. One normalisation, used by both, makes that impossible.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    seen = {}
+
+    def spy(data, require_ai):
+        seen["received"] = require_ai
+        return IS_COMPLETE(data, require_ai)
+
+    inv = _read(cache, contract=CONTRACT, is_complete=spy, require_ai=supplied)
+    assert isinstance(seen["received"], bool), "the authority must receive a real bool"
+    assert seen["received"] is bool(supplied)
+    assert inv.analysis_mode == ("require_ai" if seen["received"] else "no_ai")
+    assert inv.completeness_assessed is True
+
+
+def test_n_f7_none_remains_distinct_from_false(tmp_path):
+    """Normalising must not collapse "no mode was established" into "judge the no-AI mode"."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+
+    unasked = _read(cache, contract=CONTRACT, is_complete=IS_COMPLETE, require_ai=None)
+    assert unasked.completeness_assessed is False
+    assert unasked.complete_records is None
+    assert unasked.analysis_mode == ""
+    assert unasked.records[0].complete == lcr.NOT_ASSESSED
+
+    asked = _read(cache, contract=CONTRACT, is_complete=IS_COMPLETE, require_ai=False)
+    assert asked.completeness_assessed is True
+    assert asked.analysis_mode == "no_ai"
+    assert asked.complete_records == 1
+
+
+def test_n_f7_every_name_imported_from_a1_is_actually_used():
+    """A dead import is small, but it is also the shape of a dependency nobody checked."""
+    with open(_A3, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "beatsync_fork.library_inventory":
+            imported.update(alias.name for alias in node.names)
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert imported, "the fixture must have found the import at all"
+    assert not (imported - used), f"dead imports: {sorted(imported - used)}"
+
+
+def test_n_f7_the_a1_import_guard_is_described_as_the_subset_assertion_it_is():
+    """It asserts ``imported <= {...}``. Calling that an exact pin misdescribes the guard a reader
+    would go and check, and the conclusion drawn from it does not need the overstatement."""
+    with open(_A3, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert "pinned by an existing A1 test to exactly" not in source
+    assert "subset" in source
+    # and the guard really is a subset assertion that excludes json
+    guard = os.path.join(_REPO_ROOT, "tests", "test_library_inventory.py")
+    with open(guard, "r", encoding="utf-8") as handle:
+        guard_tree = ast.parse(handle.read())
+    allowed = None
+    for node in ast.walk(guard_tree):
+        if (isinstance(node, ast.Compare) and isinstance(node.left, ast.Name)
+                and node.left.id == "imported" and isinstance(node.comparators[0], ast.Set)):
+            allowed = {element.value for element in node.comparators[0].elts
+                       if isinstance(element, ast.Constant)}
+            assert isinstance(node.ops[0], ast.LtE), "the guard is <=, not =="
+    assert allowed and "json" not in allowed
+
+
+# =============================================================================================
+# N-M. negative controls for the remediation -- each weakens one fix and must change an answer
+# =============================================================================================
+
+def test_n_mf1_not_announcing_the_byte_ceiling_lets_the_pass_call_itself_authoritative(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    size = os.path.getsize(os.path.join(str(cache), _NAME_A))
+
+    weak = _mutant(("                    bound = bound or BOUND_TOTAL_BYTES\n"
+                    "                    assessments_complete = False\n",
+                    "                    pass\n"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                looks_reusable=ac.looks_reusable, max_total_bytes=size)
+    real = _read(cache, contract=CONTRACT, looks_reusable=ac.looks_reusable, max_total_bytes=size)
+    assert mutated.transport_counts == real.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+    assert mutated.bound == lcr.BOUND_NONE and mutated.authoritative is True
+    assert real.bound == lcr.BOUND_TOTAL_BYTES and real.authoritative is False
+
+
+def test_n_mf2_accepting_any_root_key_lets_an_unverified_root_answer_scope(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ghost = lib.probe_root(str(tmp_path / "never-created"))
+    assert ghost.root_key and ghost.positively_observed is False
+    _write_record(cache, _NAME_A, _complete_payload(os.path.join(ghost.real, "clip.mp4")))
+
+    weak = _mutant(("    if getattr(item, \"positively_observed\", False):\n        return True\n"
+                    "    return getattr(item, \"verdict\", \"\") in (PRESENT, ACCESS_DENIED)",
+                    "    return True"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                inspection_roots=[ghost])
+    real = _read(cache, contract=CONTRACT, inspection_roots=[ghost])
+    assert mutated.scope_counts == {"scope_in": 1}, "the mutant judged against a folder never seen"
+    assert real.scope_assessed is False and real.scope_counts == {}
+
+
+def test_n_mf3a_comparing_size_alone_cannot_see_a_same_size_replacement(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    deferred = dict(_complete_payload("C:/x/a.mp4"))
+    deferred["ai_deferred"] = True
+    usable = _complete_payload("C:/x/a.mp4")
+    width = max(len(json.dumps(deferred).encode("utf-8")),
+                len(json.dumps(usable).encode("utf-8"))) + 32
+    replacement = _exact_bytes(tmp_path, "staged.json", usable, pad_to=width)
+
+    weak = _mutant(("    return (int(size),\n"
+                    "            int(getattr(info, \"st_ino\", -1)),\n"
+                    "            int(getattr(info, \"st_dev\", -1)))",
+                    "    return (int(size),)"))
+
+    def run(module):
+        _exact_bytes(cache, _NAME_A, deferred, pad_to=width)
+        return module.read_records(
+            str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+            looks_reusable=ac.looks_reusable,
+            read_text=_swap_reader(os.path.join(str(cache), _NAME_A), replacement, atomic=True))
+
+    mutated = run(weak)
+    real = run(lcr)
+    assert mutated.transport_counts == {lcr.TRANSPORT_OK: 1} and mutated.changed == ()
+    assert real.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1} and real.changed == (_NAME_A,)
+
+
+def test_n_mf3b_verifying_only_the_refusal_branch_leaves_an_accepted_verdict_unchecked(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+
+    def growing(path, contract):
+        with open(path, "a", encoding="utf-8", newline="") as handle:
+            handle.write(" " * 2048)
+        return ac.looks_reusable(path, contract)
+
+    weak = _mutant(("                            after = _observe_identity(full, lstat)",
+                    "                            after = gate_identity if ok "
+                    "else _observe_identity(full, lstat)"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                looks_reusable=growing)
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    real = _read(cache, contract=CONTRACT, looks_reusable=growing)
+    assert mutated.transport_counts == {lcr.TRANSPORT_OK: 1} and mutated.changed == ()
+    assert real.transport_counts == {lcr.TRANSPORT_UNAVAILABLE: 1}
+
+
+def test_n_mf4_an_unbounded_read_parses_a_record_past_the_ceiling(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    path = _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    grown = json.dumps({**_complete_payload("C:/x/a.mp4"), "_bulk": "y" * 200_000})
+
+    weak = _mutant(("            return handle.read(max_record_bytes + 1)",
+                    "            return handle.read()"),
+                   ("            if consumed > max_record_bytes:",
+                    "            if False:"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                max_record_bytes=1_000,
+                                lstat=_grow_after_the_size_gate(path, grown))
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    real = _read(cache, contract=CONTRACT, max_record_bytes=1_000,
+                 lstat=_grow_after_the_size_gate(path, grown))
+    assert mutated.parse_counts == {lcr.PARSE_OK: 1}, "the mutant parsed the oversized payload"
+    assert real.parse_counts == {lcr.PARSE_TOO_LARGE: 1}
+
+
+def test_n_mf5_not_counting_a_refusal_turns_it_back_into_a_measured_zero(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(3):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    def explode(data, require_ai):
+        raise RuntimeError("declines")
+
+    weak = _mutant(("                    completion_unavailable += 1\n"
+                    "                    assessments_complete = False\n",
+                    "                    pass\n"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                is_complete=explode, require_ai=False)
+    real = _read(cache, contract=CONTRACT, is_complete=explode, require_ai=False)
+    assert mutated.complete_records == 0, "the mutant published a measured zero"
+    assert real.complete_records is None
+    assert real.completion_accounted == real.records_parsed == 3
+
+
+def test_n_mf6_records_truncated_cannot_silently_disappear(tmp_path):
+    """The previously SURVIVING mutant: a shortened detail display that denies being shortened."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(9):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    weak = _mutant(("            records_truncated = True\n            continue",
+                    "            records_truncated = False\n            continue"),
+                   ("        else:\n            records_truncated = True\n",
+                    "        else:\n            records_truncated = False\n"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                max_reported_names=4)
+    real = _read(cache, contract=CONTRACT, max_reported_names=4)
+    assert len(mutated.records) == len(real.records) == 4
+    assert mutated.records_attempted == real.records_attempted == 9
+    assert mutated.records_truncated is False, "the mutant claims an exhaustive 4-of-9 list"
+    assert real.records_truncated is True
+    # The flag is what the previously surviving mutant erased, so it is asserted on its own above
+    # before the derived property is brought in.
+    assert mutated.details_complete is True and real.details_complete is False
+
+
+def test_n_mf7_deriving_the_mode_label_separately_can_mislabel_it(tmp_path):
+    """The other previously SURVIVING mutant: label and authority answering different modes."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+
+    weak = _mutant(("    if assess_complete:\n        require_ai = bool(require_ai)",
+                    "    if False:\n        require_ai = bool(require_ai)"),
+                   ('    mode = ("require_ai" if require_ai else "no_ai") if assess_complete '
+                    'else ""',
+                    '    mode = ("require_ai" if require_ai is True else "no_ai") '
+                    'if assess_complete else ""'))
+    seen = {}
+
+    def spy(data, require_ai):
+        seen["received"] = require_ai
+        return IS_COMPLETE(data, require_ai)
+
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                is_complete=spy, require_ai="no")
+    mutated_received = seen["received"]
+    real = _read(cache, contract=CONTRACT, is_complete=spy, require_ai="no")
+    assert mutated.analysis_mode == "no_ai" and mutated_received == "no", \
+        "the mutant labels no_ai while the authority was handed a truthy value"
+    assert real.analysis_mode == "require_ai" and seen["received"] is True
+
+
+def test_n_mf8_an_alias_refusal_must_keep_charging_the_skipped_entry(tmp_path):
+    """Skipped entries are still work done, and must stay visible in the aggregate."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write_record(cache, _NAME_A, _complete_payload("C:/x/a.mp4"))
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    # A junction first: `mklink /J` needs no elevation, whereas `os.symlink` does on Windows
+    # unless Developer Mode is on. Preferring the junction is what keeps this control RUNNING
+    # rather than skipping on an ordinary unprivileged session -- and a junction is the alias
+    # kind this product actually meets.
+    alias = os.path.normpath(os.path.join(str(cache), "aliasdir"))
+    made = False
+    if os.name == "nt":
+        import subprocess
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", alias, os.path.normpath(str(target))],
+                              capture_output=True, text=True).returncode == 0
+    if not made and _can_symlink(tmp_path):
+        os.symlink(str(target), alias, target_is_directory=True)
+        made = True
+    if not made:
+        pytest.skip("no directory-link primitive available in this environment")
+
+    weak = _mutant(("        if evidence == _LINK_ALIAS:\n            note(aliases, name)\n"
+                    "            skipped_entries += 1\n            continue",
+                    "        if evidence == _LINK_ALIAS:\n            note(aliases, name)\n"
+                    "            continue"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT)
+    real = _read(cache, contract=CONTRACT)
+    assert mutated.skipped_aliases == real.skipped_aliases == ("aliasdir",)
+    assert mutated.skipped_entries == 0 and real.skipped_entries == 1
