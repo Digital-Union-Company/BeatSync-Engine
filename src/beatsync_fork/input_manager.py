@@ -28,6 +28,12 @@ descended, and because its exclusion cannot be reported through :class:`InputSet
 refuses the scan instead of publishing a complete-looking total. See
 :func:`_iter_candidate_paths` for why a nested symlink is deliberately treated differently.
 
+A caller that cannot afford an unbounded tree may pass ``max_entries``, which keeps the contract
+intact by **refusing** rather than returning a short result — the third way to fail, alongside an
+unlistable directory and a nested junction, and never a fourth way to succeed. It defaults to
+``None``, every caller in this repository leaves it there, and :func:`scan_folder` documents exactly
+what it does and does not bound.
+
 Deliberate non-goals
 --------------------
 No media copying, no FFmpeg, no OpenCV, no Qwen, no rendering, no full-file hashing, and no Gradio
@@ -68,6 +74,25 @@ persisted by a later phase (edit plans, run manifests) can never be compared acr
 
 class InputScanError(ValueError):
     """The scan root is missing, is not a directory, or cannot be listed."""
+
+
+class InputScanLimitExceeded(InputScanError):
+    """The tree holds more entries than the caller allowed itself to read.
+
+    A **subclass**, deliberately, so that every existing ``except InputScanError`` keeps working
+    unchanged — all seven call sites in this repository already surface that refusal to the
+    operator, and a containment refusal and a limit refusal need the same handling: the scan did
+    not complete, so nothing it saw may be published as a total.
+
+    ``limit`` is the cap that was passed; ``counted_at_least`` is how many entries had been
+    accounted for when the cap was reached. ``counted_at_least`` is a **lower bound and never a
+    total** — the tree holds more than that, which is precisely why the scan was refused.
+    """
+
+    def __init__(self, message: str, *, limit: int, counted_at_least: int) -> None:
+        super().__init__(message)
+        self.limit = int(limit)
+        self.counted_at_least = int(counted_at_least)
 
 
 class RejectReason(str, Enum):
@@ -512,6 +537,7 @@ def scan_folder(
     extensions: Iterable[str] | None = None,
     detect_duplicates: bool = True,
     chunk_bytes: int = FINGERPRINT_CHUNK_BYTES,
+    max_entries: int | None = None,
 ) -> InputSet:
     """Enumerate source video files under ``root`` and account for every entry seen.
 
@@ -522,18 +548,61 @@ def scan_folder(
             optional). Defaults to :data:`SUPPORTED_VIDEO_EXTENSIONS`.
         detect_duplicates: Compute duplicate candidates. Set ``False`` to skip all file reads.
         chunk_bytes: Head/tail size for fingerprinting.
+        max_entries: Optional ceiling on how many discovered entries this caller is willing to
+            classify. ``None`` — the default, and what every caller in this repository passes —
+            means no ceiling and behaviour identical to before the parameter existed. See
+            *Bounding* below.
 
     Returns:
         An :class:`InputSet` covering a **complete** traversal. Nothing is copied, moved, modified or
         deleted.
 
     Raises:
+        ValueError: ``max_entries`` is neither ``None`` nor a positive ``int``. Checked **before any
+            filesystem access**, because passing ``0`` or ``-1`` is a programming error in the
+            caller, not an observation about the folder, and must not be reported as one.
+        InputScanLimitExceeded: the tree holds **more than** ``max_entries`` entries.
         InputScanError: ``root`` is empty, missing, not a directory or unlistable, **or** any
             directory in the tree could not be listed. Traversal is all-or-nothing: a returned
             :class:`InputSet` always means every directory was read successfully, so an incomplete
             scan can never masquerade as a smaller library.
+
+    Bounding, and what ``max_entries`` honestly is
+    ----------------------------------------------
+    It is a **classification-entry ceiling**. It is *not* a wall-clock bound and *not* a peak-memory
+    bound, and it must never be described as either.
+
+    * It counts **discovered entries**, not supported media files. Cost is incurred per entry seen,
+      so a ceiling on accepted files alone would leave a directory of ten million ``.txt`` files
+      entirely unbounded.
+    * Exactly ``max_entries`` entries **succeeds**; the entry *after* that refuses. Proving there is
+      a further entry requires pulling one, which is what separates "there are more" from "there are
+      exactly this many".
+    * Reaching it **raises** rather than returning a short :class:`InputSet`. The all-or-nothing
+      contract is the point of this module, and a truncated success would also be a *containment*
+      lie: measured, a ceiling reached before a nested junction means the junction is never seen, so
+      a short result is no evidence that the tree is contained.
+    * **What it cannot bound.** ``os.walk`` materialises one directory's entries completely before
+      it yields the first of them, and :func:`_nested_link_kind` takes one ``os.lstat`` per child
+      directory before any of that directory's files are yielded. Measured on CPython 3.14.3: a
+      single directory of 20,000 files with a ceiling of 1 still enumerated all 20,000 entries at
+      identical peak memory, and a root holding 4,000 subdirectories still performed 4,000 ``lstat``
+      calls. The irreducible floor is therefore O(entries in the largest single directory) +
+      O(subdirectories of each visited directory), and only the per-entry classification cost above
+      that floor is actually bounded.
     """
     started = time.perf_counter()
+
+    # Before any filesystem access, so an invalid ceiling is always the same deterministic error
+    # regardless of whether `root` happens to exist. `isinstance(True, int)` is True in Python, so
+    # bool is excluded explicitly rather than being silently accepted as 1.
+    if max_entries is not None:
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+            raise ValueError(
+                f"max_entries must be a positive integer or None, not {type(max_entries).__name__}"
+            )
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be a positive integer or None, not {max_entries}")
 
     if not root or not str(root).strip():
         raise InputScanError("No folder was provided.")
@@ -553,6 +622,20 @@ def scan_folder(
     collisions = 0
 
     for candidate in _iter_candidate_paths(resolved_root, recursive):
+        if max_entries is not None and discovered >= max_entries:
+            # Checked BEFORE the increment, so `discovered` and the accounting below stay exactly
+            # consistent with one another, and so this entry is never half-counted. Reaching here
+            # at all means the generator produced one more entry than the ceiling allowed, which
+            # is the proof that the tree is larger -- a ceiling equal to the entry count exhausts
+            # the generator instead and succeeds.
+            raise InputScanLimitExceeded(
+                f"Cannot scan folder tree: {resolved_root} holds more than the {max_entries} "
+                f"entries this inspection allowed itself to read, so the inventory was not "
+                f"completed and no count for this folder is a total. Narrow the folder, or raise "
+                f"the limit.",
+                limit=max_entries,
+                counted_at_least=discovered,
+            )
         discovered += 1
         absolute = os.path.abspath(candidate)
 
@@ -644,6 +727,7 @@ __all__ = [
     "Fingerprint",
     "FingerprintError",
     "InputScanError",
+    "InputScanLimitExceeded",
     "InputSet",
     "MediaFile",
     "RejectReason",
