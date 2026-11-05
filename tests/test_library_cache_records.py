@@ -2979,3 +2979,71 @@ def test_n_mf10_dropping_the_term_from_the_two_honesty_properties_also_republish
         "the count must survive the mutation, or this is a schema kill rather than a behavioural one"
     assert mutated.counts_exact is True and real.counts_exact is False
     assert mutated.authoritative is True and real.authoritative is False
+
+
+def test_n_f8_the_unclassified_count_does_not_saturate_at_the_name_cap(tmp_path):
+    """The reason it is a dedicated integer: a count read off a capped list under-reports.
+
+    ``note()`` stops appending at ``max_reported_names``, so ``len(skipped_undecidable)`` saturates
+    at the cap while the true number keeps rising. 350 unclassifiable entries against a 200-name cap
+    is the discriminating fixture: the integer must still be 350.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    victims = set()
+    for index in range(355):
+        name = _record_name(index)
+        _write_record(cache, name, _complete_payload(f"C:/x/{index}.mp4"))
+        if index >= 5:
+            victims.add(name)
+    assert len(victims) == 350
+    real_lstat = os.lstat
+
+    def hostile(path):
+        if os.path.basename(str(path)) in victims:
+            raise PermissionError(13, "Access is denied")
+        return real_lstat(path)
+
+    inv = _read_full(cache, lstat=hostile, max_reported_names=200)
+
+    assert inv.records_recognised == 5, "only the five readable entries were classified"
+    assert inv.counts_exact is False and inv.authoritative is False
+    assert len(inv.skipped_undecidable) == 200, "the NAME list is capped, as designed"
+    assert inv.names_truncated is True
+    assert inv.entries_unclassified == 350,         "the COUNT must be exact even though the name list is capped"
+    assert inv.entries_unclassified <= inv.skipped_entries <= inv.entries_examined
+
+
+def test_n_f8_the_arithmetic_gap_identity_survives_the_new_counter(tmp_path):
+    """``entries_unclassified`` is a SUBSET of ``skipped_entries``, never an addition to it.
+
+    Every skip kind present at once: three unclassifiable entries, one subdirectory, one recognised
+    non-record file, six good records. ``skipped_entries`` must be unchanged in meaning, so the
+    disclosure arithmetic a consumer may already rely on still balances.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    victims = set()
+    for index in range(9):
+        name = _record_name(index)
+        _write_record(cache, name, _complete_payload(f"C:/x/{index}.mp4"))
+        if index >= 6:
+            victims.add(name)
+    (cache / "a-subdirectory").mkdir()
+    _write_record(cache, "qwen_batch_request_1.json", {"not": "a record"})
+    real_lstat = os.lstat
+
+    def hostile(path):
+        if os.path.basename(str(path)) in victims:
+            raise PermissionError(13, "Access is denied")
+        return real_lstat(path)
+
+    inv = _read_full(cache, lstat=hostile)
+
+    assert inv.entries_listed == 11
+    assert inv.records_recognised == 6
+    assert inv.other_files == 1
+    assert inv.entries_listed - inv.records_recognised - inv.other_files == inv.skipped_entries
+    assert inv.skipped_entries == 4, "3 unclassifiable + 1 subdirectory"
+    assert inv.entries_unclassified == 3, "the subdirectory is NOT charged"
+    assert inv.counts_exact is False and inv.authoritative is False
