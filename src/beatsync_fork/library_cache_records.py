@@ -69,12 +69,28 @@ is now bounded and disclosed rather than hidden.
 * **The per-record ceiling is enforced on the bytes this pass consumed**, so a record that grows after
   its size gate is refused rather than parsed, and never parsed as a truncated prefix. The *read* is
   bounded in **characters** (``max_record_bytes + 1``), because the single ``open`` here is text mode;
-  worst-case I/O is therefore up to four bytes per character under UTF-8. The *verdict* is exact
-  regardless: the ceiling is compared against the consumed text's encoded byte length.
+  worst-case I/O is therefore up to four bytes per character under UTF-8 — measured at 1.00× for
+  ASCII and 2.8–3.9× for 3- and 4-byte characters, the exact ratio depending on the record's own
+  content. The *verdict* is exact regardless: the ceiling is compared against the consumed text's
+  encoded byte length.
+* **`max_total_bytes` is a budget, not a hard byte ceiling.** It stops the pass opening the *next*
+  record, which is a different guarantee from capping what the current one consumes. Because the
+  per-record read is character-bounded, a file that grows after its size gate can carry total
+  consumption past the remaining budget by at most one per-record ceiling — measured at 4 001 bytes
+  under a 500-byte budget with a 4 000-byte per-record ceiling, with ``bound=''`` because nothing
+  *stopped* the pass. ``bytes_charged`` reports it; the budget is never under-charged.
 * **The delegated transport re-read cannot be bounded from here at all.** `analysis_cache.looks_reusable`
   reopens the path itself, and changing that is outside this module's contract. Its cost is charged as
-  a **stat-time estimate**, a growing file can exceed that estimate during delegation, and the identity
+  a **stat-time estimate**, a growing file can exceed that estimate during delegation (measured:
+  about 8 000 000 bytes consumed under a 5 000-byte budget, against 218 charged), and the identity
   re-observation afterwards can only *report* the change — it cannot retract bytes already read.
+* **Classification completeness is not enumeration completeness.** An entry whose link metadata is
+  undecidable, or whose size-gate ``lstat`` raises, is never put to rung 1 at all, so this pass
+  cannot say whether the folder holds one more record than its counters show. Such entries are
+  counted in ``entries_unclassified`` and clear ``counts_exact``, ``authoritative`` and
+  ``assessments_complete`` — without inventing a ceiling event, since none was reached. A confirmed
+  alias, a proven out-of-root escape and a subdirectory are *positive* classifications and are
+  deliberately not charged there.
 * **Rung 6 is lexical containment inside a positively observed root.** It never stats a source, so it
   says nothing whatsoever about whether that source exists.
 * ``listdir`` materialises one whole directory before any per-entry ceiling can apply, so the floor
@@ -138,8 +154,21 @@ PARSE_UNREADABLE = "parse_unreadable"
 #: It was listed and then was not there. Concurrency, not a defect in the record: a shared cache
 #: legitimately has other installations writing into it.
 PARSE_VANISHED = "parse_vanished"
-#: Larger than the per-record ceiling, so it was **refused rather than read**. No Stage-5 record is
-#: this large; reading it anyway is how a byte budget stops meaning anything.
+#: Larger than the per-record ceiling, so it was refused. No Stage-5 record is this large; parsing
+#: one anyway is how a byte budget stops meaning anything.
+#:
+#: **How much was read before the refusal depends on which of two cases it was**, and saying only
+#: "refused rather than read" was inaccurate for the second:
+#:
+#: * already over the ceiling at its size gate -- **refused unread**. Nothing is opened at all;
+#: * within the ceiling at its size gate and then grown before the read -- **refused after a
+#:   bounded read**. The read stops at ``max_record_bytes + 1`` characters, the consumed text's
+#:   encoded byte length exceeds the ceiling, and the record is refused on that measurement. The
+#:   prefix is never parsed. Measured with ``max_record_bytes=1000``: 1 001 bytes consumed for
+#:   single-byte text -- exactly the character bound -- rising toward the 4x worst case for
+#:   multi-byte text, the exact figure depending on the record's own content.
+#:
+#: Either way the *verdict* is exact and no truncated prefix is ever treated as a record.
 PARSE_TOO_LARGE = "parse_too_large"
 #: Never attempted -- a bound was reached or the caller asked to stop. Not zero, not failed.
 PARSE_NOT_READ = "parse_not_read"
@@ -242,10 +271,29 @@ MAX_CACHE_RECORDS = 20_000
 #: than being allowed to spend the whole byte budget.
 MAX_RECORD_BYTES = 4_000_000
 
-#: Total JSON bytes this pass may read, across every record **and** every delegated transport
-#: re-read. Chosen so the realistic production store (thousands of records at a median far below
-#: the per-record ceiling) is a *complete* pass rather than a truncated one, while a folder that is
-#: not a cache at all cannot be read without limit.
+#: The pass's JSON byte **budget**: once this much has been charged, no further record is opened
+#: and no further transport delegation is made. Chosen so the realistic production store (thousands
+#: of records at a median far below the per-record ceiling) is a *complete* pass rather than a
+#: truncated one, while a folder that is not a cache at all cannot be read without limit.
+#:
+#: **It is a budget that stops further work, not a guaranteed ceiling on bytes actually read**, and
+#: the earlier wording ("across every record and every delegated transport re-read") overclaimed.
+#: Two measured ways consumption can exceed it:
+#:
+#: * ``analysis_cache.looks_reusable`` **reopens the path itself**. Its cost is charged as a
+#:   stat-time estimate, which is all this module can know before delegating; a file that is larger
+#:   than its recorded size, or that grows during the call, reads more than was charged. Bounding
+#:   it would mean changing ``analysis_cache``'s API, which is outside this module's contract.
+#:   Measured with ``max_total_bytes=5000`` and a record grown to about 8 MB between its size gate
+#:   and the delegated re-read: roughly 8 000 000 bytes consumed, against 218 charged;
+#: * a record that grows after its size gate is read up to ``max_record_bytes + 1`` characters
+#:   before being refused, which can carry consumption past the remaining budget by at most one
+#:   per-record ceiling -- that ceiling is what bounds the overshoot. Measured with
+#:   ``max_total_bytes=500`` and ``max_record_bytes=4000``: 4 001 bytes consumed, ``bound=''``
+#:   because no limit *stopped* the pass -- it was already on its last record.
+#:
+#: :attr:`RecordInventory.bytes_charged` reports what was charged in both cases, so the overshoot is
+#: visible rather than hidden. The safety property is that the budget is never *under*-charged.
 MAX_TOTAL_RECORD_BYTES = 1_000_000_000
 
 #: Problem names reported **per category**, matching A2's ``MAX_DIAGNOSTIC_NAMES``. Note what this
@@ -283,9 +331,17 @@ class CacheRecord:
 class RecordInventory:
     """What one cache folder holds, as observed, with its own truthfulness attached.
 
-    :attr:`complete` is the load-bearing field. When it is ``False`` **no count here is a total** --
-    they are observations of the part of the folder this pass reached, and :attr:`bound` names what
-    stopped it.
+    :attr:`complete` answers one precise question: **did the pass run to the end without being
+    stopped?** When it is ``False`` no count here is a total -- they are observations of the part of
+    the folder this pass reached, and :attr:`bound` names what stopped it.
+
+    The converse does **not** hold, and reading it as though it did is the mistake F-8 was. A pass
+    can run to the very end, hit no ceiling and therefore report ``complete=True`` while still
+    having been unable to work out *what some entry was*. Enumeration completeness and
+    classification completeness are two different facts. So a consumer asking "may I publish these
+    numbers as this folder's totals?" must read :attr:`authoritative` or :attr:`counts_exact`, both
+    of which additionally fail closed on :attr:`entries_unclassified`, and never :attr:`complete`
+    on its own.
     """
 
     path: str = ""
@@ -350,18 +406,67 @@ class RecordInventory:
     #: (:attr:`assessments_complete`) and from whether the detail lists are exhaustive
     #: (:attr:`details_complete`).
     entries_complete: bool = False
-    #: Did every rung the caller **requested** actually answer, for every record this pass parsed?
-    #: ``False`` when a byte budget prevented a delegated transport check, when a file moved while
-    #: being inspected, or when a completion authority raised. The counts remain honest either way —
-    #: they say ``transport_unavailable`` and :attr:`completion_unavailable` — but a consumer that
-    #: needs every rung answered must read this rather than infer it from the counts.
+    #: Did every observation the caller **requested** actually get established? ``False`` when a
+    #: byte budget prevented a delegated transport check, when a file moved while being inspected,
+    #: when a completion authority raised, or when an entry could not be classified at all
+    #: (:attr:`entries_unclassified`). The counts remain honest either way — they say
+    #: ``transport_unavailable``, :attr:`completion_unavailable` and :attr:`entries_unclassified` —
+    #: but a consumer that needs every rung answered must read this rather than infer it from the
+    #: counts.
+    #:
+    #: The unclassifiable case is included deliberately: rung 1 is a requested observation too, and
+    #: an entry it was never put to is a requested observation that did not happen. It is not merely
+    #: a rung that answered unhelpfully for a *parsed* record — it is an entry that never became a
+    #: record at all, which is strictly less established, not more.
     assessments_complete: bool = False
 
-    # containment refusals -- never read, by construction
+    # Entries this pass did not classify as records. Two kinds, and conflating them is exactly the
+    # defect F-8 reported, so they are counted separately:
+    #
+    # * **positive refusals** -- a confirmed alias, a proven out-of-root escape, a subdirectory.
+    #   ``lstat`` answered, the entry is demonstrably not an ordinary file eligible for record
+    #   classification, and leaving it out of the record counters is correct by construction. None
+    #   of these is ever read.
+    # * **unclassifiable entries** -- the inspector could not establish *what* the entry is, so
+    #   "not a record" was never established either. See :attr:`entries_unclassified`. These are
+    #   not read either, but for the opposite reason: not because we know they are not records,
+    #   but because we could not find out.
+    #
+    # ``skipped_entries`` is the sum of both kinds plus subdirectories, so it is a work counter and
+    # is deliberately **not** the exactness discriminator.
     skipped_aliases: tuple = ()
     skipped_escapes: tuple = ()
     skipped_undecidable: tuple = ()
     skipped_entries: int = 0
+    #: Directory entries the inspector could not classify at all -- it could not establish whether
+    #: the entry is an ordinary file eligible for record classification, so rung 1 was never put to
+    #: it and its name never reached :func:`is_record_name`. Three sites increment it:
+    #:
+    #: * ``_link_evidence`` returned anything that is not positively an ordinary file and not a
+    #:   confirmed alias (today :data:`library_inventory._LINK_UNDECIDABLE`),
+    #: * the size-gate ``lstat`` raised :class:`OSError` -- a permission denial, a sharing
+    #:   violation, a device error, and
+    #: * the size-gate ``lstat`` raised :class:`FileNotFoundError`. The conservative rule, chosen
+    #:   deliberately: **a vanished entry is charged here too.** It was positively an ordinary file
+    #:   microseconds earlier (``_link_evidence`` had already answered ``_LINK_PLAIN`` for it), it
+    #:   was never tested against :func:`is_record_name`, and a folder that changed under the pass
+    #:   has no single state for which the counters could be a total anyway. :attr:`unstable` is an
+    #:   *observation*, not an exactness claim, and leaving a consumer to cross-read it before
+    #:   trusting :attr:`counts_exact` would repeat the very mistake this counter fixes.
+    #:
+    #: A subdirectory is **not** charged here: ``lstat`` answered and ``S_ISREG`` said no, which is
+    #: a positive classification. Neither is an alias or an escape -- see the group comment above.
+    #:
+    #: Why a dedicated integer rather than ``len(skipped_undecidable) + len(unreadable)``: those
+    #: tuples are capped at ``max_reported_names``, and :attr:`unreadable` and :attr:`vanished` are
+    #: each fed by a second, unrelated site at parse time (:data:`PARSE_UNREADABLE`,
+    #: :data:`PARSE_VANISHED`) where the entry *was* classified. A count read off them would be
+    #: wrong in both directions.
+    #:
+    #: Non-zero clears :attr:`counts_exact`, :attr:`authoritative` and :attr:`assessments_complete`.
+    #: It deliberately does **not** set a :attr:`bound`: no ceiling was reached, and inventing a
+    #: resource-limit event to carry an unrelated fact is how a bound stops meaning anything.
+    entries_unclassified: int = 0
 
     # instability observed while reading
     vanished: tuple = ()
@@ -433,8 +538,19 @@ class RecordInventory:
         :attr:`scope_counts`) still totals the entire directory. Reading a shortened display as the
         whole cache, or reading a withheld figure as zero, are the two misreadings this property
         exists to prevent.
+
+        Two conditions are required, not one, and the second was F-8. The loop must have visited
+        every name (:attr:`entries_complete`) **and** every name it visited must have been
+        classifiable (:attr:`entries_unclassified` zero). An entry whose ``lstat`` fails is a
+        recognised-record-name candidate that was never put to rung 1, so ``records_recognised``
+        would be a count of the records this pass *could see* while this property claimed it was a
+        count of the records the directory *holds*. Measured: four real Stage-5 records, one with a
+        failing ``lstat``, ``records_recognised=3``, no ceiling reached. A count short by an
+        unknown amount is not an exact count, so this now fails closed instead.
         """
-        return bool(self.entries_complete and self.state in (CACHE_PRESENT, CACHE_EMPTY))
+        return bool(self.entries_complete
+                    and not self.entries_unclassified
+                    and self.state in (CACHE_PRESENT, CACHE_EMPTY))
 
     @property
     def authoritative(self) -> bool:
@@ -458,8 +574,17 @@ class RecordInventory:
         So: ``authoritative`` answers "may I publish these as folder totals *and* show my full
         working?"; :attr:`counts_exact` answers "do the numbers cover the whole folder?"; and
         :attr:`assessments_complete` answers "did every rung I asked for actually answer?".
+
+        :attr:`entries_unclassified` clears this flag as well, and it does so **here** rather than
+        by forcing :attr:`complete` to ``False``: no ceiling was reached, so there is no bound to
+        name, and manufacturing one would both misreport why the pass stopped (it did not stop) and
+        corrupt first-bound-wins. :attr:`complete` therefore stays ``True`` and keeps meaning
+        exactly what it says — the loop ran to the end — while this property, the one that
+        authorises publication, refuses.
         """
-        return bool(self.complete and self.state in (CACHE_PRESENT, CACHE_EMPTY))
+        return bool(self.complete
+                    and not self.entries_unclassified
+                    and self.state in (CACHE_PRESENT, CACHE_EMPTY))
 
     @property
     def unstable(self) -> bool:
@@ -790,6 +915,7 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
     records_attempted = 0
     other_files = other_bytes = 0
     skipped_entries = 0
+    entries_unclassified = 0
     bytes_charged = 0
     names_truncated = False
     records_truncated = False
@@ -858,8 +984,13 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
             # rather than being read by default. Unreadable link metadata is not evidence of an
             # ordinary file, and an alias read by mistake is a read outside the folder we were
             # given.
+            #
+            # Refusing to read it is right; reporting the folder's counts as totals afterwards was
+            # not (F-8). We do not know what this entry is, so we do not know it is not a record.
             note(undecidable, name)
             skipped_entries += 1
+            entries_unclassified += 1
+            assessments_complete = False
             continue
 
         entry_real = _resolve(full, realpath)
@@ -880,17 +1011,35 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         except FileNotFoundError:
             # Listed and then gone. Instability, reported as such -- never silently dropped, and
             # never counted as a record that failed.
+            #
+            # It is ALSO charged as unclassifiable, which is the conservative half of the F-8 rule.
+            # `_link_evidence` had already answered `_LINK_PLAIN` for this entry microseconds ago,
+            # so it was an ordinary file and genuinely eligible for rung 1 -- and rung 1 was never
+            # put to it. `unstable` reports that the folder moved; it does not withdraw a claim of
+            # exactness, and asking a consumer to cross-read it before trusting `counts_exact` is
+            # the same shape of mistake as F-8 itself. The reasoning is on `entries_unclassified`.
             note(vanished, name)
             skipped_entries += 1
+            entries_unclassified += 1
+            assessments_complete = False
             continue
         except OSError as exc:
+            # Present, and we may not look at it. Same conclusion for the same reason: this entry's
+            # name was never tested against `is_record_name`, so nothing here establishes that the
+            # folder does not hold one more record than the counters say.
             note(unreadable, f"{name}: {type(exc).__name__}")
             skipped_entries += 1
+            entries_unclassified += 1
+            assessments_complete = False
             continue
 
         if not is_file:
             # A Stage-5 cache has no subdirectories. One that appears is counted, not entered:
             # there is no recursion in this module at all.
+            #
+            # NOT charged as unclassifiable: the `lstat` above succeeded and `S_ISREG` said no.
+            # That is a positive classification -- we know what this entry is and we know it is not
+            # a record -- which is exactly the distinction `entries_unclassified` turns on.
             skipped_entries += 1
             continue
 
@@ -1120,6 +1269,7 @@ def read_records(cache_dir, *, is_record_name, contract=None, is_complete=None, 
         entries_complete=enumerated_every_entry, assessments_complete=assessments_complete,
         skipped_aliases=tuple(aliases), skipped_escapes=tuple(escapes),
         skipped_undecidable=tuple(undecidable), skipped_entries=skipped_entries,
+        entries_unclassified=entries_unclassified,
         vanished=tuple(vanished), changed=tuple(changed),
         malformed=tuple(malformed), unreadable=tuple(unreadable), oversize=tuple(oversize),
         names_truncated=names_truncated, records=tuple(details),

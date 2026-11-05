@@ -2665,3 +2665,317 @@ def test_n_mf8_an_alias_refusal_must_keep_charging_the_skipped_entry(tmp_path):
     real = _read(cache, contract=CONTRACT)
     assert mutated.skipped_aliases == real.skipped_aliases == ("aliasdir",)
     assert mutated.skipped_entries == 0 and real.skipped_entries == 1
+
+
+# =============================================================================================
+# N-F8. an entry that could not be CLASSIFIED must not be published as an exact total
+#
+# F-8, from the final independent delta review of this PR. `_link_evidence` is consulted before
+# the size gate and before `is_record_name`, so an entry whose `lstat` fails is refused there and
+# is never tested for recognition. It was therefore absent from `records_recognised` while the pass
+# still published whole-folder totals: four real Stage-5 records in one folder, one failing
+# `lstat`, and `records_recognised=3` alongside `counts_exact=True`, `authoritative=True`,
+# `assessments_complete=True` and `bound=''`. An exact count of the records this pass could *see*
+# was being presented as an exact count of the records the folder *holds*.
+#
+# Two disciplines apply to every fixture below:
+#
+# * **the input is established, never assumed.** Each name is asserted against the genuine
+#   `ac.is_record_name` and each file is asserted `os.path.isfile` BEFORE any failure is injected,
+#   so "one of these really is a Stage-5 record the pass failed to count" is measured rather than
+#   claimed. Not every skipped entry is a record; this one provably is;
+# * **every assertion is behavioural.** An `AttributeError` on a missing field would prove nothing
+#   about the misclassification, so the tests assert the answers, not the schema.
+# =============================================================================================
+
+_F8_NAMES = (_record_name(1), _record_name(2), _record_name(3), _record_name(900))
+
+
+def _f8_cache(tmp_path):
+    """Four real ordinary files, all four recognised record names. Returns ``(cache, victim)``."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for name in _F8_NAMES:
+        _write_record(cache, name, _complete_payload(f"C:/x/{name}.mp4"))
+    for name in _F8_NAMES:
+        assert ac.is_record_name(name), f"fixture broken: {name!r} is not a recognised record name"
+        assert os.path.isfile(os.path.join(str(cache), name)), f"fixture broken: {name!r}"
+    return cache, _F8_NAMES[-1]
+
+
+def _failing_lstat(victim: str, exc: OSError, *, at: int):
+    """Fail the victim's ``at``-th ``lstat``. ``1`` = ``_link_evidence``; ``2`` = the size gate.
+
+    The call index is load-bearing. ``read_records`` stats every entry **twice** -- once inside
+    ``_link_evidence``, then again for the size gate -- so a hook that fires on the first call can
+    never exercise the size-gate branches at all. Firing on the wrong call is how a first draft of
+    this fixture measured nothing while appearing to pass.
+    """
+    real_lstat = os.lstat
+    seen: dict = {}
+
+    def hostile(path):
+        if os.path.basename(str(path)) == victim:
+            seen[victim] = seen.get(victim, 0) + 1
+            if seen[victim] == at:
+                raise exc
+        return real_lstat(path)
+
+    return hostile
+
+
+# (exception, which lstat call fails, which diagnostic bucket names it)
+_F8_CASES = [
+    pytest.param(PermissionError(13, "Access is denied"), 1, "undecidable",
+                 id="permission-denied-at-link-evidence"),
+    pytest.param(FileNotFoundError(2, "No such file or directory"), 1, "undecidable",
+                 id="gone-at-link-evidence"),
+    pytest.param(OSError(1, "attributes unavailable"), 1, "undecidable",
+                 id="undecidable-link-metadata"),
+    pytest.param(PermissionError(13, "Access is denied"), 2, "unreadable",
+                 id="permission-denied-at-size-gate"),
+    pytest.param(FileNotFoundError(2, "No such file or directory"), 2, "vanished",
+                 id="vanished-at-size-gate"),
+    pytest.param(OSError(1, "device error"), 2, "unreadable",
+                 id="device-error-at-size-gate"),
+]
+
+
+@pytest.mark.parametrize("exc,at,bucket", _F8_CASES)
+def test_n_f8_an_unclassifiable_entry_is_not_an_exact_total(tmp_path, exc, at, bucket):
+    """F-8. Four real records, one the inspector could not classify, and NO ceiling reached.
+
+    All six variants were measured against the pre-remediation module and all six reported
+    ``counts_exact=True`` and ``authoritative=True``. Note that where the failure is consistent the
+    entry lands in ``skipped_undecidable`` -- ``_link_evidence`` refuses first -- which is why the
+    size-gate branches need the ``at=2`` variants to be reached at all.
+    """
+    cache, victim = _f8_cache(tmp_path)
+    opened: list = []
+
+    def spy(path):
+        opened.append(os.path.basename(str(path)))
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    inv = _read_full(cache, lstat=_failing_lstat(victim, exc, at=at), read_text=spy)
+
+    # the misclassification itself: one real record is missing from rung 1's count
+    assert inv.entries_listed == 4
+    assert inv.entries_examined == 4
+    assert inv.records_recognised == 3, "the fixture must lose exactly one real record"
+    assert inv.records_attempted == 3
+    assert inv.parse_counts == {lcr.PARSE_OK: 3}
+
+    # ...so no count here may be published as a folder total.
+    #
+    # These three come FIRST, deliberately. On the pre-remediation module they are the assertions
+    # that fail, and they fail because the answer is wrong -- not because a field is missing. An
+    # `AttributeError` from reading a field a defective build never had would be a schema kill and
+    # would prove nothing about the misclassification, so the behavioural claim is asserted before
+    # the new counter is read at all.
+    assert inv.counts_exact is False, "a count short by an unknown amount is not exact"
+    assert inv.authoritative is False, "these may not be published as this folder's totals"
+    assert inv.assessments_complete is False, "rung 1 was never put to that entry"
+    assert inv.entries_unclassified == 1, "and the result must say HOW MANY it could not classify"
+
+    # ...while the two facts that ARE established stay true, and no ceiling is invented
+    assert inv.entries_complete is True, "enumeration genuinely did reach every name"
+    assert inv.complete is True, "nothing stopped the loop, so nothing may claim to have"
+    assert inv.bound == lcr.BOUND_NONE, "no resource ceiling was reached; none may be reported"
+    assert inv.state == lcr.CACHE_PRESENT
+
+    # ...the entry is named rather than silently dropped
+    named = {"undecidable": inv.skipped_undecidable,
+             "unreadable": inv.unreadable,
+             "vanished": inv.vanished}[bucket]
+    assert any(str(entry).startswith(victim) for entry in named), f"{victim} missing from {bucket}"
+    assert inv.skipped_entries == 1
+
+    # ...and it was never read: refusing to classify it must not become a reason to open it
+    assert victim not in opened, f"the unclassifiable entry was read: {opened}"
+
+
+def test_n_f8_a_vanished_entry_is_charged_too_and_the_rule_is_deliberate(tmp_path):
+    """The conservative half of the F-8 rule, asserted so it cannot drift silently.
+
+    A size-gate ``FileNotFoundError`` means the entry was positively an ordinary file microseconds
+    earlier -- ``_link_evidence`` had already answered ``_LINK_PLAIN`` for it -- and then was gone
+    before rung 1 was put to it. It is charged as unclassifiable anyway, for two reasons:
+
+    * a folder that changed under the pass has no single state for which the counters could be a
+      total, so "exact" is not assertable for either state; and
+    * :attr:`unstable` is an *observation*, not a withdrawal of an exactness claim. Leaving a
+      consumer to cross-read it before trusting ``counts_exact`` is the same shape of mistake as
+      F-8 itself.
+
+    The alternative rule -- treat a vanished entry as no longer part of the folder and keep the
+    totals exact -- was considered and rejected on those grounds.
+    """
+    cache, victim = _f8_cache(tmp_path)
+    inv = _read_full(cache, lstat=_failing_lstat(
+        victim, FileNotFoundError(2, "No such file or directory"), at=2))
+
+    assert victim in inv.vanished
+    assert inv.unstable is True, "the instability is still reported in its own right"
+    # behavioural first, for the same reason as the test above
+    assert inv.counts_exact is False and inv.authoritative is False
+    assert inv.entries_unclassified == 1, "and it is ALSO charged as unclassifiable"
+    # the parse-time vanish is a different thing and is NOT charged here: that entry WAS
+    # classified -- it reached rung 1, was recognised, and its read then failed.
+    gone_at_parse = _read_full(cache, read_text=lambda p: (_ for _ in ()).throw(
+        FileNotFoundError(2, "No such file")))
+    assert gone_at_parse.parse_counts.get(lcr.PARSE_VANISHED) == 4
+    assert gone_at_parse.records_recognised == 4, "every entry was classified"
+    assert gone_at_parse.counts_exact is True, "the counts DO total the folder"
+    assert gone_at_parse.entries_unclassified == 0, "a classified record is not an unknown entry"
+
+
+def test_n_f8_a_subdirectory_is_a_positive_refusal_not_an_unknown_entry(tmp_path):
+    """``lstat`` answered and ``S_ISREG`` said no. That is knowing what it is."""
+    cache, _ = _f8_cache(tmp_path)
+    (cache / "a-subdirectory").mkdir()
+
+    inv = _read_full(cache)
+    assert inv.records_recognised == 4, "all four records are still counted"
+    assert inv.skipped_entries == 1, "the directory is charged as work"
+    assert inv.counts_exact is True and inv.authoritative is True
+    assert inv.entries_unclassified == 0, "but it is not an unclassifiable entry"
+
+
+def test_n_f8_a_confirmed_alias_is_a_positive_refusal_not_an_unknown_entry(tmp_path):
+    """A2's ``_LINK_ALIAS`` gate refuses an entry it has positively identified.
+
+    This is the discriminator that proves the fix did not simply charge every skip: an alias is
+    *known* not to be an ordinary file in this folder, so excluding it from the record counters is
+    correct by construction and the totals stay exact.
+    """
+    cache, _ = _f8_cache(tmp_path)
+    alias_name = _record_name(7)
+    alias_path = os.path.join(str(cache), alias_name)
+    _write_record(cache, alias_name, _complete_payload("C:/x/alias.mp4"))
+    real_lstat = os.lstat
+
+    class _Alias:
+        def __init__(self, info):
+            self.st_size = info.st_size
+            self.st_mode = info.st_mode
+            self.st_file_attributes = (getattr(info, "st_file_attributes", 0)
+                                       | stat_module.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    def aliasing_lstat(path):
+        info = real_lstat(path)
+        if os.path.normcase(str(path)) == os.path.normcase(alias_path):
+            return _Alias(info)
+        return info
+
+    inv = _read_full(cache, lstat=aliasing_lstat)
+    assert inv.skipped_aliases == (alias_name,)
+    assert inv.skipped_entries == 1
+    assert inv.counts_exact is True and inv.authoritative is True
+    assert inv.records_recognised == 4
+    assert inv.entries_unclassified == 0, "a confirmed alias is not an unknown entry"
+
+
+def test_n_f8_a_proven_escape_is_a_positive_refusal_not_an_unknown_entry(tmp_path):
+    """The other deliberate exclusion: an entry that resolves outside the selected folder."""
+    cache, _ = _f8_cache(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escapee = _record_name(8)
+    _write_record(cache, escapee, _complete_payload("C:/x/escape.mp4"))
+
+    def escaping_realpath(path):
+        if os.path.basename(str(path)) == escapee:
+            return str(outside / escapee)
+        return os.path.realpath(path)
+
+    inv = _read_full(cache, realpath=escaping_realpath)
+    assert inv.skipped_escapes == (escapee,)
+    assert inv.skipped_entries == 1
+    assert inv.counts_exact is True and inv.authoritative is True
+    assert inv.records_recognised == 4
+    assert inv.entries_unclassified == 0, "a proven escape is not an unknown entry"
+
+
+@pytest.mark.parametrize("count", [201, 500])
+def test_n_f8_a_clean_large_cache_keeps_exact_totals_with_a_shortened_display(tmp_path, count):
+    """The regression guard for the accepted J-4 decision: a short display is not a short inventory.
+
+    If the F-8 fix had been written as ``entries_unclassified = skipped_entries``, or had been
+    folded into ``records_truncated``, this is what would have broken -- every production-sized
+    cache would have stopped reporting exact totals.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for index in range(count):
+        _write_record(cache, _record_name(index), _complete_payload(f"C:/x/{index}.mp4"))
+
+    inv = _read_full(cache)
+
+    assert inv.counts_exact is True
+    assert inv.authoritative is True
+    assert inv.records_truncated is True
+    assert inv.details_complete is False
+    assert len(inv.records) == lcr.MAX_REPORTED_RECORD_NAMES
+    # every applicable aggregate still equals the full record count
+    assert inv.entries_listed == count
+    assert inv.records_recognised == count
+    assert inv.records_attempted == count
+    assert sum(inv.parse_counts.values()) == count
+    assert sum(inv.contract_counts.values()) == count
+    assert sum(inv.complete_counts.values()) == count
+    assert inv.complete_records == count
+    assert inv.completion_accounted == inv.records_parsed == count
+    assert inv.entries_unclassified == 0, "nothing here was unclassifiable"
+
+
+def test_n_mf9_suppressing_the_unclassified_count_republishes_a_false_total(tmp_path):
+    """Negative control A: the accounting itself. Removing it restores the F-8 behaviour exactly."""
+    cache, victim = _f8_cache(tmp_path)
+    hostile = _failing_lstat(victim, PermissionError(13, "Access is denied"), at=1)
+
+    weak = _mutant(("            note(undecidable, name)\n            skipped_entries += 1\n"
+                    "            entries_unclassified += 1\n"
+                    "            assessments_complete = False\n",
+                    "            note(undecidable, name)\n            skipped_entries += 1\n"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                is_complete=IS_COMPLETE, require_ai=False, lstat=hostile)
+    real = _read_full(cache, lstat=_failing_lstat(
+        victim, PermissionError(13, "Access is denied"), at=1))
+
+    # both lose the same record -- the mutation changes only what is CLAIMED about it
+    assert mutated.records_recognised == real.records_recognised == 3
+    assert mutated.skipped_undecidable == real.skipped_undecidable == (victim,)
+    assert mutated.counts_exact is True and real.counts_exact is False
+    assert mutated.authoritative is True and real.authoritative is False
+    assert mutated.assessments_complete is True and real.assessments_complete is False
+    assert mutated.entries_unclassified == 0 and real.entries_unclassified == 1
+
+
+def test_n_mf10_dropping_the_term_from_the_two_honesty_properties_also_republishes_it(tmp_path):
+    """Negative control B: the properties. The count survives; only its consequence is removed.
+
+    Deliberately a *different* mutation from control A. Here ``entries_unclassified`` is still
+    counted and still reported -- so nothing fails with an ``AttributeError`` and nothing is a
+    schema kill -- and the mutant nevertheless publishes the counts as folder totals.
+    """
+    cache, victim = _f8_cache(tmp_path)
+    exc = OSError(1, "device error")
+
+    weak = _mutant(
+        ("        return bool(self.entries_complete\n"
+         "                    and not self.entries_unclassified\n",
+         "        return bool(self.entries_complete\n"),
+        ("        return bool(self.complete\n"
+         "                    and not self.entries_unclassified\n",
+         "        return bool(self.complete\n"))
+    mutated = weak.read_records(str(cache), is_record_name=ac.is_record_name, contract=CONTRACT,
+                                is_complete=IS_COMPLETE, require_ai=False,
+                                lstat=_failing_lstat(victim, exc, at=2))
+    real = _read_full(cache, lstat=_failing_lstat(victim, exc, at=2))
+
+    assert mutated.entries_unclassified == real.entries_unclassified == 1, \
+        "the count must survive the mutation, or this is a schema kill rather than a behavioural one"
+    assert mutated.counts_exact is True and real.counts_exact is False
+    assert mutated.authoritative is True and real.authoritative is False
