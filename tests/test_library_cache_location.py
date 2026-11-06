@@ -509,7 +509,21 @@ def test_b_scenario_m_blank_or_malformed_configuration_never_raises(tmp_path, en
 
 
 def test_b_scenario_n_a_later_configuration_change_does_not_move_the_answer(tmp_path):
-    """The snapshot is taken once, so a Settings change cannot move the cache mid-inspection."""
+    """The snapshot is taken once, so a Settings change cannot move the cache mid-inspection.
+
+    This covers the **caller-dict** case: an operator's Settings change arriving while the pass is
+    on the filesystem. It is a real case and worth keeping.
+
+    It does **not** cover the copy at ``inspect_location``'s ``snapshot = ... dict(config)``, and
+    must not be read as covering it. `inspect_location` reads ``CACHE_FOLDER``/``CACHE_ENABLED``
+    into locals before its first filesystem touch, and ``resolve_location`` likewise reads its own
+    settings before its first ``isdir()`` -- so a mutation delivered through an injected
+    filesystem callable always fires *after every read* and these three assertions hold for a
+    structural reason, whether or not the copy is there. Replacing ``dict(config)`` with ``config``
+    leaves this test green. The window is reachable only by a mapping that mutates itself when
+    **read**, which is
+    `test_b_scenario_n2_a_mapping_that_rewrites_itself_when_read_cannot_move_the_answer` below.
+    """
     local = _local(tmp_path)
     shared = tmp_path / "snapshot-shared"
     shared.mkdir()
@@ -540,6 +554,106 @@ def test_b_scenario_n_a_later_configuration_change_does_not_move_the_answer(tmp_
     assert report.configured_shared == str(shared), "the invocation snapshot was not frozen"
     assert report.sharing_enabled is True
     assert report.selected_path == str(shared)
+
+
+class _SelfMutatingConfig(dict):
+    """A settings mapping that rewrites itself when it is **read**.
+
+    The only fixture that can reach ``inspect_location``'s one-shot configuration copy. Scenario N
+    above mutates from an injected ``isdir``, which always fires after both settings have already
+    been read into locals; a mapping whose ``get`` rewrites the mapping lands the change *between*
+    A4's two reads and ``resolve_location``'s own two reads, which is exactly the window the copy
+    exists to close.
+
+    ``dict(mapping)`` does not go through ``get`` -- it copies via the C path -- so a real snapshot
+    is taken from the entry-time contents and never sees the rewrite. A live reference does.
+    """
+
+    def __init__(self, contents, *, switch_to, after=2):
+        super().__init__(contents)
+        self.get_calls: list = []
+        self.mutated = False
+        self._switch_to = switch_to
+        self._after = after
+
+    def get(self, key, default=None):
+        value = super().get(key, default)
+        self.get_calls.append(key)
+        if len(self.get_calls) >= self._after and not self.mutated:
+            super().__setitem__(FOLDER, self._switch_to)
+            self.mutated = True
+        return value
+
+
+def test_b_scenario_n2_a_mapping_that_rewrites_itself_when_read_cannot_move_the_answer(tmp_path):
+    """The configuration copy itself, with the one fixture that can actually reach it.
+
+    Asserted in both halves, because either alone is weaker than the property: the report's
+    *entry-time* settings, **and** that the folder the report names is the folder it probed. A
+    report that names one folder while having probed another is precisely the misstatement this
+    stage exists to prevent -- and with the copy removed, that is what comes out.
+    """
+    local = _local(tmp_path)
+    original = tmp_path / "entry-time-shared"
+    original.mkdir()
+    switched = tmp_path / "switched-mid-pass"
+    switched.mkdir()
+
+    original_key = os.path.normcase(os.path.abspath(str(original)))
+    switched_key = os.path.normcase(os.path.abspath(str(switched)))
+
+    def _touched(fs) -> set:
+        """Every path the pass put to the filesystem, listings and existence tests alike."""
+        return {os.path.normcase(os.path.abspath(p)) for p in fs.listdir + fs.isdir}
+
+    # (1) The fixture discriminates -- proved on a SEPARATE instance, with no module involved, so
+    # that a fixture which quietly stopped working cannot make the arms below pass vacuously.
+    control = _SelfMutatingConfig(_cfg(True, str(original)), switch_to=str(switched))
+    assert control.get(FOLDER) == str(original), "the first read must see the entry-time path"
+    assert control.get(ENABLED) is True, "the second read must still see the entry-time flag"
+    assert control.mutated is True, "the fixture never rewrote itself"
+    assert control.get(FOLDER) == str(switched), "a later read must see the switched path"
+    assert control[FOLDER] == str(switched), "the mapping itself did not change"
+
+    # (2) The property, on the real module.
+    live = _SelfMutatingConfig(_cfg(True, str(original)), switch_to=str(switched))
+    fs = _CountingFS()
+    report = lcl.inspect_location(local, live, **fs.kwargs())
+
+    assert report.configured_shared == str(original), "the invocation snapshot was not frozen"
+    assert report.sharing_enabled is True
+    assert report.selected_path == str(original), "the selection followed a mid-pass rewrite"
+    assert report.selected_source == ac.SOURCE_SHARED
+    assert (os.path.normcase(report.selected_path)
+            == os.path.normcase(report.configured_shared)), \
+        "the report names one folder and selected another"
+    assert switched_key not in _touched(fs), "the post-rewrite folder was put to the filesystem"
+    # ...and the entry-time folder WAS probed, so the absence above is a finding and not silence
+    assert original_key in _touched(fs), "nothing probed the entry-time folder at all"
+
+    # Deliberately NOT asserted above: that `live.get` was called, or that `live` stayed put.
+    # `dict(config)` copies via the C path and never calls `get` at all, so a correct
+    # implementation may leave this mapping completely unread. The fixture's own counters are
+    # asserted only where they mean something -- on the control instance in (1), and on the
+    # mutant in (3).
+
+    # (3) Discrimination control: the same fixture against the module with the copy removed. This
+    # arm is what makes (2) a constraint rather than a coincidence -- see `_mutant`'s unique-anchor
+    # assertion for why a silently-unapplied mutation cannot masquerade as a survivor.
+    weak = _mutant(("    snapshot = empty_config() if config is None else dict(config)",
+                    "    snapshot = empty_config() if config is None else config"))
+    mut_cfg = _SelfMutatingConfig(_cfg(True, str(original)), switch_to=str(switched))
+    mut_fs = _CountingFS()
+    mutated = weak.inspect_location(local, mut_cfg, **mut_fs.kwargs())
+
+    assert mut_cfg.get_calls, "the mutant never read the mapping through its own `get`"
+    assert mut_cfg.mutated is True, "the mapping did not actually change under the mutant"
+    assert mut_cfg[FOLDER] == str(switched)
+    assert mutated.configured_shared == str(original), "A4's own read is eager either way"
+    assert mutated.selected_path == str(switched), "the mutation did not apply"
+    assert (os.path.normcase(mutated.selected_path)
+            != os.path.normcase(mutated.configured_shared)), "the mutant report is consistent"
+    assert switched_key in _touched(mut_fs), "the mutant never reached the switched folder"
 
 
 # =============================================================================================
