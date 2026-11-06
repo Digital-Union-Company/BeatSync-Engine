@@ -651,10 +651,25 @@ def test_a_bare_measurement_with_no_category_is_refused():
 
 
 def test_a_category_without_an_observation_time_is_caveated():
+    """Rule T-2: the caveat is kept, and the figure is now refused rather than published.
+
+    The fixture pairs an expensive Category with an **expensive** Measurement deliberately. It
+    previously paired `expensive=True` with `meas(...)`'s default `expensive=False`, which the
+    category-provenance gate now refuses outright -- so the original fixture would have exercised
+    the identity refusal and never reached the timestamp rule it is named for.
+    """
     b = report(location=loc(), inventory=inv(),
                categories=[(cat(ca.ANALYSIS, CACHE, expensive=True),
-                            meas(ca.ANALYSIS, files=1, total=10), "", "")])
+                            meas(ca.ANALYSIS, files=1, total=10, expensive=True), "", "")])
     assert any("without an observation time" in item for item in b.caveats)
+    assert not b.refusals, f"a consistent pair must not be refused: {b.refusals}"
+    # and the numeric refusal, which the caveat alone used to leave unenforced
+    assert b.measured.value is None
+    assert b.measured.exactness == a5.NOT_ASSESSED
+    assert "no observation time" in b.measured.withheld_reason
+    assert [f.value for _k, f in b.expensive] == [None]
+    assert b.cheap_subtotal.value is None
+    assert not any("10 bytes" in line for line in lines_for(b)), "an untimed byte count was printed"
 
 
 def test_the_uncertain_label_always_says_uncertain():
@@ -857,8 +872,10 @@ def test_mutant_dropping_the_clause_guard_is_caught():
 
 def test_mutant_labelling_partial_source_coverage_exact_is_caught():
     records = tuple(rec("r%d" % i) for i in range(4))
-    weak = _mutant(("    complete_coverage = (counts_exact and not truncated and unmatched == 0 "
-                    "and not unstable\n                         and not rejected)",
+    weak = _mutant(("    complete_coverage = (counts_exact and not truncated and not unstable "
+                    "and not rejected\n                         and unmatched == 0 and "
+                    "unresolved == 0 and unjoinable == 0\n"
+                    "                         and shortfall <= 0)",
                     "    complete_coverage = counts_exact"))
     kw = dict(location=loc(),
               inventory=inv(records=records, records_recognised=4, records_attempted=4,
@@ -895,7 +912,8 @@ def test_mutant_calling_a_clean_zero_verified_empty_is_caught():
 
 def test_mutant_turning_a_withheld_uncertainty_into_zero_is_caught():
     """Two overlapping holds must withhold the headline, not collapse to a measured zero."""
-    weak = _mutant(("    elif not contributing and not any_withheld:", "    elif True:"))
+    weak = _mutant(("    elif not contributing and not any_withheld and not inv_unstable:",
+                    "    elif True:"))
     kw = dict(location=loc(), inventory=inv(entries_unclassified=3, completion_unavailable=2))
     mutated = _run(weak, **kw).uncertain
     assert mutated.value == 0 and mutated.exactness == weak.EXACT, "the mutation did not apply"
@@ -957,3 +975,771 @@ def test_mutant_removing_the_missing_source_sentence_is_caught():
     real = lines_for(report(**kw))
     assert a5.MISSING_SOURCE_SENTENCE in [line.strip() for line in real]
     assert not any("reclaimed" in line for line in real)
+
+
+# =============================================================================================
+# F. remediation regressions -- the nine findings the independent review reproduced
+#
+# Each of these fails on the reviewed source at f03f2df7 and passes here. They assert observable
+# behaviour -- a value, an exactness label, a subject, a rendered line -- never the mere presence
+# of a new field.
+# =============================================================================================
+
+def _one_record_inv(**kw):
+    """A one-record, fully-exact inventory: the smallest fixture that can carry a source state."""
+    base = dict(records=(rec("r0"),), records_recognised=1, records_attempted=1,
+                parse_counts={lcr.PARSE_OK: 1}, contract_counts={lcr.CONTRACT_CURRENT: 1},
+                scope_counts={lcr.SCOPE_IN: 1}, complete_counts={lcr.COMPLETE_YES: 1},
+                entries_listed=1, entries_examined=1)
+    base.update(kw)
+    return inv(**base)
+
+
+def _e_holds(buckets):
+    return {label: figure for label, figure in buckets.uncertain_observations}
+
+
+# ---------------------------------------------------------------------------------- F-1
+
+F1_UNRESOLVED_SHAPES = (
+    dict(state=lib.MISSING_PROVISIONAL, final=False),
+    dict(state=lib.MISSING_CONFIRMED, final=False),
+    dict(state=lib.UNKNOWN, final=True),
+    dict(state=lib.ACCESS_DENIED, final=True),
+    dict(state=lib.ROOT_UNREACHABLE, final=True),
+    dict(state=lib.NOT_INSPECTED, final=True),
+)
+
+
+@pytest.mark.parametrize("shape", F1_UNRESOLVED_SHAPES)
+def test_f1_an_unresolved_source_state_is_counted_into_uncertainty(shape):
+    """F-1. A verdict that establishes nothing must not leave E claiming an exact zero.
+
+    This is the defect the independent review called the most important one: `published` demotes a
+    provisional or non-final confirmation to UNKNOWN, D correctly refuses to count it -- and then
+    nothing at all mentioned it, so with every A3 counter zero the report published
+    "E uncertain: 0 records (exact)" over a question nobody had answered.
+    """
+    records = (rec("r0"),)
+    b = report(location=loc(), inventory=_one_record_inv(records=records),
+               source_verdicts=[verdict(records[0].source_path, **shape)])
+    assert b.confirmed_missing.value == 0, "an unresolved verdict became a confirmation"
+    assert not (b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT), \
+        "E published an exact zero while a source state was unresolved"
+    holds = _e_holds(b)
+    unresolved = [f for label, f in holds.items() if "established no state" in label]
+    assert unresolved and unresolved[0].value == 1, f"no unresolved-source hold: {list(holds)}"
+    assert unresolved[0].unit == a5.RECORDS
+    assert b.confirmed_missing.exactness != a5.EXACT
+    text = "\n".join(lines_for(b))
+    assert "established no state" in text, "the hold never reached the rendered report"
+
+
+def test_f1_no_source_verdict_withholds_both_d_and_the_uncertainty_headline():
+    """F-1, worst shape: D "not assessed" and E "0 records (exact)" in one report."""
+    b = report(location=loc(), inventory=_one_record_inv())
+    assert b.confirmed_missing.value is None
+    assert b.confirmed_missing.exactness == a5.NOT_ASSESSED
+    assert not (b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT), \
+        "E claimed zero uncertainty while the source axis was not assessed at all"
+    assert b.uncertain.value is None and b.uncertain.exactness == a5.NOT_ASSESSED
+    holds = _e_holds(b)
+    assert any("was not established" in label for label in holds)
+    withheld_hold = [f for label, f in holds.items() if "was not established" in label][0]
+    assert withheld_hold.value is None and withheld_hold.withheld_reason
+
+
+def test_f1_partial_source_verdict_coverage_discloses_the_unmatched_records():
+    records = tuple(rec("r%d" % i) for i in range(4))
+    b = report(location=loc(),
+               inventory=inv(records=records, records_recognised=4, records_attempted=4,
+                             parse_counts={lcr.PARSE_OK: 4},
+                             contract_counts={lcr.CONTRACT_CURRENT: 4},
+                             scope_counts={lcr.SCOPE_IN: 4},
+                             complete_counts={lcr.COMPLETE_YES: 4},
+                             entries_listed=4, entries_examined=4),
+               source_verdicts=[verdict(records[0].source_path)])
+    holds = _e_holds(b)
+    unmatched = [f for label, f in holds.items() if "no supplied source verdict" in label]
+    assert unmatched and unmatched[0].value == 3
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND
+    assert any("had no supplied source verdict" in item
+               for item in b.confirmed_missing.limitations)
+
+
+def test_f1_a_source_known_present_is_not_an_uncertainty():
+    """F-1, the owner's correction. PRESENT is a positive observation, not a doubt.
+
+    If every source was seen and every other question answered, D = 0 and E = 0 are both honestly
+    exact. A fix that swept "anything that is not a confirmation" into E would destroy this case
+    and make the uncertainty category meaningless.
+    """
+    records = tuple(rec("r%d" % i) for i in range(3))
+    b = report(location=loc(),
+               inventory=inv(records=records, records_recognised=3, records_attempted=3,
+                             parse_counts={lcr.PARSE_OK: 3},
+                             contract_counts={lcr.CONTRACT_CURRENT: 3},
+                             scope_counts={lcr.SCOPE_IN: 3},
+                             complete_counts={lcr.COMPLETE_YES: 3},
+                             entries_listed=3, entries_examined=3),
+               source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    assert b.confirmed_missing.value == 0
+    assert b.confirmed_missing.exactness == a5.EXACT, "full PRESENT coverage is complete coverage"
+    assert b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT
+    for label, figure in b.uncertain_observations:
+        assert figure.value == 0, f"PRESENT raised an uncertainty hold: {label}"
+    assert "present 3" in b.confirmed_missing.population
+
+
+def test_f1_mixed_present_confirmed_and_unknown():
+    records = tuple(rec("r%d" % i) for i in range(3))
+    b = report(location=loc(),
+               inventory=inv(records=records, records_recognised=3, records_attempted=3,
+                             parse_counts={lcr.PARSE_OK: 3},
+                             contract_counts={lcr.CONTRACT_CURRENT: 3},
+                             scope_counts={lcr.SCOPE_IN: 3},
+                             complete_counts={lcr.COMPLETE_YES: 3},
+                             entries_listed=3, entries_examined=3),
+               source_verdicts=[verdict(records[0].source_path, state=lib.PRESENT),
+                                verdict(records[1].source_path),
+                                verdict(records[2].source_path, state=lib.UNKNOWN)])
+    assert b.confirmed_missing.value == 1, "the one finalised confirmation is still counted"
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND, "one source state was unresolved"
+    holds = _e_holds(b)
+    assert any("established no state" in label for label in holds)
+    assert "confirmed missing 1" in b.confirmed_missing.population
+    assert "present 1" in b.confirmed_missing.population
+    assert "unresolved 1" in b.confirmed_missing.population
+
+
+# ---------------------------------------------------------------------------------- F-2
+
+def _d_for(order, inventory=None):
+    b = report(location=loc(), inventory=inventory or _one_record_inv(),
+               source_verdicts=list(order))
+    return (b.confirmed_missing.value, b.confirmed_missing.exactness)
+
+
+def test_f2_order_cannot_decide_whether_a_source_is_confirmed_missing():
+    """F-2. Two verdicts with the SAME published enum but different clause evidence.
+
+    `published` is identical for both, so comparing only `published` found no conflict and a plain
+    last-write-wins assignment let arrival order decide: [A, B] gave 0 (lower bound) and [B, A]
+    gave 1 (exact) -- a publishable confirmation conjured by input ordering.
+    """
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    strong = verdict(records[0].source_path, all_four=True)
+    weak_evidence = verdict(records[0].source_path, all_four=False)
+    assert strong.published == weak_evidence.published, "fixture misbuilt: published must agree"
+    assert strong.clauses.all_four != weak_evidence.clauses.all_four, "fixture misbuilt"
+
+    forward = _d_for((strong, weak_evidence), kept)
+    backward = _d_for((weak_evidence, strong), kept)
+    assert forward == backward, f"order decided D: {forward} vs {backward}"
+    assert forward[1] == a5.NOT_ASSESSED, "conflicting evidence must be refused, not resolved"
+    assert forward[0] is None
+
+
+def test_f2_three_way_permutations_all_agree():
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    a = verdict(records[0].source_path, all_four=True)
+    b_ = verdict(records[0].source_path, all_four=False)
+    c = verdict(records[0].source_path, state=lib.UNKNOWN)
+    orders = ((a, b_, c), (a, c, b_), (b_, a, c), (b_, c, a), (c, a, b_), (c, b_, a))
+    outcomes = {_d_for(order, kept) for order in orders}
+    assert len(outcomes) == 1, f"permutations disagreed: {outcomes}"
+    assert outcomes.pop()[1] == a5.NOT_ASSESSED
+
+
+def test_f2_two_identical_verdicts_are_not_a_contradiction():
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    one = verdict(records[0].source_path)
+    same = verdict(records[0].source_path)
+    assert _d_for((one,), kept) == (1, a5.EXACT)
+    assert _d_for((one, same), kept) == (1, a5.EXACT), "a duplicate became a contradiction"
+
+
+def test_f2_differing_root_provenance_is_order_independent():
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    here = verdict(records[0].source_path, root_key=ROOT_KEY)
+    elsewhere = verdict(records[0].source_path, root_key="somewhere-else")
+    assert _d_for((here, elsewhere), kept) == _d_for((elsewhere, here), kept)
+
+
+def test_f2_a_refused_verdict_never_becomes_a_confirmation():
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    for order in ((verdict(records[0].source_path, all_four=False),),
+                  (verdict(records[0].source_path, all_four=False),
+                   verdict(records[0].source_path, all_four=False))):
+        value, _exactness = _d_for(order, kept)
+        assert value in (0, None), "clause-less evidence was counted as a confirmation"
+
+
+# ---------------------------------------------------------------------------------- F-3
+
+def test_f3_a_refused_cross_folder_report_never_relabels_the_other_folders_numbers():
+    """F-3. Withholding the headline while printing folder Y's numbers under folder X's name.
+
+    The refusal itself always worked. What did not was `uncertain_observations`, which is
+    deliberately NOT withheld -- refusing it would destroy evidence -- and which was handed the
+    report's primary subject, so A3's counts for cache Y were published with cache X as their
+    subject, under a header reading "folder: X".
+    """
+    x_key = os.path.normcase(os.path.normpath(OTHER))
+    y_key = os.path.normcase(os.path.normpath(CACHE))
+    b = report(location=loc(selected_path=OTHER, selected=state(lcl.ROLE_SHARED, OTHER)),
+               inventory=inv(path=CACHE, resolved=CACHE, entries_unclassified=2,
+                             completion_unavailable=1, records=()))
+    assert b.refusals, "the identities must disagree for this fixture to mean anything"
+    for figure in (b.measured, b.confirmed_missing, b.uncertain, b.other_configuration,
+                   b.out_of_scope, b.cheap_subtotal):
+        assert figure.exactness == a5.NOT_ASSESSED, "a combined figure survived the refusal"
+
+    numeric = [(label, f) for label, f in b.uncertain_observations
+               if f.value is not None and f.value > 0]
+    assert numeric, "the fixture must produce at least one numeric A3 observation"
+    for label, figure in numeric:
+        assert figure.subject == y_key, \
+            f"{label!r} carries {figure.subject!r}, but it is an observation of {y_key!r}"
+        assert figure.subject != x_key
+
+
+def test_f3_a_flat_measurement_names_its_own_folder():
+    b = report(location=loc(selected_path=OTHER, selected=state(lcl.ROLE_SHARED, OTHER)),
+               flat_measurement=flat(path=CACHE), observed_at="T4")
+    subjects = [figure.subject for _name, figure in b.measurements]
+    assert subjects == [os.path.normcase(os.path.normpath(CACHE))]
+    assert os.path.normcase(os.path.normpath(OTHER)) not in subjects
+
+
+def test_f3_record_axes_name_the_inventorys_folder_even_when_identities_agree():
+    b = report(location=loc(), inventory=inv())
+    key = os.path.normcase(os.path.normpath(CACHE))
+    for figure in (b.other_configuration, b.out_of_scope):
+        assert figure.subject == key
+    for _label, figure in b.uncertain_observations:
+        if figure.basis.startswith("RecordInventory"):
+            assert figure.subject == key
+
+
+def test_f3_an_a4_only_hold_names_the_a4_location():
+    b = report(location=loc(shared=state(lcl.ROLE_SHARED, CACHE,
+                                         verdict_=lib.ROOT_UNREACHABLE, observed=False,
+                                         inspectable=False),
+                            selected_path=LOCAL, selected=state(lcl.ROLE_LOCAL, LOCAL)),
+               inventory=inv(path=LOCAL, resolved=LOCAL))
+    shared_holds = [f for label, f in b.uncertain_observations
+                    if f.basis == "CacheLocationReport.shared.verdict"]
+    assert shared_holds, "the unreachable shared folder must raise a hold"
+    assert shared_holds[0].subject == os.path.normcase(os.path.normpath(LOCAL))
+
+
+# ---------------------------------------------------------------------------------- F-4
+
+def test_f4_a_measurement_of_another_category_is_refused():
+    """F-4. ANALYSIS bytes published under the POSTERS label, root and basis string."""
+    pair = (cat(ca.POSTERS, os.path.join(BASE, "posters")),
+            meas(ca.ANALYSIS, files=777, total=123456789), "T3", "vol-1")
+    b = report(location=loc(), inventory=inv(), categories=[pair])
+    assert any("do not describe the same thing" in item for item in b.refusals)
+    assert b.cheap == (), "an incompatible measurement was published as a category figure"
+    assert b.expensive == ()
+    assert "123456789" not in "\n".join(lines_for(b))
+
+
+def test_f4_an_expensive_measurement_is_never_filed_as_cheap():
+    pair = (cat(ca.ANALYSIS, os.path.join(BASE, "an"), expensive=False),
+            meas(ca.ANALYSIS, files=5, total=500, expensive=True), "T3", "vol-1")
+    b = report(location=loc(), inventory=inv(), categories=[pair])
+    assert any("regeneration cost of these bytes is not established" in item
+               for item in b.refusals)
+    assert b.cheap == () and b.expensive == ()
+
+
+def test_f4_a_label_disagreement_is_disclosed_but_not_refused():
+    pair = (cat(ca.POSTERS, os.path.join(BASE, "p"), label="Posters"),
+            ca.Measurement(key=ca.POSTERS, label="Something Else", exists=True, files=2,
+                           total_bytes=20), "T3", "vol-1")
+    b = report(location=loc(), inventory=inv(), categories=[pair])
+    assert not b.refusals, f"a label difference must not refuse the pair: {b.refusals}"
+    assert any("labelled" in item for item in b.caveats)
+    assert [k for k, _f in b.cheap] == [ca.POSTERS]
+
+
+def test_f4_one_category_key_for_two_roots_is_not_silently_summed():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "p1"), storage="v1", total=100),
+                           catobs(ca.POSTERS, os.path.join(BASE, "p2"), storage="v2", total=200)])
+    assert b.cheap_subtotal.value is None, "two roots under one key were summed"
+    assert any("supplied twice for different roots" in item for item in b.caveats)
+    assert len(b.cheap) == 2, "the individual observations stay, each with its own root"
+    assert {f.subject for _k, f in b.cheap} == {
+        os.path.normcase(os.path.normpath(os.path.join(BASE, "p1"))),
+        os.path.normcase(os.path.normpath(os.path.join(BASE, "p2")))}
+
+
+def test_f4_the_same_root_supplied_twice_is_not_double_counted():
+    root = os.path.join(BASE, "p")
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, root, storage="v1", total=100),
+                           catobs(ca.PROCESSING, root, storage="v2", total=100)])
+    assert b.cheap_subtotal.value is None
+    assert "200" not in "\n".join(lines_for(b))
+
+
+# ---------------------------------------------------------------------------------- F-5
+
+def test_f5_an_untimed_category_measurement_is_not_assessed():
+    """F-5, Rule T-2. `_flat_figure` already refused this; the category path only caveated it."""
+    b = report(location=loc(), inventory=inv(),
+               categories=[(cat(ca.ANALYSIS, CACHE, expensive=True),
+                            meas(ca.ANALYSIS, files=120, total=900000, expensive=True), "", "")])
+    assert b.measured.value is None
+    assert b.measured.exactness == a5.NOT_ASSESSED
+    assert "no observation time" in b.measured.withheld_reason
+    assert [f.value for _k, f in b.expensive] == [None]
+    assert "900000" not in "\n".join(lines_for(b))
+
+
+def test_f5_both_measurement_paths_treat_a_missing_timestamp_alike():
+    untimed_category = report(
+        location=loc(), inventory=inv(),
+        categories=[(cat(ca.ANALYSIS, CACHE, expensive=True),
+                     meas(ca.ANALYSIS, files=1, total=10, expensive=True), "", "")]).measured
+    untimed_flat = report(location=loc(), flat_measurement=flat(), observed_at="").measured
+    assert untimed_category.exactness == untimed_flat.exactness == a5.NOT_ASSESSED
+
+
+def test_f5_a_timed_category_measurement_is_still_published():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.ANALYSIS, CACHE, expensive=True, files=4, total=400,
+                                  at="T3")])
+    assert b.measured.value == 400
+    assert b.measured.exactness == a5.OBSERVED_PARTIAL
+    assert b.measured.window == ("T3", "T3")
+
+
+# ---------------------------------------------------------------------------------- F-6
+
+def test_f6_a_cheap_root_containing_the_expensive_root_refuses_the_subtotal():
+    """F-6, and the acceptance matrix's own case 18 pair -- POSTERS outside, ANALYSIS inside.
+
+    `_disjoint` only ever sees the cheap group, so with one cheap category it returned early and
+    the subtotal was published. `cache_admin.measure` walks, so the cheap root's bytes already
+    contained the expensive root's: the figure labelled "could be rebuilt cheaply, taken together"
+    was reporting the Stage-5 analysis cache as cheap to rebuild.
+    """
+    outer = os.path.join(BASE, "lib")
+    inner = os.path.join(outer, "analysis")
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, outer, storage="v1", files=9, total=500),
+                           catobs(ca.ANALYSIS, inner, expensive=True, storage="v2", files=4,
+                                  total=400)])
+    assert b.cheap_subtotal.value is None, "a cheap subtotal included the expensive root's bytes"
+    assert "not separate storage" in b.cheap_subtotal.withheld_reason
+    assert any("lies inside" in item for item in b.overlaps)
+    assert len(b.cheap) == 1 and len(b.expensive) == 1, "individual figures must be kept"
+    text = "\n".join(lines_for(b))
+    assert "lies inside" in text, "the nesting was never disclosed in the report"
+
+
+def test_f6_an_identical_root_across_cost_tiers_is_refused():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, CACHE, storage="v1", total=500),
+                           catobs(ca.ANALYSIS, CACHE, expensive=True, storage="v2", total=500)])
+    assert b.cheap_subtotal.value is None
+    assert any("same folder" in item for item in b.overlaps)
+
+
+def test_f6_genuinely_disjoint_roots_still_subtotal():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "a"), storage="v1", total=1),
+                           catobs(ca.PROCESSING, os.path.join(BASE, "b"), storage="v2", total=2),
+                           catobs(ca.RETIRED_UPLOADS, os.path.join(BASE, "c"), storage="v3",
+                                  total=4)])
+    assert b.cheap_subtotal.value == 7
+    assert b.cheap_subtotal.exactness == a5.LOWER_BOUND
+    assert not any("not separate storage" in item for item in b.overlaps)
+
+
+def test_f6_cross_tier_aliasing_by_supplied_provenance_is_refused():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "linkA"),
+                                  storage="one-volume", total=10),
+                           catobs(ca.ANALYSIS, os.path.join(BASE, "realB"), expensive=True,
+                                  storage="one-volume", total=10)])
+    assert b.cheap_subtotal.value is None
+    assert any("same storage provenance" in item for item in b.overlaps)
+
+
+# ---------------------------------------------------------------------------------- F-7
+
+def test_f7_supplied_storage_provenance_is_not_described_as_proof():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "a"), storage="guess-1",
+                                  total=1),
+                           catobs(ca.PROCESSING, os.path.join(BASE, "b"), storage="guess-2",
+                                  total=2)])
+    population = b.cheap_subtotal.population
+    assert b.cheap_subtotal.value == 3
+    assert "proven to be different storage" not in population
+    assert "supplied with" in population
+    assert "verifies none of it independently" in population
+
+
+def test_f7_a_single_category_subtotal_claims_no_disjointness_proof():
+    b = report(location=loc(), inventory=inv(),
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "a"), total=7)])
+    assert b.cheap_subtotal.value == 7
+    assert "proven to be different storage" not in b.cheap_subtotal.population
+    assert "no disjointness question arises" in b.cheap_subtotal.population
+
+
+# ---------------------------------------------------------------------------------- F-8
+
+def test_f8_an_unstable_inventory_never_publishes_an_exact_uncertainty():
+    """F-8. F and G were demoted; E and every E hold stayed EXACT, contradicting the caveat.
+
+    Every record gets a PRESENT verdict so the source axis is fully established. Without that the
+    F-1 hold would be withheld and the headline would be withheld for the wrong reason -- the
+    assertion would pass while saying nothing at all about instability.
+    """
+    records = tuple(rec("r%d" % i) for i in range(10))
+    verdicts = [verdict(r.source_path, state=lib.PRESENT) for r in records]
+    settled = report(location=loc(), inventory=inv(records=records), source_verdicts=verdicts)
+    assert settled.uncertain.value == 0 and settled.uncertain.exactness == a5.EXACT, \
+        "control: a stable, fully-established folder must reach an exact zero"
+
+    for vanished, changed in ((("a.json",), ()), ((), ("b.json",)), (("a.json",), ("b.json",))):
+        moving = inv(records=records, vanished=vanished, changed=changed)
+        assert moving.unstable is True, "fixture misbuilt"
+        b = report(location=loc(), inventory=moving, source_verdicts=verdicts)
+        assert b.uncertain.value == 0, "fixture misbuilt: no hold may be withheld here"
+        assert b.uncertain.exactness == a5.LOWER_BOUND, \
+            "E claimed an exact folder-wide figure while the folder was moving"
+        assert not b.uncertain.publishable_as_total
+        assert any("changed while it was being read" in item for item in b.caveats)
+        for label, figure in b.uncertain_observations:
+            if figure.basis.startswith("RecordInventory") and figure.value is not None:
+                assert figure.exactness == a5.LOWER_BOUND, f"{label} stayed exact"
+                assert any("changed while it was being read" in item
+                           for item in figure.limitations)
+
+
+def test_f8_a_stable_inventory_keeps_its_exact_uncertainty_holds():
+    records = (rec("r0"),)
+    b = report(location=loc(), inventory=_one_record_inv(records=records),
+               source_verdicts=[verdict(records[0].source_path, state=lib.PRESENT)])
+    assert b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT
+    for _label, figure in b.uncertain_observations:
+        assert figure.exactness == a5.EXACT
+
+
+def test_f8_unstable_with_one_positive_hold_is_a_floor_not_a_total():
+    b = report(location=loc(), inventory=inv(vanished=("a.json",), entries_unclassified=1))
+    assert b.uncertain.exactness != a5.EXACT
+    assert not b.uncertain.publishable_as_total
+
+
+# ---------------------------------------------------------------------------------- F-9
+
+def test_f9_d_states_the_population_it_did_not_assess():
+    """F-9. "3 records (exact)" over a population silently narrowed from ten to eight."""
+    usable = [rec("u%d" % i) for i in range(8)]
+    empty_source = lcr.CacheRecord(name="e0.json", size=10, parse=lcr.PARSE_OK,
+                                   contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_UNKNOWN,
+                                   source_path="")
+    relative = lcr.CacheRecord(name="e1.json", size=10, parse=lcr.PARSE_OK,
+                               contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_UNKNOWN,
+                               source_path=os.path.join("..", "rel", "x.mp4"))
+    records = tuple(usable) + (empty_source, relative)
+    b = report(location=loc(),
+               inventory=inv(records=records, records_recognised=10, records_attempted=10,
+                             parse_counts={lcr.PARSE_OK: 10},
+                             contract_counts={lcr.CONTRACT_CURRENT: 10},
+                             scope_counts={lcr.SCOPE_IN: 8, lcr.SCOPE_UNKNOWN: 2},
+                             complete_counts={lcr.COMPLETE_YES: 10},
+                             entries_listed=10, entries_examined=10),
+               source_verdicts=[verdict(r.source_path) for r in usable[:3]]
+                               + [verdict(r.source_path, state=lib.PRESENT) for r in usable[3:]])
+    assert b.confirmed_missing.value == 3
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND, \
+        "an exact count was published over a narrowed population"
+    population = b.confirmed_missing.population
+    assert "parsed 10" in population and "recognised 10" in population
+    assert "unjoinable 1" in population
+    assert "recording no source path 1" in population
+    holds = _e_holds(b)
+    assert any("cannot join to a verdict" in label for label in holds)
+
+
+def test_f9_a_relative_source_path_is_disclosed_not_dropped():
+    """A3 resolves a relative path against its verified root and scopes it IN; A5 cannot join it."""
+    good = rec("g0")
+    relative = lcr.CacheRecord(name="g1.json", size=10, parse=lcr.PARSE_OK,
+                               contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_IN,
+                               source_path=os.path.join("..", "media", "clip.mp4"))
+    b = report(location=loc(),
+               inventory=inv(records=(good, relative), records_recognised=2, records_attempted=2,
+                             parse_counts={lcr.PARSE_OK: 2},
+                             contract_counts={lcr.CONTRACT_CURRENT: 2},
+                             scope_counts={lcr.SCOPE_IN: 2},
+                             complete_counts={lcr.COMPLETE_YES: 2},
+                             entries_listed=2, entries_examined=2),
+               source_verdicts=[verdict(good.source_path)])
+    assert b.confirmed_missing.value == 1
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND
+    assert not (b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT)
+    holds = _e_holds(b)
+    joined = [f for label, f in holds.items() if "cannot join to a verdict" in label]
+    assert joined and joined[0].value == 1
+    assert any("could not join to a verdict" in item
+               for item in b.confirmed_missing.limitations)
+    assert os.getcwd().lower() not in "\n".join(lines_for(b)).lower()
+
+
+def test_f9_records_with_no_recorded_source_do_not_block_exactness():
+    """A record with no ``video_file`` has no source, so no source of its own can be missing."""
+    usable = tuple(rec("v%d" % i) for i in range(2))
+    empty_source = lcr.CacheRecord(name="v9.json", size=10, parse=lcr.PARSE_OK,
+                                   contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_UNKNOWN,
+                                   source_path="")
+    b = report(location=loc(),
+               inventory=inv(records=usable + (empty_source,), records_recognised=3,
+                             records_attempted=3, parse_counts={lcr.PARSE_OK: 3},
+                             contract_counts={lcr.CONTRACT_CURRENT: 3},
+                             scope_counts={lcr.SCOPE_IN: 2, lcr.SCOPE_UNKNOWN: 1},
+                             complete_counts={lcr.COMPLETE_YES: 3},
+                             entries_listed=3, entries_examined=3),
+               source_verdicts=[verdict(usable[0].source_path),
+                                verdict(usable[1].source_path, state=lib.PRESENT)])
+    assert b.confirmed_missing.value == 1
+    assert b.confirmed_missing.exactness == a5.EXACT
+    assert "recording no source path 1" in b.confirmed_missing.population
+
+
+def test_f9_a_truncated_detail_list_stays_a_floor():
+    records = tuple(rec("t%d" % i) for i in range(3))
+    b = report(location=loc(),
+               inventory=inv(records=records, records_truncated=True, records_recognised=3,
+                             records_attempted=3, parse_counts={lcr.PARSE_OK: 3},
+                             contract_counts={lcr.CONTRACT_CURRENT: 3},
+                             scope_counts={lcr.SCOPE_IN: 3},
+                             complete_counts={lcr.COMPLETE_YES: 3},
+                             entries_listed=3, entries_examined=3),
+               source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND
+    assert any("truncated display" in item for item in b.confirmed_missing.limitations)
+
+
+def test_f9_unparsed_records_absent_from_the_detail_list_are_named():
+    records = tuple(rec("w%d" % i) for i in range(2))
+    b = report(location=loc(),
+               inventory=inv(records=records, records_recognised=4, records_attempted=4,
+                             parse_counts={lcr.PARSE_OK: 4},
+                             contract_counts={lcr.CONTRACT_CURRENT: 4},
+                             scope_counts={lcr.SCOPE_IN: 4},
+                             complete_counts={lcr.COMPLETE_YES: 4},
+                             entries_listed=4, entries_examined=4),
+               source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    assert b.confirmed_missing.exactness == a5.LOWER_BOUND
+    assert any("absent from the supplied detail list" in item
+               for item in b.confirmed_missing.limitations)
+
+
+# =============================================================================================
+# G. mutation controls for the remediated rules
+#
+# Same discipline as section E: `_mutant` asserts each anchor matches exactly once, so an anchor
+# that stops applying fails loudly instead of producing a false survivor, and every control makes
+# a BEHAVIOURAL assertion on both arms. Anchors here are distinct from every anchor in section E.
+# =============================================================================================
+
+def test_mutant_suppressing_the_source_state_holds_is_caught():
+    """F-1: if the source-state holds stop reaching E, E goes back to publishing an exact zero."""
+    records = (rec("r0"),)
+    kw = dict(location=loc(), inventory=_one_record_inv(records=records),
+              source_verdicts=[verdict(records[0].source_path, state=lib.UNKNOWN)])
+    weak = _mutant(("    for label, figure in tuple(source_holds or ()):",
+                    "    for label, figure in ():"))
+    mutated = _run(weak, **kw).uncertain
+    assert mutated.value == 0 and mutated.exactness == weak.EXACT, "the mutation did not apply"
+    real = report(**kw).uncertain
+    assert not (real.value == 0 and real.exactness == a5.EXACT)
+
+
+def test_mutant_treating_a_present_source_as_uncertain_is_caught():
+    """F-1's own correction, guarded in the opposite direction.
+
+    A fix that swept every non-confirmation into E would be just as wrong as the original defect:
+    `PRESENT` is a positive observation. This mutant makes PRESENT fall through to the unresolved
+    branch, and the real module must keep reporting an honest exact zero.
+    """
+    records = tuple(rec("r%d" % i) for i in range(3))
+    kw = dict(location=loc(),
+              inventory=inv(records=records, records_recognised=3, records_attempted=3,
+                            parse_counts={lcr.PARSE_OK: 3},
+                            contract_counts={lcr.CONTRACT_CURRENT: 3},
+                            scope_counts={lcr.SCOPE_IN: 3},
+                            complete_counts={lcr.COMPLETE_YES: 3},
+                            entries_listed=3, entries_examined=3),
+              source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    weak = _mutant(("        if published == SOURCE_PRESENT:", "        if False:"))
+    mutated = _run(weak, **kw)
+    assert mutated.uncertain.value == 3, "the mutation did not apply"
+    real = report(**kw)
+    assert real.uncertain.value == 0 and real.uncertain.exactness == a5.EXACT
+    assert real.confirmed_missing.exactness == a5.EXACT
+
+
+def test_mutant_comparing_duplicate_evidence_only_by_published_is_caught():
+    """F-2: with only `published` in the signature, arrival order decides D again."""
+    records = (rec("r0"),)
+    kept = _one_record_inv(records=records)
+    strong = verdict(records[0].source_path, all_four=True)
+    weak_evidence = verdict(records[0].source_path, all_four=False)
+    weak = _mutant(('            bool(getattr(clauses, "all_four", False)),', ""))
+    forward = _run(weak, location=loc(), inventory=kept,
+                   source_verdicts=[strong, weak_evidence]).confirmed_missing
+    backward = _run(weak, location=loc(), inventory=kept,
+                    source_verdicts=[weak_evidence, strong]).confirmed_missing
+    assert (forward.value, forward.exactness) != (backward.value, backward.exactness), \
+        "the mutation did not apply"
+    real_f = report(location=loc(), inventory=kept,
+                    source_verdicts=[strong, weak_evidence]).confirmed_missing
+    real_b = report(location=loc(), inventory=kept,
+                    source_verdicts=[weak_evidence, strong]).confirmed_missing
+    assert (real_f.value, real_f.exactness) == (real_b.value, real_b.exactness)
+    assert real_f.exactness == a5.NOT_ASSESSED
+
+
+def test_mutant_labelling_a3_holds_with_a4s_folder_is_caught():
+    """F-3: the uncertainty holds take the primary subject again, misattributing cache Y to X."""
+    x_key = os.path.normcase(os.path.normpath(OTHER))
+    y_key = os.path.normcase(os.path.normpath(CACHE))
+    kw = dict(location=loc(selected_path=OTHER, selected=state(lcl.ROLE_SHARED, OTHER)),
+              inventory=inv(path=CACHE, resolved=CACHE, entries_unclassified=2, records=()))
+    weak = _mutant(("    inv_subject = _inventory_subject(inv) if inv is not None else subject",
+                    "    inv_subject = subject"))
+    mutated = [f.subject for _l, f in _run(weak, **kw).uncertain_observations
+               if f.value is not None and f.value > 0]
+    assert mutated and set(mutated) == {x_key}, "the mutation did not apply"
+    real = [f.subject for _l, f in report(**kw).uncertain_observations
+            if f.value is not None and f.value > 0]
+    assert real and set(real) == {y_key}
+
+
+def test_mutant_accepting_an_incompatible_measurement_is_caught():
+    """F-4: ANALYSIS bytes published under the POSTERS category, root and basis string."""
+    pair = (cat(ca.POSTERS, os.path.join(BASE, "posters")),
+            meas(ca.ANALYSIS, files=777, total=123456789), "T3", "vol-1")
+    kw = dict(location=loc(), inventory=inv(), categories=[pair])
+    weak = _mutant(("        elif cat.identity_conflict:", "        elif False:"),
+                   ("                    and not self.identity_conflict)", "                    )"))
+    mutated = _run(weak, **kw)
+    assert [(k, f.value) for k, f in mutated.cheap] == [(ca.POSTERS, 123456789)], \
+        "the mutation did not apply"
+    real = report(**kw)
+    assert real.cheap == ()
+    assert any("do not describe the same thing" in item for item in real.refusals)
+
+
+def test_mutant_accepting_an_untimed_measurement_is_caught():
+    """F-5: Rule T-2 -- a byte count with no observation window becomes a published figure."""
+    kw = dict(location=loc(), inventory=inv(),
+              categories=[(cat(ca.ANALYSIS, CACHE, expensive=True),
+                           meas(ca.ANALYSIS, files=120, total=900000, expensive=True), "", "")])
+    weak = _mutant(("    if not cat.observed_at:", "    if False:"))
+    assert _run(weak, **kw).measured.value == 900000, "the mutation did not apply"
+    real = report(**kw)
+    assert real.measured.value is None and real.measured.exactness == a5.NOT_ASSESSED
+
+
+def test_mutant_ignoring_a_cross_tier_overlap_is_caught():
+    """F-6: the cheap subtotal again includes the nested expensive root's bytes."""
+    outer = os.path.join(BASE, "lib")
+    inner = os.path.join(outer, "analysis")
+    kw = dict(location=loc(), inventory=inv(),
+              categories=[catobs(ca.POSTERS, outer, storage="v1", files=9, total=500),
+                          catobs(ca.ANALYSIS, inner, expensive=True, storage="v2", files=4,
+                                 total=400)])
+    weak = _mutant(("    cheap_overlap = next((reason for reason, involves_cheap in "
+                    "cost_overlaps if involves_cheap), \"\")",
+                    "    cheap_overlap = \"\""))
+    assert _run(weak, **kw).cheap_subtotal.value == 500, "the mutation did not apply"
+    real = report(**kw)
+    assert real.cheap_subtotal.value is None
+    assert "not separate storage" in real.cheap_subtotal.withheld_reason
+
+
+def test_mutant_keeping_an_unstable_uncertainty_exact_is_caught():
+    """F-8: a moving folder's uncertainty holds go back to claiming exactness.
+
+    The fixture supplies a PRESENT verdict for every record on purpose. Without that, the F-1
+    source-state hold is withheld, the headline is withheld for *that* reason, and this mutant
+    would look dead while changing nothing observable -- the instability demotion would never be
+    the thing under test.
+    """
+    records = tuple(rec("r%d" % i) for i in range(10))
+    kw = dict(location=loc(), inventory=inv(records=records, vanished=("a.json",),
+                                            changed=("b.json",)),
+              source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    assert report(**kw).uncertain.value == 0, "fixture misbuilt: no hold may be withheld here"
+    weak = _mutant(("    inv_unstable = bool(getattr(inv, \"unstable\", False)) "
+                    "if inv is not None else False",
+                    "    inv_unstable = False"))
+    mutated = _run(weak, **kw).uncertain
+    assert mutated.value == 0 and mutated.exactness == weak.EXACT, "the mutation did not apply"
+    real = report(**kw)
+    assert real.uncertain.exactness != a5.EXACT
+    for _label, figure in real.uncertain_observations:
+        if figure.basis.startswith("RecordInventory") and figure.value is not None:
+            assert figure.exactness == a5.LOWER_BOUND
+
+
+def test_mutant_dropping_the_unassessed_population_from_d_is_caught():
+    """F-9: D claims complete coverage again over a population it narrowed on its own."""
+    usable = [rec("u%d" % i) for i in range(8)]
+    relative = lcr.CacheRecord(name="e1.json", size=10, parse=lcr.PARSE_OK,
+                               contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_IN,
+                               source_path=os.path.join("..", "rel", "x.mp4"))
+    kw = dict(location=loc(),
+              inventory=inv(records=tuple(usable) + (relative,), records_recognised=9,
+                            records_attempted=9, parse_counts={lcr.PARSE_OK: 9},
+                            contract_counts={lcr.CONTRACT_CURRENT: 9},
+                            scope_counts={lcr.SCOPE_IN: 9},
+                            complete_counts={lcr.COMPLETE_YES: 9},
+                            entries_listed=9, entries_examined=9),
+              source_verdicts=[verdict(r.source_path) for r in usable[:3]]
+                              + [verdict(r.source_path, state=lib.PRESENT) for r in usable[3:]])
+    weak = _mutant(("                         and unmatched == 0 and unresolved == 0 "
+                    "and unjoinable == 0\n                         and shortfall <= 0)",
+                    "                         and unmatched == 0)"))
+    assert _run(weak, **kw).confirmed_missing.exactness == weak.EXACT, \
+        "the mutation did not apply"
+    real = report(**kw)
+    assert real.confirmed_missing.value == 3
+    assert real.confirmed_missing.exactness == a5.LOWER_BOUND
+
+
+def test_every_mutation_control_is_accounted_for():
+    """The count claim the previous report got wrong: tabulate, do not estimate.
+
+    The implementation report said "nine mutation controls" while the file held ten. This test
+    makes the number self-reporting, so the claim cannot drift from the source again.
+    """
+    import inspect
+    this_module = sys.modules[__name__]
+    controls = [name for name in dir(this_module)
+                if name.startswith("test_mutant_") and callable(getattr(this_module, name))]
+    assert len(controls) == 19, f"expected 19 mutation controls, found {len(controls)}: {controls}"
+    for name in controls:
+        source = inspect.getsource(getattr(this_module, name))
+        assert "_mutant(" in source, f"{name} does not build a mutant"
+        assert "the mutation did not apply" in source, \
+            f"{name} has no guard proving its anchor applied"

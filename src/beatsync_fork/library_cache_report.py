@@ -70,6 +70,8 @@ from beatsync_fork.library_inventory import (
     ACCESS_DENIED,
     LeafVerdict,
     MISSING_CONFIRMED,
+    NOT_INSPECTED,
+    PRESENT,
     ROOT_UNREACHABLE,
     UNKNOWN,
 )
@@ -151,6 +153,24 @@ EXPENSIVE_SENTENCE = (
 
 #: Words that must never appear on a line carrying D's number.
 _RECLAIM_WORDS = ("delete", "reclaim", "free", "obsolete", "safe")
+
+#: A1 leaf verdicts that **establish** a source state, as opposed to leaving it open. These are the
+#: only two outcomes that answer "what is the state of this source file?", and the distinction is
+#: load-bearing for bucket E: :data:`library_inventory.PRESENT` is a positive observation, not an
+#: uncertainty, so a record whose source A1 saw must **not** become an uncertainty hold merely
+#: because it is not missing. A cache whose every source is `PRESENT`, with every other question
+#: answered, legitimately reports D = 0 and E = 0 as exact.
+#:
+#: ``MISSING_CONFIRMED`` is deliberately absent here: it establishes a state only when
+#: :func:`_finalised_confirmed` also finds the four clauses, and that second gate is applied
+#: separately so an enum carrying no clause evidence is *refused* rather than believed.
+SOURCE_PRESENT = PRESENT
+
+#: Published leaf verdicts that establish **nothing** about the source. ``MISSING_PROVISIONAL`` and
+#: a non-final ``MISSING_CONFIRMED`` do not appear because `LeafVerdict.published` has already
+#: mapped both to :data:`library_inventory.UNKNOWN` before A5 sees them -- which is exactly why
+#: ``published`` is read and ``verdict`` never is.
+SOURCE_UNRESOLVED = (UNKNOWN, ROOT_UNREACHABLE, ACCESS_DENIED, NOT_INSPECTED)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -309,8 +329,58 @@ class CategoryObservation:
         return bool(getattr(self.category, "expensive", False))
 
     @property
+    def measurement_key(self) -> str:
+        return str(getattr(self.measurement, "key", "") or "")
+
+    @property
+    def measurement_label(self) -> str:
+        return str(getattr(self.measurement, "label", "") or "")
+
+    @property
+    def identity_conflict(self) -> str:
+        """Does the supplied Measurement actually describe the supplied Category? ``""`` if so.
+
+        `cache_admin.Measurement` carries its own ``key`` and ``expensive`` flag, and the caller
+        pairs the two objects by hand. If they disagree, the pair is evidence about **something
+        else**: a Measurement keyed ``analysis`` carries the Stage-5 folder's bytes, and filing it
+        under a ``posters`` Category would publish those bytes under another category's label and
+        root -- and, because only `Category.expensive` is consulted when splitting the cost axis,
+        would classify the expensive analysis cache as cheaply regenerable poster art.
+
+        A5 already refuses a bare Measurement and a Category with no absolute root. Refusing an
+        incompatible *pair* is the same rule: a figure may only be published about a subject its
+        evidence actually describes. A differing **label** is a presentational disagreement and is
+        reported as a caveat rather than a refusal -- it cannot misattribute bytes on its own.
+        """
+        if self.category is None or self.measurement is None:
+            return ""
+        mkey, ckey = self.measurement_key, self.category_key
+        if mkey and ckey and mkey != ckey:
+            return (f"the measurement is keyed {mkey!r} but the category is {ckey!r}, so it is a "
+                    f"measurement of a different category")
+        if bool(getattr(self.measurement, "expensive", False)) != self.expensive:
+            return (f"category {ckey or self.label!r} declares expensive="
+                    f"{self.expensive} while its measurement declares "
+                    f"expensive={bool(getattr(self.measurement, 'expensive', False))}, so the "
+                    f"regeneration cost of these bytes is not established")
+        return ""
+
+    @property
+    def label_disagreement(self) -> str:
+        """A differing descriptive label: disclosed, never a refusal on its own."""
+        if self.category is None or self.measurement is None:
+            return ""
+        clabel = str(getattr(self.category, "label", "") or "")
+        mlabel = self.measurement_label
+        if clabel and mlabel and clabel != mlabel:
+            return (f"category {self.category_key!r} is labelled {clabel!r} but its measurement is "
+                    f"labelled {mlabel!r}")
+        return ""
+
+    @property
     def usable(self) -> bool:
-        return bool(self.category is not None and self.measurement is not None and self.key)
+        return bool(self.category is not None and self.measurement is not None and self.key
+                    and not self.identity_conflict)
 
 
 @dataclass(frozen=True)
@@ -417,10 +487,30 @@ def bind_observation(*, location=None, inventory=None, categories=(), flat_measu
             refusals.append(
                 f"category {cat.category_key or index!r} has no usable absolute root, so its "
                 f"measurement has no verifiable subject")
+        elif cat.identity_conflict:
+            refusals.append(
+                f"category observation {index} pairs a Category and a Measurement that do not "
+                f"describe the same thing: {cat.identity_conflict}")
         elif cat.measurement is not None and not cat.observed_at:
             caveats.append(
                 f"category {cat.label!r} was supplied without an observation time; "
                 f"cache_admin.Measurement carries none of its own")
+        if cat.label_disagreement:
+            caveats.append(cat.label_disagreement)
+
+    # A category key is the only name a consumer has for a category figure, so two different roots
+    # sharing one key leave every such figure ambiguous even though each figure's own `subject` is
+    # still truthful. The individual observations are kept; the group subtotal is not.
+    seen_keys: dict = {}
+    for cat in cats:
+        if not cat.usable:
+            continue
+        previous = seen_keys.get(cat.category_key)
+        if previous is not None and previous != cat.key:
+            caveats.append(
+                f"category key {cat.category_key!r} was supplied twice for different roots "
+                f"({previous} and {cat.key}), so that key does not identify one category")
+        seen_keys.setdefault(cat.category_key, cat.key)
 
     # --- the primary subject: the cache folder A3 and A4 are talking about -----------------------
     typed: list = []
@@ -547,6 +637,18 @@ def _admin_figure(cat: CategoryObservation, *, axis: str, subject: str) -> Figur
         return withheld("the folder does not exist, so no occupancy was measured", unit=BYTES,
                         axis=axis, subject=subject, basis=basis, window=window,
                         notes=(f"category {cat.label!r}",))
+    if not cat.observed_at:
+        # Rule T-2. `cache_admin.Measurement` carries no timestamp of its own, so a figure built
+        # from one has no observation window unless the caller supplies it -- and a byte count with
+        # no "as at when" is not an observation of anything in particular. `_flat_figure` already
+        # refuses the identical omission; the two measurement paths must not disagree about whether
+        # the same missing fact is fatal. A4's own `observed_at` is NOT substituted: it timestamps
+        # a location selection, not this walk.
+        return withheld("no observation time was supplied for this measurement", unit=BYTES,
+                        axis=axis, subject=subject, basis=basis,
+                        notes=(f"category {cat.label!r}",
+                               "cache_admin.Measurement carries no timestamp of its own, so the "
+                               "caller must supply one"))
     if skipped:
         limits.append(f"{len(skipped)} entries were skipped and named by cache_admin")
     limits.append("cache_admin.measure passes no onerror to os.walk, so an unreadable nested "
@@ -564,6 +666,37 @@ def _admin_figure(cat: CategoryObservation, *, axis: str, subject: str) -> Figur
                   basis=basis, window=window, limitations=tuple(limits),
                   notes=(f"category {cat.label!r}",
                          "a floor: complete physical coverage of the folder was not certified"))
+
+
+def _flat_subject(observation: Observation) -> str:
+    """The folder an `analysis_cache.Measurement` is actually about -- its own ``path``.
+
+    Not the report's primary subject. When the primary subject came from A4 and this measurement
+    describes a different folder, the combined figures are withheld, but this figure survives as a
+    statement about its own folder -- so it must carry *its own* key or it would publish one
+    folder's bytes under another folder's name.
+    """
+    m = observation.flat_measurement
+    return _key(str(getattr(m, "path", "") or "")) or "an unestablished folder"
+
+
+def _inventory_subject(inv) -> str:
+    """The folder an A3 `RecordInventory` is actually about -- its own resolved location."""
+    if inv is None:
+        return "an unestablished folder"
+    return (_key(str(getattr(inv, "resolved", "") or ""))
+            or _key(str(getattr(inv, "path", "") or ""))
+            or "an unestablished folder")
+
+
+def _location_subject(location) -> str:
+    """The folder an A4 `CacheLocationReport` observation is about."""
+    if location is None:
+        return "an unestablished folder"
+    chosen = getattr(location, "selected", None)
+    return (_key(str(getattr(chosen, "real", "") or ""))
+            or _key(str(getattr(location, "selected_path", "") or ""))
+            or "an unestablished folder")
 
 
 def _flat_figure(observation: Observation, subject: str) -> Figure:
@@ -622,6 +755,12 @@ def _disjoint(cats: tuple) -> tuple:
     """
     if len(cats) < 2:
         return True, ""
+    keys: dict = {}
+    for c in cats:
+        if c.category_key in keys and keys[c.category_key] != c.key:
+            return False, (f"category key {c.category_key!r} was supplied for two different roots, "
+                           f"so the group it names is not well defined")
+        keys.setdefault(c.category_key, c.key)
     missing = [c.label for c in cats if not c.storage_key]
     if missing:
         return False, ("no storage provenance was supplied for " + ", ".join(repr(m) for m in missing)
@@ -640,6 +779,43 @@ def _disjoint(cats: tuple) -> tuple:
                 return False, (f"{inner.label!r} lies inside {outer.label!r}, so their bytes would "
                                f"be counted twice")
     return True, ""
+
+
+def _cost_overlaps(cats: tuple) -> tuple:
+    """``((reason, involves_cheap), ...)`` for every pair of category roots that is not separate.
+
+    :func:`_disjoint` answers "may the **cheap** figures be added together?" and therefore only
+    ever sees the cheap categories. That is not the whole question, because `cache_admin.measure`
+    **walks**: if the expensive Stage-5 root lies *inside* a cheap root, the cheap root's byte count
+    already contains the expensive bytes, and a "non-expensive categories, taken together" subtotal
+    silently reports expensive storage as cheaply regenerable. No double-count occurs *within* the
+    cheap group, so the within-group test cannot see it -- which is why this runs across **all**
+    supplied categories regardless of cost tier.
+
+    Containment and equality are pure lexical component work (`commonpath`, never `startswith`), so
+    no provenance is needed for them and A5 still resolves nothing. A supplied ``storage_key``
+    collision is also reported, because two paths the caller says are one storage are one storage
+    whatever the strings look like. Both directions of containment are reported: whichever way the
+    nesting runs, the cost split is not a partition of distinct bytes.
+    """
+    out: list = []
+    for index, outer in enumerate(cats):
+        for inner in cats[index + 1:]:
+            involves_cheap = (not outer.expensive) or (not inner.expensive)
+            pair = f"{outer.label!r} ({outer.key}) and {inner.label!r} ({inner.key})"
+            if outer.key == inner.key:
+                out.append((f"{pair} name the same folder, so their bytes are one quantity "
+                            f"reported twice, not two quantities", involves_cheap))
+            elif _contained(outer.key, inner.key):
+                out.append((f"{inner.label!r} lies inside {outer.label!r}, so {outer.label!r}'s "
+                            f"measured bytes already include {inner.label!r}'s", involves_cheap))
+            elif _contained(inner.key, outer.key):
+                out.append((f"{outer.label!r} lies inside {inner.label!r}, so {inner.label!r}'s "
+                            f"measured bytes already include {outer.label!r}'s", involves_cheap))
+            elif outer.storage_key and outer.storage_key == inner.storage_key:
+                out.append((f"{pair} were supplied with the same storage provenance, so they are "
+                            f"one storage under two paths", involves_cheap))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -740,29 +916,120 @@ def _finalised_confirmed(item) -> bool:
     return bool(getattr(item.clauses, "all_four", False))
 
 
+def _source_signature(item) -> tuple:
+    """Everything about a verdict that A5's acceptance of it actually depends on.
+
+    Two verdicts for one source path are in conflict unless they agree on **all** of this.
+    Comparing `LeafVerdict.published` alone is not sufficient, and that was finding F-2: a
+    confirmation carrying its four clauses and one carrying none publish the *same* enum while
+    being, to A5, opposite evidence -- the first establishes a missing source, the second is refused
+    outright. With only ``published`` compared, no contradiction was detected and a plain
+    last-write-wins assignment let **whichever verdict arrived last** decide whether D read
+    ``1 (exact)`` or ``0 (lower bound)``.
+
+    So the signature carries every field the two independent gates consult -- the published answer,
+    finalisation, the clause evidence and the root provenance -- and a difference in any of them is
+    a disagreement A5 refuses rather than resolves.
+    """
+    clauses = getattr(item, "clauses", None)
+    return (str(getattr(item, "published", "") or ""),
+            bool(getattr(item, "is_final", False)),
+            bool(getattr(clauses, "all_four", False)),
+            str(getattr(item, "root_key", "") or ""))
+
+
 def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
-    """``(Figure, rejected, holds)`` for axis D. Never generates a verdict of its own."""
+    """``(Figure, rejected, holds)`` for axis D. Never generates a verdict of its own.
+
+    ``holds`` is the source axis's contribution to bucket E, and populating it is not optional.
+    A record whose source state was never established *is* an uncertainty, and reporting it nowhere
+    was finding F-1: E then published ``0 records (exact)`` -- "every uncertainty question that was
+    put returned zero" -- over a question nobody had answered, in the worst shape alongside a D
+    reading ``not assessed``.
+
+    Only two outcomes **establish** a source state: :data:`library_inventory.PRESENT`, and a
+    finalised confirmation that also carries its four clauses. ``PRESENT`` therefore contributes no
+    hold at all -- it is a positive observation, not a doubt, and a cache whose every source A1 saw,
+    with every other question answered, legitimately reports D = 0 and E = 0 as exact. Everything
+    else -- an unresolved answer, a record no verdict covered, a recorded path A5 cannot join -- is
+    counted and labelled rather than absorbed.
+    """
     basis = ("library_inventory.LeafVerdict.published == MISSING_CONFIRMED, joined onto "
              "RecordInventory.records[].source_path")
     verdicts = obs.source_verdicts
     rejected: list = []
     holds: list = []
 
+    records = tuple(getattr(inv, "records", ()) or ()) if inv is not None else ()
+    truncated = bool(getattr(inv, "records_truncated", False))
+    counts_exact = bool(getattr(inv, "counts_exact", False))
+    unstable = bool(getattr(inv, "unstable", False))
+    parsed = int(getattr(inv, "records_parsed", 0) or 0)
+    recognised = int(getattr(inv, "records_recognised", 0) or 0)
+
+    # --- which records could carry a source state at all (finding F-9) --------------------------
+    # A record with no recorded ``video_file`` has no source, so no source of its own can be
+    # missing: excluding it is correct and it raises no doubt. A record that recorded a path A5
+    # cannot form a key from is different -- A3 may well have resolved and scoped that path against
+    # its own verified root, so the record is one whose source state is simply unknown *here*, and
+    # it must be disclosed rather than silently dropped out of the denominator.
+    eligible: list = []
+    unjoinable = 0
+    no_source = 0
+    for rec in records:
+        text = str(getattr(rec, "source_path", "") or "").strip()
+        if not text:
+            no_source += 1
+            continue
+        key = _key(text)
+        if key:
+            eligible.append((rec, key))
+        else:
+            unjoinable += 1
+
+    # Note on phrasing throughout this function: a count is written *after* its noun
+    # ("records in the supplied detail list: 10"), never as "10 records". A cross-cutting guard
+    # asserts that no line in the report presents an F+G cross-axis total, and it does so by
+    # looking for the literal sum as "<n> records" -- so a population string that happens to
+    # mention the same number in that shape would trip it and read as the very double-count the
+    # guard exists to forbid.
+    if unjoinable:
+        holds.append((
+            "uncertain: records whose recorded source path A5 cannot join to a verdict",
+            Figure(value=unjoinable, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
+                   subject=subject,
+                   population=f"records in the supplied detail list: {len(records)}",
+                   basis="RecordInventory.records[].source_path that is not an absolute path",
+                   window=window,
+                   notes=("A3 resolves a recorded path against its own verified root; A5 resolves "
+                          "nothing, so without supplied absolute provenance it cannot join these "
+                          "to a source verdict",))))
+
+    def axis_withheld(reason):
+        """Withhold D, and -- when there was something to answer for -- withhold an E hold too."""
+        if eligible or unjoinable:
+            holds.append((
+                "uncertain: the source state of these records was not established",
+                withheld(reason, unit=RECORDS, axis=AXIS_UNCERTAIN, subject=subject, basis=basis,
+                         window=window,
+                         notes=("records carrying a source path A5 could join: "
+                                f"{len(eligible)}",))))
+        return (withheld(reason, unit=RECORDS, axis=AXIS_SOURCE, subject=subject, basis=basis,
+                         window=window),
+                tuple(sorted(rejected)), tuple(holds))
+
     if not verdicts:
-        return (withheld("no finalised source verdict was supplied, so nothing is known about any "
-                         "source file", unit=RECORDS, axis=AXIS_SOURCE, subject=subject,
-                         basis=basis, window=window),
-                tuple(rejected), tuple(holds))
+        return axis_withheld("no finalised source verdict was supplied, so nothing is known about "
+                             "any source file")
 
     root_keys = _verified_root_keys(inv) if inv is not None else ()
     if not root_keys:
-        return (withheld("no verified inspection root was supplied, so no source verdict has "
-                         "jurisdiction over records in this folder", unit=RECORDS,
-                         axis=AXIS_SOURCE, subject=subject, basis=basis, window=window),
-                tuple(rejected), tuple(holds))
+        return axis_withheld("no verified inspection root was supplied, so no source verdict has "
+                             "jurisdiction over records in this folder")
 
     # --- index the supplied verdicts by path, refusing contradictions rather than picking one ----
     by_path: dict = {}
+    signatures: dict = {}
     contradictions: list = []
     for item in verdicts:
         if not isinstance(item, LeafVerdict):
@@ -781,38 +1048,30 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
             rejected.append(("no root provenance, so jurisdiction cannot be established",
                              str(item.path)))
             continue
-        previous = by_path.get(key)
-        if previous is not None and previous.published != item.published:
+        signature = _source_signature(item)
+        previous = signatures.get(key)
+        if previous is None:
+            signatures[key] = signature
+            by_path[key] = item
+        elif previous != signature:
+            # Flagged, and the first-seen item is deliberately NOT replaced: the outcome is a
+            # refusal either way, so no surviving assignment can depend on arrival order.
             contradictions.append(key)
-        by_path[key] = item
 
     if contradictions:
-        return (withheld("two supplied verdicts disagree about the same source path, and A5 does "
-                         "not choose between them: " + ", ".join(sorted(set(contradictions))),
-                         unit=RECORDS, axis=AXIS_SOURCE, subject=subject, basis=basis,
-                         window=window),
-                tuple(rejected), tuple(holds))
-
-    records = tuple(getattr(inv, "records", ()) or ())
-    truncated = bool(getattr(inv, "records_truncated", False))
-    counts_exact = bool(getattr(inv, "counts_exact", False))
-    unstable = bool(getattr(inv, "unstable", False))
-
-    eligible = []
-    for rec in records:
-        key = _key(getattr(rec, "source_path", ""))
-        if key:
-            eligible.append((rec, key))
+        return axis_withheld("two supplied verdicts disagree about the same source path, and A5 "
+                             "does not choose between them: "
+                             + ", ".join(sorted(set(contradictions))))
 
     if not eligible:
-        return (withheld("no record in the supplied inventory carries a usable source path, so no "
-                         "source verdict can be joined to one", unit=RECORDS, axis=AXIS_SOURCE,
-                         subject=subject, basis=basis, window=window),
-                tuple(rejected), tuple(holds))
+        return axis_withheld("no record in the supplied inventory carries a usable source path, so "
+                             "no source verdict can be joined to one")
 
     confirmed = 0
+    present = 0
     unmatched = 0
-    not_confirmed = 0
+    unresolved = 0
+    refused = 0
     for rec, key in eligible:
         item = by_path.get(key)
         if item is None:
@@ -820,14 +1079,40 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
             continue
         if _finalised_confirmed(item):
             confirmed += 1
+            continue
+        published = str(getattr(item, "published", "") or "")
+        if published == SOURCE_PRESENT:
+            present += 1
+        elif published == MISSING_CONFIRMED:
+            refused += 1
+            rejected.append(("a confirmed-missing enum without its finalised clause evidence",
+                             f"{item.path} (unmet: "
+                             f"{','.join(item.clauses.unmet()) or 'none recorded'})"))
         else:
-            not_confirmed += 1
-            if isinstance(item, LeafVerdict) and item.verdict == MISSING_CONFIRMED \
-                    and not getattr(item.clauses, "all_four", False):
-                rejected.append(("a confirmed-missing enum without its finalised clause evidence",
-                                 f"{item.path} (unmet: "
-                                 f"{','.join(item.clauses.unmet()) or 'none recorded'})"))
+            unresolved += 1
 
+    if unresolved:
+        holds.append((
+            "uncertain: records whose supplied source verdict established no state",
+            Figure(value=unresolved, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
+                   subject=subject,
+                   population=f"records with a joinable source path: {len(eligible)}",
+                   basis="library_inventory.LeafVerdict.published outside (PRESENT, "
+                         "MISSING_CONFIRMED)",
+                   window=window,
+                   notes=("a provisional or non-final missing verdict publishes as UNKNOWN, and an "
+                          "unreachable, access-denied or uninspected source establishes nothing "
+                          "either",))))
+    if unmatched:
+        holds.append((
+            "uncertain: records with a source path but no supplied source verdict",
+            Figure(value=unmatched, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
+                   subject=subject,
+                   population=f"records with a joinable source path: {len(eligible)}",
+                   basis="RecordInventory.records[].source_path with no matching LeafVerdict",
+                   window=window)))
+
+    shortfall = parsed - len(records)
     limits: list = []
     if truncated:
         limits.append("RecordInventory.records is a truncated display, so records beyond it could "
@@ -836,34 +1121,52 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
         limits.append("RecordInventory.counts_exact is False")
     if unmatched:
         limits.append(f"{unmatched} eligible records had no supplied source verdict")
+    if unresolved:
+        limits.append(f"{unresolved} eligible records had a supplied verdict that established no "
+                      f"source state")
+    if unjoinable:
+        limits.append(f"{unjoinable} records recorded a source path A5 could not join to a verdict")
+    if no_source:
+        limits.append(f"{no_source} records recorded no source path at all, so no source of theirs "
+                      f"can be missing")
+    if not truncated and shortfall > 0:
+        limits.append(f"{shortfall} parsed records are absent from the supplied detail list")
     if unstable:
         limits.append("the folder changed while it was being read")
     if rejected:
         limits.append(f"{len(rejected)} supplied verdicts were rejected as evidence")
 
-    population = (f"{len(eligible) - unmatched} of {len(eligible)} records with a source path were "
-                  f"matched to a finalised verdict; {not_confirmed} of those were not a "
-                  f"confirmation")
+    population = (
+        f"source states established: {confirmed + present} of {len(eligible)} joinable "
+        f"(confirmed missing {confirmed}, present {present}); unresolved {unresolved}, "
+        f"unmatched {unmatched}, refused as evidence {refused}, unjoinable {unjoinable}, "
+        f"recording no source path {no_source}; in this folder parsed {parsed}, "
+        f"recognised {recognised}")
 
-    complete_coverage = (counts_exact and not truncated and unmatched == 0 and not unstable
-                         and not rejected)
+    # EXACT means "this is the count for the whole source-state question in this folder". That
+    # needs every record in the population to have been answered -- not merely every verdict that
+    # happened to be supplied to have been consumed.
+    complete_coverage = (counts_exact and not truncated and not unstable and not rejected
+                         and unmatched == 0 and unresolved == 0 and unjoinable == 0
+                         and shortfall <= 0)
     if complete_coverage:
         return (Figure(value=confirmed, unit=RECORDS, exactness=EXACT, axis=AXIS_SOURCE,
                        subject=subject, population=population + " (complete coverage)",
                        basis=basis, window=window),
-                tuple(rejected), tuple(holds))
+                tuple(sorted(rejected)), tuple(holds))
     return (Figure(value=confirmed, unit=RECORDS, exactness=LOWER_BOUND, axis=AXIS_SOURCE,
                    subject=subject, population=population, basis=basis, window=window,
                    limitations=tuple(limits),
-                   notes=("a floor: records with no supplied verdict were not assessed",)),
-            tuple(rejected), tuple(holds))
+                   notes=("a floor: records whose source state was not established could also "
+                          "qualify",)),
+            tuple(sorted(rejected)), tuple(holds))
 
 
 # ---------------------------------------------------------------------------------------------
 # axis E -- separately labelled holds
 # ---------------------------------------------------------------------------------------------
 
-def _uncertainty(obs: Observation, inv, subject, window, rejected) -> tuple:
+def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=()) -> tuple:
     """``(headline, observations)``. Separate labels, separate units, deliberately no sum.
 
     Clarification C-3: the uncertainty category stays visible, but a visible category does not imply
@@ -871,11 +1174,33 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected) -> tuple:
     directory entry may be the same thing as a skipped one -- and they are not even all in the same
     unit, so adding them would invent a population. The headline is therefore published only when
     exactly one member contributes, and withheld otherwise.
+
+    **Every hold names the folder it is actually about** (finding F-3). The report's primary subject
+    is established from A4 when A4 is supplied, and an A3 inventory of a *different* folder still
+    contributes its own observations here -- correctly, because refusing them would destroy evidence
+    rather than qualify it. Labelling them with the primary subject published one folder's numbers
+    under another folder's name, which is the very thing the cross-folder refusal exists to prevent.
+    So an inventory-derived hold carries the inventory's key and an A4-derived hold carries A4's.
     """
     out: list = []
+    inv_subject = _inventory_subject(inv) if inv is not None else subject
+    loc_subject = _location_subject(obs.location) if obs.location is not None else subject
+    inv_unstable = bool(getattr(inv, "unstable", False)) if inv is not None else False
 
     def add(label, figure):
         out.append((label, figure))
+
+    def inv_figure(value, unit, basis, population, notes=()):
+        """An inventory-derived count, demoted when the folder moved under the pass (Rule T-3)."""
+        if inv_unstable:
+            return Figure(value=value, unit=unit, exactness=LOWER_BOUND, axis=AXIS_UNCERTAIN,
+                          subject=inv_subject, population=population, basis=basis, window=window,
+                          limitations=("the folder changed while it was being read, so this counts "
+                                       "only what this pass examined",),
+                          notes=tuple(notes))
+        return Figure(value=value, unit=unit, exactness=EXACT, axis=AXIS_UNCERTAIN,
+                      subject=inv_subject, population=population, basis=basis, window=window,
+                      notes=tuple(notes))
 
     if inv is not None:
         unclassified = int(getattr(inv, "entries_unclassified", 0) or 0)
@@ -889,49 +1214,47 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected) -> tuple:
         entries_complete = bool(getattr(inv, "entries_complete", False))
 
         add("uncertain: directory entries that could not be classified",
-            Figure(value=unclassified, unit=ENTRIES, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                   subject=subject, population="entries examined by this pass",
-                   basis="RecordInventory.entries_unclassified", window=window))
+            inv_figure(unclassified, ENTRIES, "RecordInventory.entries_unclassified",
+                       "entries examined by this pass"))
         add("uncertain: directory entries deliberately skipped",
-            Figure(value=skipped, unit=ENTRIES, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                   subject=subject, population="entries examined by this pass",
-                   basis="RecordInventory.skipped_entries", window=window))
+            inv_figure(skipped, ENTRIES, "RecordInventory.skipped_entries",
+                       "entries examined by this pass"))
         add("uncertain: recognised records that could not be parsed",
-            Figure(value=max(recognised - parsed, 0), unit=RECORDS, exactness=EXACT,
-                   axis=AXIS_UNCERTAIN, subject=subject,
-                   population=f"{recognised} recognised records",
-                   basis="RecordInventory.records_recognised - records_parsed", window=window))
+            inv_figure(max(recognised - parsed, 0), RECORDS,
+                       "RecordInventory.records_recognised - records_parsed",
+                       f"{recognised} recognised records"))
         add("uncertain: records whose completion authority would not answer",
-            Figure(value=unavailable, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                   subject=subject, population=f"{parsed} parsed records",
-                   basis="RecordInventory.completion_unavailable", window=window))
+            inv_figure(unavailable, RECORDS, "RecordInventory.completion_unavailable",
+                       f"{parsed} parsed records"))
         if scope_assessed and isinstance(scope_counts, dict):
             add("uncertain: records whose recorded source path could not be resolved",
-                Figure(value=int(scope_counts.get(SCOPE_UNKNOWN, 0) or 0), unit=RECORDS,
-                       exactness=EXACT, axis=AXIS_UNCERTAIN, subject=subject,
-                       population=f"{_counter_total(scope_counts)} records scoped",
-                       basis=f"RecordInventory.scope_counts[{SCOPE_UNKNOWN}]", window=window))
+                inv_figure(int(scope_counts.get(SCOPE_UNKNOWN, 0) or 0), RECORDS,
+                           f"RecordInventory.scope_counts[{SCOPE_UNKNOWN}]",
+                           f"{_counter_total(scope_counts)} records scoped"))
         else:
             add("uncertain: source scope was not assessed",
                 withheld("scope was not assessed for this folder, so the number of unscoped "
-                         "records is unknown", unit=RECORDS, axis=AXIS_UNCERTAIN, subject=subject,
-                         basis="RecordInventory.scope_assessed", window=window))
+                         "records is unknown", unit=RECORDS, axis=AXIS_UNCERTAIN,
+                         subject=inv_subject, basis="RecordInventory.scope_assessed",
+                         window=window))
         if unverified:
             add("uncertain: roots supplied without a positive observation",
-                Figure(value=len(unverified), unit=ENTRIES, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                       subject=subject, population="roots supplied to the record pass",
-                       basis="RecordInventory.unverified_roots", window=window,
-                       notes=("these took no part in any scope verdict",)))
+                inv_figure(len(unverified), ENTRIES, "RecordInventory.unverified_roots",
+                           "roots supplied to the record pass",
+                           notes=("these took no part in any scope verdict",)))
         if not entries_complete:
             add("uncertain: the enumeration did not reach the end of the folder",
                 withheld("the entry loop stopped early, so the number of unseen entries is "
-                         "unknown", unit=ENTRIES, axis=AXIS_UNCERTAIN, subject=subject,
+                         "unknown", unit=ENTRIES, axis=AXIS_UNCERTAIN, subject=inv_subject,
                          basis="RecordInventory.entries_complete", window=window))
     else:
         add("uncertain: no record inventory was supplied",
             withheld("no record inventory was supplied, so nothing about this folder's records is "
                      "known", unit=RECORDS, axis=AXIS_UNCERTAIN, subject=subject,
                      basis="Observation.inventory"))
+
+    for label, figure in tuple(source_holds or ()):
+        add(label, figure)
 
     if obs.location is not None:
         shared = getattr(obs.location, "shared", None)
@@ -940,13 +1263,13 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected) -> tuple:
             add(f"uncertain: the configured shared folder reported {verdict}",
                 withheld(f"A1's verdict for the configured shared folder was {verdict}, so its "
                          f"contents were not established", unit=RECORDS, axis=AXIS_UNCERTAIN,
-                         subject=subject, basis="CacheLocationReport.shared.verdict",
+                         subject=loc_subject, basis="CacheLocationReport.shared.verdict",
                          window=window))
 
     if rejected:
         add("uncertain: supplied source verdicts rejected as evidence",
             Figure(value=len(rejected), unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                   subject=subject, population="verdicts supplied to this report",
+                   subject=inv_subject, population="verdicts supplied to this report",
                    basis="A5 rejection of unusable source verdicts", window=window,
                    notes=tuple(f"{why}: {what}" for why, what in rejected)[:8]))
 
@@ -957,11 +1280,22 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected) -> tuple:
     if len(contributing) == 1 and not any_withheld:
         label, fig = contributing[0]
         headline = replace(fig, notes=fig.notes + (f"the only uncertainty observed: {label}",))
-    elif not contributing and not any_withheld:
+    elif not contributing and not any_withheld and not inv_unstable:
         headline = Figure(value=0, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
                           subject=subject,
                           population="every uncertainty question that was put returned zero",
                           basis="all A5 uncertainty observations", window=window)
+    elif not contributing and not any_withheld:
+        # Every question returned zero, but the folder demonstrably moved while it was being read,
+        # so each of those zeros describes only what the pass managed to examine. Publishing it as
+        # an exact folder-wide zero would contradict this report's own concurrency caveat.
+        headline = Figure(value=0, unit=RECORDS, exactness=LOWER_BOUND, axis=AXIS_UNCERTAIN,
+                          subject=subject,
+                          population="every uncertainty question that was put returned zero for "
+                                     "the entries this pass examined",
+                          basis="all A5 uncertainty observations", window=window,
+                          limitations=("the folder changed while it was being read, so entries it "
+                                       "never saw are not counted here",))
     else:
         headline = withheld(
             "uncertain, but not countable: these holds can refer to the same entries and are not "
@@ -1005,8 +1339,11 @@ def estimate_reclaimable(observation) -> Buckets:
         fig = _admin_figure(cat, axis=axis, subject=cat.key)
         (expensive if cat.expensive else cheap).append((cat.category_key, fig))
 
-    cheap_cats = tuple(c for c in obs.categories if c.usable and not c.expensive)
+    all_cats = tuple(c for c in obs.categories if c.usable)
+    cheap_cats = tuple(c for c in all_cats if not c.expensive)
     ok, why = _disjoint(cheap_cats)
+    cost_overlaps = _cost_overlaps(all_cats)
+    cheap_overlap = next((reason for reason, involves_cheap in cost_overlaps if involves_cheap), "")
     values = [fig.value for _k, fig in cheap if fig.value is not None
               and fig.exactness != EMPTY_OR_UNREADABLE]
     if not cheap:
@@ -1017,18 +1354,41 @@ def estimate_reclaimable(observation) -> Buckets:
                                   "so adding them could count the same bytes twice: " + why,
                                   unit=BYTES, axis=AXIS_COST, subject=subject,
                                   basis="sum of cache_admin category measurements")
+    elif cheap_overlap:
+        # Finding F-6. `_disjoint` only ever sees the cheap group, so a cheap root that *contains*
+        # the expensive root passes it -- while `cache_admin.measure` walks, so that cheap root's
+        # byte count already includes the expensive bytes. A "cheaply regenerable, taken together"
+        # figure would then be reporting the Stage-5 analysis cache as cheap to rebuild.
+        cheap_subtotal = withheld("the supplied category roots are not separate storage, so a "
+                                  "non-expensive subtotal would include bytes that belong to "
+                                  "another category: " + cheap_overlap,
+                                  unit=BYTES, axis=AXIS_COST, subject=subject,
+                                  basis="sum of cache_admin category measurements")
     elif len(values) != len(cheap):
         cheap_subtotal = withheld("at least one category was not measured, so a subtotal would "
                                   "understate the group without saying so", unit=BYTES,
                                   axis=AXIS_COST, subject=subject,
                                   basis="sum of cache_admin category measurements")
     else:
+        # Finding F-7: `storage_key` is provenance the CALLER supplied. A5 resolves nothing, so it
+        # is in no position to call anything "proven", and a single-member group has not been
+        # compared against anything at all.
+        if len(values) == 1:
+            provenance = ("a single non-expensive category, so no disjointness question arises "
+                          "between members")
+        else:
+            provenance = (f"{len(values)} categories, each supplied with a distinct storage "
+                          f"provenance by the caller; A5 resolves nothing and so verifies none of "
+                          f"it independently")
         cheap_subtotal = Figure(
             value=int(sum(values)), unit=BYTES, exactness=LOWER_BOUND, axis=AXIS_COST,
             subject="the non-expensive categories, taken together",
-            population=f"{len(values)} categories, each proven to be different storage",
+            population=provenance,
             basis="sum of cache_admin category measurements",
             limitations=("every member is itself a floor, so the sum is a floor",))
+
+    for reason, _involves_cheap in cost_overlaps:
+        overlaps.append("supplied category roots are not separate storage: " + reason)
 
     if expensive and any(cat.expensive and cat.key == identity.key for cat in obs.categories):
         overlaps.append("the expensive category and the measured total describe the same folder: "
@@ -1041,7 +1401,10 @@ def estimate_reclaimable(observation) -> Buckets:
             measurements.append((f"cache_admin.{cat.category_key}",
                                  _admin_figure(cat, axis=AXIS_TOTAL, subject=cat.key)))
     if obs.flat_measurement is not None:
-        measurements.append(("analysis_cache.measure", _flat_figure(obs, subject)))
+        # Its own path, not the report's primary subject (finding F-3): when this measurement
+        # describes a different folder from A4's selection, the combined figures are withheld but
+        # this one survives as a statement about the folder it actually measured.
+        measurements.append(("analysis_cache.measure", _flat_figure(obs, _flat_subject(obs))))
 
     if not measurements:
         measured = withheld("the cache folder was not measured", unit=BYTES, axis=AXIS_TOTAL,
@@ -1059,6 +1422,9 @@ def estimate_reclaimable(observation) -> Buckets:
                         "and are never added")
 
     # ------------------------------------------------------------------ record axes (D, E, F, G)
+    # Every one of these is an observation of the A3 inventory's folder, so they carry the
+    # inventory's own key as their subject rather than the report's primary subject (finding F-3).
+    record_subject = _inventory_subject(inv) if inv is not None else subject
     if inv is None:
         other_configuration = withheld("no record inventory was supplied", unit=RECORDS,
                                        axis=AXIS_CONTRACT, subject=subject)
@@ -1067,29 +1433,32 @@ def estimate_reclaimable(observation) -> Buckets:
         confirmed_missing = withheld("no record inventory was supplied", unit=RECORDS,
                                      axis=AXIS_SOURCE, subject=subject)
         rejected = ()
+        source_holds = ()
     else:
         other_configuration = _record_axis_figure(
             inv, counts_attr="contract_counts", assessed_attr="contract_assessed",
             wanted=CONTRACT_OTHER, axis=AXIS_CONTRACT,
-            label="the cache-contract generation", subject=subject, window=window,
+            label="the cache-contract generation", subject=record_subject, window=window,
             extra_limits=("only the recorded cache-contract generation was compared: A3 reads no "
                           "analysis version, backend identity or Qwen configuration token, so "
                           "those remain unassessed",))
         roots = _verified_root_keys(inv)
         out_of_scope = _record_axis_figure(
             inv, counts_attr="scope_counts", assessed_attr="scope_assessed",
-            wanted=SCOPE_OUT, axis=AXIS_SCOPE, label="source scope", subject=subject,
+            wanted=SCOPE_OUT, axis=AXIS_SCOPE, label="source scope", subject=record_subject,
             window=window,
             extra_limits=(() if roots else
                           ("no verified inspection root anchored the comparison",)))
         if not roots and out_of_scope.value is not None:
             out_of_scope = withheld(
                 "no verified inspection root was supplied, so nothing lies demonstrably outside "
-                "the library", unit=RECORDS, axis=AXIS_SCOPE, subject=subject,
+                "the library", unit=RECORDS, axis=AXIS_SCOPE, subject=record_subject,
                 basis=f"RecordInventory.scope_counts[{SCOPE_OUT}]", window=window)
-        confirmed_missing, rejected, _holds = _source_state_figure(obs, inv, subject, window)
+        confirmed_missing, rejected, source_holds = _source_state_figure(
+            obs, inv, record_subject, window)
 
-    uncertain, uncertain_observations = _uncertainty(obs, inv, subject, window, rejected)
+    uncertain, uncertain_observations = _uncertainty(obs, inv, subject, window, rejected,
+                                                     source_holds)
 
     if (other_configuration.value or 0) > 0 and (out_of_scope.value or 0) > 0:
         overlaps.append("a record can record a different cache-contract generation AND resolve "
@@ -1248,6 +1617,7 @@ __all__ = [
     "EMPTY_OR_UNREADABLE", "EXACT", "EXACTNESS", "LOWER_BOUND", "NOT_ASSESSED",
     "OBSERVED_PARTIAL", "PUBLISHABLE",
     "IDENTITY_LEXICAL", "IDENTITY_NONE", "IDENTITY_PROVENANCE",
+    "SOURCE_PRESENT", "SOURCE_UNRESOLVED",
     "EXPENSIVE_SENTENCE", "MISSING_SOURCE_SENTENCE", "OUT_OF_SCOPE_SENTENCE",
     "SELECTION_SENTENCE", "SHARED_SENTENCE",
     "Buckets", "CategoryObservation", "Figure", "FolderIdentity", "Observation",
