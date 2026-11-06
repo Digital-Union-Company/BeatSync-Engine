@@ -91,7 +91,17 @@ from beatsync_fork.library_cache_records import (
 BYTES = "bytes"
 RECORDS = "records"
 ENTRIES = "entries"
-UNITS = (BYTES, RECORDS, ENTRIES)
+#: Supplied **evidence objects** -- not folder contents. Finding N-2: the rejected-verdict hold
+#: counts `LeafVerdict`s that A5 refused, and publishing that count in :data:`RECORDS` said "2
+#: records (exact)" for two verdicts naming **one** path -- a path that need not be a record in
+#: this folder at all. An evidence-object count is a fact about the *inputs*, so it carries its own
+#: unit and :func:`_uncertainty` never promotes it into a record total.
+VERDICTS = "verdicts"
+UNITS = (BYTES, RECORDS, ENTRIES, VERDICTS)
+
+#: Units that count things **in the folder**. A figure in one of these answers for the subject; a
+#: figure in :data:`VERDICTS` answers for what the caller handed in.
+CONTENT_UNITS = (BYTES, RECORDS, ENTRIES)
 
 #: Covers the whole stated subject; may be published as a total.
 EXACT = "exact"
@@ -153,6 +163,13 @@ EXPENSIVE_SENTENCE = (
 
 #: Words that must never appear on a line carrying D's number.
 _RECLAIM_WORDS = ("delete", "reclaim", "free", "obsolete", "safe")
+
+#: Carried by every uncertainty figure once the folder has demonstrably changed under the pass.
+#: Rule T-3: a count taken while its subject was moving describes the entries this pass examined,
+#: never the folder. The wording is the one :func:`_demote_while_moving` applies to all of them, so
+#: a reader cannot find two different accounts of the same concurrency on one page.
+CONCURRENCY_LIMITATION = ("the folder changed while it was being read, so this counts only what "
+                          "this pass examined")
 
 #: A1 leaf verdicts that **establish** a source state, as opposed to leaving it open. These are the
 #: only two outcomes that answer "what is the state of this source file?", and the distinction is
@@ -699,6 +716,42 @@ def _location_subject(location) -> str:
             or "an unestablished folder")
 
 
+def _configured_subject(location) -> str:
+    """The folder a *configured shared folder* observation is about -- A4's configured path.
+
+    Finding N-3. This hold was given :func:`_location_subject`, A4's **selected** folder. In the
+    case the hold exists to report, those are different folders and the selected one is the
+    healthy one: sharing was configured, the shared root came back ``ROOT_UNREACHABLE``, and A4
+    fell back to the local default. The report then said the configured shared folder was
+    unreachable and named the one folder that demonstrably was not.
+
+    ``configured_shared`` is the only path A4 carries for that folder, and it is already on
+    :attr:`FolderIdentity.path_as_configured`, so nothing had to be resolved to fix this. A blank
+    or relative configured path yields no subject rather than silently falling back to the
+    selected folder -- naming the wrong folder is the defect, and naming none is the honest
+    alternative.
+    """
+    if location is None:
+        return "an unestablished folder"
+    return (_key(str(getattr(location, "configured_shared", "") or ""))
+            or "an unestablished folder")
+
+
+def _location_window(location) -> tuple:
+    """A4's **own** observation time, for a figure derived from A4.
+
+    Finding N-4. :attr:`Observation.window` is A3's ``(observed_from, observed_to)`` whenever an
+    inventory was supplied, and the A4-derived hold inherited it -- attributing A3's record pass
+    over one folder to A4's observation of another. The two measurement figures already carry
+    their own supplied stamps; this closes the last borrowed window. When A4 supplied no time,
+    the hold carries none and says so rather than taking a neighbour's.
+    """
+    if location is None:
+        return ("", "")
+    stamp = str(getattr(location, "observed_at", "") or "")
+    return (stamp, stamp) if stamp else ("", "")
+
+
 def _flat_figure(observation: Observation, subject: str) -> Figure:
     """Classify one `analysis_cache.Measurement`. ``OBSERVED_PARTIAL`` at best, by measurement.
 
@@ -930,6 +983,18 @@ def _source_signature(item) -> tuple:
     So the signature carries every field the two independent gates consult -- the published answer,
     finalisation, the clause evidence and the root provenance -- and a difference in any of them is
     a disagreement A5 refuses rather than resolves.
+
+    **Disposition on N-7, accepted as-is.** Two verdicts can share this signature and still differ
+    in *which* clauses they left unmet: ``all_four`` is a single boolean, so ``parent_listed``
+    alone and ``name_absent`` alone both reduce to ``False``. Those two are not a contradiction --
+    A5 refuses both for the same reason, and the refusal is identical -- but the first-seen one is
+    the one kept, so the ``Clauses.unmet()`` list quoted in the rejection note depends on arrival
+    order. Measured on both orders: D is ``0 / LOWER_BOUND`` either way, the rejected count is 1
+    either way, and the unit, population, subject, exactness and every other published field agree.
+    **No figure is order-dependent**; what varies is which of two equally true explanations of the
+    same refusal is quoted. Pinning an order here would mean ranking unmet-clause sets against each
+    other, which is a judgement about A1's evidence that A5 is in no position to make, so the note
+    is left as the first-seen one and this paragraph is the disclosure.
     """
     clauses = getattr(item, "clauses", None)
     return (str(getattr(item, "published", "") or ""),
@@ -1133,26 +1198,54 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
         limits.append(f"{shortfall} parsed records are absent from the supplied detail list")
     if unstable:
         limits.append("the folder changed while it was being read")
+    if recognised > parsed:
+        limits.append(f"{recognised - parsed} recognised records were never parsed, so they "
+                      f"recorded no source path A5 could read and are outside this figure's "
+                      f"population entirely")
     if rejected:
-        limits.append(f"{len(rejected)} supplied verdicts were rejected as evidence")
+        # Finding N-5. Two different counts were both called "refused": `refused` counts verdicts
+        # that matched a record and lacked their clause evidence, while `len(rejected)` also covers
+        # verdicts thrown out before any matching happened. The figure printed "refused as evidence
+        # 0" and, on the same page, "1 supplied verdicts were rejected as evidence". Both numbers
+        # were right; the shared word made them read as a contradiction. Each is now named for the
+        # question it answers.
+        limits.append(f"{len(rejected)} supplied verdict objects were rejected as evidence "
+                      f"({refused} matched a record but carried no finalised clause evidence, "
+                      f"{len(rejected) - refused} were rejected before any record was matched)")
 
     population = (
         f"source states established: {confirmed + present} of {len(eligible)} joinable "
         f"(confirmed missing {confirmed}, present {present}); unresolved {unresolved}, "
-        f"unmatched {unmatched}, refused as evidence {refused}, unjoinable {unjoinable}, "
-        f"recording no source path {no_source}; in this folder parsed {parsed}, "
-        f"recognised {recognised}")
+        f"unmatched {unmatched}, matched verdicts refused for missing clause evidence {refused}, "
+        f"supplied verdict objects rejected before matching {len(rejected) - refused}, "
+        f"unjoinable {unjoinable}, recording no source path {no_source}; in this folder parsed "
+        f"{parsed}, recognised {recognised}")
 
     # EXACT means "this is the count for the whole source-state question in this folder". That
     # needs every record in the population to have been answered -- not merely every verdict that
     # happened to be supplied to have been consumed.
+    #
+    # Disposition on N-6, stated rather than left implicit. This test deliberately does **not**
+    # carry F's and G's ``parsed == recognised`` term, and the difference is a real one rather than
+    # an oversight. F and G read A3 counters that A3 bumps once per *parsed* record, so an unparsed
+    # record is a record the question was put to and lost -- their population genuinely falls short
+    # of the folder. D is reachable only by joining a verdict onto a ``source_path`` that A3 read
+    # out of a record's payload, and an unparsed record has no readable payload at all: it could
+    # not carry a source path even in principle, so it is not a shortfall in D's population but
+    # outside it. D may therefore stay exact for the population it names, and what N-6 actually
+    # required is that the *wording* stop implying a folder total. So the label now names the
+    # population the count covers, and the unparsed remainder is disclosed as a limitation on the
+    # exact figure too -- D's value and exactness are unchanged.
     complete_coverage = (counts_exact and not truncated and not unstable and not rejected
                          and unmatched == 0 and unresolved == 0 and unjoinable == 0
                          and shortfall <= 0)
     if complete_coverage:
         return (Figure(value=confirmed, unit=RECORDS, exactness=EXACT, axis=AXIS_SOURCE,
-                       subject=subject, population=population + " (complete coverage)",
-                       basis=basis, window=window),
+                       subject=subject,
+                       population=population + " (complete coverage of the records whose source "
+                                               "state could be established here, which is the "
+                                               "population this figure answers for)",
+                       basis=basis, window=window, limitations=tuple(limits)),
                 tuple(sorted(rejected)), tuple(holds))
     return (Figure(value=confirmed, unit=RECORDS, exactness=LOWER_BOUND, axis=AXIS_SOURCE,
                    subject=subject, population=population, basis=basis, window=window,
@@ -1165,6 +1258,42 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
 # ---------------------------------------------------------------------------------------------
 # axis E -- separately labelled holds
 # ---------------------------------------------------------------------------------------------
+
+def _demote_while_moving(holds: tuple, unstable: bool) -> tuple:
+    """The **one** place concurrency demotes an uncertainty figure (Rule T-3).
+
+    Finding N-1. This rule used to live inside :func:`_uncertainty`'s ``inv_figure`` builder, which
+    meant it protected exactly the holds that happened to be built there. The four figures bucket E
+    gained with the F-1 fix are built elsewhere -- an unjoinable recorded source path, an unresolved
+    supplied verdict, a record with no matching verdict, and rejected verdict evidence -- so all
+    four were constructed ``EXACT`` and reached the headline untouched. Measured on a folder with
+    ``vanished=('x.json',)``: D, F, G and all five inventory-derived holds were correctly
+    ``LOWER_BOUND``, while the source hold stayed ``EXACT`` and ``_uncertainty``'s
+    single-contributor passthrough copied that into ``E uncertain: 1 records (exact)`` with
+    :attr:`Figure.publishable_as_total` **True** -- three lines from the report's own "every
+    record-level figure here is a floor" caveat.
+
+    So the rule is applied to the **assembled list** rather than to each producer. That is the
+    point: a hold added later cannot bypass a rule that runs over all of them, and there is one
+    wording for the limitation instead of one per builder.
+
+    Two things are deliberately left alone. A figure that is already a floor keeps its own
+    exactness and its own reason -- it is not re-demoted and not relabelled. And a **withheld**
+    figure stays withheld: it carries no number, so there is nothing to demote, and overwriting its
+    ``NOT_ASSESSED`` would break :attr:`Figure.consistent`.
+    """
+    if not unstable:
+        return tuple(holds)
+    out: list = []
+    for label, fig in holds:
+        if fig.value is None or fig.exactness != EXACT:
+            out.append((label, fig))
+            continue
+        limits = (fig.limitations if CONCURRENCY_LIMITATION in fig.limitations
+                  else fig.limitations + (CONCURRENCY_LIMITATION,))
+        out.append((label, replace(fig, exactness=LOWER_BOUND, limitations=limits)))
+    return tuple(out)
+
 
 def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=()) -> tuple:
     """``(headline, observations)``. Separate labels, separate units, deliberately no sum.
@@ -1184,20 +1313,18 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
     """
     out: list = []
     inv_subject = _inventory_subject(inv) if inv is not None else subject
-    loc_subject = _location_subject(obs.location) if obs.location is not None else subject
     inv_unstable = bool(getattr(inv, "unstable", False)) if inv is not None else False
 
     def add(label, figure):
         out.append((label, figure))
 
     def inv_figure(value, unit, basis, population, notes=()):
-        """An inventory-derived count, demoted when the folder moved under the pass (Rule T-3)."""
-        if inv_unstable:
-            return Figure(value=value, unit=unit, exactness=LOWER_BOUND, axis=AXIS_UNCERTAIN,
-                          subject=inv_subject, population=population, basis=basis, window=window,
-                          limitations=("the folder changed while it was being read, so this counts "
-                                       "only what this pass examined",),
-                          notes=tuple(notes))
+        """An inventory-derived count, carrying the inventory's own folder as its subject.
+
+        It builds the figure at face value and does **not** decide the concurrency question:
+        :func:`_demote_while_moving` does that for every hold at once, which is what finding N-1
+        was about. Deciding it here protected only the holds built by this one helper.
+        """
         return Figure(value=value, unit=unit, exactness=EXACT, axis=AXIS_UNCERTAIN,
                       subject=inv_subject, population=population, basis=basis, window=window,
                       notes=tuple(notes))
@@ -1260,24 +1387,60 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
         shared = getattr(obs.location, "shared", None)
         verdict = str(getattr(shared, "verdict", "") or "")
         if verdict in (ROOT_UNREACHABLE, ACCESS_DENIED, UNKNOWN):
+            # Findings N-3 and N-4: this hold is about the **configured shared** folder, so it
+            # names that folder and carries A4's own observation time -- not the selected folder,
+            # which in the fallback case is the healthy one, and not A3's record-pass window.
+            loc_window = _location_window(obs.location)
             add(f"uncertain: the configured shared folder reported {verdict}",
                 withheld(f"A1's verdict for the configured shared folder was {verdict}, so its "
                          f"contents were not established", unit=RECORDS, axis=AXIS_UNCERTAIN,
-                         subject=loc_subject, basis="CacheLocationReport.shared.verdict",
-                         window=window))
+                         subject=_configured_subject(obs.location),
+                         basis="CacheLocationReport.shared.verdict", window=loc_window,
+                         notes=(() if any(loc_window) else
+                                ("A4 supplied no observation time, so this hold carries none "
+                                 "rather than borrowing another input's",))))
 
     if rejected:
+        # Finding N-2. `len(rejected)` counts supplied verdict OBJECTS. Two rejected verdicts can
+        # name one path, and a rejected path need not be a record in this folder at all, so this
+        # is not a count of records and is not published as one. A5 cannot derive a unique record
+        # population from it either -- deduplicating by path would still be counting paths it
+        # cannot place in the inventory -- so the honest figure is the evidence-object count, in
+        # its own unit, on its own line.
         add("uncertain: supplied source verdicts rejected as evidence",
-            Figure(value=len(rejected), unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
-                   subject=inv_subject, population="verdicts supplied to this report",
+            Figure(value=len(rejected), unit=VERDICTS, exactness=EXACT, axis=AXIS_UNCERTAIN,
+                   subject=inv_subject,
+                   population="supplied verdict objects that A5 refused as evidence; not a count "
+                              "of distinct cache records, and not necessarily records of this "
+                              "folder at all",
                    basis="A5 rejection of unusable source verdicts", window=window,
                    notes=tuple(f"{why}: {what}" for why, what in rejected)[:8]))
 
+    # Rule T-3, enforced once over every hold rather than per producer (finding N-1). This runs
+    # before the headline is chosen, so the single-contributor passthrough below cannot copy an
+    # exactness the folder's own instability has already forfeited.
+    out = list(_demote_while_moving(tuple(out), inv_unstable))
+
+    # Finding N-2. An evidence-object hold is a fact about the inputs, not about the folder, so it
+    # is never a candidate for the record-unit headline. If it is the only positive observation the
+    # headline is **withheld** rather than supplied: E would otherwise publish a count of supplied
+    # verdicts as an exact number of this folder's records. The hold itself stays on its own line
+    # with its own unit, so refusing the aggregate costs no evidence.
+    evidence = [(label, fig) for label, fig in out
+                if fig.unit == VERDICTS and fig.value is not None and fig.value > 0]
     contributing = [(label, fig) for label, fig in out
-                    if fig.value is not None and fig.value > 0]
+                    if fig.unit in CONTENT_UNITS and fig.value is not None and fig.value > 0]
     any_withheld = any(fig.value is None for _label, fig in out)
 
-    if len(contributing) == 1 and not any_withheld:
+    if evidence:
+        headline = withheld(
+            "uncertain, but not countable: rejected verdict evidence counts supplied objects, not "
+            "records in this folder, so it is reported on its own line and never becomes a record "
+            "total",
+            unit=RECORDS, axis=AXIS_UNCERTAIN, subject=subject,
+            basis="A5 uncertainty observations", window=window,
+            notes=tuple(label for label, _f in out)[:12])
+    elif len(contributing) == 1 and not any_withheld:
         label, fig = contributing[0]
         headline = replace(fig, notes=fig.notes + (f"the only uncertainty observed: {label}",))
     elif not contributing and not any_withheld and not inv_unstable:
@@ -1613,7 +1776,8 @@ def report_lines(buckets) -> list[str]:
 __all__ = [
     "AXES", "AXIS_CONTRACT", "AXIS_COST", "AXIS_SCOPE", "AXIS_SOURCE", "AXIS_TOTAL",
     "AXIS_UNCERTAIN",
-    "BYTES", "ENTRIES", "RECORDS", "UNITS",
+    "BYTES", "CONTENT_UNITS", "ENTRIES", "RECORDS", "UNITS", "VERDICTS",
+    "CONCURRENCY_LIMITATION",
     "EMPTY_OR_UNREADABLE", "EXACT", "EXACTNESS", "LOWER_BOUND", "NOT_ASSESSED",
     "OBSERVED_PARTIAL", "PUBLISHABLE",
     "IDENTITY_LEXICAL", "IDENTITY_NONE", "IDENTITY_PROVENANCE",

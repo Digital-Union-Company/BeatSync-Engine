@@ -1228,6 +1228,15 @@ def test_f3_record_axes_name_the_inventorys_folder_even_when_identities_agree():
 
 
 def test_f3_an_a4_only_hold_names_the_a4_location():
+    """An A4-derived hold names an A4 folder -- and, per N-3, the **right** one.
+
+    This assertion previously pinned the defect. It required the hold to name
+    ``normcase(normpath(LOCAL))``, A4's *selected* folder, which in exactly this fixture is the
+    healthy local fallback: sharing was configured, ``SharedCache`` came back ``ROOT_UNREACHABLE``,
+    and A4 selected ``LOCAL``. The report therefore announced that the configured shared folder was
+    unreachable and named the one folder that demonstrably was not. The subject must be the folder
+    the hold is about.
+    """
     b = report(location=loc(shared=state(lcl.ROLE_SHARED, CACHE,
                                          verdict_=lib.ROOT_UNREACHABLE, observed=False,
                                          inspectable=False),
@@ -1236,7 +1245,11 @@ def test_f3_an_a4_only_hold_names_the_a4_location():
     shared_holds = [f for label, f in b.uncertain_observations
                     if f.basis == "CacheLocationReport.shared.verdict"]
     assert shared_holds, "the unreachable shared folder must raise a hold"
-    assert shared_holds[0].subject == os.path.normcase(os.path.normpath(LOCAL))
+    assert shared_holds[0].subject == CACHE_KEY, "the hold named a folder it is not about"
+    assert shared_holds[0].subject != os.path.normcase(os.path.normpath(LOCAL))
+    # and A4 still identifies both folders, so nothing was lost by correcting the subject
+    assert b.identity.path_as_configured == CACHE
+    assert b.identity.path_as_selected == LOCAL
 
 
 # ---------------------------------------------------------------------------------- F-4
@@ -1737,9 +1750,508 @@ def test_every_mutation_control_is_accounted_for():
     this_module = sys.modules[__name__]
     controls = [name for name in dir(this_module)
                 if name.startswith("test_mutant_") and callable(getattr(this_module, name))]
-    assert len(controls) == 19, f"expected 19 mutation controls, found {len(controls)}: {controls}"
+    assert len(controls) == 24, f"expected 24 mutation controls, found {len(controls)}: {controls}"
     for name in controls:
         source = inspect.getsource(getattr(this_module, name))
         assert "_mutant(" in source, f"{name} does not build a mutant"
         assert "the mutation did not apply" in source, \
             f"{name} has no guard proving its anchor applied"
+
+
+# =============================================================================================
+# H. N-1 .. N-5: the instability rule applies to EVERY hold, and every figure's unit, subject
+#    and observation time belongs to the thing it describes
+#
+# Why the previous F-8 fixtures could not see N-1: `test_f8_an_unstable_inventory_never_publishes_
+# an_exact_uncertainty` gives every record a PRESENT verdict, so no source hold fires at all, and
+# its per-hold loop then filters on `basis.startswith("RecordInventory")` -- which the unresolved
+# and rejected holds do not satisfy. Each fixture below makes exactly ONE source hold fire, and
+# asserts the hold itself as well as the headline.
+# =============================================================================================
+
+REL_SOURCE = os.path.join("..", "elsewhere", "rel.mp4")
+OUTSIDE = os.path.join(LIBRARY, "not-a-record-here.mp4")
+OUTSIDE2 = os.path.join(LIBRARY, "also-not-a-record.mp4")
+
+#: The four producers bucket E gained with the F-1 fix, each with a fixture that fires only it.
+#: ``headline_passthrough`` is False for the rejected-evidence producer because N-2 keeps an
+#: evidence-object count out of the record-unit headline entirely.
+N1_PRODUCERS = (
+    ("unresolved supplied verdict",
+     "uncertain: records whose supplied source verdict established no state",
+     lambda: dict(records=(rec("r0"),),
+                  verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.UNKNOWN)]),
+     True),
+    ("record with no matching verdict",
+     "uncertain: records with a source path but no supplied source verdict",
+     lambda: dict(records=(rec("r0"),),
+                  verdicts=[verdict(OUTSIDE, state=lib.PRESENT)]),
+     True),
+    ("unjoinable recorded source path",
+     "uncertain: records whose recorded source path A5 cannot join to a verdict",
+     lambda: dict(records=(rec("r0"), rec("r1", source=REL_SOURCE)),
+                  verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)]),
+     True),
+    ("rejected verdict evidence",
+     "uncertain: supplied source verdicts rejected as evidence",
+     lambda: dict(records=(rec("r0"),),
+                  verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), all_four=False)]),
+     False),
+)
+
+
+def _n1_inv(records, **kw):
+    """A fully exact, fully assessed inventory of exactly these records."""
+    n = len(records)
+    base = dict(records=records, records_recognised=n, records_attempted=n,
+                parse_counts={lcr.PARSE_OK: n}, contract_counts={lcr.CONTRACT_CURRENT: n},
+                scope_counts={lcr.SCOPE_IN: n}, complete_counts={lcr.COMPLETE_YES: n},
+                entries_listed=n, entries_examined=n)
+    base.update(kw)
+    return inv(**base)
+
+
+def _hold(buckets, label):
+    found = [f for lab, f in buckets.uncertain_observations if lab == label]
+    assert found, (f"the fixture did not fire {label!r}; it fired "
+                   f"{[lab for lab, _f in buckets.uncertain_observations]}")
+    return found[0]
+
+
+@pytest.mark.parametrize("name,label,build,passthrough", N1_PRODUCERS)
+def test_n1_a_stable_folder_keeps_its_source_hold_exact(name, label, build, passthrough):
+    """The control. Correcting instability must not demote a settled folder's figures."""
+    spec = build()
+    b = report(location=loc(), inventory=_n1_inv(spec["records"], path=CACHE, resolved=CACHE),
+               source_verdicts=spec["verdicts"])
+    hold = _hold(b, label)
+    assert hold.value == 1
+    assert hold.exactness == a5.EXACT, f"{name}: a stable folder's hold was demoted"
+    assert not any("changed while it was being read" in item for item in hold.limitations)
+    if passthrough:
+        assert b.uncertain.value == 1 and b.uncertain.exactness == a5.EXACT
+        assert b.uncertain.publishable_as_total
+    else:
+        assert b.uncertain.value is None, "an evidence-object count is not a record headline"
+
+
+@pytest.mark.parametrize("name,label,build,passthrough", N1_PRODUCERS)
+@pytest.mark.parametrize("moving", ({"vanished": ("a.json",)}, {"changed": ("b.json",)},
+                                    {"vanished": ("a.json",), "changed": ("b.json",)}))
+def test_n1_an_unstable_folder_demotes_every_source_hold(name, label, build, passthrough, moving):
+    """N-1. Each of the four source holds, under each way A3 can report instability.
+
+    Measured before the fix: every one of these published ``EXACT``, and three of the four carried
+    that straight into ``E uncertain: 1 records (exact)`` with ``publishable_as_total`` True, on a
+    page that also said every record-level figure here is a floor.
+    """
+    spec = build()
+    inventory = _n1_inv(spec["records"], path=CACHE, resolved=CACHE, **moving)
+    assert inventory.unstable is True, "fixture misbuilt: the folder must be moving"
+    b = report(location=loc(), inventory=inventory, source_verdicts=spec["verdicts"])
+
+    hold = _hold(b, label)
+    assert hold.value == 1, f"{name}: fixture misbuilt"
+    assert hold.exactness == a5.LOWER_BOUND, f"{name}: the hold stayed exact while moving"
+    assert not hold.publishable_as_total
+    assert a5.CONCURRENCY_LIMITATION in hold.limitations, \
+        f"{name}: the hold was demoted without saying why"
+
+    # the headline, which is what a consumer reads first
+    assert b.uncertain.exactness != a5.EXACT, f"{name}: E claimed an exact folder-wide figure"
+    assert not b.uncertain.publishable_as_total, f"{name}: E was certified as a total"
+    assert any("changed while it was being read" in item for item in b.caveats)
+
+    # and no OTHER hold quietly kept its exactness either -- one corrected headline must not hide
+    # a still-exact individual figure
+    for lab, figure in b.uncertain_observations:
+        if figure.value is not None:
+            assert figure.exactness != a5.EXACT, f"{lab} stayed exact while the folder moved"
+
+    # the rendered text must not offer an exact number anywhere in the uncertainty block
+    for line in lines_for(b):
+        stripped = line.strip()
+        if stripped.startswith("E "):
+            assert "(exact)" not in stripped, f"an exact uncertainty line survived: {line}"
+
+
+def test_n1_a_withheld_source_hold_stays_withheld_while_moving():
+    """A withheld figure carries no number, so there is nothing to demote and no reason to relabel.
+
+    `Figure.consistent` requires ``value is None`` exactly when ``NOT_ASSESSED``, so a demotion
+    that overwrote the exactness of a withheld hold would break the module's core invariant.
+    """
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"),), vanished=("a.json",)))
+    withheld_holds = [(lab, f) for lab, f in b.uncertain_observations if f.value is None]
+    assert withheld_holds, "fixture misbuilt: no verdicts were supplied, so a hold must be withheld"
+    for lab, figure in withheld_holds:
+        assert figure.exactness == a5.NOT_ASSESSED, f"{lab} lost its withheld state"
+        assert figure.consistent
+        assert figure.withheld_reason
+
+
+def test_n1_the_demotion_is_enforced_at_one_point_over_the_assembled_list():
+    """A structural guard: the rule must not go back to living inside one producer.
+
+    If a future hold is added anywhere in `_uncertainty` and the demotion has drifted back into a
+    per-builder branch, this fails -- `_demote_while_moving` must be called, and called once.
+    """
+    with open(_A5, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert source.count("def _demote_while_moving(") == 1
+    assert source.count("_demote_while_moving(tuple(out), inv_unstable)") == 1, \
+        "the central demotion is not applied exactly once over the assembled hold list"
+    tree = ast.parse(source)
+    uncertainty = [n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_uncertainty"]
+    assert len(uncertainty) == 1
+    inner = [n.name for n in ast.walk(uncertainty[0]) if isinstance(n, ast.FunctionDef)]
+    assert "inv_figure" in inner
+    # the inventory builder must no longer decide the concurrency question for itself
+    builder = [n for n in ast.walk(uncertainty[0])
+               if isinstance(n, ast.FunctionDef) and n.name == "inv_figure"][0]
+    assert "inv_unstable" not in ast.dump(builder), \
+        "inv_figure decides instability again, so a hold built elsewhere can bypass the rule"
+
+
+# ------------------------------------------------------------------------------------ N-2
+
+def _rejected_hold(buckets):
+    return _hold(buckets, "uncertain: supplied source verdicts rejected as evidence")
+
+
+@pytest.mark.parametrize("moving", ({}, {"vanished": ("a.json",)}))
+def test_n2_two_rejected_verdicts_for_one_path_are_not_two_records(moving):
+    """N-2. Two refused verdict objects naming ONE path that is not a record of this folder."""
+    bad = [verdict(OUTSIDE, root_key=os.path.normcase(os.path.normpath(OTHER))) for _ in range(2)]
+    b = report(location=loc(),
+               inventory=_n1_inv((rec("r0"),), **moving),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)] + bad)
+    hold = _rejected_hold(b)
+    assert hold.value == 2, "both refused verdict objects must stay visible"
+    assert hold.unit == a5.VERDICTS, "an evidence-object count was published in a record unit"
+    assert hold.unit != a5.RECORDS
+    assert "not a count of distinct cache records" in hold.population
+    # the headline must not become a record total built from evidence objects
+    assert b.uncertain.value is None
+    assert b.uncertain.exactness == a5.NOT_ASSESSED
+    assert not b.uncertain.publishable_as_total
+    assert "counts supplied objects" in b.uncertain.withheld_reason
+    for line in lines_for(b):
+        assert "2 records (exact)" not in line, f"verdict objects were printed as records: {line}"
+
+
+def test_n2_four_rejected_verdicts_over_two_paths():
+    bad = []
+    for path in (OUTSIDE, OUTSIDE2):
+        bad += [verdict(path, root_key=os.path.normcase(os.path.normpath(OTHER)))
+                for _ in range(2)]
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"),)),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)] + bad)
+    hold = _rejected_hold(b)
+    assert hold.value == 4 and hold.unit == a5.VERDICTS
+    assert b.uncertain.value is None, "four objects over two paths is still not a record count"
+    for line in lines_for(b):
+        assert "4 records" not in line
+
+
+def test_n2_a_rejected_path_absent_from_every_record_is_never_a_record_count():
+    """The rejected path is not among the inventory's records at all, so no record population
+    exists for it -- and A5 must not invent one by deduplicating paths it cannot place."""
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"),)),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT),
+                                verdict(OUTSIDE, root_key=os.path.normcase(
+                                    os.path.normpath(OTHER)))])
+    recorded = {r.source_path for r in _n1_inv((rec("r0"),)).records}
+    assert OUTSIDE not in recorded, "fixture misbuilt"
+    hold = _rejected_hold(b)
+    assert hold.value == 1 and hold.unit == a5.VERDICTS
+    assert b.uncertain.value is None
+
+
+@pytest.mark.parametrize("moving", ({}, {"vanished": ("a.json",)}))
+def test_n2_one_unmatched_record_plus_one_rejected_verdict_describing_it(moving):
+    """The two holds describe the same doubt in different units, so the aggregate stays withheld.
+
+    This is also the double-count check: the record counts once in the record-unit hold and its
+    verdict counts once in the evidence-unit hold, and the two are never added.
+    """
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"),), **moving),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"),
+                                        root_key=os.path.normcase(os.path.normpath(OTHER)))])
+    unmatched = _hold(b, "uncertain: records with a source path but no supplied source verdict")
+    rejected_hold = _rejected_hold(b)
+    assert unmatched.value == 1 and unmatched.unit == a5.RECORDS
+    assert rejected_hold.value == 1 and rejected_hold.unit == a5.VERDICTS
+    assert b.uncertain.value is None, "two units were collapsed into one number"
+    assert not b.uncertain.publishable_as_total
+    if moving:
+        assert rejected_hold.exactness == a5.LOWER_BOUND
+        assert unmatched.exactness == a5.LOWER_BOUND
+
+
+def test_n2_the_evidence_unit_is_a_declared_unit_and_not_a_content_unit():
+    assert a5.VERDICTS in a5.UNITS
+    assert a5.VERDICTS not in a5.CONTENT_UNITS
+    assert set(a5.CONTENT_UNITS) == {a5.BYTES, a5.RECORDS, a5.ENTRIES}
+
+
+# ------------------------------------------------------------------------------------ N-3 / N-4
+
+#: Deliberately distinct per input, so a borrowed window cannot pass by coincidence.
+A4_STAMP = "A4-OBSERVED"
+A3_FROM, A3_TO = "A3-FROM", "A3-TO"
+FLAT_STAMP = "FLAT-OBSERVED"
+CAT_STAMP = "CAT-OBSERVED"
+
+
+def _fallback_location(shared_verdict, **kw):
+    base = dict(configured_shared=CACHE, selected_path=LOCAL, fallback=True, observed_at=A4_STAMP,
+                selected=state(lcl.ROLE_LOCAL, LOCAL),
+                shared=state(lcl.ROLE_SHARED, CACHE, verdict_=shared_verdict, observed=False,
+                             inspectable=False))
+    base.update(kw)
+    return loc(**base)
+
+
+@pytest.mark.parametrize("shared_verdict", (lib.ROOT_UNREACHABLE, lib.ACCESS_DENIED, lib.UNKNOWN))
+def test_n3_the_shared_hold_names_the_configured_shared_folder(shared_verdict):
+    """N-3, for all three triggering states. The selected folder is healthy and must not be named."""
+    b = report(location=_fallback_location(shared_verdict),
+               inventory=inv(path=LOCAL, resolved=LOCAL, observed_from=A3_FROM, observed_to=A3_TO))
+    hold = _hold(b, f"uncertain: the configured shared folder reported {shared_verdict}")
+    assert hold.subject == CACHE_KEY, "the hold named a folder it is not about"
+    assert hold.subject != os.path.normcase(os.path.normpath(LOCAL))
+    assert hold.value is None and hold.exactness == a5.NOT_ASSESSED
+    # N-4: A4's own time, not A3's record-pass window
+    assert hold.window == (A4_STAMP, A4_STAMP), f"the hold borrowed a window: {hold.window}"
+    assert A3_FROM not in hold.window and A3_TO not in hold.window
+
+
+def test_n3_a_blank_configured_path_reports_no_folder_rather_than_the_selected_one():
+    b = report(location=_fallback_location(lib.ROOT_UNREACHABLE, configured_shared=""),
+               inventory=inv(path=LOCAL, resolved=LOCAL))
+    hold = _hold(b, f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}")
+    assert hold.subject == "an unestablished folder"
+    assert hold.subject != os.path.normcase(os.path.normpath(LOCAL))
+
+
+def test_n3_a_relative_configured_path_reports_no_folder():
+    b = report(location=_fallback_location(lib.ROOT_UNREACHABLE,
+                                           configured_shared=os.path.join("..", "rel", "cache")),
+               inventory=inv(path=LOCAL, resolved=LOCAL))
+    hold = _hold(b, f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}")
+    assert hold.subject == "an unestablished folder", "a relative path was resolved into a subject"
+
+
+def test_n4_every_figure_carries_its_own_inputs_observation_time():
+    """One report, four distinct supplied timestamps, each landing only where it belongs."""
+    b = report(location=_fallback_location(lib.ROOT_UNREACHABLE),
+               inventory=inv(path=LOCAL, resolved=LOCAL, observed_from=A3_FROM, observed_to=A3_TO,
+                             entries_unclassified=2),
+               flat_measurement=flat(path=LOCAL), observed_at=FLAT_STAMP,
+               categories=[catobs(ca.POSTERS, os.path.join(BASE, "posters"), at=CAT_STAMP,
+                                  storage="vol-1")])
+    shared = _hold(b, f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}")
+    assert shared.window == (A4_STAMP, A4_STAMP)
+
+    a3_holds = [f for _l, f in b.uncertain_observations
+                if f.basis.startswith("RecordInventory")]
+    assert a3_holds, "fixture misbuilt"
+    for figure in a3_holds:
+        assert figure.window == (A3_FROM, A3_TO), "an A3 hold lost its own window"
+
+    flat_figures = [f for name, f in b.measurements if name == "analysis_cache.measure"]
+    assert flat_figures and flat_figures[0].window == (FLAT_STAMP, FLAT_STAMP)
+    assert [f.window for _k, f in b.cheap] == [(CAT_STAMP, CAT_STAMP)]
+
+
+def test_n4_a4_without_a_timestamp_carries_none_and_says_so():
+    b = report(location=_fallback_location(lib.ROOT_UNREACHABLE, observed_at=""),
+               inventory=inv(path=LOCAL, resolved=LOCAL, observed_from=A3_FROM, observed_to=A3_TO))
+    hold = _hold(b, f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}")
+    assert hold.window == ("", ""), "an absent A4 time was filled in from somewhere else"
+    assert any("supplied no observation time" in note for note in hold.notes)
+    assert not any("observed:" in line for line in lines_for(b)
+                   if "configured shared folder" in line)
+
+
+# ------------------------------------------------------------------------------------ N-5
+
+def test_n5_the_two_refusal_counts_are_named_for_different_questions():
+    """N-5. One figure printed "refused as evidence 0" and "1 ... rejected as evidence"."""
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"),)),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"),
+                                        root_key=os.path.normcase(os.path.normpath(OTHER)))])
+    d = b.confirmed_missing
+    assert "refused as evidence 0" not in d.population, "the ambiguous phrasing survived"
+    assert "matched verdicts refused for missing clause evidence 0" in d.population
+    assert "supplied verdict objects rejected before matching 1" in d.population
+    joined = " | ".join(d.limitations)
+    assert "1 supplied verdict objects were rejected as evidence" in joined
+    assert "0 matched a record but carried no finalised clause evidence" in joined
+    assert "1 were rejected before any record was matched" in joined
+
+
+def test_n5_a_clause_evidence_refusal_is_counted_separately_from_a_pre_match_rejection():
+    """Both kinds in one report, each under its own name."""
+    b = report(location=loc(), inventory=_n1_inv((rec("r0"), rec("r1"))),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), all_four=False),
+                                verdict(OUTSIDE, root_key=os.path.normcase(
+                                    os.path.normpath(OTHER)))])
+    d = b.confirmed_missing
+    assert "matched verdicts refused for missing clause evidence 1" in d.population
+    assert "supplied verdict objects rejected before matching 1" in d.population
+    assert _rejected_hold(b).value == 2, "both rejections stay visible as evidence objects"
+
+
+def test_n5_d_still_reports_the_same_value_and_exactness():
+    """The wording changed; the figure did not."""
+    records = tuple(rec("r%d" % i) for i in range(3))
+    verdicts = [verdict(r.source_path) for r in records[:2]] \
+        + [verdict(records[2].source_path, state=lib.PRESENT)]
+    b = report(location=loc(), inventory=_n1_inv(records), source_verdicts=verdicts)
+    assert b.confirmed_missing.value == 2
+    assert b.confirmed_missing.exactness == a5.EXACT
+
+
+# ------------------------------------------------------------------------------------ N-6
+
+def test_n6_d_names_the_population_it_covers_and_discloses_the_unparsed_remainder():
+    """The N-6 disposition, asserted: D stays exact for its own population and says which one.
+
+    `parsed=1, recognised=4`. F and G are floors because A3's counters answer for parsed records
+    and three were never parsed. D stays exact because an unparsed record has no readable payload
+    and therefore no `source_path` -- it is outside D's population rather than missing from it --
+    and the figure now says so on its own line instead of claiming bare "complete coverage".
+    """
+    b = report(location=loc(),
+               inventory=inv(records=(rec("r0"),), records_recognised=4, records_attempted=4,
+                             parse_counts={lcr.PARSE_OK: 1},
+                             contract_counts={lcr.CONTRACT_CURRENT: 1},
+                             scope_counts={lcr.SCOPE_IN: 1},
+                             complete_counts={lcr.COMPLETE_YES: 1},
+                             entries_listed=4, entries_examined=4),
+               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"))])
+    d = b.confirmed_missing
+    assert d.value == 1 and d.exactness == a5.EXACT, "the disposition keeps D's figure unchanged"
+    assert "complete coverage of the records whose source state could be established" in \
+        d.population
+    assert "parsed 1, recognised 4" in d.population
+    assert any("3 recognised records were never parsed" in item for item in d.limitations), \
+        "an exact D did not disclose the population it never saw"
+    # the sibling axes are floors for the same inventory, which is the distinction being documented
+    assert b.other_configuration.exactness == a5.LOWER_BOUND
+    assert b.out_of_scope.exactness == a5.LOWER_BOUND
+
+
+# ------------------------------------------------------------------------------------ N-7
+
+def test_n7_identical_signatures_with_different_unmet_clauses_publish_the_same_figures():
+    """The N-7 disposition: only the quoted explanation varies, never a published figure."""
+    first = lib.LeafVerdict(path=os.path.join(LIBRARY, "r0.mp4"), verdict=lib.MISSING_CONFIRMED,
+                            clauses=lib.Clauses(parent_listed=True), root_key=ROOT_KEY,
+                            is_final=True)
+    second = lib.LeafVerdict(path=os.path.join(LIBRARY, "r0.mp4"), verdict=lib.MISSING_CONFIRMED,
+                             clauses=lib.Clauses(name_absent=True), root_key=ROOT_KEY,
+                             is_final=True)
+    assert a5._source_signature(first) == a5._source_signature(second), "fixture misbuilt"
+    shapes = []
+    for order in ((first, second), (second, first)):
+        b = report(location=loc(), inventory=_n1_inv((rec("r0"),)), source_verdicts=list(order))
+        hold = _rejected_hold(b)
+        shapes.append((b.confirmed_missing.value, b.confirmed_missing.exactness,
+                       b.confirmed_missing.population, hold.value, hold.unit, hold.exactness,
+                       hold.subject, b.uncertain.value, b.uncertain.exactness))
+    assert shapes[0] == shapes[1], "a published figure depended on the supplied order"
+
+
+# =============================================================================================
+# I. mutation controls for N-1 .. N-4. Anchors are distinct from every anchor in sections E and G.
+# =============================================================================================
+
+def test_mutant_demoting_only_the_inventory_built_holds_is_caught():
+    """N-1: the pre-fix architecture, where only `inv_figure`'s own holds were demoted.
+
+    The discriminating hold is the unresolved-verdict one: its basis names `library_inventory`, so
+    a demotion restricted to `RecordInventory`-based figures skips exactly it -- which is how the
+    defect survived a suite that looped over `basis.startswith("RecordInventory")`.
+    """
+    kw = dict(location=loc(),
+              inventory=_n1_inv((rec("r0"),), vanished=("a.json",)),
+              source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.UNKNOWN)])
+    label = "uncertain: records whose supplied source verdict established no state"
+    weak = _mutant(("        if fig.value is None or fig.exactness != EXACT:",
+                    "        if fig.value is None or fig.exactness != EXACT or not "
+                    "fig.basis.startswith(\"RecordInventory\"):"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations if lab == label][0]
+    assert mutated_hold.exactness == weak.EXACT, "the mutation did not apply"
+    assert mutated.uncertain.exactness == weak.EXACT
+    real = report(**kw)
+    assert _hold(real, label).exactness == a5.LOWER_BOUND
+    assert real.uncertain.exactness == a5.LOWER_BOUND
+    assert not real.uncertain.publishable_as_total
+
+
+def test_mutant_labelling_rejected_evidence_objects_as_records_is_caught():
+    """N-2: the evidence-object count goes back into the records unit."""
+    kw = dict(location=loc(), inventory=_n1_inv((rec("r0"),)),
+              source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)]
+                              + [verdict(OUTSIDE, root_key=os.path.normcase(
+                                  os.path.normpath(OTHER))) for _ in range(2)])
+    weak = _mutant(("            Figure(value=len(rejected), unit=VERDICTS, exactness=EXACT, "
+                    "axis=AXIS_UNCERTAIN,",
+                    "            Figure(value=len(rejected), unit=RECORDS, exactness=EXACT, "
+                    "axis=AXIS_UNCERTAIN,"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations
+                    if "rejected as evidence" in lab][0]
+    assert mutated_hold.unit == weak.RECORDS, "the mutation did not apply"
+    assert mutated.uncertain.value == 2, "the mutant must publish the object count as records"
+    real = report(**kw)
+    assert _rejected_hold(real).unit == a5.VERDICTS
+    assert real.uncertain.value is None
+
+
+def test_mutant_promoting_rejected_evidence_into_the_headline_is_caught():
+    """N-2: the evidence hold becomes eligible for the record-unit headline again."""
+    kw = dict(location=loc(), inventory=_n1_inv((rec("r0"),)),
+              source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)]
+                              + [verdict(OUTSIDE, root_key=os.path.normcase(
+                                  os.path.normpath(OTHER))) for _ in range(2)])
+    weak = _mutant(("    if evidence:", "    if False:"),
+                   ("                    if fig.unit in CONTENT_UNITS and fig.value is not None "
+                    "and fig.value > 0]",
+                    "                    if fig.value is not None and fig.value > 0]"))
+    mutated = _run(weak, **kw).uncertain
+    assert mutated.value == 2 and mutated.exactness == weak.EXACT, "the mutation did not apply"
+    real = report(**kw).uncertain
+    assert real.value is None and real.exactness == a5.NOT_ASSESSED
+
+
+def test_mutant_attributing_the_shared_hold_to_the_selected_folder_is_caught():
+    """N-3: the hold goes back to naming A4's selected folder."""
+    kw = dict(location=_fallback_location(lib.ROOT_UNREACHABLE),
+              inventory=inv(path=LOCAL, resolved=LOCAL))
+    label = f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}"
+    weak = _mutant(("                         subject=_configured_subject(obs.location),",
+                    "                         subject=_location_subject(obs.location),"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations if lab == label][0]
+    assert mutated_hold.subject == os.path.normcase(os.path.normpath(LOCAL)), \
+        "the mutation did not apply"
+    assert _hold(report(**kw), label).subject == CACHE_KEY
+
+
+def test_mutant_making_the_a4_hold_inherit_a3s_window_is_caught():
+    """N-4: the A4-derived hold goes back to borrowing A3's record-pass window."""
+    kw = dict(location=_fallback_location(lib.ROOT_UNREACHABLE),
+              inventory=inv(path=LOCAL, resolved=LOCAL, observed_from=A3_FROM, observed_to=A3_TO))
+    label = f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}"
+    weak = _mutant(("            loc_window = _location_window(obs.location)",
+                    "            loc_window = window"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations if lab == label][0]
+    assert mutated_hold.window == (A3_FROM, A3_TO), "the mutation did not apply"
+    assert _hold(report(**kw), label).window == (A4_STAMP, A4_STAMP)
