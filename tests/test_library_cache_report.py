@@ -3362,13 +3362,14 @@ def test_mutant_dropping_the_floor_note_from_the_population_is_caught():
 #     notes = <rejection notes>[:8] + (REFUSAL_FLOOR_NOTE if join_incomplete else ())
 #
 # is correct, and the review proved it was also undefended. Moving the `[:8]` to after the
-# concatenation survives every one of the 278 tests this file held before this section -- measured
-# here, not taken on trust -- yet at eight or more distinct rejection groups on an incomplete join
-# it pushes the floor explanation off the end, so the hold publishes a floor while no longer saying
-# why. That is the X2-1 failure mode in the one field X2-1's own matrix never sized. Reproduced
-# independently before this section was written, with a changed Git blob: at 8, 9 and 12 genuinely
-# distinct groups the real module renders nine notes including the floor and the mutant renders
-# eight without it, in `Figure.notes` AND in `report_lines`.
+# concatenation survived every one of the 277 tests the mutant run selected out of the 278 this
+# file held before this section -- measured, not taken on trust; the 278th censuses this test
+# module, not the source, so it was deselected -- yet at eight or more distinct rejection groups on
+# an incomplete join it pushes the floor explanation off the end, so the hold publishes a floor
+# while no longer saying why. That is the X2-1 failure mode in the one field X2-1's own matrix
+# never sized. Reproduced independently before this section was written, with a changed Git blob:
+# at 8, 9 and 12 genuinely distinct groups the real module renders nine notes including the floor
+# and the mutant renders eight without it, in `Figure.notes` AND in `report_lines`.
 #
 # Eight is the boundary, measured, not nine: at exactly eight groups the cap is already full, so the
 # post-concatenation slice evicts the floor note. The fixtures below therefore start at eight.
