@@ -3362,7 +3362,7 @@ def test_mutant_dropping_the_floor_note_from_the_population_is_caught():
 #     notes = <rejection notes>[:8] + (REFUSAL_FLOOR_NOTE if join_incomplete else ())
 #
 # is correct, and the review proved it was also undefended. Moving the `[:8]` to after the
-# concatenation survives every one of the 277 tests this file held before this section -- measured
+# concatenation survives every one of the 278 tests this file held before this section -- measured
 # here, not taken on trust -- yet at eight or more distinct rejection groups on an incomplete join
 # it pushes the floor explanation off the end, so the hold publishes a floor while no longer saying
 # why. That is the X2-1 failure mode in the one field X2-1's own matrix never sized. Reproduced
