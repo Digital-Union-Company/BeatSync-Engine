@@ -1750,7 +1750,7 @@ def test_every_mutation_control_is_accounted_for():
     this_module = sys.modules[__name__]
     controls = [name for name in dir(this_module)
                 if name.startswith("test_mutant_") and callable(getattr(this_module, name))]
-    assert len(controls) == 24, f"expected 24 mutation controls, found {len(controls)}: {controls}"
+    assert len(controls) == 28, f"expected 28 mutation controls, found {len(controls)}: {controls}"
     for name in controls:
         source = inspect.getsource(getattr(this_module, name))
         assert "_mutant(" in source, f"{name} does not build a mutant"
@@ -2085,7 +2085,11 @@ def test_n5_the_two_refusal_counts_are_named_for_different_questions():
                                         root_key=os.path.normcase(os.path.normpath(OTHER)))])
     d = b.confirmed_missing
     assert "refused as evidence 0" not in d.population, "the ambiguous phrasing survived"
-    assert "matched verdicts refused for missing clause evidence 0" in d.population
+    # N-8 corrected this noun. The figure counts matched verdict OBJECTS, and calling them
+    # "matched verdicts" left it indistinguishable from the record-level refusal count printed
+    # beside it -- which is the separate number the next assertion pins.
+    assert "matched verdict objects refused for missing clause evidence 0" in d.population
+    assert "record-level refusals of those objects 0" in d.population
     assert "supplied verdict objects rejected before matching 1" in d.population
     joined = " | ".join(d.limitations)
     assert "1 supplied verdict objects were rejected as evidence" in joined
@@ -2100,7 +2104,8 @@ def test_n5_a_clause_evidence_refusal_is_counted_separately_from_a_pre_match_rej
                                 verdict(OUTSIDE, root_key=os.path.normcase(
                                     os.path.normpath(OTHER)))])
     d = b.confirmed_missing
-    assert "matched verdicts refused for missing clause evidence 1" in d.population
+    assert "matched verdict objects refused for missing clause evidence 1" in d.population
+    assert "record-level refusals of those objects 1" in d.population
     assert "supplied verdict objects rejected before matching 1" in d.population
     assert _rejected_hold(b).value == 2, "both rejections stay visible as evidence objects"
 
@@ -2166,6 +2171,197 @@ def test_n7_identical_signatures_with_different_unmet_clauses_publish_the_same_f
     assert shapes[0] == shapes[1], "a published figure depended on the supplied order"
 
 
+# ------------------------------------------------------------------------------------ N-8
+
+#: A source path that several cache records legitimately share. This is the expected steady state
+#: of a versioned, never-pruned cache: the Stage-5 signature mixes eight inputs of which the path
+#: is one, so a contract bump, a Qwen settings change or a new mtime all add a record for the same
+#: video. `CacheRecord` has no uniqueness constraint on `source_path` at all.
+SHARED_SRC = os.path.join(LIBRARY, "shared-source.mp4")
+
+
+def _bad_finalisation(path=SHARED_SRC):
+    """`MISSING_CONFIRMED` without the four clauses: refused at the record join, not before it."""
+    return verdict(path, state=lib.MISSING_CONFIRMED, final=True, all_four=False)
+
+
+def _pre_match_reject(path=OUTSIDE):
+    """No root provenance: rejected before any join, so it is a pre-match object."""
+    return verdict(path, root_key="")
+
+
+def _records_sharing(path, n):
+    return tuple(lcr.CacheRecord(name="r%d" % i, size=100, parse=lcr.PARSE_OK,
+                                 contract=lcr.CONTRACT_CURRENT, scope=lcr.SCOPE_IN,
+                                 source_path=path)
+                 for i in range(n))
+
+
+#: ``(name, verdicts, records, objects, record_events, pre_match)``. The six populations R1 requires
+#: to stay distinguishable, as independent oracles. Measured against the parent commit, the
+#: published object count was wrong in **both** directions: 3 where 1 was true when a path was
+#: shared, and 1 where 2 was true when two entries shared a signature.
+_N8_SHAPES = (
+    ("one refused entry, one record", [_bad_finalisation()], 1, 1, 1, 0),
+    ("one refused entry, two records sharing its path", [_bad_finalisation()], 2, 1, 2, 0),
+    ("one refused entry, three records sharing its path", [_bad_finalisation()], 3, 1, 3, 0),
+    ("two equal-signature entries, one record",
+     [_bad_finalisation(), _bad_finalisation()], 1, 2, 1, 0),
+    ("two equal-signature entries, three records sharing the path",
+     [_bad_finalisation(), _bad_finalisation()], 3, 2, 3, 0),
+    ("one pre-match rejection plus one refused entry, two records",
+     [_pre_match_reject(), _bad_finalisation()], 2, 2, 2, 1),
+    ("one pre-match rejection plus two equal-signature entries, two records",
+     [_pre_match_reject(), _bad_finalisation(), _bad_finalisation()], 2, 3, 2, 1),
+)
+
+
+def _n8_report(verdicts, nrecords, **invkw):
+    return report(location=loc(),
+                  inventory=_n1_inv(_records_sharing(SHARED_SRC, nrecords), **invkw),
+                  source_verdicts=list(verdicts))
+
+
+@pytest.mark.parametrize("name,verdicts,nrec,objects,events,pre", _N8_SHAPES)
+@pytest.mark.parametrize("moving", ({}, {"vanished": ("a.json",)}, {"changed": ("b.json",)}))
+def test_n8_the_evidence_figure_counts_input_entries_not_records(
+        name, verdicts, nrec, objects, events, pre, moving):
+    """N-8. The published `VERDICTS` figure is the input-entry population and nothing else.
+
+    It must not be the number of cache records that matched, and it must not silently drop an
+    equal-signature successor -- the two failure directions the parent commit had at once.
+    """
+    b = _n8_report(verdicts, nrec, **moving)
+    hold = _rejected_hold(b)
+    assert hold.value == objects, (
+        f"{name}: published {hold.value} for {objects} supplied input entries "
+        f"({nrec} records, {events} record-level refusals)")
+    assert hold.unit == a5.VERDICTS
+    assert hold.value != events or objects == events, "an event count reached an object figure"
+
+
+@pytest.mark.parametrize("name,verdicts,nrec,objects,events,pre", _N8_SHAPES)
+def test_n8_d_states_objects_and_events_under_their_own_names(
+        name, verdicts, nrec, objects, events, pre):
+    """Every rendered counter identifies its own population and cannot be read as another."""
+    d = _n8_report(verdicts, nrec).confirmed_missing
+    matched = objects - pre
+    assert f"matched verdict objects refused for missing clause evidence {matched}" in d.population
+    assert f"record-level refusals of those objects {events}" in d.population
+    assert f"supplied verdict objects rejected before matching {pre}" in d.population
+    joined = " | ".join(d.limitations)
+    assert f"{objects} supplied verdict objects were rejected as evidence" in joined
+    assert f"{matched} matched a record but carried no finalised clause evidence" in joined
+    assert f"refused at record level {events} times" in joined
+    assert f"{pre} were rejected before any record was matched" in joined
+
+
+def test_n8_two_entries_over_one_record_report_no_pre_match_rejection():
+    """R1's named trap: the old `len(rejected) - refused` invented a pre-match rejection here.
+
+    Two equal-signature entries over one record is 2 objects and 1 event, and the subtraction read
+    ``2 - 1 = 1`` "rejected before any record was matched" -- a rejection that never happened.
+    """
+    d = _n8_report([_bad_finalisation(), _bad_finalisation()], 1).confirmed_missing
+    assert "supplied verdict objects rejected before matching 0" in d.population
+    assert "0 were rejected before any record was matched" in " | ".join(d.limitations)
+
+
+def test_n8_the_same_input_instance_supplied_twice_is_two_entries():
+    """Identity is not the unit: the caller handed in two entries, so two were refused.
+
+    This is also why `id(item)` cannot be the provenance key -- it would collapse to one.
+    """
+    one = _bad_finalisation()
+    b = _n8_report([one, one], 1)
+    assert _rejected_hold(b).value == 2
+
+
+def test_n8_a_shared_path_prints_one_note_that_states_its_multiplicity():
+    """The note list stopped repeating one object once per matching record.
+
+    Nine records sharing a path printed eight identical lines and hid the rest behind the cap.
+    """
+    single = _n8_report([_bad_finalisation()], 9)
+    notes = _rejected_hold(single).notes
+    assert len(notes) == 1, f"one refused entry produced {len(notes)} notes"
+    assert "supplied entries naming this path" not in notes[0], "one entry claimed multiplicity"
+
+    doubled = _n8_report([_bad_finalisation(), _bad_finalisation()], 9)
+    dnotes = _rejected_hold(doubled).notes
+    assert len(dnotes) == 1
+    assert "supplied entries naming this path: 2" in dnotes[0], \
+        "two genuinely distinct entries were grouped without exposing their multiplicity"
+
+
+def test_n8_a_rejected_path_that_is_no_record_of_this_folder_is_still_one_object():
+    """No record population exists for it, and A5 must not invent one."""
+    b = report(location=loc(), inventory=_n1_inv(_records_sharing(SHARED_SRC, 3)),
+               source_verdicts=[_pre_match_reject(OUTSIDE)])
+    assert _rejected_hold(b).value == 1
+
+
+@pytest.mark.parametrize("state_", (lib.MISSING_CONFIRMED, lib.PRESENT))
+def test_n8_an_accepted_verdict_shared_by_three_records_raises_no_hold(state_):
+    """Positive control. A finalised-with-clauses verdict and a PRESENT one each establish a
+    state, so sharing a source path across three records must produce no rejection at all."""
+    b = _n8_report([verdict(SHARED_SRC, state=state_)], 3)
+    labels = [lab for lab, _f in b.uncertain_observations]
+    assert not any("rejected as evidence" in lab for lab in labels), \
+        f"an accepted verdict produced a rejection hold: {labels}"
+    d = b.confirmed_missing
+    assert "rejected as evidence" not in " | ".join(d.limitations)
+
+
+def test_n8_the_t3_decision_is_retained_and_applies_to_the_evidence_hold():
+    """The explicit Rule T-3 disposition (R1 requirement 7): demotion is KEPT, with a reason.
+
+    `supplied_objects` is `pre_match_objects + matched_objects`, and the second addend is reached
+    through the record join -- a record a moving pass never saw could have matched and refused
+    another supplied entry. One addend is a floor, so the sum is a floor. The rule therefore needs
+    no per-unit exemption, which is what keeps N-1's single unconditional call site intact.
+    """
+    stable = _rejected_hold(_n8_report([_bad_finalisation()], 2))
+    assert stable.exactness == a5.EXACT
+    assert stable.publishable_as_total
+
+    moving = _rejected_hold(_n8_report([_bad_finalisation()], 2, vanished=("a.json",)))
+    assert moving.exactness == a5.LOWER_BOUND
+    assert not moving.publishable_as_total
+    assert a5.CONCURRENCY_LIMITATION in moving.limitations
+    assert moving.value == stable.value, "demotion changed the count as well as the exactness"
+
+
+def test_n8_the_rejection_record_never_mixes_a_count_of_records_into_a_unit():
+    """No byte, entry, record or evidence-object count is mixed on any rendered line."""
+    for _name, verdicts, nrec, objects, events, _pre in _N8_SHAPES:
+        b = _n8_report(verdicts, nrec)
+        for line in lines_for(b):
+            if "rejected as evidence" not in line:
+                continue
+            assert f"{events} records" not in line, f"an event count was printed as records: {line}"
+            if objects != nrec:
+                assert f"{nrec} records (exact)" not in line, f"record count leaked: {line}"
+
+
+def test_n8_d_value_and_exactness_are_unchanged_by_the_fix():
+    """D is LOWER_BOUND whenever anything was rejected, before and after -- and still 0 here."""
+    for _name, verdicts, nrec, _objects, _events, _pre in _N8_SHAPES:
+        d = _n8_report(verdicts, nrec).confirmed_missing
+        assert d.value == 0
+        assert d.exactness == a5.LOWER_BOUND
+
+
+def test_n8_the_supplied_object_total_is_the_sum_of_its_two_direct_counters():
+    """A structural invariant, so a future edit cannot reintroduce a derived count."""
+    r = a5._Rejections(pre_match_objects=2, matched_objects=3, record_events=9)
+    assert r.supplied_objects == 5
+    assert bool(r)
+    assert not bool(a5._Rejections())
+    assert bool(a5._Rejections(record_events=1)), \
+        "a record-level refusal must still make the rejection record truthy"
+
+
 # =============================================================================================
 # I. mutation controls for N-1 .. N-4. Anchors are distinct from every anchor in sections E and G.
 # =============================================================================================
@@ -2200,10 +2396,14 @@ def test_mutant_labelling_rejected_evidence_objects_as_records_is_caught():
               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.PRESENT)]
                               + [verdict(OUTSIDE, root_key=os.path.normcase(
                                   os.path.normpath(OTHER))) for _ in range(2)])
-    weak = _mutant(("            Figure(value=len(rejected), unit=VERDICTS, exactness=EXACT, "
-                    "axis=AXIS_UNCERTAIN,",
-                    "            Figure(value=len(rejected), unit=RECORDS, exactness=EXACT, "
-                    "axis=AXIS_UNCERTAIN,"))
+    # Anchor RE-POINTED by the N-8 fix, not re-scored: the published value is now
+    # `rejected.supplied_objects` rather than `len(rejected)`, because the old length was taken
+    # over a list fed at two cardinalities. The rule under test is unchanged -- an evidence-object
+    # count must not be published in a record unit -- so the mutation is the same unit swap.
+    weak = _mutant(("            Figure(value=rejected.supplied_objects, unit=VERDICTS, "
+                    "exactness=EXACT,",
+                    "            Figure(value=rejected.supplied_objects, unit=RECORDS, "
+                    "exactness=EXACT,"))
     mutated = _run(weak, **kw)
     mutated_hold = [f for lab, f in mutated.uncertain_observations
                     if "rejected as evidence" in lab][0]
@@ -2255,3 +2455,87 @@ def test_mutant_making_the_a4_hold_inherit_a3s_window_is_caught():
     mutated_hold = [f for lab, f in mutated.uncertain_observations if lab == label][0]
     assert mutated_hold.window == (A3_FROM, A3_TO), "the mutation did not apply"
     assert _hold(report(**kw), label).window == (A4_STAMP, A4_STAMP)
+
+
+# ------------------------------------------------------------------- mutation controls for N-8
+
+def test_mutant_making_the_evidence_count_depend_on_matching_records_is_caught():
+    """N-8: the published object count goes back to being the record-level event count.
+
+    This is the over-counting half of the parent commit's defect, and the discriminating fixture is
+    one refused entry against three records that share its source path.
+    """
+    kw = dict(location=loc(), inventory=_n1_inv(_records_sharing(SHARED_SRC, 3)),
+              source_verdicts=[_bad_finalisation()])
+    weak = _mutant(("    matched_objects = sum(entries_for_key.get(k, 1) for k in refused_keys)",
+                    "    matched_objects = refused"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations
+                    if "rejected as evidence" in lab][0]
+    assert mutated_hold.value == 3, "the mutation did not apply"
+    assert _rejected_hold(report(**kw)).value == 1, \
+        "one supplied entry over three records is one refused object"
+
+
+def test_mutant_collapsing_equal_signature_entries_into_one_is_caught():
+    """N-8: the under-counting half -- per-key accounting instead of per-entry accounting.
+
+    Setting the tally to a constant 1 is exactly the `refused_keys`-only formula the original
+    review suggested, and it loses the second of two equal-signature supplied entries.
+    """
+    kw = dict(location=loc(), inventory=_n1_inv(_records_sharing(SHARED_SRC, 1)),
+              source_verdicts=[_bad_finalisation(), _bad_finalisation()])
+    weak = _mutant(("        entries_for_key[key] = entries_for_key.get(key, 0) + 1",
+                    "        entries_for_key[key] = 1"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations
+                    if "rejected as evidence" in lab][0]
+    assert mutated_hold.value == 1, "the mutation did not apply"
+    assert _rejected_hold(report(**kw)).value == 2, \
+        "two distinct supplied entries sharing a signature are two refused objects"
+
+
+def test_mutant_restoring_the_mixed_pre_match_subtraction_is_caught():
+    """N-8: `len(rejected) - refused` comes back, inventing a pre-match rejection.
+
+    Two equal-signature entries over one record is 2 objects and 1 event, so the subtraction
+    publishes one rejection "before any record was matched" that never occurred.
+    """
+    kw = dict(location=loc(), inventory=_n1_inv(_records_sharing(SHARED_SRC, 1)),
+              source_verdicts=[_bad_finalisation(), _bad_finalisation()])
+    weak = _mutant(('        f"{rejected.record_events}, supplied verdict objects rejected '
+                    'before matching "\n        f"{rejected.pre_match_objects}, "',
+                    '        f"{rejected.record_events}, supplied verdict objects rejected '
+                    'before matching "\n        f"{rejected.supplied_objects - '
+                    'rejected.record_events}, "'))
+    mutated = _run(weak, **kw)
+    assert "supplied verdict objects rejected before matching 1" in \
+        mutated.confirmed_missing.population, "the mutation did not apply"
+    assert "supplied verdict objects rejected before matching 0" in \
+        report(**kw).confirmed_missing.population, \
+        "a pre-match rejection was invented by subtracting an event count from an object count"
+
+
+def test_mutant_aggregating_the_object_total_from_record_events_is_caught():
+    """N-8: the aggregation itself lies, rather than either counter feeding it.
+
+    Distinct from the control above: there `matched_objects` is mis-computed, here both counters are
+    right and `supplied_objects` adds the wrong one. The published figure is the only place the
+    difference shows, which is exactly why the value is asserted rather than the internals.
+
+    Note on a guard that is deliberately NOT a control here: `if key not in refused_keys:` was
+    measured and is **behaviourally inert** -- `refused_keys[key] = item` is idempotent for a given
+    key, since `by_path[key]` is fixed once assigned. Mutating it to `if True:` compiles, imports
+    and changes no published figure, so it is a surviving mutant and is reported as one rather than
+    being dressed up as a kill. The guard is kept for intent, not for behaviour.
+    """
+    kw = dict(location=loc(), inventory=_n1_inv(_records_sharing(SHARED_SRC, 3)),
+              source_verdicts=[_bad_finalisation()])
+    weak = _mutant(("        return self.pre_match_objects + self.matched_objects",
+                    "        return self.pre_match_objects + self.record_events"))
+    mutated = _run(weak, **kw)
+    mutated_hold = [f for lab, f in mutated.uncertain_observations
+                    if "rejected as evidence" in lab][0]
+    assert mutated_hold.value == 3, "the mutation did not apply"
+    assert _rejected_hold(report(**kw)).value == 1, \
+        "the object total was aggregated from a record-level event count"

@@ -1003,6 +1003,59 @@ def _source_signature(item) -> tuple:
             str(getattr(item, "root_key", "") or ""))
 
 
+@dataclass(frozen=True)
+class _Rejections:
+    """What A5 refused, counted in the cardinalities that are genuinely different (finding N-8).
+
+    One flat list used to carry both, and ``len()`` of it was published as an exact count of
+    *supplied objects*. It never was. Four of the five append sites fire once per supplied entry and
+    the fifth fires once per **matching cache record**, so the published number drifted in both
+    directions at once. Measured on the parent commit:
+
+    ======================================== ============== ==============
+    shape                                    true entries   published
+    ======================================== ============== ==============
+    1 entry, 3 records sharing its path      1              3  (over)
+    2 equal-signature entries, 1 record      2              1  (**under**)
+    2 equal-signature entries, 3 records     2              3  (over)
+    the same entry object supplied twice     2              1  (**under**)
+    ======================================== ============== ==============
+
+    The under-count is the half the review did not see, and it has its own cause: the indexing loop
+    assigns ``by_path[key]`` only when ``previous is None``, so a second entry with an *equal*
+    signature takes neither that branch nor the contradiction branch. It remains a supplied entry
+    with no representative in the map. That is also why counting ``len(refused_keys)`` -- the
+    review's suggested minimal fix -- would still publish 1 for two equal-signature entries: a key
+    is not an entry. So the entries naming each key are counted as they arrive.
+
+    Why these three numbers and not one: ``pre_match_objects`` answers "how many things you handed
+    me could not be used at all", ``matched_objects`` answers "how many of them were refused once
+    joined to a record", and ``record_events`` answers "how many record-level refusals that caused".
+    The last is a different unit of thing from the first two and is never added to them.
+    """
+
+    #: Supplied input entries rejected before any join was attempted. One per entry, always.
+    pre_match_objects: int = 0
+    #: Supplied input entries refused at the record join. Counted once per entry, **not** once per
+    #: matching record: a single bad verdict joined onto three records sharing a source path is one
+    #: refused object and three refusal events.
+    matched_objects: int = 0
+    #: Record-level refusal **events**. Real information, in its own right, in its own unit.
+    record_events: int = 0
+    #: ``(why, what)`` pairs, one per rejection *group*, with multiplicity stated in the text
+    #: rather than by repeating the line once per matching record.
+    notes: tuple = ()
+
+    @property
+    def supplied_objects(self) -> int:
+        """The input-entry population: what a :data:`VERDICTS` figure is allowed to publish."""
+        return self.pre_match_objects + self.matched_objects
+
+    def __bool__(self) -> bool:
+        """True when anything was refused, so ``not rejected`` keeps its original meaning."""
+        return bool(self.pre_match_objects or self.matched_objects or self.record_events)
+
+
 def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
     """``(Figure, rejected, holds)`` for axis D. Never generates a verdict of its own.
 
@@ -1022,7 +1075,9 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
     basis = ("library_inventory.LeafVerdict.published == MISSING_CONFIRMED, joined onto "
              "RecordInventory.records[].source_path")
     verdicts = obs.source_verdicts
-    rejected: list = []
+    #: One entry per supplied input entry refused before any join (finding N-8). Deliberately
+    #: separate from the record-level refusals below, which are events and not objects.
+    pre_match: list = []
     holds: list = []
 
     records = tuple(getattr(inv, "records", ()) or ()) if inv is not None else ()
@@ -1079,9 +1134,12 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
                          window=window,
                          notes=("records carrying a source path A5 could join: "
                                 f"{len(eligible)}",))))
+        # Every early return happens before the record join, so only pre-match entries can exist
+        # here and there are no record-level events to report.
         return (withheld(reason, unit=RECORDS, axis=AXIS_SOURCE, subject=subject, basis=basis,
                          window=window),
-                tuple(sorted(rejected)), tuple(holds))
+                _Rejections(pre_match_objects=len(pre_match),
+                            notes=tuple(sorted(pre_match))), tuple(holds))
 
     if not verdicts:
         return axis_withheld("no finalised source verdict was supplied, so nothing is known about "
@@ -1096,23 +1154,29 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
     by_path: dict = {}
     signatures: dict = {}
     contradictions: list = []
+    #: How many validated input **entries** named each key. Finding N-8: ``by_path`` cannot answer
+    #: this, because an equal-signature successor is never stored in it, and the same object
+    #: supplied twice is two entries either way. Incremented once per arriving entry, so a later
+    #: refusal of that key can be charged to every entry that asked for it.
+    entries_for_key: dict = {}
     for item in verdicts:
         if not isinstance(item, LeafVerdict):
-            rejected.append(("not a LeafVerdict", repr(type(item).__name__)))
+            pre_match.append(("not a LeafVerdict", repr(type(item).__name__)))
             continue
         key = _key(getattr(item, "path", ""))
         if not key:
-            rejected.append(("no usable absolute path", str(getattr(item, "path", ""))))
+            pre_match.append(("no usable absolute path", str(getattr(item, "path", ""))))
             continue
         vroot = str(getattr(item, "root_key", "") or "")
         if vroot and vroot not in root_keys:
-            rejected.append(("root provenance not among the verified inspection roots",
-                             f"{item.path} (root_key={vroot})"))
+            pre_match.append(("root provenance not among the verified inspection roots",
+                              f"{item.path} (root_key={vroot})"))
             continue
         if not vroot:
-            rejected.append(("no root provenance, so jurisdiction cannot be established",
-                             str(item.path)))
+            pre_match.append(("no root provenance, so jurisdiction cannot be established",
+                              str(item.path)))
             continue
+        entries_for_key[key] = entries_for_key.get(key, 0) + 1
         signature = _source_signature(item)
         previous = signatures.get(key)
         if previous is None:
@@ -1137,6 +1201,10 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
     unmatched = 0
     unresolved = 0
     refused = 0
+    #: The distinct keys refused at the join, first-seen item kept for the note. Finding N-8: this
+    #: is keyed so that three records sharing one source path produce three *events* but charge the
+    #: refusal to that key's supplied entries exactly once.
+    refused_keys: dict = {}
     for rec, key in eligible:
         item = by_path.get(key)
         if item is None:
@@ -1150,11 +1218,29 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
             present += 1
         elif published == MISSING_CONFIRMED:
             refused += 1
-            rejected.append(("a confirmed-missing enum without its finalised clause evidence",
-                             f"{item.path} (unmet: "
-                             f"{','.join(item.clauses.unmet()) or 'none recorded'})"))
+            if key not in refused_keys:
+                refused_keys[key] = item
         else:
             unresolved += 1
+
+    # The two populations, each counted directly rather than by subtracting one cardinality from
+    # the other (finding N-8, requirement 8). `len(rejected) - refused` mixed objects with events:
+    # it read 1 pre-match rejection out of two equal-signature entries over one record, and could
+    # in principle go negative.
+    matched_objects = sum(entries_for_key.get(k, 1) for k in refused_keys)
+    rejection_notes = list(pre_match)
+    for key in sorted(refused_keys):
+        item = refused_keys[key]
+        entries = entries_for_key.get(key, 1)
+        # Multiplicity is stated rather than shown by repeating the line, which is what printed the
+        # same object once per matching record and, past eight, hid the rest behind the cap.
+        shared = "" if entries == 1 else f" [supplied entries naming this path: {entries}]"
+        rejection_notes.append(
+            ("a confirmed-missing enum without its finalised clause evidence",
+             f"{item.path} (unmet: "
+             f"{','.join(item.clauses.unmet()) or 'none recorded'}){shared}"))
+    rejected = _Rejections(pre_match_objects=len(pre_match), matched_objects=matched_objects,
+                           record_events=refused, notes=tuple(sorted(rejection_notes)))
 
     if unresolved:
         holds.append((
@@ -1203,21 +1289,29 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
                       f"recorded no source path A5 could read and are outside this figure's "
                       f"population entirely")
     if rejected:
-        # Finding N-5. Two different counts were both called "refused": `refused` counts verdicts
-        # that matched a record and lacked their clause evidence, while `len(rejected)` also covers
-        # verdicts thrown out before any matching happened. The figure printed "refused as evidence
-        # 0" and, on the same page, "1 supplied verdicts were rejected as evidence". Both numbers
-        # were right; the shared word made them read as a contradiction. Each is now named for the
-        # question it answers.
-        limits.append(f"{len(rejected)} supplied verdict objects were rejected as evidence "
-                      f"({refused} matched a record but carried no finalised clause evidence, "
-                      f"{len(rejected) - refused} were rejected before any record was matched)")
+        # Finding N-5. Two different counts were both called "refused": one counts verdicts that
+        # matched a record and lacked their clause evidence, the other also covers verdicts thrown
+        # out before any matching happened. The figure printed "refused as evidence 0" and, on the
+        # same page, "1 supplied verdicts were rejected as evidence". Both numbers were right; the
+        # shared word made them read as a contradiction. Each is now named for the question it
+        # answers.
+        #
+        # Finding N-8 then made the numbers themselves true. Every count here is tracked directly:
+        # the object counts never subtract a record-event count, and the event count is reported as
+        # an event count instead of being labelled "matched verdicts".
+        limits.append(f"{rejected.supplied_objects} supplied verdict objects were rejected as "
+                      f"evidence ({rejected.matched_objects} matched a record but carried no "
+                      f"finalised clause evidence, refused at record level "
+                      f"{rejected.record_events} times; {rejected.pre_match_objects} were "
+                      f"rejected before any record was matched)")
 
     population = (
         f"source states established: {confirmed + present} of {len(eligible)} joinable "
         f"(confirmed missing {confirmed}, present {present}); unresolved {unresolved}, "
-        f"unmatched {unmatched}, matched verdicts refused for missing clause evidence {refused}, "
-        f"supplied verdict objects rejected before matching {len(rejected) - refused}, "
+        f"unmatched {unmatched}, matched verdict objects refused for missing clause evidence "
+        f"{rejected.matched_objects}, record-level refusals of those objects "
+        f"{rejected.record_events}, supplied verdict objects rejected before matching "
+        f"{rejected.pre_match_objects}, "
         f"unjoinable {unjoinable}, recording no source path {no_source}; in this folder parsed "
         f"{parsed}, recognised {recognised}")
 
@@ -1246,13 +1340,13 @@ def _source_state_figure(obs: Observation, inv, subject, window) -> tuple:
                                                "state could be established here, which is the "
                                                "population this figure answers for)",
                        basis=basis, window=window, limitations=tuple(limits)),
-                tuple(sorted(rejected)), tuple(holds))
+                rejected, tuple(holds))
     return (Figure(value=confirmed, unit=RECORDS, exactness=LOWER_BOUND, axis=AXIS_SOURCE,
                    subject=subject, population=population, basis=basis, window=window,
                    limitations=tuple(limits),
                    notes=("a floor: records whose source state was not established could also "
                           "qualify",)),
-            tuple(sorted(rejected)), tuple(holds))
+            rejected, tuple(holds))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1281,6 +1375,23 @@ def _demote_while_moving(holds: tuple, unstable: bool) -> tuple:
     exactness and its own reason -- it is not re-demoted and not relabelled. And a **withheld**
     figure stays withheld: it carries no number, so there is nothing to demote, and overwriting its
     ``NOT_ASSESSED`` would break :attr:`Figure.consistent`.
+
+    **The evidence-object hold stays in scope, decided rather than inherited (finding N-8).** The
+    question was put directly: a count of caller-supplied objects is a fact about the *inputs*, and
+    a folder moving under A3's pass cannot change how many verdicts the caller handed in, so why
+    should it become a floor? Because the published figure is
+    :attr:`_Rejections.supplied_objects`, which is ``pre_match_objects + matched_objects``, and only
+    the first term is purely an input fact. ``matched_objects`` is reached through the record join:
+    a record this pass never saw could have matched a supplied verdict and refused it, which would
+    raise the term. One of the two addends is therefore a floor whenever the folder moved, and a sum
+    containing a floor is a floor. So the hold is demoted, and the rule needs no exemption
+    mechanism and no per-unit special case -- which is also what keeps finding N-1 closed: Rule T-3
+    still runs over every hold, unconditionally, in exactly one place.
+
+    Had the figure been split into two published numbers, the pre-match half would have a genuine
+    claim to staying exact. It is deliberately not split: one number answering "how much of what
+    you supplied was unusable" is the more useful report, and a floor is the honest exactness for
+    it.
     """
     if not unstable:
         return tuple(holds)
@@ -1401,20 +1512,26 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
                                  "rather than borrowing another input's",))))
 
     if rejected:
-        # Finding N-2. `len(rejected)` counts supplied verdict OBJECTS. Two rejected verdicts can
-        # name one path, and a rejected path need not be a record in this folder at all, so this
-        # is not a count of records and is not published as one. A5 cannot derive a unique record
-        # population from it either -- deduplicating by path would still be counting paths it
-        # cannot place in the inventory -- so the honest figure is the evidence-object count, in
-        # its own unit, on its own line.
+        # Finding N-2. This counts supplied verdict OBJECTS. Two rejected verdicts can name one
+        # path, and a rejected path need not be a record in this folder at all, so this is not a
+        # count of records and is not published as one. A5 cannot derive a unique record population
+        # from it either -- deduplicating by path would still be counting paths it cannot place in
+        # the inventory -- so the honest figure is the evidence-object count, in its own unit, on
+        # its own line.
+        #
+        # Finding N-8 is why the value is `supplied_objects` and not a length. The old `len()` was
+        # over one list fed at two cardinalities, so it published the number of record-level
+        # refusal *events* whenever a source path was shared, and dropped equal-signature entries
+        # entirely. `supplied_objects` is the input-entry population and nothing else.
         add("uncertain: supplied source verdicts rejected as evidence",
-            Figure(value=len(rejected), unit=VERDICTS, exactness=EXACT, axis=AXIS_UNCERTAIN,
+            Figure(value=rejected.supplied_objects, unit=VERDICTS, exactness=EXACT,
+                   axis=AXIS_UNCERTAIN,
                    subject=inv_subject,
                    population="supplied verdict objects that A5 refused as evidence; not a count "
-                              "of distinct cache records, and not necessarily records of this "
-                              "folder at all",
+                              "of distinct cache records, not a count of record-level refusals, "
+                              "and not necessarily records of this folder at all",
                    basis="A5 rejection of unusable source verdicts", window=window,
-                   notes=tuple(f"{why}: {what}" for why, what in rejected)[:8]))
+                   notes=tuple(f"{why}: {what}" for why, what in rejected.notes)[:8]))
 
     # Rule T-3, enforced once over every hold rather than per producer (finding N-1). This runs
     # before the headline is chosen, so the single-contributor passthrough below cannot copy an
