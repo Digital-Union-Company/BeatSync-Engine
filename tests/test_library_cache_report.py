@@ -1757,8 +1757,9 @@ def test_every_mutation_control_is_accounted_for():
     controls = [name for name in dir(this_module)
                 if name.startswith("test_mutant_") and callable(getattr(this_module, name))]
     # 28 before X2-1; section K adds seven behavioural controls for the published semantics of the
-    # evidence hold and the headline zero. Updated here deliberately, as the docstring requires.
-    assert len(controls) == 35, f"expected 35 mutation controls, found {len(controls)}: {controls}"
+    # evidence hold and the headline zero; section L adds one for the note cap that keeps the floor
+    # explanation reachable (finding R1-2). Updated here deliberately, as the docstring requires.
+    assert len(controls) == 36, f"expected 36 mutation controls, found {len(controls)}: {controls}"
     for name in controls:
         source = inspect.getsource(getattr(this_module, name))
         assert "_mutant(" in source, f"{name} does not build a mutant"
@@ -3351,3 +3352,227 @@ def test_mutant_dropping_the_floor_note_from_the_population_is_caught():
     real = _rejected_hold(report(**kw))
     assert a5.REFUSAL_FLOOR_POPULATION in real.population
     assert "floor rather than a total" in real.population
+
+
+# =============================================================================================
+# L. R1-2 and R1-1 -- the two residual findings of the independent review of the X2-1 commit.
+#
+# R1-2 is a COVERAGE finding, not a defect: the shipped order
+#
+#     notes = <rejection notes>[:8] + (REFUSAL_FLOOR_NOTE if join_incomplete else ())
+#
+# is correct, and the review proved it was also undefended. Moving the `[:8]` to after the
+# concatenation survives every one of the 277 tests this file held before this section -- measured
+# here, not taken on trust -- yet at eight or more distinct rejection groups on an incomplete join
+# it pushes the floor explanation off the end, so the hold publishes a floor while no longer saying
+# why. That is the X2-1 failure mode in the one field X2-1's own matrix never sized. Reproduced
+# independently before this section was written, with a changed Git blob: at 8, 9 and 12 genuinely
+# distinct groups the real module renders nine notes including the floor and the mutant renders
+# eight without it, in `Figure.notes` AND in `report_lines`.
+#
+# Eight is the boundary, measured, not nine: at exactly eight groups the cap is already full, so the
+# post-concatenation slice evicts the floor note. The fixtures below therefore start at eight.
+#
+# R1-1 is a producer-contract finding. Axis D weighs `shortfall <= 0` where
+# `shortfall = records_parsed - len(records)`; the X2-1 guard does not. A hand-built inventory with
+# a shortfall and all three flags clear makes D a floor while the evidence hold stays EXACT. That
+# state is unreachable from A3, provably rather than by sampling, and the test here holds A3 to it
+# so the assumption fails loudly if A3 ever stops honouring it. No A5 behaviour is changed for it.
+# =============================================================================================
+
+#: Distinct refused source paths produce distinct `(why, what)` rejection groups, because `what`
+#: carries the path. A fixture that repeated one line would make the cap look exercised while
+#: measuring nothing, so the tests assert distinctness instead of assuming it.
+def _distinct_refusal_groups(n):
+    """``(records, verdicts)`` for ``n`` genuinely distinct rejection groups."""
+    paths = [os.path.join(LIBRARY, "absent-%02d.mp4" % i) for i in range(n)]
+    records = tuple(rec("g%02d" % i, source=p) for i, p in enumerate(paths))
+    verdicts = [_bad_finalisation(p) for p in paths]
+    return records, verdicts
+
+
+#: ``(name, truncated, counts_exact)`` -- the two causes the producer decides, each alone. The
+#: concurrency state is deliberately absent: `_demote_while_moving` adds no note, so it cannot move
+#: the cap, and asserting it here would test N-1 again rather than the cap.
+_R1_2_INCOMPLETE = (("truncated display", True, True),
+                    ("uncertified counts", False, False))
+
+
+@pytest.mark.parametrize("groups", (8, 9, 12))
+@pytest.mark.parametrize("name,truncated,counts_exact", _R1_2_INCOMPLETE)
+def test_r1_2_a_capped_rejection_list_still_states_why_the_number_is_a_floor(
+        groups, name, truncated, counts_exact):
+    """Finding R1-2. The floor explanation survives a full rejection-note cap.
+
+    Asserted on the published `Figure` **and** on the rendered report, because the rendered line is
+    what an operator reads: a floor whose reason is invisible there is a floor nobody was told
+    about.
+    """
+    records, verdicts = _distinct_refusal_groups(groups)
+    inventory = _x2_inv(records, truncated=truncated, counts_exact=counts_exact)
+    buckets = report(location=loc(), inventory=inventory, source_verdicts=list(verdicts))
+    hold = _rejected_hold(buckets)
+
+    rejection_notes = tuple(n for n in hold.notes if n != a5.REFUSAL_FLOOR_NOTE)
+    assert len(rejection_notes) == 8, (
+        f"{name}/{groups}: {len(rejection_notes)} rejection notes published, cap is eight")
+    assert len(set(rejection_notes)) == len(rejection_notes), (
+        f"{name}/{groups}: the fixture repeated a line instead of supplying distinct groups")
+
+    # exactly once, and after them -- the ordering is the whole finding
+    assert hold.notes.count(a5.REFUSAL_FLOOR_NOTE) == 1, (
+        f"{name}/{groups}: the floor explanation appears {hold.notes.count(a5.REFUSAL_FLOOR_NOTE)} "
+        f"times in a hold carrying a full rejection-note cap")
+    assert hold.notes[-1] == a5.REFUSAL_FLOOR_NOTE, (
+        f"{name}/{groups}: the floor explanation is not the note appended after the cap")
+    assert len(hold.notes) == 9
+
+    # the published semantics the note explains
+    assert hold.value == groups, f"{name}/{groups}: the count moved with the note cap"
+    assert hold.exactness == a5.LOWER_BOUND
+    assert not hold.publishable_as_total
+    assert hold.consistent
+    assert a5.REFUSAL_FLOOR_POPULATION in hold.population
+
+    # the cause that applies, and no cause that does not
+    expected = {a5.TRUNCATED_JOIN_LIMITATION} if truncated else {a5.INEXACT_JOIN_LIMITATION}
+    assert set(hold.limitations) == expected, f"{name}/{groups}: {hold.limitations}"
+    assert a5.CONCURRENCY_LIMITATION not in hold.limitations, (
+        f"{name}/{groups}: a stable folder was reported as changing under the pass")
+
+    # and the operator-visible surface
+    rendered = lines_for(buckets)
+    assert any(a5.REFUSAL_FLOOR_NOTE in line for line in rendered), (
+        f"{name}/{groups}: the rendered report publishes a floor without its reason")
+    assert sum(line.count(a5.REFUSAL_FLOOR_NOTE) for line in rendered) == 1
+
+
+@pytest.mark.parametrize("groups", (8, 9, 12))
+def test_r1_2_a_complete_join_attaches_no_floor_note_at_any_group_count(groups):
+    """The control. A full note cap must not become a reason to call a complete join a floor.
+
+    Without this, a "fix" that appended the floor explanation unconditionally would pass the test
+    above and silently demote every exact hold.
+    """
+    records, verdicts = _distinct_refusal_groups(groups)
+    inventory = _x2_inv(records, truncated=False, counts_exact=True, unstable=False)
+    buckets = report(location=loc(), inventory=inventory, source_verdicts=list(verdicts))
+    hold = _rejected_hold(buckets)
+
+    assert hold.value == groups
+    assert hold.exactness == a5.EXACT, "a complete join was demoted by the note cap"
+    assert hold.publishable_as_total
+    assert hold.limitations == ()
+    assert a5.REFUSAL_FLOOR_NOTE not in hold.notes, (
+        "the floor explanation was attached to a join that fell short of nothing")
+    assert a5.REFUSAL_FLOOR_POPULATION not in hold.population
+    assert len(hold.notes) == 8
+    assert not any(a5.REFUSAL_FLOOR_NOTE in line for line in lines_for(buckets))
+
+
+def test_r1_1_the_producer_never_shows_fewer_records_than_it_parsed_without_saying_so():
+    """Finding R1-1, as a producer contract rather than as an A5 behaviour change.
+
+    A5's X2-1 guard asks ``records_truncated or not counts_exact``. Axis D additionally weighs
+    ``shortfall <= 0``. The gap between them is only reachable with a hand-built inventory, because
+    A3 guarantees ``records_parsed > len(records) => records_truncated``: every record counted into
+    ``parse_counts`` reaches ``read_records``' append-or-truncate decision in the same iteration,
+    and declining to append sets ``records_truncated``.
+
+    This test holds A3 to that guarantee with injected, non-filesystem inputs, so if the producer
+    ever stops honouring it the failure lands here -- loudly -- instead of A5 quietly publishing a
+    total. A5 is deliberately **not** changed to re-check the fourth term: doing so would add a
+    second opinion about a producer invariant, which is the shape of coupling finding N-1 closed.
+    """
+    folder = os.path.join(BASE, "A3Probe")
+    library = os.path.join(BASE, "A3Lib")
+    root_key = os.path.normcase(os.path.normpath(library))
+
+    class _FakeStat:
+        #: ``S_IFREG | 0o644``. Spelled as a literal rather than importing ``stat``, and present at
+        #: all because ``_link_evidence`` reports a Windows entry UNDECIDABLE without
+        #: ``st_file_attributes`` -- every entry would then land in ``skipped_undecidable`` and the
+        #: probe would read ``records_parsed == 0``, measuring nothing at all.
+        def __init__(self, size):
+            self.st_size = size
+            self.st_mode = 0o100644
+            self.st_mtime_ns = 1
+            self.st_ino = 1
+            self.st_dev = 1
+            self.st_nlink = 1
+            self.st_file_attributes = 0x80
+
+    def _probe(entries, max_reported, max_records, bad_every=0):
+        names = ["rec%04d.json" % i for i in range(entries)]
+
+        def _read_text(path, **_kw):
+            base = os.path.basename(path)
+            index = names.index(base) if base in names else 0
+            if bad_every and index % bad_every == 0:
+                return "{ this is not json"
+            return ('{"video_file": "%s", "contract_version": "stage5_cache_v3"}'
+                    % os.path.join(library, "v%04d.mp4" % index).replace("\\", "\\\\"))
+
+        return lcr.read_records(
+            folder,
+            is_record_name=lambda nm: nm.endswith(".json"),
+            contract="stage5_cache_v3", inspection_roots=(root_key,),
+            listdir=lambda _p: list(names),
+            lstat=lambda _p: _FakeStat(120),
+            realpath=os.path.normpath,
+            read_text=_read_text,
+            max_entries=100_000, max_records=max_records, max_record_bytes=4_000_000,
+            max_total_bytes=1_000_000_000, max_reported_names=max_reported)
+
+    shortfalls = 0
+    for entries in (0, 1, 2, 5, 9, 12, 40):
+        for max_reported in (1, 2, 8, 200):
+            for max_records in (3, 10, 20_000):
+                for bad_every in (0, 3):
+                    out = _probe(entries, max_reported, max_records, bad_every)
+                    shortfall = out.records_parsed - len(out.records)
+                    if shortfall <= 0:
+                        continue
+                    shortfalls += 1
+                    where = (f"entries={entries} max_reported={max_reported} "
+                             f"max_records={max_records} bad_every={bad_every}")
+                    assert out.records_truncated, (
+                        f"{where}: A3 showed {len(out.records)} of {out.records_parsed} parsed "
+                        f"records without setting records_truncated -- the invariant A5's "
+                        f"join_incomplete guard relies on is broken")
+                    # and therefore A5's weaker guard is satisfied too
+                    assert out.records_truncated or not out.counts_exact
+
+    #: Guards the guard. A configuration grid that never produced a shortfall would pass every
+    #: assertion above while measuring nothing -- the vacuous-sweep trap.
+    assert shortfalls > 0, "no configuration produced a shortfall: this test measured nothing"
+
+
+def test_mutant_capping_the_rejection_notes_after_the_floor_note_is_caught():
+    """Finding R1-2's mutation control: the cap is applied to the concatenation instead.
+
+    The anchor is the two-line `notes=` expression, unique in the module. The mutant is proved to
+    have changed the published notes BEFORE the real module is asserted on, and the fixture carries
+    nine distinct rejection groups so the cap is genuinely full -- below eight the mutation is
+    behaviourally inert and a "kill" would be an illusion.
+    """
+    records, verdicts = _distinct_refusal_groups(9)
+    kw = dict(location=loc(), inventory=_x2_inv(records, truncated=True),
+              source_verdicts=list(verdicts))
+    weak = _mutant((
+        '                   notes=tuple(f"{why}: {what}" for why, what in rejected.notes)[:8]\n'
+        '                         + ((REFUSAL_FLOOR_NOTE,) if join_incomplete else ())))',
+        '                   notes=(tuple(f"{why}: {what}" for why, what in rejected.notes)\n'
+        '                         + ((REFUSAL_FLOOR_NOTE,) if join_incomplete else ()))[:8]))'))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert weak.REFUSAL_FLOOR_NOTE not in mutated.notes, "the mutation did not apply"
+    assert len(mutated.notes) == 8, "the mutation did not apply"
+
+    real = _rejected_hold(report(**kw))
+    assert a5.REFUSAL_FLOOR_NOTE in real.notes, (
+        "a hold with a full rejection-note cap published a floor without its reason")
+    assert real.notes[-1] == a5.REFUSAL_FLOOR_NOTE
+    assert len(real.notes) == 9
+    assert real.exactness == a5.LOWER_BOUND
+    assert not real.publishable_as_total

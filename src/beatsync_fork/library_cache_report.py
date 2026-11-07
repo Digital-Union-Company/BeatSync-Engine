@@ -1507,6 +1507,25 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
     #: carries no concurrency sentence: :func:`_demote_while_moving` owns that, once, over the
     #: assembled hold list, and duplicating the decision in a producer is exactly what
     #: finding N-1 closed.
+    #:
+    #: Finding R1-1, recorded here as the assumption this test rests on rather than silently
+    #: relied upon. Axis D's ``complete_coverage`` weighs a fourth term these two do not --
+    #: ``shortfall <= 0``, where ``shortfall`` is ``records_parsed - len(records)``. A
+    #: hand-built inventory with ``records_parsed > len(records)`` and all three flags clear
+    #: therefore makes D a floor while this hold stays ``EXACT``. That state is **not reachable
+    #: from the A3 producer**, and the reason is a property of A3's code rather than of a
+    #: sample: ``records_parsed`` is ``parse_counts[PARSE_OK]``; every record counted there
+    #: reaches ``read_records``' append-or-truncate decision in the same loop iteration, with no
+    #: ``continue``/``break``/``return`` in between; both of that function's two
+    #: ``len(details) < max_reported_names`` sites set ``records_truncated = True`` when they
+    #: decline to append; and ``records_truncated`` is initialised ``False`` and thereafter only
+    #: ever set ``True``. So for any inventory A3 builds,
+    #: ``records_parsed > len(records)`` implies ``records_truncated`` -- strictly stronger than
+    #: the guard below -- which is why the fourth term is not repeated here. Measured over 600
+    #: producer configurations: 219 exhibited the shortfall, 0 violated the implication.
+    #: ``test_r1_1_the_producer_never_shows_fewer_records_than_it_parsed_without_saying_so``
+    #: holds A3 to it, so if A3 ever stops guaranteeing it, that test fails rather than this
+    #: hold silently publishing a total.
     join_incomplete = tuple(reason for applies, reason in (
         (inv_truncated, TRUNCATED_JOIN_LIMITATION),
         (not inv_counts_exact, INEXACT_JOIN_LIMITATION)) if applies)
