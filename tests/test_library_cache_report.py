@@ -22,6 +22,7 @@ than coincidences: each weakens one rule in a copy of the module and must be kil
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib.util
 import os
 import sys
@@ -912,7 +913,12 @@ def test_mutant_calling_a_clean_zero_verified_empty_is_caught():
 
 def test_mutant_turning_a_withheld_uncertainty_into_zero_is_caught():
     """Two overlapping holds must withhold the headline, not collapse to a measured zero."""
-    weak = _mutant(("    elif not contributing and not any_withheld and not inv_unstable:",
+    # Anchor RE-POINTED by the X2-1 fix. The branch now guards on `zero_doubts`, which
+    # carries the concurrency cause AND the two new ones, because a truncated display or
+    # uncertified counts reach this zero exactly as a moving folder does. The rule under
+    # test is unchanged -- two overlapping holds must withhold rather than collapse to a
+    # measured zero -- so the mutation is the same unconditional branch.
+    weak = _mutant(("    elif not contributing and not any_withheld and not zero_doubts:",
                     "    elif True:"))
     kw = dict(location=loc(), inventory=inv(entries_unclassified=3, completion_unavailable=2))
     mutated = _run(weak, **kw).uncertain
@@ -1750,7 +1756,9 @@ def test_every_mutation_control_is_accounted_for():
     this_module = sys.modules[__name__]
     controls = [name for name in dir(this_module)
                 if name.startswith("test_mutant_") and callable(getattr(this_module, name))]
-    assert len(controls) == 28, f"expected 28 mutation controls, found {len(controls)}: {controls}"
+    # 28 before X2-1; section K adds seven behavioural controls for the published semantics of the
+    # evidence hold and the headline zero. Updated here deliberately, as the docstring requires.
+    assert len(controls) == 35, f"expected 35 mutation controls, found {len(controls)}: {controls}"
     for name in controls:
         source = inspect.getsource(getattr(this_module, name))
         assert "_mutant(" in source, f"{name} does not build a mutant"
@@ -2377,8 +2385,13 @@ def test_mutant_demoting_only_the_inventory_built_holds_is_caught():
               inventory=_n1_inv((rec("r0"),), vanished=("a.json",)),
               source_verdicts=[verdict(os.path.join(LIBRARY, "r0.mp4"), state=lib.UNKNOWN)])
     label = "uncertain: records whose supplied source verdict established no state"
-    weak = _mutant(("        if fig.value is None or fig.exactness != EXACT:",
-                    "        if fig.value is None or fig.exactness != EXACT or not "
+    # Anchor RE-POINTED by the X2-1 fix. The guard now skips only a WITHHELD figure: a
+    # figure that is already a floor for its own cause keeps its exactness but must still
+    # collect the concurrency reason, which the old `exactness != EXACT` skip suppressed.
+    # The rule under test is unchanged -- the demotion must not be restricted to the holds
+    # one builder happens to produce -- so the mutation is the same basis restriction.
+    weak = _mutant(("        if fig.value is None:",
+                    "        if fig.value is None or not "
                     "fig.basis.startswith(\"RecordInventory\"):"))
     mutated = _run(weak, **kw)
     mutated_hold = [f for lab, f in mutated.uncertain_observations if lab == label][0]
@@ -2400,10 +2413,12 @@ def test_mutant_labelling_rejected_evidence_objects_as_records_is_caught():
     # `rejected.supplied_objects` rather than `len(rejected)`, because the old length was taken
     # over a list fed at two cardinalities. The rule under test is unchanged -- an evidence-object
     # count must not be published in a record unit -- so the mutation is the same unit swap.
-    weak = _mutant(("            Figure(value=rejected.supplied_objects, unit=VERDICTS, "
-                    "exactness=EXACT,",
-                    "            Figure(value=rejected.supplied_objects, unit=RECORDS, "
-                    "exactness=EXACT,"))
+    # Anchor RE-POINTED a second time, by the X2-1 fix: `exactness` moved onto its own
+    # line and is now conditional on `join_incomplete`. The rule under test is unchanged --
+    # an evidence-object count must not be published in a record unit -- so the mutation is
+    # still the same unit swap, now on the line that carries the unit alone.
+    weak = _mutant(("            Figure(value=rejected.supplied_objects, unit=VERDICTS,",
+                    "            Figure(value=rejected.supplied_objects, unit=RECORDS,"))
     mutated = _run(weak, **kw)
     mutated_hold = [f for lab, f in mutated.uncertain_observations
                     if "rejected as evidence" in lab][0]
@@ -2539,3 +2554,800 @@ def test_mutant_aggregating_the_object_total_from_record_events_is_caught():
     assert mutated_hold.value == 3, "the mutation did not apply"
     assert _rejected_hold(report(**kw)).value == 1, \
         "the object total was aggregated from a record-level event count"
+
+
+# =============================================================================================
+# J. X2-1 -- the published semantics of the VERDICTS evidence hold, and the headline zero beside
+#    it, across every combination of the three ways the record join can fall short of the folder.
+#
+# Why this section exists at all. `_Rejections.supplied_objects` is `pre_match_objects +
+# matched_objects`, and the second addend is produced by matching supplied entries against
+# `RecordInventory.records` -- a capped DISPLAY list. The hold was built with an unconditional
+# `exactness=EXACT` and an empty `limitations` tuple, and only `_demote_while_moving` ever touched
+# it, on concurrency alone. So a truncated display or uncertified counts published a floor as a
+# total. Axis D weighed all three states in `complete_coverage` already; its limitations never
+# reached bucket E.
+#
+# Measured on the parent blob, the shape that makes it undeniable: one folder, one set of supplied
+# verdicts, and only the position of the display window moved. Refused record inside it ->
+# `1 verdicts (exact)` with `publishable_as_total` True. Beyond it -> no hold at all, and
+# `E uncertain: 0 records (exact)`, also publishable. A difference in where a cap fell, published
+# as a difference in fact.
+#
+# Everything here is behavioural: public entry points in, published fields out. The structural
+# guards at the end of the section are additions, never substitutes -- a mutation that changes a
+# number has to be killed by an assertion about that number.
+# =============================================================================================
+
+class _X2InexactCounts(lcr.RecordInventory):
+    """A real inventory whose aggregate counters are NOT certified to cover the folder.
+
+    `counts_exact` is derived from `entries_complete` and `entries_unclassified`, and each of those
+    raises an E hold of its own -- a withheld one and a positive one respectively. Setting either
+    would change `contributing`/`any_withheld` and so measure a different branch entirely, which is
+    exactly how the flag went untested. Overriding the property varies the one flag under test and
+    nothing else, and the builder asserts all three flags landed as intended.
+    """
+
+    @property
+    def counts_exact(self) -> bool:
+        return False
+
+
+def _x2_inv(records, *, folder_records=None, truncated=False, counts_exact=True, unstable=False,
+            **override):
+    """An inventory whose COUNTERS describe the whole folder and whose ``records`` is the display.
+
+    ``folder_records`` is how many records the folder actually holds; ``records`` is what A3 chose
+    to show. Keeping them separate is the whole point: a truncated display with whole-folder
+    counters is the ordinary state of any cache past `max_reported_names`, not an edge case.
+    """
+    n = folder_records if folder_records is not None else len(records)
+    base = dict(
+        path=CACHE, resolved=CACHE, state=lcr.CACHE_PRESENT, complete=True, bound=lcr.BOUND_NONE,
+        entries_listed=n, entries_examined=n, records_recognised=n, records_attempted=n,
+        parse_counts={lcr.PARSE_OK: n}, contract_counts={lcr.CONTRACT_CURRENT: n},
+        contract_assessed=True, scope_counts={lcr.SCOPE_IN: n}, scope_assessed=True,
+        complete_counts={lcr.COMPLETE_YES: n}, completeness_assessed=True,
+        inspection_roots=(ROOT_KEY,), entries_complete=True, assessments_complete=True,
+        entries_unclassified=0, skipped_entries=0, observed_from="T0", observed_to="T1",
+        records=tuple(records), records_truncated=truncated,
+        vanished=("gone.json",) if unstable else (),
+    )
+    base.update(override)
+    out = (lcr.RecordInventory if counts_exact else _X2InexactCounts)(**base)
+    assert bool(out.records_truncated) is truncated, "fixture misbuilt: records_truncated"
+    assert bool(out.counts_exact) is counts_exact, "fixture misbuilt: counts_exact"
+    assert bool(out.unstable) is unstable, "fixture misbuilt: unstable"
+    return out
+
+
+#: ``(name, truncated, counts_exact, unstable)``. The three flags independently and in every
+#: combination -- eight states, not the three the old suite could reach.
+X2_STATES = (
+    ("complete", False, True, False),
+    ("T", True, True, False),
+    ("C", False, False, False),
+    ("TC", True, False, False),
+    ("U", False, True, True),
+    ("UT", True, True, True),
+    ("UC", False, False, True),
+    ("UTC", True, False, True),
+)
+
+
+def _x2_expected_hold_limitations(a5mod, truncated, counts_exact, unstable):
+    """Exactly the causes that apply, and no other. Order-independent by construction."""
+    want = set()
+    if truncated:
+        want.add(a5mod.TRUNCATED_JOIN_LIMITATION)
+    if not counts_exact:
+        want.add(a5mod.INEXACT_JOIN_LIMITATION)
+    if unstable:
+        want.add(a5mod.CONCURRENCY_LIMITATION)
+    return want
+
+
+def _x2_expected_zero_limitations(a5mod, truncated, counts_exact, unstable):
+    want = set()
+    if unstable:
+        want.add(a5mod.ZERO_CONCURRENCY_LIMITATION)
+    if truncated:
+        want.add(a5mod.ZERO_TRUNCATED_LIMITATION)
+    if not counts_exact:
+        want.add(a5mod.ZERO_INEXACT_LIMITATION)
+    return want
+
+
+# ------------------------------------------------------------------- J1. the eight-state matrix
+
+@pytest.mark.parametrize("name,truncated,counts_exact,unstable", X2_STATES)
+def test_x2_1_the_evidence_hold_publishes_a_floor_on_any_incomplete_join(
+        name, truncated, counts_exact, unstable):
+    """The matrix. One refused supplied entry, two records sharing its source path.
+
+    This is the test that fails against the parent blob: in states T, C and TC it published
+    ``exact`` / ``publishable_as_total=True`` / ``limitations=()`` for a figure whose matched half
+    came out of a capped display list.
+    """
+    records = _records_sharing(SHARED_SRC, 2)
+    inventory = _x2_inv(records, truncated=truncated, counts_exact=counts_exact,
+                        unstable=unstable)
+    b = report(location=loc(), inventory=inventory, source_verdicts=[_bad_finalisation()])
+    hold = _rejected_hold(b)
+    incomplete = truncated or (not counts_exact) or unstable
+    #: The two causes the PRODUCER decides, and so the two that carry the record-join floor
+    #: wording. Concurrency is deliberately not among them: `_demote_while_moving` owns that
+    #: decision, once, over the assembled list, and it is unit-agnostic -- it cannot attach a
+    #: `VERDICTS`-specific note without the producer pre-judging instability, which is the
+    #: architecture finding N-1 closed. In the concurrency-only state the demotion is explained by
+    #: `CONCURRENCY_LIMITATION`, whose own wording already says the count covers only what this
+    #: pass examined, so no reason goes unstated.
+    join_incomplete = truncated or (not counts_exact)
+
+    # the value is a property of the INPUTS and must never move with the flags
+    assert hold.value == 1, f"{name}: the count changed with an incompleteness flag"
+    assert hold.unit == a5.VERDICTS
+    assert hold.axis == a5.AXIS_UNCERTAIN
+    assert hold.consistent, f"{name}: Figure.consistent broke"
+    assert "not a count of distinct cache records" in hold.population
+
+    if not incomplete:
+        assert hold.exactness == a5.EXACT, f"{name}: a complete join was demoted"
+        assert hold.publishable_as_total
+        assert hold.limitations == (), f"{name}: a cause was given that does not apply"
+    else:
+        assert hold.exactness == a5.LOWER_BOUND, f"{name}: an incomplete join published EXACT"
+        assert not hold.publishable_as_total, f"{name}: a floor was certified as a total"
+        assert hold.limitations, f"{name}: demoted without saying why"
+
+    # the record-join floor wording tracks the two producer-decided causes
+    if join_incomplete:
+        assert a5.REFUSAL_FLOOR_NOTE in hold.notes, f"{name}: no reason given for the floor"
+        assert a5.REFUSAL_FLOOR_POPULATION in hold.population, \
+            f"{name}: the population still reads as a total of what the caller supplied"
+    else:
+        assert a5.REFUSAL_FLOOR_NOTE not in hold.notes, f"{name}: a join cause was implied"
+        assert a5.REFUSAL_FLOOR_POPULATION not in hold.population, name
+        if unstable:
+            # the concurrency-only state: the central rule's own sentence is the stated reason
+            assert hold.limitations == (a5.CONCURRENCY_LIMITATION,), name
+            assert "counts only what this pass examined" in hold.limitations[0]
+
+    # every applicable cause, and NO cause that does not apply
+    assert set(hold.limitations) == _x2_expected_hold_limitations(
+        a5, truncated, counts_exact, unstable), f"{name}: wrong set of causes"
+    assert len(hold.limitations) == len(set(hold.limitations)), f"{name}: a cause was duplicated"
+
+    # D is untouched by this fix: it already weighed all three states for itself
+    d = b.confirmed_missing
+    assert d.value == 0
+    assert d.exactness == a5.LOWER_BOUND, f"{name}: D changed"
+    assert d.unit == a5.RECORDS
+
+    # the E headline: a positive VERDICTS hold withholds it, in every state
+    assert b.uncertain.value is None, f"{name}: an evidence-object count reached the headline"
+    assert b.uncertain.exactness == a5.NOT_ASSESSED
+    assert not b.uncertain.publishable_as_total
+    assert "counts supplied objects" in b.uncertain.withheld_reason
+
+    # and the rendered report, which is what a consumer actually reads
+    text = "\n".join(lines_for(b))
+    if incomplete:
+        assert "rejected as evidence: at least 1 verdicts (lower_bound)" in text, \
+            f"{name}: the rendered line still offered an exact count"
+        assert "rejected as evidence: 1 verdicts (exact)" not in text
+    else:
+        assert "rejected as evidence: 1 verdicts (exact)" in text
+    assert "1 records (exact)" not in text, f"{name}: a verdict count rendered as records"
+
+
+@pytest.mark.parametrize("name,truncated,counts_exact,unstable", X2_STATES)
+def test_x2_1_the_headline_zero_is_a_floor_on_any_incomplete_join(
+        name, truncated, counts_exact, unstable):
+    """The adjacent E-zero path (prompt requirement 6), reached with no rejection at all.
+
+    Every record carries a PRESENT verdict, so nothing is outstanding and every question returns
+    zero. On the parent blob that published ``0 records (exact)``, ``publishable_as_total=True``,
+    over a folder whose unexamined remainder could hold any number of doubts.
+    """
+    records = tuple(rec("p%d" % i) for i in range(2))
+    inventory = _x2_inv(records, folder_records=5, truncated=truncated,
+                        counts_exact=counts_exact, unstable=unstable)
+    b = report(location=loc(), inventory=inventory,
+               source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    e = b.uncertain
+    incomplete = truncated or (not counts_exact) or unstable
+
+    assert e.value == 0, f"{name}: fixture misbuilt -- a hold fired or was withheld"
+    assert e.unit == a5.RECORDS
+    assert e.consistent
+    assert not any(f.unit == a5.VERDICTS for _lab, f in b.uncertain_observations), \
+        f"{name}: fixture misbuilt -- this path must be reached with no rejection"
+
+    if not incomplete:
+        assert e.exactness == a5.EXACT, f"{name}: a complete pass was demoted"
+        assert e.publishable_as_total
+        assert e.limitations == ()
+        assert e.population == "every uncertainty question that was put returned zero"
+    else:
+        assert e.exactness == a5.LOWER_BOUND, f"{name}: an incomplete zero published EXACT"
+        assert not e.publishable_as_total, f"{name}: an incomplete zero was certified as a total"
+        assert "this pass examined" in e.population, f"{name}: the population still reads folder-wide"
+
+    assert set(e.limitations) == _x2_expected_zero_limitations(
+        a5, truncated, counts_exact, unstable), f"{name}: wrong set of causes on the zero"
+    assert len(e.limitations) == len(set(e.limitations))
+
+    text = "\n".join(lines_for(b))
+    if incomplete:
+        assert "E uncertain: 0 records (exact)" not in text, \
+            f"{name}: the rendered headline still read as an exact folder-wide zero"
+
+
+@pytest.mark.parametrize("name,truncated,counts_exact,unstable", X2_STATES)
+def test_x2_1_the_concurrency_reason_is_given_only_for_concurrency(
+        name, truncated, counts_exact, unstable):
+    """Never say the folder moved because a display list was capped.
+
+    The two new causes exist as separate sentences for this reason alone: a reader told the folder
+    changed under the pass would be told about an event that did not happen. Checked on the hold,
+    on the headline and in the rendered text.
+    """
+    records = _records_sharing(SHARED_SRC, 2)
+    b = report(location=loc(),
+               inventory=_x2_inv(records, truncated=truncated, counts_exact=counts_exact,
+                                 unstable=unstable),
+               source_verdicts=[_bad_finalisation()])
+    hold = _rejected_hold(b)
+    moved_claimed = any("changed while it was being read" in item for item in hold.limitations)
+    assert moved_claimed is unstable, \
+        f"{name}: concurrency claimed={moved_claimed} while unstable={unstable}"
+
+    settled = tuple(rec("q%d" % i) for i in range(2))
+    zero = report(location=loc(),
+                  inventory=_x2_inv(settled, folder_records=4, truncated=truncated,
+                                    counts_exact=counts_exact, unstable=unstable),
+                  source_verdicts=[verdict(r.source_path, state=lib.PRESENT)
+                                   for r in settled]).uncertain
+    zero_moved = any("changed while it was being read" in item for item in zero.limitations)
+    assert zero_moved is unstable, f"{name}: the headline zero claimed a concurrency event"
+
+
+# ------------------------------------------------------- J2. the decisive display-window pair
+
+def test_x2_1_the_decisive_display_window_pair_publishes_no_total_either_way():
+    """One folder, one set of supplied verdicts; only where the cap fell differs.
+
+    This is the measurement that turns X2-1 from an argument into a fact. The folder holds two
+    records: one whose source A1 saw, and one whose source carries a confirmed-missing enum with no
+    clause evidence. The aggregate counters say two either way. The only difference is whether A3's
+    shortened display happened to include the second one.
+
+    Measured on the parent blob:
+      inside  -> hold `1 verdicts (exact)`, publishable_as_total True
+      beyond  -> no hold at all, headline `0 records (exact)`, publishable_as_total True
+    Neither may be read as a total now, and the whole headline is asserted, not merely whether the
+    hold exists.
+    """
+    present = rec("p0")
+    refused = rec("x0", source=SHARED_SRC)
+    verdicts = [verdict(present.source_path, state=lib.PRESENT), _bad_finalisation()]
+
+    inside = report(location=loc(),
+                    inventory=_x2_inv((present, refused), folder_records=2, truncated=True),
+                    source_verdicts=verdicts)
+    beyond = report(location=loc(),
+                    inventory=_x2_inv((present,), folder_records=2, truncated=True),
+                    source_verdicts=verdicts)
+
+    # the arm that sees the refusal: a floor, with truncation named, and the headline withheld
+    hold = _rejected_hold(inside)
+    assert hold.value == 1 and hold.unit == a5.VERDICTS
+    assert hold.exactness == a5.LOWER_BOUND
+    assert not hold.publishable_as_total
+    assert a5.TRUNCATED_JOIN_LIMITATION in hold.limitations
+    assert inside.uncertain.value is None
+    assert inside.uncertain.exactness == a5.NOT_ASSESSED
+    assert not inside.uncertain.publishable_as_total
+
+    # the arm that cannot see it: no hold exists, and the zero must not pass as a folder total
+    assert not [f for lab, f in beyond.uncertain_observations if "rejected as evidence" in lab], \
+        "fixture misbuilt: the refused record must lie beyond the window on this arm"
+    e = beyond.uncertain
+    assert e.value == 0
+    assert e.unit == a5.RECORDS
+    assert e.exactness == a5.LOWER_BOUND, \
+        "a zero taken over a truncated display was published as an exact folder-wide zero"
+    assert not e.publishable_as_total
+    assert a5.ZERO_TRUNCATED_LIMITATION in e.limitations
+    assert not any("changed while it was being read" in item for item in e.limitations), \
+        "a truncated display was reported as a concurrency event"
+    assert "this pass examined" in e.population
+    assert e.consistent
+
+    # neither arm may offer a publishable HEADLINE total. The individual whole-folder counter
+    # holds stay exact on purpose (requirement 5): `records_truncated` shortens the per-record
+    # display and leaves `entries_unclassified`, `skipped_entries` and the parse counters whole, so
+    # demoting them would report a doubt that does not exist. Only the headline rendering -- the
+    # bare "E uncertain: <n> <unit>" line, with no hold label after the colon -- is checked here.
+    for name, buckets in (("inside", inside), ("beyond", beyond)):
+        assert not buckets.uncertain.publishable_as_total, name
+        for lab, fig in buckets.uncertain_observations:
+            if fig.unit == a5.VERDICTS and fig.value:
+                assert not fig.publishable_as_total, f"{name}: {lab}"
+        text = "\n".join(lines_for(buckets))
+        assert "E uncertain: 0 records (exact)" not in text, f"{name}: exact headline zero"
+        assert "E uncertain: 1 verdicts (exact)" not in text, f"{name}: exact headline count"
+
+
+# ------------------------------------------------------------------- J3. the two cardinalities
+
+@pytest.mark.parametrize("nrecords,events", ((1, 1), (2, 2), (3, 3)))
+@pytest.mark.parametrize("truncated", (False, True))
+def test_x2_1_one_refused_entry_over_n_records_keeps_both_cardinalities(nrecords, events,
+                                                                       truncated):
+    """One supplied entry, N records sharing its path: 1 object refusal, N record events.
+
+    The N-8 separation must survive the X2-1 change untouched -- the exactness moved, the
+    cardinalities did not, and neither was deduplicated by source path or by object identity.
+    """
+    b = report(location=loc(),
+               inventory=_x2_inv(_records_sharing(SHARED_SRC, nrecords), truncated=truncated),
+               source_verdicts=[_bad_finalisation()])
+    hold = _rejected_hold(b)
+    assert hold.value == 1, "one supplied entry became more or fewer than one object"
+    assert hold.unit == a5.VERDICTS
+    assert f"record-level refusals of those objects {events}" in b.confirmed_missing.population
+    assert "matched verdict objects refused for missing clause evidence 1" in \
+        b.confirmed_missing.population
+    assert hold.exactness == (a5.LOWER_BOUND if truncated else a5.EXACT)
+
+
+@pytest.mark.parametrize("truncated", (False, True))
+def test_x2_1_two_equal_signature_entries_and_the_same_object_twice(truncated):
+    """Two input entries over one path and one record: 2 objects, 1 record event.
+
+    Also the same Python object supplied twice -- still two supplied entries, because an entry is
+    what the caller handed in, not a distinct identity. Both are N-8 cases and both must keep their
+    counts while gaining the floor.
+    """
+    one = _bad_finalisation()
+    for label, verdicts in (("two equal-signature entries", [_bad_finalisation(),
+                                                             _bad_finalisation()]),
+                            ("the same object supplied twice", [one, one])):
+        b = report(location=loc(), inventory=_x2_inv(_records_sharing(SHARED_SRC, 1),
+                                                     truncated=truncated),
+                   source_verdicts=verdicts)
+        hold = _rejected_hold(b)
+        assert hold.value == 2, f"{label}: a key was counted instead of an entry"
+        assert "record-level refusals of those objects 1" in b.confirmed_missing.population, label
+        assert hold.exactness == (a5.LOWER_BOUND if truncated else a5.EXACT), label
+        if truncated:
+            assert set(hold.limitations) == {a5.TRUNCATED_JOIN_LIMITATION}, label
+
+
+@pytest.mark.parametrize("truncated", (False, True))
+def test_x2_1_one_pre_match_rejection_plus_two_matched_entries_invents_nothing(truncated):
+    """1 pre-match + 2 equal-signature matched entries = 3 objects, 1 pre-match, 1 record event."""
+    b = report(location=loc(),
+               inventory=_x2_inv(_records_sharing(SHARED_SRC, 1), truncated=truncated),
+               source_verdicts=[_pre_match_reject(), _bad_finalisation(), _bad_finalisation()])
+    hold = _rejected_hold(b)
+    assert hold.value == 3
+    population = b.confirmed_missing.population
+    assert "supplied verdict objects rejected before matching 1" in population, \
+        "the pre-match count was invented or derived"
+    assert "matched verdict objects refused for missing clause evidence 2" in population
+    assert "record-level refusals of those objects 1" in population
+    assert hold.exactness == (a5.LOWER_BOUND if truncated else a5.EXACT)
+
+
+@pytest.mark.parametrize("name,truncated,counts_exact,unstable", X2_STATES)
+def test_x2_1_only_pre_match_rejects_with_potential_unseen_records(name, truncated, counts_exact,
+                                                                   unstable):
+    """No observed record refusal at all, and records the pass never saw.
+
+    The pre-match half is exact in isolation. The PUBLISHED figure is the sum, and an unseen record
+    can only ever raise its matched half, so the sum is a floor. The rule is deliberately
+    unconditional on the flags rather than reasoning about whether some surviving verdict could
+    have matched an unseen record: that is a second join over records A5 was never shown, getting
+    it wrong would publish a total, and a floor is sound in every case.
+    """
+    kept = rec("k0")
+    b = report(location=loc(),
+               inventory=_x2_inv((kept,), folder_records=9, truncated=truncated,
+                                 counts_exact=counts_exact, unstable=unstable),
+               source_verdicts=[verdict(kept.source_path, state=lib.PRESENT),
+                                _pre_match_reject()])
+    hold = _rejected_hold(b)
+    assert hold.value == 1
+    assert "supplied verdict objects rejected before matching 1" in b.confirmed_missing.population
+    assert "matched verdict objects refused for missing clause evidence 0" in \
+        b.confirmed_missing.population
+    incomplete = truncated or (not counts_exact) or unstable
+    assert hold.exactness == (a5.LOWER_BOUND if incomplete else a5.EXACT), name
+    assert set(hold.limitations) == _x2_expected_hold_limitations(
+        a5, truncated, counts_exact, unstable), name
+
+
+# ------------------------------------------------------------------------- J4. the controls
+
+@pytest.mark.parametrize("truncated", (False, True))
+@pytest.mark.parametrize("state_", (lib.PRESENT, lib.MISSING_CONFIRMED))
+def test_x2_1_an_established_source_state_manufactures_no_evidence_hold(state_, truncated):
+    """`SOURCE_PRESENT` and a fully finalised four-clause confirmation are positive observations.
+
+    Truncation must not conjure a `VERDICTS` object out of a verdict that was accepted. A fix that
+    demoted by inventing a hold would be worse than the defect.
+    """
+    b = report(location=loc(),
+               inventory=_x2_inv(_records_sharing(SHARED_SRC, 3), truncated=truncated),
+               source_verdicts=[verdict(SHARED_SRC, state=state_)])
+    labels = [lab for lab, _f in b.uncertain_observations]
+    assert not any("rejected as evidence" in lab for lab in labels), \
+        f"an accepted verdict produced a rejection hold: {labels}"
+    assert "rejected as evidence" not in " | ".join(b.confirmed_missing.limitations)
+    if state_ == lib.MISSING_CONFIRMED:
+        assert b.confirmed_missing.value == 3
+        assert b.confirmed_missing.exactness == (a5.LOWER_BOUND if truncated else a5.EXACT)
+
+
+@pytest.mark.parametrize("truncated", (False, True))
+def test_x2_1_contradictory_verdicts_still_withhold_rather_than_publish_a_floor(truncated):
+    """Two supplied verdicts disagreeing about one path: D and the source hold are WITHHELD.
+
+    A withheld figure carries no number, so there is nothing to demote; the fix must not turn a
+    refusal into an optimistic zero or a floor of zero.
+    """
+    records = _records_sharing(SHARED_SRC, 1)
+    b = report(location=loc(), inventory=_x2_inv(records, truncated=truncated),
+               source_verdicts=[verdict(SHARED_SRC, all_four=True),
+                                verdict(SHARED_SRC, all_four=False)])
+    assert b.confirmed_missing.value is None
+    assert b.confirmed_missing.exactness == a5.NOT_ASSESSED
+    assert "disagree about the same source path" in b.confirmed_missing.withheld_reason
+    assert b.confirmed_missing.consistent
+    assert b.uncertain.value is None, "a contradiction became a countable zero"
+    for lab, fig in b.uncertain_observations:
+        if fig.value is None:
+            assert fig.exactness == a5.NOT_ASSESSED and fig.withheld_reason, lab
+            assert fig.consistent, lab
+
+
+@pytest.mark.parametrize("truncated", (False, True))
+def test_x2_1_no_verified_root_withholds_and_invents_no_optimistic_zero(truncated):
+    """With no verified inspection root, no supplied verdict has jurisdiction: D is withheld.
+
+    The early return happens before the record join, so only pre-match objects can exist -- and the
+    fix must not turn that refusal into an exact zero in either bucket.
+    """
+    b = report(location=loc(),
+               inventory=_x2_inv(_records_sharing(SHARED_SRC, 2), truncated=truncated,
+                                 inspection_roots=()),
+               source_verdicts=[_bad_finalisation()])
+    assert b.confirmed_missing.value is None
+    assert b.confirmed_missing.exactness == a5.NOT_ASSESSED
+    assert b.confirmed_missing.consistent
+    assert "no verified inspection root" in b.confirmed_missing.withheld_reason
+    assert not (b.uncertain.value == 0 and b.uncertain.exactness == a5.EXACT)
+
+
+def test_x2_1_a_withheld_hold_stays_withheld_under_every_incompleteness_state():
+    """`Figure.consistent` requires ``value is None`` exactly when ``NOT_ASSESSED``."""
+    for name, truncated, counts_exact, unstable in X2_STATES:
+        b = report(location=loc(),
+                   inventory=_x2_inv((rec("r0"),), truncated=truncated,
+                                     counts_exact=counts_exact, unstable=unstable))
+        withheld_holds = [(lab, f) for lab, f in b.uncertain_observations if f.value is None]
+        assert withheld_holds, f"{name}: fixture misbuilt -- no verdicts, so a hold must withhold"
+        for lab, figure in withheld_holds:
+            assert figure.exactness == a5.NOT_ASSESSED, f"{name}: {lab} lost its withheld state"
+            assert figure.consistent and figure.withheld_reason, f"{name}: {lab}"
+        for lab, figure in b.uncertain_observations:
+            assert figure.consistent, f"{name}: {lab}"
+
+
+def test_x2_1_a_truncated_display_does_not_demote_unrelated_producers():
+    """Requirement 5. Truncation bears on counts reached THROUGH the record detail list, and on
+    nothing else.
+
+    A3's whole-folder entry counters, A4's location holds, the category measurements, the cheap
+    subtotal, the independent A4 timestamp and the configured/selected distinction are all
+    unaffected -- asserted against a non-truncated twin built from the same inputs, field by field,
+    so "unaffected" means equal and not merely plausible.
+    """
+    records = tuple(rec("c%d" % i) for i in range(3))
+    verdicts = [verdict(r.source_path, state=lib.PRESENT) for r in records]
+    location = loc(fallback=True,
+                   shared=state(lcl.ROLE_SHARED, OTHER, verdict_=lib.ROOT_UNREACHABLE,
+                                observed=False, inspectable=False),
+                   configured_shared=OTHER, observed_at="T9")
+    cats = [catobs(ca.POSTERS, os.path.join(BASE, "p"), total=11, storage="vol-p"),
+            catobs(ca.ANALYSIS, os.path.join(BASE, "a"), expensive=True, total=22,
+                   storage="vol-a")]
+
+    def build(truncated):
+        return report(location=location,
+                      inventory=_x2_inv(records, folder_records=3, truncated=truncated),
+                      source_verdicts=verdicts, categories=cats)
+
+    plain, cut = build(False), build(True)
+
+    # the A4-derived hold: its own folder, its own observation window, untouched
+    label = f"uncertain: the configured shared folder reported {lib.ROOT_UNREACHABLE}"
+    a_plain, a_cut = _hold(plain, label), _hold(cut, label)
+    assert a_cut.subject == a_plain.subject
+    assert a_cut.window == a_plain.window, "a truncated record display moved the A4 hold's window"
+    assert a_cut.window != ("T0", "T1"), "the A4 hold borrowed A3's record-pass window (N-3/N-4)"
+    assert a_cut.exactness == a_plain.exactness == a5.NOT_ASSESSED
+    assert a_cut.limitations == a_plain.limitations == ()
+
+    # the entry-counter holds come from whole-folder counters, not the display list
+    for lab, fig in cut.uncertain_observations:
+        if fig.basis.startswith("RecordInventory") and fig.value is not None:
+            twin = _hold(plain, lab)
+            assert (fig.value, fig.unit, fig.exactness, fig.limitations) == \
+                   (twin.value, twin.unit, twin.exactness, twin.limitations), lab
+            assert fig.exactness == a5.EXACT, f"{lab} was demoted by a truncated display"
+
+    # the cost axis, the subtotal and the identity are not record-join figures at all
+    assert [(k, f.value, f.exactness) for k, f in cut.cheap] == \
+           [(k, f.value, f.exactness) for k, f in plain.cheap]
+    assert [(k, f.value, f.exactness) for k, f in cut.expensive] == \
+           [(k, f.value, f.exactness) for k, f in plain.expensive]
+    assert (cut.cheap_subtotal.value, cut.cheap_subtotal.exactness) == \
+           (plain.cheap_subtotal.value, plain.cheap_subtotal.exactness)
+    assert cut.identity.path_as_configured == plain.identity.path_as_configured == OTHER
+    assert cut.identity.path_as_selected == plain.identity.path_as_selected == CACHE
+    assert (cut.other_configuration.value, cut.other_configuration.exactness) == \
+           (plain.other_configuration.value, plain.other_configuration.exactness)
+    assert (cut.out_of_scope.value, cut.out_of_scope.exactness) == \
+           (plain.out_of_scope.value, plain.out_of_scope.exactness)
+
+    # what truncation legitimately DOES change: D says so, and E stops claiming a folder total
+    assert plain.confirmed_missing.exactness == a5.EXACT
+    assert cut.confirmed_missing.exactness == a5.LOWER_BOUND
+    assert any("truncated display" in item for item in cut.confirmed_missing.limitations)
+
+
+def test_x2_1_no_reclaimable_total_is_created_in_any_incompleteness_state():
+    """The data model is unchanged: no field exists in which a reclaimable total could be held.
+
+    A fix in this area is exactly where one would be tempted to appear -- "if the figure is only a
+    floor, how much could be reclaimed?" -- so the absence is asserted across all eight states
+    rather than once.
+    """
+    records = _records_sharing(SHARED_SRC, 2)
+    fields = {f.name for f in dataclasses.fields(a5.Buckets)}
+    assert not fields & {"reclaimable", "total", "reclaimable_total", "freeable"}
+    for name, truncated, counts_exact, unstable in X2_STATES:
+        b = report(location=loc(),
+                   inventory=_x2_inv(records, truncated=truncated, counts_exact=counts_exact,
+                                     unstable=unstable),
+                   source_verdicts=[_bad_finalisation()])
+        assert {f.name for f in dataclasses.fields(b)} == fields, name
+        text = "\n".join(lines_for(b))
+        assert a5.MISSING_SOURCE_SENTENCE not in text, \
+            f"{name}: no source was confirmed missing, so that sentence must not appear"
+        # the one line carrying the new floor wording must not also carry a reclaim verb
+        for line in lines_for(b):
+            if a5.REFUSAL_FLOOR_POPULATION.strip("; ")[:40] in line:
+                for word in ("delete", "reclaim", "obsolete"):
+                    assert word not in line.lower(), f"{name}: {line}"
+
+
+# ------------------------------------------------------ J5. X2-2, and the strengthened N-1 guard
+
+def test_x2_2_the_unit_is_the_operative_reason_the_hold_is_not_the_headline():
+    """X2-2 was a false *provenance* claim in a comment; the behaviour it guards is correct.
+
+    The mechanism is asserted behaviourally rather than by reading the comment: `VERDICTS` is not a
+    content unit, so the hold is excluded from the headline candidates, and a positive one forces
+    the headline to be withheld rather than merely skipped. Then the corrected prose is checked for
+    the claim it must no longer make.
+    """
+    assert a5.VERDICTS not in a5.CONTENT_UNITS
+    b = report(location=loc(), inventory=_x2_inv(_records_sharing(SHARED_SRC, 1)),
+               source_verdicts=[_bad_finalisation()])
+    hold = _rejected_hold(b)
+    assert hold.value == 1 and hold.unit == a5.VERDICTS
+    # the only positive hold is in a non-content unit, so the headline is WITHHELD, not passed
+    # through and not turned into a zero
+    positive = [(lab, f) for lab, f in b.uncertain_observations if f.value]
+    assert [lab for lab, _f in positive] == ["uncertain: supplied source verdicts rejected as "
+                                             "evidence"]
+    assert b.uncertain.value is None and b.uncertain.exactness == a5.NOT_ASSESSED
+    assert "never becomes a record total" in b.uncertain.withheld_reason
+
+    with open(_A5, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert "a fact about the inputs, not about the folder" not in source, \
+        "the false provenance claim corrected by X2-2 is back"
+    assert "CONTENT_UNITS" in source.split("Finding N-2, with its stated reason corrected")[1][:900], \
+        "the corrected comment no longer names the unit as the operative reason"
+
+
+def test_n1_the_demotion_is_still_enforced_at_exactly_one_point_after_x2_1():
+    """N-1, re-pointed and strengthened rather than relaxed.
+
+    The X2-1 fix deliberately did NOT pre-attach the concurrency sentence at the producer, because
+    that is the architecture N-1 closed. So the single call site must still exist, and the
+    concurrency constant must appear nowhere inside `_uncertainty` -- which the previous guard did
+    not check, and which is the drift that would actually reintroduce the defect.
+    """
+    with open(_A5, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    assert source.count("def _demote_while_moving(") == 1
+    assert source.count("_demote_while_moving(") == 2, \
+        "the central demotion is defined once and must be called exactly once"
+    assert source.count("_demote_while_moving(tuple(out), inv_unstable)") == 1
+
+    tree = ast.parse(source)
+    uncertainty = [n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_uncertainty"]
+    assert len(uncertainty) == 1
+
+    def names_in(node):
+        """Identifiers, resolved as identifiers.
+
+        Deliberately NOT a substring search on the dumped tree: `ZERO_CONCURRENCY_LIMITATION`
+        CONTAINS `CONCURRENCY_LIMITATION`, so `"CONCURRENCY_LIMITATION" not in dump` can never be
+        satisfied by any correct implementation and the guard would be a permanent false alarm --
+        or, written the other way round, a permanent vacuous pass.
+        """
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    uncertainty_names = names_in(uncertainty[0])
+    assert "CONCURRENCY_LIMITATION" not in uncertainty_names, \
+        "_uncertainty attaches the concurrency sentence to a hold itself, bypassing the one rule"
+    assert "ZERO_CONCURRENCY_LIMITATION" in uncertainty_names, \
+        "the headline zero no longer names concurrency; the headline is not a hold, so it must"
+
+    builder = [n for n in ast.walk(uncertainty[0])
+               if isinstance(n, ast.FunctionDef) and n.name == "inv_figure"][0]
+    assert "inv_unstable" not in names_in(builder), \
+        "inv_figure decides instability again, so a hold built elsewhere can bypass the rule"
+
+    normaliser = [n for n in tree.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "_demote_while_moving"][0]
+    normaliser_names = names_in(normaliser)
+    assert "CONCURRENCY_LIMITATION" in normaliser_names, "the central rule lost its own sentence"
+    assert not normaliser_names & {"TRUNCATED_JOIN_LIMITATION", "INEXACT_JOIN_LIMITATION"}, \
+        "the concurrency normaliser took on a cause that is not concurrency"
+    assert "records_truncated" not in ast.dump(normaliser)
+
+
+def test_n1_an_already_floored_hold_still_collects_the_concurrency_reason():
+    """The behavioural half of the N-1 re-pointing, which a source-text guard cannot give.
+
+    Under UT the hold is already a floor for truncation when the normaliser sees it. Before the
+    fix, `exactness != EXACT` made the normaliser skip it entirely, so the folder having moved went
+    unsaid. Both reasons must now appear, exactly once each, with the exactness still a floor.
+    """
+    records = _records_sharing(SHARED_SRC, 2)
+    hold = _rejected_hold(report(
+        location=loc(), inventory=_x2_inv(records, truncated=True, unstable=True),
+        source_verdicts=[_bad_finalisation()]))
+    assert hold.exactness == a5.LOWER_BOUND
+    assert set(hold.limitations) == {a5.TRUNCATED_JOIN_LIMITATION, a5.CONCURRENCY_LIMITATION}
+    assert hold.limitations.count(a5.CONCURRENCY_LIMITATION) == 1, "the reason was duplicated"
+    assert not hold.publishable_as_total
+
+
+# =============================================================================================
+# K. behavioural mutation controls for X2-1 / X2-2. Anchors are distinct from every anchor in
+#    sections E, G and I. Each one is a real byte change in a compiled copy, proved to apply by an
+#    assertion on the MUTANT's published output before the real module is asserted on at all.
+# =============================================================================================
+
+def _x2_mutant_fixture(**invkw):
+    return dict(location=loc(),
+                inventory=_x2_inv(_records_sharing(SHARED_SRC, 2), **invkw),
+                source_verdicts=[_bad_finalisation()])
+
+
+def test_mutant_restoring_the_unconditional_exact_evidence_hold_is_caught():
+    """X2-1 itself: the published exactness goes back to being unconditional.
+
+    This is the mutate-to-the-defect control. The mutant reproduces the parent blob's behaviour
+    exactly -- `exact`, publishable, no limitation -- on a truncated join.
+    """
+    kw = _x2_mutant_fixture(truncated=True)
+    weak = _mutant(("                   exactness=(LOWER_BOUND if join_incomplete else EXACT),",
+                    "                   exactness=EXACT,"))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert mutated.exactness == weak.EXACT, "the mutation did not apply"
+    assert mutated.publishable_as_total, "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert real.exactness == a5.LOWER_BOUND
+    assert not real.publishable_as_total
+
+
+def test_mutant_ignoring_record_detail_truncation_is_caught():
+    """The truncation cause stops being asked for."""
+    kw = _x2_mutant_fixture(truncated=True)
+    weak = _mutant(("        (inv_truncated, TRUNCATED_JOIN_LIMITATION),",
+                    "        (False, TRUNCATED_JOIN_LIMITATION),"))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert mutated.exactness == weak.EXACT and mutated.limitations == (), \
+        "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert real.exactness == a5.LOWER_BOUND
+    assert a5.TRUNCATED_JOIN_LIMITATION in real.limitations
+
+
+def test_mutant_ignoring_uncertified_counts_is_caught():
+    """The `counts_exact` cause stops being asked for -- the flag truncation does not imply."""
+    kw = _x2_mutant_fixture(counts_exact=False)
+    weak = _mutant(("        (not inv_counts_exact, INEXACT_JOIN_LIMITATION)) if applies)",
+                    "        (False, INEXACT_JOIN_LIMITATION)) if applies)"))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert mutated.exactness == weak.EXACT and mutated.limitations == (), \
+        "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert real.exactness == a5.LOWER_BOUND
+    assert set(real.limitations) == {a5.INEXACT_JOIN_LIMITATION}
+
+
+def test_mutant_blaming_concurrency_for_a_truncated_display_is_caught():
+    """A fix that reused the concurrency sentence would report an event that did not happen."""
+    kw = _x2_mutant_fixture(truncated=True)
+    weak = _mutant(("        (inv_truncated, TRUNCATED_JOIN_LIMITATION),",
+                    "        (inv_truncated, CONCURRENCY_LIMITATION),"))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert weak.CONCURRENCY_LIMITATION in mutated.limitations, "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert a5.CONCURRENCY_LIMITATION not in real.limitations, \
+        "a capped display list was published as the folder changing under the pass"
+    assert a5.TRUNCATED_JOIN_LIMITATION in real.limitations
+
+
+def test_mutant_letting_an_incomplete_headline_zero_stay_exact_is_caught():
+    """The E-zero path: truncation stops counting as a doubt about the zero."""
+    records = tuple(rec("z%d" % i) for i in range(2))
+    kw = dict(location=loc(),
+              inventory=_x2_inv(records, folder_records=6, truncated=True),
+              source_verdicts=[verdict(r.source_path, state=lib.PRESENT) for r in records])
+    weak = _mutant(("        (inv_truncated, ZERO_TRUNCATED_LIMITATION),",
+                    "        (False, ZERO_TRUNCATED_LIMITATION),"))
+    mutated = _run(weak, **kw).uncertain
+    assert mutated.value == 0 and mutated.exactness == weak.EXACT, "the mutation did not apply"
+    assert mutated.publishable_as_total, "the mutation did not apply"
+    real = report(**kw).uncertain
+    assert real.value == 0
+    assert real.exactness == a5.LOWER_BOUND
+    assert not real.publishable_as_total
+    assert a5.ZERO_TRUNCATED_LIMITATION in real.limitations
+
+
+def test_mutant_dropping_the_concurrency_reason_from_a_floored_hold_is_caught():
+    """The N-1 re-pointing, guarded behaviourally: the pre-fix skip hid one of two causes."""
+    kw = _x2_mutant_fixture(truncated=True, unstable=True)
+    weak = _mutant(("        if fig.value is None:",
+                    "        if fig.value is None or fig.exactness != EXACT:"))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert weak.CONCURRENCY_LIMITATION not in mutated.limitations, "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert set(real.limitations) == {a5.TRUNCATED_JOIN_LIMITATION, a5.CONCURRENCY_LIMITATION}, \
+        "a hold that was already a floor lost the fact that the folder also moved"
+    assert real.exactness == a5.LOWER_BOUND
+
+
+def test_mutant_dropping_the_floor_note_from_the_population_is_caught():
+    """The number must not read as a total of what the caller supplied."""
+    kw = _x2_mutant_fixture(truncated=True)
+    weak = _mutant(('                              + (REFUSAL_FLOOR_POPULATION if join_incomplete '
+                    'else ""),',
+                    '                              + "",'))
+    mutated = [f for lab, f in _run(weak, **kw).uncertain_observations
+               if "rejected as evidence" in lab][0]
+    assert weak.REFUSAL_FLOOR_POPULATION not in mutated.population, "the mutation did not apply"
+    real = _rejected_hold(report(**kw))
+    assert a5.REFUSAL_FLOOR_POPULATION in real.population
+    assert "floor rather than a total" in real.population

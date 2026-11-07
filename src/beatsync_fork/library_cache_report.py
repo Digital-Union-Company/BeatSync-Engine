@@ -94,8 +94,11 @@ ENTRIES = "entries"
 #: Supplied **evidence objects** -- not folder contents. Finding N-2: the rejected-verdict hold
 #: counts `LeafVerdict`s that A5 refused, and publishing that count in :data:`RECORDS` said "2
 #: records (exact)" for two verdicts naming **one** path -- a path that need not be a record in
-#: this folder at all. An evidence-object count is a fact about the *inputs*, so it carries its own
-#: unit and :func:`_uncertainty` never promotes it into a record total.
+#: this folder at all. So it carries its own unit, and :func:`_uncertainty` never promotes it
+#: into a record total -- because this unit is not in :data:`CONTENT_UNITS`, which is the
+#: operative reason. It is **not** purely a fact about the *inputs* (finding X2-2): the
+#: count's matched half is reached through the record join, which is why it is demoted to a
+#: floor whenever that join could not cover the folder.
 VERDICTS = "verdicts"
 UNITS = (BYTES, RECORDS, ENTRIES, VERDICTS)
 
@@ -170,6 +173,49 @@ _RECLAIM_WORDS = ("delete", "reclaim", "free", "obsolete", "safe")
 #: a reader cannot find two different accounts of the same concurrency on one page.
 CONCURRENCY_LIMITATION = ("the folder changed while it was being read, so this counts only what "
                           "this pass examined")
+
+#: Carried by an evidence-object hold whose record join could not see the whole folder, because
+#: `RecordInventory.records` is a shortened *display* (finding X2-1). Deliberately a different
+#: sentence from :data:`CONCURRENCY_LIMITATION`: a truncated display list is not a folder that
+#: moved, and saying so would report a concurrency event that never happened.
+TRUNCATED_JOIN_LIMITATION = (
+    "the supplied record detail list is a truncated display, so a supplied verdict that only a "
+    "record beyond it would have refused is not counted here")
+
+#: Carried by the same hold when A3 did not certify that its aggregate counts cover the whole
+#: folder. Separate from truncation, and not implied by it: `records_truncated` shortens only
+#: the per-record display and leaves :attr:`counts_exact` true, so each has to be asked for
+#: itself.
+INEXACT_JOIN_LIMITATION = (
+    "RecordInventory.counts_exact is False, so the record set this count was joined against is "
+    "not certified to be the whole folder")
+
+#: Why either of the two above makes the count a floor rather than a total.
+#: :attr:`_Rejections.supplied_objects` is ``pre_match_objects + matched_objects``; only the
+#: first addend is purely an input fact, and the second is reached through the record join, so
+#: a record this pass never saw can only ever *raise* it. A floor is therefore never an
+#: over-claim here, which is what makes the conservative rule safe.
+REFUSAL_FLOOR_NOTE = (
+    "a floor: a record this pass did not see could have matched a further supplied verdict and "
+    "refused it, which would raise the matched half of this count")
+
+#: Appended to that hold's population so the number is not read as a total of what the caller
+#: supplied. The population sentence is what a consumer reads to find the denominator, so the
+#: qualification belongs there and not only in a limitation.
+REFUSAL_FLOOR_POPULATION = (
+    "; and a floor rather than a total of them, because the matched half of this count was "
+    "reached through a record detail list that does not cover the whole folder")
+
+#: What a headline **zero** may still be hiding, one sentence per cause (finding X2-1). A zero
+#: that only covers the part of the folder the questions could be put to is not a folder-wide
+#: zero. The concurrency wording is preserved verbatim from before the fix: it is the one a
+#: reader and this suite already know.
+ZERO_CONCURRENCY_LIMITATION = ("the folder changed while it was being read, so entries it never "
+                               "saw are not counted here")
+ZERO_TRUNCATED_LIMITATION = ("the supplied record detail list is a truncated display, so records "
+                             "beyond it were never put to these questions")
+ZERO_INEXACT_LIMITATION = ("RecordInventory.counts_exact is False, so these questions were put "
+                           "over counts that are not certified to cover the whole folder")
 
 #: A1 leaf verdicts that **establish** a source state, as opposed to leaving it open. These are the
 #: only two outcomes that answer "what is the state of this source file?", and the distinction is
@@ -1371,10 +1417,15 @@ def _demote_while_moving(holds: tuple, unstable: bool) -> tuple:
     point: a hold added later cannot bypass a rule that runs over all of them, and there is one
     wording for the limitation instead of one per builder.
 
-    Two things are deliberately left alone. A figure that is already a floor keeps its own
-    exactness and its own reason -- it is not re-demoted and not relabelled. And a **withheld**
-    figure stays withheld: it carries no number, so there is nothing to demote, and overwriting its
-    ``NOT_ASSESSED`` would break :attr:`Figure.consistent`.
+    Two things are deliberately left alone, and one was corrected by finding X2-1. A figure
+    that is already a floor keeps its own **exactness** and its own reason -- it is not
+    re-demoted and not relabelled. It does now also gain the concurrency *reason*, because
+    the folder having moved is true of that figure whether or not something else had already
+    made it a floor: with the reason suppressed, a hold that was a floor for its own cause
+    published one of two applicable causes and read as though the other had not happened.
+    Stating a reason and demoting an exactness are therefore two decisions, not one. And a
+    **withheld** figure stays withheld: it carries no number, so there is nothing to demote,
+    and overwriting its ``NOT_ASSESSED`` would break :attr:`Figure.consistent`.
 
     **The evidence-object hold stays in scope, decided rather than inherited (finding N-8).** The
     question was put directly: a count of caller-supplied objects is a fact about the *inputs*, and
@@ -1392,17 +1443,28 @@ def _demote_while_moving(holds: tuple, unstable: bool) -> tuple:
     claim to staying exact. It is deliberately not split: one number answering "how much of what
     you supplied was unusable" is the more useful report, and a floor is the honest exactness for
     it.
+
+    **Finding X2-1 extended that same argument to two causes this function does not own.** A
+    folder that moved is not the only way the record join can fall short of the folder: a
+    truncated record *display* and uncertified aggregate counts do it too, without any
+    concurrency event at all. Those are producer facts rather than concurrency, so the hold
+    is built as a floor where it is built -- see :func:`_uncertainty` -- and this function is
+    left owning exactly one rule. Pre-attaching the concurrency sentence at a producer is
+    what finding N-1 closed, so it is not done, and this is why an already-floor figure must
+    still collect the reason here.
     """
     if not unstable:
         return tuple(holds)
     out: list = []
     for label, fig in holds:
-        if fig.value is None or fig.exactness != EXACT:
+        if fig.value is None:
             out.append((label, fig))
             continue
         limits = (fig.limitations if CONCURRENCY_LIMITATION in fig.limitations
                   else fig.limitations + (CONCURRENCY_LIMITATION,))
-        out.append((label, replace(fig, exactness=LOWER_BOUND, limitations=limits)))
+        out.append((label, replace(fig, exactness=(LOWER_BOUND if fig.exactness == EXACT
+                                                   else fig.exactness),
+                                   limitations=limits)))
     return tuple(out)
 
 
@@ -1425,6 +1487,37 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
     out: list = []
     inv_subject = _inventory_subject(inv) if inv is not None else subject
     inv_unstable = bool(getattr(inv, "unstable", False)) if inv is not None else False
+
+    # Finding X2-1. Three independent ways the record join this pass could perform fell short
+    # of the folder, each named for itself. `records_truncated` shortens the per-record
+    # *display* and leaves the aggregate counters whole; `counts_exact` answers for those
+    # counters; `unstable` is a concurrency event. Telling a reader the folder changed under
+    # the pass because a display list was capped would report an event that did not happen,
+    # so the three never share one sentence. `counts_exact` defaults to False for the same
+    # reason it does in `_source_state_figure`: an input that cannot answer the question is
+    # not an input that answered it affirmatively.
+    if inv is None:
+        inv_truncated = False
+        inv_counts_exact = True
+    else:
+        inv_truncated = bool(getattr(inv, "records_truncated", False))
+        inv_counts_exact = bool(getattr(inv, "counts_exact", False))
+
+    #: Why a count reached *through* the capped record detail list is a floor. Deliberately
+    #: carries no concurrency sentence: :func:`_demote_while_moving` owns that, once, over the
+    #: assembled hold list, and duplicating the decision in a producer is exactly what
+    #: finding N-1 closed.
+    join_incomplete = tuple(reason for applies, reason in (
+        (inv_truncated, TRUNCATED_JOIN_LIMITATION),
+        (not inv_counts_exact, INEXACT_JOIN_LIMITATION)) if applies)
+
+    #: What a headline zero may still be hiding. The concurrency cause **is** named here,
+    #: because the headline is not a hold: it is chosen after the demotion pass and
+    #: `_demote_while_moving` never sees it, so N-1's single call site is unaffected.
+    zero_doubts = tuple(reason for applies, reason in (
+        (inv_unstable, ZERO_CONCURRENCY_LIMITATION),
+        (inv_truncated, ZERO_TRUNCATED_LIMITATION),
+        (not inv_counts_exact, ZERO_INEXACT_LIMITATION)) if applies)
 
     def add(label, figure):
         out.append((label, figure))
@@ -1523,26 +1616,59 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
         # over one list fed at two cardinalities, so it published the number of record-level
         # refusal *events* whenever a source path was shared, and dropped equal-signature entries
         # entirely. `supplied_objects` is the input-entry population and nothing else.
+        #
+        # Finding X2-1 is why its exactness is now conditional. `supplied_objects` is
+        # `pre_match_objects + matched_objects`, and `matched_objects` is reached by matching
+        # supplied entries against `RecordInventory.records` -- a capped *display* list, not
+        # necessarily every record in the folder. So whenever that list is truncated, or the
+        # aggregate counts are not certified, a supplied verdict that only an unseen record
+        # would have refused is simply absent from this number. Published `EXACT` with an
+        # empty `limitations` tuple, it read as a complete count of what the caller handed in.
+        # Measured on the parent commit, identical supplied verdicts over one folder:
+        # the refused record inside the display window gave `1 verdicts (exact)` with
+        # `publishable_as_total` True, and beyond it gave no hold at all -- a difference in
+        # where a cap fell, published as a difference in fact. Axis D already weighed all
+        # three states in `complete_coverage`; its limitations never reached here. The
+        # pre-match half of the sum genuinely is exact in isolation, but the published figure
+        # is the sum, and a sum with a floor in it is a floor.
+        #
+        # The rule is deliberately unconditional on the two flags rather than reasoning about
+        # whether an unseen record *could* have matched a surviving refusable verdict. That
+        # second join is a question about records A5 was never shown, and getting it wrong
+        # would publish a total; a floor, by contrast, is sound in every case, because an
+        # unseen match can only raise `matched_objects` and never lower it.
         add("uncertain: supplied source verdicts rejected as evidence",
-            Figure(value=rejected.supplied_objects, unit=VERDICTS, exactness=EXACT,
+            Figure(value=rejected.supplied_objects, unit=VERDICTS,
+                   exactness=(LOWER_BOUND if join_incomplete else EXACT),
                    axis=AXIS_UNCERTAIN,
                    subject=inv_subject,
                    population="supplied verdict objects that A5 refused as evidence; not a count "
                               "of distinct cache records, not a count of record-level refusals, "
-                              "and not necessarily records of this folder at all",
+                              "and not necessarily records of this folder at all"
+                              + (REFUSAL_FLOOR_POPULATION if join_incomplete else ""),
                    basis="A5 rejection of unusable source verdicts", window=window,
-                   notes=tuple(f"{why}: {what}" for why, what in rejected.notes)[:8]))
+                   limitations=join_incomplete,
+                   # Sliced BEFORE the floor note is appended, so a hold already carrying eight
+                   # rejection notes cannot push the reason it is a floor off the end.
+                   notes=tuple(f"{why}: {what}" for why, what in rejected.notes)[:8]
+                         + ((REFUSAL_FLOOR_NOTE,) if join_incomplete else ())))
 
     # Rule T-3, enforced once over every hold rather than per producer (finding N-1). This runs
     # before the headline is chosen, so the single-contributor passthrough below cannot copy an
     # exactness the folder's own instability has already forfeited.
     out = list(_demote_while_moving(tuple(out), inv_unstable))
 
-    # Finding N-2. An evidence-object hold is a fact about the inputs, not about the folder, so it
-    # is never a candidate for the record-unit headline. If it is the only positive observation the
-    # headline is **withheld** rather than supplied: E would otherwise publish a count of supplied
-    # verdicts as an exact number of this folder's records. The hold itself stays on its own line
-    # with its own unit, so refusing the aggregate costs no evidence.
+    # Finding N-2, with its stated reason corrected by finding X2-2. The behaviour below is
+    # right and is unchanged; the justification was not. An evidence-object hold is **not** a
+    # fact about the inputs and not about the folder -- `supplied_objects` includes
+    # `matched_objects`, which exists only because of the record join, which is precisely why
+    # `_demote_while_moving` demotes it and why finding X2-1 makes it a floor on a truncated
+    # or uncertified join. The real reason it can never become the record-unit headline is
+    # the **unit**: `VERDICTS` is not in `CONTENT_UNITS`, so it is excluded from
+    # `contributing` below; and a positive `VERDICTS` hold additionally forces the headline to
+    # be **withheld** rather than merely skipped, since E would otherwise publish a count of
+    # supplied verdicts as a number of this folder's records. The hold stays on its own line
+    # in its own unit, so refusing the aggregate costs no evidence.
     evidence = [(label, fig) for label, fig in out
                 if fig.unit == VERDICTS and fig.value is not None and fig.value > 0]
     contributing = [(label, fig) for label, fig in out
@@ -1560,22 +1686,30 @@ def _uncertainty(obs: Observation, inv, subject, window, rejected, source_holds=
     elif len(contributing) == 1 and not any_withheld:
         label, fig = contributing[0]
         headline = replace(fig, notes=fig.notes + (f"the only uncertainty observed: {label}",))
-    elif not contributing and not any_withheld and not inv_unstable:
+    elif not contributing and not any_withheld and not zero_doubts:
         headline = Figure(value=0, unit=RECORDS, exactness=EXACT, axis=AXIS_UNCERTAIN,
                           subject=subject,
                           population="every uncertainty question that was put returned zero",
                           basis="all A5 uncertainty observations", window=window)
     elif not contributing and not any_withheld:
-        # Every question returned zero, but the folder demonstrably moved while it was being read,
-        # so each of those zeros describes only what the pass managed to examine. Publishing it as
-        # an exact folder-wide zero would contradict this report's own concurrency caveat.
+        # Every question returned zero, but not over the whole folder, so each of those zeros
+        # describes only the part this pass could put the question to. Publishing it as an
+        # exact folder-wide zero would contradict this report's own caveats.
+        #
+        # Finding X2-1: a moving folder was not the only way to arrive here. A truncated
+        # record *display* reaches this branch identically, because the refused record that
+        # would have raised a hold can simply lie beyond the display window -- measured, one
+        # folder and one set of supplied verdicts published `E uncertain: 1 verdicts` or
+        # `E uncertain: 0 records (exact)` depending only on where the cap fell, the second
+        # of them `publishable_as_total`. The zero is kept rather than withheld: it is a real
+        # observation and withholding it would destroy evidence. It is demoted to a floor
+        # that names every cause that applies and no cause that does not.
         headline = Figure(value=0, unit=RECORDS, exactness=LOWER_BOUND, axis=AXIS_UNCERTAIN,
                           subject=subject,
                           population="every uncertainty question that was put returned zero for "
-                                     "the entries this pass examined",
+                                     "the entries and records this pass examined",
                           basis="all A5 uncertainty observations", window=window,
-                          limitations=("the folder changed while it was being read, so entries it "
-                                       "never saw are not counted here",))
+                          limitations=zero_doubts)
     else:
         headline = withheld(
             "uncertain, but not countable: these holds can refer to the same entries and are not "
