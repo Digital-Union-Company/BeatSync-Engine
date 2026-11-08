@@ -8654,8 +8654,9 @@ A6_NAME_ONLY_SENTENCE_CONTEXT = (
 #: the folder this read-out would NAME is not provably the folder a check would REACH.
 A6_AMBIGUOUS_PATH_WARNING = (
     '  this folder was NOT inspected, because the text above does not have one unambiguous '
-    'absolute form: an environment reference, a leading "~", a quoted or relative path, or a '
-    'redundant separator is expanded before a folder is reached but not before it is displayed, '
+    'absolute form: an environment reference, a leading "~", a quoted or relative path, a '
+    'redundant separator, a component ending in a dot or a space, or a reserved device name is '
+    'rewritten before a folder is reached but not before it is displayed, '
     'so the folder named here and the folder a check would reach can be two different folders. '
     'No verdict is attached to a folder this report cannot name exactly. Save the folder in '
     'Settings as a plain absolute path to have it inspected.')
@@ -8725,6 +8726,22 @@ def _a6_startup_snapshot_superseded():
     return _A6_SNAPSHOT_SUPERSEDED is not False
 
 
+#: The Windows device names a full-path resolution can redirect into the device namespace, as
+#: `ntpath` itself enumerates them -- including the superscript-digit spellings Win32 accepts for
+#: the serial and parallel ports. Written out as a constant rather than reached through
+#: `ntpath.isreserved`, which exists only from Python 3.12 and would make this gate's answer depend
+#: on which interpreter the application happened to start under.
+A6_RESERVED_DEVICE_NAMES = frozenset(
+    {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'}
+    | {'COM' + c for c in '123456789\xb9\xb2\xb3'}
+    | {'LPT' + c for c in '123456789\xb9\xb2\xb3'})
+
+#: Characters a Windows path component cannot hold. The colon is here because a colon after the
+#: drive names an alternate data stream rather than a folder, and the drive itself is split off
+#: before these are checked.
+A6_FORBIDDEN_COMPONENT_CHARS = '<>:"|?*'
+
+
 def _a6_configured_path_is_unambiguous(text):
     """Does `text` name exactly the folder an A4 observation of it would reach? Pure text.
 
@@ -8753,9 +8770,14 @@ def _a6_configured_path_is_unambiguous(text):
     costs a read-out; publishing a verdict about the wrong folder costs the truth.
 
     A table in `tests/test_library_cache_panel.py` pins this to `normalize_root_text` + `abspath`
-    over real cases, in the direction that matters: every text accepted here is proved to resolve
-    to itself. That is the same "pin the equivalence, do not trust the comment" discipline A1 uses
-    for its own `clips_review` equivalence.
+    over real cases, in the direction that matters: every text the TABLE offers and this function
+    accepts is proved to resolve to itself. That is the same "pin the equivalence, do not trust the
+    comment" discipline A1 uses for its own `clips_review` equivalence -- and it is a proof over
+    that table, not over every string a settings file can hold. The claim is deliberately stated
+    that narrowly now: an independent review enumerated 84 texts and found seven that an earlier
+    version of this function accepted while the resolver moved them, none of which the table
+    contained. A finite table proves a finite set of cases; the enumeration below is what carries
+    the rest, and it carries it only as far as the canonicalisations it names.
     """
     if not isinstance(text, str) or not text or text != text.strip():
         return False
@@ -8780,6 +8802,61 @@ def _a6_configured_path_is_unambiguous(text):
     # Separator form, `.`, `..` and trailing separators, all of which `abspath` rewrites.
     if os.path.normpath(text) != text:
         return False
+
+    # --- the second half of the question, which the first version of this gate missed ---------
+    #
+    # Everything above models A1's text transformations and `normpath`. But `normpath` is pure
+    # string work, while the resolver finishes with a Win32 full-path call, and that call performs
+    # canonicalisations `normpath` does not. An independent review measured seven texts that
+    # passed every test above and still moved -- identically on Python 3.13.12 and 3.14.3:
+    #
+    #   C:\cache.  C:\cache...  C:\a.\b  C:\a\b.       a trailing dot stripped per component
+    #   \\server\share\a.                              the same, across a UNC root
+    #   four consecutive separators                    collapsed to three
+    #   C:\NUL                                         redirected into the device namespace
+    #
+    # Four of those denote the same directory either way, so the verdict landed on the right
+    # folder and only this function's stated invariant was broken. `C:\NUL` is the one where the
+    # two are genuinely different objects. Both are refusals now, because the panel's promise is
+    # that the folder it NAMES is the folder a check REACHES, and "same folder by a different
+    # name" is not that promise.
+    #
+    # The extra canonicalisations are reproduced as REFUSALS rather than detected by resolving the
+    # text, which is what keeps the test purely syntactic: resolving it would consult the process
+    # working directory, the exact thing this function exists not to do. The cost is accepted and
+    # it is one-directional -- a few legitimate but unusual folders are refused a read-out. Being
+    # stricter costs a report; being looser costs the truth.
+    for ch in text:
+        # Control characters, which no real path holds and which the display cannot render.
+        if ch < ' ':
+            return False
+
+    tail = remainder.split('\\')
+    # The leading element is always empty (the root separator). A single trailing empty element is
+    # the bare root itself -- `C:\` -- which is stable and stays acceptable.
+    tail = tail[1:] if tail[-1] else tail[1:-1]
+    head = drive.split('\\')[2:] if drive[:1] in ('\\', '/') else []
+
+    for component in head + tail:
+        # An empty component here is a separator run that survived `normpath`: four consecutive
+        # separators do, and are then collapsed to three. The UNC and extended-length prefixes are
+        # checked too, because a server or share name canonicalises exactly as a component does.
+        if not component:
+            return False
+        if component[-1] == '.' or component[-1] == ' ':
+            return False
+
+    for component in tail:
+        for ch in component:
+            if ch in A6_FORBIDDEN_COMPONENT_CHARS:
+                return False
+        # A device name is reserved with or without an extension, in any case, and the comparison
+        # is on the stem before the first dot. Deliberately wider than what was measured today --
+        # only a bare final `NUL` was seen to redirect -- because which spellings redirect is a
+        # property of the platform call, not of this application, and a path that names a device
+        # is not a cache folder under any reading.
+        if component.split('.')[0].strip().upper() in A6_RESERVED_DEVICE_NAMES:
+            return False
     return True
 
 

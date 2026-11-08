@@ -110,6 +110,10 @@ A6_CONSTANTS = (
     "A6_REFUSED_NO_CONTACT_NOTE",
     "A6_REFUSED_CONTEXT_LINE",
     "A6_SNAPSHOT_SCOPE_NOTE",
+    # the two tables the strengthened R-A gate reads (F1): the Windows device names a full-path
+    # resolution can redirect, and the characters a path component cannot hold
+    "A6_RESERVED_DEVICE_NAMES",
+    "A6_FORBIDDEN_COMPONENT_CHARS",
 )
 
 #: Module-level A6 state, kept separate from the constants above because it is NOT a constant: it
@@ -326,7 +330,8 @@ class watch_a4_filesystem:  # noqa: N801  (a context manager, named for what it 
 
 def load_a6(*, shared_config=None, local_default="", fs=None, open_fn=None,
             cache_location=None, cache_report=None, analysis_cache=None,
-            mutate_gate=False, mutate_path_gate=False) -> dict:
+            mutate_gate=False, mutate_path_gate=False,
+            mutate_path_gate_pre_canonicalisation=False) -> dict:
     """Execute the real A6 constants and functions against a controlled namespace."""
     fs = fs if fs is not None else _FsSpy()
     namespace: dict = {
@@ -359,6 +364,8 @@ def load_a6(*, shared_config=None, local_default="", fs=None, open_fn=None,
             node = _mutate_gate_closed(node)
         if mutate_path_gate and name == PATH_OK_FN:
             node = _mutate_path_gate_open(node)
+        if mutate_path_gate_pre_canonicalisation and name == PATH_OK_FN:
+            node = _mutate_path_gate_pre_canonicalisation(node)
         body.append(node)
 
     exec(compile(ast.Module(body=body, type_ignores=[]), "<gui-a6>", "exec"),
@@ -408,6 +415,35 @@ def _mutate_path_gate_open(node: ast.FunctionDef) -> ast.FunctionDef:
     clone.body = [ast.Return(value=ast.Constant(True))]
     mutated = ast.fix_missing_locations(clone)
     assert ast.unparse(mutated) != original, "the R-A control did not change the gate"
+    return mutated
+
+
+def _mutate_path_gate_pre_canonicalisation(node: ast.FunctionDef) -> ast.FunctionDef:
+    """The F1 NEGATIVE CONTROL: truncate the gate back to the state the review measured.
+
+    The strengthened gate is the original text tests followed by an enumeration of the Win32
+    canonicalisations `os.path.normpath` does not perform. This control cuts everything after the
+    `normpath` check and returns `True` there, which is *exactly* the shipped gate of PR #94 head
+    `add507e2` — so the F1 tests reproduce the seven measured counterexamples rather than merely
+    asserting that today's gate refuses some strings.
+
+    Anchored on the `normpath` test and the anchor count is asserted: a control that silently
+    located nothing would make the F1 group look verified when it is not. It also asserts there
+    IS something after the anchor, so the control cannot pass by cutting an empty tail.
+    """
+    clone = ast.parse(ast.unparse(node)).body[0]
+    anchors = [i for i, stmt in enumerate(clone.body)
+               if isinstance(stmt, ast.If) and "normpath" in ast.unparse(stmt.test)]
+    assert len(anchors) == 1, (
+        f"expected exactly one normpath test in {node.name}; found {len(anchors)}. The F1 control "
+        "cannot be trusted against an anchor it did not locate.")
+    cut = anchors[0] + 1
+    assert cut < len(clone.body), (
+        "there is nothing after the normpath check to remove, so this control would be a no-op "
+        "and the F1 assertions would prove nothing")
+    clone.body = clone.body[:cut] + [ast.Return(value=ast.Constant(True))]
+    mutated = ast.fix_missing_locations(clone)
+    assert ast.unparse(mutated) != ast.unparse(node), "the F1 control did not change the gate"
     return mutated
 
 
@@ -716,6 +752,9 @@ _ALLOWED_CALL_NAMES = frozenset({
     # pure text, pure string and list building; none of these reaches a disk
     "join", "splitdrive", "normpath", "get_input_dir", "isinstance", "bool",
     "append", "extend", "strip", "startswith", "format", "get",
+    # F1: the strengthened R-A gate splits the path into components and upper-cases a stem to
+    # compare it against the device-name table. Both are pure string operations.
+    "split", "upper",
     # the injected observation clock
     "now", "astimezone", "isoformat",
 })
@@ -1430,6 +1469,43 @@ _PATH_CASES = (
     (None, False),
     (123, False),
     ("", False),
+    # --- F1: the seven counterexamples the independent review measured, each of which the
+    #     pre-R3 gate ACCEPTED while the resolver moved it. `test_i10` proves separately that
+    #     each one really does move, so none of these rows is an invented refusal.
+    (r"C:\cache.", False),                       # a trailing dot is stripped per component
+    (r"C:\cache...", False),
+    (r"C:\a.\b", False),                         # ... including an intermediate component
+    (r"C:\a\b.", False),
+    ("\\\\server\\share\\a.", False),            # ... and across a UNC root
+    (r"C:\NUL", False),                          # redirected into the device namespace
+    ("\\" * 4, False),                           # a separator run normpath leaves alone
+    # --- F1: the same canonicalisations in the shapes the seven did not cover
+    (r"C:\a \b", False),                         # a trailing SPACE is stripped too
+    (r"C:\a. \b", False),                        # ... and a dot-space pair, in either order
+    ("\\\\server.\\share\\a", False),            # the UNC server name canonicalises as well
+    ("\\\\server\\share.\\a", False),
+    (r"C:\nul.txt", False),                      # a device name keeps its meaning with a suffix
+    (r"C:\Nul", False),                          # ... and is case-insensitive
+    (r"C:\a\CON", False),                        # ... in any component
+    (r"C:\cache\COM1", False),
+    (r"C:\NUL .txt", False),                     # ... and the stem is compared with its trailing
+                                                 #     space stripped, because whether THAT
+                                                 #     spelling redirects is a property of the
+                                                 #     platform call, not of this application
+    ("C:\\a\x00b", False),                       # control characters, which no real path holds
+    ("C:\\a\x01b", False),
+    ("C:\\a\tb", False),                         # interior whitespace `_clean` does not strip
+    (r"C:\a|b", False),                          # characters a component cannot hold
+    (r"C:\a<b", False),
+    # --- F1: and the shapes that must SURVIVE the new rules, so this is a tightening and not a
+    #     refusal of everything. `test_i12` asserts these are still inspected end to end.
+    (r"C:\NULL", True),                           # a device name is a component, not a prefix
+    (r"C:\COM10", True),
+    (r"C:\a.b\c.d", True),                        # dots INSIDE a component are ordinary
+    (r"C:\a b\c d", True),                        # so are spaces
+    ("C:\\日本語\\кэш", True),                     # and non-ASCII
+    ("C:\\", True),                               # the bare drive root is stable
+    (r"\\?\C:\cache", True),                      # an extended-length prefix is left alone
 )
 
 
@@ -1591,6 +1667,216 @@ def test_i8_the_gate_reads_no_environment_and_touches_no_disk(tree):
     assert "os.environ" not in referenced, "the ambiguity gate reads the environment"
 
 
+# ---------------------------------------------------------------------------
+# F1 — the Win32 canonicalisations `normpath` does not perform
+# ---------------------------------------------------------------------------
+#
+# `os.path.normpath` is pure string work. The resolver A4 uses finishes with `os.path.abspath`,
+# which on Windows goes through `GetFullPathName` and ALSO strips trailing dots and spaces from
+# every component, collapses a degenerate separator run, and redirects a reserved device name into
+# the device namespace. A gate that models the second with the first therefore accepted text the
+# resolver moved, and an independent review measured seven such texts out of 84 — identically on
+# Python 3.13.12 and 3.14.3. `test_i1`'s table could not see any of them: it proves the property
+# over the rows it contains, and none of those rows had a trailing dot, a device name or a
+# degenerate separator run.
+
+#: The seven measured counterexamples, as the review recorded them.
+_CANONICALISATION_COUNTEREXAMPLES = (
+    r"C:\cache.",
+    r"C:\cache...",
+    r"C:\a.\b",
+    r"C:\a\b.",
+    "\\\\server\\share\\a.",
+    r"C:\NUL",
+    "\\" * 4,
+)
+
+#: A wider corpus than the table, for the property test below. Deliberately includes shapes that
+#: must be ACCEPTED as well as shapes that must be refused: a property test over refusals only is
+#: satisfied by a gate that refuses everything.
+_CANONICALISATION_CORPUS = _CANONICALISATION_COUNTEREXAMPLES + (
+    # device names: every stem, every position, with and without a suffix, in mixed case
+    r"C:\nul", r"C:\Nul", r"C:\NUL.txt", r"C:\nul.json", r"C:\CON.log", r"C:\aux",
+    r"C:\PRN", r"C:\COM1", r"C:\com9", r"C:\LPT1", r"C:\lpt9.dat", "C:\\COM\xb9",
+    r"C:\NUL\sub", r"C:\a\NUL\b", r"C:\a\CON", "C:\\CONIN$", "C:\\CONOUT$.x",
+    r"C:\NUL .txt", r"C:\NUL.a.b",
+    # NOT device names: the stem is a whole component, never a prefix or a substring
+    r"C:\NULL", r"C:\CONFIG", r"C:\communications", r"C:\nulsoft\cache", r"C:\a\prnt",
+    r"C:\COM10", r"C:\COM0", r"C:\LPT10",
+    # trailing dot / space in every position, including the UNC head
+    r"C:\a \b", r"C:\a .\b", r"C:\a. \b", r"C:\a\b. ",
+    "\\\\server.\\share\\a", "\\\\server\\share.\\a", "\\\\server \\share\\a",
+    "\\\\?\\C:\\a.", "\\\\?\\UNC\\server\\share\\a.",
+    # degenerate separator runs
+    "\\" * 3, "\\" * 5, "C:\\\\", "C:\\\\\\a",
+    # control characters and characters a component cannot hold
+    "C:\\a\x00b", "C:\\a\x01b", "C:\\a\x1fb", "C:\\a\tb",
+    r"C:\a|b", r"C:\a<b", r"C:\a>b", r"C:\a?b", r"C:\a*b", 'C:\\a"b', r"C:\a:b",
+    # legitimate and stable: these must survive
+    r"C:\cache", r"C:\a.b\c.d", r"C:\a b\c d", "C:\\日本語\\кэш", "C:\\", "Z:\\",
+    r"\\?\C:\cache", r"\\?\UNC\server\share\cache", r"\\nas\beatsync\cache",
+    r"C:\PROGRA~1\BeatSync", r"C:\a-b_c.d\e (1)",
+)
+
+#: Shapes the strengthened gate must still ACCEPT, so F1 is a tightening and not a capitulation.
+_STILL_ACCEPTED = (
+    r"C:\cache", r"C:\BeatSync\video_analysis_cache", r"D:\a\b\c", r"C:\caché-ünïcode",
+    r"C:\cache with spaces\deeper", r"\\server\share\cache", r"C:\~notleading", r"C:\a~b",
+    "C:\\", "Z:\\", r"\\?\C:\cache", r"\\?\UNC\server\share\cache",
+    r"C:\PROGRA~1\BeatSync", r"C:\NULL", r"C:\COM10", r"C:\a.b\c.d", r"C:\a b\c d",
+    "C:\\日本語\\кэш",
+)
+
+
+class _TripwireOs:
+    """An `os` whose ONLY permitted members are the two pure path helpers the gate may use.
+
+    A structural ban (`test_i8`) proves the gate's source names nothing forbidden. This proves the
+    stronger dynamic property over a whole corpus: every other `os` member is unreachable, so a
+    future clause that reads the environment or resolves against the working directory raises here
+    rather than passing quietly. An environment read leaves no filesystem trace for a spy, which
+    is why this is a tripwire and not a recorder.
+    """
+
+    class _Path:
+        def __init__(self, log):
+            self._log = log
+
+        def splitdrive(self, text):
+            self._log.append("splitdrive")
+            return os.path.splitdrive(text)
+
+        def normpath(self, text):
+            self._log.append("normpath")
+            return os.path.normpath(text)
+
+        def __getattr__(self, name):
+            raise AssertionError(f"the textual gate reached os.path.{name}")
+
+    def __init__(self):
+        self.log: list[str] = []
+        self.path = self._Path(self.log)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the textual gate reached os.{name}")
+
+
+def _probed_target(text):
+    """The folder A4 would actually reach for `text` — A4's own composition, nothing re-derived."""
+    return os.path.abspath(a1.normalize_root_text(ac._clean(text)))
+
+
+@pytest.mark.parametrize("text", _CANONICALISATION_COUNTEREXAMPLES)
+def test_i10_every_measured_counterexample_really_moved_and_is_now_refused(tree, text):
+    """Three assertions in one place, because each is worthless without the others.
+
+    1. the resolver REALLY moves this text — so the row is a measured counterexample and not an
+       invented refusal;
+    2. the PRE-R3 gate accepted it — the control reproduces the defect on this machine rather than
+       citing the review; and
+    3. the shipped gate refuses it, and the refusal is a refusal: no A4 call, no filesystem
+       contact at either seam, and `not_inspected` in the read-out.
+    """
+    probed = _probed_target(text)
+    assert probed != text, (
+        f"{text!r} no longer moves under the resolver on this platform; re-measure this row "
+        "rather than trusting it")
+
+    pre = load_a6(mutate_path_gate_pre_canonicalisation=True)
+    assert pre[PATH_OK_FN](text) is True, (
+        f"the pre-R3 control refused {text!r}, so it does not reproduce the gate the review "
+        "measured and these assertions prove nothing about the fix")
+
+    spy = _ModuleSpy(a4, "inspect_location")
+    with watch_a4_filesystem() as a4fs:
+        ns = load_a6(shared_config=cfg(text, True), local_default=tree["local_parent"],
+                     cache_location=spy)
+        rendered = ns[HANDLER](True)
+    assert ns[PATH_OK_FN](text) is False, f"{text!r} is still accepted"
+    assert spy.count("inspect_location") == 0, f"{text!r} reached A4"
+    assert a4fs.calls == [], f"{text!r} reached a disk: {a4fs.calls}"
+    assert ns["_fs"].calls == [], f"{text!r} touched the filesystem: {ns['_fs'].calls}"
+    assert reported_verdicts(shared_lines(rendered, ns), ns) == {a1.NOT_INSPECTED}
+    assert ns["A6_AMBIGUOUS_PATH_WARNING"] in rendered, "the refusal is not explained"
+
+
+def test_i11_no_text_the_gate_accepts_is_moved_by_the_resolver():
+    """The property, over a corpus rather than over the table — which is the lesson of F1.
+
+    `test_i1` proves `accepted => resolves to itself` for the rows of `_PATH_CASES`. That is a
+    proof about a table, and a docstring that generalises it to every possible string is claiming
+    more than the test delivers. This widens the evidence to the adversarial corpus above, and the
+    accepted count is asserted so a gate that refused everything could not pass.
+    """
+    ns = load_a6()
+    gate = ns[PATH_OK_FN]
+    corpus = list(_CANONICALISATION_CORPUS) + [t for t, _ in _PATH_CASES]
+    accepted = [t for t in corpus if isinstance(t, str) and gate(t)]
+    assert len(accepted) >= len(_STILL_ACCEPTED), (
+        f"only {len(accepted)} of {len(corpus)} texts were accepted; a gate that refuses "
+        "everything satisfies no property worth having")
+    for text in accepted:
+        assert _probed_target(text) == text, (
+            f"the gate accepted {text!r} but A4 would probe {_probed_target(text)!r}. A verdict "
+            "would be attributed to the wrong folder.")
+
+
+@pytest.mark.parametrize("text", _STILL_ACCEPTED)
+def test_i12_the_tightening_refuses_no_ordinary_absolute_path(text):
+    """The companion `test_i10` needs. The gate is permitted to be stricter than necessary, but a
+    panel that refuses every real folder is not the fix either — so the ordinary drive, UNC,
+    extended-length, unicode, spaced and dotted-component shapes are pinned as ACCEPTED."""
+    ns = load_a6()
+    assert ns[PATH_OK_FN](text) is True, f"an ordinary absolute path was refused: {text!r}"
+    assert _probed_target(text) == text, f"the premise changed: {text!r} now moves"
+
+
+def test_i13_a_real_folder_with_a_dot_and_a_space_in_its_name_is_still_inspected(tmp_path):
+    """End to end, on a folder that actually exists: the new per-component rules reject a trailing
+    dot or space, NOT a dot or a space inside a component. Measured through the real A4, because
+    this is the case a careless implementation of F1 would break."""
+    shared = tmp_path / "Shared cache v1.2"
+    shared.mkdir()
+    (shared / "a_1234567890abcdef.json").write_text('{"v": 1}', encoding="utf-8")
+    local_parent = tmp_path / "input"
+    (local_parent / "video_analysis_cache").mkdir(parents=True)
+
+    spy = _ModuleSpy(a4, "inspect_location")
+    with watch_a4_filesystem() as a4fs:
+        ns = load_a6(shared_config=cfg(str(shared), True), local_default=str(local_parent),
+                     cache_location=spy)
+        rendered = ns[HANDLER](True)
+    assert ns[PATH_OK_FN](str(shared)) is True, f"a real folder was refused: {str(shared)!r}"
+    assert spy.count("inspect_location") == 1
+    assert a4fs.touching(str(shared)), "the folder was never reached"
+    assert a1.PRESENT in reported_verdicts(shared_lines(rendered, ns), ns)
+    assert ns["A6_AMBIGUOUS_PATH_WARNING"] not in rendered
+
+
+def test_i14_the_gate_reaches_no_os_member_but_the_two_pure_path_helpers():
+    """The dynamic half of `test_i8`, over the whole adversarial corpus.
+
+    The gate is executed against an `os` that raises on every attribute except `path.splitdrive`
+    and `path.normpath`, so an environment read or a working-directory resolution is structurally
+    unreachable rather than merely unobserved. The members actually used are asserted exactly, so
+    a new pure helper has to be admitted deliberately.
+    """
+    node = _func(PATH_OK_FN)
+    tripwire = _TripwireOs()
+    namespace = {"os": tripwire, "__builtins__": builtins}
+    consts = [n for n in _tree().body
+              if isinstance(n, ast.Assign) and len(n.targets) == 1
+              and getattr(n.targets[0], "id", None) in {"A6_RESERVED_DEVICE_NAMES",
+                                                        "A6_FORBIDDEN_COMPONENT_CHARS"}]
+    assert len(consts) == 2, "the gate's two tables are not module-level assignments any more"
+    exec(compile(ast.Module(body=consts + [node], type_ignores=[]), "<gate>", "exec"),
+         namespace)  # noqa: S102
+    gate = namespace[PATH_OK_FN]
+    for text in _CANONICALISATION_CORPUS + tuple(t for t, _ in _PATH_CASES):
+        gate(text)
+    assert sorted(set(tripwire.log)) == ["normpath", "splitdrive"], sorted(set(tripwire.log))
+
+
 # ===========================================================================
 # GROUP J — R-B: a successful Settings save supersedes the startup snapshot
 # ===========================================================================
@@ -1686,6 +1972,64 @@ def test_j2_a_successful_save_supersedes_and_the_panel_then_withholds_everything
         "the panel claimed nothing was configured, which it cannot know"
     assert ns["A6_STARTUP_SNAPSHOT_NOTE"] not in text, \
         "a note about 'the folder above' survived with no folder above it"
+
+
+def test_j2b_a_superseded_read_out_does_not_reveal_that_a_folder_was_configured(tree):
+    """The hole `test_j2` left open, measured: mutation M10 of the independent review.
+
+    `_a6_cache_report_lines` passes `''` into `_a6_uninspected_lines` under supersession, so the
+    tail cannot disclose the one bit the rest of the refusal withholds — whether a folder was
+    configured at startup at all. Changing that single argument to `configured_folder` left ALL
+    137 tests of this suite green while adding four lines to the read-out: the name-only sentence
+    context and A5's two approved sentences, which `_a6_uninspected_lines` emits only when a folder
+    is named. `test_j2` asserts five absences, and none of them is that one.
+
+    So the property is pinned as an IDENTITY rather than as a sixth absence, because an enumerated
+    list of absences is exactly what was incomplete: under supersession the read-out must be the
+    same text whether or not a folder was configured, in BOTH modes. Any leak breaks the equality,
+    through whichever line it leaks.
+
+    The second half is the positive control. An identity test alone is satisfied by deleting the
+    three lines everywhere, so the unsuperseded name-only read-out is asserted to still carry all
+    three — and the two approved ones by identity against A5's own constants, never as copied text.
+    """
+    configured = load_a6_with_save(shared_config=cfg(tree["shared"], True),
+                                   local_default=tree["local_parent"])
+    assert configured[SAVE_HANDLER](r"C:\Somewhere\Else", True)
+    assert configured[SUPERSEDED_FN]() is True, "the premise failed: no supersession"
+
+    bare = load_a6_with_save(shared_config=cfg("", False), local_default=tree["local_parent"])
+    assert bare[SAVE_HANDLER](r"C:\Somewhere\Else", True)
+    assert bare[SUPERSEDED_FN]() is True, "the premise failed: no supersession"
+
+    for probe in (False, True):
+        with watch_a4_filesystem() as a4fs:
+            with_folder = configured[HANDLER](probe)
+            without_folder = bare[HANDLER](probe)
+        assert with_folder == without_folder, (
+            "a superseded read-out discloses whether a folder was configured at startup. The "
+            "startup snapshot is stale in its entirety, and that bit is part of it.\n"
+            f"--- configured at startup (probe={probe}) ---\n{with_folder}\n"
+            f"--- nothing configured at startup ---\n{without_folder}")
+        assert a4fs.calls == [], f"a superseded read-out reached a disk: {a4fs.calls}"
+
+    text = configured[HANDLER](False)
+    for leak, label in ((tree["shared"], "the stale folder"),
+                        (configured["A6_SHARING_ON_LINE"], "a stale sharing claim"),
+                        (configured["A6_SHARING_OFF_LINE"], "a stale sharing claim"),
+                        (configured["A6_NO_SHARED_FOLDER_LINE"], "a claim nothing was configured"),
+                        (configured["A6_STARTUP_SNAPSHOT_NOTE"], "a note about 'the folder above'"),
+                        (configured["A6_NAME_ONLY_SENTENCE_CONTEXT"], "the name-only context"),
+                        (a5.SHARED_SENTENCE, "A5's shared-folder sentence"),
+                        (a5.OUT_OF_SCOPE_SENTENCE, "A5's out-of-scope sentence")):
+        assert leak not in text, f"{label} survived supersession"
+
+    named = load_a6(shared_config=cfg(tree["shared"], True), local_default=tree["local_parent"])
+    name_only = named[HANDLER](False)
+    assert named["A6_NAME_ONLY_SENTENCE_CONTEXT"] in name_only, (
+        "the name-only context is simply gone, so the absences above prove nothing")
+    assert a5.SHARED_SENTENCE in name_only, "the approved SHARED_SENTENCE is gone entirely"
+    assert a5.OUT_OF_SCOPE_SENTENCE in name_only, "the approved OUT_OF_SCOPE_SENTENCE is gone"
 
 
 def test_j3_a_refused_save_does_not_supersede(tree):
