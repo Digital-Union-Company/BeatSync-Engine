@@ -258,6 +258,19 @@ from beatsync_fork import cache_admin as fork_cache
 # import. Stdlib-only, so every branch is testable without a disk or a model. It owns no cache
 # identity: that stays entirely in `video_analysis.py`.
 from beatsync_fork import analysis_cache as fork_analysis_cache
+# [FORK] Digital-Union (R14-A stage A6): the read-only cache-location observer (A4) and the
+# read-only report renderer (A5), wired here for the first time. A1-A5 were merged unwired and
+# were reachable only from tests; this is the whole of their GUI surface.
+#
+# A4 is the ONLY route from this panel to the filesystem, and that is the point of it: it passes a
+# refusing `make_dirs` on every resolver call, so the documented folder-creating behaviour of
+# `analysis_cache.resolve_location` cannot happen on a read-only path, and it re-establishes the
+# directory state independently instead of trusting the resolver's `available`.
+#
+# A3 (`library_cache_records`) is deliberately NOT imported. It is the record reader, which is
+# depth 2 -- rejected by the owner for this panel.
+from beatsync_fork import library_cache_location as fork_cache_location
+from beatsync_fork import library_cache_report as fork_cache_report
 # [FORK] Digital-Union (R8 UX Refresh, Commit C): the one composition rule for "what is this
 # render actually going to do creatively". It is a pure view over values this module already has,
 # and it delegates every verdict -- the preset name to `presets.matching_preset`, Freestyle
@@ -8438,6 +8451,228 @@ def _on_import_analysis_cache(source_folder):
     return f'{report}\n\n{_shared_cache_report(location)}'
 
 
+# =============================================================================================
+# [FORK] Digital-Union (R14-A stage A6): the Library cache report panel.
+#
+# One read-only read-out over the already-merged A4 observer and A5 renderer, built to owner
+# decision R-3 **Option 2 + W-a**. Two reach modes and nothing between them:
+#
+#   DEFAULT  (the opt-in unticked -- depth 0)
+#       names the configured shared analysis-cache folder from configuration ALREADY IN MEMORY,
+#       and makes NO filesystem contact of any kind. Not a listing, not an lstat, not an open,
+#       not a resolver call, and -- specifically -- not an A4 call.
+#
+#   OPT-IN   (the operator ticks the box, which is default-off, and clicks Build report)
+#       adds exactly ONE directory-state observation through A4, which opens nothing.
+#
+# Why the default path must not call A4 at all, measured rather than assumed:
+# `inspect_location` probes the local folder UNCONDITIONALLY (its step 2) and the shared folder
+# only under `if enabled and configured`. A4 therefore has **no depth-0 mode** -- any invocation
+# touches at least this installation's own cache directory. So "report the configured folder
+# without contacting it" cannot be served by A4, and the default path reads the folder straight
+# out of the in-memory mapping instead.
+#
+# And it must NOT be faked by handing A4 no-op `listdir`/`lstat`/`isdir`/`realpath` callables.
+# Those injection points exist so tests can reach every branch without a disk; using them in
+# production would MANUFACTURE observations and publish them as if something had been looked at.
+# Nothing here injects a filesystem callable into A4.
+#
+# Forbidden outright, in both modes: opening or enumerating any cache record, recursion below
+# either folder, any A3 invocation, any record count, byte total or reclaimable figure about the
+# shared folder, and any create/write/rename/delete anywhere. There is no Delete, Clean, Migrate
+# or Repair control, because there is nothing here to confirm.
+#
+# The configuration source is `_SHARED_CACHE_CONFIG`, the dict loaded once at import. That is the
+# owner's explicit boundary -- no new read of the live `shared-config.json` -- and it carries one
+# consequence that must be disclosed rather than smoothed over: `_on_save_shared_cache` persists
+# through `save_config` and does **not** refresh that dict, so after an in-session Save it is
+# stale relative to the file. Every line this panel writes about configuration therefore says
+# "as loaded when this application started", never "currently configured".
+#
+# `_analysis_cache_location()` is FORBIDDEN as a source here, for a second and worse reason:
+# it routes to `video_analysis.resolve_cache_location` -> `analysis_cache.resolve_location`,
+# whose `make_dirs` defaults to the real `os.makedirs`. It CREATES the configured folder. That is
+# the exact hazard A4 exists to neutralise.
+# =============================================================================================
+
+LABEL_LIBRARY_CACHE_REPORT = 'Library cache report'
+LABEL_LIBRARY_CACHE_PROBE_SHARED = (
+    'Also observe whether the shared folder is reachable (one directory check; off by default)')
+LABEL_LIBRARY_CACHE_BUILD = 'Build report'
+INFO_LIBRARY_CACHE_REPORT = (
+    'A read-only read-out. It names the shared analysis-cache folder this installation was '
+    'configured with when it started, and reports nothing about what is inside it. Nothing here '
+    'deletes, moves, creates or changes any file or folder, and no figure here is a '
+    'recommendation to remove anything.\n\n'
+    'By default the shared folder is **not contacted at all**. Tick the box to allow one '
+    'directory check of it — that observes whether the folder is reachable and opens nothing in '
+    'it.')
+
+#: The local cache subdirectory name, matching `_analysis_cache_location`'s own local default.
+#: Duplicated as a constant rather than reached through that function, which creates folders.
+A6_LOCAL_CACHE_DIRNAME = 'video_analysis_cache'
+
+#: Machine-identifiable prefixes, so a state line can be located and its verdict parsed exactly.
+#: The shape is `<prefix><verdict> -- <sentence>`.
+A6_SHARED_STATE_PREFIX = '  shared analysis-cache folder state: '
+A6_LOCAL_STATE_PREFIX = '  local cache folder state: '
+
+#: One sentence per state A4 can report. Keyed by the literal verdicts, with a test pinning the
+#: key set to `library_cache_location.LOCATION_STATES`, so a new or renamed state cannot slip
+#: through unworded.
+#:
+#: The rule every line obeys: a folder that could not be inspected is **never** rendered as an
+#: empty or clean one. Denied, unreachable, absent and uninspected are four different findings,
+#: and none of them is a zero.
+A6_STATE_WORDING = {
+    'present': 'present and inspectable, as observed at {when}',
+    'configured_not_created': (
+        'no folder is present at the configured location, and this report created nothing'),
+    'access_denied': (
+        'the folder is there, and this installation was refused access to it -- being refused is '
+        'itself a positive observation, not an absence'),
+    # Worded to avoid "nothing in it", which a banned-phrase check cannot tell apart from the
+    # zero-claim it exists to forbid. "Its contents were not established" says the opposite.
+    'root_unreachable': 'the location could not be reached, so its contents were not established',
+    'unknown': 'its state could not be established, so nothing is claimed about it',
+    'not_inspected': 'the question was not put, so nothing is known about this folder',
+}
+
+#: Fail closed. An unrecognised verdict claims nothing, and in particular claims no zero.
+A6_STATE_UNRECOGNISED = (
+    'an unrecognised state was reported, so nothing is claimed about this folder')
+
+A6_STARTUP_SNAPSHOT_NOTE = (
+    'The folder above is the configuration as loaded when this application started. Saving a '
+    'different folder in Settings during this session does not update this read-out.')
+A6_NAME_ONLY_NOTE = (
+    'Neither folder was contacted. This read-out named the configured folder and stopped there, '
+    'so it is not an inspection of either one and offers no figure about either.')
+A6_NO_SHARED_FOLDER_LINE = 'shared analysis-cache folder: none was configured'
+A6_OPT_IN_HEADLINE = (
+    'You allowed one directory check, so the state below was observed once, just now. It is what '
+    'was true at that moment and not a promise about later; nothing in either folder was opened, '
+    'listed below itself, or counted.')
+A6_OPT_IN_LOCAL_DISCLOSURE = (
+    "One such check cannot look at the shared folder without also looking at this installation's "
+    'own local cache folder, so the local folder was observed too. The box governs the shared '
+    'folder; it does not mean the local one went untouched.')
+A6_CREATION_REFUSED_PREFIX = '  directory creation requested and refused: '
+A6_CREATION_NONE_REQUESTED = (
+    '  directory creation: nothing asked to be created during this check')
+A6_SHARING_ON_LINE = 'sharing was switched on in that startup snapshot'
+A6_SHARING_OFF_LINE = (
+    'sharing was switched off in that startup snapshot, so the folder above is the stored setting '
+    'and was not inspected')
+
+
+def _a6_shared_cache_startup_snapshot():
+    """The shared-cache setting as loaded at import, parsed by the ONE parser A4 also uses.
+
+    Returns ``(folder, enabled)``. Reads only `_SHARED_CACHE_CONFIG`; opens nothing, resolves
+    nothing and creates nothing.
+
+    `fork_analysis_cache._clean` / `_as_bool` are borrowed deliberately rather than reimplemented
+    — the same reason A4 borrows them. They are the single parser for these two human-editable
+    settings, and a second one here could make this panel display "on" for a hand-written
+    ``"false"`` while the observation it then takes reports the folder uninspected.
+    """
+    return (fork_analysis_cache._clean(_SHARED_CACHE_CONFIG.get(
+                fork_analysis_cache.CACHE_FOLDER)),
+            fork_analysis_cache._as_bool(_SHARED_CACHE_CONFIG.get(
+                fork_analysis_cache.CACHE_ENABLED)))
+
+
+def _a6_state_sentence(verdict, observed_at=''):
+    """Plain English for one directory state. Never a zero, and never a claim of currency."""
+    wording = A6_STATE_WORDING.get(verdict)
+    if wording is None:
+        return A6_STATE_UNRECOGNISED
+    return wording.format(when=observed_at or 'the moment this report was built')
+
+
+def _a6_cache_report_lines(probe_shared_folder, configured_folder, sharing_enabled,
+                           local_default):
+    """The whole read-out, as lines. The opt-in gate is the only branch that reaches a disk.
+
+    `probe_shared_folder is True` rather than a truthy test, and that is fail-closed on purpose:
+    a stray ``1`` or ``'false'`` arriving from anywhere must not be able to enable a filesystem
+    observation the operator did not ask for.
+    """
+    lines = [LABEL_LIBRARY_CACHE_REPORT, '']
+    if configured_folder:
+        lines.append('  shared analysis-cache folder: ' + configured_folder)
+        lines.append('  ' + (A6_SHARING_ON_LINE if sharing_enabled else A6_SHARING_OFF_LINE))
+    else:
+        lines.append('  ' + A6_NO_SHARED_FOLDER_LINE)
+    lines.append('  ' + A6_STARTUP_SNAPSHOT_NOTE)
+    lines.append('')
+
+    if probe_shared_folder is not True:
+        uninspected = fork_cache_location.NOT_INSPECTED
+        lines.append('  ' + A6_NAME_ONLY_NOTE)
+        lines.append('')
+        lines.append(A6_SHARED_STATE_PREFIX + uninspected + ' -- '
+                     + _a6_state_sentence(uninspected))
+        lines.append(A6_LOCAL_STATE_PREFIX + uninspected + ' -- '
+                     + _a6_state_sentence(uninspected))
+        if configured_folder:
+            lines.append('')
+            lines.append('  ' + fork_cache_report.SHARED_SENTENCE)
+            lines.append('  ' + fork_cache_report.OUT_OF_SCOPE_SENTENCE)
+        return lines
+
+    # --- the opt-in: exactly ONE A4 observation, which opens nothing -------------------------
+    #
+    # The mapping handed to A4 is built from the two parsed values above and nothing else, so no
+    # other preference can leak into a cache-location question. A4 copies it on entry anyway.
+    snapshot = {fork_analysis_cache.CACHE_FOLDER: configured_folder,
+                fork_analysis_cache.CACHE_ENABLED: sharing_enabled}
+    observation = fork_cache_location.inspect_location(
+        local_default, snapshot,
+        clock=lambda: datetime.datetime.now().isoformat(timespec='seconds'))
+
+    lines.append('  ' + A6_OPT_IN_HEADLINE)
+    lines.append('  ' + A6_OPT_IN_LOCAL_DISCLOSURE)
+    lines.append('')
+    lines.append(A6_SHARED_STATE_PREFIX + observation.shared.verdict + ' -- '
+                 + _a6_state_sentence(observation.shared.verdict, observation.observed_at))
+    lines.append(A6_LOCAL_STATE_PREFIX + observation.local.verdict + ' -- '
+                 + _a6_state_sentence(observation.local.verdict, observation.observed_at))
+
+    # Positive evidence that the creation hazard was reached and refused, rather than the absence
+    # of evidence that it was never reached. Those are different findings.
+    if observation.creation_attempts:
+        for asked in observation.creation_attempts:
+            lines.append(A6_CREATION_REFUSED_PREFIX + asked)
+    else:
+        lines.append(A6_CREATION_NONE_REQUESTED)
+
+    # A5 renders the rest. With no record inventory supplied it withholds every figure -- which
+    # is exactly the depth the owner authorised -- and it is also what emits the two approved
+    # sentences, by producing them rather than by this module restating them.
+    lines.append('')
+    lines.extend(fork_cache_report.report_lines(
+        fork_cache_report.estimate_reclaimable(
+            fork_cache_report.bind_observation(location=observation))))
+    return lines
+
+
+def _on_library_cache_report_click(probe_shared_folder=False):
+    """Build the read-only cache report. The parameter default is `False`, so a missing value
+    cannot enable probing.
+
+    This handler writes exactly one widget, its own report textbox. It is not a render: it takes
+    no `_RENDER_LOCK`, holds no `RenderLifecycle`, joins no concurrency lane, touches no
+    processing directory and has no `gr.State`. It starts no subprocess and installs no
+    JavaScript.
+    """
+    configured_folder, sharing_enabled = _a6_shared_cache_startup_snapshot()
+    local_default = os.path.join(get_input_dir(), A6_LOCAL_CACHE_DIRNAME)
+    return '\n'.join(_a6_cache_report_lines(
+        probe_shared_folder, configured_folder, sharing_enabled, local_default))
+
+
 def _on_reset_folder_prefs():
     """Clear the saved defaults. Removes no folder and no media -- only the remembered choices.
 
@@ -12054,6 +12289,54 @@ def create_ui() -> gr.Blocks:
                         audio_preview_armed_state = gr.State('')
 
                     with gr.Tab(LABEL_SECTION_PREPARE_VERIFY, id='tab-prepare-verify'):
+                        # [FORK] Digital-Union (R14-A stage A6): the Library cache report.
+                        #
+                        # Placed here on measured grounds (design 9.2 Option A): inside Prepare &
+                        # Verify, immediately after the section tab opens and BEFORE the
+                        # preparation accordion below. That one position clears every pinned span
+                        # at once -- the tab and tab-container counts are unchanged, it sits
+                        # ahead of the sample-policy guard's span, and it sits ahead of the
+                        # preparation accordion's span, so neither of that span's two widget bans
+                        # applies. An accordion is count-pinned nowhere in the suite.
+                        #
+                        # It is also the right place for an operator: "what is my cache, and
+                        # where is it?" is a question this section already exists to answer.
+                        #
+                        # Three widgets and no fourth: a checkbox, a button and a read-only
+                        # textbox. No number field (so no upper-bound keyword that a future
+                        # re-order could drag inside the span below), no radio group, no slider,
+                        # and no Delete / Clean / Migrate / Repair button -- there is nothing
+                        # here to confirm.
+                        #
+                        # IMPORTANT, and learned the hard way in this very change: several of
+                        # those pinned spans are sliced out of RAW SOURCE with `str.index`, so
+                        # naming a span's boundary token or a banned token in a COMMENT moves the
+                        # boundary onto the comment. The first draft of this block spelled four
+                        # such tokens out and broke three structural tests that merged main
+                        # passes. Describe them; do not spell them. `tests/
+                        # test_library_cache_panel.py` now guards this block against exactly
+                        # that.
+                        with gr.Accordion(LABEL_LIBRARY_CACHE_REPORT, open=False):
+                            gr.Markdown(INFO_LIBRARY_CACHE_REPORT)
+                            # DEFAULT-OFF, and the default is the safety property: unticked, the
+                            # report never contacts the shared folder and never enters A4.
+                            library_cache_probe_shared = gr.Checkbox(
+                                value=False,
+                                label=LABEL_LIBRARY_CACHE_PROBE_SHARED,
+                                elem_id='library-cache-probe-shared',
+                            )
+                            library_cache_report_btn = gr.Button(
+                                LABEL_LIBRARY_CACHE_BUILD,
+                                variant='secondary',
+                                elem_id='library-cache-report-button',
+                            )
+                            library_cache_report_box = gr.Textbox(
+                                label=LABEL_LIBRARY_CACHE_REPORT,
+                                interactive=False,
+                                lines=20,
+                                show_copy_button=True,
+                                elem_id='library-cache-report-box',
+                            )
                         # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
                         # workflow, not part of the render flow. Nothing in here is wired to
                         # `source_outputs`, so it cannot touch the Create Music Video gate.
@@ -13551,6 +13834,39 @@ def create_ui() -> gr.Blocks:
             fn=_on_sample_invalidate,
             inputs=None,
             outputs=[sample_report],
+        )
+
+        # [FORK] Digital-Union (R14-A stage A6): the Library cache report read-out.
+        #
+        # Wired here on measured grounds (design 9.2): after the sample-decode registration above
+        # -- which closes the sample-policy guard's span -- and before the Video Review check
+        # registration that opens the span pinned at exactly six registrations. This window is
+        # outside BOTH, so no existing test needs amending.
+        #
+        # Those two boundaries are deliberately described rather than spelled: both spans are
+        # sliced out of RAW SOURCE, so naming a boundary token in a comment relocates the
+        # boundary onto the comment. The first draft of this block did exactly that and broke a
+        # structural test merged main passes.
+        #
+        # `outputs` is exactly one textbox, and that exactness is the contract: an inspection
+        # cannot clear a confirmed source set, enable or disable a render, move the preparation
+        # state machine or disturb a cutter job. It writes no render status panel, no
+        # configuration widget and no state object.
+        #
+        # `inputs` is the LIVE checkbox, matched POSITIONALLY against the handler's single
+        # parameter -- Gradio passes handler arguments by position, and the seam test pins that
+        # alignment. The checkbox registers no `.change()` of its own: ticking the box must not
+        # itself reach a disk, so only a deliberate Build report click can observe anything.
+        #
+        # No `concurrency_id`: a read-out is not a render and must never queue behind one.
+        # `concurrency_limit=None` for the measured S2-A R3 reason -- on the pinned gradio a full
+        # concurrency group leaves the event QUEUED rather than delivering or refusing it.
+        library_cache_report_btn.click(
+            fn=_on_library_cache_report_click,
+            inputs=[library_cache_probe_shared],
+            outputs=[library_cache_report_box],
+            show_progress='hidden',
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (FUN R10 Repeat Music): the estimate read-out, from the two values
