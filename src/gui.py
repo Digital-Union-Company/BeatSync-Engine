@@ -258,6 +258,23 @@ from beatsync_fork import cache_admin as fork_cache
 # import. Stdlib-only, so every branch is testable without a disk or a model. It owns no cache
 # identity: that stays entirely in `video_analysis.py`.
 from beatsync_fork import analysis_cache as fork_analysis_cache
+# [FORK] Digital-Union (R14-A stage A6): the read-only cache-location observer (A4) and the
+# read-only report renderer (A5), wired here for the first time. A1-A5 were merged unwired and
+# were reachable only from tests; this is the whole of their GUI surface.
+#
+# A4 is the ONLY route from this panel to the filesystem, and that is the point of it: it passes a
+# refusing `make_dirs` on every resolver call, so the documented folder-creating behaviour of
+# `analysis_cache.resolve_location` cannot happen on a read-only path, and it re-establishes the
+# directory state independently instead of trusting the resolver's `available`.
+#
+# A3 (`library_cache_records`) is deliberately not imported HERE, and the honest statement of what
+# that buys is narrower than "A3 is not loaded": A5 imports four constants from A3 at its own module
+# load, so A3's module object exists in `sys.modules` before this panel does anything. The property
+# that actually holds -- and the one the suite pins -- is that **no A3 function is reachable from
+# this panel's call graph**. `read_records` is depth 2, which the owner rejected for this panel, and
+# nothing here calls it.
+from beatsync_fork import library_cache_location as fork_cache_location
+from beatsync_fork import library_cache_report as fork_cache_report
 # [FORK] Digital-Union (R8 UX Refresh, Commit C): the one composition rule for "what is this
 # render actually going to do creatively". It is a pure view over values this module already has,
 # and it delegates every verdict -- the preset name to `presets.matching_preset`, Freestyle
@@ -8399,6 +8416,15 @@ def _on_save_shared_cache(folder, enabled):
          fork_analysis_cache.CACHE_ENABLED: wanted})
     if failure:
         return STATUS_SHARED_CACHE_SAVE_FAILED.format(reason=failure)
+    # [FORK] Digital-Union (R14-A stage A6, R-B): the save SUCCEEDED, so the Library cache report
+    # panel's import-time configuration snapshot is now out of date and must stop being described
+    # in the present tense. This latches that one bit and nothing else -- no refresh of
+    # `_SHARED_CACHE_CONFIG`, no re-read of the settings file, no stored path or switch, and no
+    # change to what this handler returns or to Settings/Stage-5 routing. It is placed after the
+    # failure check on purpose: a refused or failed save leaves the snapshot still accurate, so it
+    # must not supersede. An unchanged-value save DOES supersede, because establishing that the
+    # value was unchanged would require the file read this panel is not permitted to make.
+    _a6_mark_startup_snapshot_superseded()
     location = _analysis_cache_location()
     header = (STATUS_SHARED_CACHE_SAVED_ON.format(path=location.path) if location.shared
               else STATUS_SHARED_CACHE_SAVED_OFF.format(path=location.path))
@@ -8436,6 +8462,583 @@ def _on_import_analysis_cache(source_folder):
         report = report + '\n\nFirst few:\n' + '\n'.join(
             f'  {line}' for line in outcome.first_errors)
     return f'{report}\n\n{_shared_cache_report(location)}'
+
+
+# =============================================================================================
+# [FORK] Digital-Union (R14-A stage A6): the Library cache report panel.
+#
+# One read-only read-out over the already-merged A4 observer and A5 renderer, built to owner
+# decision R-3 **Option 2 + W-a**. Two reach modes and nothing between them:
+#
+#   DEFAULT  (the opt-in unticked -- depth 0)
+#       names the configured shared analysis-cache folder from configuration ALREADY IN MEMORY,
+#       and makes NO filesystem contact of any kind. Not a listing, not an lstat, not an open,
+#       not a resolver call, and -- specifically -- not an A4 call.
+#
+#   OPT-IN   (the operator ticks the box, which is default-off, and clicks Build report)
+#       adds exactly ONE directory-state observation through A4, which opens nothing.
+#
+# Why the default path must not call A4 at all, measured rather than assumed:
+# `inspect_location` probes the local folder UNCONDITIONALLY (its step 2) and the shared folder
+# only under `if enabled and configured`. A4 therefore has **no depth-0 mode** -- any invocation
+# touches at least this installation's own cache directory. So "report the configured folder
+# without contacting it" cannot be served by A4, and the default path reads the folder straight
+# out of the in-memory mapping instead.
+#
+# And it must NOT be faked by handing A4 no-op `listdir`/`lstat`/`isdir`/`realpath` callables.
+# Those injection points exist so tests can reach every branch without a disk; using them in
+# production would MANUFACTURE observations and publish them as if something had been looked at.
+# Nothing here injects a filesystem callable into A4.
+#
+# And the OPT-IN is gated on the configured folder having one unambiguous absolute form (R-A).
+# This panel displays the folder as `analysis_cache._clean` leaves it -- stripped, nothing more --
+# while A4's probe sends it through A1's `normalize_root_text`, which strips quotation marks and
+# expands `~` and environment references, and then through `os.path.abspath`, which resolves a
+# relative path against the PROCESS WORKING DIRECTORY. The displayed folder and the enumerated
+# folder were therefore not always the same folder: a stored environment reference was shown
+# verbatim and reported inspectable while a different directory was the one actually looked at,
+# and a stored relative path made the application's own working directory the subject. A verdict
+# attached to the wrong folder is worse than no verdict, so an ambiguous path is REFUSED, by a
+# purely syntactic test that reads no environment and touches no disk, and the read-out says
+# exactly why. Re-implementing A1's expansion here was rejected: it would create two answers that
+# must stay equal forever, where proving the question cannot arise stays true by itself.
+#
+# Forbidden outright, in both modes: opening or enumerating any cache record, recursion below
+# either folder, any A3 invocation, any record count, byte total or reclaimable figure about the
+# shared folder, and any create/write/rename/delete anywhere. There is no Delete, Clean, Migrate
+# or Repair control, because there is nothing here to confirm.
+#
+# The configuration source is `_SHARED_CACHE_CONFIG`, the dict loaded once at import. That is the
+# owner's explicit boundary -- no new read of the live `shared-config.json` -- and it carries one
+# consequence that must be disclosed rather than smoothed over: `_on_save_shared_cache` persists
+# through `save_config` and does **not** refresh that dict, so after an in-session Save it is
+# stale relative to the file. Every line this panel writes about configuration therefore says
+# "as loaded when this application started", never "currently configured".
+#
+# A LABEL IS NOT ENOUGH, and saying so was the correction R-B forced. Labelling the snapshot
+# honestly still left the panel publishing present-tense falsehoods after a Save: "none was
+# configured" when one had just been configured, a path that was no longer the path, and -- via A5
+# -- an unqualified statement about where a new invocation would be pointed. So a successful Save
+# now LATCHES the snapshot as superseded, and from that point the panel withholds the folder, the
+# sharing switch and every location claim, and refuses to inspect anything. Withholding, not
+# caveating: a stale path shown beside a warning is still a stale path shown.
+#
+# The latch is one bit and buys nothing it was not given. It cannot see a settings file edited by
+# another program or by hand after startup -- that is invisible under a no-new-file-read boundary,
+# is stated in the read-out itself, and is not a gap this stage may close by reading the file.
+#
+# `_analysis_cache_location()` is FORBIDDEN as a source here, for a second and worse reason:
+# it routes to `video_analysis.resolve_cache_location` -> `analysis_cache.resolve_location`,
+# whose `make_dirs` defaults to the real `os.makedirs`. It CREATES the configured folder. That is
+# the exact hazard A4 exists to neutralise.
+# =============================================================================================
+
+LABEL_LIBRARY_CACHE_REPORT = 'Library cache report'
+LABEL_LIBRARY_CACHE_PROBE_SHARED = (
+    'Also observe whether the shared folder is reachable (one directory-state observation, which '
+    'looks at the folder and may look at the folders above it; off by default)')
+LABEL_LIBRARY_CACHE_BUILD = 'Build report'
+INFO_LIBRARY_CACHE_REPORT = (
+    'A read-only read-out. It names the shared analysis-cache folder this installation was '
+    'configured with when it started, and reports nothing about what is inside it. Nothing here '
+    'deletes, moves, creates or changes any file or folder, and nothing here is a '
+    'recommendation to remove anything.\n\n'
+    'By default the shared folder is **not contacted at all**. Tick the box to allow one '
+    'directory-state observation of it — that establishes whether the folder is reachable, may '
+    'look at the folders above it to tell "not created yet" apart from "not reachable", and opens '
+    'nothing in either folder.')
+
+#: The local cache subdirectory name, matching `_analysis_cache_location`'s own local default.
+#: Duplicated as a constant rather than reached through that function, which creates folders.
+A6_LOCAL_CACHE_DIRNAME = 'video_analysis_cache'
+
+#: Machine-identifiable prefixes, so a state line can be located and its verdict parsed exactly.
+#: The shape is `<prefix><verdict> -- <sentence>`.
+A6_SHARED_STATE_PREFIX = '  shared analysis-cache folder state: '
+A6_LOCAL_STATE_PREFIX = '  local cache folder state: '
+
+#: One sentence per state A4 can report. Keyed by the literal verdicts, with a test pinning the
+#: key set to `library_cache_location.LOCATION_STATES`, so a new or renamed state cannot slip
+#: through unworded.
+#:
+#: The rule every line obeys: a folder that could not be inspected is **never** rendered as an
+#: empty or clean one. Denied, unreachable, absent and uninspected are four different findings,
+#: and none of them is a zero.
+A6_STATE_WORDING = {
+    'present': 'present and inspectable, as observed at {when}',
+    'configured_not_created': (
+        'no folder is present at the configured location, and this report created nothing'),
+    'access_denied': (
+        'the folder is there, and this installation was refused access to it -- being refused is '
+        'itself a positive observation, not an absence'),
+    # Worded to avoid "nothing in it", which a banned-phrase check cannot tell apart from the
+    # zero-claim it exists to forbid. "Its contents were not established" says the opposite.
+    'root_unreachable': 'the location could not be reached, so its contents were not established',
+    'unknown': 'its state could not be established, so nothing is claimed about it',
+    'not_inspected': 'the question was not put, so nothing is known about this folder',
+}
+
+#: Fail closed. An unrecognised verdict claims nothing, and in particular claims no zero.
+A6_STATE_UNRECOGNISED = (
+    'an unrecognised state was reported, so nothing is claimed about this folder')
+
+#: Substituted for `{when}` when A4 handed back no observation stamp. A4 swallows a clock that
+#: raises and returns `observed_at=''`, and the first version of this panel then filled the gap
+#: with "the moment this report was built" -- which READS like a time and is not one. An
+#: observation whose time is unknown says so; it does not borrow a plausible-sounding phrase.
+A6_WHEN_UNAVAILABLE = 'a time this report was unable to establish'
+
+#: Emitted beside the state lines whenever that substitution actually happened, so a missing stamp
+#: is a visible finding rather than a quiet degradation buried inside one sentence.
+A6_NO_TIMESTAMP_LINE = (
+    '  the time of this observation could not be established, so no time is stated for it')
+
+A6_STARTUP_SNAPSHOT_NOTE = (
+    'The folder above is the configuration as loaded when this application started. Saving a '
+    'different folder in Settings during this session does not update this read-out.')
+A6_NAME_ONLY_NOTE = (
+    'Neither folder was contacted. This read-out named the configured folder and stopped there, '
+    'so it is not an inspection of either one and offers no figure about either.')
+A6_NO_SHARED_FOLDER_LINE = 'shared analysis-cache folder: none was configured'
+A6_OPT_IN_HEADLINE = (
+    'You allowed one directory-state observation, so the shared folder below was observed once, '
+    'just now. It is what was true at that moment and not a promise about later; nothing in '
+    'either folder was opened, listed below itself, or counted.')
+
+#: The same observation, when the SHARED folder was nonetheless not looked at -- sharing switched
+#: off in the snapshot, or no folder named. The original single headline said "the state below was
+#: observed" in that case too, which is a claim about a folder nobody went near. A4 still probed
+#: the local folder (it has no depth-0 mode), so this says exactly that and no more.
+A6_OPT_IN_HEADLINE_SHARED_NOT_OBSERVED = (
+    'You allowed one directory-state observation. The shared folder was NOT observed -- there was '
+    'no shared folder to observe, or sharing was switched off in the startup snapshot, and either '
+    'way nobody looked at it. What was observed, once and just now, is this installation\'s own '
+    'local cache folder; nothing in it was opened, listed below itself, or counted.')
+A6_OPT_IN_LOCAL_DISCLOSURE = (
+    'One such observation cannot look at the shared folder without also looking at this '
+    "installation's own local cache folder, so the local folder was observed too. The box governs "
+    'the shared folder; it does not mean the local one went untouched. Telling "not created yet" '
+    'apart from "not reachable" also means the folders ABOVE a named folder may be looked at, '
+    'which is one bounded observation and not a search.')
+#: Worded so it cannot be read as "a directory was created and then undone". The resolver ASKED;
+#: `RefuseDirectoryCreation` answered no; the filesystem was never touched on this path. The old
+#: wording ("creation requested and refused") left the refusal ambiguous about whether anything had
+#: happened on disk, and it also fires for a folder that is already PRESENT -- the resolver asks
+#: regardless -- so the line must not imply the folder was missing either.
+A6_CREATION_REFUSED_PREFIX = (
+    '  the location resolver asked for this folder, was refused, and nothing was created or '
+    'changed on disk: ')
+A6_CREATION_NONE_REQUESTED = (
+    '  no folder was asked for during this observation, and nothing was created or changed on disk')
+A6_SHARING_ON_LINE = 'sharing was switched on in that startup snapshot'
+A6_SHARING_OFF_LINE = (
+    'sharing was switched off in that startup snapshot, so the folder above is the stored setting '
+    'and was not inspected')
+
+#: Said in the name-only mode immediately before A5's two approved sentences, because in that mode
+#: there is nothing observed for them to qualify and "since it was observed" would otherwise read
+#: as a claim that something was. The approved constants themselves are untouched -- W-a approved
+#: that exact English and this adds the context around them rather than rewriting them.
+A6_NAME_ONLY_SENTENCE_CONTEXT = (
+    'The two sentences below are standing properties of a shared folder\'s role, not findings '
+    'about this one. Nothing was observed in this mode, so there is no observation for them to '
+    'qualify and no figure for them to caveat.')
+
+# --- the two conditions that make this panel REFUSE to inspect, and say so --------------------
+#
+# Both are fail-closed: the panel would rather publish "not inspected, and here is exactly why"
+# than attach a positive verdict to a folder it cannot name unambiguously or to a configuration it
+# knows is out of date. Neither condition reads a file.
+
+#: R-A. The folder named in the startup snapshot does not have ONE unambiguous absolute form, so
+#: the folder this read-out would NAME is not provably the folder a check would REACH.
+A6_AMBIGUOUS_PATH_WARNING = (
+    '  this folder was NOT inspected, because the text above does not have one unambiguous '
+    'absolute form: an environment reference, a leading "~", a quoted or relative path, a '
+    'redundant separator, a component ending in a dot or a space, or a reserved device name is '
+    'rewritten before a folder is reached but not before it is displayed, '
+    'so the folder named here and the folder a check would reach can be two different folders. '
+    'No verdict is attached to a folder this report cannot name exactly. Save the folder in '
+    'Settings as a plain absolute path to have it inspected.')
+
+#: R-B. A Settings save succeeded during this session, so the startup snapshot this panel is
+#: allowed to read is known to be out of date and the panel cannot say what is configured now.
+A6_SUPERSEDED_WARNING = (
+    '  the startup snapshot this read-out is built from was SUPERSEDED by a successful Settings '
+    'save during this session, so this panel cannot state the configured location, cannot say '
+    'whether sharing is on, and will not inspect anything. The folder and switch it loaded at '
+    'startup are withheld rather than shown, because they are known to be stale. Restart the '
+    'application to read the saved configuration.')
+
+#: Said under either refusal, as positive evidence that refusing meant refusing.
+A6_REFUSED_NO_CONTACT_NOTE = (
+    '  neither folder was contacted during this read-out: no listing, no directory check, and no '
+    'resolver call was made.')
+
+#: The "why there is no state below" line for a REFUSAL, where `A6_NAME_ONLY_NOTE` would be wrong:
+#: that note says this read-out named the configured folder and stopped there, which is false under
+#: supersession (nothing was named) and misleading under an ambiguous path (what was named is
+#: precisely what could not be trusted).
+A6_REFUSED_CONTEXT_LINE = (
+    '  nothing was inspected, for the reason given above, so neither folder has a state to report '
+    'and no figure about either is offered.')
+
+#: An out-of-process edit of the settings file cannot be seen at all under the owner's
+#: no-new-file-read boundary, and that limit is stated rather than left to be discovered.
+A6_SNAPSHOT_SCOPE_NOTE = (
+    '  this panel is only ever able to notice a save made in THIS application. A settings file '
+    'changed by another program, or by hand, after this application started is invisible here; '
+    'that is a deliberate limit of a read-out that reads no file.')
+
+#: The latch R-B installs. `False` at process start and set exactly once, by a SUCCESSFUL Settings
+#: save, through `_a6_mark_startup_snapshot_superseded`. It is deliberately one-way:
+#:
+#:   * nothing resets it but a normal process start, so no later callback can talk the panel back
+#:     into trusting a snapshot it has already disowned; and
+#:   * because the only transition is `False -> True`, two callbacks racing cannot produce a wrong
+#:     value, which is why no lock is needed here. Either the report runs before the save completes
+#:     and shows the snapshot that was still current when it ran, or it runs after and refuses.
+#:     There is no interleaving that yields a stale value presented as a fresh one.
+#:
+#: It stores no path, no switch and no file content -- only the single bit "this is now stale".
+_A6_SNAPSHOT_SUPERSEDED = False
+
+
+def _a6_mark_startup_snapshot_superseded():
+    """Latch the startup snapshot as stale. Called only after a Settings save SUCCEEDS.
+
+    Deliberately not a refresh. The owner's boundary for this panel is "no new read of the live
+    configuration file", so the honest response to a successful save is to stop making present-tense
+    claims about configuration -- not to go and read the file this panel is not allowed to read.
+    """
+    global _A6_SNAPSHOT_SUPERSEDED
+    _A6_SNAPSHOT_SUPERSEDED = True
+
+
+def _a6_startup_snapshot_superseded():
+    """Is the startup snapshot known to be stale?
+
+    `is not False` rather than a truthy test, and that direction is the fail-closed one here: the
+    flag's job is to SUPPRESS claims, so anything other than an explicit `False` must suppress. The
+    opt-in gate's `is not True` test is the mirror image of the same principle -- there, the flag's
+    job is to ENABLE filesystem contact, so only an explicit `True` may.
+    """
+    return _A6_SNAPSHOT_SUPERSEDED is not False
+
+
+#: The Windows device names a full-path resolution can redirect into the device namespace, as
+#: `ntpath` itself enumerates them -- including the superscript-digit spellings Win32 accepts for
+#: the serial and parallel ports. Written out as a constant rather than reached through
+#: `ntpath.isreserved`, which exists only from Python 3.12 and would make this gate's answer depend
+#: on which interpreter the application happened to start under.
+A6_RESERVED_DEVICE_NAMES = frozenset(
+    {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'}
+    | {'COM' + c for c in '123456789\xb9\xb2\xb3'}
+    | {'LPT' + c for c in '123456789\xb9\xb2\xb3'})
+
+#: Characters a Windows path component cannot hold. The colon is here because a colon after the
+#: drive names an alternate data stream rather than a folder, and the drive itself is split off
+#: before these are checked.
+A6_FORBIDDEN_COMPONENT_CHARS = '<>:"|?*'
+
+
+def _a6_configured_path_is_unambiguous(text):
+    """Does `text` name exactly the folder an A4 observation of it would reach? Pure text.
+
+    R-A, and the defect it closes is a real one: this panel displays the configured folder as
+    `analysis_cache._clean` leaves it -- stripped, nothing more -- while A4's probe passes it
+    through A1's `library_inventory.normalize_root_text` (which strips quotation marks and expands
+    `~` and environment references) and then `os.path.abspath` (which resolves a relative path
+    against the **process working directory**). So `%SOMEWHERE%` was displayed verbatim, reported
+    `present and inspectable`, and the folder actually enumerated was a different one; and a
+    relative path quietly made the application's own working directory the thing inspected.
+
+    The fix is a refusal, not a second resolver. Reproducing A1's expansion here would produce two
+    answers that must be kept equal forever; proving the question does not arise is stable. So this
+    accepts a path only when every one of A1's transformations provably leaves it alone, and the
+    panel refuses to inspect anything else.
+
+    **It touches nothing.** No `expandvars`, so no environment is read; no `abspath`, so the
+    working directory is not consulted; no filesystem call of any kind. A purely syntactic test is
+    the point -- validating text with a probe would be contacting a folder in order to decide
+    whether it may be contacted.
+
+    Deliberately STRICTER than strictly necessary in two measured cases: a path containing `$` or
+    `%` is refused even where expansion would have left it alone (``\\\\nas\\C$\\share``), because
+    "does this particular dollar sign expand?" is an environment-dependent question and this
+    function answers no environment-dependent questions. Refusing to inspect a legitimate folder
+    costs a read-out; publishing a verdict about the wrong folder costs the truth.
+
+    A table in `tests/test_library_cache_panel.py` pins this to `normalize_root_text` + `abspath`
+    over real cases, in the direction that matters: every text the TABLE offers and this function
+    accepts is proved to resolve to itself. That is the same "pin the equivalence, do not trust the
+    comment" discipline A1 uses for its own `clips_review` equivalence -- and it is a proof over
+    that table, not over every string a settings file can hold. The claim is deliberately stated
+    that narrowly now: an independent review enumerated 84 texts and found seven that an earlier
+    version of this function accepted while the resolver moved them, none of which the table
+    contained. A finite table proves a finite set of cases; the enumeration below is what carries
+    the rest, and it carries it only as far as the canonicalisations it names.
+    """
+    if not isinstance(text, str) or not text or text != text.strip():
+        return False
+    # A1 strips surrounding quotation marks; `_clean` does not.
+    if text.strip('"').strip() != text:
+        return False
+    # Environment references, which A1 expands and `_clean` does not. An unset reference is caught
+    # here too, and must be: unset, it survives expansion unchanged and is then resolved against
+    # the working directory, which is the worst of both outcomes.
+    if '%' in text or '$' in text:
+        return False
+    # `expanduser` acts only on a LEADING tilde, so only a leading tilde is refused. A tilde inside
+    # a component is an ordinary character -- short 8.3 names contain them routinely.
+    if text.startswith('~'):
+        return False
+    # Absolute in the strong sense: a drive or UNC root FOLLOWED by a separator. `os.path.isabs` is
+    # not sufficient on Windows -- it accepts a drive-relative `\folder`, which `abspath` completes
+    # with whatever the current drive happens to be.
+    drive, remainder = os.path.splitdrive(text)
+    if not drive or remainder[:1] not in ('\\', '/'):
+        return False
+    # Separator form, `.`, `..` and trailing separators, all of which `abspath` rewrites.
+    if os.path.normpath(text) != text:
+        return False
+
+    # --- the second half of the question, which the first version of this gate missed ---------
+    #
+    # Everything above models A1's text transformations and `normpath`. But `normpath` is pure
+    # string work, while the resolver finishes with a Win32 full-path call, and that call performs
+    # canonicalisations `normpath` does not. An independent review measured seven texts that
+    # passed every test above and still moved -- identically on Python 3.13.12 and 3.14.3:
+    #
+    #   C:\cache.  C:\cache...  C:\a.\b  C:\a\b.       a trailing dot stripped per component
+    #   \\server\share\a.                              the same, across a UNC root
+    #   four consecutive separators                    collapsed to three
+    #   C:\NUL                                         redirected into the device namespace
+    #
+    # Four of those denote the same directory either way, so the verdict landed on the right
+    # folder and only this function's stated invariant was broken. `C:\NUL` is the one where the
+    # two are genuinely different objects. Both are refusals now, because the panel's promise is
+    # that the folder it NAMES is the folder a check REACHES, and "same folder by a different
+    # name" is not that promise.
+    #
+    # The extra canonicalisations are reproduced as REFUSALS rather than detected by resolving the
+    # text, which is what keeps the test purely syntactic: resolving it would consult the process
+    # working directory, the exact thing this function exists not to do. The cost is accepted and
+    # it is one-directional -- a few legitimate but unusual folders are refused a read-out. Being
+    # stricter costs a report; being looser costs the truth.
+    for ch in text:
+        # Control characters, which no real path holds and which the display cannot render.
+        if ch < ' ':
+            return False
+
+    tail = remainder.split('\\')
+    # The leading element is always empty (the root separator). A single trailing empty element is
+    # the bare root itself -- `C:\` -- which is stable and stays acceptable.
+    tail = tail[1:] if tail[-1] else tail[1:-1]
+    head = drive.split('\\')[2:] if drive[:1] in ('\\', '/') else []
+
+    for component in head + tail:
+        # An empty component here is a separator run that survived `normpath`: four consecutive
+        # separators do, and are then collapsed to three. The UNC and extended-length prefixes are
+        # checked too, because a server or share name canonicalises exactly as a component does.
+        if not component:
+            return False
+        if component[-1] == '.' or component[-1] == ' ':
+            return False
+
+    for component in tail:
+        for ch in component:
+            if ch in A6_FORBIDDEN_COMPONENT_CHARS:
+                return False
+        # A device name is reserved with or without an extension, in any case, and the comparison
+        # is on the stem before the first dot. Deliberately wider than what was measured today --
+        # only a bare final `NUL` was seen to redirect -- because which spellings redirect is a
+        # property of the platform call, not of this application, and a path that names a device
+        # is not a cache folder under any reading.
+        if component.split('.')[0].strip().upper() in A6_RESERVED_DEVICE_NAMES:
+            return False
+    return True
+
+
+def _a6_shared_cache_startup_snapshot():
+    """The shared-cache setting as loaded at import, parsed by the ONE parser A4 also uses.
+
+    Returns ``(folder, enabled)``. Reads only `_SHARED_CACHE_CONFIG`; opens nothing, resolves
+    nothing and creates nothing.
+
+    `fork_analysis_cache._clean` / `_as_bool` are borrowed deliberately rather than reimplemented
+    — the same reason A4 borrows them. They are the single parser for these two human-editable
+    settings, and a second one here could make this panel display "on" for a hand-written
+    ``"false"`` while the observation it then takes reports the folder uninspected.
+    """
+    return (fork_analysis_cache._clean(_SHARED_CACHE_CONFIG.get(
+                fork_analysis_cache.CACHE_FOLDER)),
+            fork_analysis_cache._as_bool(_SHARED_CACHE_CONFIG.get(
+                fork_analysis_cache.CACHE_ENABLED)))
+
+
+def _a6_state_sentence(verdict, observed_at=''):
+    """Plain English for one directory state. Never a zero, and never a claim of currency.
+
+    With no stamp the substitution is an explicit admission that the time is unknown. It used to be
+    'the moment this report was built', which is not a timestamp but reads like one -- and A4
+    produces exactly that case silently, by swallowing a clock that raises and returning ``''``.
+    """
+    wording = A6_STATE_WORDING.get(verdict)
+    if wording is None:
+        return A6_STATE_UNRECOGNISED
+    return wording.format(when=observed_at or A6_WHEN_UNAVAILABLE)
+
+
+def _a6_uninspected_lines(configured_folder, context):
+    """The read-out's tail for a pass that inspected NOTHING, whatever the reason.
+
+    Shared by the name-only mode and by both refusals in `_a6_cache_report_lines`, so that "nothing
+    was inspected" renders identically however it was arrived at -- and in particular so that a
+    refusal cannot accidentally render as a cleaner-looking report than the default mode does.
+    `context` is the single line that says why nothing was inspected.
+
+    A5's two approved sentences are emitted only when a folder is actually named, and the context
+    line before them is new: in a mode where nothing was observed, "since it was observed" would
+    otherwise read as a claim that something was. The approved constants are referenced by identity
+    and left byte-exact -- W-a approved that English, so the fix is context around them.
+    """
+    uninspected = fork_cache_location.NOT_INSPECTED
+    lines = [context, '']
+    lines.append(A6_SHARED_STATE_PREFIX + uninspected + ' -- '
+                 + _a6_state_sentence(uninspected))
+    lines.append(A6_LOCAL_STATE_PREFIX + uninspected + ' -- '
+                 + _a6_state_sentence(uninspected))
+    if configured_folder:
+        lines.append('')
+        lines.append('  ' + A6_NAME_ONLY_SENTENCE_CONTEXT)
+        lines.append('  ' + fork_cache_report.SHARED_SENTENCE)
+        lines.append('  ' + fork_cache_report.OUT_OF_SCOPE_SENTENCE)
+    return lines
+
+
+def _a6_cache_report_lines(probe_shared_folder, configured_folder, sharing_enabled,
+                           local_default):
+    """The whole read-out, as lines. The opt-in gate is the only branch that reaches a disk.
+
+    `probe_shared_folder is True` rather than a truthy test, and that is fail-closed on purpose:
+    a stray ``1`` or ``'false'`` arriving from anywhere must not be able to enable a filesystem
+    observation the operator did not ask for.
+
+    Two conditions refuse to inspect at all, BEFORE the opt-in gate is even consulted, and both
+    are deliberately expressed without reference to the opt-in flag:
+
+    * the startup snapshot has been superseded by a successful Settings save this session, so this
+      panel no longer knows what is configured and withholds the stale folder rather than showing
+      it (R-B); and
+    * the configured folder's text does not have one unambiguous absolute form, so the folder this
+      read-out would NAME is not provably the folder a check would REACH (R-A).
+
+    Refusing first is what makes those two fail-closed: no ordering of the opt-in flag can route
+    around them, and neither refusal consults a file, an environment variable or a disk.
+    """
+    superseded = _a6_startup_snapshot_superseded()
+    ambiguous = bool(configured_folder) and not _a6_configured_path_is_unambiguous(
+        configured_folder)
+
+    lines = [LABEL_LIBRARY_CACHE_REPORT, '']
+    if superseded:
+        # The folder and the switch are WITHHELD, not shown with a caveat. They are known to be
+        # stale, and a stale path displayed beside a warning is still a stale path displayed.
+        lines.append(A6_SUPERSEDED_WARNING)
+    elif configured_folder:
+        lines.append('  shared analysis-cache folder: ' + configured_folder)
+        lines.append('  ' + (A6_SHARING_ON_LINE if sharing_enabled else A6_SHARING_OFF_LINE))
+        lines.append('  ' + A6_STARTUP_SNAPSHOT_NOTE)
+    else:
+        lines.append('  ' + A6_NO_SHARED_FOLDER_LINE)
+        lines.append('  ' + A6_STARTUP_SNAPSHOT_NOTE)
+    lines.append(A6_SNAPSHOT_SCOPE_NOTE)
+    lines.append('')
+
+    if superseded:
+        lines.append(A6_REFUSED_NO_CONTACT_NOTE)
+        lines.append('')
+        # `''` rather than the real value: under supersession this panel must not even reveal
+        # whether a folder WAS configured at startup, because that bit is stale too.
+        lines.extend(_a6_uninspected_lines('', A6_REFUSED_CONTEXT_LINE))
+        return lines
+
+    if ambiguous:
+        lines.append(A6_AMBIGUOUS_PATH_WARNING)
+        lines.append(A6_REFUSED_NO_CONTACT_NOTE)
+        lines.append('')
+        lines.extend(_a6_uninspected_lines(configured_folder, A6_REFUSED_CONTEXT_LINE))
+        return lines
+
+    if probe_shared_folder is not True:
+        lines.extend(_a6_uninspected_lines(configured_folder, '  ' + A6_NAME_ONLY_NOTE))
+        return lines
+
+    # --- the opt-in: exactly ONE A4 observation, which opens nothing -------------------------
+    #
+    # The mapping handed to A4 is built from the two parsed values above and nothing else, so no
+    # other preference can leak into a cache-location question. A4 copies it on entry anyway.
+    #
+    # The clock is OFFSET-AWARE. A naive local stamp is ambiguous twice a year and meaningless to
+    # anyone reading the read-out from another machine -- and this is the record of when a folder
+    # was observed, which is the one thing here that is purely a fact about a moment.
+    snapshot = {fork_analysis_cache.CACHE_FOLDER: configured_folder,
+                fork_analysis_cache.CACHE_ENABLED: sharing_enabled}
+    observation = fork_cache_location.inspect_location(
+        local_default, snapshot,
+        clock=lambda: datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+
+    # A4 probes the shared folder only when sharing is on AND a path is set, so the headline must
+    # follow what was actually observed rather than what was asked for. A4 has no depth-0 mode, so
+    # the local folder was observed either way.
+    if observation.shared.inspected:
+        lines.append('  ' + A6_OPT_IN_HEADLINE)
+    else:
+        lines.append('  ' + A6_OPT_IN_HEADLINE_SHARED_NOT_OBSERVED)
+    lines.append('  ' + A6_OPT_IN_LOCAL_DISCLOSURE)
+    lines.append('')
+    lines.append(A6_SHARED_STATE_PREFIX + observation.shared.verdict + ' -- '
+                 + _a6_state_sentence(observation.shared.verdict, observation.observed_at))
+    lines.append(A6_LOCAL_STATE_PREFIX + observation.local.verdict + ' -- '
+                 + _a6_state_sentence(observation.local.verdict, observation.observed_at))
+
+    # A4 swallows a clock that raises and hands back an empty stamp. Say so, rather than letting a
+    # placeholder phrase stand in for a time that was never established.
+    if not observation.observed_at:
+        lines.append(A6_NO_TIMESTAMP_LINE)
+
+    # Positive evidence that the creation hazard was reached and refused, rather than the absence
+    # of evidence that it was never reached. Those are different findings.
+    if observation.creation_attempts:
+        for asked in observation.creation_attempts:
+            lines.append(A6_CREATION_REFUSED_PREFIX + asked)
+    else:
+        lines.append(A6_CREATION_NONE_REQUESTED)
+
+    # A5 renders the rest. With no record inventory supplied it withholds every figure -- which
+    # is exactly the depth the owner authorised -- and it is also what emits the two approved
+    # sentences, by producing them rather than by this module restating them.
+    lines.append('')
+    lines.extend(fork_cache_report.report_lines(
+        fork_cache_report.estimate_reclaimable(
+            fork_cache_report.bind_observation(location=observation))))
+    return lines
+
+
+def _on_library_cache_report_click(probe_shared_folder=False):
+    """Build the read-only cache report. The parameter default is `False`, so a missing value
+    cannot enable probing.
+
+    This handler writes exactly one widget, its own report textbox. It is not a render: it takes
+    no `_RENDER_LOCK`, holds no `RenderLifecycle`, joins no concurrency lane, touches no
+    processing directory and has no `gr.State`. It starts no subprocess and installs no
+    JavaScript.
+    """
+    configured_folder, sharing_enabled = _a6_shared_cache_startup_snapshot()
+    local_default = os.path.join(get_input_dir(), A6_LOCAL_CACHE_DIRNAME)
+    return '\n'.join(_a6_cache_report_lines(
+        probe_shared_folder, configured_folder, sharing_enabled, local_default))
 
 
 def _on_reset_folder_prefs():
@@ -12054,6 +12657,54 @@ def create_ui() -> gr.Blocks:
                         audio_preview_armed_state = gr.State('')
 
                     with gr.Tab(LABEL_SECTION_PREPARE_VERIFY, id='tab-prepare-verify'):
+                        # [FORK] Digital-Union (R14-A stage A6): the Library cache report.
+                        #
+                        # Placed here on measured grounds (design 9.2 Option A): inside Prepare &
+                        # Verify, immediately after the section tab opens and BEFORE the
+                        # preparation accordion below. That one position clears every pinned span
+                        # at once -- the tab and tab-container counts are unchanged, it sits
+                        # ahead of the sample-policy guard's span, and it sits ahead of the
+                        # preparation accordion's span, so neither of that span's two widget bans
+                        # applies. An accordion is count-pinned nowhere in the suite.
+                        #
+                        # It is also the right place for an operator: "what is my cache, and
+                        # where is it?" is a question this section already exists to answer.
+                        #
+                        # Three widgets and no fourth: a checkbox, a button and a read-only
+                        # textbox. No number field (so no upper-bound keyword that a future
+                        # re-order could drag inside the span below), no radio group, no slider,
+                        # and no Delete / Clean / Migrate / Repair button -- there is nothing
+                        # here to confirm.
+                        #
+                        # IMPORTANT, and learned the hard way in this very change: several of
+                        # those pinned spans are sliced out of RAW SOURCE with `str.index`, so
+                        # naming a span's boundary token or a banned token in a COMMENT moves the
+                        # boundary onto the comment. The first draft of this block spelled four
+                        # such tokens out and broke three structural tests that merged main
+                        # passes. Describe them; do not spell them. `tests/
+                        # test_library_cache_panel.py` now guards this block against exactly
+                        # that.
+                        with gr.Accordion(LABEL_LIBRARY_CACHE_REPORT, open=False):
+                            gr.Markdown(INFO_LIBRARY_CACHE_REPORT)
+                            # DEFAULT-OFF, and the default is the safety property: unticked, the
+                            # report never contacts the shared folder and never enters A4.
+                            library_cache_probe_shared = gr.Checkbox(
+                                value=False,
+                                label=LABEL_LIBRARY_CACHE_PROBE_SHARED,
+                                elem_id='library-cache-probe-shared',
+                            )
+                            library_cache_report_btn = gr.Button(
+                                LABEL_LIBRARY_CACHE_BUILD,
+                                variant='secondary',
+                                elem_id='library-cache-report-button',
+                            )
+                            library_cache_report_box = gr.Textbox(
+                                label=LABEL_LIBRARY_CACHE_REPORT,
+                                interactive=False,
+                                lines=20,
+                                show_copy_button=True,
+                                elem_id='library-cache-report-box',
+                            )
                         # [FORK] Digital-Union (P V1): media library preparation. An occasional maintenance
                         # workflow, not part of the render flow. Nothing in here is wired to
                         # `source_outputs`, so it cannot touch the Create Music Video gate.
@@ -13551,6 +14202,39 @@ def create_ui() -> gr.Blocks:
             fn=_on_sample_invalidate,
             inputs=None,
             outputs=[sample_report],
+        )
+
+        # [FORK] Digital-Union (R14-A stage A6): the Library cache report read-out.
+        #
+        # Wired here on measured grounds (design 9.2): after the sample-decode registration above
+        # -- which closes the sample-policy guard's span -- and before the Video Review check
+        # registration that opens the span pinned at exactly six registrations. This window is
+        # outside BOTH, so no existing test needs amending.
+        #
+        # Those two boundaries are deliberately described rather than spelled: both spans are
+        # sliced out of RAW SOURCE, so naming a boundary token in a comment relocates the
+        # boundary onto the comment. The first draft of this block did exactly that and broke a
+        # structural test merged main passes.
+        #
+        # `outputs` is exactly one textbox, and that exactness is the contract: an inspection
+        # cannot clear a confirmed source set, enable or disable a render, move the preparation
+        # state machine or disturb a cutter job. It writes no render status panel, no
+        # configuration widget and no state object.
+        #
+        # `inputs` is the LIVE checkbox, matched POSITIONALLY against the handler's single
+        # parameter -- Gradio passes handler arguments by position, and the seam test pins that
+        # alignment. The checkbox registers no `.change()` of its own: ticking the box must not
+        # itself reach a disk, so only a deliberate Build report click can observe anything.
+        #
+        # No `concurrency_id`: a read-out is not a render and must never queue behind one.
+        # `concurrency_limit=None` for the measured S2-A R3 reason -- on the pinned gradio a full
+        # concurrency group leaves the event QUEUED rather than delivering or refusing it.
+        library_cache_report_btn.click(
+            fn=_on_library_cache_report_click,
+            inputs=[library_cache_probe_shared],
+            outputs=[library_cache_report_box],
+            show_progress='hidden',
+            concurrency_limit=None,
         )
 
         # [FORK] Digital-Union (FUN R10 Repeat Music): the estimate read-out, from the two values

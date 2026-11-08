@@ -781,8 +781,24 @@ def test_the_fork_hard_rule_list_is_untouched_by_this_module():
             assert (node.module or "").split(".")[0] not in forbidden
 
 
-def test_a5_is_unwired():
-    """Nothing in the application may import A5. Only its own test may."""
+def test_a5_is_wired_by_the_a6_panel_and_by_nothing_else():
+    """A5 may be referenced by exactly ONE application module, `src/gui.py`, and by nothing else.
+
+    [FORK] Digital-Union (R14-A stage A6) -- AMENDED, AND THE AMENDMENT NEEDS OWNER RATIFICATION.
+
+    This test read `test_a5_is_unwired` and asserted that NO application module referenced A5 at
+    all. That was the correct pin for the whole period between A5's merge and the owner's R-3
+    decision: A1-A5 were merged deliberately unwired, pending it. R-3 is now decided as Option 2 +
+    W-a, and the A6 panel is the authorised first wiring -- so "no importer at all" is a statement
+    that no correct A6 can satisfy. The two cannot both hold, which is why this is disclosed
+    rather than quietly edited: the A6 authorisation also said to keep A1-A5's tests unchanged and
+    to report any further edit for separate authorisation. This is that report.
+
+    What is preserved is the test's protective value, NARROWED rather than relaxed. The allowlist
+    is an EXACT single-element set, so a second module reaching for the report renderer -- a
+    render path, Stage 5, a cache-admin handler -- still fails here, which is the thing this test
+    was actually guarding. Nothing else in this file, and no other A1-A5 test, was touched.
+    """
     src = os.path.join(_REPO_ROOT, "src")
     importers: list = []
     for base, _dirs, names in os.walk(src):
@@ -793,7 +809,8 @@ def test_a5_is_unwired():
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 if "library_cache_report" in handle.read():
                     importers.append(os.path.relpath(path, _REPO_ROOT))
-    assert importers == [], f"A5 must stay unwired, but it is referenced by {importers}"
+    assert importers == [os.path.join("src", "gui.py")], \
+        f"A5 may be referenced by src/gui.py alone, but it is referenced by {importers}"
 
 
 # =============================================================================================
