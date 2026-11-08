@@ -99,16 +99,37 @@ untouched.
 `main`, a malformed-record defect rather than a capacity one, and pinned by a test so the finding
 cannot be lost. The two other clips that failed in the field report were never characterised.
 
-**One existing test is red and is deliberately left so.**
-`tests/test_stage6_console_reporting.py::test_the_stage6_planner_is_unchanged_from_merged_main`
-asserts `git diff 079e9b31 -- src/auto_mode/stage6_av_planner.py` is **empty**, which froze the
-planner byte-identical as a guard for an older reporting-only slice. Any planner change reddens it,
-so it is logically incompatible with this fix. Measured on one variable: the node passes on pristine
-`main` and fails on this branch. Updating that baseline needs a path this change was not authorized
-to touch, so it is reported rather than widened into here.
+**One existing test was red at R1; R2 resolved it under its own authorization.** This paragraph
+records both states, because the first one is the history and the second one is the current truth.
+
+At R1, `tests/test_stage6_console_reporting.py::test_the_stage6_planner_is_unchanged_from_merged_main`
+asserted `git diff 079e9b31 -- src/auto_mode/stage6_av_planner.py` is **empty**, freezing the planner
+byte-identical. That guard was *appropriate for the older reporting-only change it shipped with*,
+whose whole point was that it did not touch the planner — but it reddens for **any** planner edit, so
+it was logically incompatible with this fix. Measured then on one variable: the node passed on
+pristine `main` and failed on this branch. R1 was not authorized to touch that path, so it reported
+the red node rather than widening into it.
+
+**R2 then re-pointed the baseline with explicit owner authorization** to this branch's published
+candidate commit `1828569ebe2a4f5b351e6c44b013e7df3dd56b1b` — a pinned historical Git object, not a
+fabricated hash — and renamed the node
+`test_the_stage6_planner_is_unchanged_from_the_approved_baseline`, because what it now asserts is
+weaker and different: unchanged from the **approved** baseline, not unchanged since the merged main
+the reporting-only change branched from. The node was not deleted, skipped, or weakened into an
+unconditional pass, and any *further* planner change still reddens it. Measured on a disposable
+worktree, never on the candidate source: **GREEN** with the planner unchanged, **RED** for a
+behavioural mutation (`>=` → `>` in `_can_fill_segment`), and **RED** for a comment-only mutation —
+which a byte freeze has to do, or "no unreviewed planner drift" reads stronger than it is.
+
+**The corrected gate can SKIP, and a SKIP is not a PASS.** Its baseline is a commit on this branch,
+so until that merges, a checkout holding only `main` — the installed production checkout, a fresh
+clone, a reviewer who has not fetched the branch — cannot reach the object: the node skips there
+instead of passing, and asserts nothing at all in that case. Once the baseline is an ordinary
+ancestor of `main`, the gate runs everywhere again.
 
 `src/auto_mode/stage6_av_planner.py`, `src/video_processor.py`,
-`tests/test_short_source_eligibility.py` (new, 71 tests, synthetic and media-free).
+`tests/test_short_source_eligibility.py` (new, 71 tests, synthetic and media-free),
+`tests/test_stage6_console_reporting.py` (R2: the baseline re-point and rename described above).
 
 ### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
 
