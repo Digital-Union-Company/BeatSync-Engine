@@ -20,6 +20,95 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-08 (Short-Source Eligibility R1: a segment is only given a source that can fill it)
+
+**The owner's render stopped with three failed clips, and the planner was the one at fault.** Clip 5
+was allocated a 5.280-second frame-locked slot at 25 fps and handed `424.mp4`, a 5.133-second file:
+132 output frames committed, 128 available, short by four frames (0.160 s). The extraction worker
+refused it before FFmpeg ran — correctly — and `create_music_video` then refused to concatenate an
+incomplete timeline, also correctly. Reproduced as pure data from the pinned source; **no decoded
+frame count or rendered playback is claimed anywhere below.**
+
+**Three things had to be true at once, and the middle one is the real defect.**
+
+```
+_adjusted_score      penalty only below 55% of the slot -> 5.133/5.280 = 97%, silent
+                     and it reads candidate["duration"], the capped ANALYSIS WINDOW
+_materialize_clip    max(source_duration, video_duration) inflates the shortfall away
+create_clip_parallel refuses pre-extraction                                    <- correct
+create_music_video   refuses to concatenate                                    <- correct
+```
+
+The planner was measuring the wrong quantity, not measuring it too leniently. `candidate["duration"]`
+is the length of the Stage-5 analysis *window*, which Stage 5 caps; the length of the **file** was on
+every candidate all along as `candidate["video_duration"]`, written from the same FFprobe duration the
+worker later reads, and scoring never consulted it. Above the cap every candidate in any library reads
+as short — so a "penalise short candidates harder" fix would refuse every render whose segments exceed
+the cap, however long the real sources are. Just below it, a file barely longer than its own window
+reads as unlimited, which is exactly `424.mp4`.
+
+**Eligibility is now decided on the file, in output frames, at the real output rate.** `_source_frames`
+converts `video_duration` to output frames and `_can_fill_segment` compares it against the slot —
+`int(round(have * fps)) >= int(round(need * fps))`, mirroring `_materialize_clip`'s own `final_duration`
+floor so the number compared is the number the plan records. No probe, no new import, no new score
+penalty: `_adjusted_score` still has exactly nine `score -=` sites and the planner's module import set
+is unchanged.
+
+**The rate is the timeline's own rate, and there is no default.** `create_music_video` publishes the
+`fps` that built the frame-aligned timeline onto the shared `beat_info` bus, and
+`output_frame_rate` is its single reader — the same shape as `creative_profile`. Absent means *the
+guarantee was not requested*, so every existing caller and test keeps today's behaviour exactly; a rate
+that was supplied but is zero, negative, non-finite or unparseable **fails closed** with `ValueError`,
+because output-frame eligibility against a rate that is not one would be a guarantee about nothing. The
+rate travels on the bus rather than as a planner-call keyword because three suites pin that call's
+keyword bundle by exact equality; `build_planned_clip_sequence` and `_choose_candidate` still gained the
+optional `output_fps` parameter for direct callers.
+
+**An ineligible candidate is denied the win, never the draw — and that distinction was measured, not
+assumed.** A pre-filter that drops candidates before scoring changes which jitter each remaining
+candidate receives in the legacy branch, and changes both the weight normalisation and
+`select_index`'s single-eligible early return in the seeded branch. On a 48-segment synthetic matrix it
+re-edited renders that were already fine: **30 of 46 (65.2 %)** eligible winners changed at seed 0, and
+1–3 at seeds 381944 / 101 / 4242. So the legacy branch still draws `rng.random()` for **every**
+candidate in the original order and only skips the comparison, and the seeded branch runs
+`select_index` against the **unchanged** full score list, keeping that winner when it fits and
+re-drawing from the **same** `rng` only when it does not. Measured across seeds 0 / 381944 / 101 / 4242
+at 25 and 30 fps, two pool shapes: **0 of 736** already-viable segments changed winner, **368 of 368**
+physically impossible winners repaired, **0** short sources leaked through.
+
+**No eligible source is a refusal before any worker starts, never a silent fallback.**
+`SegmentSourceCapacityError` names the segment (1-based and 0-based), the frames and seconds it needed,
+the best capacity actually available and the shortfall, labels the figures as duration-derived
+estimates, and says what to change. This matters because the alternative is worse than the bug:
+dropping an unfillable segment makes the plan shorter than the timeline, which discards the plan
+*whole* and sends the render to legacy random sampling — a path with no view of a source length at all.
+A render with **no** visual candidate library still returns `[]` and falls back exactly as before; that
+fallback remains duration-blind and is left so deliberately.
+
+**Both existing guards are kept as the backstop.** `video_duration` can be stale, and
+`ffmpeg_processing.get_video_duration` returns a 10.0-second fallback when its probe fails, so an
+unmeasured length is treated as *unmeasured rather than short* — the planner declines to judge and the
+worker, which actually probes the file, decides. R10's rule reused: an unmeasured count is never a
+refusal. Nothing pads, loops, stretches, duplicates or truncates a source frame, no beat boundary
+moves, and the frame-locked timeline, cancellation, render locking and the Source Input Gate are
+untouched.
+
+**Known and deliberately not fixed here.** `_materialize_clip` coerces `video_duration` with a bare
+`float()`, so a record carrying a string, list or dict there raises during planning — true on pristine
+`main`, a malformed-record defect rather than a capacity one, and pinned by a test so the finding
+cannot be lost. The two other clips that failed in the field report were never characterised.
+
+**One existing test is red and is deliberately left so.**
+`tests/test_stage6_console_reporting.py::test_the_stage6_planner_is_unchanged_from_merged_main`
+asserts `git diff 079e9b31 -- src/auto_mode/stage6_av_planner.py` is **empty**, which froze the
+planner byte-identical as a guard for an older reporting-only slice. Any planner change reddens it,
+so it is logically incompatible with this fix. Measured on one variable: the node passes on pristine
+`main` and fails on this branch. Updating that baseline needs a path this change was not authorized
+to touch, so it is reported rather than widened into here.
+
+`src/auto_mode/stage6_av_planner.py`, `src/video_processor.py`,
+`tests/test_short_source_eligibility.py` (new, 71 tests, synthetic and media-free).
+
 ### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
 
 **Pressing Confirm in Video Review used to start moving files with no acknowledgement at all.** Two

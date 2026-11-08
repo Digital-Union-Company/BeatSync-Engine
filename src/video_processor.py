@@ -852,6 +852,18 @@ def create_music_video(audio_file: str, video_files: VideoList, beat_times: Beat
         1 for candidate in ((beat_info.get("video_analysis") or {}).get("candidates") or [])
         if candidate.get("video_file")
     ) if isinstance(beat_info, dict) else 0
+    # [FORK] Digital-Union (Short-Source Eligibility R1): publish the EFFECTIVE output frame rate —
+    # the same `fps` the frame-locked timeline above was built at — onto the shared bus, so the
+    # planner can state its source-capacity guarantee in output frames instead of guessing a rate
+    # or inventing a second one. A render-scoped fact travels as a `beat_info` key, which is this
+    # pipeline's documented channel for a new signal and is why the planner call itself is
+    # byte-identical; three suites pin that call's keyword bundle by exact equality.
+    #
+    # This is published AFTER Stage 5 has returned and is read only by Stage 6, so it has no route
+    # to an analysis request, a persisted record or any cache identity. Nothing downstream reads it
+    # back from here, and the value is already reported on the stage-6 progress event above.
+    if isinstance(beat_info, dict):
+        beat_info['output_fps'] = float(fps)
     planner_started = time.perf_counter()
     planned_clip_sequence = build_planned_clip_sequence(
         cut_times=selected_beats,
