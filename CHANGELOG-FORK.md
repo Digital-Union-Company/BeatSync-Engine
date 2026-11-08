@@ -20,6 +20,98 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-08 (R14-A F-3, Option 1: the local-only Media Library inventory)
+
+**A2 and A3 merged with no user surface at all.** An AST census over every module under `src/`
+put `inspect_library`, `inventory_lines`, `duplicate_basenames`, `forecast_destination`,
+`diagnose_root`, `list_directory`, `classify_leaf` and `read_records` at **zero call sites**: two
+heavily-tested stages were reachable only from their own suites. F-3 asked what to do about it,
+and the owner chose Option 1 — a small, read-only, **local-only** exposure of the producers that
+already exist — over both leaving them inert and building the broader historical design, whose
+source-state buckets have no producer at all.
+
+One new sibling accordion in Prepare & Verify, between the Library cache report and the
+preparation section. Four widgets and no fifth: a folder box, a default-off tick, one Build
+button and one read-only read-out. It publishes
+
+* **bounded Tier-A media facts** for one explicitly named folder, through A2's own
+  `inspect_library` / `inventory_lines` over the existing authoritative scanner, with
+  `diagnostics=False` (no recursive diagnostic walk) and A2's own existing per-root ceiling;
+* **local analysis-cache record facts**, behind the separate default-off tick, through A3's
+  `read_records` rendered by A5; and
+* **three separately labelled location facts** — the folder configured at startup, the folder a
+  new analysis would select, and the folder the last analysis actually used — two of which are
+  explicitly `NOT INSPECTED` / `NOT AVAILABLE` rather than guessed.
+
+**The owner's two operational choices are structural, not defaults.** Record reading needs the
+tick *and* the click: the gate is `inspect_records is not True`, so a stray `1` or `'false'`
+arriving from anywhere cannot start a filesystem pass. The Discarded folder is **omitted** — not
+offered, not selectable, not inspected; only one root is ever supplied and `include_rejected` is
+always `False`.
+
+**The shared analysis-cache folder's reach is unchanged, and the direction is worth stating
+precisely because it is easy to state backwards.** This panel never reads, lists, counts,
+measures or resolves it. It uses the startup snapshot's folder *text* for exactly one purpose:
+proving, lexically, that the folder it is about to read records from is **not** that folder. Where
+that cannot be proved the record pass is **refused**, and three conditions do so — the folder
+resolving onto the shared one, a Settings save having superseded the snapshot this session (so
+which folder is shared is no longer known), and a configured folder with no single absolute form
+(so comparing it would mean resolving it, which would mean contacting it). The comparison is exact
+normalised equality on both the typed and the resolved local path, never a prefix test, so
+`…\VideoAnalysis2` is not part of `…\VideoAnalysis`. A local cache legitimately junctioned onto a
+larger disk is followed and **disclosed**, because the records came off the resolved storage.
+
+**Four of A3's optional observations are deliberately not requested, and each absence is stated
+in the read-out rather than inferred from a missing line.** `looks_reusable` and `read_text` are
+both `None`, so no record is re-opened by the delegated transport check and no alternative file
+transport exists; `is_complete` and `require_ai` are both `None`, so record completeness stays
+unassessed — outside a render there is no established analysis mode to judge for, and a figure for
+a question nobody asked is not a figure. The contract generation is passed **in** from
+`video_analysis` through the deferred import the cache Import handler already uses, and when it
+cannot be read that axis is unassessed rather than zero.
+
+Reading is bounded well below A3's own defaults — 4 000 entries, 2 000 records, 1 MB per record,
+32 MB in total, 100 reported names — expressed as module constants rather than widget limits, so
+no resource ceiling is in the operator's hands. The bounds charge work **attempted**, they are not
+a wall-clock, peak-memory or exact-byte ceiling, and whichever one was reached is named.
+
+**No number in this panel is its own.** A2's and A5's read-outs own every figure, each with its
+unit, its exactness and the population it answers for; what the panel writes is labels, states,
+refusals and words. A refused or limited pass publishes **no** count rather than a smaller one, no
+bucket is summed, nothing unestablished is rendered as a zero, and no A4 observation is bound
+beside a local record inventory — that would put two populations in one report.
+
+Separate call graph from the A6 panel by contract: no helper carries the `_a6_` prefix (every such
+name is pinned into A6's own ban tuple), A6 cannot reach this handler, and this handler reads
+exactly three **pure, no-disk** A6 helpers — the startup-snapshot parser, the supersession latch
+reader and the unambiguous-absolute-path gate — rather than keeping a second copy of a gate whose
+equivalence to the resolver is already proved over a measured table.
+
+Touched: `src/gui.py` (new constants, nine new `_f3_*` functions, one accordion, one
+registration), `tests/test_library_inventory_panel.py` (new).
+
+### Fixed — 2026-11-08 (the application did not start on the pinned Gradio)
+
+**`gr.Textbox` has no `show_copy_button` parameter on `gradio==6.19.0`.** Gradio 6 replaced it
+with `buttons`, so the keyword raises
+
+```
+TypeError: Textbox.__init__() got an unexpected keyword argument 'show_copy_button'
+```
+
+while `create_ui()` is building the interface — the whole application failed to start. Measured
+against pristine `main` `2a7dcb01e0f1b247a4b8bd91033b799592aa8e89` (`src/gui.py` blob
+`171ab573a9d6b06ecf9d47c1dff997583952b30b`) on the real library.
+
+It went unnoticed because `gradio` cannot be imported on a bare interpreter, so every existing
+assertion about that widget is an AST assertion about source text the real library rejects. The
+intent — an operator can copy the read-out — is preserved by the replacement parameter rather
+than dropped. Production is unaffected: it runs `e6a7c0cd255c527c83b651e43c893bfc98418943`, which
+predates the widget. Pinned two ways: a bare-CPython source assertion, and an isolated smoke that
+builds the real `Blocks` and is the only thing that can catch the next one of these.
+
+Touched: `src/gui.py` (one keyword, in the R14-A A6 read-out box).
+
 ### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
 
 **Pressing Confirm in Video Review used to start moving files with no acknowledgement at all.** Two
