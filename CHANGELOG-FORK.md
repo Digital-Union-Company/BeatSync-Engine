@@ -39,9 +39,13 @@ button and one read-only read-out. It publishes
   `diagnostics=False` (no recursive diagnostic walk) and A2's own existing per-root ceiling;
 * **local analysis-cache record facts**, behind the separate default-off tick, through A3's
   `read_records` rendered by A5; and
-* **three separately labelled location facts** — the folder configured at startup, the folder a
-  new analysis would select, and the folder the last analysis actually used — two of which are
-  explicitly `NOT INSPECTED` / `NOT AVAILABLE` rather than guessed.
+* **three separately labelled location facts.** Only the first is answered: the folder configured
+  at startup. The folder a **new** analysis would select is `NOT INSPECTED` — establishing it
+  takes a directory-state observation of the shared folder, which this local-only read-out does
+  not make. The folder the **last** analysis actually used is `NOT AVAILABLE, and OUTSTANDING`:
+  `OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`, see the
+  outstanding item below. Neither is guessed, and the third is **not** complete and is not
+  reported as a pass.
 
 **The owner's two operational choices are structural, not defaults.** Record reading needs the
 tick *and* the click: the gate is `inspect_records is not True`, so a stray `1` or `'false'`
@@ -49,17 +53,37 @@ arriving from anywhere cannot start a filesystem pass. The Discarded folder is *
 offered, not selectable, not inspected; only one root is ever supplied and `include_rejected` is
 always `False`.
 
-**The shared analysis-cache folder's reach is unchanged, and the direction is worth stating
-precisely because it is easy to state backwards.** This panel never reads, lists, counts,
-measures or resolves it. It uses the startup snapshot's folder *text* for exactly one purpose:
-proving, lexically, that the folder it is about to read records from is **not** that folder. Where
-that cannot be proved the record pass is **refused**, and three conditions do so — the folder
-resolving onto the shared one, a Settings save having superseded the snapshot this session (so
-which folder is shared is no longer known), and a configured folder with no single absolute form
-(so comparing it would mean resolving it, which would mean contacting it). The comparison is exact
-normalised equality on both the typed and the resolved local path, never a prefix test, so
-`…\VideoAnalysis2` is not part of `…\VideoAnalysis`. A local cache legitimately junctioned onto a
-larger disk is followed and **disclosed**, because the records came off the resolved storage.
+**The shared analysis-cache folder's reach, stated precisely and scoped to what the
+implementation establishes.** The two halves of the panel differ and must not be described
+together:
+
+* **The record half never targets it.** It uses the startup snapshot's folder *text* for exactly
+  one purpose: establishing, lexically, that the folder it is about to read records from is
+  **not** that folder. It never reads, lists, counts or resolves the configured folder itself,
+  and never reaches the folder-creating resolver. Where the check cannot be made the record pass
+  is **refused**, and three conditions do so — the local folder resolving onto the shared one, a
+  Settings save having superseded the snapshot this session (so which folder is shared is no
+  longer known), and a configured folder with no single absolute form (so comparing it would mean
+  resolving it, which would mean contacting it). The comparison is exact normalised equality on
+  both the typed and the resolved local path, never a prefix test, so `…\VideoAnalysis2` is not
+  part of `…\VideoAnalysis`. A local cache legitimately junctioned onto a larger disk is followed
+  and **disclosed**, because the records came off the resolved storage.
+* **The media half inspects whatever folder the operator names** — including the shared folder,
+  if that is the path they type. It has no notion of a shared folder, does not recognise one and
+  does not refuse one. That is disclosed in the panel's own text and in the read-out.
+
+**And the record half's check is a comparison of NAMES, not of storage — a bounded limitation,
+disclosed rather than claimed away.** Two different names can denote one folder: a junction, a
+symbolic link, the extended-length `\\?\` spelling, a substituted or mapped drive letter, a short
+name. Distinguishing those would mean resolving the configured shared path, which the approved
+R-3 boundary forbids, so they are **not disproved**. A configured shared folder that is itself a
+junction onto the local cache's real target, and the extended-length spelling of the same folder,
+were reproduced and are known **not** to be refused; drive substitution, mapped drives and short
+names were **not** measured and are not claimed safe. The read-out states this where the records
+are reported, and the operator is told the practical precaution: if the local and shared folders
+may be two names for one folder, do not enable record reading. **No claim of physical
+shared-cache non-contact is made anywhere**, and the gate's behaviour is unchanged by this
+wording — the limitation was always there and is now written down.
 
 **Four of A3's optional observations are deliberately not requested, and each absence is stated
 in the read-out rather than inferred from a missing line.** `looks_reusable` and `read_text` are
@@ -87,8 +111,48 @@ exactly three **pure, no-disk** A6 helpers — the startup-snapshot parser, the 
 reader and the unambiguous-absolute-path gate — rather than keeping a second copy of a gate whose
 equivalence to the resolver is already proved over a measured table.
 
-Touched: `src/gui.py` (new constants, nine new `_f3_*` functions, one accordion, one
-registration), `tests/test_library_inventory_panel.py` (new).
+**Outstanding, by owner decision, and named rather than buried.** *The location the last analysis
+actually used* is **NOT DELIVERED** in this increment. `video_analysis` already produces the fact
+and returns it per invocation; no part of the interface keeps it, so delivering it would mean the
+**analysis/render handler retaining the value it already receives**, after which this read-out
+would only read what that handler kept — the panel writes nothing itself and no render-path change
+is part of this increment. The line therefore reads `NOT AVAILABLE, and OUTSTANDING`, and the
+three-location-fact requirement is recorded as
+`OWNER_ACCEPTED_DEFERRED_FOR_THIS_INCREMENT; THIRD_LOCATION_FACT_NOT_DELIVERED`.
+
+Touched: `src/gui.py` (new constants, **eight** new `_f3_*` helpers plus the click handler — nine
+new functions, of which eight carry the prefix — one accordion, one registration),
+`tests/test_library_inventory_panel.py` (new).
+
+#### Corrections applied after independent review (R2)
+
+The R1 independent review of this candidate returned `CHANGES_REQUIRED` on five findings, all of
+them about what the increment *claimed* plus two coverage gaps. No behaviour changed: the gate,
+the comparison, the bounds, the call sites and the widget set are what they were, and the only
+executable addition is two `lines.append` calls that emit new disclosure text.
+
+* **The unqualified isolation sentence is gone** (above). It was false two ways, both reproduced:
+  typing the shared folder into the media box enumerates it — one operator keystroke, no alias
+  needed — and a configured shared *text* reaching the local cache's storage under a different
+  name is not refused.
+* **A repository-carried, opt-in runtime check now exists**: `tests/test_gradio_runtime_compat.py`.
+  It skips unless `BEATSYNC_TEST_GRADIO=1`; opted in, an absent or mismatched `gradio==6.19.0` is
+  a **failure, not a skip**. It censuses every `gr.*` call in `src/gui.py` against the real
+  `inspect.signature`, and it builds `create_ui()` once in a child process with `LOCALAPPDATA`
+  and `BEATSYNC_SHARED_CONFIG` redirected into a task-local directory. A build is **not** a
+  live-server smoke and not user acceptance; nothing calls `.launch()` or binds a port.
+* **Two proven test vacuities are fixed.** `test_e6` built a look-alike fixture, never used it as
+  the local cache and ended in a tautology; it now configures the shared folder as a strict
+  string prefix of the local cache path, in both realistic spellings, and asserts the pass runs
+  once on the intended folder. A new `test_e13` covers the **typed** arm of the comparison, which
+  had none. Each was measured RED under the matching mutation of the shipped source and GREEN
+  with it restored byte-for-byte.
+* **The mutation accounting is corrected.** The suite carries **ten** distinct mutators, all of
+  them used, referenced **thirteen** times across **twelve** call sites, and they mutate
+  **AST-extracted copies of function bodies, in memory**:
+  `src/gui.py` is never written to and therefore never restored. The earlier "seven mutations …
+  restored byte-identically" conflated this with a separate external file-mutation harness, whose
+  results are distinct evidence.
 
 ### Fixed — 2026-11-08 (the application did not start on the pinned Gradio)
 
@@ -107,10 +171,20 @@ It went unnoticed because `gradio` cannot be imported on a bare interpreter, so 
 assertion about that widget is an AST assertion about source text the real library rejects. The
 intent — an operator can copy the read-out — is preserved by the replacement parameter rather
 than dropped. Production is unaffected: it runs `e6a7c0cd255c527c83b651e43c893bfc98418943`, which
-predates the widget. Pinned two ways: a bare-CPython source assertion, and an isolated smoke that
-builds the real `Blocks` and is the only thing that can catch the next one of these.
+predates the widget.
 
-Touched: `src/gui.py` (one keyword, in the R14-A A6 read-out box).
+**Pinned two ways, both of them now in the repository.** A bare-CPython AST assertion on keyword
+names catches this one parameter returning; `tests/test_gradio_runtime_compat.py` — opt-in behind
+`BEATSYNC_TEST_GRADIO=1` — catches the *class* of defect, because it checks every `gr.*` keyword
+in the file against the real signature and builds `create_ui()` on the real library. The first
+version of this entry claimed the second half while it existed only as a local verification step
+outside the repository; that is corrected, and the check is committed and has been executed.
+Measured on the pinned runtime: 571 `gr.*` calls, 1183 keywords validated against a signature, 43
+accepted only by the runtime across six named `callee.keyword` pairs, nothing unknown and nothing
+dynamic; pristine `main` fails the build with the `TypeError` above, this tree builds 544 blocks.
+
+Touched: `src/gui.py` (one keyword, in the R14-A A6 read-out box),
+`tests/test_gradio_runtime_compat.py` (new, opt-in).
 
 ### Added — 2026-11-01 (Video Review R13: the transfer is visible, truthful and single-flight)
 

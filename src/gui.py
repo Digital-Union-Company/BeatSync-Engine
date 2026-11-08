@@ -9069,11 +9069,26 @@ def _on_library_cache_report_click(probe_shared_folder=False):
 #     copy of the path gate in particular would be two 100-line equivalence proofs to keep equal
 #     forever.
 #
-# What the shared analysis-cache folder's reach is, stated precisely, because it is easy to get
-# backwards: this panel NEVER reads it, never lists it, never counts it and never resolves it
-# through the folder-creating resolver. It uses the startup snapshot's folder TEXT for exactly
-# one purpose -- proving, lexically, that the folder it is about to read records from is NOT that
-# folder. Where that cannot be proved, the record pass is REFUSED rather than attempted.
+# What the shared analysis-cache folder's reach is, stated precisely -- and scoped, because an
+# unqualified version of this sentence was measurably false in two ways (R1 independent review,
+# finding F-1):
+#
+#   * the RECORD half never targets it. It uses the startup snapshot's folder TEXT for exactly
+#     one purpose -- establishing, lexically, that the folder it is about to read records from is
+#     not that folder -- and never reads, lists, counts or resolves the configured folder itself,
+#     nor reaches the folder-creating resolver. Where that cannot be established, the record pass
+#     is REFUSED rather than attempted.
+#   * the MEDIA half inspects whatever folder the operator types, including the shared folder if
+#     that is what they type. It is disclosed and operator-directed, but it is a listing and a
+#     count, so "this panel never lists the shared folder" is not a true sentence and is not
+#     written anywhere.
+#
+# And the record half's establishment is a comparison of NAMES, not of storage. Two different
+# names can denote one folder -- a junction, a symbolic link, the extended-length spelling, a
+# substituted or mapped drive letter, a short name -- and distinguishing those would mean
+# resolving the configured shared path, which the approved R-3 boundary forbids. So the residual
+# is DISCLOSED in the read-out (`F3_RECORDS_ALIAS_LIMIT`) rather than claimed away: a reverse
+# junction and an extended-length spelling of the same folder are known NOT to be refused.
 #
 # `_analysis_cache_location()` is FORBIDDEN here for the same reason it is forbidden to A6: it
 # routes to `analysis_cache.resolve_location`, whose `make_dirs` defaults to the real
@@ -9090,8 +9105,10 @@ def _on_library_cache_report_click(probe_shared_folder=False):
 LABEL_LIBRARY_INVENTORY = 'Media Library inventory (local only)'
 LABEL_LIBRARY_INVENTORY_FOLDER = 'Media Library folder to inspect'
 LABEL_LIBRARY_INVENTORY_RECORDS = (
-    "Also read this installation's OWN LOCAL analysis-cache records (off by default; the shared "
-    'folder is never read, listed or counted, whether this box is ticked or not)')
+    "Also read this installation's OWN LOCAL analysis-cache records (off by default; the record "
+    'pass never targets the shared analysis-cache folder, but it compares folder NAMES and so '
+    'cannot prove two names are not one folder - read the limit note in the read-out before '
+    'ticking this)')
 LABEL_LIBRARY_INVENTORY_BUILD = 'Build inventory'
 INFO_LIBRARY_INVENTORY = (
     'A read-only read-out of one Media Library folder you name, and optionally of this '
@@ -9101,6 +9118,15 @@ INFO_LIBRARY_INVENTORY = (
     'Name the folder as a plain absolute path. A blank, relative, quoted or environment-'
     'referencing path is **refused** rather than guessed at, because a path that is rewritten '
     'before a folder is reached is not the folder this read-out would name.\n\n'
+    '**The Media Library half inspects the folder you supply, whichever folder that is.** It '
+    'does not recognise the shared analysis-cache folder and does not refuse it: if you type '
+    'that folder here, that folder is what gets listed and counted. Only the record half is '
+    'bound to this installation.\n\n'
+    "**Record reading is off by default.** Ticked, it targets this installation's own local "
+    'cache folder, accepted only after its typed and resolved paths are both compared against '
+    'the shared folder configured at startup. Those checks compare NAMES: they do not prove the '
+    'two folders are different storage. If your local and shared analysis-cache folders may be '
+    'two names for the same folder, do not tick the box.\n\n'
     'The Discarded folder is not part of this read-out. Record reading is off until you tick '
     'its own box **and** press the button below.')
 
@@ -9142,6 +9168,15 @@ F3_MEDIA_TIER_NOTE = (
 F3_MEDIA_FAILED = (
     'NOT INSPECTED - the inspection could not be completed, so no count for this folder is '
     'offered: ')
+#: The media half's reach, said rather than left to be discovered (R1 independent review, F-1).
+#: This half has no notion of a shared folder at all: it inspects the one folder it was given.
+#: Claiming anywhere that this panel cannot contact the shared folder would therefore be false,
+#: and one operator keystroke is all it takes to disprove.
+F3_MEDIA_NAMED_FOLDER_NOTE = (
+    'This half inspects exactly the folder named above, whichever folder that is. It has no '
+    'notion of a shared analysis-cache folder: if the path above is the shared folder, then the '
+    'shared folder is what was listed and counted here. Only the record half below is bound to '
+    "this installation's own cache.")
 
 # --- the local record half --------------------------------------------------------------------
 
@@ -9200,6 +9235,25 @@ F3_RECORDS_BOUND_NONE = 'none - no ceiling was reached and the pass was not aske
 F3_RECORDS_SCOPE_UNASSESSED = (
     'No Media Library root was positively observed, so "a record whose source is outside this '
     'library" was never established for any record and that axis is withheld.')
+#: The residual the identity proof cannot close, printed whenever the pass actually ran (R1
+#: independent review, F-1). The proof compares the local folder's typed and resolved paths
+#: against the configured shared TEXT, by exact normalised equality. That is a comparison of
+#: names. Closing it would mean resolving the configured shared path, which the approved R-3
+#: boundary forbids -- so the honest move is to state it, not to imply a physical guarantee the
+#: implementation does not establish. Two of the alias forms below were reproduced and are known
+#: NOT to be refused; the rest were reasoned about and are reported as untested rather than safe.
+F3_RECORDS_ALIAS_LIMIT = (
+    'LIMIT, stated rather than left to be found: this folder was accepted because its typed path '
+    'and its resolved path both differ from the shared folder configured at startup, compared as '
+    'exact normalised text. That compares NAMES, not storage. A junction, a symbolic link, the '
+    'extended-length "\\\\?\\" spelling, a substituted or mapped drive letter or a short name can '
+    'make two different names denote ONE folder, and establishing that they do not would mean '
+    'resolving the configured shared path - which this read-out deliberately does not do. A '
+    'configured shared folder that is itself a junction onto this folder, and the extended-'
+    'length spelling of the same folder, are known NOT to be refused; drive substitution, mapped '
+    'drives and short names were not all tested and are not claimed to be safe. So: if your '
+    'local and shared analysis-cache folders may be two names for one folder, untick the box '
+    'above - no figure below is offered as proof that they are not.')
 
 # --- the three location facts, deliberately not one -------------------------------------------
 
@@ -9219,10 +9273,13 @@ F3_LOCATION_SELECTED_NOT_INSPECTED = (
     'state observation of the shared folder, which this local-only read-out does not make. The '
     'Library cache report above offers that observation behind its own default-off box.')
 F3_LOCATION_LAST_RUN_UNAVAILABLE = (
-    'the location the LAST completed analysis actually used: NOT AVAILABLE - the analysis pass '
-    'already produces this fact, but no part of the interface keeps it, and keeping it would mean '
-    'writing to the render path from a read-only panel. It is withheld rather than guessed, and '
-    'in particular no claim is made that any analysis has run.')
+    'the location the LAST completed analysis actually used: NOT AVAILABLE, and OUTSTANDING - the '
+    'analysis pass already produces this fact and returns it, but no part of the interface keeps '
+    'it. Delivering it would mean the analysis/render handler retaining the value it already '
+    'receives; this read-out would then only read what that handler kept, and it writes nothing '
+    'itself. That retention is deliberately not part of this increment, by owner decision, so '
+    'this third fact is NOT DELIVERED rather than complete. It is withheld rather than guessed, '
+    'and in particular no claim is made that any analysis has run.')
 F3_LOCATION_SCOPE_NOTE = (
     'An out-of-process edit of the settings file is invisible to all three lines above: this '
     'read-out opens no settings file.')
@@ -9262,14 +9319,20 @@ def _f3_shared_folder_keys():
 
     Returns ``(keys, refusal)``. Nothing here contacts either folder, opens any file or resolves
     any path: the key is formed from the startup snapshot's text and only after A6's R-A gate has
-    proved that text is already its own absolute canonical form, which is exactly what makes
-    ``normcase`` a sound key for it.
+    established that that text is already strongly absolute and normalised, which is what makes
+    ``normcase`` a sound key **for that text**.
+
+    For that text, and no more. The gate is syntactic, so it admits the extended-length spelling
+    of a folder -- the question mark lands in the prefix segment, which is checked for empty
+    components and for trailing dots and spaces but not for forbidden characters -- and that
+    spelling does not ``normcase``-match the plain one. Measured, not assumed. The residual is
+    disclosed by ``F3_RECORDS_ALIAS_LIMIT``; see ``_f3_local_cache_identity``.
 
     Two refusals, both fail-closed, and both mean "the record pass may not run":
 
     * the snapshot was superseded by a successful Settings save this session, so which folder is
       the shared one is no longer known at all; and
-    * the configured text is not provably canonical, so comparing it would need it resolved, and
+    * the configured text has no single absolute form, so comparing it would need it resolved, and
       resolving it would mean contacting it.
 
     Refusing to read a legitimate local cache costs a read-out. Reading the shared folder because
@@ -9286,7 +9349,12 @@ def _f3_shared_folder_keys():
 
 
 def _f3_local_cache_identity(local_cache):
-    """Prove the folder about to be read is this installation's own LOCAL cache, or refuse.
+    """Establish BY NAME that the folder about to be read is not the configured shared one, or
+    refuse.
+
+    "By name" is the whole scope and is stated first deliberately: an earlier version of this
+    docstring said "prove ... is this installation's own LOCAL cache", which claims more than a
+    text comparison can deliver. See the paragraph below.
 
     Returns ``(resolved, refusal)``; a non-empty refusal means nothing may be read.
 
@@ -9296,8 +9364,19 @@ def _f3_local_cache_identity(local_cache):
     before. Only the LOCAL side is resolved; the shared side is never touched.
 
     A local folder that legitimately resolves somewhere else -- a junction onto a larger disk is a
-    supported setup -- is allowed and DISCLOSED, not refused on sight. The one resolution that is
-    refused is the one that lands on the shared folder.
+    supported setup -- is allowed and DISCLOSED, not refused on sight.
+
+    What this establishes, and what it deliberately does NOT (R1 independent review, F-1): both
+    comparisons are on NAMES. A refusal means the folder about to be read carries the same name as
+    the configured shared one, typed or resolved -- which is the FORWARD direction, and the only
+    one a name comparison can see. It does not establish that two surviving names denote different
+    storage. The shared side is never resolved, because resolving it would mean contacting it and
+    the approved R-3 boundary forbids that, so a configured shared TEXT that is itself a junction
+    onto this folder's real target, the extended-length spelling of the same folder, a substituted
+    or mapped drive letter and a short name are all NOT disproved here. The first two were
+    reproduced and are known not to be refused. The read-out states that residual itself
+    (``F3_RECORDS_ALIAS_LIMIT``) rather than letting the absence of a refusal read as a physical
+    guarantee.
     """
     shared_keys, refusal = _f3_shared_folder_keys()
     if refusal:
@@ -9437,6 +9516,7 @@ def _f3_record_lines(local_cache, verified_roots):
     lines.append('  ' + F3_RECORDS_BOUNDS_NOTE)
     lines.append('  ' + F3_RECORDS_TRANSPORT_NOTE)
     lines.append('  ' + F3_RECORDS_MODE_NOTE)
+    lines.append('  ' + F3_RECORDS_ALIAS_LIMIT)
     if contract_problem:
         lines.append('  ' + F3_RECORDS_CONTRACT_UNAVAILABLE + contract_problem)
     if not inventory.scope_assessed:
@@ -9497,6 +9577,7 @@ def _f3_inventory_lines(root_text, inspect_records, local_cache):
         lines.append('  ' + F3_ROOT_REFUSED)
     else:
         lines.append('  ' + F3_MEDIA_TIER_NOTE)
+        lines.append('  ' + F3_MEDIA_NAMED_FOLDER_NOTE)
         media_lines, roots = _f3_media_inventory(text)
         lines.extend('  ' + line for line in media_lines)
     lines.append('')

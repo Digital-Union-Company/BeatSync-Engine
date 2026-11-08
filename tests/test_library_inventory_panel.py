@@ -436,6 +436,43 @@ def mutate_shared_alias_allowed(name, node):
     return mutated
 
 
+def mutate_prefix_comparison(name, node):
+    """DEFECT: the exact-equality identity proof becomes a PREFIX test.
+
+    The specific trap: with a prefix test, any folder whose path merely STARTS WITH the configured
+    shared one -- a sibling named `…VideoAnalysis2`, or anything under `…\\SharedCache` -- is
+    called the shared folder and refused. The R1 independent review measured that the previous
+    version of `test_e6` stayed GREEN under exactly this mutation, because it never used its own
+    look-alike fixture as the local cache.
+    """
+    if name != IDENTITY_FN:
+        return node
+    clone = ast.parse(ast.unparse(node)).body[0]
+    branch = _find_if(clone, "shared_keys")
+    branch.test = ast.parse(
+        "any(os.path.normcase(typed).startswith(key) "
+        "or os.path.normcase(resolved).startswith(key) for key in shared_keys)").body[0].value
+    mutated = ast.fix_missing_locations(clone)
+    assert ast.unparse(mutated) != ast.unparse(node), "the control did not change the comparison"
+    return mutated
+
+
+def mutate_typed_arm_dropped(name, node):
+    """DEFECT: only the RESOLVED path is compared, so the typed arm stops protecting anything.
+
+    Also measured by the R1 review: deleting `normcase(typed)` left the shipped suite green,
+    while deleting `normcase(resolved)` went red. One half of the comparison had no coverage.
+    """
+    if name != IDENTITY_FN:
+        return node
+    clone = ast.parse(ast.unparse(node)).body[0]
+    branch = _find_if(clone, "shared_keys")
+    branch.test = ast.parse("{os.path.normcase(resolved)} & shared_keys").body[0].value
+    mutated = ast.fix_missing_locations(clone)
+    assert ast.unparse(mutated) != ast.unparse(node), "the control did not change the comparison"
+    return mutated
+
+
 def mutate_root_gate_open(name, node):
     """DEFECT: every root text is treated as unambiguous, so a blank field scans something."""
     if name != LINES_FN:
@@ -547,7 +584,11 @@ def tree(tmp_path):
     rejected = tmp_path / "Discarded"
     local = tmp_path / "input" / "video_analysis_cache"
     shared = tmp_path / "SharedCache" / "VideoAnalysis"
-    # A folder whose name is a PREFIX of the shared one, so a prefix test would call it shared.
+    # A folder the configured shared path is a strict string PREFIX of, so a prefix test would
+    # call it shared. It is a realistic NEIGHBOUR in this tree and is deliberately kept here --
+    # but the discriminating prefix case needs the LOCAL CACHE to sit under it, which this
+    # fixture's local cache does not, so `test_e6` builds its own tree (`_prefix_tree`). The
+    # earlier version of that test used this entry and proved nothing; see R1 finding F-3.
     lookalike = tmp_path / "SharedCache" / "VideoAnalysis2"
     for p in (media, rejected, local, shared, lookalike):
         p.mkdir(parents=True)
@@ -1038,17 +1079,146 @@ def test_e5_both_mutations_together_do_reach_the_shared_folder(tree, contract_mo
         os.path.normcase(os.path.abspath(tree["shared"]))
 
 
-def test_e6_a_similar_prefix_folder_is_not_mistaken_for_the_shared_one(tree, contract_module):
-    """`SharedCache\\VideoAnalysis2` is not part of `SharedCache\\VideoAnalysis`. A prefix test
-    would say it is, which is the containment trap this repository has hit before."""
-    inp = os.path.dirname(tree["lookalike"])
-    link_parent = os.path.join(tree["root"], "input2")
-    os.makedirs(link_parent)
-    os.makedirs(os.path.join(link_parent, "video_analysis_cache"))
-    ns = load_f3(shared_config=cfg(tree["shared"], True), local_default=link_parent)
-    out = ns[HANDLER](tree["media"], True)
-    assert ns["F3_LOCAL_IS_SHARED"] not in out, out
-    assert inp  # the lookalike exists and was never the subject
+def _prefix_tree(tmp_path):
+    """A local cache whose path has the configured shared path as a strict STRING prefix.
+
+    ``…\\SharedCache\\VideoAnalysis`` is a strict prefix of
+    ``…\\SharedCache\\VideoAnalysis2\\video_analysis_cache``, and so is ``…\\SharedCache``
+    itself -- the realistic spelling, since a shared folder's parent commonly holds other things.
+    Neither is the local cache folder, so neither may be mistaken for it.
+    """
+    shared = tmp_path / "SharedCache" / "VideoAnalysis"
+    shared.mkdir(parents=True)
+    (shared / "deadbeef_fedcba9876543210fedcba98.json").write_text("{}", encoding="utf-8")
+    parent = tmp_path / "SharedCache" / "VideoAnalysis2"
+    parent.mkdir()
+    local = parent / "video_analysis_cache"
+    local.mkdir()
+    (local / "aabbccdd_0123456789abcdef01234567.json").write_text(
+        '{"cache_contract": "stage5_cache_v3"}', encoding="utf-8")
+    media = tmp_path / "Library"
+    media.mkdir()
+    (media / "a.mp4").write_bytes(b"\0" * 2048)
+    return {"shared": str(shared), "parent": str(parent), "local": str(local),
+            "media": str(media), "above": str(tmp_path / "SharedCache")}
+
+
+def test_e6_a_shared_folder_that_is_a_strict_prefix_is_not_mistaken_for_the_local_one(
+        tmp_path, contract_module):
+    """The DISCRIMINATING prefix case: the record pass must PROCEED, on the local folder.
+
+    The previous version of this test built a look-alike fixture, never used it as the local
+    cache, put the local cache somewhere unrelated, and ended in `assert inp` -- a tautology,
+    since `dirname()` of an absolute path is never empty. The R1 independent review measured that
+    a prefix-test mutation left the whole suite green (98/98). So this version makes the local
+    cache path actually carry the configured shared path as a strict prefix, both spellings, and
+    asserts the pass runs once on the intended folder.
+    """
+    fixture = _prefix_tree(tmp_path)
+    for configured in (fixture["shared"], fixture["above"]):
+        assert os.path.normcase(fixture["local"]).startswith(os.path.normcase(configured)), \
+            configured
+        assert os.path.normcase(fixture["local"]) != os.path.normcase(configured), configured
+        with _RecordReaderSpy() as spy, watch_fork_filesystem() as fw:
+            ns = load_f3(shared_config=cfg(configured, True), local_default=fixture["parent"])
+            out = ns[HANDLER](fixture["media"], True)
+        assert ns["F3_LOCAL_IS_SHARED"] not in out, (configured, out)
+        assert len(spy.calls) == 1, (configured, out)
+        directory, _kw = spy.calls[0]
+        assert os.path.normcase(os.path.abspath(directory)) == \
+            os.path.normcase(fixture["local"]), (configured, directory)
+        # The instrument was live in THIS run -- it saw the local folder -- and the shared leaf
+        # was never touched. Both halves matter: the first stops the second being vacuous.
+        assert fw.touching(fixture["local"]), (configured, fw.calls[:5])
+        assert fw.touching(fixture["shared"]) == [], (configured, fw.touching(fixture["shared"]))
+
+
+def test_e6a_the_prefix_control_fires(tmp_path, contract_module):
+    """Negative control for e6: as a prefix test, both spellings DO refuse a legitimate local
+    cache, so the assertions above are measuring a live comparison."""
+    fixture = _prefix_tree(tmp_path)
+    for configured in (fixture["shared"], fixture["above"]):
+        with _RecordReaderSpy() as spy:
+            ns = load_f3(shared_config=cfg(configured, True), local_default=fixture["parent"],
+                         mutations=(mutate_prefix_comparison,))
+            out = ns[HANDLER](fixture["media"], True)
+        assert ns["F3_LOCAL_IS_SHARED"] in out, (
+            configured, "the mutation did not turn the comparison into a prefix test, so test_e6 "
+            "proves nothing")
+        assert spy.calls == [], configured
+
+
+#: The R1 independent review (finding F-1) measured the panel's strongest sentence to be false
+#: two ways. These are the shapes that sentence took. They are checked against the CONSTANT
+#: VALUES loaded out of `gui.py`, not against this file's own text, so naming them here cannot
+#: trip the check -- the "naming a ban trips it" trap, which this repository has hit repeatedly.
+_UNCONDITIONAL_ISOLATION_CLAIMS = (
+    "the shared folder is never read, listed or counted",
+    "never reads, lists, counts or resolves the shared",
+    "cannot contact the shared",
+    "never contacts the shared",
+)
+
+
+def test_e16_the_unconditional_isolation_claim_cannot_come_back(tree, contract_module):
+    """The user-facing texts must scope the guarantee to what the comparison establishes.
+
+    Two measured counterexamples to an unconditional version: the MEDIA half enumerates whatever
+    folder the operator types, shared folder included, with no alias involved at all; and the
+    record half's check compares folder NAMES, so a configured shared text reaching this folder's
+    storage under a different name is not refused (`test_e13`'s mirror image, reproduced in R2).
+    So the texts may promise a scoped thing and must not promise a physical one.
+    """
+    ns = ns_for(tree)
+    faces = {name: ns[name] for name in
+             ("LABEL_LIBRARY_INVENTORY_RECORDS", "INFO_LIBRARY_INVENTORY",
+              "F3_MEDIA_NAMED_FOLDER_NOTE", "F3_RECORDS_ALIAS_LIMIT")}
+    for name, text in faces.items():
+        assert isinstance(text, str) and text.strip(), name
+        lowered = text.lower()
+        for claim in _UNCONDITIONAL_ISOLATION_CLAIMS:
+            assert claim not in lowered, (
+                f"{name} carries {claim!r}, which R1 measured to be false; scope it to the record "
+                "half and to a comparison of names")
+
+    # And the scoped half is actually said, in both places an operator looks.
+    assert "names" in faces["LABEL_LIBRARY_INVENTORY_RECORDS"].lower(), (
+        "the checkbox label no longer warns that the check is on names")
+    limit = faces["F3_RECORDS_ALIAS_LIMIT"].lower()
+    for required in ("junction", "not storage", "untick"):
+        assert required in limit, (required, limit[:200])
+    media = faces["F3_MEDIA_NAMED_FOLDER_NOTE"].lower()
+    assert "whichever folder that is" in media, media[:200]
+
+    # Control: the comparison really does see the claim it is a guard for.
+    planted = (faces["INFO_LIBRARY_INVENTORY"]
+               + " The shared folder is never read, listed or counted.")
+    assert [c for c in _UNCONDITIONAL_ISOLATION_CLAIMS if c in planted.lower()], (
+        "the instrument cannot see the sentence it exists to keep out")
+
+
+def test_e17_the_alias_limit_is_shown_exactly_when_the_pass_ran(tree, contract_module):
+    """The residual is disclosed where the records are reported, and NOT where nothing was read.
+
+    Printing it beside a refusal would be noise; omitting it beside a result would be the
+    overclaim again, one layer down.
+    """
+    ns = ns_for(tree)
+    ran = ns[HANDLER](tree["media"], True)
+    assert ns["F3_RECORDS_ALIAS_LIMIT"] in ran, ran
+    off = ns[HANDLER](tree["media"], False)
+    assert ns["F3_RECORDS_ALIAS_LIMIT"] not in off, off
+    assert ns["F3_RECORDS_OFF"] in off
+    refused = ns_for(tree, shared="%SHARED_CACHE%\\VideoAnalysis")
+    out = refused[HANDLER](tree["media"], True)
+    assert refused["F3_SHARED_UNKNOWN_AMBIGUOUS"] in out
+    assert refused["F3_RECORDS_ALIAS_LIMIT"] not in out, out
+
+    # The media half's note is shown when a folder is inspected and withheld when it is refused.
+    assert ns["F3_MEDIA_NAMED_FOLDER_NOTE"] in ran, ran
+    blank = ns[HANDLER]("", False)
+    assert ns["F3_MEDIA_NAMED_FOLDER_NOTE"] not in blank, blank
+    assert ns["F3_ROOT_REFUSED"] in blank
 
 
 def test_e7_a_superseded_snapshot_refuses_the_record_pass(tree, contract_module):
@@ -1115,6 +1285,91 @@ def test_e12_the_shared_reach_instrument_can_actually_fail(tree):
     with watch_fork_filesystem() as fw:
         a3.read_records(tree["shared"], is_record_name=ac.is_record_name)
     assert fw.touching(tree["shared"]), "the instrument saw nothing; every GROUP E test is vacuous"
+
+
+def _typed_arm_tree(tmp_path):
+    """A local cache whose TYPED path is the configured shared folder, resolving elsewhere.
+
+    The reparse point is on the LOCAL side, so `realpath` leads away from the configured folder
+    and only the typed comparison can see the collision. A real junction, not a stub: the whole
+    question is what `realpath` does with one.
+    """
+    elsewhere = tmp_path / "BigDisk" / "Cache"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "aabbccdd_0123456789abcdef01234567.json").write_text(
+        '{"cache_contract": "stage5_cache_v3"}', encoding="utf-8")
+    inp = tmp_path / "input"
+    inp.mkdir()
+    link = inp / "video_analysis_cache"
+    _junction(link, elsewhere)
+    media = tmp_path / "Library"
+    media.mkdir()
+    (media / "a.mp4").write_bytes(b"\0" * 2048)
+    return {"input": str(inp), "typed": os.path.abspath(str(link)),
+            "elsewhere": str(elsewhere), "media": str(media)}
+
+
+def test_e13_a_typed_local_path_that_is_the_shared_folder_is_refused(tmp_path, contract_module):
+    """The TYPED arm of the comparison, which nothing else in this suite reached.
+
+    The local cache path AS TYPED is exactly the configured shared folder, while the folder it
+    resolves to is somewhere else entirely. The resolved arm therefore sees nothing, and the R1
+    independent review measured that deleting `normcase(typed)` left the shipped suite GREEN.
+    """
+    fixture = _typed_arm_tree(tmp_path)
+    assert os.path.normcase(os.path.realpath(fixture["typed"])) != \
+        os.path.normcase(fixture["typed"]), (
+            "the junction did not redirect, so the RESOLVED arm could refuse this on its own and "
+            "the test would not isolate the typed one")
+    with _RecordReaderSpy() as spy, watch_fork_filesystem() as fw:
+        ns = load_f3(shared_config=cfg(fixture["typed"], True), local_default=fixture["input"])
+        out = ns[HANDLER](fixture["media"], True)
+    assert ns["F3_LOCAL_IS_SHARED"] in out, out
+    assert spy.calls == [], "the record reader ran against the configured shared folder's own path"
+    assert fw.opened == [], fw.opened
+    # Under BOTH names: the typed one (which is the configured folder) and the storage it leads
+    # to. The instrument records the path as it was asked for, so both have to be stated.
+    assert fw.touching(fixture["typed"]) == [], fw.touching(fixture["typed"])
+    assert fw.touching(fixture["elsewhere"]) == [], fw.touching(fixture["elsewhere"])
+
+
+def test_e14_the_typed_arm_control_fires(tmp_path, contract_module):
+    """Negative control for e13: with the typed arm deleted the records ARE read, off the storage
+    the junction leads to, so the refusal above is a live guard rather than an accident."""
+    fixture = _typed_arm_tree(tmp_path)
+    with _RecordReaderSpy() as spy, watch_fork_filesystem() as fw:
+        ns = load_f3(shared_config=cfg(fixture["typed"], True), local_default=fixture["input"],
+                     mutations=(mutate_typed_arm_dropped,))
+        out = ns[HANDLER](fixture["media"], True)
+    assert ns["F3_LOCAL_IS_SHARED"] not in out, out
+    assert len(spy.calls) == 1, (
+        "the mutation did not make the reader run, so test_e13 proves nothing")
+    # The instrument fired in THIS run, which is what makes its silence in e13 meaningful. It
+    # records the path as asked for -- the junction -- not the storage `realpath` leads to, so
+    # that is the name to look for.
+    assert fw.touching(fixture["typed"]), (
+        "the instrument saw no contact at all, so its silence in test_e13 would mean nothing")
+
+
+def test_e15_the_resolved_arm_is_covered_too(tmp_path, contract_module):
+    """The other half of the same comparison, so neither arm rests on the other's coverage.
+
+    `test_e2` already measures a local cache junctioned ONTO the shared folder, which is the
+    resolved arm. This states the pairing explicitly: with the typed arm deleted, `test_e2`'s
+    case must STILL be refused.
+    """
+    shared = tmp_path / "SharedCache"
+    shared.mkdir()
+    (shared / "deadbeef_fedcba9876543210fedcba98.json").write_text("{}", encoding="utf-8")
+    inp = tmp_path / "input"
+    inp.mkdir()
+    _junction(inp / "video_analysis_cache", shared)
+    with _RecordReaderSpy() as spy:
+        ns = load_f3(shared_config=cfg(str(shared), True), local_default=str(inp),
+                     mutations=(mutate_typed_arm_dropped,))
+        out = ns[HANDLER](str(tmp_path), True)
+    assert ns["F3_LOCAL_IS_SHARED"] in out, out
+    assert spy.calls == []
 
 
 # ===========================================================================
@@ -1692,11 +1947,21 @@ def test_k4a_the_gradio_6_keyword_regression_cannot_come_back():
     assert hits == [removed], "the instrument cannot see the defect it is a guard for"
 
 
+#: Every in-memory AST mutator in this file, in definition order. TEN, since the R1 independent
+#: review added the prefix-comparison and dropped-typed-arm defects that the shipped suite was
+#: measured to survive. They mutate EXTRACTED function bodies in memory: `gui.py` is never
+#: written to and therefore never needs restoring, which is the safer arrangement and must not be
+#: described as a file-mutating harness.
+MUTATORS = (mutate_records_always_on, mutate_shared_alias_allowed, mutate_prefix_comparison,
+            mutate_typed_arm_dropped, mutate_root_gate_open, mutate_transport_enabled,
+            mutate_bounds_widened, mutate_fabricated_zero, mutate_point_at_shared,
+            mutate_discarded_included)
+
+
 def test_k4_every_mutator_really_changes_the_shipped_function():
     """A mutator that silently no-ops turns its own control green for the wrong reason."""
-    mutators = (mutate_records_always_on, mutate_shared_alias_allowed, mutate_root_gate_open,
-                mutate_transport_enabled, mutate_bounds_widened, mutate_fabricated_zero,
-                mutate_point_at_shared, mutate_discarded_included)
+    mutators = MUTATORS
+    assert len(set(mutators)) == len(mutators) == 10, len(mutators)
     changed = 0
     for mutate in mutators:
         for name in F3_FUNCTIONS:
