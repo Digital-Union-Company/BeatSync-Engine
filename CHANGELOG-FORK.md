@@ -73,8 +73,9 @@ re-edited renders that were already fine: **30 of 46 (65.2 %)** eligible winners
 candidate in the original order and only skips the comparison, and the seeded branch runs
 `select_index` against the **unchanged** full score list, keeping that winner when it fits and
 re-drawing from the **same** `rng` only when it does not. Measured across seeds 0 / 381944 / 101 / 4242
-at 25 and 30 fps, two pool shapes: **0 of 736** already-viable segments changed winner, **368 of 368**
-physically impossible winners repaired, **0** short sources leaked through.
+at 25 and 30 fps, two pool shapes, 768 segment decisions in total: **0 of 400** already-viable
+segments changed winner, **368 of 368** physically impossible winners repaired, **0** short sources
+leaked through.
 
 **No eligible source is a refusal before any worker starts, never a silent fallback.**
 `SegmentSourceCapacityError` names the segment (1-based and 0-based), the frames and seconds it needed,
