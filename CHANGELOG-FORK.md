@@ -90,11 +90,22 @@ it.** Independent review measured that the first version of `_run_git` handed th
 `GIT_DIR`, `rev-parse HEAD` answered out of a **different repository** while `--show-toplevel`
 still named the application root — so the ownership check passed and the header stated a foreign
 commit with no disclosure, which is precisely the confident lie this feature exists to prevent. It
-needed no file corruption, no administrator and no write access to the checkout: `git` itself
-exports `GIT_DIR` inside hook, `rebase --exec`, `bisect run`, `submodule foreach` and
-`filter-branch` contexts, so launching the application from one of those inherited it. The ordinary
-launch path was never affected — nothing in this repository sets a `GIT_*` variable and `run.bat`
-sets only `PYTHONUTF8` and `PYTHONPATH`.
+needed no file corruption, no administrator and no write access to the checkout, because `git`
+exports repository locators into the children it launches. Which locator, and whether it bites, was
+measured per context on git 2.53.0 for Windows rather than assumed:
+
+* `filter-branch --index-filter` exported an absolute `GIT_DIR` — the vector that borrows a foreign
+  commit outright.
+* A `post-commit` hook exported `GIT_INDEX_FILE`, which was enough to mislabel a clean checkout.
+* `submodule foreach` exported a **relative** `GIT_DIR=.git`, benign in the measured invocation.
+* `rebase --exec` and `bisect run` exported no harmful repository locator in the measured cases.
+
+Those are measurements of one git version on one platform and are not generalised to every git.
+What they establish is the finding that matters: an ordinary operator can inherit a Git-specific
+variable without malice, corruption or privilege, such a variable can make the reported build
+identity wrong, and the sweep below prevents that measured failure. The ordinary launch path was
+never affected — nothing in this repository sets a `GIT_*` variable, and `run.bat` introduces no
+`GIT_*` repository locator.
 
 The child environment is now built by **dropping every inherited variable whose name begins with
 `GIT_`** (case-insensitively) and then reinstating this module's own two settings by name. Measured
