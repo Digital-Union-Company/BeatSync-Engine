@@ -55,11 +55,12 @@ Four properties, each of which is the honest answer rather than the convenient o
 | commit known, modification state **not measurable** | `e6a7c0cd (unverified)` |
 | no git, no metadata, a foreign worktree, or a non-commit answer | `Build unknown` |
 
-* **A worktree is believed only when it IS the application root.** `--show-toplevel` is compared —
-  resolved, case-folded, exact equality, never a prefix in either direction — against `ROOT_DIR`.
-  A portable install dropped inside an unrelated repository would otherwise have reported *that*
-  repository's commit as BeatSync's own; measured against a real nested checkout, it reports
-  `Build unknown` instead.
+* **A worktree is believed only when it IS the application root, and only when the environment
+  cannot move it.** `--show-toplevel` is compared — resolved, case-folded, exact equality, never a
+  prefix in either direction — against `ROOT_DIR`. A portable install dropped inside an unrelated
+  repository would otherwise have reported *that* repository's commit as BeatSync's own; measured
+  against a real nested checkout, it reports `Build unknown` instead. The path comparison alone was
+  **not sufficient**, which independent review measured and which is corrected below.
 * **`(unverified)` is a genuine third state and is never collapsed into clean.** That is the one
   direction that would turn a modified build into a confident-looking clean one.
 * **Nothing is ever invented.** Not a placeholder SHA, not the version, and in particular not
@@ -82,6 +83,38 @@ input/output directories, shared analysis cache and configuration are not read.
 
 `BUILD_ID_CSS` styles the second line down with two inherited properties and no layout arithmetic,
 scoped to its own class.
+
+**The git child environment is isolated, because the ownership check above was defeatable through
+it.** Independent review measured that the first version of `_run_git` handed the child
+`dict(os.environ)`, and `git` reads its own behaviour out of its environment. With an inherited
+`GIT_DIR`, `rev-parse HEAD` answered out of a **different repository** while `--show-toplevel`
+still named the application root — so the ownership check passed and the header stated a foreign
+commit with no disclosure, which is precisely the confident lie this feature exists to prevent. It
+needed no file corruption, no administrator and no write access to the checkout: `git` itself
+exports `GIT_DIR` inside hook, `rebase --exec`, `bisect run`, `submodule foreach` and
+`filter-branch` contexts, so launching the application from one of those inherited it. The ordinary
+launch path was never affected — nothing in this repository sets a `GIT_*` variable and `run.bat`
+sets only `PYTHONUTF8` and `PYTHONPATH`.
+
+The child environment is now built by **dropping every inherited variable whose name begins with
+`GIT_`** (case-insensitively) and then reinstating this module's own two settings by name. Measured
+against git 2.53.0, `GIT_DIR` borrowed the commit outright, `GIT_WORK_TREE` moved the toplevel so a
+legitimate install read `Build unknown`, and `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` /
+`GIT_INDEX_FILE` broke `status` so a clean tree read `(unverified)`. It is deliberately a **prefix
+rather than a list of the variables that bite today**: the `GIT_CONFIG_*` family is inert for these
+three commands in that version and is swept anyway, because enumerating known offenders leaves the
+next one to be discovered in production. The sweep is equally deliberately narrow in the other
+direction — `PATH`, `SystemRoot` and `USERPROFILE` still arrive, or `git` would stop being
+findable; a nonstandard install depending on an inherited `GIT_EXEC_PATH` now answers
+`Build unknown` rather than a wrong commit, which is the correct direction to fail in. The caller's
+own environment is never modified.
+
+Twelve hostile environments are pinned as regression tests, the original defect is reproduced
+permanently against the policy that shipped, and a mutation control asserts the sweep is
+load-bearing: disabling it brings the borrowed commit straight back, so the new tests cannot
+quietly become vacuous. One consequence is recorded rather than hidden — `(unverified)` is no
+longer reachable by breaking `status` through the environment, so that branch stays pinned by the
+injected-runner test where it belongs.
 
 **Known limitation, deliberately not fixed here.** This base revision still carries the
 `show_copy_button` keyword that gradio 6.19.0 removed, so the full `create_ui()` does not build

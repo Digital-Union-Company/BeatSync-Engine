@@ -797,3 +797,274 @@ def test_an_invented_component_keyword_would_be_rejected():
 
     with pytest.raises(TypeError):
         gr.Markdown("x", definitely_not_a_gradio_keyword=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# 5. The git child environment
+#
+# Last because it is remediation rather than original design: review measured that the shipped
+# `_run_git` inherited the whole parent environment, and `git` reads its *own* behaviour out of
+# that environment. An inherited `GIT_DIR` therefore made `rev-parse HEAD` answer out of a
+# different repository while `--show-toplevel` still named the application root — so the ownership
+# check in section 1 passed and the header stated a foreign commit with no disclosure. That is
+# precisely the confident lie this whole feature exists to prevent, so the fix is asserted from
+# four directions: the defect is reproduced, it is shown neutralised, the sanitisation is shown to
+# be load-bearing (mutate it and the defect returns), and the environment is shown to be otherwise
+# intact — a sweep that also removed `PATH` would simply make `git` unfindable.
+#
+# Measured against git 2.53.0, the variables that actually perturb these three commands are
+# GIT_DIR (borrows the commit), GIT_WORK_TREE (moves the toplevel), and GIT_COMMON_DIR /
+# GIT_OBJECT_DIRECTORY / GIT_INDEX_FILE (break `status`, so a clean tree reports `(unverified)`).
+# The GIT_CONFIG_* family is inert for these commands in that version. It is covered anyway, and
+# deliberately by the `GIT_` prefix rather than by a list of the ones that happen to bite today:
+# enumerating known offenders leaves the next one to be discovered in production.
+# ---------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def foreign_repo(tmp_path):
+    """A second real repository, with deliberately different content.
+
+    The content must differ. Two repositories built from the same tree, message, author and
+    second produce the *same* commit id, and a borrowed-identity test against identical ids
+    cannot fail — the first draft of this fixture did exactly that and proved nothing.
+    """
+    root = tmp_path / "someone-elses-repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / "unrelated.txt").write_text("a completely different repository\n", encoding="utf-8")
+    _git(root, "add", "unrelated.txt")
+    _git(root, "commit", "-q", "-m", "not the application's history")
+    return root
+
+
+def _hostile(app_root, foreign_root):
+    """Environments that redirect `git` away from the checkout it was pointed at.
+
+    The first two are the reported defect; the rest were measured to degrade the answer rather
+    than falsify it, and the GIT_CONFIG_* entries are inert today and included on principle.
+    """
+    foreign_git = str(foreign_root / ".git")
+    return {
+        "GIT_DIR": {"GIT_DIR": foreign_git},
+        "GIT_DIR and GIT_WORK_TREE": {"GIT_DIR": foreign_git,
+                                      "GIT_WORK_TREE": str(app_root)},
+        "GIT_WORK_TREE": {"GIT_WORK_TREE": str(foreign_root)},
+        "GIT_COMMON_DIR": {"GIT_COMMON_DIR": foreign_git},
+        "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(foreign_root / ".git" / "objects")},
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(foreign_root / ".git" / "objects")},
+        "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(foreign_root)},
+        "GIT_CEILING_DIRECTORIES": {"GIT_CEILING_DIRECTORIES": str(app_root.parent)},
+        "GIT_NAMESPACE": {"GIT_NAMESPACE": "refs/namespaces/elsewhere"},
+        "GIT_CONFIG_COUNT trio": {"GIT_CONFIG_COUNT": "1",
+                                  "GIT_CONFIG_KEY_0": "core.worktree",
+                                  "GIT_CONFIG_VALUE_0": str(foreign_root)},
+        "GIT_CONFIG_PARAMETERS": {"GIT_CONFIG_PARAMETERS": "'core.bare'='true'"},
+        "git_dir lowercase": {"git_dir": foreign_git},
+    }
+
+
+def _captured_environment(monkeypatch, root, args=("rev-parse", "HEAD")):
+    """The environment `_run_git` actually hands to the child, without running `git`.
+
+    A `SimpleNamespace` stands in for the `subprocess` module rather than patching the real one,
+    so nothing outside this call is affected. `_NO_WINDOW` was bound at import, so the stand-in
+    only needs `run` and the exception type the `except` clause names.
+    """
+    import types
+
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = tuple(argv)
+        seen["env"] = dict(kwargs["env"])
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(fork_build, "subprocess",
+                        types.SimpleNamespace(run=fake_run,
+                                              SubprocessError=subprocess.SubprocessError))
+    fork_build._run_git(root, args)
+    assert seen, "_run_git did not reach its subprocess site"
+    return seen
+
+
+@_needs_git
+def test_the_reported_defect_reproduces_against_the_environment_policy_that_shipped(
+        real_repo, foreign_repo):
+    """The defect itself, reproduced from the policy PR #97 shipped: `dict(os.environ)` plus the
+    two flags. Kept permanently, because a regression test for a bug nobody can demonstrate is a
+    test that cannot be trusted to still be testing anything.
+    """
+    own = _git(real_repo, "rev-parse", "HEAD")
+    foreign = _git(foreign_repo, "rev-parse", "HEAD")
+    assert own != foreign, "the two fixtures share a commit id; nothing below could fail"
+
+    shipped = dict(os.environ)                      # <- the policy as it shipped, verbatim
+    shipped["GIT_TERMINAL_PROMPT"] = "0"
+    shipped["GIT_OPTIONAL_LOCKS"] = "0"
+    shipped["GIT_DIR"] = str(foreign_repo / ".git")
+
+    def run(*args):
+        done = subprocess.run([_GIT, "-C", str(real_repo)] + list(args),
+                              capture_output=True, text=True, env=shipped, timeout=120)
+        return done.returncode == 0, done.stdout.strip()
+
+    top_ok, toplevel = run("rev-parse", "--show-toplevel")
+    head_ok, head = run("rev-parse", "HEAD")
+    assert top_ok and head_ok
+    assert fork_build._same_location(toplevel, str(real_repo)), \
+        "the ownership check still passes, which is what made the wrong answer confident"
+    assert head == foreign, "the defect no longer reproduces, so this detector proves nothing"
+    assert head != own
+
+
+@_needs_git
+@pytest.mark.parametrize("label", [
+    "GIT_DIR", "GIT_DIR and GIT_WORK_TREE", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE",
+    "GIT_CEILING_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG_COUNT trio",
+    "GIT_CONFIG_PARAMETERS", "git_dir lowercase"])
+def test_no_inherited_git_variable_can_redirect_the_identity(monkeypatch, real_repo,
+                                                             foreign_repo, label):
+    """Whatever the parent environment says, the answer is about the checkout at `root`."""
+    own = _git(real_repo, "rev-parse", "HEAD")
+    foreign = _git(foreign_repo, "rev-parse", "HEAD")
+    assert own != foreign
+
+    for name, value in _hostile(real_repo, foreign_repo)[label].items():
+        monkeypatch.setenv(name, value)
+
+    identity = fork_build.resolve(str(real_repo))
+    assert identity.commit != foreign, f"{label} borrowed another repository's commit"
+    assert identity.commit == own, f"{label} changed the answer (reason={identity.reason!r})"
+    assert identity.modified is False, \
+        f"{label} made a clean checkout report {identity.label()!r}"
+    assert identity.label() == own[:8]
+
+
+@_needs_git
+def test_the_sanitisation_is_load_bearing(monkeypatch, real_repo, foreign_repo):
+    """The mutation control. Disable the sweep and the defect must come straight back.
+
+    Without this, every assertion above would still pass if the sanitisation silently stopped
+    matching anything — a test suite that cannot detect its own subject being removed is
+    decoration.
+    """
+    own = _git(real_repo, "rev-parse", "HEAD")
+    foreign = _git(foreign_repo, "rev-parse", "HEAD")
+    assert own != foreign
+    monkeypatch.setenv("GIT_DIR", str(foreign_repo / ".git"))
+
+    # sanity: with the sanitisation in place the identity is our own
+    assert fork_build.resolve(str(real_repo)).commit == own
+
+    # mutate the policy so the sweep matches no variable at all, and nothing else
+    monkeypatch.setattr(fork_build, "GIT_ENVIRONMENT_PREFIX", "DEFINITELY_NOT_A_GIT_PREFIX_")
+    mutated = fork_build.resolve(str(real_repo))
+    assert mutated.commit == foreign, \
+        "removing the sanitisation did NOT reintroduce the defect, so the tests above are vacuous"
+
+
+@_needs_git
+def test_the_four_states_still_hold_while_the_environment_is_hostile(monkeypatch, real_repo,
+                                                                     foreign_repo, tmp_path):
+    """Clean, modified and unknown, measured with `GIT_DIR` pointed somewhere else throughout.
+
+    (`unverified` is not reachable this way any more — breaking `status` through the environment
+    is exactly what the sweep prevents — so it stays pinned by the injected-runner test in
+    section 1, which is where that branch belongs.)
+    """
+    # Measured BEFORE the environment is poisoned: `_git` is an ordinary subprocess helper that
+    # inherits `os.environ`, so asking it for HEAD afterwards would answer out of the foreign
+    # repository and this test would compare the resolver against the wrong expectation.
+    own = _git(real_repo, "rev-parse", "HEAD")
+
+    monkeypatch.setenv("GIT_DIR", str(foreign_repo / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(foreign_repo))
+
+    assert fork_build.resolve(str(real_repo)).modified is False
+
+    (real_repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    modified = fork_build.resolve(str(real_repo))
+    assert modified.commit == own
+    assert modified.modified is True
+
+    plain = tmp_path / "not-a-checkout"
+    plain.mkdir()
+    unknown = fork_build.resolve(str(plain))
+    assert not unknown.known
+    assert unknown.label() == fork_build.UNKNOWN_LABEL
+
+
+def test_ordinary_environment_variables_are_still_inherited(monkeypatch, tmp_path):
+    """The sweep must remove git's own variables, not build a bare environment: without `PATH`
+    the `git` executable stops being findable at all, which would turn every build into
+    `Build unknown` on a perfectly good checkout.
+    """
+    monkeypatch.setenv("BEATSYNC_MARKER_FOR_THIS_TEST", "kept")
+    captured = _captured_environment(monkeypatch, str(tmp_path))["env"]
+
+    assert captured.get("BEATSYNC_MARKER_FOR_THIS_TEST") == "kept"
+    for inherited in ("PATH", "SYSTEMROOT", "USERPROFILE", "WINDIR", "TEMP"):
+        if inherited in {k.upper() for k in os.environ}:
+            assert inherited in {k.upper() for k in captured}, \
+                f"{inherited} was swept out of the child environment"
+
+
+def test_only_the_two_deliberate_git_variables_reach_the_child(monkeypatch, tmp_path):
+    """Everything `GIT_*` goes, then exactly two come back with exactly these values."""
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "9")
+    monkeypatch.setenv("GIT_TRACE", "1")
+    monkeypatch.setenv("git_work_tree", str(tmp_path))
+
+    captured = _captured_environment(monkeypatch, str(tmp_path))["env"]
+    surviving = {k: v for k, v in captured.items() if k.upper().startswith("GIT_")}
+    assert surviving == {"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}, surviving
+
+
+def test_the_callers_own_environment_is_left_alone(monkeypatch, tmp_path):
+    """A child's environment is built, never imposed on this process. `setup_environment` already
+    mutates `PATH` and `CUDA_PATH` for the whole application; a label on a screen may not.
+    """
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+    before = dict(os.environ)
+    _captured_environment(monkeypatch, str(tmp_path))
+    assert dict(os.environ) == before
+    assert os.environ["GIT_DIR"] == str(tmp_path / "elsewhere" / ".git")
+
+
+def test_the_environment_is_filtered_by_construction_not_by_a_list(module_tree):
+    """Structural, so a future edit that reintroduces inheritance is caught on a bare interpreter
+    with no `git` and no repository — the same reason the rest of section 1 exists.
+    """
+    runner = _func(module_tree, "_run_git")
+    rendered = ast.unparse(runner)
+
+    assert "dict(os.environ)" not in rendered, \
+        "the whole parent environment is being inherited again; GIT_DIR can redirect the answer"
+    assert "GIT_ENVIRONMENT_PREFIX" in rendered, "the sweep is not applied"
+    assert "os.environ.items()" in rendered, "the child no longer inherits anything at all"
+    # Reinstated inline rather than through a constant, so the pre-existing structural guard
+    # `test_every_git_call_is_bounded_windowless_and_read_only` keeps meaning what it says.
+    assert "GIT_TERMINAL_PROMPT" in rendered and "GIT_OPTIONAL_LOCKS" in rendered
+
+    # the policy is a prefix, not an enumeration of today's offenders
+    assert fork_build.GIT_ENVIRONMENT_PREFIX == "GIT_"
+    for offender in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                     "GIT_OBJECT_DIRECTORY", "GIT_CONFIG_COUNT"):
+        assert offender not in rendered, \
+            f"{offender} is named individually; the next variable like it would be missed"
+
+
+def test_the_sweep_added_no_import_and_no_second_subprocess_site(module_tree):
+    """The fork package's stdlib-only promise, and `_run_git` as the only child-process site."""
+    imported = sorted({node.module or "" for node in ast.walk(module_tree)
+                       if isinstance(node, ast.ImportFrom)}
+                      | {alias.name for node in ast.walk(module_tree)
+                         if isinstance(node, ast.Import) for alias in node.names})
+    assert imported == ["__future__", "dataclasses", "os", "subprocess", "typing"], imported
+
+    calls = [ast.unparse(n.func) for n in ast.walk(module_tree) if isinstance(n, ast.Call)
+             and ast.unparse(n.func).startswith("subprocess.")]
+    assert calls == ["subprocess.run"], calls

@@ -74,6 +74,34 @@ REASON_NO_COMMIT = "git reported no usable commit"
 #: Windows-only; absent on the bare interpreters the test suite also runs on.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+#: Every inherited variable whose name begins with this is dropped from the `git` child's
+#: environment, compared case-insensitively.
+#:
+#: `git` reads its own behaviour out of the environment, so inheriting it hands an outsider the
+#: answer. An inherited `GIT_DIR` was measured making `rev-parse HEAD` reply out of a *different*
+#: repository while `--show-toplevel` still named this one — so the ownership check below passed
+#: and the header stated a foreign commit with no disclosure, which is the exact lie this module
+#: exists to prevent. `GIT_WORK_TREE` moves the toplevel instead (a legitimate install then reads
+#: `Build unknown`), and `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` and `GIT_INDEX_FILE` break
+#: `status` so a clean tree reads `(unverified)`.
+#:
+#: It is a **prefix, not a list of the variables that happen to bite today**. The `GIT_CONFIG_*`
+#: family is inert for these three commands in git 2.53.0 and is swept anyway: enumerating known
+#: offenders leaves the next one to be discovered in production, and `git`'s environment surface
+#: grows with every release. Only `-C <root>` and the checkout on disk may decide which repository
+#: answers.
+#:
+#: The sweep is deliberately narrow in the other direction — it removes `GIT_*` and nothing else,
+#: so `PATH`, `SystemRoot` and `USERPROFILE` still arrive and `git` stays findable. A nonstandard
+#: install that depends on an inherited `GIT_EXEC_PATH` will answer `Build unknown` rather than a
+#: wrong commit, which is the correct direction to fail in.
+#:
+#: The sweep removes the two settings this module sets for itself as well, so `_run_git` puts those
+#: back **by name, inline where the child is spawned** rather than through a second constant: a
+#: reader asking whether an unattended startup can block on a credential prompt should find the
+#: answer at the call, and the pre-existing structural guard asserts it there.
+GIT_ENVIRONMENT_PREFIX = "GIT_"
+
 #: ``(ok, stdout)``. A runner never raises: a failure is ``(False, '')``.
 GitRunner = Callable[[str, Tuple[str, ...]], Tuple[bool, str]]
 
@@ -135,11 +163,15 @@ def _run_git(root: str, args: Tuple[str, ...]) -> Tuple[bool, str]:
     """One bounded, windowless, read-only `git` call. Never raises, never prompts.
 
     `-C` scopes the call to the application root rather than inheriting whatever working directory
-    the process happens to have. The environment is left alone apart from the two settings that
-    stop git asking a question nobody is there to answer — an unattended UI startup must fail
-    cleanly instead of blocking on a credential prompt.
+    the process happens to have, and the child's environment inherits everything *except* `git`'s
+    own variables (`GIT_ENVIRONMENT_PREFIX`), so nothing an outsider exported can change which
+    repository answers. The sweep takes this module's own two settings with it, so they are put
+    back immediately below — an unattended UI startup must fail cleanly instead of blocking on a
+    credential prompt, and `status` must not take the index lock, which is what keeps this call
+    read-only.
     """
-    env = dict(os.environ)
+    env = {name: value for name, value in os.environ.items()
+           if not name.upper().startswith(GIT_ENVIRONMENT_PREFIX)}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
