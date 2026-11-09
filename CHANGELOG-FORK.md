@@ -20,6 +20,126 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Added — 2026-11-09 (visible version and running build id)
+
+**The header now says which BeatSync this is and which source revision it was actually loaded
+from.** Two lines, built once at startup:
+
+```
+🎵 BeatSync Engine v0.1.0
+Running build: `e6a7c0cd` · Digital Union
+```
+
+and the same two facts in the browser tab title, so a screenshot of a window identifies what
+produced it. The version alone could not distinguish two machines on the same release running two
+different commits, which is the situation this was hard to diagnose from.
+
+**The version is the existing `FORK_VERSION`, reused and not restated.** There is deliberately no
+second version constant: a product version is a release decision, and two places to state it is how
+the screen and this record start disagreeing. The three display templates live in `ui_content.py`
+with every other string in the app; `0.1.0` appears in neither `gui.py` nor `ui_content.py`.
+
+**The build identity is resolved by one new stdlib-only fork module,
+`src/beatsync_fork/build_identity.py`** — read-only, bounded, windowless, and injectable, so every
+branch is executed on a bare interpreter with no `git` and no repository. It lives in the fork
+package rather than in `gui.py` because it needs a `git` child process and `gui.py`'s
+`subprocess.run` site count is pinned at exactly two; that count, the three authorised
+`app.load(js=…)` installers, the ten `gr.Tab`s and the `gr.Blocks` keyword set are all unchanged.
+
+Four properties, each of which is the honest answer rather than the convenient one:
+
+| Situation | Reported |
+|---|---|
+| this root is a git worktree, tracked files clean | `e6a7c0cd` |
+| tracked files differ from that commit | `e6a7c0cd (modified)` |
+| commit known, modification state **not measurable** | `e6a7c0cd (unverified)` |
+| no git, no metadata, a foreign worktree, or a non-commit answer | `Build unknown` |
+
+* **A worktree is believed only when it IS the application root, and only when the environment
+  cannot move it.** `--show-toplevel` is compared — resolved, case-folded, exact equality, never a
+  prefix in either direction — against `ROOT_DIR`. A portable install dropped inside an unrelated
+  repository would otherwise have reported *that* repository's commit as BeatSync's own; measured
+  against a real nested checkout, it reports `Build unknown` instead. The path comparison alone was
+  **not sufficient**, which independent review measured and which is corrected below.
+* **`(unverified)` is a genuine third state and is never collapsed into clean.** That is the one
+  direction that would turn a modified build into a confident-looking clean one.
+* **Nothing is ever invented.** Not a placeholder SHA, not the version, and in particular not
+  `UPSTREAM_BASELINE_COMMIT` — a real 40-character id sitting in the same package that would look
+  entirely plausible in the header while answering a different question. Untracked content is not a
+  modification either (`--untracked-files=no`), because `bin/`, `input/` and `output/` are runtime
+  directories and a fresh install is full of them.
+* **It is the LOCAL revision.** No network request, no remote, no `fetch` or `ls-remote`, and
+  GitHub's current `main` is never substituted — which is wrong in exactly the case the feature
+  exists for, a machine running something that was never pushed. No branch name is read either
+  (no `symbolic-ref`, no `--abbrev-ref`), which is what makes a detached HEAD work by construction;
+  verified against a real detached checkout and a real linked worktree.
+
+**Resolved once per process.** `create_ui` calls the memoised `cached_identity(ROOT_DIR)` exactly
+once; no handler, browser event, tab selection or render can reach it, asserted over every function
+in the module. The label is a string on the screen: it reaches no render path, no cache key, no
+Qwen request and no `beat_info`, and the module computes no identity of any kind — no `hashlib`, no
+contract constant. Nothing is created, written, moved or deleted, and the operator's media,
+input/output directories, shared analysis cache and configuration are not read.
+
+`BUILD_ID_CSS` styles the second line down with two inherited properties and no layout arithmetic,
+scoped to its own class.
+
+**The git child environment is isolated, because the ownership check above was defeatable through
+it.** Independent review measured that the first version of `_run_git` handed the child
+`dict(os.environ)`, and `git` reads its own behaviour out of its environment. With an inherited
+`GIT_DIR`, `rev-parse HEAD` answered out of a **different repository** while `--show-toplevel`
+still named the application root — so the ownership check passed and the header stated a foreign
+commit with no disclosure, which is precisely the confident lie this feature exists to prevent. It
+needed no file corruption, no administrator and no write access to the checkout, because `git`
+exports repository locators into the children it launches. Which locator, and whether it bites, was
+measured per context on git 2.53.0 for Windows rather than assumed:
+
+* `filter-branch --index-filter` exported an absolute `GIT_DIR` — the vector that borrows a foreign
+  commit outright.
+* A `post-commit` hook exported `GIT_INDEX_FILE`, which was enough to mislabel a clean checkout.
+* `submodule foreach` exported a **relative** `GIT_DIR=.git`, benign in the measured invocation.
+* `rebase --exec` and `bisect run` exported no harmful repository locator in the measured cases.
+
+Those are measurements of one git version on one platform and are not generalised to every git.
+What they establish is the finding that matters: an ordinary operator can inherit a Git-specific
+variable without malice, corruption or privilege, such a variable can make the reported build
+identity wrong, and the sweep below prevents that measured failure. The ordinary launch path was
+never affected — nothing in this repository sets a `GIT_*` variable, and `run.bat` introduces no
+`GIT_*` repository locator.
+
+The child environment is now built by **dropping every inherited variable whose name begins with
+`GIT_`** (case-insensitively) and then reinstating this module's own two settings by name. Measured
+against git 2.53.0, `GIT_DIR` borrowed the commit outright, `GIT_WORK_TREE` moved the toplevel so a
+legitimate install read `Build unknown`, and `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` /
+`GIT_INDEX_FILE` broke `status` so a clean tree read `(unverified)`. It is deliberately a **prefix
+rather than a list of the variables that bite today**: the `GIT_CONFIG_*` family is inert for these
+three commands in that version and is swept anyway, because enumerating known offenders leaves the
+next one to be discovered in production. The sweep is equally deliberately narrow in the other
+direction — `PATH`, `SystemRoot` and `USERPROFILE` still arrive, or `git` would stop being
+findable; a nonstandard install depending on an inherited `GIT_EXEC_PATH` now answers
+`Build unknown` rather than a wrong commit, which is the correct direction to fail in. The caller's
+own environment is never modified.
+
+Twelve hostile environments are pinned as regression tests, the original defect is reproduced
+permanently against the policy that shipped, and a mutation control asserts the sweep is
+load-bearing: disabling it brings the borrowed commit straight back, so the new tests cannot
+quietly become vacuous. One consequence is recorded rather than hidden — `(unverified)` is no
+longer reachable by breaking `status` through the environment, so that branch stays pinned by the
+injected-runner test where it belongs.
+
+**Known limitation, deliberately not fixed here.** This base revision still carries the
+`show_copy_button` keyword that gradio 6.19.0 removed, so the full `create_ui()` does not build
+under the pinned Gradio. That is an unrelated, separately tracked blocker and silently fixing it was
+out of scope. Consequently the verification for this change is **source-level**: the keyword
+`elem_classes` was measured as declared by `gr.Markdown.__init__` in the installed gradio 6.19.0
+(which takes no `**kwargs`, so the check is real) and `title` as declared by `gr.Blocks.__init__`.
+The live GUI was **not** started and the header has **not** been seen rendered; it becomes visible
+only after a separately authorised deployment and restart.
+
+Touched: `src/beatsync_fork/build_identity.py` (new), `src/ui_content.py` (three templates, purely
+additive), `src/gui.py` (one import, one CSS constant, the `gr.Blocks` title, one resolution and two
+header lines), `tests/test_build_identity.py` (new).
+
 ### Added — 2026-11-08 (R14-A F-3, Option 1: the local-only Media Library inventory)
 
 **A2 and A3 merged with no user surface at all.** An AST census over every module under `src/`
