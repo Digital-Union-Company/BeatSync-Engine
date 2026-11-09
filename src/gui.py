@@ -9080,8 +9080,13 @@ def _on_library_cache_report_click(probe_shared_folder=False):
 #     is REFUSED rather than attempted.
 #   * the MEDIA half inspects whatever folder the operator types, including the shared folder if
 #     that is what they type. It is disclosed and operator-directed, but it is a listing and a
-#     count, so "this panel never lists the shared folder" is not a true sentence and is not
-#     written anywhere.
+#     count, so "this panel never lists the shared folder" is not a true sentence and is
+#     asserted nowhere in this feature's code, tests or documentation. The only places such a
+#     sentence appears at all are `tests/test_library_inventory_panel.py`'s own ban patterns and
+#     the counterexamples it assembles to prove the guard fires -- quoting a false sentence in
+#     order to forbid it is not asserting it. Stated this way because the R2 independent review
+#     (finding N-1) measured the earlier "is not written anywhere" to be false: the sentence had
+#     survived in that suite's module docstring, which the then-four-constant guard never read.
 #
 # And the record half's establishment is a comparison of NAMES, not of storage. Two different
 # names can denote one folder -- a junction, a symbolic link, the extended-length spelling, a

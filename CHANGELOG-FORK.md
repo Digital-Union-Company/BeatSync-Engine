@@ -82,8 +82,11 @@ were reproduced and are known **not** to be refused; drive substitution, mapped 
 names were **not** measured and are not claimed safe. The read-out states this where the records
 are reported, and the operator is told the practical precaution: if the local and shared folders
 may be two names for one folder, do not enable record reading. **No claim of physical
-shared-cache non-contact is made anywhere**, and the gate's behaviour is unchanged by this
-wording — the limitation was always there and is now written down.
+shared-cache non-contact is asserted anywhere in this feature's code, tests or documentation** —
+the only places such a sentence appears at all are the regression guard's own ban patterns and the
+counterexamples it assembles to prove it fires, and quoting a false sentence in order to forbid it
+is not asserting it. The gate's behaviour is unchanged by this wording — the limitation was always
+there and is now written down.
 
 **Four of A3's optional observations are deliberately not requested, and each absence is stated
 in the read-out rather than inferred from a missing line.** `looks_reusable` and `read_text` are
@@ -153,6 +156,45 @@ executable addition is two `lines.append` calls that emit new disclosure text.
   `src/gui.py` is never written to and therefore never restored. The earlier "seven mutations …
   restored byte-identically" conflated this with a separate external file-mutation harness, whose
   results are distinct evidence.
+
+#### Corrections applied after the second independent review (R3)
+
+The R2 independent review of the remediated candidate closed F-2, F-3, F-4 and F-5 on its own
+measurements and returned `CHANGES_REQUIRED` on two further findings, both of them about the claim
+R1 had already ruled out. No behaviour changed: the AST delta of `src/gui.py` against the R2 head
+is **zero executable function bodies**, and the only `src/gui.py` edit is inside one block comment.
+
+* **A seventh location was carrying the sentence, and this record denied it (N-1).** The R2 sweep
+  corrected the checkbox label, the panel info text, the `gui.py` block comment, two `gui.py`
+  docstrings, the read-out and this file — but `tests/test_library_inventory_panel.py`'s own module
+  docstring still stated, unchanged since the R1 head, that *this panel never reads, lists, counts,
+  measures or resolves the shared folder*. That paragraph is now scoped the same way the rest of
+  the increment is: the record half never **targets** the folder and compares **names**, the media
+  half inspects whatever it is given, and the alias residual is named with its measured,
+  unverified and unmeasured cases kept apart. Two universal statements that the surviving
+  docstring had falsified — this file's "no claim … is made anywhere" and the `gui.py` comment's
+  "is not written anywhere" — are corrected to say **asserted**, and both now name the one
+  legitimate exception: a regression guard necessarily quotes the sentence it forbids.
+* **The guard that was supposed to prevent this could not see the repository's own wording (N-2).**
+  `test_e16` banned four literal substrings in four constants; the phrasing above differs from one
+  of them by the single inserted word *measures*, and the review proved the blind spot was about
+  the phrasing rather than the file by planting that exact sentence into `INFO_LIBRARY_INVENTORY`
+  — an operator-facing constant the test guards — and watching `test_e16` still pass. The literal
+  pins are kept, and a **structural** matcher is added beside them: a negation that directly
+  governs a *list* of contact verbs, which catches the R1 wording, the `measures` variant, the
+  passive form and the original pronoun-object form alike. It runs over a widened surface — every
+  `F3_*`/`LABEL_LIBRARY_INVENTORY*`/`INFO_LIBRARY_INVENTORY` constant, the eight F-3 docstrings,
+  the F-3 block comment **and this suite's own module docstring**, the surface whose absence let
+  N-1 survive. Scoped statements and quoted counterexamples are exempt by construction, because a
+  guard that forbade *"the record half never reads, lists, counts or resolves the configured
+  folder itself"* or the media half's affirmative disclosure would make the honest text
+  unsayable; `test_e16b` asserts exactly that, and `test_e16a` asserts every matcher can fire,
+  from claims assembled at runtime so no banned literal sits in the file for a scanner to find.
+  The extraction is deliberately scoped to the F-3 block: `gui.py` carries a **pre-existing**
+  `main` comment about A6's unticked default-off report that a whole-file scan would flag.
+
+Touched: `src/gui.py` (one block comment), `tests/test_library_inventory_panel.py` (module
+docstring, `test_e16` strengthened, `test_e16a`/`test_e16b` added), `CHANGELOG-FORK.md`.
 
 ### Fixed — 2026-11-08 (the application did not start on the pinned Gradio)
 

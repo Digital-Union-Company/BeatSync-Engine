@@ -10,12 +10,31 @@ exposure of the producers that already exist — and chose two operational detai
   selectable. `include_rejected` is always ``False``.
 
 The approved R-3 restrictions on the live shared analysis-cache folder are carried over unchanged
-and are what most of this file is about. Stated precisely, because it is easy to state backwards:
+and are what most of this file is about. They have to be stated **scoped**, because an unqualified
+version of them was measured false two ways by independent review (R1 finding F-1, and the R2
+review's N-1 which found this very paragraph still carrying it). The two halves of the panel differ
+and must not be described together:
 
-    this panel never reads, lists, counts, measures or resolves the shared folder. It uses the
-    startup snapshot's folder TEXT for exactly one purpose — proving, lexically, that the folder
-    it is about to read records from is NOT that folder — and where that cannot be proved, the
-    record pass is REFUSED rather than attempted.
+* **the record half never TARGETS the shared folder.** It uses the startup snapshot's folder TEXT
+  for exactly one purpose — establishing, *lexically*, that the folder it is about to read records
+  from is not that folder — and where that cannot be established the record pass is REFUSED rather
+  than attempted. The comparison is exact normalised equality on both the typed and the resolved
+  local path, never a prefix test.
+* **the media half inspects whatever folder the operator names**, the shared folder included. It
+  has no notion of a shared folder, does not recognise one and does not refuse one.
+
+And the record half's establishment is a comparison of NAMES, not of storage. Two different names
+can denote one folder — a junction, a symbolic link, the extended-length spelling, a substituted or
+mapped drive letter, a short name — and distinguishing those would mean resolving the configured
+shared path, which the approved R-3 boundary forbids. A configured shared folder that is itself a
+junction onto the local cache's real target, and the extended-length spelling of the same folder,
+were reproduced and are known **not** to be refused; drive substitution, mapped drives and short
+names were **not** measured and are not claimed safe. The read-out discloses that residual itself
+(``F3_RECORDS_ALIAS_LIMIT``), and no physical non-contact guarantee is asserted here or anywhere
+else in this feature — the only places such a sentence appears at all are this module's own ban
+patterns and the counterexamples ``test_e16a``/``test_e16b`` assemble to prove the guard fires,
+and quoting a false sentence in order to forbid it is not asserting it. ``test_e16`` keeps it that
+way, over this docstring included.
 
 `gui.py` cannot be imported on a bare interpreter (`logger` pulls in librosa, `gpu_cpu_utils`
 probes NVENC), so the REAL F-3 functions and the REAL F-3 constants are AST-extracted from
@@ -44,6 +63,7 @@ import ast
 import builtins
 import functools
 import os
+import re
 import sys
 import types
 
@@ -1149,9 +1169,10 @@ def test_e6a_the_prefix_control_fires(tmp_path, contract_module):
 
 
 #: The R1 independent review (finding F-1) measured the panel's strongest sentence to be false
-#: two ways. These are the shapes that sentence took. They are checked against the CONSTANT
-#: VALUES loaded out of `gui.py`, not against this file's own text, so naming them here cannot
-#: trip the check -- the "naming a ban trips it" trap, which this repository has hit repeatedly.
+#: two ways. These are the literal shapes that sentence took, kept as exact pins. They are checked
+#: against CONSTANT VALUES and extracted PROSE, never against this file's own source text, so
+#: naming them here cannot trip the check -- the "naming a ban trips it" trap, which this
+#: repository has hit repeatedly.
 _UNCONDITIONAL_ISOLATION_CLAIMS = (
     "the shared folder is never read, listed or counted",
     "never reads, lists, counts or resolves the shared",
@@ -1159,29 +1180,153 @@ _UNCONDITIONAL_ISOLATION_CLAIMS = (
     "never contacts the shared",
 )
 
+#: A literal ban list is one inserted word away from blind, and the R2 independent review proved
+#: it: the repository's own phrasing of the claim is "never reads, lists, counts, MEASURES or
+#: resolves the shared folder", and the second pin above misses it because of that one word. The
+#: review planted that exact sentence into `INFO_LIBRARY_INVENTORY` -- an operator-facing constant
+#: this test guards -- and `test_e16` still passed (finding N-2). So the claim is also matched
+#: STRUCTURALLY, by shape rather than by spelling.
+#:
+#: The shape of the false claim is a negation that directly governs a LIST of contact verbs:
+#: "never read, listed or counted", "never reads, lists, counts, measures or resolves". One
+#: contact verb is not enough -- the panel legitimately says things like "no record was read
+#: twice" -- and the verbs have to follow the negation closely, because "it does not recognise the
+#: shared folder ... that folder is what gets listed and counted" is a true DISCLOSURE whose verbs
+#: are affirmative and far from the negation.
+_NEGATION = (r"(?:never|cannot|can\s+not|does\s+not|do\s+not|did\s+not|is\s+not|are\s+not"
+             r"|was\s+not|were\s+not|nothing)")
+_CONTACT_VERB = (r"(?:reads?|listed|lists?|counted|counts?|measured|measures?|resolved|resolves?"
+                 r"|enumerated|enumerates?|inspected|inspects?|opened|opens?)")
+#: Matched on their own, because "cannot contact the shared folder" is a single-verb claim and was
+#: one of the two shapes R1 found. `reach` is deliberately NOT here: "nor reaches the
+#: folder-creating resolver" is a true scoped statement in the shipped block comment.
+_REACH_VERB = r"(?:contacts?|contacted|touch(?:es|ed)?)"
+
+#: A negation, then at most a short subject/adverb gap of word characters, then two or more
+#: contact verbs in a list. The gap may not cross punctuation, which is what keeps an affirmative
+#: clause later in the same sentence out of reach.
+_CLAIM_PATTERNS = (
+    re.compile(rf"\b{_NEGATION}\b[\w\s]{{0,20}}?\b{_CONTACT_VERB}"
+               rf"(?:\s*(?:,|or|and)\s*{_CONTACT_VERB}){{1,}}\b"),
+    re.compile(rf"\b{_NEGATION}\b[\w\s]{{0,20}}?\b{_REACH_VERB}\b[\w\s]{{0,30}}?\bshared\b"),
+)
+
+#: A sentence naming WHICH half, or naming the configured folder's own path as the object, is a
+#: scoped statement rather than a blanket physical guarantee. "the record half never reads, lists,
+#: counts or resolves the configured folder itself" is true and must stay sayable.
+_SCOPE_MARKERS = ("record pass", "record half", "media half", "configured folder",
+                  "configured shared path", "this half")
+#: Prose that QUOTES the false sentence in order to explain that it is false is not an assertion
+#: of it. `src/gui.py` does exactly this on purpose, and so does this module.
+_COUNTEREXAMPLE_MARKERS = ("would be false", "would therefore be false", "not a true sentence",
+                           "measured false", "measured to be false", "is not written",
+                           "not asserted", "easy to state backwards", "unqualified version",
+                           "stated rather than left to be found", "keeps it that way")
+
+
+def unconditional_non_contact_claims(text: str) -> list:
+    """Every sentence in `text` that ASSERTS physical non-contact with the shared folder.
+
+    Scoped statements and quoted counterexamples are exempt by design -- a guard that rejected
+    those would make the honest disclosure the feature now ships unsayable, which is the opposite
+    of the finding it exists for.
+    """
+    flat = re.sub(r"[*`_]", "", " ".join(text.split())).lower()
+    offenders = []
+    for sentence in re.split(r"(?<=[.;:])\s+", flat):
+        if any(marker in sentence for marker in _COUNTEREXAMPLE_MARKERS):
+            continue
+        if any(marker in sentence for marker in _SCOPE_MARKERS):
+            continue
+        if any(pattern.search(sentence) for pattern in _CLAIM_PATTERNS):
+            offenders.append(sentence.strip())
+    return offenders
+
+
+def _f3_block_comment() -> str:
+    """The contiguous `#` block immediately above `LABEL_LIBRARY_INVENTORY`, from the real file.
+
+    Scoped to the F-3 block deliberately. `gui.py` carries a PRE-EXISTING A6 comment --
+    "the report never contacts the shared folder and never enters A4" -- which is scoped to A6's
+    unticked default-off report, predates this increment on `main`, and is out of this PR's scope.
+    Widening this extraction to the whole file would flag it.
+    """
+    lines = _source().splitlines()
+    anchor = next(i for i, line in enumerate(lines)
+                  if line.startswith("LABEL_LIBRARY_INVENTORY ="))
+    block, index = [], anchor - 1
+    while index >= 0 and (not lines[index].strip() or lines[index].lstrip().startswith("#")):
+        block.append(lines[index])
+        index -= 1
+    assert len(block) > 20, f"the F-3 block comment did not extract ({len(block)} lines)"
+    return "\n".join(reversed(block))
+
+
+def _f3_prose_surfaces() -> dict:
+    """Every F-3 prose surface the claim could hide in: constants, docstrings, the block comment,
+    and this module's own stated contract."""
+    surfaces = {}
+    for node in _tree().body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        name = node.targets[0].id
+        if not (name.startswith("F3_") or name.startswith("LABEL_LIBRARY_INVENTORY")
+                or name == "INFO_LIBRARY_INVENTORY"):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except Exception:                                                # noqa: BLE001
+            continue
+        if isinstance(value, str) and value.strip():
+            surfaces[f"gui.py::{name}"] = value
+    for name in F3_FUNCTIONS:
+        doc = ast.get_docstring(_func(name))
+        if doc:
+            surfaces[f"gui.py::{name}.__doc__"] = doc
+    surfaces["gui.py::<F-3 block comment>"] = _f3_block_comment()
+    surfaces["tests/test_library_inventory_panel.py::<module docstring>"] = __doc__ or ""
+    return surfaces
+
 
 def test_e16_the_unconditional_isolation_claim_cannot_come_back(tree, contract_module):
-    """The user-facing texts must scope the guarantee to what the comparison establishes.
+    """The F-3 prose must scope the guarantee to what the comparison establishes.
 
     Two measured counterexamples to an unconditional version: the MEDIA half enumerates whatever
     folder the operator types, shared folder included, with no alias involved at all; and the
     record half's check compares folder NAMES, so a configured shared text reaching this folder's
     storage under a different name is not refused (`test_e13`'s mirror image, reproduced in R2).
     So the texts may promise a scoped thing and must not promise a physical one.
+
+    Both halves of the guard run over the SAME widened surface (R2 finding N-1: the claim survived
+    in this module's own docstring, which the four-constant version never looked at).
     """
     ns = ns_for(tree)
-    faces = {name: ns[name] for name in
-             ("LABEL_LIBRARY_INVENTORY_RECORDS", "INFO_LIBRARY_INVENTORY",
-              "F3_MEDIA_NAMED_FOLDER_NOTE", "F3_RECORDS_ALIAS_LIMIT")}
-    for name, text in faces.items():
-        assert isinstance(text, str) and text.strip(), name
-        lowered = text.lower()
+    surfaces = _f3_prose_surfaces()
+    # The four operator-facing constants must be among them, or the widening is cosmetic.
+    for required in ("gui.py::LABEL_LIBRARY_INVENTORY_RECORDS", "gui.py::INFO_LIBRARY_INVENTORY",
+                     "gui.py::F3_MEDIA_NAMED_FOLDER_NOTE", "gui.py::F3_RECORDS_ALIAS_LIMIT",
+                     "tests/test_library_inventory_panel.py::<module docstring>",
+                     "gui.py::<F-3 block comment>"):
+        assert required in surfaces, (required, sorted(surfaces))
+    assert len(surfaces) > 30, f"only {len(surfaces)} prose surfaces found"
+
+    for name, text in surfaces.items():
+        lowered = " ".join(text.split()).lower()
         for claim in _UNCONDITIONAL_ISOLATION_CLAIMS:
             assert claim not in lowered, (
                 f"{name} carries {claim!r}, which R1 measured to be false; scope it to the record "
                 "half and to a comparison of names")
+        offenders = unconditional_non_contact_claims(text)
+        assert offenders == [], (
+            f"{name} ASSERTS physical non-contact with the shared folder: {offenders}. "
+            "Scope it to the record half and to a comparison of names, or state it as a "
+            "counterexample.")
 
     # And the scoped half is actually said, in both places an operator looks.
+    faces = {name: ns[name] for name in
+             ("LABEL_LIBRARY_INVENTORY_RECORDS", "INFO_LIBRARY_INVENTORY",
+              "F3_MEDIA_NAMED_FOLDER_NOTE", "F3_RECORDS_ALIAS_LIMIT")}
     assert "names" in faces["LABEL_LIBRARY_INVENTORY_RECORDS"].lower(), (
         "the checkbox label no longer warns that the check is on names")
     limit = faces["F3_RECORDS_ALIAS_LIMIT"].lower()
@@ -1190,11 +1335,70 @@ def test_e16_the_unconditional_isolation_claim_cannot_come_back(tree, contract_m
     media = faces["F3_MEDIA_NAMED_FOLDER_NOTE"].lower()
     assert "whichever folder that is" in media, media[:200]
 
-    # Control: the comparison really does see the claim it is a guard for.
-    planted = (faces["INFO_LIBRARY_INVENTORY"]
-               + " The shared folder is never read, listed or counted.")
-    assert [c for c in _UNCONDITIONAL_ISOLATION_CLAIMS if c in planted.lower()], (
-        "the instrument cannot see the sentence it exists to keep out")
+
+def test_e16a_both_guards_fire_on_both_recorded_phrasings(tree, contract_module):
+    """Positive controls. Every matcher must be shown capable of firing, or `test_e16` is a green
+    that means nothing -- and a literal ban list that misses the repository's own wording is
+    exactly how N-2 happened.
+
+    The claims are ASSEMBLED AT RUNTIME from fragments so that no banned literal appears in this
+    file's source for the structural matcher, or a future source-scanning guard, to find.
+    """
+    panel = "this panel "
+    verbs_r1 = "never reads, lists, counts or resolves "
+    verbs_r2 = "never reads, lists, counts, measures or resolves "
+    folder = "the shared folder."
+    passive = "the shared folder is " + "never read, listed or counted" + ", whether this box " \
+        "is ticked or not."
+    reach = panel + "cannot " + "contact the shared folder."
+
+    r1_form = panel + verbs_r1 + folder
+    r2_form = panel + verbs_r2 + folder          # the variant the literal pin could not see
+    pronoun = panel + verbs_r2 + "it."           # the original changelog wording: no "shared"
+
+    # 1. the structural matcher sees all four, including the two the literal pins miss.
+    for label, claim in (("R1 verb list", r1_form), ("the 'measures' variant", r2_form),
+                         ("passive form", passive), ("pronoun object", pronoun),
+                         ("single reach verb", reach)):
+        assert unconditional_non_contact_claims(claim), (
+            f"the structural matcher cannot see {label}: {claim!r}")
+
+    # 2. the literal pins are still satisfiable, and demonstrably NOT sufficient on their own --
+    #    which is the finding, asserted rather than described.
+    assert [c for c in _UNCONDITIONAL_ISOLATION_CLAIMS if c in r1_form.lower()], r1_form
+    assert [c for c in _UNCONDITIONAL_ISOLATION_CLAIMS if c in passive.lower()], passive
+    assert not [c for c in _UNCONDITIONAL_ISOLATION_CLAIMS if c in r2_form.lower()], (
+        "the 'measures' variant is now caught by a literal pin; if that is deliberate, this "
+        "control needs rewriting -- but the structural matcher is what must carry it")
+
+    # 3. planted into a real operator-facing constant, the guard fires -- the exact scenario the
+    #    R2 review planted and watched pass.
+    ns = ns_for(tree)
+    assert unconditional_non_contact_claims(ns["INFO_LIBRARY_INVENTORY"] + " " + r2_form), (
+        "the claim can be added to the panel's own info text without the guard firing")
+
+
+def test_e16b_the_guard_does_not_reject_legitimate_scoped_disclosure(tree, contract_module):
+    """The other half of a usable guard: the honest sentences this feature ships must stay sayable.
+
+    A guard that cannot be satisfied is as useless as one that cannot fail, and these are the
+    exact constructions the R2 remediation introduced -- a scoped non-targeting statement, an
+    affirmative disclosure that the media half DOES list whatever it is given, and a quoted
+    counterexample explaining why the unqualified sentence is false.
+    """
+    scoped = ("the record half never reads, lists, counts or resolves the configured folder "
+              "itself, nor reaches the folder-creating resolver.")
+    disclosure = ("it does not recognise the shared analysis-cache folder and does not refuse "
+                  "it: if you type that folder here, that folder is what gets listed and counted.")
+    counterexample = ('claiming anywhere that this panel cannot contact the shared folder would '
+                      'therefore be false, and one operator keystroke is all it takes to disprove.')
+    single = "no record was read twice."
+    for label, text in (("scoped to the record half", scoped),
+                        ("an affirmative media-half disclosure", disclosure),
+                        ("a quoted counterexample", counterexample),
+                        ("a single contact verb", single)):
+        assert unconditional_non_contact_claims(text) == [], (
+            f"the guard rejects {label}, which is legitimate and shipped: {text!r}")
 
 
 def test_e17_the_alias_limit_is_shown_exactly_when_the_pass_ran(tree, contract_module):
