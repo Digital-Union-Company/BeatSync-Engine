@@ -140,6 +140,15 @@ from auto_mode import CONFIG as AUTO_MODE_CONFIG, analyze_beats_auto
 from beatsync_fork.progress import EventKind, ProgressEvent
 from beatsync_fork.progress_view import ProgressView
 
+# [FORK] Digital-Union: visible version and running build id. `FORK_VERSION` is the ONE product
+# version in this repository and is reused rather than restated here; `build_identity` resolves
+# which local source revision this installation was loaded from. Both are read exactly once, in
+# `create_ui`, and neither reaches a render, a cache key or a Qwen request -- they are a label on
+# the screen. The resolution lives in the fork package because it needs a `git` child process and
+# `gui.py`'s `subprocess.run` site count is pinned at exactly two.
+from beatsync_fork import FORK_VERSION
+from beatsync_fork import build_identity as fork_build
+
 # [FORK] Digital-Union: creative variation seed (Phase A). Selection rule and seed normalisation
 # live in src/beatsync_fork/ (stdlib-only, Gradio-free); this module only wires them to widgets.
 from beatsync_fork import variation as fork_variation
@@ -603,6 +612,18 @@ CLIPS_GALLERY_CSS = """
 #clips-gallery .r5-rejected { border-color: #d02828; background: #26100f; }
 #clips-gallery .r5-rejected .r5-badge { color: #ff6b6b; }
 #clips-gallery .r5-empty { padding: 24px; color: #8a8a8a; font-style: italic; }
+"""
+
+# [FORK] Digital-Union: the running-build line under the title.
+#
+# Secondary information -- an operator reads it when they need to know which revision is on
+# screen, and should not have it competing with the heading the rest of the time. Deliberately two
+# inherited properties and no layout arithmetic: `font-size` and `opacity` degrade to "a slightly
+# plainer paragraph" if the theme changes the surrounding markup, whereas a negative margin tuned
+# against one Gradio version is the kind of rule that silently overlaps the title in the next one.
+# Scoped to its own class, so it can reach nothing else on the page.
+BUILD_ID_CSS = """
+.bs-build-id p { font-size: 0.85em; opacity: 0.72; }
 """
 
 # [FORK] Digital-Union (R5 Clips Preview Selector, P1): gallery interaction.
@@ -10909,8 +10930,16 @@ def create_ui() -> gr.Blocks:
         cuda_status = "⚠️  System CUDA (or not available)"
     ffmpeg_status = "✅ Portable (bin/ffmpeg/)" if FFMPEG_FOUND else "⚠️  System FFmpeg"
     
-    app = gr.Blocks(title='BeatSync Engine', theme='ocean',
-                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS)
+    # [FORK] Digital-Union: which build is on screen. Resolved ONCE here -- `create_ui` runs once
+    # per process and `cached_identity` memoises per root, so no browser event, tab selection or
+    # render ever spawns this `git` child. `ROOT_DIR` is the application root (the parent of
+    # `src/`), so an installed copy that is not a checkout reports `Build unknown` rather than
+    # borrowing the commit of some unrelated repository it happens to sit inside.
+    build_label = fork_build.cached_identity(ROOT_DIR).label()
+
+    app = gr.Blocks(title=UI_BROWSER_TITLE.format(version=FORK_VERSION, build=build_label),
+                    theme='ocean',
+                    css=STATUS_BOX_CSS + CUT_CANCEL_CSS + CLIPS_GALLERY_CSS + BUILD_ID_CSS)
     with app:
         session_state = gr.State({})
         # [FORK] Digital-Union: source-input confirmation state, kept separate from the processing
@@ -10949,7 +10978,12 @@ def create_ui() -> gr.Blocks:
         # graph and asserts `copy.deepcopy(proposal) == proposal`.
         director_proposal_state = gr.State(None)
 
-        gr.Markdown(f"# {UI_TITLE}")
+        # [FORK] Digital-Union: the version rides in the heading, the running build on a quiet
+        # second line beneath it. Two `gr.Markdown` calls rather than one so the build line can be
+        # styled down without shrinking the title, and no component is named: both are static text
+        # written once at build time, read by nothing and written by no handler.
+        gr.Markdown(f"# {UI_TITLE_VERSIONED.format(title=UI_TITLE, version=FORK_VERSION)}")
+        gr.Markdown(UI_BUILD_LINE.format(build=build_label), elem_classes=['bs-build-id'])
         gr.Markdown(UI_MAIN_DESCRIPTION)
 
         # [FORK] Digital-Union (GUI Refresh A): three tabs instead of one long column.

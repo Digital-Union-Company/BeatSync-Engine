@@ -14,6 +14,34 @@ UI_MAIN_DESCRIPTION = """Create music videos that cut to the beat. Upload audio 
 to automatically generate a video synchronized with your music's rhythm."""
 
 # ============================================================================
+# [FORK] Digital-Union: visible version and running build id
+#
+# Which BeatSync this is, and which source revision it was actually loaded from. The two are
+# separate questions and the header answers both, because the version alone cannot tell two
+# machines on the same release apart -- which is the situation that made this hard to diagnose.
+#
+# The templates live here with every other string in the app; the identity itself is resolved by
+# `beatsync_fork/build_identity.py`, which owns the `Build unknown` / `(modified)` /
+# `(unverified)` vocabulary and never invents a SHA. `{build}` is therefore already a finished
+# label -- these templates must not re-decide what an unknown build looks like.
+#
+# `{version}` is always `beatsync_fork.FORK_VERSION`. There is deliberately no second version
+# constant anywhere: a product version is a release decision, and two places to state it is how
+# the screen and the record start disagreeing.
+# ============================================================================
+
+#: The heading. Rendered as Markdown `#`, so the version rides inside the same line as the title.
+UI_TITLE_VERSIONED = "{title} v{version}"
+
+#: The secondary line directly beneath it. The SHA is code-formatted so it can be read off the
+#: screen and pasted into a `git show` without ambiguity about where it ends.
+UI_BUILD_LINE = "Running build: `{build}` · Digital Union"
+
+#: The browser tab title. Plain text -- a tab renders no Markdown -- and the same two facts, so a
+#: screenshot of a window is enough to identify what produced it.
+UI_BROWSER_TITLE = "BeatSync Engine v{version} ({build})"
+
+# ============================================================================
 # SYSTEM STATUS
 # ============================================================================
 
