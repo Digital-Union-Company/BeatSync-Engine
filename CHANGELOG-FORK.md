@@ -20,6 +20,70 @@ behaviour is preserved as the default.
 
 ## Unreleased
 
+### Fixed — 2026-11-10 (final assembly no longer dies on a constant: FUN R11 Assembly Budget)
+
+**A 1h59m render was discarded 81 seconds from completion.** Final assembly ran under a
+hardcoded `timeout=300`, and a render of 2,187 segments (14,865,314,550 bytes of clips, a
+7157.666667 s frame-locked timeline) was killed by `subprocess.TimeoutExpired` at exactly
+300 s. Forensics on the abandoned file: `ftyp`, then a 64-bit `mdat` whose declared size
+plus the 32-byte `ftyp` equalled the file length **exactly**, and **no `moov`**. So the mux
+had written all 16,922,008,592 bytes and patched the box size; only the index was missing.
+Re-running the identical argv with a sufficient bound completed in **381 s** — 219 s of mux
+plus **162 s of `+faststart` rewrite**. The render died in the faststart pass, which the old
+constant never budgeted for, and two hours of extraction were thrown away.
+
+**300 s was never a property of the workload.** Assembly cost is dominated by bytes moved,
+and the bytes are set by the operator's music length and source resolution — quantities the
+code can *measure* before the child starts. `src/beatsync_fork/assembly_budget.py` (new,
+stdlib-only, pure) derives the bound from the real `os.path.getsize` total of the segments
+about to be read, plus the `pcm_s24le` stream the plan implies, times the traversals the
+chosen argv actually performs.
+
+Load-bearing details:
+
+- **`+faststart` is budgeted explicitly, not absorbed.** It re-reads and rewrites the
+  finished file to move `moov` ahead of `mdat` — a whole extra read and write of the output,
+  and the pass the incident died in. `faststart=True` is passed only where `+faststart` is
+  genuinely on the command line.
+- **The 300 s constant is preserved as the FLOOR.** Any render whose measured workload
+  implies less keeps exactly the historical prompt-failure behaviour, so short renders are
+  bit-for-bit unchanged in this respect. `MIN == 300` is asserted by a test.
+- **A finite ceiling, never unbounded.** `MAX = 21,600 s`. A stalled FFmpeg must still die,
+  be reaped and be reported; a timeout helper is not a licence to wait forever. A test drives
+  payloads up to 10^18 bytes and asserts the result stays inside `[MIN, MAX]` and is always
+  an `int`.
+- **A timeout now names the workload it measured.** `describe_assembly_timeout` reports the
+  byte totals, the faststart pass and the throughput floor, printed *at the point of failure*
+  as well as before the run. A timeout that names no workload is how the constant survived
+  this long.
+- **No silent re-encode after a genuine timeout.** The fallback is gated on
+  `returncode != 0`; a timeout *raises* from `_run_media_command` after the child has been
+  killed **and reaped**, so it never returns and never reaches the fallback. Silently
+  re-encoding ~17 GB after a slow assembly would convert a late render into an hours-long
+  one. A test asserts exactly **one** child is started on the timeout path.
+- **Four other latent constants in the same function went with it.** The ProRes audio
+  extraction was bounded at `120 s` — unable to transcode a long track at all, since a 2 h
+  timeline is ~2.06 GiB of PCM — and the re-encode fallback at `600 s`, unreachable for any
+  long render. Each now scales on the term that actually governs it; the re-encode carries an
+  extra per-output-second encode term because it is compute-bound, not I/O-bound.
+- **The throughput floor is derived from measurement, not taste.** The mux moved ~31.8 GB of
+  combined read+write in 300 s (~106 MB/s aggregate) on the incident volume; the floor is set
+  at 16 MiB/s, roughly a 6× margin — low enough that a contended mechanical drive never trips
+  it, high enough that a stalled child still dies.
+- **Nothing else moved.** `-shortest`, the planned `-t` at the frame-locked plan length,
+  `pcm_s24le` @ 48 kHz, `+faststart`, `-c:v copy`, the frame-lock invariant and PR #96's
+  source-capacity eligibility are all unchanged and pinned by tests. The budget decides *how
+  long to wait*, never whether an output is valid: `rc=0` with a zero-byte file is still
+  rejected, because this incident's own artefact proves a nonempty MP4 is not a render.
+
+`tests/test_assembly_budget.py` — 31 tests. The pure arithmetic is imported and tested
+directly on a bare interpreter; the behavioural tests compile and execute the **real**
+`concatenate_videos_ffmpeg` and `_run_media_command` bodies against hand-built namespaces,
+following `test_extraction_failure_context.py`. A stalled child is a real subprocess
+(`sys.executable -c "time.sleep(600)"`), so the kill-and-reap path is exercised with no
+FFmpeg at all. One opt-in real-FFmpeg test concatenates three decodable segments and asserts
+the published frame count, the pcm_s24le stream and a clean full decode.
+
 ### Added — 2026-11-09 (visible version and running build id)
 
 **The header now says which BeatSync this is and which source revision it was actually loaded

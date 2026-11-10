@@ -53,6 +53,11 @@ from beatsync_fork.media_sample import (
     DEFAULT_SAMPLE_FRAMES as _MEDIA_SAMPLE_FRAMES,
     SampleDecodeOutcome,
 )
+# [FORK] Digital-Union (FUN R11 Assembly Budget): the final-assembly timeout contract
+# (stdlib-only fork module). Same one-way direction as every fork import above. It owns the
+# pure arithmetic -- how many bytes the mux will move, what +faststart's extra pass costs,
+# where the floor and the ceiling sit -- while this module keeps the child process.
+from beatsync_fork import assembly_budget as fork_assembly_budget
 
 # Initialize environment
 setup_environment()
@@ -1082,7 +1087,41 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
     """
     if temp_dir is None:
         temp_dir = os.path.dirname(output_file)
-    
+
+    # [FORK] Digital-Union (FUN R11 Assembly Budget): every timeout below used to be a
+    # hardcoded constant. A 1h59m render (2,187 segments / 14.86 GiB / a 7157.666667s
+    # timeline) was killed at exactly 300s having written 16,922,008,592 of ~16.93 GB --
+    # the mdat was complete and size-patched, only the moov was missing, so two hours of
+    # extraction were discarded ~99.97% of the way through final assembly.
+    #
+    # The budget is derived from MEASURED workload: the real byte size of the segments
+    # about to be read, plus the pcm_s24le stream the plan implies, times the traversals
+    # the chosen argv performs. `faststart=True` is passed only where `+faststart` is
+    # actually on the command line, because that extra read+write of the output is the
+    # pass the incident died in. Short renders clamp to the historical 300s floor, so
+    # their prompt-failure behaviour is unchanged.
+    _assembly_input_bytes = fork_assembly_budget.measure_input_bytes(video_files)
+    _assembly_audio_seconds = timeline_seconds if audio_file else None
+    _copy_assembly_timeout = fork_assembly_budget.assembly_timeout_seconds(
+        _assembly_input_bytes,
+        audio_seconds=_assembly_audio_seconds,
+        faststart=False,
+    )
+    _faststart_assembly_timeout = fork_assembly_budget.assembly_timeout_seconds(
+        _assembly_input_bytes,
+        audio_seconds=_assembly_audio_seconds,
+        faststart=True,
+    )
+    _audio_only_timeout = fork_assembly_budget.assembly_timeout_seconds(
+        0, audio_seconds=_assembly_audio_seconds, faststart=False,
+    )
+    _reencode_assembly_timeout = fork_assembly_budget.assembly_timeout_seconds(
+        _assembly_input_bytes,
+        audio_seconds=_assembly_audio_seconds,
+        faststart=False,
+        reencode_seconds=timeline_seconds,
+    )
+
     # Create concat file
     concat_file = os.path.join(temp_dir, f'concat_list_{uuid.uuid4().hex}.txt')
     with open(concat_file, 'w', encoding='utf-8') as f:
@@ -1110,9 +1149,11 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 '-y',
                 temp_video
             ]
-            
-            result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
-            
+
+            # [FORK] FUN R11: stream-copy concat, no faststart on .mov.
+            result = _run_media_command(cmd, timeout=_copy_assembly_timeout,
+                                        lifecycle=lifecycle)
+
             if result.returncode != 0:
                 raise Exception(f"Concatenation failed: {result.stderr}")
             
@@ -1137,8 +1178,12 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     temp_audio
                 ])
                 
-                result = _run_media_command(audio_cmd, timeout=120, lifecycle=lifecycle)
-                
+                # [FORK] FUN R11: writes pcm_s24le for the whole timeline. The old flat 120s
+                # could not transcode a long track at all -- a 2h timeline is ~2.06 GiB of
+                # PCM -- so this scales on the audio payload alone, with no video term.
+                result = _run_media_command(audio_cmd, timeout=_audio_only_timeout,
+                                            lifecycle=lifecycle)
+
                 if result.returncode != 0:
                     raise Exception(f"Audio extraction failed: {result.stderr}")
                 
@@ -1162,8 +1207,10 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                     output_file
                 ])
                 
-                result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
-                
+                # [FORK] FUN R11: remux video copy + PCM into the .mov; no faststart here.
+                result = _run_media_command(cmd, timeout=_copy_assembly_timeout,
+                                            lifecycle=lifecycle)
+
                 if result.returncode != 0:
                     raise Exception(f"Audio merging failed: {result.stderr}")
                 
@@ -1213,7 +1260,35 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                         cmd.extend(['-t', str(timeline_seconds)])
                 cmd.extend(['-fflags', '+genpts', '-movflags', '+faststart', '-y', output_file])
 
-                result = _run_media_command(cmd, timeout=300, lifecycle=lifecycle)
+                # [FORK] FUN R11 Assembly Budget: THE incident site. `+faststart` is on this
+                # command line, so the budget includes its extra read+write of the output.
+                # A timeout here still raises TimeoutExpired from _run_media_command after
+                # the child has been killed AND reaped -- it does NOT fall through to the
+                # re-encode below, because that fallback is gated on `returncode != 0` and a
+                # timeout never returns. That is deliberate: silently re-encoding ~17 GB
+                # after a genuine timeout would turn a slow assembly into an hours-long one.
+                _budget_detail = fork_assembly_budget.describe_assembly_timeout(
+                    _faststart_assembly_timeout,
+                    input_bytes=_assembly_input_bytes,
+                    audio_seconds=_assembly_audio_seconds,
+                    faststart=True,
+                )
+                print(f"      assembly budget: {_budget_detail}")
+                try:
+                    result = _run_media_command(cmd, timeout=_faststart_assembly_timeout,
+                                                lifecycle=lifecycle)
+                except subprocess.TimeoutExpired:
+                    # Re-raise unchanged, but say what the bound was measuring first -- a
+                    # timeout that names no workload is how the 300s constant survived.
+                    # The exception itself already carries the real timeout value, which is
+                    # what `ffmpeg_diagnostics` reports, so no new transport is needed.
+                    print(
+                        f"   ⏱️  Final assembly exceeded its measured budget after "
+                        f"{_fmt_seconds(time.perf_counter() - copy_started)}: "
+                        f"{_budget_detail}. The FFmpeg child was terminated and reaped; "
+                        f"the partial output is NOT a render."
+                    )
+                    raise
                 if result.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                     print(f"   ✓ Fast concat-copy complete in {_fmt_seconds(time.perf_counter() - copy_started)}")
                     return output_file
@@ -1264,8 +1339,12 @@ def concatenate_videos_ffmpeg(video_files: List[str], output_file: str,
                 output_file
             ])
             
-            result = _run_media_command(cmd, timeout=600, lifecycle=lifecycle)
-            
+            # [FORK] FUN R11: a full re-encode is compute-bound, not I/O-bound, so this
+            # budget carries the extra per-output-second encode term. The old flat 600s was
+            # unreachable for any long render.
+            result = _run_media_command(cmd, timeout=_reencode_assembly_timeout,
+                                        lifecycle=lifecycle)
+
             if result.returncode != 0:
                 raise Exception(f"Encoding failed: {result.stderr}")
             print(f"   ✓ Full final re-encode complete in {_fmt_seconds(time.perf_counter() - encode_started)}")
